@@ -70,8 +70,8 @@ type ProductionReaderDeps = Readonly<{
  * Read-only production boundary for passive OpenCode status. It reads only the
  * app-owned redacted snapshot store; it has no inventory, host, process, launch,
  * provider API, network, profile preparation, or writer dependency. Native
- * Windows deliberately returns unsupported/unknown without disk I/O or legacy
- * fallback until a handle-relative persistence implementation exists.
+ * Windows uses the same app-owned redacted store through the verified Windows
+ * safe-publication boundary. No passive read starts or provisions a runtime.
  */
 export class OpenCodePassiveStatusProductionReader {
   readonly reader: OpenCodePassiveStatusReader
@@ -93,12 +93,10 @@ export class OpenCodePassiveStatusProductionReader {
       this.#platform,
     ).supported
     this.#rootDirectory = persistenceSupported
-      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
+      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory(process.env, this.#platform)
       : ''
     this.#now = deps.now ?? Date.now
-    this.#canonicalizePath = deps.canonicalizePath ?? (this.#platform === 'win32'
-      ? async () => { throw new Error('Passive transactional persistence is unsupported on native Windows') }
-      : canonicalizeOpenCodePassiveProjectPath)
+    this.#canonicalizePath = deps.canonicalizePath ?? canonicalizeOpenCodePassiveProjectPath
     this.#readBoundedText = deps.readBoundedText ?? readBoundedSnapshotText
     this.#transactionalStorage = deps.readBoundedText === undefined
     this.#afterCommittedTransactionSelected = deps.afterCommittedTransactionSelected ?? (() => undefined)

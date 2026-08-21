@@ -2,14 +2,18 @@ export const OPEN_CODE_UNSUPPORTED_SAFE_PERSISTENCE_CODE = 'EUNSUPPORTED_SAFE_PE
 
 export type OpenCodePassiveSnapshotPersistenceCapability =
   | Readonly<{ supported: true; implementation: 'descriptor-root' }>
+  | Readonly<{ supported: true; implementation: 'verified-windows-path' }>
   | Readonly<{ supported: false; implementation: 'unavailable' }>
 
-/** Pure platform policy. Native Windows needs handle-relative primitives that Node does not expose. */
+/** Pure platform policy for the app-owned, identity-verified snapshot store. */
 export function getOpenCodePassiveSnapshotPersistenceCapability(
   platform: NodeJS.Platform = process.platform,
 ): OpenCodePassiveSnapshotPersistenceCapability {
-  return platform === 'linux' || platform === 'darwin'
-    ? Object.freeze({ supported: true, implementation: 'descriptor-root' })
+  if (platform === 'linux' || platform === 'darwin') {
+    return Object.freeze({ supported: true, implementation: 'descriptor-root' })
+  }
+  return platform === 'win32'
+    ? Object.freeze({ supported: true, implementation: 'verified-windows-path' })
     : Object.freeze({ supported: false, implementation: 'unavailable' })
 }
 

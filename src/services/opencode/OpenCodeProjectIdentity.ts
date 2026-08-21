@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { lstat, realpath } from 'node:fs/promises'
 
@@ -7,6 +8,11 @@ export function normalizeOpenCodeProjectIdentity(
 ): string {
   const resolved = path.resolve(projectPath)
   return platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+/** Stable path key shared by every durable project-scoped compatibility root. */
+export function openCodeProjectIdentityKey(canonicalProjectIdentity: string): string {
+  return createHash('sha256').update(canonicalProjectIdentity).digest('hex').slice(0, 16)
 }
 
 /**
@@ -19,6 +25,8 @@ export async function canonicalizeOpenCodeProjectIdentity(
   options: Readonly<{
     platform?: NodeJS.Platform
     signal?: AbortSignal
+    /** Compatibility profiles historically accepted not-yet-created projects. */
+    allowMissing?: boolean
     filesystem?: Readonly<{
       realpath(path: string): Promise<string>
       lstat(path: string): Promise<{ dev: number; ino: number; isDirectory(): boolean }>
@@ -30,7 +38,20 @@ export async function canonicalizeOpenCodeProjectIdentity(
   if (!projectPath.trim()) throw new Error('OpenCode project path is empty')
   const filesystem = options.filesystem ?? { realpath, lstat }
   const platform = options.platform ?? process.platform
-  const canonical = await abortable(filesystem.realpath(resolved), options.signal)
+  let canonical: string
+  try {
+    canonical = await abortable(filesystem.realpath(resolved), options.signal)
+  } catch (error) {
+    if (!options.allowMissing || !isMissing(error)) throw error
+    // A broken alias is not a missing project: accepting it would create a
+    // second durable identity for an already-named filesystem object.
+    try { await abortable(filesystem.lstat(resolved), options.signal) }
+    catch (metadataError) {
+      if (isMissing(metadataError)) return normalizeCanonicalPath(resolved, platform)
+      throw metadataError
+    }
+    throw error
+  }
   const first = await abortable(filesystem.lstat(canonical), options.signal)
   if (!first.isDirectory()) throw new Error('OpenCode project path must be a directory')
   // Re-resolve after observing the target. A deleted or retargeted alias fails
@@ -49,8 +70,14 @@ export async function canonicalizeOpenCodeProjectIdentity(
 }
 
 function normalizeCanonicalPath(value: string, platform: NodeJS.Platform): string {
-  const normalized = path.normalize(value)
+  const normalized = platform === 'win32' && isWindowsPath(value)
+    ? path.win32.normalize(value)
+    : path.normalize(value)
   return platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function isWindowsPath(value: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\')
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -70,4 +97,9 @@ async function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promis
   })
   try { return await Promise.race([operation, aborted]) }
   finally { remove() }
+}
+
+function isMissing(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'ENOENT')
 }

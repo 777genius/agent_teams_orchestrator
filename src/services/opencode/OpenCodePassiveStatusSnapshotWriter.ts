@@ -58,7 +58,7 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
     }
     this.#platform = deps.platform ?? process.platform
     this.#rootDirectory = getOpenCodePassiveSnapshotPersistenceCapability(this.#platform).supported
-      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
+      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory(process.env, this.#platform)
       : ''
     this.#makeDirectory = deps.makeDirectory
     this.#writeAtomic = deps.writeAtomic

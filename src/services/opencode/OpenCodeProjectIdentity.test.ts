@@ -3,7 +3,10 @@ import { lstat, mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { canonicalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import {
+  canonicalizeOpenCodeProjectIdentity,
+  openCodeProjectIdentityKey,
+} from './OpenCodeProjectIdentity.js'
 
 const roots: string[] = []
 afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
@@ -14,8 +17,10 @@ describe('canonical OpenCode project identity', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-identity-')); roots.push(root)
     const project = path.join(root, 'project'); const alias = path.join(root, 'alias')
     await mkdir(project); await symlink(project, alias)
-    expect(await canonicalizeOpenCodeProjectIdentity(project))
-      .toBe(await canonicalizeOpenCodeProjectIdentity(alias))
+    const projectIdentity = await canonicalizeOpenCodeProjectIdentity(project)
+    const aliasIdentity = await canonicalizeOpenCodeProjectIdentity(alias)
+    expect(projectIdentity).toBe(aliasIdentity)
+    expect(openCodeProjectIdentityKey(projectIdentity)).toBe(openCodeProjectIdentityKey(aliasIdentity))
   })
 
   test('different real projects remain distinct and Windows folds canonical case', async () => {
@@ -24,6 +29,8 @@ describe('canonical OpenCode project identity', () => {
     await mkdir(first); await mkdir(second)
     expect(await canonicalizeOpenCodeProjectIdentity(first))
       .not.toBe(await canonicalizeOpenCodeProjectIdentity(second))
+    expect(openCodeProjectIdentityKey(await canonicalizeOpenCodeProjectIdentity(first)))
+      .not.toBe(openCodeProjectIdentityKey(await canonicalizeOpenCodeProjectIdentity(second)))
     expect(await canonicalizeOpenCodeProjectIdentity(first, { platform: 'win32' }))
       .toBe(path.resolve(first).toLowerCase())
   })
@@ -31,13 +38,16 @@ describe('canonical OpenCode project identity', () => {
   test('Windows case-only realpath observations retain one stable identity', async () => {
     let reads = 0
     const stat = { dev: 7, ino: 11, isDirectory: () => true }
-    await expect(canonicalizeOpenCodeProjectIdentity('C:\\Project', {
+    const canonical = await canonicalizeOpenCodeProjectIdentity('C:\\Project', {
       platform: 'win32',
       filesystem: {
         realpath: async () => reads++ === 0 ? 'C:\\Project' : 'c:\\project',
         lstat: async () => stat,
       },
-    })).resolves.toBe('c:\\project')
+    })
+    expect(canonical).toBe('c:\\project')
+    expect(openCodeProjectIdentityKey(canonical))
+      .toBe(openCodeProjectIdentityKey('c:\\project'))
   })
 
   test('missing, deleted, and broken symlink inputs fail conservatively', async () => {

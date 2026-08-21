@@ -68,6 +68,10 @@ import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  canonicalizeOpenCodeProjectIdentity,
+  openCodeProjectIdentityKey,
+} from './OpenCodeProjectIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import {
   canonicalSerializeOpenCodePolicyIdentity,
@@ -3833,7 +3837,7 @@ export class OpenCodeProfileManager {
   }
 
   private getProfileRootKey(projectPath: string): string {
-    return hashString(projectPath).slice(0, 16)
+    return openCodeProjectIdentityKey(projectPath)
   }
 
   private async resolveManagedAppMcpConfig(): Promise<OpenCodeMcpServerConfig | null> {
@@ -4663,7 +4667,10 @@ export class OpenCodeProfileManager {
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
-    const resolvedProjectPath = this.getProjectPath(projectPath)
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectIdentity(
+      this.getProjectPath(projectPath),
+      { platform: this.platform, signal: options.abortSignal, allowMissing: true },
+    )
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
     return this.withProfilePreparationLock(profileRootKey, async () => {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
