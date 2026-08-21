@@ -187,6 +187,8 @@ export type OpenCodeLaunchAttemptInput = {
   request: OpenCodeLaunchAttemptRequest
   members: readonly OpenCodeOpaqueIdentity[]
   requestedBudgetMs?: number
+  /** Absolute monotonic envelope inherited from the caller. */
+  deadlineAtMs?: number
   continuation?: boolean
   signal?: AbortSignal
   /** Locally recomputed digest of every mutation-bearing production command field. */
@@ -235,6 +237,7 @@ export class OpenCodeLaunchAttempt {
     const initialPolicy = new OpenCodeLaunchAttemptPolicy({
       requestedBudgetMs: input.requestedBudgetMs,
       monotonicNow: () => this.ports.clock.monotonicNow(),
+      deadlineAtMs: input.deadlineAtMs,
     })
     const controller = new AbortController()
     const cancel = () => controller.abort(input.signal?.reason)
@@ -271,6 +274,8 @@ export class OpenCodeLaunchAttempt {
           let firstClockRead = true
           const policy = new OpenCodeLaunchAttemptPolicy({
             requestedBudgetMs: lease.journal.totalBudgetMs,
+            startedAtMs: lease.journal.startedAtMs,
+            deadlineAtMs: input.deadlineAtMs,
             monotonicNow: () => {
               if (firstClockRead) { firstClockRead = false; return lease.journal.startedAtMs }
               return this.ports.clock.monotonicNow()

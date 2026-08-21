@@ -143,6 +143,19 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     expect(coreInput?.commandInputDigest).toBe(computeOpenCodeLaunchCommandInputDigest(baseline))
   })
 
+  test('passes an absolute deadline unchanged while preserving the original policy budget', async () => {
+    const value = { ...command(), requestedBudgetMs: 42_000, outerRemainingBudgetMs: 8_000,
+      deadlineAtMs: 50_000 }
+    let coreInput: OpenCodeLaunchAttemptInput | undefined
+    await new OpenCodeLaunchAttemptBridge({
+      commandLedger: { read: async () => ({ status: 'absent' }) },
+      attempt: { run: async input => { coreInput = input; return result } },
+      projection: { fromDurableResult: async () => ({ snapshot, data: null }) },
+    }).execute(value)
+    expect(coreInput?.deadlineAtMs).toBe(50_000)
+    expect(coreInput?.requestedBudgetMs).toBe(42_000)
+  })
+
   test('keeps only generation metadata mutable across continuation and rejects altered plans', () => {
     const first = command()
     const continuation = command()

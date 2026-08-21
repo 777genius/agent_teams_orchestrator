@@ -1,8 +1,15 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { createOpenCodeLaunchAttemptProductionBridge } from './OpenCodeLaunchAttemptProductionComposition.js'
-import type { OpenCodeLaunchAttemptBridgePort } from './OpenCodeLaunchAttemptBridge.js'
+import {
+  computeOpenCodeLaunchCommandInputDigest,
+  type OpenCodeLaunchAttemptBridgePort,
+} from './OpenCodeLaunchAttemptBridge.js'
 import type { OpenCodeLaunchAttemptResult } from './OpenCodeLaunchAttempt.js'
+import { OpenCodeLaunchMutationLedger } from './OpenCodeLaunchMutationLedger.js'
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
 const identity = (character: string) => `sha256:${character.repeat(64)}` as const
@@ -16,6 +23,9 @@ const result: OpenCodeLaunchAttemptResult = {
   absoluteDeadlineAtMs: 10_000,
   workDeadlineAtMs: 9_000,
 }
+let projectPath = ''
+beforeAll(async () => { projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-composition-')) })
+afterAll(async () => { await rm(projectPath, { recursive: true, force: true }) })
 
 function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
   return {
@@ -34,7 +44,7 @@ function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
       },
     },
     members: [{ name: 'alice', memberIdentity: identity('d') }],
-    runId: 'run', laneId: 'primary', teamId: 'team', projectPath: '/fake/project',
+    runId: 'run', laneId: 'primary', teamId: 'team', projectPath,
     selectedModel: 'openrouter/model', toolApprovalMode: 'auto', continuation: false,
     requestedBudgetMs: 10_000,
   }
@@ -91,7 +101,7 @@ describe('OpenCode production launch composition', () => {
   })
 
   test('a hanging authorization is bounded by the one outer absolute deadline', async () => {
-    const value = { ...command(), requestedBudgetMs: 40, outerRemainingBudgetMs: 40 }
+    const value = { ...command(), requestedBudgetMs: 250, outerRemainingBudgetMs: 250 }
     let authorizationSignal: AbortSignal | undefined
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
       authorize: async (_command, controls) => {
@@ -105,5 +115,82 @@ describe('OpenCode production launch composition', () => {
     await expect(bridge.execute(value)).rejects.toThrow('absolute deadline')
     expect(authorizationSignal?.aborted).toBe(true)
     expect(performance.now() - started).toBeLessThan(500)
+  })
+
+  test('canonicalizes a real project and its symlink alias before authorization and digesting', async () => {
+    if (process.platform === 'win32') return
+    const project = path.join(projectPath, 'canonical-project')
+    const alias = path.join(projectPath, 'canonical-alias')
+    await mkdir(project); await symlink(project, alias)
+    const observed: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0][] = []
+    const output = { snapshot, data: { launchAttempt: { status: 'succeeded' } } }
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async value => { observed.push(value); return value },
+      inspect: async () => output,
+      executeAfterPreflight: async () => { throw new Error('effects must not run') },
+    })
+
+    await bridge.execute({ ...command(), projectPath: project })
+    await bridge.execute({ ...command(), projectPath: alias })
+
+    expect(observed).toHaveLength(2)
+    expect(observed[0]!.projectPath).toBe(project)
+    expect(observed[1]!.projectPath).toBe(project)
+    expect(observed[0]!.projectIdentity).toBe(observed[1]!.projectIdentity)
+    expect(computeOpenCodeLaunchCommandInputDigest(observed[0]!))
+      .toBe(computeOpenCodeLaunchCommandInputDigest(observed[1]!))
+    const targets = observed.map(value => OpenCodeLaunchMutationLedger.targetDigest({
+      teamId: value.teamId,
+      laneId: value.laneId,
+      projectIdentity: value.projectIdentity!,
+      memberIdentity: value.members[0]!.memberIdentity,
+    }))
+    expect(targets[0]).toBe(targets[1])
+    expect(OpenCodeLaunchMutationLedger.idempotencyIdentity(targets[0]!))
+      .toBe(OpenCodeLaunchMutationLedger.idempotencyIdentity(targets[1]!))
+  })
+
+  test('an 80ms durable inspection cannot reset or extend the absolute envelope', async () => {
+    let now = 1_000
+    let inspectedDeadline = 0
+    let executed: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] | undefined
+    const output = { snapshot, data: { launchAttempt: result } }
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async (value, controls) => {
+        expect(controls.deadlineAtMs).toBe(1_100)
+        return value
+      },
+      inspect: async value => {
+        inspectedDeadline = value.deadlineAtMs!
+        now += 80
+        return null
+      },
+      executeAfterPreflight: async value => {
+        executed = value
+        return { output, result }
+      },
+    }, { monotonicNow: () => now })
+    const value = { ...command(), requestedBudgetMs: 100, outerRemainingBudgetMs: 100,
+      deadlineAtMs: 1_100 }
+
+    await expect(bridge.execute(value)).resolves.toBe(output)
+    expect(inspectedDeadline).toBe(1_100)
+    expect(executed?.deadlineAtMs).toBe(1_100)
+    expect(executed?.outerRemainingBudgetMs).toBe(20)
+    expect(executed!.deadlineAtMs! - now).toBe(20)
+  })
+
+  test('pre-cancellation bounds canonicalization and reaches no authorization or ledger work', async () => {
+    const reason = new Error('caller cancelled')
+    const controller = new AbortController(); controller.abort(reason)
+    let canonicalCalls = 0
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async () => { throw new Error('authorization must not run') },
+      inspect: async () => { throw new Error('ledger must not run') },
+      executeAfterPreflight: async () => { throw new Error('effects must not run') },
+    }, { canonicalizeProject: async () => { canonicalCalls += 1; return new Promise<never>(() => {}) } })
+
+    await expect(bridge.execute({ ...command(), signal: controller.signal })).rejects.toBe(reason)
+    expect(canonicalCalls).toBe(1)
   })
 })

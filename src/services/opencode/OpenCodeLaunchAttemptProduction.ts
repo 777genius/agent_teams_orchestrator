@@ -39,7 +39,7 @@ import type {
   OpenCodeScopedPreparedProfile,
   OpenCodeSessionRecord,
 } from './types.js'
-import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import { OpenCodeLaunchMutationLedger } from './OpenCodeLaunchMutationLedger.js'
 import {
   hydrateOpenCodeRecoveredSessionLease,
@@ -135,10 +135,8 @@ function bootstrapText(command: Command, memberName: string, sessionId: string, 
 
 class DeadlineError extends Error {}
 
-let lastLaunchClockMs = Date.now()
 function launchMonotonicNow(): number {
-  lastLaunchClockMs = Math.max(lastLaunchClockMs, Date.now())
-  return lastLaunchClockMs
+  return openCodeMonotonicNow()
 }
 
 async function bounded<T>(operation: Promise<T>, deadlineAtMs: number, signal: AbortSignal): Promise<T> {
@@ -178,7 +176,7 @@ class OpenCodeProductionLaunchRuntime {
     return authorized
   }
 
-  inspect(command: Command): Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
+  async inspect(command: Command): Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
     return this.run(command, false, true)
   }
 
@@ -195,6 +193,8 @@ class OpenCodeProductionLaunchRuntime {
 
   private async run(command: Command, skipPreflight: boolean, inspectionOnly: boolean):
   Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
+    const projectIdentity = command.projectIdentity
+    if (!projectIdentity) throw new Error('OpenCode canonical launch project identity is absent')
     const profiles = new Map<OpenCodeOpaqueIdentity, OpenCodeScopedPreparedProfile>()
     const hosts = new Map<OpenCodeOpaqueIdentity, OpenCodeHostHandle>()
     const records = new Map<OpenCodeOpaqueIdentity, OpenCodeSessionRecord>()
@@ -213,7 +213,7 @@ class OpenCodeProductionLaunchRuntime {
     const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
       OpenCodeLaunchMutationLedger.targetDigest({
         teamId: command.teamId, laneId: command.laneId,
-        projectIdentity: normalizeOpenCodeProjectIdentity(command.projectPath),
+        projectIdentity,
         memberIdentity: member.memberIdentity,
       })]))
     const linkageFor = (memberIdentity: OpenCodeOpaqueIdentity, record: OpenCodeSessionRecord):
@@ -236,8 +236,8 @@ class OpenCodeProductionLaunchRuntime {
     // writes scoped files), host acquisition, proof, or member effects.  A
     // claimed/unknown remote effect is reconciliation-only; an exact completed
     // command is projected from the authoritative session store.
-    const preflightDeadlineAtMs = launchMonotonicNow()
-      + (command.outerRemainingBudgetMs ?? command.requestedBudgetMs)
+    const preflightDeadlineAtMs = command.deadlineAtMs ?? (launchMonotonicNow()
+      + (command.outerRemainingBudgetMs ?? command.requestedBudgetMs))
     const preflightSignal = command.signal ?? new AbortController().signal
     await attemptStore.inspect({
       attemptId: command.request.launchAttempt.attemptId,
@@ -379,7 +379,7 @@ class OpenCodeProductionLaunchRuntime {
         ])
         const profile: OpenCodeLaunchProfile = {
           purpose: 'launch_attempt', providerId: input.providerId,
-          projectIdentity: opaque({ project: normalizeOpenCodeProjectIdentity(command.projectPath) }),
+          projectIdentity: opaque({ project: projectIdentity }),
           profileIdentity: opaque({ profileRoot: observedProfileIdentity }),
           pluginPolicyIdentity: opaque({ pluginTree: observedPluginFingerprint }),
           cacheIdentity: opaque({ cacheRoot: observedCacheIdentity }),
@@ -839,7 +839,10 @@ class OpenCodeProductionLaunchRuntime {
       attemptStore, ports)
     const result = await core.run({ request: command.request,
       members: command.members.map(member => member.memberIdentity),
-      requestedBudgetMs: command.outerRemainingBudgetMs ?? command.requestedBudgetMs,
+      requestedBudgetMs: command.deadlineAtMs === undefined
+        ? command.outerRemainingBudgetMs ?? command.requestedBudgetMs
+        : command.requestedBudgetMs,
+      deadlineAtMs: command.deadlineAtMs,
       continuation: command.continuation,
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),

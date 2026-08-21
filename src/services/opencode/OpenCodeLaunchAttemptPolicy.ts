@@ -35,6 +35,10 @@ export type OpenCodeMemberMaterializationBudget = {
 type OpenCodeLaunchAttemptPolicyOptions = {
   requestedBudgetMs?: number | null
   monotonicNow?: () => number
+  /** Original start when reconstructing a durable attempt. */
+  startedAtMs?: number
+  /** Existing outer monotonic envelope; never extended by this policy. */
+  deadlineAtMs?: number
 }
 
 export class OpenCodeLaunchAttemptBudgetError extends Error {
@@ -73,17 +77,28 @@ export class OpenCodeLaunchAttemptPolicy {
     }
     this.totalBudgetMs = totalBudgetMs
 
-    this.monotonicNow = options.monotonicNow ?? (() => performance.now())
-    this.startedAtMs = this.readNow()
+    this.monotonicNow = options.monotonicNow ?? (() => Math.ceil(performance.now()))
+    const now = this.readNow()
+    if (options.deadlineAtMs !== undefined) assertSafeTimestamp(options.deadlineAtMs, 'outer deadline')
+    if (options.startedAtMs !== undefined) assertSafeTimestamp(options.startedAtMs, 'attempt start')
+    this.startedAtMs = options.startedAtMs ?? (options.deadlineAtMs === undefined
+      ? now : Math.max(0, options.deadlineAtMs - requested))
+    const naturalDeadlineAtMs = checkedSafeAdd(
+      this.startedAtMs,
+      this.totalBudgetMs,
+      'absolute deadline',
+    )
+    this.absoluteDeadlineAtMs = options.deadlineAtMs === undefined
+      ? naturalDeadlineAtMs : Math.min(naturalDeadlineAtMs, options.deadlineAtMs)
+    if (this.absoluteDeadlineAtMs < this.startedAtMs) {
+      throw new OpenCodeLaunchAttemptBudgetError('outer deadline must not precede the attempt start')
+    }
+    const availableEnvelopeMs = this.absoluteDeadlineAtMs - this.startedAtMs
     this.cleanupReserveMs = Math.min(
       15_000,
       Math.max(1_000, Math.floor(this.totalBudgetMs * 0.10)),
       Math.floor(this.totalBudgetMs / 3),
-    )
-    this.absoluteDeadlineAtMs = checkedSafeAdd(
-      this.startedAtMs,
-      this.totalBudgetMs,
-      'absolute deadline',
+      Math.floor(availableEnvelopeMs / 3),
     )
     this.workDeadlineAtMs = checkedSafeSubtract(
       this.absoluteDeadlineAtMs,
