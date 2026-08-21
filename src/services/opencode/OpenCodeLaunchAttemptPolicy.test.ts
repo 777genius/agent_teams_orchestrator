@@ -41,6 +41,31 @@ describe('OpenCodeLaunchAttemptPolicy', () => {
     expect(policy.remainingWorkMs()).toBe(197_345)
   })
 
+  test('inherits one outer absolute deadline without recreating it after inspection', () => {
+    let now = 10_080
+    const policy = new OpenCodeLaunchAttemptPolicy({
+      requestedBudgetMs: 10_000,
+      startedAtMs: 10_000,
+      deadlineAtMs: 20_000,
+      monotonicNow: () => now,
+    })
+
+    expect(policy.absoluteDeadlineAtMs).toBe(20_000)
+    expect(policy.workDeadlineAtMs).toBe(19_000)
+    expect(policy.remainingAttemptMs()).toBe(9_920)
+    now = 20_000
+    expect(policy.remainingAttemptMs()).toBe(0)
+    expect(policy.remainingCleanupMs()).toBe(0)
+
+    const capped = new OpenCodeLaunchAttemptPolicy({
+      requestedBudgetMs: 900_000,
+      deadlineAtMs: 910_000,
+      monotonicNow: () => 10_080,
+    })
+    expect(capped.startedAtMs).toBe(10_000)
+    expect(capped.absoluteDeadlineAtMs).toBe(310_000)
+  })
+
   test('caps valid integer budgets and rejects invalid budgets before side effects', () => {
     expect(new OpenCodeLaunchAttemptPolicy({ monotonicNow: () => 0 }).totalBudgetMs).toBe(300_000)
     let monotonicReads = 0

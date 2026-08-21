@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -18,9 +18,60 @@ describe('canonical OpenCode project identity', () => {
       .toBe(await canonicalizeOpenCodeProjectIdentity(alias))
   })
 
-  test('missing paths have an explicit normalized spelling policy and Windows folds case', async () => {
-    const missing = path.join(os.tmpdir(), 'Missing-OpenCode-Project')
-    expect(await canonicalizeOpenCodeProjectIdentity(missing, { platform: 'win32' }))
-      .toBe(path.resolve(missing).toLowerCase())
+  test('different real projects remain distinct and Windows folds canonical case', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-distinct-')); roots.push(root)
+    const first = path.join(root, 'First'); const second = path.join(root, 'Second')
+    await mkdir(first); await mkdir(second)
+    expect(await canonicalizeOpenCodeProjectIdentity(first))
+      .not.toBe(await canonicalizeOpenCodeProjectIdentity(second))
+    expect(await canonicalizeOpenCodeProjectIdentity(first, { platform: 'win32' }))
+      .toBe(path.resolve(first).toLowerCase())
+  })
+
+  test('Windows case-only realpath observations retain one stable identity', async () => {
+    let reads = 0
+    const stat = { dev: 7, ino: 11, isDirectory: () => true }
+    await expect(canonicalizeOpenCodeProjectIdentity('C:\\Project', {
+      platform: 'win32',
+      filesystem: {
+        realpath: async () => reads++ === 0 ? 'C:\\Project' : 'c:\\project',
+        lstat: async () => stat,
+      },
+    })).resolves.toBe('c:\\project')
+  })
+
+  test('missing, deleted, and broken symlink inputs fail conservatively', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-missing-')); roots.push(root)
+    const deleted = path.join(root, 'deleted'); const alias = path.join(root, 'alias')
+    await mkdir(deleted); await rm(deleted, { recursive: true }); await symlink(deleted, alias)
+    await expect(canonicalizeOpenCodeProjectIdentity(deleted)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(canonicalizeOpenCodeProjectIdentity(alias)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('a symlink retarget during canonicalization fails closed', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-race-')); roots.push(root)
+    const first = path.join(root, 'first'); const second = path.join(root, 'second')
+    const alias = path.join(root, 'alias')
+    await mkdir(first); await mkdir(second); await symlink(first, alias)
+    let observations = 0
+    await expect(canonicalizeOpenCodeProjectIdentity(alias, { filesystem: {
+      realpath,
+      lstat: async value => {
+        const observed = await lstat(value)
+        if (++observations === 1) {
+          await rm(alias); await symlink(second, alias)
+        }
+        return observed
+      },
+    } })).rejects.toThrow('changed during canonicalization')
+  })
+
+  test('pre-cancelled canonicalization stays bounded and preserves the abort reason', async () => {
+    const controller = new AbortController()
+    const reason = new Error('outer deadline')
+    controller.abort(reason)
+    await expect(canonicalizeOpenCodeProjectIdentity('/never-inspected', { signal: controller.signal }))
+      .rejects.toBe(reason)
   })
 })

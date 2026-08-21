@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
 import {
@@ -12,13 +15,16 @@ import type { OpenCodeProvisioningSnapshot } from './types.js'
 import { createOpenCodeLaunchAttemptProductionBridge } from './OpenCodeLaunchAttemptProductionComposition.js'
 
 const identity = (value: string) => `sha256:${value.repeat(64).slice(0, 64)}` as const
+let sandboxProject = ''
+beforeAll(async () => { sandboxProject = await mkdtemp(path.join(os.tmpdir(), 'opencode-bridge-project-')) })
+afterAll(async () => { await rm(sandboxProject, { recursive: true, force: true }) })
 
 function envelope(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 1,
     requestId: 'request-s3',
     command: 'opencode.launchTeam',
-    cwd: '/fake/project',
+    cwd: sandboxProject,
     startedAt: '2026-08-19T00:00:00.000Z',
     timeoutMs: 42_000,
     body: {
@@ -140,13 +146,15 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
     expect(result.ok).toBe(true)
     expect(input).toMatchObject({
       runId: 'run-s3', laneId: 'primary', teamId: 'team-s3',
-      projectPath: '/fake/project', selectedModel: 'openrouter/model-s3',
+      projectPath: sandboxProject, selectedModel: 'openrouter/model-s3',
       continuation: false, requestedBudgetMs: 42_000,
       members: [
         { name: 'alice', memberIdentity: identity('d'), prompt: 'fake prompt' },
         { name: 'bob', memberIdentity: identity('e') },
       ],
     })
+    expect(input!.deadlineAtMs).toBeGreaterThan(0)
+    expect(input!.outerRemainingBudgetMs).toBeLessThanOrEqual(42_000)
     expect(result.data).toEqual({ launchAttempt: { status: 'succeeded', generation: 1 } })
   })
 

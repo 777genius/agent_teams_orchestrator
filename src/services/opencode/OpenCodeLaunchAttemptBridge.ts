@@ -39,6 +39,8 @@ export type OpenCodeLaunchAttemptBridgePort = {
     laneId: string
     teamId: string
     projectPath: string
+    /** Frozen canonical real-path identity. Production composition authors this once. */
+    projectIdentity?: string
     selectedModel: string
     toolApprovalMode: 'auto' | 'manual'
     continuation: boolean
@@ -46,6 +48,8 @@ export type OpenCodeLaunchAttemptBridgePort = {
     signal?: AbortSignal
     /** Remaining time on the already-running outer command deadline. */
     outerRemainingBudgetMs?: number
+    /** Absolute monotonic caller deadline; preferred over legacy remaining snapshots. */
+    deadlineAtMs?: number
     /** S1-authored immutable plan identity, added only by production composition. */
     effectiveProfilePlanDigest?: string
   }): Promise<{
@@ -179,7 +183,10 @@ export class OpenCodeLaunchAttemptBridge implements OpenCodeLaunchAttemptBridgeP
       signal: input.signal,
       commandInputDigest: inputDigest,
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(input),
-      requestedBudgetMs: input.outerRemainingBudgetMs ?? input.requestedBudgetMs,
+      requestedBudgetMs: input.deadlineAtMs === undefined
+        ? input.outerRemainingBudgetMs ?? input.requestedBudgetMs
+        : input.requestedBudgetMs,
+      deadlineAtMs: input.deadlineAtMs,
     })
     return this.dependencies.projection.fromDurableResult({ result, command: input })
   }
@@ -204,7 +211,7 @@ export function computeOpenCodeLaunchCommandInputDigest(
     runId: input.runId,
     teamId: input.teamId,
     laneId: input.laneId,
-    projectIdentity: normalizeOpenCodeProjectIdentity(input.projectPath),
+    projectIdentity: input.projectIdentity ?? normalizeOpenCodeProjectIdentity(input.projectPath),
     selectedModel: input.selectedModel,
     toolApprovalMode: input.toolApprovalMode,
     continuation: input.continuation,
@@ -235,7 +242,7 @@ export function computeOpenCodeLaunchCommandImmutableDigest(
     runId: input.runId,
     teamId: input.teamId,
     laneId: input.laneId,
-    projectIdentity: normalizeOpenCodeProjectIdentity(input.projectPath),
+    projectIdentity: input.projectIdentity ?? normalizeOpenCodeProjectIdentity(input.projectPath),
     selectedModel: input.selectedModel,
     toolApprovalMode: input.toolApprovalMode,
     requestedBudgetMs: input.requestedBudgetMs,

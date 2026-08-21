@@ -2841,6 +2841,7 @@ async function runLaunch(
       continuation,
       requestedBudgetMs: envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000,
       outerRemainingBudgetMs: runtimeDeadline.remainingMs(),
+      deadlineAtMs: runtimeDeadline.deadlineAtMs,
       signal: runtimeDeadline.signal,
     })
     return result
