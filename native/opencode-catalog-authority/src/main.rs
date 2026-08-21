@@ -558,7 +558,10 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         .position(|v| *v == 0)
         .unwrap_or(fs_name.len());
     let fs = String::from_utf16_lossy(&fs_name[..end]);
-    if fs != "NTFS" && fs != "ReFS" {
+    // GetFileInformationByHandle supplies NTFS's stable 64-bit file reference
+    // number. ReFS identities are 128-bit, so accepting ReFS while retaining
+    // only the legacy fields could make distinct objects compare equal.
+    if fs != "NTFS" {
         return Err("WINDOWS_VOLUME_UNVERIFIED".into());
     }
     let mut root_path = std::path::PathBuf::from(prefix);
@@ -589,16 +592,14 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         if matches!(component, Component::Prefix(_) | Component::RootDir) {
             continue;
         }
-        if !cursor.exists() {
-            std::fs::create_dir(&cursor).map_err(|_| "ROOT_MKDIR")?;
-            fault("root-before-directory-sync");
-            let parent_path = cursor.parent().ok_or("ROOT_HANDLE")?;
-            sync_windows_directory_path(parent_path, "ROOT_SYNC")?;
-        }
-        let metadata = std::fs::symlink_metadata(&cursor).map_err(|_| "ROOT_METADATA")?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err("ROOT_REPARSE".into());
-        }
+        // Creation is not a trust check. Whether this component was already
+        // present or was just created, only the opened no-follow handle below
+        // establishes its type and identity.
+        let created = match std::fs::create_dir(&cursor) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(_) => return Err("ROOT_MKDIR".into()),
+        };
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -617,6 +618,14 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
             index: opened_identity.1,
             handle: file,
         });
+        // Retain the non-delete-sharing handle before the durability sync. It
+        // prevents a checked component from being swapped and restored while
+        // child components are captured or the final root is validated.
+        if created {
+            fault("root-before-directory-sync");
+            let parent_path = cursor.parent().ok_or("ROOT_HANDLE")?;
+            sync_windows_directory_path(parent_path, "ROOT_SYNC")?;
+        }
     }
     std::env::set_current_dir(&target).map_err(|_| "ROOT_CHDIR")?;
     WINDOWS_ROOT_HANDLES.set(held).map_err(|_| "ROOT_HANDLES")?;
