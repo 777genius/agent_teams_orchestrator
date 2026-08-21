@@ -81,9 +81,9 @@ Schema v4 has exactly five operations: `approval_ingress_claim`, `approval_ingre
 `approval_decision_reconcile`. Its canonical capability digest is
 `sha256:40a6c4a131b4e64c04b87337fbce667c91f274fb85b3879c6cdcac49dbbbd639`.
 The cross-repository raw-byte/HMAC fixture is
-`docs/hosted-approval-wire-v4-golden.json` and is pinned to product head
-`17e51cb5aa442465627ad011183ee3c8855b9c87`. Both repositories consume the exact
-fixture bytes with SHA-256
+`docs/hosted-approval-wire-v4-golden.json`. Its immutable envelope records the original
+product contract head `44ada5b51032a3aafe81ce8e30b50cdb4a06c909`; current product integration head
+`17e51cb5aa442465627ad011183ee3c8855b9c87` consumes those exact fixture bytes with SHA-256
 `2594e9816f6116a406fe1b367fbd9c4231a9698c1cb7a395c2967ef2f32f1572`.
 
 The owner response schema must include `operator_required` with the request's stable
