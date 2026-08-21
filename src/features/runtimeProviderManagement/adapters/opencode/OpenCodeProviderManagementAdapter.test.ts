@@ -362,13 +362,21 @@ describe('OpenCodeProviderManagementAdapter', () => {
         runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
       })
     }
+
+    probeResult = {
+      ...executionProbeResult('local/qwen', 'not_authenticated', 'Invalid API key.'),
+      observedProviderId: 'fallback-provider',
+    }
+    await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
     expect(updates).toHaveLength(1)
   })
 
   test('does not publish success when probe evidence names a different model or provider', async () => {
     const updates: unknown[] = []
-    let observedProviderId = 'local'
-    let observedModelId = 'other'
+    let observedProviderId: string | null = 'local'
+    let observedModelId: string | null = 'other'
     const adapter = activeModelActionAdapter({
       probe: () => ({
         ...executionProbeResult('local/qwen'),
@@ -386,11 +394,20 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const wrongProvider = await adapter.testModel({
       runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
     })
+    observedProviderId = null
+    observedModelId = null
+    const missingIdentity = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
 
-    expect([wrongModel.ok, wrongProvider.ok]).toEqual([true, true])
-    if (wrongModel.ok && wrongProvider.ok) {
-      expect([wrongModel.value.availability, wrongProvider.value.availability]).toEqual([
-        'unknown', 'unknown',
+    expect([wrongModel.ok, wrongProvider.ok, missingIdentity.ok]).toEqual([true, true, true])
+    if (wrongModel.ok && wrongProvider.ok && missingIdentity.ok) {
+      expect([
+        wrongModel.value.availability,
+        wrongProvider.value.availability,
+        missingIdentity.value.availability,
+      ]).toEqual([
+        'unknown', 'unknown', 'unknown',
       ])
     }
     expect(updates).toEqual([])
@@ -414,13 +431,22 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const missingDefault = await adapter.setDefaultModel({
       runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
     })
+    probeResult = {
+      ...executionProbeResult('local/qwen'),
+      observedProviderId: 'fallback-provider',
+    }
+    const providerFallbackDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
     probeResult = { ...executionProbeResult('local/qwen'), observedModelId: 'fallback' }
     const fallbackLimits = await adapter.configureModelLimits({
       runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
       contextTokens: 32_000, outputTokens: 8_000,
     })
 
-    expect([missingDefault.ok, fallbackLimits.ok]).toEqual([false, false])
+    expect([missingDefault.ok, providerFallbackDefault.ok, fallbackLimits.ok]).toEqual([
+      false, false, false,
+    ])
     expect({ defaultWrites, limitWrites }).toEqual({ defaultWrites: 0, limitWrites: 0 })
   })
 
@@ -7078,6 +7104,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probeModel: async input => ({
           providerId: 'opencode',
           modelId: input.selectedModel,
+          observedProviderId: 'openrouter',
+          observedModelId: 'openai/gpt-oss-20b:free',
           probePrompt: 'Output only the single word PONG.',
           expectedOutput: 'PONG',
           outcome: 'available',
@@ -8030,6 +8058,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
           return {
             providerId: 'opencode',
             modelId: input.selectedModel,
+            observedProviderId: 'opencode',
+            observedModelId: 'nemotron-3-super-free',
             probePrompt: 'Output only the single word PONG.',
             expectedOutput: 'PONG',
             outcome: 'available',

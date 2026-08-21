@@ -149,7 +149,7 @@ describe('OpenCodeExecutionProbe', () => {
     })
   })
 
-  test('classifies Cursor resource exhaustion as model unavailable', () => {
+  test('keeps Cursor resource exhaustion uncertain', () => {
     for (const message of [
       'grpc_code=resource_exhausted error_code=upgrade',
       'grpc_code=resource-exhausted error_code=upgrade',
@@ -1938,7 +1938,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(ensureHostCalls).toBe(0)
   })
 
-  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+  test('keeps native Cursor success uncertain without exact execution identity metadata', async () => {
     let createSessionCalls = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1987,9 +1987,9 @@ describe('OpenCodeExecutionProbe', () => {
       outcome: 'unknown',
       failureCode: 'execution_identity_unverified',
     })
-    expect(result.verifiedAt).toBeTruthy()
+    expect(result.verifiedAt).toBeUndefined()
     expect(result.diagnostics.join('\n')).toContain(
-      'native execution probe confirmed model availability',
+      'did not report exact provider/model metadata',
     )
     expect(createSessionCalls).toBe(0)
   })

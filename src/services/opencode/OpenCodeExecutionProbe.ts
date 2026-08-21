@@ -319,7 +319,6 @@ export function classifyProbeFailure(params: {
     || lower.includes('not logged in')
     || lower.includes('please run \'agent login\'')
     || lower.includes('please run `kiro-cli login`')
-    || lower.includes('cursor_api_key')
     || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
     || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
   ) {
@@ -966,7 +965,7 @@ export class OpenCodeExecutionProbe {
             const classified = classifyProbeFailure({
               message: failureMessageFromUnknown(error),
             })
-            if (classified.outcome !== 'unknown') throw error
+            if (classified.outcome !== 'unknown' || classified.failureCode) throw error
             return null
           })
         : (await input.client.getSessionMessages(input.sessionId))[0] ?? null
@@ -1566,7 +1565,7 @@ export class OpenCodeExecutionProbe {
             const classified = classifyProbeFailure({
               message: failureMessageFromUnknown(error),
             })
-            if (classified.outcome === 'unknown') throw error
+            if (classified.outcome === 'unknown' && !classified.failureCode) throw error
             return {
               started: false as const,
               classified,
@@ -1578,7 +1577,10 @@ export class OpenCodeExecutionProbe {
 
       if (!submitted.started) {
         const hasTerminalClassification = submitted.classified != null
-          && submitted.classified.outcome !== 'unknown'
+          && (
+            submitted.classified.outcome !== 'unknown'
+            || submitted.classified.failureCode != null
+          )
         const reason = submitted.classified?.reason
           ?? 'OpenCode accepted prompt_async but did not create a user message or enter a running state'
         diagnostics.add(reason)
@@ -1674,7 +1676,7 @@ export class OpenCodeExecutionProbe {
             return
           }
           const classified = classifyProbeFailure({ message: result.message ?? '' })
-          if (classified.outcome !== 'unknown') {
+          if (classified.outcome !== 'unknown' || classified.failureCode) {
             nativeProbeConclusive = true
             nativeTerminalFailure = {
               classified,
@@ -2151,6 +2153,7 @@ export class OpenCodeExecutionProbe {
             if (
               summary.durableState === 'idle'
               && classified.outcome === 'unknown'
+              && !classified.failureCode
               && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
             ) {
               sessionRequiresCleanup = false
