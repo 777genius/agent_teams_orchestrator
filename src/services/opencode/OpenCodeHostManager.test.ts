@@ -16,6 +16,7 @@ import {
   bindVerifiedScopedBinaryHandle,
   deriveOpenCodeScopedHostKey,
   buildOpenCodeHostSpawnOptions,
+  buildOpenCodeVerifiedScopedHostCommand,
   resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
   stageScopedHostBinary,
@@ -253,6 +254,7 @@ function scopedProfile(
     pluginKey: policy.identity.pluginKey!,
     cacheKey: policy.identity.cacheKey!,
     profileScopeIdentity,
+    catalogAttemptPlan: null,
     scopedPlanDigest,
     plannedHostKey: deriveOpenCodeScopedHostKeyFromPlanDigest(scopedPlanDigest),
     selectedAuthBaselineFingerprint: authFingerprint,
@@ -1995,6 +1997,29 @@ describe('OpenCodeHostManager', () => {
     expect(shouldUnrefOpenCodeHostProcess('process', 'darwin')).toBe(true)
   })
 
+  test('builds a same-object native launcher command for both supported Windows architectures', async () => {
+    const profile = scopedProfile('execution-probe')
+    const verified = {
+      profile,
+      fileHandle: { fd: 17 },
+      objectIdentity: { dev: '7', ino: '11', size: '13' },
+      close: async () => {},
+    } as never
+    for (const architecture of ['x64', 'arm64']) {
+      expect(buildOpenCodeVerifiedScopedHostCommand(
+        profile, verified, 'win32', architecture, 'C:\\runtime\\opencode-catalog-launcher.exe',
+      )).toEqual({
+        binaryPath: 'C:\\runtime\\opencode-catalog-launcher.exe',
+        args: [profile.binaryPath, '--verified-opencode-host-v1', '7', '11', '13',
+          'serve', '--hostname', '127.0.0.1', '--port'],
+        inheritedVerifiedFd: false,
+      })
+    }
+    expect(() => buildOpenCodeVerifiedScopedHostCommand(
+      profile, verified, 'win32', 'ia32', 'C:\\runtime\\opencode-catalog-launcher.exe',
+    )).toThrow('unsupported')
+  })
+
   test('does not persist process-scoped hosts into the cross-process registry', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
@@ -2371,6 +2396,62 @@ describe('OpenCodeHostManager', () => {
     await manager.releaseHost('host-key')
     expect(manager.getHost('host-key')).toBeNull()
     expect(spawned.killedSignals).toEqual(['SIGTERM'])
+  })
+
+  test('never reacquires a zero-ref host once disposal reaches its first await', async () => {
+    const children = [createMockChildProcess(43131), createMockChildProcess(43132)]
+    let nextPort = 43130
+    let spawnCount = 0
+    let disposeCount = 0
+    let disposalEntered!: () => void
+    const entered = new Promise<void>(resolve => { disposalEntered = resolve })
+    let allowFirstDisposal!: () => void
+    const firstDisposalGate = new Promise<void>(resolve => { allowFirstDisposal = resolve })
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => ++nextPort,
+      spawnHostProcess: () => children[spawnCount++]!.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/global/dispose')) {
+          disposeCount += 1
+          if (disposeCount === 1) {
+            disposalEntered()
+            await firstDisposalGate
+          }
+          return { status: 200, data: { ok: true } }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      isProcessAlive: () => false,
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const old = await manager.ensureHost({ hostKey: 'raced-host', hostLifetime: 'process' })
+    const releasing = manager.releaseHost(old.hostKey)
+    await entered
+    expect(manager.getHost(old.hostKey)).toBeNull()
+
+    const replacement = await manager.ensureHost({
+      hostKey: old.hostKey,
+      hostLifetime: 'process',
+    })
+    expect(replacement.pid).not.toBe(old.pid)
+    expect(replacement.state).toBe('healthy')
+    allowFirstDisposal()
+    await releasing
+    expect(manager.getHost(old.hostKey)?.pid).toBe(replacement.pid)
+
+    await Promise.all([
+      manager.releaseHost(replacement.hostKey),
+      manager.releaseHost(replacement.hostKey),
+    ])
+    expect(disposeCount).toBe(2)
+    expect(spawnCount).toBe(2)
+    expect(manager.getHost(old.hostKey)).toBeNull()
   })
 
   test('force-kills an owned host that survives release SIGTERM', async () => {

@@ -46,6 +46,7 @@ import {
 import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPolicy.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { prepareOpenCodeProviderCatalogProductionProfile } from './OpenCodeProviderCatalogProduction.js'
+import { OpenCodeProviderCatalogService } from './OpenCodeProviderCatalogService.js'
 import {
   authorizeOpenCodeLaunchScopedProfile,
   prepareAuthorizedOpenCodeLaunchScopedProfile,
@@ -429,6 +430,11 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       expect(prepared.providerId).toBe('deepinfra')
       expect(prepared.purpose).toBe('provider-catalog')
       expect(prepared.scopedPlanDigest).toMatch(/^[a-f0-9]{64}$/)
+      expect(prepared.catalogAttemptPlan).toMatchObject({
+        runtimeInstanceId: 'catalog-g1-attempt-a',
+        profileRootKey: prepared.profileRootKey,
+        configDirectory: path.join(prepared.profileRootPath, 'catalog-project-config'),
+      })
 
       const launchAuthorization = await authorizeOpenCodeLaunchScopedProfile(fixture.manager, {
         purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
@@ -451,6 +457,84 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         .not.toBe(fixture.manager.planScopedProfile(first).digest)
       await expect(fixture.manager.prepareScopedProfile(first, fixture.manager.planScopedProfile(first)))
         .rejects.toThrow('evidence drifted')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production catalog cache miss passes real preparation and host validation before fake I/O', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-host-e2e-'))
+    const fixture = await createScopedTestManager(tempDir)
+    let fakeIo = 0
+    let prepared: Awaited<ReturnType<typeof prepareOpenCodeProviderCatalogProductionProfile>> | null = null
+    const child = new EventEmitter() as ChildProcess
+    Object.assign(child, {
+      pid: 54143,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      unref() {},
+      kill() { return true },
+    })
+    const hostManager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44143,
+      spawnHostProcess: () => child,
+      fetchJson: async (url: string) => {
+        fakeIo += 1
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.2.3' } }
+        }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`unexpected fake host request ${url}`)
+      },
+      isProcessAlive: () => false,
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    let generation = 0
+    const service = new OpenCodeProviderCatalogService({
+      profileManager: fixture.manager,
+      canonicalizeProjectPath: async value => path.resolve(value),
+      allocateAttempt: () => ({ requestGeneration: ++generation,
+        attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` }),
+      readPersisted: async () => null,
+      writePersisted: async () => {},
+      ensureHost: async input => {
+        prepared = input.preparedProfile
+        const handle = await hostManager.ensureScopedHost(input)
+        return { hostKey: handle.hostKey, baseUrl: handle.baseUrl }
+      },
+      releaseHost: key => hostManager.releaseHost(key),
+      fetchProviderCatalog: async () => {
+        fakeIo += 1
+        return { all: [{ id: 'deepinfra', models: { 'model-a': { name: 'model-a' } } }],
+          connected: ['deepinfra'] }
+      },
+    })
+    try {
+      const loaded = await service.loadCatalog({ providerId: 'deepinfra', projectPath: tempDir })
+      expect(loaded.catalogProvenance).toBe('fresh-live')
+      expect(fakeIo).toBeGreaterThanOrEqual(2)
+      expect(prepared).not.toBeNull()
+      const profile = prepared!
+      expect(profile.profileRootKey).not.toBe(profile.profileScopeIdentity)
+      expect(profile.env.OPENCODE_CONFIG_DIR).toBe(path.join(
+        profile.profileRootPath, 'catalog-project-config',
+      ))
+      expect(Object.keys(profile.managedConfig.provider as object)
+        .every(providerId => providerId === 'deepinfra')).toBe(true)
+
+      for (const tampered of [
+        { ...profile, profileRootKey: `${profile.profileRootKey}-replaced` },
+        { ...profile, env: { ...profile.env, OPENCODE_CONFIG_DIR: profile.executionProjectPath } },
+      ]) {
+        const before = fakeIo
+        await expect(hostManager.ensureScopedHost({
+          preparedProfile: tampered,
+          expectedHostKey: profile.plannedHostKey,
+        })).rejects.toThrow('valid policy-bearing prepared profile')
+        expect(fakeIo).toBe(before)
+      }
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })

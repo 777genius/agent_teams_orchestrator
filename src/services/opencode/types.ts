@@ -218,6 +218,15 @@ export type OpenCodeScopedPreparedProfile = OpenCodePreparedProfile & {
   pluginNodeModulesPath: string
   preparationLockPath: string
   profileLayoutGeneration: string
+  /** Attempt-local catalog filesystem identity bound into scopedPlanDigest. */
+  catalogAttemptPlan: {
+    schema: 'opencode-catalog-attempt-plan-v1'
+    basePlanDigest: string
+    runtimeInstanceId: string
+    profileRootKey: string
+    profileRootPath: string
+    configDirectory: string
+  } | null
   /** Digest of the mandatory pure plan/materialize contract. */
   scopedPlanDigest: string
   /** Canonical host key produced by that pure plan. */
