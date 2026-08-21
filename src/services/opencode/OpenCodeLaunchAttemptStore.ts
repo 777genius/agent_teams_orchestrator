@@ -632,7 +632,10 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     const handle = name === '.' ? undefined : await this.open(name, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
     const fd = handle ? (handle as NativeNamespaceHandle).fd : this.rootHandle.fd
     try { this.result((unixSymbols().symbols as any).fsync(fd), 'fsync') }
-    catch (error) { if (!UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error }
+    catch (error) {
+      if (classifyOpenCodeDirectoryDurabilityError(process.platform,
+        (error as NodeJS.ErrnoException).code) !== 'explicitly_unsupported') throw error
+    }
     finally { await handle?.close() }
   }
   statFd(fd: number) { return this.fdStat(fd) }
