@@ -2398,15 +2398,24 @@ describe('OpenCodeHostManager', () => {
     expect(spawned.killedSignals).toEqual(['SIGTERM'])
   })
 
-  test('never reacquires a zero-ref host once disposal reaches its first await', async () => {
-    const children = [createMockChildProcess(43131), createMockChildProcess(43132)]
+  test('scopes disposal single-flight to the exact host generation', async () => {
+    const children = [
+      createMockChildProcess(43131),
+      createMockChildProcess(43132),
+      createMockChildProcess(43133),
+    ]
     let nextPort = 43130
     let spawnCount = 0
     let disposeCount = 0
-    let disposalEntered!: () => void
-    const entered = new Promise<void>(resolve => { disposalEntered = resolve })
+    const disposalUrls: string[] = []
+    let firstDisposalEntered!: () => void
+    const firstEntered = new Promise<void>(resolve => { firstDisposalEntered = resolve })
+    let secondDisposalEntered!: () => void
+    const secondEntered = new Promise<void>(resolve => { secondDisposalEntered = resolve })
     let allowFirstDisposal!: () => void
     const firstDisposalGate = new Promise<void>(resolve => { allowFirstDisposal = resolve })
+    let allowSecondDisposal!: () => void
+    const secondDisposalGate = new Promise<void>(resolve => { allowSecondDisposal = resolve })
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => ++nextPort,
@@ -2417,9 +2426,13 @@ describe('OpenCodeHostManager', () => {
         }
         if (url.endsWith('/global/dispose')) {
           disposeCount += 1
+          disposalUrls.push(url)
           if (disposeCount === 1) {
-            disposalEntered()
+            firstDisposalEntered()
             await firstDisposalGate
+          } else if (disposeCount === 2) {
+            secondDisposalEntered()
+            await secondDisposalGate
           }
           return { status: 200, data: { ok: true } }
         }
@@ -2431,8 +2444,8 @@ describe('OpenCodeHostManager', () => {
     })
 
     const old = await manager.ensureHost({ hostKey: 'raced-host', hostLifetime: 'process' })
-    const releasing = manager.releaseHost(old.hostKey)
-    await entered
+    const releasingOld = manager.releaseHost(old.hostKey)
+    await firstEntered
     expect(manager.getHost(old.hostKey)).toBeNull()
 
     const replacement = await manager.ensureHost({
@@ -2441,16 +2454,99 @@ describe('OpenCodeHostManager', () => {
     })
     expect(replacement.pid).not.toBe(old.pid)
     expect(replacement.state).toBe('healthy')
-    allowFirstDisposal()
-    await releasing
-    expect(manager.getHost(old.hostKey)?.pid).toBe(replacement.pid)
 
-    await Promise.all([
-      manager.releaseHost(replacement.hostKey),
-      manager.releaseHost(replacement.hostKey),
-    ])
+    // B reaches zero while A is still disposing. It must be tombstoned before
+    // waiting for A, so a concurrent ensure creates C instead of reusing B.
+    const releasingReplacement = manager.releaseHost(replacement.hostKey)
+    expect(manager.getHost(replacement.hostKey)).toBeNull()
+    const current = await manager.ensureHost({
+      hostKey: replacement.hostKey,
+      hostLifetime: 'process',
+    })
+    expect(current.pid).not.toBe(replacement.pid)
+    expect(current.state).toBe('healthy')
+
+    allowFirstDisposal()
+    await releasingOld
+    await secondEntered
+    expect(manager.getHost(old.hostKey)?.pid).toBe(current.pid)
+    allowSecondDisposal()
+    await releasingReplacement
+    expect(manager.getHost(old.hostKey)?.pid).toBe(current.pid)
+    expect(manager.getHost(old.hostKey)?.state).toBe('healthy')
+    const trackedHosts = (manager as unknown as {
+      hosts: Map<string, { refCount: number }>
+    }).hosts
+    expect(trackedHosts.get(old.hostKey)?.refCount).toBe(1)
     expect(disposeCount).toBe(2)
-    expect(spawnCount).toBe(2)
+    expect(disposalUrls).toEqual([
+      'http://127.0.0.1:43131/global/dispose',
+      'http://127.0.0.1:43132/global/dispose',
+    ])
+
+    // Concurrent releases for C remain single-flight and cannot affect a
+    // later generation under the same key.
+    expect((await manager.ensureHost({
+      hostKey: current.hostKey,
+      hostLifetime: 'process',
+    })).pid).toBe(current.pid)
+    await Promise.all([
+      manager.releaseHost(current.hostKey),
+      manager.releaseHost(current.hostKey),
+    ])
+    expect(disposeCount).toBe(3)
+    expect(new Set(disposalUrls).size).toBe(3)
+    expect(spawnCount).toBe(3)
+    expect(manager.getHost(old.hostKey)).toBeNull()
+  })
+
+  test('continues a replacement disposal after the prior generation fails', async () => {
+    const stuck = createMockChildProcess(43134, null)
+    const replacement = createMockChildProcess(43135)
+    const children = [stuck, replacement]
+    let spawnCount = 0
+    let firstDisposalEntered!: () => void
+    const firstEntered = new Promise<void>(resolve => { firstDisposalEntered = resolve })
+    const disposeUrls: string[] = []
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43134 + spawnCount,
+      spawnHostProcess: () => children[spawnCount++]!.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/global/dispose')) {
+          disposeUrls.push(url)
+          if (disposeUrls.length === 1) firstDisposalEntered()
+          return { status: 200, data: { ok: true } }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      isProcessAlive: pid => children.some(({ child }) =>
+        child.pid === pid && child.exitCode === null),
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const old = await manager.ensureHost({ hostKey: 'failed-disposal', hostLifetime: 'process' })
+    const releasingOld = manager.releaseHost(old.hostKey)
+    await firstEntered
+    const next = await manager.ensureHost({
+      hostKey: old.hostKey,
+      hostLifetime: 'process',
+    })
+    const releasingNext = manager.releaseHost(next.hostKey)
+    expect(manager.getHost(next.hostKey)).toBeNull()
+
+    await expect(releasingOld).rejects.toThrow('did not exit through its owned child handle')
+    await expect(releasingNext).resolves.toBeUndefined()
+    expect(disposeUrls).toEqual([
+      'http://127.0.0.1:43134/global/dispose',
+      'http://127.0.0.1:43135/global/dispose',
+    ])
+    expect(stuck.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(replacement.killedSignals).toEqual(['SIGTERM'])
     expect(manager.getHost(old.hostKey)).toBeNull()
   })
 

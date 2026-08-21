@@ -1513,7 +1513,10 @@ function normalizePersistentHostLeases(value: unknown): Record<string, Persisten
 
 export class OpenCodeHostManager {
   private readonly hosts = new Map<string, ManagedHostEntry>()
-  private readonly disposingHosts = new Map<string, Readonly<{
+  /** Exact host generations already committed to disposal. */
+  private readonly disposingHosts = new Map<ManagedHostEntry, Promise<void>>()
+  /** Latest disposal for a key; newer generations queue behind older ones. */
+  private readonly disposalTails = new Map<string, Readonly<{
     entry: ManagedHostEntry
     promise: Promise<void>
   }>>()
@@ -3472,7 +3475,7 @@ export class OpenCodeHostManager {
     await this.withPersistentHostStartupLock(hostKey, () =>
       this.withPersistentRegistryLock(async () => {
         if (this.hosts.get(hostKey) !== entry
-          && this.disposingHosts.get(hostKey)?.entry !== entry) {
+          && !this.disposingHosts.has(entry)) {
           throw new Error('OpenCode adopted host registry compare-and-swap failed [redacted]')
         }
         const registry = await this.readPersistentRegistryUnlocked()
@@ -3592,14 +3595,19 @@ export class OpenCodeHostManager {
     this.scopedStagingGenerations.delete(hostKey)
     this.pendingHostGenerations.delete(hostKey)
     this.pendingHosts.delete(hostKey)
-    const inFlightDisposal = this.disposingHosts.get(hostKey)
-    if (inFlightDisposal) {
-      await inFlightDisposal.promise
-      return true
-    }
     const entry = this.hosts.get(hostKey)
     if (!entry) {
+      const inFlightDisposal = this.disposalTails.get(hostKey)
+      if (inFlightDisposal) {
+        await inFlightDisposal.promise
+        return true
+      }
       return pending
+    }
+    const exactDisposal = this.disposingHosts.get(entry)
+    if (exactDisposal) {
+      await exactDisposal
+      return true
     }
     // Remove the zero-ref entry before the first disposal await. A concurrent
     // ensure can now only create/adopt a fresh host; it cannot reacquire bytes
@@ -3608,8 +3616,9 @@ export class OpenCodeHostManager {
     if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
     if (!Object.isFrozen(entry.handle)) entry.handle.state = 'disposed'
     publicHostHandleSnapshots.delete(entry.handle)
+    const previousDisposal = this.disposalTails.get(hostKey)?.promise
     let disposal!: Promise<void>
-    disposal = Promise.resolve().then(async () => {
+    disposal = Promise.resolve(previousDisposal).catch(() => undefined).then(async () => {
       if (!entry.ownedByProcess && entry.adoptedRegistryReceipt) {
         await this.disposeAdoptedPersistentHost(hostKey, entry)
         return
@@ -3620,11 +3629,15 @@ export class OpenCodeHostManager {
       }
       throw new Error('OpenCode host disposal ownership receipt is unavailable [redacted]')
     }).finally(() => {
-      if (this.disposingHosts.get(hostKey)?.promise === disposal) {
-        this.disposingHosts.delete(hostKey)
+      if (this.disposingHosts.get(entry) === disposal) {
+        this.disposingHosts.delete(entry)
+      }
+      if (this.disposalTails.get(hostKey)?.promise === disposal) {
+        this.disposalTails.delete(hostKey)
       }
     })
-    this.disposingHosts.set(hostKey, { entry, promise: disposal })
+    this.disposingHosts.set(entry, disposal)
+    this.disposalTails.set(hostKey, { entry, promise: disposal })
     try {
       await disposal
     } catch (error) {
