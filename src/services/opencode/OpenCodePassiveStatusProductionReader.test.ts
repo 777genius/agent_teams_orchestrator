@@ -514,6 +514,30 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test('returns the last committed transactional snapshot stale and degraded when refresh times out', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-committed-timeout-'))
+    let stall = false
+    try {
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(snapshot(), new AbortController().signal)
+      const reader = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: root,
+        now: () => 1_000,
+        canonicalizePath: async () => '/canonical/a',
+        afterCommittedTransactionSelected: () => stall ? new Promise<void>(() => undefined) : undefined,
+      })
+      const initial = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 1_000 })
+      expect(initial.providers[0].configured.value).toBe('configured')
+      stall = true
+      const degraded = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 20 })
+      expect(degraded.binary).toMatchObject({ freshness: 'stale', condition: 'degraded', issueCode: 'read_timeout' })
+      expect(degraded.providers[0].configured).toMatchObject({
+        value: 'configured', freshness: 'stale', condition: 'degraded', issueCode: 'read_timeout',
+      })
+      expect(degraded.launchReadiness).toBe('not_authorized')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   test('legacy component symlinks are never traversed by the SQLite store', async () => {
     if (process.platform === 'win32') return
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-symlink-'))

@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
@@ -134,6 +137,7 @@ import {
 } from '../../../../services/opencode/OpenCodePassiveProviderDirectory.js'
 import type { OpenCodePassiveStatusV1 } from '../../../../services/opencode/OpenCodePassiveStatusContract.js'
 import {
+  OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS,
   openCodeActiveStatusSnapshotPublisher,
   type OpenCodeActiveStatusPublisherPort,
 } from '../../../../services/opencode/OpenCodeActiveStatusSnapshotPublisher.js'
@@ -227,6 +231,8 @@ type OpenCodeProviderManagementAdapterDeps = {
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
+    /** Resolves the stable project preference scope, never an operation-attempt profile. */
+    resolveProjectRoot?(projectPath: string): string
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     readGlobal?(dataRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     clearProjectDefaultModel?(profileRootPath: string): Promise<unknown>
@@ -252,6 +258,12 @@ const CURATED_SUBSCRIPTION_PROVIDER_LABELS = Object.fromEntries(
     definition.displayName,
   ]),
 )
+
+export function resolveOpenCodeProjectPreferenceRoot(projectPath: string): string {
+  const canonicalProjectPath = path.resolve(projectPath.trim())
+  const profileRootKey = createHash('sha256').update(canonicalProjectPath).digest('hex').slice(0, 16)
+  return path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'profiles', profileRootKey)
+}
 
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -669,6 +681,31 @@ async function safeRead<T>(read: () => Promise<T>): Promise<SafeValue<T>> {
       message: error instanceof Error ? error.message : String(error),
     }
   }
+}
+
+async function boundedPassivePublication(
+  publish: (signal: AbortSignal) => Promise<void>,
+): Promise<string | null> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<'deadline'>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort(new Error('Passive publication deadline exceeded'))
+      resolve('deadline')
+    }, OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS)
+    timer.unref?.()
+  })
+  const operation = Promise.resolve().then(() => publish(controller.signal)).then(
+    () => 'published' as const,
+    () => 'failed' as const,
+  )
+  const outcome = await Promise.race([operation, deadline])
+  if (timer) clearTimeout(timer)
+  return outcome === 'published'
+    ? null
+    : outcome === 'deadline'
+      ? 'Passive status publication exceeded its deadline; the active operation completed without waiting.'
+      : 'Passive status publication failed; the active operation completed with its authoritative result.'
 }
 
 function safeReadDiagnostics<T>(result: SafeValue<T>): string[] {
@@ -2996,7 +3033,8 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async publishProviderStatus(input: Parameters<OpenCodeActiveStatusPublisherPort['publishExecutionUpdate']>[0]): Promise<void> {
-    await this.getActiveStatusPublisher().publishExecutionUpdate(input).catch(() => undefined)
+    await boundedPassivePublication(signal =>
+      this.getActiveStatusPublisher().publishExecutionUpdate(input, signal))
   }
 
   private async retainProviderManagementHost(
@@ -3154,12 +3192,14 @@ export class OpenCodeProviderManagementAdapter
           ...configured,
           read: configured.read ?? readOpenCodeManagedRuntimePreferences,
           readGlobal: configured.readGlobal ?? readOpenCodeGlobalManagedRuntimePreferences,
+          resolveProjectRoot: configured.resolveProjectRoot ?? resolveOpenCodeProjectPreferenceRoot,
           clearProjectDefaultModel:
             configured.clearProjectDefaultModel ?? clearOpenCodeManagedDefaultModel,
         }
       : {
         read: readOpenCodeManagedRuntimePreferences,
         readGlobal: readOpenCodeGlobalManagedRuntimePreferences,
+        resolveProjectRoot: resolveOpenCodeProjectPreferenceRoot,
         clearProjectDefaultModel: clearOpenCodeManagedDefaultModel,
         setDefaultModel: setOpenCodeManagedDefaultModel,
         setModelLimits: setOpenCodeManagedModelLimits,
@@ -3949,7 +3989,7 @@ export class OpenCodeProviderManagementAdapter
       const scoped = await (this.deps.providerCatalog ?? openCodeProviderCatalogService)
         .loadCatalog({ providerId, projectPath: input.projectPath })
       const catalog = scoped.catalog
-      await this.getActiveStatusPublisher().publishCatalogResult({
+      const publicationIssue = await boundedPassivePublication(signal => this.getActiveStatusPublisher().publishCatalogResult({
         projectPath: scoped.projectPath,
         evidence: scoped.catalogEvidence,
         catalogAvailable: true,
@@ -3957,10 +3997,10 @@ export class OpenCodeProviderManagementAdapter
         observedAt: scoped.catalogObservedAt,
         expiresAt: scoped.catalogExpiresAt,
         provenance: scoped.catalogProvenance,
-      }).catch(() => undefined)
+      }, signal))
       const managedPreferences = this.getManagedPreferences()
       const [preferencesResult, globalPreferencesResult] = await Promise.all([
-        safeRead(() => managedPreferences.read(scoped.profileRootPath)),
+        safeRead(() => managedPreferences.read(managedPreferences.resolveProjectRoot(scoped.projectPath))),
         safeRead(() => managedPreferences.readGlobal(resolveClaudeMultimodelPaths().data)),
       ])
       const preferences = preferencesResult.ok ? preferencesResult.value : null
@@ -4022,6 +4062,7 @@ export class OpenCodeProviderManagementAdapter
           defaultModelId,
           diagnostics: Object.freeze([
             ...scoped.diagnostics,
+            ...(publicationIssue ? [publicationIssue] : []),
             ...safeReadDiagnostics(preferencesResult),
             ...safeReadDiagnostics(globalPreferencesResult),
           ]),
@@ -5043,48 +5084,52 @@ export class OpenCodeProviderManagementAdapter
         'A project path is required to clear its OpenCode default model',
       )
     }
-    return this.withManagedOpenCodeClient(
-      input.runtimeId,
-      projectPath,
-      async ({ inventory, inventoryService, host, client }) => {
-        const profile = inventory.profile
-        if (!profile) {
-          return providerManagementError(
-            'runtime-unhealthy',
-            'OpenCode managed profile is unavailable',
-          )
-        }
-
-        await this.getManagedPreferences().clearProjectDefaultModel(profile.profileRootPath)
-        this.invalidateDirectoryCache()
-        inventoryService.clearCache?.()
-
-        const refreshedInventory = await this.probeInventory(
-          inventoryService,
-          inventory.projectPath,
-          {
-            bypassCache: true,
-            mode: 'summary',
-          },
-        )
-        const refresh = useActionRefreshInventory(
-          inventory,
-          refreshedInventory,
-          applyClearedProjectDefaultToInventory,
-        )
-        const view = await readLiveView({
-          inventory: refresh.inventory,
-          host,
-          client,
-          diagnostics: refresh.inventory.diagnostics,
-        })
-        return {
-          ok: true,
-          value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
-        }
-      },
-      { failureCode: 'runtime-unhealthy', inventoryMode: 'summary' },
-    )
+    if (input.runtimeId !== 'opencode') {
+      return providerManagementError(
+        'unsupported-runtime',
+        `Provider management is not available for ${input.runtimeId}`,
+        false,
+      )
+    }
+    try {
+      const managedPreferences = this.getManagedPreferences()
+      const preferenceRoot = managedPreferences.resolveProjectRoot(projectPath)
+      await managedPreferences.clearProjectDefaultModel(preferenceRoot)
+      this.invalidateDirectoryCache()
+      // Clearing a configured preference is deliberately independent of
+      // inventory, profile preparation, binary detection, and host startup.
+      // The next explicit live read projects the canonical preference state.
+      const global = await safeRead(() => managedPreferences.readGlobal(resolveClaudeMultimodelPaths().data))
+      const inherited = global.ok ? global.value.defaultModelId : null
+      const inventory: OpenCodeInventorySnapshot = {
+        detected: false,
+        binaryPath: null,
+        version: null,
+        projectPath: path.resolve(projectPath),
+        profile: null,
+        connectedProviders: [],
+        availableProviders: [],
+        models: [],
+        agents: [],
+        authStorePath: null,
+        probeError: null,
+        diagnostics: [
+          'OpenCode project default was cleared without probing or provisioning the runtime.',
+          ...(inherited ? [`The all-projects default ${inherited} will be inherited on the next live read.`] : []),
+          ...safeReadDiagnostics(global),
+        ],
+      }
+      return {
+        ok: true,
+        value: buildView({ inventory, host: null, configProviders: null, providers: null,
+          providerAuth: null, diagnostics: inventory.diagnostics }),
+      }
+    } catch (error) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        error instanceof Error ? error.message : String(error),
+      )
+    }
   }
 
   async testModel(

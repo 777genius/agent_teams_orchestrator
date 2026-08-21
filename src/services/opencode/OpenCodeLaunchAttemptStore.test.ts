@@ -4,6 +4,7 @@ import { join, posix, win32 } from 'node:path'
 
 import {
   OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES,
+  classifyOpenCodeDirectoryDurabilityError,
   deriveOpenCodeLaunchNamespacePaths,
   OpenCodeLaunchAttemptStore,
   OpenCodeLaunchFileJournalPersistence,
@@ -52,6 +53,16 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
 }
 
 describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
+  test('classifies native Windows directory durability errors without treating access denial as success', () => {
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EINVAL')).toBe('explicitly_unsupported')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'ENOTSUP')).toBe('explicitly_unsupported')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EISDIR')).toBe('explicitly_unsupported')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EACCES')).toBe('durability_failure')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EPERM')).toBe('durability_failure')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EBADF')).toBe('durability_failure')
+    expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EIO')).toBe('durability_failure')
+  })
+
   test('derives the secure namespace with the injected host path strategy and no descriptor filesystem', async () => {
     expect(deriveOpenCodeLaunchNamespacePaths('/var/app/attempt.json', posix)).toMatchObject({
       directory: '/var/app', trustedRoot: '/',

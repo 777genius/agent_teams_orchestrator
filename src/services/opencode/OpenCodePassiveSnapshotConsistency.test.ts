@@ -109,7 +109,7 @@ describe('OpenCode passive SQLite transaction consistency', () => {
       const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'ignore', stderr: 'pipe' })
       expect(await child.exited).toBe(77)
       await new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 2_000,
-        canonicalizePath: async () => canonical }).publishProviderUpdate({ projectPath: canonical,
+        canonicalizePath: async () => canonical, publicationDeadlineMs: 5_000 }).publishProviderUpdate({ projectPath: canonical,
           providerId: 'deepinfra', connected: false })
       expect((await status(root)).providers[0].lastConnected.value.state).toBe('not_connected')
       expect((await readdir(root)).filter(name => name.startsWith(OPEN_CODE_PASSIVE_DATABASE)).length).toBeLessThanOrEqual(4)
@@ -434,6 +434,32 @@ describe('OpenCode passive SQLite transaction consistency', () => {
       await maintainOpenCodePassiveStore(root)
       resume.resolve(); await pending
       expect((await status(root)).binary.value.version).toBe('3.0.0')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('shares machine-global binary evidence across project scopes without merging project providers', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-global-binary-'))
+    const otherScope = `sha256:${'9'.repeat(64)}` as const
+    try {
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      await writer.write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
+      await writer.update(scope, 1_000, value => {
+        value.providers[0].binaryFingerprint = digest('b')
+      }, new AbortController().signal)
+      const other = snapshot(1_001, false, '1.0.0')
+      other.projectScope = otherScope
+      other.providers[0].configured = direct('configured' as const, 'config_metadata', 1_001)
+      await writer.write(other, new AbortController().signal)
+      await writer.update(scope, 2_000, value => {
+        value.binary = direct({ presence: 'present' as const, version: '2.0.0' }, 'binary_metadata', 2_000)
+        value.providers[0].binaryFingerprint = digest('e')
+      }, new AbortController().signal)
+
+      const observed = await readOpenCodePassiveSnapshot(root, otherScope, new AbortController().signal)
+      expect(observed?.value.binary.value.version).toBe('2.0.0')
+      expect(observed?.value.providers[0].binaryFingerprint).toBe(digest('e'))
+      expect(observed?.value.providers[0].configured.value).toBe('configured')
+      expect(observed?.value.providers[0].lastConnected.value.state).toBe('not_connected')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 

@@ -56,6 +56,10 @@ type StoreOptions = Readonly<{
 }>
 
 type SnapshotRow = { transactionId: number; payload: string }
+type GlobalBinaryEvidence = Readonly<{
+  binary: OpenCodeRedactedSnapshotV1['binary']
+  fingerprint: `sha256:${string}` | null
+}>
 type LegacyEvidence = Readonly<{ rank: number; sequence: number; fingerprint: string }>
 type LegacyProvenance = Record<string, LegacyEvidence>
 type LegacyRead =
@@ -145,7 +149,8 @@ async function commitOpenCodePassiveSnapshot(
       // merged into a later mutation or retain launch-adjacent authority.
       if (previous && !base) deleteScope(database, projectScope)
       const reconciled = await reconcileLegacy(database, options.rootDirectory, projectScope, base)
-      base = reconciled.snapshot
+      const globalBinary = readGlobalBinary(database)
+      base = withGlobalBinary(reconciled.snapshot, globalBinary)
       const logicalTime = Math.max(base?.capturedAt ?? 0, capturedAt)
       const normalized = mutation ? normalizeMutationTime(mutation, logicalTime) : undefined
       const initial = base ?? emptySnapshot(projectScope, logicalTime)
@@ -167,6 +172,16 @@ async function commitOpenCodePassiveSnapshot(
       await options.hooks?.afterBinarySnapshotPublished?.()
       if (signal.aborted) throw cancelled()
       database.query('UPDATE passive_transactions SET payload = ? WHERE id = ?').run(payload, id)
+      const fingerprints = [...new Set(next.providers.map(provider => provider.binaryFingerprint).filter(Boolean))]
+      const nextGlobalBinary: GlobalBinaryEvidence = {
+        binary: next.binary,
+        fingerprint: fingerprints.length === 1 ? fingerprints[0]! : globalBinary?.fingerprint ?? null,
+      }
+      if (!globalBinary || JSON.stringify(globalBinary) !== JSON.stringify(nextGlobalBinary)) {
+        database.query(`INSERT INTO passive_global_binary(singleton, payload, transaction_id) VALUES (1, ?, ?)
+          ON CONFLICT(singleton) DO UPDATE SET payload = excluded.payload,
+          transaction_id = excluded.transaction_id`).run(JSON.stringify(nextGlobalBinary), id)
+      }
       database.query(`INSERT INTO passive_current(scope, transaction_id) VALUES (?, ?)
         ON CONFLICT(scope) DO UPDATE SET transaction_id = excluded.transaction_id`).run(projectScope, id)
       database.query(`DELETE FROM passive_transactions WHERE scope = ? AND id NOT IN
@@ -233,16 +248,17 @@ export async function readOpenCodePassiveSnapshot(
       // transaction pins its version. Retention can now proceed independently.
       await options.afterSelected?.()
       if (signal.aborted) throw cancelled()
-      let value = decodeDurable(row.payload, row.transactionId, scope)
-      let text = row.payload
+      let value = withGlobalBinary(decodeDurable(row.payload, row.transactionId, scope), readGlobalBinary(database))
       if (value && legacyCapturedAt !== undefined && value.capturedAt < legacyCapturedAt) {
         value = { ...value, capturedAt: legacyCapturedAt }
-        const encoded = encodeOpenCodeRedactedSnapshotV1(value)
-        if (!encoded.ok || !encoded.bytes) value = null
-        else text = new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
       }
+      const encoded = value && encodeOpenCodeRedactedSnapshotV1(value)
+      const text = encoded && encoded.ok && encoded.bytes
+        ? new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
+        : null
+      if (text === null) value = null
       database.exec('COMMIT')
-      return value ? { transactionId: row.transactionId, text, value } : null
+      return value && text ? { transactionId: row.transactionId, text, value } : null
     } catch (error) { rollback(database); throw error }
   } finally { database.close(false) }
 }
@@ -290,11 +306,17 @@ function initializeSchema(database: Database): void {
       fingerprint TEXT NOT NULL,
       provenance TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS passive_global_binary (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      payload TEXT NOT NULL,
+      transaction_id INTEGER NOT NULL
+    );
   `)
   verifySchema(database)
 }
 
 async function ensureDatabaseReady(database: Database, signal: AbortSignal): Promise<void> {
+  let incompleteSchemaObservations = 0
   for (;;) {
     if (signal.aborted) throw cancelled()
     try {
@@ -303,15 +325,20 @@ async function ensureDatabaseReady(database: Database, signal: AbortSignal): Pro
       ).get()
       if (ready?.schemaVersion !== SCHEMA_VERSION) throw new Error('Passive snapshot store schema is invalid')
       if (ready.journalReady === 1) {
-        const supplemental = database.query<{ present: number }, []>(`SELECT 1 AS present FROM sqlite_master
-          WHERE type = 'table' AND name = 'passive_legacy_state'`).get()
-        if (supplemental) return
+        const supplemental = database.query<{ count: number }, []>(`SELECT count(*) AS count FROM sqlite_master
+          WHERE type = 'table' AND name IN ('passive_legacy_state', 'passive_global_binary')`).get()
+        if (supplemental?.count === 2) return
         await beginImmediate(database, signal)
         try {
           database.exec(`CREATE TABLE IF NOT EXISTS passive_legacy_state (
             scope TEXT PRIMARY KEY,
             fingerprint TEXT NOT NULL,
             provenance TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS passive_global_binary (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            payload TEXT NOT NULL,
+            transaction_id INTEGER NOT NULL
           )`)
           database.exec('COMMIT')
           return
@@ -335,7 +362,16 @@ async function ensureDatabaseReady(database: Database, signal: AbortSignal): Pro
         await new Promise<void>(resolve => setImmediate(resolve))
         continue
       }
-      if (existingTables !== 0) throw new Error('Passive snapshot store schema is invalid')
+      if (existingTables !== 0) {
+        // Another process can expose the newly created SQLite file before its
+        // first EXCLUSIVE schema transaction is observable on this connection.
+        // Retry only a bounded number of event-loop turns; stable partial or
+        // foreign schemas still fail closed.
+        incompleteSchemaObservations += 1
+        if (incompleteSchemaObservations > 256) throw new Error('Passive snapshot store schema is invalid')
+        await new Promise<void>(resolve => setImmediate(resolve))
+        continue
+      }
       await beginTransaction(database, signal, 'EXCLUSIVE')
       try { initializeSchema(database); database.exec('COMMIT') }
       catch (initializationError) { rollback(database); if (!isBusy(initializationError)) throw initializationError }
@@ -381,6 +417,68 @@ function readCurrent(database: Database, scope: string): SnapshotRow | null {
   return database.query<SnapshotRow, [string]>(`SELECT t.id AS transactionId, t.payload
     FROM passive_current c JOIN passive_transactions t ON t.id = c.transaction_id
     WHERE c.scope = ?`).get(scope)
+}
+
+function readGlobalBinary(database: Database): GlobalBinaryEvidence | null {
+  let row: { payload: string; transactionId: number } | null
+  try {
+    row = database.query<{ payload: string; transactionId: number }, []>(
+      'SELECT payload, transaction_id AS transactionId FROM passive_global_binary WHERE singleton = 1',
+    ).get()
+  } catch (error) {
+    if (error instanceof Error && /no such table/i.test(error.message)) return null
+    throw error
+  }
+  if (!row || !Number.isSafeInteger(row.transactionId) || row.transactionId <= 0) return null
+  try {
+    const parsed = JSON.parse(row.payload) as Partial<GlobalBinaryEvidence> & OpenCodeRedactedSnapshotV1['binary']
+    const binary = parsed.binary ?? parsed
+    const fingerprint = parsed.binary === undefined ? null : parsed.fingerprint
+    if (fingerprint !== null && fingerprint !== undefined && !/^sha256:[0-9a-f]{64}$/.test(fingerprint)) return null
+    const capturedAt = typeof binary?.observedAt === 'number' && Number.isSafeInteger(binary.observedAt)
+      ? Math.max(0, binary.observedAt)
+      : 0
+    const encoded = encodeOpenCodeRedactedSnapshotV1({
+      schemaVersion: 1,
+      projectScope: `sha256:${'0'.repeat(64)}`,
+      capturedAt,
+      binary,
+      providers: [],
+    })
+    return encoded.ok ? {
+      binary: structuredClone(encoded.value.binary),
+      fingerprint: fingerprint ?? null,
+    } : null
+  } catch { return null }
+}
+
+function withGlobalBinary(
+  snapshot: OpenCodeRedactedSnapshotV1 | null,
+  evidence: GlobalBinaryEvidence | null,
+): OpenCodeRedactedSnapshotV1 | null {
+  if (!snapshot || !evidence) return snapshot
+  const providers = structuredClone(snapshot.providers)
+  if (evidence.fingerprint) for (const provider of providers) {
+    if (provider.catalogBinaryFingerprint
+      && provider.catalogBinaryFingerprint !== evidence.fingerprint) {
+      provider.catalogFenceGeneration = Math.min(Number.MAX_SAFE_INTEGER,
+        Math.max(provider.catalogFenceGeneration ?? 0, provider.catalogRequestGeneration ?? 0, 1))
+      delete provider.catalogIdentity
+      delete provider.catalogAttemptIdentity
+      delete provider.catalogRequestGeneration
+      delete provider.catalogStartedAt
+      delete provider.catalogBinaryFingerprint
+      delete provider.catalogConfigFingerprint
+      delete provider.catalogAuthFingerprint
+    }
+    provider.binaryFingerprint = evidence.fingerprint
+  }
+  return {
+    ...snapshot,
+    binary: structuredClone(evidence.binary),
+    providers,
+    capturedAt: Math.max(snapshot.capturedAt, evidence.binary.observedAt ?? 0),
+  }
 }
 
 function deleteScope(database: Database, scope: string): void {

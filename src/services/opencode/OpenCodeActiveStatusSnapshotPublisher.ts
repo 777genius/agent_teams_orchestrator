@@ -28,6 +28,7 @@ import type { OpenCodeInventoryCompleteness, OpenCodeInventorySnapshot } from '.
 import type { OpenCodeCatalogPublicationEvidence } from './OpenCodeProviderCatalogService.js'
 
 const ACTIVE_EVIDENCE_TTL_MS = 5 * 60_000
+export const OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS = 2_000
 
 export type OpenCodeActiveStatusPublisherPort = {
   publishInventory(snapshot: OpenCodeInventorySnapshot, signal?: AbortSignal): Promise<void>
@@ -62,6 +63,7 @@ type PublisherDeps = Readonly<{
   canonicalizePath?: (projectPath: string, signal: AbortSignal) => Promise<string>
   readSnapshot?: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
   withScopeUpdate?: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
+  publicationDeadlineMs?: number
 }>
 
 /** Mutation-only bridge from successful active observations to the passive redacted store. */
@@ -73,6 +75,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
   readonly #canonicalizePath: (projectPath: string, signal: AbortSignal) => Promise<string>
   readonly #readSnapshot: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
   readonly #withScopeUpdate: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
+  readonly #publicationDeadlineMs: number
   readonly #tails = new Map<string, Promise<void>>()
 
   constructor(deps: PublisherDeps = {}) {
@@ -93,6 +96,10 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       )
     })
     this.#withScopeUpdate = deps.withScopeUpdate ?? (async (_scope, _signal, operation) => operation())
+    this.#publicationDeadlineMs = deps.publicationDeadlineMs ?? OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS
+    if (!Number.isSafeInteger(this.#publicationDeadlineMs) || this.#publicationDeadlineMs <= 0) {
+      throw new TypeError('Passive publication deadline must be a positive safe integer')
+    }
   }
 
   async publishInventory(inventory: OpenCodeInventorySnapshot, signal = new AbortController().signal): Promise<void> {
@@ -265,40 +272,45 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     // canonicalization or compatibility reads so native Windows does zero I/O.
     assertOpenCodePassiveSnapshotPersistenceSupported(this.#platform)
     if (signal.aborted) return
-    const canonical = await this.#canonicalizePath(projectPath, signal)
-    const scope = projectScope(canonical)
-    const previous = this.#tails.get(scope) ?? Promise.resolve()
-    const next = previous.catch(() => undefined).then(async () => this.#withScopeUpdate(scope, signal, async () => {
-      if (signal.aborted) return
-      const now = this.#now()
-      if (!Number.isSafeInteger(now) || now < 0) return
-      if (this.#writer.update) {
-        await this.#writer.update(scope, now, snapshot => {
-          const evidenceTime = Math.max(now, snapshot.capturedAt)
-          ageExpiredObservations(snapshot, evidenceTime)
-          snapshot.capturedAt = evidenceTime
-          mutate(snapshot, evidenceTime)
-          snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
-        }, signal)
-        return
-      }
-      if (this.#writer.mutate) {
-        const delta = emptySnapshot(scope, now)
-        mutate(delta, now)
-        await this.#writer.mutate(toMutation(delta, defaults?.(now)), signal)
-        return
-      }
-      const loaded = await this.#load(scope, signal)
-      const snapshot = loaded ?? emptySnapshot(scope, now)
-      const evidenceTime = Math.max(now, snapshot.capturedAt)
-      ageExpiredObservations(snapshot, evidenceTime)
-      snapshot.capturedAt = evidenceTime
-      mutate(snapshot, evidenceTime)
-      snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
-      await this.#writer.write(snapshot, signal)
-    }))
-    this.#tails.set(scope, next)
-    try { await next } finally { if (this.#tails.get(scope) === next) this.#tails.delete(scope) }
+    const deadline = publicationSignal(signal, this.#publicationDeadlineMs)
+    signal = deadline.signal
+    try {
+      const canonical = await this.#canonicalizePath(projectPath, signal)
+      const scope = projectScope(canonical)
+      const previous = this.#tails.get(scope) ?? Promise.resolve()
+      const next = previous.catch(() => undefined).then(async () => this.#withScopeUpdate(scope, signal, async () => {
+        if (signal.aborted) return
+        const now = this.#now()
+        if (!Number.isSafeInteger(now) || now < 0) return
+        if (this.#writer.update) {
+          await this.#writer.update(scope, now, snapshot => {
+            const evidenceTime = Math.max(now, snapshot.capturedAt)
+            ageExpiredObservations(snapshot, evidenceTime)
+            snapshot.capturedAt = evidenceTime
+            mutate(snapshot, evidenceTime)
+            snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
+          }, signal)
+          return
+        }
+        if (this.#writer.mutate) {
+          const delta = emptySnapshot(scope, now)
+          mutate(delta, now)
+          await this.#writer.mutate(toMutation(delta, defaults?.(now)), signal)
+          return
+        }
+        const loaded = await this.#load(scope, signal)
+        const snapshot = loaded ?? emptySnapshot(scope, now)
+        const evidenceTime = Math.max(now, snapshot.capturedAt)
+        ageExpiredObservations(snapshot, evidenceTime)
+        snapshot.capturedAt = evidenceTime
+        mutate(snapshot, evidenceTime)
+        snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
+        await this.#writer.write(snapshot, signal)
+      }))
+      this.#tails.set(scope, next)
+      try { await awaitPublication(next, signal) }
+      finally { if (this.#tails.get(scope) === next) this.#tails.delete(scope) }
+    } finally { deadline.dispose() }
   }
 
   async #load(scope: `sha256:${string}`, signal: AbortSignal): Promise<OpenCodeRedactedSnapshotV1 | null> {
@@ -306,6 +318,36 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     if (text === null) return null
     const decoded = decodeOpenCodeRedactedSnapshotV1(text)
     return decoded.ok && decoded.value.projectScope === scope ? structuredClone(decoded.value) : null
+  }
+}
+
+function publicationSignal(parent: AbortSignal, timeoutMs: number): {
+  signal: AbortSignal; dispose(): void
+} {
+  const controller = new AbortController()
+  const abort = () => controller.abort(parent.reason)
+  parent.addEventListener('abort', abort, { once: true })
+  if (parent.aborted) abort()
+  const timer = setTimeout(() => controller.abort(new Error('Passive snapshot publication deadline exceeded')), timeoutMs)
+  timer.unref?.()
+  return {
+    signal: controller.signal,
+    dispose: () => { clearTimeout(timer); parent.removeEventListener('abort', abort) },
+  }
+}
+
+async function awaitPublication(operation: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw signal.reason ?? new Error('Passive snapshot publication cancelled')
+  let rejectAbort!: (reason: unknown) => void
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
+  const onAbort = () => rejectAbort(signal.reason ?? new Error('Passive snapshot publication cancelled'))
+  signal.addEventListener('abort', onAbort, { once: true })
+  try { await Promise.race([operation, aborted]) }
+  finally {
+    signal.removeEventListener('abort', onAbort)
+    // A timed-out SQLite waiter observes the same abort and unwinds on its
+    // next lock attempt; retaining a rejection handler prevents a late leak.
+    void operation.catch(() => undefined)
   }
 }
 
