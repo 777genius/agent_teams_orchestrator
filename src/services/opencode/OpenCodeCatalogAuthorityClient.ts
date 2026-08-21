@@ -16,11 +16,27 @@ import {
 } from './OpenCodeCatalogAuthorityProtocol.js'
 
 const COMMIT_RESOLVE_RESERVE_MS = 250
+type WithoutWait<T> = T extends unknown ? Omit<T, 'wait_ms'> : never
+type PendingAuthorityRequest = WithoutWait<OpenCodeCatalogAuthorityRequest>
 
 export class OpenCodeCatalogCommitUncertainError extends Error {
   constructor() {
     super('catalog authority commit outcome is uncertain')
     this.name = 'OpenCodeCatalogCommitUncertainError'
+  }
+}
+
+export class OpenCodeCatalogDeadlineError extends Error {
+  constructor() {
+    super('catalog authority deadline')
+    this.name = 'OpenCodeCatalogDeadlineError'
+  }
+}
+
+export class OpenCodeCatalogAbortError extends Error {
+  constructor() {
+    super('catalog authority aborted')
+    this.name = 'OpenCodeCatalogAbortError'
   }
 }
 
@@ -150,7 +166,8 @@ export class OpenCodeCatalogAuthorityClient {
   #committed = false
 
   constructor(options: OpenCodeCatalogAuthorityClientOptions) {
-    if (!Number.isFinite(options.deadline) || options.signal.aborted) throw new Error('expired authority attempt')
+    if (!Number.isFinite(options.deadline)) throw new OpenCodeCatalogDeadlineError()
+    if (options.signal.aborted) throw new OpenCodeCatalogAbortError()
     this.#deadline = options.deadline
     this.#signal = options.signal
     this.#options = options
@@ -274,27 +291,41 @@ export class OpenCodeCatalogAuthorityClient {
     }
   }
 
-  async #request(request: OpenCodeCatalogAuthorityRequest,
+  async #request(request: PendingAuthorityRequest,
     requestDeadline = this.#deadline): Promise<unknown> {
-    if (this.#closed || this.#signal.aborted || performance.now() >= this.#deadline) {
-      this.kill(); throw new Error('catalog authority deadline')
+    if (this.#signal.aborted) {
+      this.kill(); throw new OpenCodeCatalogAbortError()
     }
-    const encoded = `${JSON.stringify(request)}\n`
+    if (this.#closed || performance.now() >= this.#deadline) {
+      this.kill(); throw new OpenCodeCatalogDeadlineError()
+    }
+    const remaining = Math.max(0, requestDeadline - performance.now())
+    const wireRequest = { ...request,
+      wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeCatalogAuthorityRequest
+    const encoded = `${JSON.stringify(wireRequest)}\n`
     if (new TextEncoder().encode(encoded).byteLength > OPENCODE_CATALOG_MAX_WIRE_BYTES + 1) {
       throw new Error('catalog authority request too large')
     }
     this.#child.stdin.write(encoded)
-    const remaining = Math.max(0, requestDeadline - performance.now())
     let timer: ReturnType<typeof setTimeout> | null = null
     const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => { this.kill(); reject(new Error('catalog authority deadline')) }, remaining)
+      timer = setTimeout(() => { this.kill(); reject(new OpenCodeCatalogDeadlineError()) }, remaining)
       timer.unref?.()
     })
     try {
       const line = await Promise.race([this.#readLine(), timeout])
       const reply = decodeAuthorityReply(line, request.id)
-      if (!reply.ok) throw new Error(`catalog authority rejected ${reply.error}`)
+      if (!reply.ok) {
+        if (reply.error === 'DEADLINE') {
+          this.kill()
+          throw new OpenCodeCatalogDeadlineError()
+        }
+        throw new Error(`catalog authority rejected ${reply.error}`)
+      }
       return reply.value
+    } catch (error) {
+      if (this.#signal.aborted) throw new OpenCodeCatalogAbortError()
+      throw error
     } finally { if (timer) clearTimeout(timer) }
   }
 

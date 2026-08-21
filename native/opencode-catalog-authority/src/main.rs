@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Component, Path};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 mod posix_vfs;
@@ -110,17 +110,20 @@ fn test_gate(phase: &str) {
 enum Request {
     BeginAttempt {
         id: String,
+        wait_ms: u32,
         started_at: i64,
         scope_hash: String,
     },
     BindAndRead {
         id: String,
+        wait_ms: u32,
         generation: i64,
         attempt_identity: String,
         identity: Identity,
     },
     Finalize {
         id: String,
+        wait_ms: u32,
         generation: i64,
         attempt_identity: String,
         identity: Identity,
@@ -130,13 +133,38 @@ enum Request {
     },
     Resolve {
         id: String,
+        wait_ms: u32,
         generation: i64,
         attempt_identity: String,
         identity: Identity,
     },
     Close {
         id: String,
+        wait_ms: u32,
     },
+}
+
+impl Request {
+    fn id(&self) -> &str {
+        match self {
+            Self::BeginAttempt { id, .. }
+            | Self::BindAndRead { id, .. }
+            | Self::Finalize { id, .. }
+            | Self::Resolve { id, .. }
+            | Self::Close { id, .. } => id,
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        let wait_ms = match self {
+            Self::BeginAttempt { wait_ms, .. }
+            | Self::BindAndRead { wait_ms, .. }
+            | Self::Finalize { wait_ms, .. }
+            | Self::Resolve { wait_ms, .. }
+            | Self::Close { wait_ms, .. } => *wait_ms,
+        };
+        Instant::now() + Duration::from_millis(u64::from(wait_ms))
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -152,11 +180,56 @@ struct Identity {
 
 struct Db {
     raw: *mut sqlite::sqlite3,
+    busy: Box<BusyDeadline>,
 }
 impl Drop for Db {
     fn drop(&mut self) {
         unsafe {
             sqlite::sqlite3_close(self.raw);
+        }
+    }
+}
+
+struct BusyDeadline {
+    deadline: Instant,
+}
+
+unsafe extern "C" fn deadline_busy_handler(context: *mut c_void, prior_calls: c_int) -> c_int {
+    let state = unsafe { &*(context as *const BusyDeadline) };
+    let now = Instant::now();
+    if now >= state.deadline {
+        return 0;
+    }
+    // SQLite invokes the handler once per failed lock attempt. Exponential
+    // backoff reduces cross-process churn, while the remaining absolute budget
+    // caps every sleep and the handler itself decides when waiting ends.
+    let shift = u32::try_from(prior_calls.max(0)).unwrap_or(u32::MAX).min(3);
+    let backoff = Duration::from_millis(1u64 << shift);
+    std::thread::sleep(backoff.min(state.deadline.saturating_duration_since(now)));
+    c_int::from(Instant::now() < state.deadline)
+}
+
+impl Db {
+    fn legacy(raw: *mut sqlite::sqlite3) -> Self {
+        Self {
+            raw,
+            // Legacy snapshot connections are retained-handle, read-only work;
+            // they do not participate in authority lock acquisition.
+            busy: Box::new(BusyDeadline {
+                deadline: Instant::now(),
+            }),
+        }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.busy.deadline = deadline;
+    }
+
+    fn check_deadline(&self) -> Result<(), String> {
+        if Instant::now() < self.busy.deadline {
+            Ok(())
+        } else {
+            Err("DEADLINE".into())
         }
     }
 }
@@ -187,6 +260,15 @@ fn sqlite_error(db: *mut sqlite::sqlite3) -> String {
     }
 }
 
+fn sqlite_result(db: *mut sqlite::sqlite3, rc: c_int) -> String {
+    let primary = rc & 0xff;
+    if primary == sqlite::SQLITE_BUSY || primary == sqlite::SQLITE_LOCKED {
+        "DEADLINE".into()
+    } else {
+        sqlite_error(db)
+    }
+}
+
 fn exec(db: &Db, sql: &str) -> Result<(), String> {
     let sql = c(sql)?;
     let mut error: *mut c_char = ptr::null_mut();
@@ -204,7 +286,12 @@ fn exec(db: &Db, sql: &str) -> Result<(), String> {
             value
         }
     };
-    Err(message)
+    let primary = unsafe { sqlite::sqlite3_extended_errcode(db.raw) } & 0xff;
+    if primary == sqlite::SQLITE_BUSY || primary == sqlite::SQLITE_LOCKED {
+        Err("DEADLINE".into())
+    } else {
+        Err(message)
+    }
 }
 
 struct Statement {
@@ -219,7 +306,7 @@ impl Statement {
             sqlite::sqlite3_prepare_v2(db.raw, sql.as_ptr(), -1, &mut ptr, ptr::null_mut())
         };
         if rc != sqlite::SQLITE_OK {
-            return Err(sqlite_error(db.raw));
+            return Err(sqlite_result(db.raw, rc));
         }
         Ok(Self { db: db.raw, ptr })
     }
@@ -231,7 +318,7 @@ impl Statement {
         if rc == sqlite::SQLITE_OK {
             Ok(())
         } else {
-            Err(sqlite_error(self.db))
+            Err(sqlite_result(self.db, rc))
         }
     }
     fn int(&self, at: c_int, value: i64) -> Result<(), String> {
@@ -239,7 +326,7 @@ impl Statement {
         if rc == sqlite::SQLITE_OK {
             Ok(())
         } else {
-            Err(sqlite_error(self.db))
+            Err(sqlite_result(self.db, rc))
         }
     }
     fn step(&self) -> Result<c_int, String> {
@@ -247,7 +334,7 @@ impl Statement {
         if rc == sqlite::SQLITE_ROW || rc == sqlite::SQLITE_DONE {
             Ok(rc)
         } else {
-            Err(sqlite_error(self.db))
+            Err(sqlite_result(self.db, rc))
         }
     }
     fn integer(&self, at: c_int) -> i64 {
@@ -600,7 +687,7 @@ fn sync_windows_directory_path(path: &Path, error: &str) -> Result<(), String> {
     }
 }
 
-fn open_db() -> Result<Db, String> {
+fn open_db(deadline: Instant) -> Result<Db, String> {
     fault("vfs-open");
     #[cfg(unix)]
     validate_root()?;
@@ -609,39 +696,60 @@ fn open_db() -> Result<Db, String> {
     posix_vfs::register()?;
     #[cfg(windows)]
     windows_vfs::register()?;
-    let mut raw = ptr::null_mut();
+    let raw = loop {
+        if Instant::now() >= deadline {
+            return Err("DEADLINE".into());
+        }
+        let mut raw = ptr::null_mut();
+        let rc = unsafe {
+            sqlite::sqlite3_open_v2(
+                filename.as_ptr(),
+                &mut raw,
+                sqlite::SQLITE_OPEN_READWRITE
+                    | sqlite::SQLITE_OPEN_CREATE
+                    | sqlite::SQLITE_OPEN_FULLMUTEX,
+                {
+                    #[cfg(unix)]
+                    {
+                        posix_vfs::name()
+                    }
+                    #[cfg(windows)]
+                    {
+                        windows_vfs::name()
+                    }
+                },
+            )
+        };
+        if rc == sqlite::SQLITE_OK {
+            break raw;
+        }
+        if !raw.is_null() {
+            unsafe { sqlite::sqlite3_close(raw) };
+        }
+        let primary = rc & 0xff;
+        if primary != sqlite::SQLITE_BUSY && primary != sqlite::SQLITE_LOCKED {
+            return Err("DB_OPEN".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("DEADLINE".into());
+        }
+        std::thread::sleep(Duration::from_millis(1).min(remaining));
+    };
+    let busy = Box::new(BusyDeadline { deadline });
+    let mut db = Db { raw, busy };
     let rc = unsafe {
-        sqlite::sqlite3_open_v2(
-            filename.as_ptr(),
-            &mut raw,
-            sqlite::SQLITE_OPEN_READWRITE
-                | sqlite::SQLITE_OPEN_CREATE
-                | sqlite::SQLITE_OPEN_FULLMUTEX,
-            {
-                #[cfg(unix)]
-                {
-                    posix_vfs::name()
-                }
-                #[cfg(windows)]
-                {
-                    windows_vfs::name()
-                }
-            },
+        sqlite::sqlite3_busy_handler(
+            db.raw,
+            Some(deadline_busy_handler),
+            (&mut *db.busy as *mut BusyDeadline).cast(),
         )
     };
     if rc != sqlite::SQLITE_OK {
-        if !raw.is_null() {
-            unsafe {
-                sqlite::sqlite3_close(raw);
-            }
-        }
-        return Err("DB_OPEN".into());
-    }
-    let db = Db { raw };
-    unsafe {
-        sqlite::sqlite3_busy_timeout(db.raw, 0);
+        return Err("DB_BUSY_HANDLER".into());
     }
     exec(&db, "PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF")?;
+    db.check_deadline()?;
     Ok(db)
 }
 
@@ -909,20 +1017,35 @@ fn legacy_audit_anchor(db: &Db, high: i64) -> Result<(i64, String), String> {
 
 fn schema(db: &Db) -> Result<(), String> {
     fault("migration-open");
+    // Serialize all catalog initialization before observing user_version. A
+    // contender that read version zero before another process committed could
+    // otherwise replay first-use migration over the newly allocated ledger.
+    exec(db, "BEGIN IMMEDIATE")?;
     let version = scalar(db, "PRAGMA user_version")?;
     if version == VERSION {
-        exec(db,"CREATE TABLE IF NOT EXISTS legacy_import(cache_key TEXT NOT NULL, identity_json TEXT NOT NULL, envelope_json TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(cache_key,identity_json));
+        let initialized = (|| {
+            exec(db,"CREATE TABLE IF NOT EXISTS legacy_import(cache_key TEXT NOT NULL, identity_json TEXT NOT NULL, envelope_json TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(cache_key,identity_json));
           CREATE TABLE IF NOT EXISTS committed_result(generation INTEGER PRIMARY KEY, attempt_identity TEXT NOT NULL,
             identity_json TEXT NOT NULL, cache_key TEXT NOT NULL, envelope_json TEXT NOT NULL, envelope_bytes INTEGER NOT NULL);
           INSERT OR IGNORE INTO committed_result
             SELECT generation,attempt_identity,identity_json,cache_key,envelope_json,envelope_bytes FROM catalog_entry")?;
-        validate(db)?;
-        // A crash after the schema COMMIT but before its directory flush is
-        // resumed here. No BEGIN acknowledgement is possible until the
-        // database/journal directory entries have crossed this durability
-        // barrier on a subsequent worker start.
-        fault("migration-resume-before-directory-sync");
-        return sync_directory();
+            validate(db)
+        })();
+        return match initialized {
+            Ok(()) => {
+                exec(db, "COMMIT")?;
+                // A crash after the schema COMMIT but before its directory flush is
+                // resumed here. No BEGIN acknowledgement is possible until the
+                // database/journal directory entries have crossed this durability
+                // barrier on a subsequent worker start.
+                fault("migration-resume-before-directory-sync");
+                sync_directory()
+            }
+            Err(error) => {
+                let _ = exec(db, "ROLLBACK");
+                Err(error)
+            }
+        };
     }
     if version != 0 && version != 44305 && version != 44306 {
         return Err("SCHEMA_VERSION".into());
@@ -939,7 +1062,6 @@ fn schema(db: &Db) -> Result<(), String> {
         // initialized, or pre-versioned authority must never be reset to one.
         return Err("VERSION_ZERO_NONEMPTY".into());
     }
-    exec(db, "BEGIN IMMEDIATE")?;
     let migrated = (|| {
         let maximum = if version == 0 { 0 } else { legacy_maximum(db)? };
         let (audit_sequence, audit_hash) = if version == 0 {
@@ -1104,16 +1226,31 @@ fn apply_external_legacy(authority: &Db, snapshot: LegacySnapshot) -> Result<(),
     } = snapshot;
     exec(authority, "BEGIN IMMEDIATE")?;
     let result = (|| {
-        if scalar(
+        let existing_source = scalar(
             authority,
             "SELECT source_version FROM migration_state WHERE singleton=1",
-        )? != 0
-            || scalar(
+        )?;
+        let existing_generation = scalar(
+            authority,
+            "SELECT generation FROM authority_state WHERE singleton=1",
+        )?;
+        if existing_source != 0 || existing_generation != 0 {
+            let burned = scalar(
                 authority,
-                "SELECT generation FROM authority_state WHERE singleton=1",
-            )? != 0
-        {
-            return Err("MIGRATION_RACE".into());
+                "SELECT burned_generation FROM migration_state WHERE singleton=1",
+            )?;
+            // Another startup may have imported the same retained authority
+            // while this process was taking its snapshot. Treat only that exact
+            // completed import (possibly followed by newer allocations) as the
+            // same initialization; all divergent state remains a hard failure.
+            return if existing_source == version
+                && burned == maximum
+                && existing_generation >= maximum
+            {
+                Ok(())
+            } else {
+                Err("MIGRATION_RACE".into())
+            };
         }
         let state = Statement::new(
             authority,
@@ -1278,7 +1415,7 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
             }
             return Err("LEGACY_OPEN".into());
         }
-        let legacy = Db { raw };
+        let legacy = Db::legacy(raw);
         let snapshot = legacy_snapshot(&legacy);
         drop(legacy);
         posix_vfs::clear_legacy_handle();
@@ -1383,7 +1520,7 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         }
         return Err("LEGACY_OPEN".into());
     }
-    let legacy = Db { raw };
+    let legacy = Db::legacy(raw);
     let reopened = std::fs::symlink_metadata(&path).map_err(|_| "LEGACY_REPLACED")?;
     if reopened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || reopened.volume_serial_number().ok_or("LEGACY_REPLACED")? as u64 != expected_identity.0
@@ -1945,18 +2082,8 @@ fn main() {
         Some(v) => v,
         None => return,
     };
-    if enter_root(&cache_home).is_err() {
-        return;
-    }
-    let db = match open_db().and_then(|db| {
-        schema(&db)?;
-        import_external_legacy(&db)?;
-        Ok(db)
-    }) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let mut db = Some(db);
+    let mut db: Option<Db> = None;
+    let mut root_entered = false;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut out = io::BufWriter::new(io::stdout().lock());
@@ -1969,13 +2096,45 @@ fn main() {
             Ok(v) => v,
             Err(_) => break,
         };
+        let request_id = request.id().to_string();
+        let deadline = request.deadline();
+        let needs_db = !matches!(&request, Request::Close { .. });
+        if needs_db && db.is_none() {
+            let initialized: Result<Db, String> = (|| -> Result<Db, String> {
+                if !root_entered {
+                    enter_root(&cache_home)?;
+                    root_entered = true;
+                }
+                let opened = open_db(deadline)?;
+                schema(&opened)?;
+                opened.check_deadline()?;
+                import_external_legacy(&opened)?;
+                opened.check_deadline()?;
+                Ok(opened)
+            })();
+            match initialized {
+                Ok(opened) => db = Some(opened),
+                Err(code) => {
+                    let reply = fail(&request_id, &code);
+                    let _ = writeln!(out, "{}", reply).and_then(|_| out.flush());
+                    break;
+                }
+            }
+        }
+        if let Some(current) = db.as_mut() {
+            current.set_deadline(deadline);
+        }
         let (id, result, close) = match request {
             Request::BeginAttempt {
                 id,
                 started_at,
                 scope_hash,
+                ..
             } => {
-                let r = with_db(&db, |current| begin(current, started_at, &scope_hash));
+                let r = with_db(&db, |current| {
+                    current.check_deadline()?;
+                    begin(current, started_at, &scope_hash)
+                });
                 (id, r, false)
             }
             Request::BindAndRead {
@@ -1983,8 +2142,10 @@ fn main() {
                 generation,
                 attempt_identity,
                 identity,
+                ..
             } => {
                 let r = with_db(&db, |current| {
+                    current.check_deadline()?;
                     bind(current, generation, &attempt_identity, &identity)
                 });
                 (id, r, false)
@@ -1997,8 +2158,10 @@ fn main() {
                 envelope_json,
                 observed_at,
                 expires_at,
+                ..
             } => {
                 let r = with_db(&db, |current| {
+                    current.check_deadline()?;
                     finalize(
                         current,
                         generation,
@@ -2016,13 +2179,15 @@ fn main() {
                 generation,
                 attempt_identity,
                 identity,
+                ..
             } => {
                 let r = with_db(&db, |current| {
+                    current.check_deadline()?;
                     resolve(current, generation, &attempt_identity, &identity)
                 });
                 (id, r, false)
             }
-            Request::Close { id } => {
+            Request::Close { id, .. } => {
                 drop(db.take());
                 #[cfg(windows)]
                 let _ = windows_vfs::release();
@@ -2201,7 +2366,7 @@ mod tests {
     fn retention_caps_catalog_admissions_and_audit_with_anchor() {
         let fixture = FixtureRoot::new("retention");
         enter_root(fixture.path.to_str().unwrap()).unwrap();
-        let db = open_db().unwrap();
+        let db = open_db(Instant::now() + Duration::from_secs(10)).unwrap();
         schema(&db).unwrap();
         assert_eq!(posix_vfs::retained_handle_count(), 2);
         for i in 1..=140i64 {
