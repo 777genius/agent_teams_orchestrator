@@ -31,6 +31,15 @@ struct WindowsRootComponent {
 #[cfg(windows)]
 static WINDOWS_ROOT_HANDLES: std::sync::OnceLock<Vec<WindowsRootComponent>> =
     std::sync::OnceLock::new();
+#[cfg(windows)]
+struct WindowsRootMarker {
+    path: std::path::PathBuf,
+    handle: std::fs::File,
+    volume: u64,
+    index: u64,
+}
+#[cfg(windows)]
+static WINDOWS_ROOT_MARKER: std::sync::OnceLock<WindowsRootMarker> = std::sync::OnceLock::new();
 #[cfg(unix)]
 struct UnixRootComponent {
     fd: c_int,
@@ -595,11 +604,11 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         // Creation is not a trust check. Whether this component was already
         // present or was just created, only the opened no-follow handle below
         // establishes its type and identity.
-        let created = match std::fs::create_dir(&cursor) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        match std::fs::create_dir(&cursor) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(_) => return Err("ROOT_MKDIR".into()),
-        };
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -618,15 +627,11 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
             index: opened_identity.1,
             handle: file,
         });
-        // Retain the non-delete-sharing handle before the durability sync. It
-        // prevents a checked component from being swapped and restored while
-        // child components are captured or the final root is validated.
-        if created {
-            fault("root-before-directory-sync");
-            let parent_path = cursor.parent().ok_or("ROOT_HANDLE")?;
-            sync_windows_directory_path(parent_path, "ROOT_SYNC")?;
-        }
+        // Retain the non-delete-sharing handle before consulting durability
+        // state. It prevents a checked component from being swapped and
+        // restored while child components and the marker are captured.
     }
+    confirm_windows_root(&target, &held)?;
     std::env::set_current_dir(&target).map_err(|_| "ROOT_CHDIR")?;
     WINDOWS_ROOT_HANDLES.set(held).map_err(|_| "ROOT_HANDLES")?;
     Ok(())
@@ -659,6 +664,249 @@ fn validate_windows_root() -> Result<(), String> {
             || held_identity != (component.volume, component.index)
             || named_identity != (component.volume, component.index)
         {
+            return Err("ROOT_REPLACED".into());
+        }
+    }
+    let marker = WINDOWS_ROOT_MARKER.get().ok_or("ROOT_STATE")?;
+    let held = marker.handle.metadata().map_err(|_| "ROOT_STATE")?;
+    let named_handle = open_windows_state_file(&marker.path, false)?.ok_or("ROOT_STATE")?;
+    let named = named_handle.metadata().map_err(|_| "ROOT_STATE")?;
+    let held_identity =
+        windows_identity::file_identity(&marker.handle).map_err(|_| "ROOT_STATE")?;
+    let named_identity =
+        windows_identity::file_identity(&named_handle).map_err(|_| "ROOT_STATE")?;
+    if !held.is_file()
+        || !named.is_file()
+        || held.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || held_identity != (marker.volume, marker.index)
+        || named_identity != (marker.volume, marker.index)
+    {
+        return Err("ROOT_STATE".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+const WINDOWS_ROOT_STATE_MAX: u64 = 128;
+#[cfg(windows)]
+const WINDOWS_ROOT_PENDING: &str = ".root-durability-v1.pending";
+#[cfg(windows)]
+const WINDOWS_ROOT_CONFIRMED: &str = ".root-durability-v1.confirmed";
+
+#[cfg(windows)]
+fn windows_root_state(held: &[WindowsRootComponent]) -> Vec<u8> {
+    let mut identity = b"opencode-root-durability-v1\0".to_vec();
+    for component in held {
+        identity.extend_from_slice(&component.volume.to_be_bytes());
+        identity.extend_from_slice(&component.index.to_be_bytes());
+    }
+    format!("opencode-root-durability-v1 {}\n", sha256_hex(&identity)).into_bytes()
+}
+
+#[cfg(windows)]
+fn open_windows_state_file(
+    path: &Path,
+    delete_sharing: bool,
+) -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let sharing = FILE_SHARE_READ
+        | if delete_sharing {
+            FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            0
+        };
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(sharing)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("ROOT_STATE".into()),
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_state_file(
+    file: &mut std::fs::File,
+    expected: Option<&[u8]>,
+) -> Result<(), String> {
+    let contents = windows_state_contents(file)?;
+    if expected.is_some_and(|value| contents != value) {
+        return Err("ROOT_STATE".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_state_contents(file: &mut std::fs::File) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek};
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let metadata = file.metadata().map_err(|_| "ROOT_STATE")?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > WINDOWS_ROOT_STATE_MAX
+    {
+        return Err("ROOT_STATE".into());
+    }
+    file.rewind().map_err(|_| "ROOT_STATE")?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(WINDOWS_ROOT_STATE_MAX + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| "ROOT_STATE")?;
+    if contents.len() as u64 > WINDOWS_ROOT_STATE_MAX {
+        return Err("ROOT_STATE".into());
+    }
+    Ok(contents)
+}
+
+#[cfg(windows)]
+fn create_windows_state_file(
+    path: &Path,
+    contents: &[u8],
+    delete_sharing: bool,
+) -> Result<std::fs::File, String> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let sharing = FILE_SHARE_READ
+        | if delete_sharing {
+            FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            0
+        };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(sharing)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+        .open(path)
+        .map_err(|_| "ROOT_STATE")?;
+    if path.file_name().and_then(|value| value.to_str()) == Some(WINDOWS_ROOT_CONFIRMED)
+        && std::env::var("OPENCODE_CATALOG_TEST_FAULT").ok().as_deref()
+            == Some("exit:root-during-confirmation-write")
+    {
+        file.write_all(&contents[..contents.len().min(16)])
+            .map_err(|_| "ROOT_STATE")?;
+        file.sync_all().map_err(|_| "ROOT_STATE")?;
+        std::process::exit(86);
+    }
+    file.write_all(contents).map_err(|_| "ROOT_STATE")?;
+    file.sync_all().map_err(|_| "ROOT_STATE")?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn retain_windows_root_marker(
+    path: std::path::PathBuf,
+    mut file: std::fs::File,
+    expected: &[u8],
+) -> Result<(), String> {
+    validate_windows_state_file(&mut file, Some(expected))?;
+    let identity = windows_identity::file_identity(&file).map_err(|_| "ROOT_STATE")?;
+    WINDOWS_ROOT_MARKER
+        .set(WindowsRootMarker {
+            path,
+            handle: file,
+            volume: identity.0,
+            index: identity.1,
+        })
+        .map_err(|_| "ROOT_STATE")
+}
+
+#[cfg(windows)]
+fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<(), String> {
+    let pending_path = target.join(WINDOWS_ROOT_PENDING);
+    let confirmed_path = target.join(WINDOWS_ROOT_CONFIRMED);
+    let expected = windows_root_state(held);
+
+    let mut pending = open_windows_state_file(&pending_path, true)?;
+    if let Some(file) = pending.as_mut() {
+        validate_windows_state_file(file, None)?;
+    }
+    let mut confirmed = open_windows_state_file(&confirmed_path, false)?;
+    if let Some(file) = confirmed.as_mut() {
+        // A committed marker is immutable: corruption or an identity mismatch
+        // is never repaired into authority. The sole exception is a strict
+        // prefix written while a pending marker still proves that confirmation
+        // creation was interrupted; that partial file is removed before all
+        // barriers are retried.
+        if let Err(error) = validate_windows_state_file(file, Some(&expected)) {
+            let contents = windows_state_contents(file)?;
+            if pending.is_none()
+                || contents.len() >= expected.len()
+                || !expected.starts_with(&contents)
+            {
+                return Err(error);
+            }
+            drop(confirmed.take());
+            std::fs::remove_file(&confirmed_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
+            sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+        } else if pending.is_some() {
+            drop(pending.take());
+            fault("root-before-state-cleanup");
+            std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
+            sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+            return retain_windows_root_marker(confirmed_path, confirmed.unwrap(), &expected);
+        } else {
+            return retain_windows_root_marker(confirmed_path, confirmed.unwrap(), &expected);
+        }
+    }
+
+    // The pending entry is a durable, authority-bounded indication that no
+    // root-chain acknowledgement exists. Missing state is also unconfirmed.
+    // Either case takes every parent barrier on every retry.
+    let mut pending = match pending {
+        Some(file) => file,
+        None => create_windows_state_file(&pending_path, b"unconfirmed\n", true)?,
+    };
+    pending.sync_all().map_err(|_| "ROOT_STATE")?;
+    sync_windows_directory_path(target, "ROOT_STATE_SYNC")?;
+
+    for component in held.iter().skip(1) {
+        fault("root-before-directory-sync");
+        let parent = component.path.parent().ok_or("ROOT_HANDLE")?;
+        sync_windows_directory_path(parent, "ROOT_SYNC")?;
+        validate_windows_root_components(held)?;
+    }
+
+    let confirmed = match create_windows_state_file(&confirmed_path, &expected, false) {
+        Ok(file) => file,
+        Err(_) => {
+            let mut file = open_windows_state_file(&confirmed_path, false)?.ok_or("ROOT_STATE")?;
+            validate_windows_state_file(&mut file, Some(&expected))?;
+            file
+        }
+    };
+    sync_windows_directory_path(target, "ROOT_STATE_SYNC")?;
+    drop(pending);
+    fault("root-before-state-cleanup");
+    std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
+    sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+    // A newly created marker handle still has write access. Close it and
+    // recapture the immutable marker read-only so its share mask both blocks
+    // later mutation and permits same-object validation opens.
+    drop(confirmed);
+    let confirmed = open_windows_state_file(&confirmed_path, false)?.ok_or("ROOT_STATE")?;
+    retain_windows_root_marker(confirmed_path, confirmed, &expected)
+}
+
+#[cfg(windows)]
+fn validate_windows_root_components(held: &[WindowsRootComponent]) -> Result<(), String> {
+    for component in held {
+        let actual =
+            windows_identity::file_identity(&component.handle).map_err(|_| "ROOT_REPLACED")?;
+        if actual != (component.volume, component.index) {
             return Err("ROOT_REPLACED".into());
         }
     }
