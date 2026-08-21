@@ -71,7 +71,12 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('EXTENDED_STARTUPINFO_PRESENT')
     expect(source).toContain('OPENCODE_CATALOG_LAUNCHER_TEST_GATE')
     expect(source).not.toContain('AssignProcessToJobObject')
-    expect(source).not.toContain('named_after')
+    expect(source).toContain('named_after')
+    expect(source).toContain('same_object')
+    expect(source).toContain('before.nFileIndexHigh == after.nFileIndexHigh')
+    expect(source).toContain('--verified-opencode-host-v1')
+    expect(source).toContain('actual_ino != expected_ino')
+    expect(source).toContain('actual_size != expected_size')
     expect(source).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE')
   })
 

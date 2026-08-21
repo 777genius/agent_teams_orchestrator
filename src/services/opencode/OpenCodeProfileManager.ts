@@ -71,6 +71,7 @@ import {
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import {
   canonicalSerializeOpenCodePolicyIdentity,
+  deriveOpenCodeScopedHostKeyFromPlanDigest,
   planScopedProfile,
   resolveOpenCodeOperationPolicy,
   type OpenCodePreservedPlugin,
@@ -4553,6 +4554,17 @@ export class OpenCodeProfileManager {
             state: 'ready',
           })
         }
+        const catalogAttemptPlan = catalogPurpose ? {
+          schema: 'opencode-catalog-attempt-plan-v1' as const,
+          basePlanDigest: expectedPlan.digest,
+          runtimeInstanceId,
+          profileRootKey,
+          profileRootPath,
+          configDirectory: catalogConfigPath,
+        } : null
+        const scopedPlanDigest = catalogAttemptPlan
+          ? canonicalFingerprint(catalogAttemptPlan)
+          : expectedPlan.digest
         const preparedProfile: OpenCodeScopedPreparedProfile = {
           scopeSchema: 'opencode-scoped-profile-v1',
           policy,
@@ -4563,8 +4575,9 @@ export class OpenCodeProfileManager {
           canonicalProjectPathFingerprint: canonicalFingerprint(projectPath),
           executionProjectPath: projectBehaviorSnapshotPath,
           profileLayoutGeneration,
-          scopedPlanDigest: expectedPlan.digest,
-          plannedHostKey: expectedPlan.expectedHostKey,
+          catalogAttemptPlan,
+          scopedPlanDigest,
+          plannedHostKey: deriveOpenCodeScopedHostKeyFromPlanDigest(scopedPlanDigest),
           operationKey: policy.identity.operationKey,
           profileKey: policy.identity.profileKey!,
           pluginKey: policy.identity.pluginKey!,

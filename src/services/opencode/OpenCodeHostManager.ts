@@ -16,6 +16,7 @@ import {
 } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeCatalogAuthorityClient.js'
 import {
   OpenCodeSafePublicationDirectory,
   withOpenCodeSafePublicationDirectory,
@@ -387,6 +388,8 @@ function canonicalWindowsPath(value: string): string {
 export type VerifiedScopedBinary = {
   profile: OpenCodeScopedPreparedProfile
   fileHandle: FileHandle
+  /** Stable object identity captured from the same descriptor as verified bytes. */
+  objectIdentity: Readonly<{ dev: string; ino: string; size: string }> | null
   /** Close the manager-owned descriptor at most once, including after transfer failures. */
   close: () => Promise<void>
 }
@@ -394,11 +397,13 @@ export type VerifiedScopedBinary = {
 export function bindVerifiedScopedBinaryHandle(
   profile: OpenCodeScopedPreparedProfile,
   fileHandle: FileHandle,
+  objectIdentity: VerifiedScopedBinary['objectIdentity'] = null,
 ): VerifiedScopedBinary {
   let ownedHandle: FileHandle | null = fileHandle
   return {
     profile,
     fileHandle,
+    objectIdentity,
     close: async () => {
       const handle = ownedHandle
       ownedHandle = null
@@ -679,6 +684,7 @@ export async function stageScopedHostBinary(
   }
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(stagedDirectory)
   let fileHandle: FileHandle | null = null
+  let objectIdentity: VerifiedScopedBinary['objectIdentity'] = null
   let stagedHandleVerified = false
   try {
     await publicationDirectory.publishImmutableFile('opencode', sourceBytes, 0o500)
@@ -694,6 +700,16 @@ export async function stageScopedHostBinary(
     if (createHash('sha256').update(publishedBytes).digest('hex') !== profile.binaryFingerprint) {
       throw new Error('OpenCode staged binary fingerprint verification failed')
     }
+    const identity = await fileHandle.stat({ bigint: true })
+    if (!identity.isFile() || identity.dev === 0n || identity.ino === 0n
+      || identity.size !== BigInt(publishedBytes.length)) {
+      throw new Error('OpenCode staged binary object identity is unavailable')
+    }
+    objectIdentity = Object.freeze({
+      dev: identity.dev.toString(),
+      ino: identity.ino.toString(),
+      size: identity.size.toString(),
+    })
     await fileHandle.chmod(0o500)
     assertCurrent()
     stagedHandleVerified = true
@@ -718,6 +734,7 @@ export async function stageScopedHostBinary(
     const transferred = bindVerifiedScopedBinaryHandle(
       { ...profile, binaryPath: stagedPath },
       fileHandle!,
+      objectIdentity,
     )
     fileHandle = null
     return transferred
@@ -980,6 +997,18 @@ async function assertValidScopedPreparedProfile(profile: OpenCodeScopedPreparedP
     profile.profileRootPath,
     `prepare-${profile.operationKey.split(':').at(-1)}.lock`,
   )
+  const projectSnapshotPath = path.join(
+    profile.profileRootPath,
+    profile.expectedEntryManifest.projectBehaviorSnapshotPath,
+  )
+  const catalogAttemptPlan = profile.catalogAttemptPlan
+  const catalogPurpose = profile.purpose === 'provider-catalog'
+  const expectedConfigDirectory = catalogPurpose
+    ? path.join(profile.profileRootPath, 'catalog-project-config')
+    : projectSnapshotPath
+  const basePlanDigest = catalogPurpose && catalogAttemptPlan
+    ? catalogAttemptPlan.basePlanDigest
+    : profile.scopedPlanDigest
   const bridge = profile.nativeCredentialBridge
   const expectedBridgeBinPath = path.join(profile.profileRootPath, 'native-subscription-cli-bin')
   if (
@@ -1046,14 +1075,8 @@ async function assertValidScopedPreparedProfile(profile: OpenCodeScopedPreparedP
     || profile.env.XDG_CACHE_HOME !== profile.xdgCacheHome
     || profile.env.OPENCODE_DISABLE_CLAUDE_CODE !== '1'
     || profile.env.OPENCODE_CONFIG !== undefined
-    || profile.env.OPENCODE_CONFIG_DIR !== path.join(
-      profile.profileRootPath,
-      profile.expectedEntryManifest.projectBehaviorSnapshotPath,
-    )
-    || profile.executionProjectPath !== path.join(
-      profile.profileRootPath,
-      profile.expectedEntryManifest.projectBehaviorSnapshotPath,
-    )
+    || profile.env.OPENCODE_CONFIG_DIR !== expectedConfigDirectory
+    || profile.executionProjectPath !== projectSnapshotPath
     || profile.env.OPENCODE_DISABLE_PROJECT_CONFIG !== '1'
     || profile.env.OPENCODE_CONFIG_CONTENT !== JSON.stringify(profile.managedConfig)
     || !isNonblankString(profile.env.NPM_CONFIG_CACHE)
@@ -1082,8 +1105,8 @@ async function assertValidScopedPreparedProfile(profile: OpenCodeScopedPreparedP
     ))
     || fingerprints.binary !== profile.binaryFingerprint
     || fingerprints.layout !== hashText(canonicalSerializeOpenCodePolicyIdentity(
-      profile.scopedPlanDigest
-        ? { profileLayoutGeneration: profile.profileLayoutGeneration, planDigest: profile.scopedPlanDigest }
+      basePlanDigest
+        ? { profileLayoutGeneration: profile.profileLayoutGeneration, planDigest: basePlanDigest }
         : profile.profileLayoutGeneration,
     ))
     || !/^[a-f0-9]{64}$/.test(profile.scopedPlanDigest)
@@ -1146,7 +1169,28 @@ async function assertValidScopedPreparedProfile(profile: OpenCodeScopedPreparedP
     if (actual !== expected || profile.policy.identity[`${kind}Key` as keyof typeof profile.policy.identity] !== actual) fail()
   }
   if (profile.profileScopeIdentity !== hashText(canonicalSerializeOpenCodePolicyIdentity(canonicalInput))) fail()
-  if (profile.profileRootKey !== profile.profileScopeIdentity) fail()
+  if (catalogPurpose) {
+    if (
+      !catalogAttemptPlan
+      || catalogAttemptPlan.schema !== 'opencode-catalog-attempt-plan-v1'
+      || !/^[a-f0-9]{64}$/.test(catalogAttemptPlan.basePlanDigest)
+      || catalogAttemptPlan.runtimeInstanceId !== profile.runtimeInstanceId
+      || catalogAttemptPlan.profileRootKey !== profile.profileRootKey
+      || catalogAttemptPlan.profileRootPath !== profile.profileRootPath
+      || catalogAttemptPlan.configDirectory !== expectedConfigDirectory
+      || profile.profileRootKey !== `${profile.profileScopeIdentity}-catalog-${hashText(
+        canonicalSerializeOpenCodePolicyIdentity(profile.runtimeInstanceId),
+      )}`
+      || hashText(canonicalSerializeOpenCodePolicyIdentity(catalogAttemptPlan))
+        !== profile.scopedPlanDigest
+    ) fail()
+    const configMetadata = await lstat(expectedConfigDirectory).catch(() => null)
+    const canonicalConfigDirectory = await realpath(expectedConfigDirectory).catch(() => null)
+    if (!configMetadata?.isDirectory() || configMetadata.isSymbolicLink()
+      || canonicalConfigDirectory !== path.resolve(expectedConfigDirectory)) fail()
+  } else if (catalogAttemptPlan !== null || profile.profileRootKey !== profile.profileScopeIdentity) {
+    fail()
+  }
   if (profile.profileLayoutGeneration !== '1') fail()
   if (
     !/^[a-f0-9]{64}$/.test(profile.binaryFingerprint)
@@ -1383,6 +1427,53 @@ export function buildOpenCodeHostSpawnOptions(
   }
 }
 
+export function resolveOpenCodeVerifiedHostLauncherPath(): string {
+  const sourceRuntime = import.meta.url.endsWith('.ts')
+  if (sourceRuntime) {
+    return resolveOpenCodeCatalogSourceArtifacts(path.resolve(import.meta.dir, '../../..'))
+      .launcherPath
+  }
+  const bunHostedBundle = /(?:^|[\\/])bun(?:\.exe)?$/i.test(process.execPath)
+  const packaged = bunHostedBundle ? import.meta.dir : path.dirname(process.execPath)
+  return path.join(packaged, 'opencode-catalog-launcher.exe')
+}
+
+export function buildOpenCodeVerifiedScopedHostCommand(
+  profile: OpenCodeScopedPreparedProfile,
+  verifiedScopedBinary: VerifiedScopedBinary,
+  platform: NodeJS.Platform = process.platform,
+  architecture: string = process.arch,
+  windowsLauncherPath: string = resolveOpenCodeVerifiedHostLauncherPath(),
+): Readonly<{ binaryPath: string; args: string[]; inheritedVerifiedFd: boolean }> {
+  if (verifiedScopedBinary.profile.binaryPath !== profile.binaryPath) {
+    throw new Error('OpenCode scoped host requires verified staged bytes')
+  }
+  const serveArgs = ['serve', '--hostname', '127.0.0.1', '--port']
+  if (platform === 'linux' || platform === 'darwin') {
+    return Object.freeze({
+      binaryPath: platform === 'linux' ? '/proc/self/fd/3' : '/dev/fd/3',
+      args: serveArgs,
+      inheritedVerifiedFd: true,
+    })
+  }
+  if (platform === 'win32' && (architecture === 'x64' || architecture === 'arm64')) {
+    // The native launcher retains delete/write-denying handles for the staged
+    // executable and every ancestor, compares object identity after suspended
+    // CreateProcess, and owns the descendant in a kill-on-close job.
+    const identity = verifiedScopedBinary.objectIdentity
+    if (!identity) {
+      throw new Error('OpenCode scoped Windows executable identity is unavailable')
+    }
+    return Object.freeze({
+      binaryPath: windowsLauncherPath,
+      args: [profile.binaryPath, '--verified-opencode-host-v1',
+        identity.dev, identity.ino, identity.size, ...serveArgs],
+      inheritedVerifiedFd: false,
+    })
+  }
+  throw new Error('OpenCode scoped verified-handle execution is unsupported on this platform')
+}
+
 function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {}
@@ -1422,6 +1513,10 @@ function normalizePersistentHostLeases(value: unknown): Record<string, Persisten
 
 export class OpenCodeHostManager {
   private readonly hosts = new Map<string, ManagedHostEntry>()
+  private readonly disposingHosts = new Map<string, Readonly<{
+    entry: ManagedHostEntry
+    promise: Promise<void>
+  }>>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
@@ -2589,22 +2684,27 @@ export class OpenCodeHostManager {
       return this.deps.spawnHostProcess(profile, port)
     }
 
-    const spawnOptions = buildOpenCodeHostSpawnOptions(profile, process.platform, { lifetime })
+    const platform = this.deps.platform ?? process.platform
+    const spawnOptions = buildOpenCodeHostSpawnOptions(profile, platform, { lifetime })
+    let args = ['serve', '--hostname', '127.0.0.1', '--port']
     const binaryPath = isScopedPreparedProfile(profile)
       ? (() => {
-          if (!verifiedScopedBinary || verifiedScopedBinary.profile.binaryPath !== profile.binaryPath) {
+          if (!verifiedScopedBinary) {
             throw new Error('OpenCode scoped host requires verified staged bytes')
           }
-          if (process.platform === 'linux' || process.platform === 'darwin') {
+          const command = buildOpenCodeVerifiedScopedHostCommand(
+            profile, verifiedScopedBinary, platform, process.arch,
+          )
+          args = command.args
+          if (command.inheritedVerifiedFd) {
             spawnOptions.stdio = ['pipe', 'pipe', 'pipe', verifiedScopedBinary.fileHandle.fd]
-            return process.platform === 'linux' ? '/proc/self/fd/3' : '/dev/fd/3'
           }
-          throw new Error('OpenCode scoped verified-handle execution is unsupported on this platform')
+          return command.binaryPath
         })()
       : resolveOpenCodeBinaryPath() ?? 'opencode'
     return spawnPortableCli(
       binaryPath,
-      ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
+      [...args, String(port)],
       spawnOptions,
     )
   }
@@ -2838,8 +2938,9 @@ export class OpenCodeHostManager {
     child.stdout?.destroy()
     child.stderr?.destroy()
     child.stdin?.destroy()
-    this.hosts.delete(receipt.record.hostKey)
-    this.pendingHosts.delete(receipt.record.hostKey)
+    if (this.hosts.get(receipt.record.hostKey) === entry) {
+      this.hosts.delete(receipt.record.hostKey)
+    }
     // The owned child emitted/confirmed exit, so do not reclassify that known
     // fact through a PID liveness probe that could observe immediate PID reuse.
     await this.cleanupOpenTuiTempArtifactsIfUnused(receipt.profileTmpPath)
@@ -3329,8 +3430,9 @@ export class OpenCodeHostManager {
       entry.child?.stdin?.destroy()
       entry.handle.state = 'disposed'
     }
-    this.hosts.delete(record.hostKey)
-    this.pendingHosts.delete(record.hostKey)
+    if (entry && this.hosts.get(record.hostKey) === entry) {
+      this.hosts.delete(record.hostKey)
+    }
     await this.cleanupOpenTuiTempArtifactsIfUnused(
       options.cleanupTempPath
         ?? entry?.handle.profile.tmpPath
@@ -3369,7 +3471,8 @@ export class OpenCodeHostManager {
     }
     await this.withPersistentHostStartupLock(hostKey, () =>
       this.withPersistentRegistryLock(async () => {
-        if (this.hosts.get(hostKey) !== entry) {
+        if (this.hosts.get(hostKey) !== entry
+          && this.disposingHosts.get(hostKey)?.entry !== entry) {
           throw new Error('OpenCode adopted host registry compare-and-swap failed [redacted]')
         }
         const registry = await this.readPersistentRegistryUnlocked()
@@ -3479,28 +3582,63 @@ export class OpenCodeHostManager {
     )
   }
 
-  async disposeHost(hostKey: string): Promise<boolean> {
+  async disposeHost(
+    hostKey: string,
+    controls: { restoreOnFailure?: boolean } = {},
+  ): Promise<boolean> {
     const pending = this.pendingHosts.has(hostKey)
       || this.pendingHostGenerations.has(hostKey)
       || this.scopedStagingGenerations.has(hostKey)
     this.scopedStagingGenerations.delete(hostKey)
     this.pendingHostGenerations.delete(hostKey)
     this.pendingHosts.delete(hostKey)
+    const inFlightDisposal = this.disposingHosts.get(hostKey)
+    if (inFlightDisposal) {
+      await inFlightDisposal.promise
+      return true
+    }
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return pending
     }
-
-    if (!entry.ownedByProcess && entry.adoptedRegistryReceipt) {
-      await this.disposeAdoptedPersistentHost(hostKey, entry)
-      return true
+    // Remove the zero-ref entry before the first disposal await. A concurrent
+    // ensure can now only create/adopt a fresh host; it cannot reacquire bytes
+    // whose process is already committed to termination.
+    const previousState = entry.handle.state
+    if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
+    if (!Object.isFrozen(entry.handle)) entry.handle.state = 'disposed'
+    publicHostHandleSnapshots.delete(entry.handle)
+    let disposal!: Promise<void>
+    disposal = Promise.resolve().then(async () => {
+      if (!entry.ownedByProcess && entry.adoptedRegistryReceipt) {
+        await this.disposeAdoptedPersistentHost(hostKey, entry)
+        return
+      }
+      if (entry.ownedByProcess) {
+        await this.disposeCreatedHost(hostKey, entry)
+        return
+      }
+      throw new Error('OpenCode host disposal ownership receipt is unavailable [redacted]')
+    }).finally(() => {
+      if (this.disposingHosts.get(hostKey)?.promise === disposal) {
+        this.disposingHosts.delete(hostKey)
+      }
+    })
+    this.disposingHosts.set(hostKey, { entry, promise: disposal })
+    try {
+      await disposal
+    } catch (error) {
+      // Explicit administrative disposal remains retryable after a failed
+      // compare-and-swap. Zero-ref release opts out: such an entry must never
+      // become reusable after disposal has begun.
+      if (controls.restoreOnFailure !== false
+        && !this.hosts.has(hostKey) && !this.pendingHosts.has(hostKey)) {
+        if (!Object.isFrozen(entry.handle)) entry.handle.state = previousState
+        this.hosts.set(hostKey, entry)
+      }
+      throw error
     }
-
-    if (entry.ownedByProcess) {
-      await this.disposeCreatedHost(hostKey, entry)
-      return true
-    }
-    throw new Error('OpenCode host disposal ownership receipt is unavailable [redacted]')
+    return true
   }
 
   async disposeUnregisteredOwnedHosts(): Promise<{
@@ -3890,9 +4028,11 @@ export class OpenCodeHostManager {
         return
       }
       if (entry.ownedByProcess) {
-        await this.disposeHost(hostKey)
+        await this.disposeHost(hostKey, { restoreOnFailure: false })
       } else {
-        this.hosts.delete(hostKey)
+        // Adopted entries are reusable only while referenced. Remove them
+        // synchronously so a racing ensure must revalidate durable ownership.
+        if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
       }
     }
   }

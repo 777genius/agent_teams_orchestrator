@@ -113,16 +113,35 @@ fn main() {
         Some(v) => v,
         None => std::process::exit(125),
     };
-    let cache = match args.next() {
-        Some(v) => v,
-        None => std::process::exit(125),
+    let mut forwarded = args.collect::<Vec<_>>();
+    if forwarded.is_empty() {
+        std::process::exit(125)
+    }
+    if worker.to_string_lossy().contains('"')
+        || forwarded
+            .iter()
+            .any(|value| value.to_string_lossy().contains('"'))
+    {
+        std::process::exit(125)
+    }
+    let expected_object = if forwarded.first().and_then(|value| value.to_str())
+        == Some("--verified-opencode-host-v1")
+    {
+        if forwarded.len() < 5 {
+            std::process::exit(125)
+        }
+        let parsed = forwarded[1..4]
+            .iter()
+            .map(|value| value.to_str().and_then(|text| text.parse::<u64>().ok()))
+            .collect::<Vec<_>>();
+        if parsed.iter().any(Option::is_none) {
+            std::process::exit(125)
+        }
+        forwarded.drain(0..4);
+        Some((parsed[0].unwrap(), parsed[1].unwrap(), parsed[2].unwrap()))
+    } else {
+        None
     };
-    if args.next().is_some() {
-        std::process::exit(125)
-    }
-    if worker.to_string_lossy().contains('"') || cache.to_string_lossy().contains('"') {
-        std::process::exit(125)
-    }
     let worker_path = std::path::PathBuf::from(&worker);
     if !worker_path.is_absolute() {
         std::process::exit(126)
@@ -190,11 +209,28 @@ fn main() {
     {
         std::process::exit(126)
     }
-    let command = format!(
-        "\"{}\" \"{}\"",
-        worker.to_string_lossy(),
-        cache.to_string_lossy()
-    );
+    if let Some((expected_dev, expected_ino, expected_size)) = expected_object {
+        let actual_ino = ((before.nFileIndexHigh as u64) << 32) | before.nFileIndexLow as u64;
+        let actual_size = ((before.nFileSizeHigh as u64) << 32) | before.nFileSizeLow as u64;
+        if before.dwVolumeSerialNumber as u64 != expected_dev
+            || actual_ino != expected_ino
+            || actual_size != expected_size
+        {
+            std::process::exit(126)
+        }
+    }
+    // Inputs containing quotes are rejected above. Doubling trailing
+    // backslashes before the closing quote preserves the exact Windows argv.
+    let quote = |value: &std::ffi::OsStr| {
+        let text = value.to_string_lossy();
+        let trailing = text.chars().rev().take_while(|c| *c == '\\').count();
+        format!("\"{}{}\"", text, "\\".repeat(trailing))
+    };
+    let command = std::iter::once(worker.as_os_str())
+        .chain(forwarded.iter().map(|value| value.as_os_str()))
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut command_w = std::ffi::OsStr::new(&command)
         .encode_wide()
         .chain([0])
@@ -271,6 +307,41 @@ fn main() {
     };
     unsafe { DeleteProcThreadAttributeList(attributes) };
     if created == 0 {
+        std::process::exit(126)
+    }
+    // CreateProcess consumed a pathname. While the retained no-share-write /
+    // no-share-delete handles make replacement fail, compare the named object
+    // again before allowing the suspended child to execute so this invariant
+    // remains explicit and fail-closed on every supported Windows filesystem.
+    let named_after = unsafe {
+        CreateFileW(
+            worker_w.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut after = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let same_object = named_after != INVALID_HANDLE_VALUE
+        && unsafe { GetFileInformationByHandle(named_after, &mut after) } != 0
+        && after.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && before.dwVolumeSerialNumber == after.dwVolumeSerialNumber
+        && before.nFileIndexHigh == after.nFileIndexHigh
+        && before.nFileIndexLow == after.nFileIndexLow;
+    if named_after != INVALID_HANDLE_VALUE {
+        unsafe { CloseHandle(named_after) };
+    }
+    if !same_object {
+        unsafe {
+            TerminateProcess(process.hProcess, 126);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            CloseHandle(job);
+            CloseHandle(held);
+        }
         std::process::exit(126)
     }
     // PROC_THREAD_ATTRIBUTE_JOB_LIST attached the kill-on-close job as part of
