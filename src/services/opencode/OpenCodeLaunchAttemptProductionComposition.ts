@@ -11,7 +11,11 @@ type Output = Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>>
 
 export type OpenCodeLaunchAttemptProductionRuntime = {
   /** Read-only S1 authorization; must run before the durable ledger gate. */
-  authorize(command: Command): Promise<Command>
+  authorize(command: Command, controls: Readonly<{
+    signal: AbortSignal
+    deadlineAtMs: number
+    remainingMs(): number
+  }>): Promise<Command>
   /** Durable, read-only gate. Null is the only result that authorizes effects. */
   inspect(command: Command): Promise<Output | null>
   executeAfterPreflight(command: Command): Promise<{
@@ -69,8 +73,40 @@ export function createOpenCodeLaunchAttemptProductionBridge(
     }
 
     override async execute(command: Command): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
-      const authorized = await runtime.authorize(command)
-      return context.run({ command: authorized }, () => super.execute(authorized))
+      const budget = command.outerRemainingBudgetMs ?? command.requestedBudgetMs
+      const deadlineAtMs = performance.now() + Math.max(0, budget)
+      const controller = new AbortController()
+      const abort = () => controller.abort(command.signal?.reason
+        ?? new Error('OpenCode launch authorization cancelled'))
+      command.signal?.addEventListener('abort', abort, { once: true })
+      const timeout = setTimeout(() => controller.abort(
+        new Error('OpenCode launch absolute deadline expired during authorization'),
+      ), Math.max(0, deadlineAtMs - performance.now()))
+      timeout.unref?.()
+      const controls = Object.freeze({
+        signal: controller.signal,
+        deadlineAtMs,
+        remainingMs: () => Math.max(0, deadlineAtMs - performance.now()),
+      })
+      const boundary = new Promise<never>((_, reject) => {
+        const rejectAbort = () => reject(controller.signal.reason)
+        if (controller.signal.aborted) rejectAbort()
+        else controller.signal.addEventListener('abort', rejectAbort, { once: true })
+      })
+      try {
+        const authorized = await Promise.race([
+          runtime.authorize({ ...command, signal: controller.signal }, controls), boundary,
+        ])
+        const remaining = controls.remainingMs()
+        if (remaining <= 0) throw controller.signal.reason
+          ?? new Error('OpenCode launch absolute deadline expired during authorization')
+        const boundedCommand = { ...authorized, signal: controller.signal,
+          outerRemainingBudgetMs: remaining }
+        return await context.run({ command: boundedCommand }, () => super.execute(boundedCommand))
+      } finally {
+        clearTimeout(timeout)
+        command.signal?.removeEventListener('abort', abort)
+      }
     }
   }
 

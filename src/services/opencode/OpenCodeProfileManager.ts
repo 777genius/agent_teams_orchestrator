@@ -2225,6 +2225,21 @@ function deepMergeOpenCodeConfig(
   return merged
 }
 
+/** Execution-only catalog projection; canonical config is read-only input. */
+function projectProviderCatalogConfig(
+  imported: Record<string, unknown>,
+  providerId: string,
+): Record<string, unknown> {
+  const rawProvider = asRecord(asRecord(imported.provider)[providerId])
+  const { models: _verboseModels, ...selectedProvider } = rawProvider
+  return {
+    autoupdate: false,
+    provider: Object.keys(selectedProvider).length > 0
+      ? { [providerId]: selectedProvider }
+      : {},
+  }
+}
+
 export function applyOpenCodeManagedSubscriptionPlugins(
   config: Record<string, unknown>,
 ): void {
@@ -2404,6 +2419,7 @@ export async function probeNativeCredentialIdentity(
   executablePath: string,
   platform: NodeJS.Platform,
   environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ): Promise<{ reportsAuthenticated: boolean; accountIdentity: string | null }> {
   const args = providerId === 'kiro' ? ['whoami', '--format', 'json'] : ['status']
   return new Promise(resolve => {
@@ -2412,6 +2428,7 @@ export async function probeNativeCredentialIdentity(
       windowsHide: true,
       shell: platform === 'win32',
       env: environment,
+      signal,
     }, (error, stdout, stderr) => {
       const reportsAuthenticated = providerId === 'kiro'
         ? isKiroCliWhoamiAuthenticated({ error, stdout, stderr })
@@ -2975,9 +2992,14 @@ export function orderOpenCodeAuthSyncSources(input: {
   return sources
 }
 
-async function normalizeScopedProjectPath(projectPath?: string | null): Promise<string> {
+async function normalizeScopedProjectPath(
+  projectPath?: string | null,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
   const resolved = path.resolve(projectPath?.trim() || getCwd())
   const canonical = await realpath(resolved).catch(() => resolved)
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
   const normalized = path.normalize(canonical)
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
@@ -3535,19 +3557,22 @@ export class OpenCodeProfileManager {
       ? canonicalizeOpenCodeProviderId(requestedSnapshot.providerId)
       : null
     if (!providerId) throw new Error('OpenCode scoped planning requires a provider id')
-    const projectPath = await normalizeScopedProjectPath(requestedSnapshot.projectPath)
+    const projectPath = await normalizeScopedProjectPath(requestedSnapshot.projectPath, signal)
     const hostEnvironment = { ...process.env }
     const binaryPath = resolveOpenCodeBinaryPath()
     if (!binaryPath) throw new Error('OpenCode scoped planning requires the OpenCode binary')
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
       || path.join(os.homedir(), '.config')
-    const [behavior, binaryFingerprint, preservedPlugins, automaticUserPluginEntries] =
+    const catalogPurpose = requestedSnapshot.purpose === 'provider-catalog'
+    const [behavior, binaryFingerprint, discoveredPlugins, discoveredUserPluginEntries] =
       await Promise.all([
         collectProjectBehaviorMetadata(projectPath, this.platform),
         fingerprintScopedBinary(binaryPath),
         collectScopedPreservedPlugins(projectPath, hostEnvironment),
         collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
       ])
+    const preservedPlugins = catalogPurpose ? [] : discoveredPlugins
+    const automaticUserPluginEntries = catalogPurpose ? [] : discoveredUserPluginEntries
     if (signal?.aborted) throwOpenCodeAbortReason(signal)
 
     // Never silently discard ordinary user/project/environment plugins.  A
@@ -3628,6 +3653,7 @@ export class OpenCodeProfileManager {
         nativeTargetExecutablePath!,
         process.platform,
         hostEnvironment,
+        signal,
       ).catch(() => ({ reportsAuthenticated: false, accountIdentity: null }))
       nativeCredentialProofFingerprint = canonicalFingerprint({
         providerId,
@@ -3687,6 +3713,9 @@ export class OpenCodeProfileManager {
         await readSafeOpenCodeRuntimeConfigFile(configPath),
       )
     }
+    if (catalogPurpose) {
+      importedRuntimeConfig = projectProviderCatalogConfig(importedRuntimeConfig, providerId)
+    }
     const modelId = requestedSnapshot.modelId?.trim() || null
     const automaticUserPluginFingerprint = canonicalFingerprint(automaticUserPluginEntries)
     const initialFingerprints = {
@@ -3709,12 +3738,14 @@ export class OpenCodeProfileManager {
     const appMcpConfig = preliminaryPolicy.appMcp === 'enabled'
       ? await this.resolveManagedAppMcpConfig()
       : null
-    const managedConfig = deepMergeOpenCodeConfig(importedRuntimeConfig, buildManagedConfig(appMcpConfig, {
+    const managedConfig = catalogPurpose
+      ? projectProviderCatalogConfig(importedRuntimeConfig, providerId)
+      : deepMergeOpenCodeConfig(importedRuntimeConfig, buildManagedConfig(appMcpConfig, {
       allowAutoUpdate: isOpenCodeAutoUpdateAllowed(hostEnvironment),
       defaultModelId: modelId,
       toolApprovalMode: preliminaryPolicy.toolApproval === 'auto' ? 'auto' : undefined,
     }))
-    if (preliminaryPolicy.toolApproval === 'none') {
+    if (preliminaryPolicy.toolApproval === 'none' && !catalogPurpose) {
       managedConfig.agent = Object.fromEntries(
         Object.entries(asRecord(managedConfig.agent)).map(([agentName, rawAgent]) => [agentName, {
           ...asRecord(rawAgent), tools: { '*': false }, permission: { '*': 'deny' },
@@ -3929,7 +3960,7 @@ export class OpenCodeProfileManager {
     // publication, and child inheritance must all observe the same inputs.
     const hostEnvironment = { ...process.env }
 
-    const projectPath = await normalizeScopedProjectPath(plan.projectPath)
+    const projectPath = await normalizeScopedProjectPath(plan.projectPath, preparationSignal)
     assertPreparationActive()
     const binaryPath = resolveOpenCodeBinaryPath()
     if (!binaryPath) throw new Error('OpenCode binary is required for scoped profile preparation')
@@ -3977,16 +4008,19 @@ export class OpenCodeProfileManager {
     let profileTransactionCommitted = false
     let catalogAttemptRootCreated = false
     try {
+    const catalogPurpose = plan.purpose === 'provider-catalog'
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
       || path.join(os.homedir(), '.config')
     const userPluginDirectory = path.join(userConfigRoot, 'opencode', 'plugins')
     behaviorCapture = await captureProjectBehaviorMetadata(projectPath, this.platform)
     const behavior = behaviorCapture
-    const [binaryFingerprint, preservedPlugins, automaticUserPluginEntries] = await Promise.all([
+    const [binaryFingerprint, discoveredPlugins, discoveredUserPluginEntries] = await Promise.all([
       fingerprintScopedBinary(binaryPath),
       collectScopedPreservedPlugins(projectPath, hostEnvironment),
       collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
     ])
+    const preservedPlugins = catalogPurpose ? [] : discoveredPlugins
+    const automaticUserPluginEntries = catalogPurpose ? [] : discoveredUserPluginEntries
     assertPreparationActive()
     const automaticUserPluginFingerprint = canonicalFingerprint(automaticUserPluginEntries)
     if (expectedPlan && (
@@ -3996,7 +4030,8 @@ export class OpenCodeProfileManager {
       || expectedPlan.profileLayoutFingerprint !== canonicalFingerprint(profileLayoutGeneration)
       || expectedPlan.automaticUserPluginFingerprint !== automaticUserPluginFingerprint
     )) throw new Error('OpenCode scoped planned project or binary evidence drifted [redacted]')
-    const pluginConfigCandidates = getScopedPluginConfigCandidates(projectPath, hostEnvironment)
+    const pluginConfigCandidates = catalogPurpose
+      ? [] : getScopedPluginConfigCandidates(projectPath, hostEnvironment)
     const configuredPluginsWithoutInline = (await Promise.all(
       pluginConfigCandidates.map(([configPath, provenance]) =>
         readConfiguredPlugins(configPath, provenance)),
@@ -4096,6 +4131,7 @@ export class OpenCodeProfileManager {
         nativeCommand,
         process.platform,
         hostEnvironment,
+        preparationSignal,
       ).catch(() => ({ reportsAuthenticated: false, accountIdentity: null }))
       const nativeBytesAfterProof = await fingerprintScopedBinary(nativeCommand)
       if (nativeBytesAfterProof !== nativeTargetExecutableFingerprint) {
@@ -4153,6 +4189,9 @@ export class OpenCodeProfileManager {
         await readSafeOpenCodeRuntimeConfigFile(configPath),
       )
     }
+    if (catalogPurpose) {
+      importedRuntimeConfig = projectProviderCatalogConfig(importedRuntimeConfig, providerId)
+    }
     const policyPreservedPlugins = preservedPlugins.map(plugin => ({
       ...plugin,
       packageName: expectedPlan?.plugins.find(planned =>
@@ -4207,15 +4246,17 @@ export class OpenCodeProfileManager {
     const appMcpConfig = preliminaryPolicy.appMcp === 'enabled'
       ? await this.resolveManagedAppMcpConfig()
       : null
-    const managedConfig = deepMergeOpenCodeConfig(
-      importedRuntimeConfig,
-      buildManagedConfig(appMcpConfig, {
+    const managedConfig = catalogPurpose
+      ? projectProviderCatalogConfig(importedRuntimeConfig, providerId)
+      : deepMergeOpenCodeConfig(
+        importedRuntimeConfig,
+        buildManagedConfig(appMcpConfig, {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(hostEnvironment),
         defaultModelId: modelId,
         toolApprovalMode: preliminaryPolicy.toolApproval === 'auto' ? 'auto' : undefined,
       }),
-    )
-    if (preliminaryPolicy.toolApproval === 'none') {
+      )
+    if (preliminaryPolicy.toolApproval === 'none' && !catalogPurpose) {
       managedConfig.agent = Object.fromEntries(
         Object.entries(asRecord(managedConfig.agent)).map(([agentName, rawAgent]) => [
           agentName,
@@ -4310,6 +4351,7 @@ export class OpenCodeProfileManager {
       policy.identity.cacheKey.split(':').at(-1)!,
     )
     const pluginNodeModulesPath = path.join(xdgConfigHome, 'opencode', 'node_modules')
+    const catalogConfigPath = path.join(profileRootPath, 'catalog-project-config')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const preparationLockPath = path.join(profileRootPath, `prepare-${policy.identity.operationKey.split(':').at(-1)!}.lock`)
 
@@ -4346,6 +4388,12 @@ export class OpenCodeProfileManager {
         path.dirname(managedAuthPath), this.paths.data, undefined, this.platform,
         this.paths.dataTrustedRoot, preparationSignal,
       )
+      if (catalogPurpose) {
+        await ensureOpenCodeManagedDirectoryPath(
+          catalogConfigPath, this.paths.data, undefined, this.platform,
+          this.paths.dataTrustedRoot, preparationSignal,
+        )
+      }
       await ensureOpenCodeManagedDirectoryPath(
         xdgCacheHome, this.paths.cache, undefined, this.platform, this.paths.cacheTrustedRoot,
         preparationSignal,
@@ -4482,7 +4530,7 @@ export class OpenCodeProfileManager {
           [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
           OPENCODE_DISABLE_CLAUDE_CODE: '1',
           OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
-          OPENCODE_CONFIG_DIR: projectBehaviorSnapshotPath,
+          OPENCODE_CONFIG_DIR: catalogPurpose ? catalogConfigPath : projectBehaviorSnapshotPath,
           OPENCODE_DISABLE_PROJECT_CONFIG: '1',
         })
         delete env.OPENCODE_CONFIG

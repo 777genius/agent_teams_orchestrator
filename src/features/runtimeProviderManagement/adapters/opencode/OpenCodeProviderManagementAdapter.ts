@@ -70,6 +70,7 @@ import {
   type OpenCodeManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
+import { canonicalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 import type {
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
@@ -233,6 +234,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   managedPreferences?: {
     /** Resolves the stable project preference scope, never an operation-attempt profile. */
     resolveProjectRoot?(projectPath: string): string
+    canonicalizeProjectIdentity?(projectPath: string): Promise<string>
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     readGlobal?(dataRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     clearProjectDefaultModel?(profileRootPath: string): Promise<unknown>
@@ -3208,6 +3210,13 @@ export class OpenCodeProviderManagementAdapter
       }
   }
 
+  private async resolveCanonicalPreferenceRoot(projectPath: string): Promise<string> {
+    const preferences = this.getManagedPreferences()
+    const canonical = await (this.deps.managedPreferences?.canonicalizeProjectIdentity
+      ?? canonicalizeOpenCodeProjectIdentity)(projectPath)
+    return preferences.resolveProjectRoot(canonical)
+  }
+
   private getProfileManager() {
     return this.deps.profileManager ?? openCodeProfileManager
   }
@@ -4000,7 +4009,9 @@ export class OpenCodeProviderManagementAdapter
       }, signal))
       const managedPreferences = this.getManagedPreferences()
       const [preferencesResult, globalPreferencesResult] = await Promise.all([
-        safeRead(() => managedPreferences.read(managedPreferences.resolveProjectRoot(scoped.projectPath))),
+        safeRead(async () => managedPreferences.read(
+          await this.resolveCanonicalPreferenceRoot(scoped.projectPath),
+        )),
         safeRead(() => managedPreferences.readGlobal(resolveClaudeMultimodelPaths().data)),
       ])
       const preferences = preferencesResult.ok ? preferencesResult.value : null
@@ -5037,7 +5048,9 @@ export class OpenCodeProviderManagementAdapter
           }
           await managedPreferences.setAllProjectsDefaultModel(modelId)
         } else {
-          await managedPreferences.setDefaultModel(profile.profileRootPath, modelId)
+          await managedPreferences.setDefaultModel(
+            await this.resolveCanonicalPreferenceRoot(inventory.projectPath), modelId,
+          )
         }
         this.invalidateDirectoryCache()
         inventoryService.clearCache?.()
@@ -5093,7 +5106,7 @@ export class OpenCodeProviderManagementAdapter
     }
     try {
       const managedPreferences = this.getManagedPreferences()
-      const preferenceRoot = managedPreferences.resolveProjectRoot(projectPath)
+      const preferenceRoot = await this.resolveCanonicalPreferenceRoot(projectPath)
       await managedPreferences.clearProjectDefaultModel(preferenceRoot)
       this.invalidateDirectoryCache()
       // Clearing a configured preference is deliberately independent of

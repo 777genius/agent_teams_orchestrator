@@ -21,6 +21,8 @@ export type OpenCodeClient = {
   getConfig(): Promise<OpenCodeConfigResponse>
   getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
+  /** Provider-scoped catalog route. It deliberately has no full-inventory fallback. */
+  getProviderCatalog(providerId: string): Promise<unknown>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc(): Promise<OpenCodeServerDocResponse>
   authorizeProviderOAuth(
@@ -262,6 +264,10 @@ export class OpenCodeClientFactory {
       getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
       getProviders: () => request<OpenCodeProviderResponse>(
         '/provider', undefined, DEFAULT_REQUEST_TIMEOUT_MS, PROVIDER_RESPONSE_BODY_MAX_BYTES,
+      ),
+      getProviderCatalog: providerId => request<unknown>(
+        `/provider/${encodeURIComponent(providerId)}`, undefined,
+        DEFAULT_REQUEST_TIMEOUT_MS, PROVIDER_RESPONSE_BODY_MAX_BYTES,
       ),
       getProviderAuth: () =>
         request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
