@@ -66,7 +66,8 @@ describe('OpenCode transactional storage integration isolation', () => {
 
       const allocation = await allocateOpenCodeProviderCatalogAttempt(`${canonical}\0deepinfra`, 1_000)
       expect(allocation.requestGeneration).toBeGreaterThan(0)
-      const catalogPath = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v2', 'attempts.sqlite')
+      const catalogPath = path.join(cacheHome, 'opencode',
+        'provider-catalog-authority-v44307', 'authority.sqlite')
       expect(catalogPath).not.toBe(passivePath)
       const catalog = new Database(catalogPath)
       catalog.exec('BEGIN EXCLUSIVE')
@@ -99,14 +100,15 @@ describe('OpenCode transactional storage integration isolation', () => {
     const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
     process.env.CLAUDE_MULTIMODEL_CACHE_HOME = parent
     try {
-      const root = path.join(parent, 'opencode', 'provider-catalog-attempts-v2')
+      const root = path.join(parent, 'opencode', 'provider-catalog-authority-v44307')
       await mkdir(root, { recursive: true, mode: 0o700 })
-      const databasePath = path.join(root, 'attempts.sqlite')
+      const databasePath = path.join(root, 'authority.sqlite')
       const database = new Database(databasePath)
       try { database.exec('CREATE TABLE foreign_allocator(value INTEGER); INSERT INTO foreign_allocator VALUES (443)') }
       finally { database.close(false) }
       await chmod(databasePath, 0o600)
-      expect(() => allocateOpenCodeProviderCatalogAttempt('foreign-schema', 1_000)).toThrow('temporarily unavailable')
+      await expect(allocateOpenCodeProviderCatalogAttempt('foreign-schema', 1_000))
+        .rejects.toThrow('VERSION_ZERO_NONEMPTY')
       const retained = new Database(databasePath, { readonly: true })
       try { expect(retained.query<{ value: number }, []>('SELECT value FROM foreign_allocator').get()?.value).toBe(443) }
       finally { retained.close(false) }

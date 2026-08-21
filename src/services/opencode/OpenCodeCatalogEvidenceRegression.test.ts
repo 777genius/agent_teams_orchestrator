@@ -113,6 +113,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher catalog evidence', () => {
           providerId: plan.providerId, projectPath: '/canonical/project', profileRootPath: '/profile',
           binaryFingerprint: old ? 'binary-old' : 'binary-new',
           managedConfigFingerprint: old ? 'config-old' : 'config-new', selectedAuthBaselineFingerprint: 'auth',
+          plannedHostKey: old ? 'binary-old' : 'binary-new',
           policy: { inventory: 'selected-provider-only', inventoryFallback: 'forbidden', launchAuthorization: 'forbidden' } }
       },
       ensureHost: async ({ preparedProfile }) => {
