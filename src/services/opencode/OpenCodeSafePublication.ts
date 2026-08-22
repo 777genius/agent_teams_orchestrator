@@ -2,10 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { constants as fsConstants, fsyncSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
+import {
+  OpenCodeWindowsPublicationAuthorityClient,
+  type OpenCodeWindowsPublicationAuthorityFactory,
+} from './OpenCodeWindowsPublicationAuthorityClient.js'
 
 export type OpenCodeSafePublicationTransaction = Readonly<{
   commit(): Promise<void>
   rollback(): Promise<void>
+}>
+
+export type OpenCodeSafePublicationOpenOptions = Readonly<{
+  abortSignal?: AbortSignal
+  deadline?: number
+  windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
 }>
 
 function fail(): never {
@@ -33,30 +43,32 @@ export class OpenCodeSafePublicationDirectory {
   readonly #handle: FileHandle | null
   readonly #root: string
   readonly #windowsIdentity: { dev: bigint; ino: bigint } | null
+  readonly #windowsAuthority: OpenCodeWindowsPublicationAuthorityClient | null
 
-  private constructor(
+  constructor(
     handle: FileHandle | null,
     root?: string,
     windowsIdentity: { dev: bigint; ino: bigint } | null = null,
+    windowsAuthority: OpenCodeWindowsPublicationAuthorityClient | null = null,
   ) {
     this.#handle = handle
     this.#root = root ?? descriptorRoot(handle!.fd)
     this.#windowsIdentity = windowsIdentity
+    this.#windowsAuthority = windowsAuthority
   }
 
-  static async open(directoryPath: string): Promise<OpenCodeSafePublicationDirectory> {
+  static async open(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
     if (process.platform === 'win32') {
       const resolved = path.resolve(directoryPath)
-      const before = await lstat(resolved, { bigint: true }).catch(fail)
-      const canonical = await realpath(resolved).catch(fail)
-      if (!before.isDirectory() || before.isSymbolicLink()
-        || canonical.replace(/^\\\\\?\\/, '').toLowerCase()
-          !== resolved.replace(/^\\\\\?\\/, '').toLowerCase()
-        || (before.dev === 0n && before.ino === 0n)) fail()
-      return new OpenCodeSafePublicationDirectory(null, resolved, {
-        dev: before.dev,
-        ino: before.ino,
+      const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
+        deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
       })
+      try {
+        const identity = await authority.openRoot(resolved, false, false)
+        return new OpenCodeSafePublicationDirectory(null, resolved, {
+          dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId),
+        }, authority)
+      } catch (error) { await authority.close(); throw error }
     }
     descriptorRoot(0)
     const resolved = path.resolve(directoryPath)
@@ -89,14 +101,8 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async #assertWindowsRoot(): Promise<void> {
-    if (!this.#windowsIdentity) return
-    const metadata = await lstat(this.#root, { bigint: true }).catch(fail)
-    const canonical = await realpath(this.#root).catch(fail)
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()
-      || metadata.dev !== this.#windowsIdentity.dev
-      || metadata.ino !== this.#windowsIdentity.ino
-      || canonical.replace(/^\\\\\?\\/, '').toLowerCase()
-        !== this.#root.replace(/^\\\\\?\\/, '').toLowerCase()) fail()
+    if (!this.#windowsAuthority) return
+    await this.#windowsAuthority.validateRoot().catch(fail)
   }
 
   /** Descriptor-root path for composing additional no-follow directory operations. */
@@ -110,6 +116,17 @@ export class OpenCodeSafePublicationDirectory {
     const metadata = await this.#handle!.stat({ bigint: true }).catch(fail)
     if (!metadata.isDirectory()) fail()
     return { dev: metadata.dev, ino: metadata.ino }
+  }
+
+  async validate(): Promise<void> {
+    if (this.#windowsAuthority) return this.#assertWindowsRoot()
+    const metadata = await this.#handle!.stat().catch(fail)
+    if (!metadata.isDirectory()) fail()
+  }
+
+  /** Retains the primary SQLite object without delete sharing until this directory closes. */
+  async pinRegularFile(name: string): Promise<void> {
+    if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name)).catch(fail)
   }
 
   async openChildDirectory(name: string): Promise<OpenCodeSafePublicationDirectory> {
@@ -204,10 +221,8 @@ export class OpenCodeSafePublicationDirectory {
 
   /** Durably records prior immutable child creation before a commit is exposed. */
   async sync(): Promise<void> {
-    // Windows does not expose directory fsync through Node. Publication still
-    // uses FlushFileBuffers for each file; Windows CI exercises the no-replace
-    // namespace operations. POSIX additionally persists directory entries.
-    await this.#handle?.sync().catch(fail)
+    if (this.#windowsAuthority) await this.#windowsAuthority.syncRoot().catch(fail)
+    else await this.#handle?.sync().catch(fail)
     await this.#assertWindowsRoot()
   }
 
@@ -536,7 +551,8 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async close(): Promise<void> {
-    await this.#handle?.close()
+    if (this.#windowsAuthority) await this.#windowsAuthority.close()
+    else await this.#handle?.close()
   }
 }
 
@@ -545,8 +561,20 @@ export async function ensureOpenCodeSafePublicationDirectory(
   directoryPath: string,
   durableAncestors = false,
   afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
+  options: OpenCodeSafePublicationOpenOptions = {},
 ): Promise<OpenCodeSafePublicationDirectory> {
   const resolved = path.resolve(directoryPath)
+  if (process.platform === 'win32') {
+    const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
+      deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
+    })
+    try {
+      const identity = await authority.openRoot(resolved, true, durableAncestors)
+      for (const created of identity.createdPaths) await afterCreatedEntrySynced?.(created)
+      return new OpenCodeSafePublicationDirectory(null, resolved,
+        { dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId) }, authority)
+    } catch (error) { await authority.close(); throw error }
+  }
   const missing: string[] = []
   let cursor = resolved
   for (;;) {

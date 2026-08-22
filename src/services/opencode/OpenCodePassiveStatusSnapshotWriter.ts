@@ -25,6 +25,10 @@ type SnapshotWriterDeps = Readonly<{
   writeAtomic?: (filePath: string, data: string) => Promise<void>
   safeStorageHooks?: {
     afterRootOpened?: () => void | Promise<void>
+    afterDatabasePinned?: () => void | Promise<void>
+    beforeDatabaseOpen?: () => void | Promise<void>
+    afterDatabaseClosed?: () => void | Promise<void>
+    afterRootClosed?: () => void | Promise<void>
     afterTransactionMarker?: () => void | Promise<void>
     afterGenerationDirectoryCreated?: () => void | Promise<void>
     afterProjectSnapshotPublished?: () => void | Promise<void>

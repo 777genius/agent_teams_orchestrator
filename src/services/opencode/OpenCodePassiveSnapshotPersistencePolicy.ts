@@ -5,7 +5,7 @@ export type OpenCodePassiveSnapshotPersistenceCapability =
   | Readonly<{ supported: true; implementation: 'verified-windows-path' }>
   | Readonly<{ supported: false; implementation: 'unavailable' }>
 
-/** Pure platform policy for the app-owned, identity-verified snapshot store. */
+/** Pure platform policy; Windows uses the retained native root/file authority. */
 export function getOpenCodePassiveSnapshotPersistenceCapability(
   platform: NodeJS.Platform = process.platform,
 ): OpenCodePassiveSnapshotPersistenceCapability {

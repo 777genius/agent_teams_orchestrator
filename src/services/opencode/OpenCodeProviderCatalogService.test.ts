@@ -51,6 +51,27 @@ async function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
 }
 
 describe.serial('OpenCodeProviderCatalogService native ownership', () => {
+  test('settles prepared auth once before host work and rolls back validation failures once', async () => {
+    const order: string[] = []; let rollbacks = 0
+    const f = await fixture({ finalizePreparedProfile: async () => { order.push('finalize') },
+      ensureHost: async () => { order.push('host'); return { hostKey: 'fake-host', baseUrl: 'http://127.0.0.1:48003' } } })
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = f.cache
+    try {
+      await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/settlement' })
+      expect(order).toEqual(['finalize', 'host'])
+      const invalid = await fixture({ prepareProfile: async plan => ({ purpose: 'provider-catalog',
+        providerId: plan.providerId, projectPath: plan.projectPath, profileRootPath: '/invalid',
+        binaryFingerprint: '', managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth',
+        plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile),
+      rollbackPreparedProfile: async () => { rollbacks += 1 } })
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = invalid.cache
+      await expect(invalid.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/invalid' }))
+        .rejects.toThrow('temporarily unavailable')
+      expect(rollbacks).toBe(1)
+    } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
+  })
+
   test('arms one deadline before canonicalization and preempts abort-ignoring preparation', async () => {
     let fire!: () => void; let signal!: AbortSignal
     const f = await fixture({ setTimer: ((callback: () => void) => {

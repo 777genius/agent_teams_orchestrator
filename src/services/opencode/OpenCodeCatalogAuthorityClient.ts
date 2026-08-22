@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -14,6 +14,14 @@ import {
   type OpenCodeCatalogFinalizeReply,
   type OpenCodeCatalogResolveReply,
 } from './OpenCodeCatalogAuthorityProtocol.js'
+import {
+  launchOpenCodeNativeAuthority,
+  resolveOpenCodeNativeAuthorityArtifacts,
+  verifyOpenCodeNativeAuthorityArtifacts,
+  type OpenCodeNativeAuthorityChild as Child,
+} from './OpenCodeNativeAuthorityArtifacts.js'
+
+export { resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeNativeAuthorityArtifacts.js'
 
 const COMMIT_RESOLVE_RESERVE_MS = 250
 type WithoutWait<T> = T extends unknown ? Omit<T, 'wait_ms'> : never
@@ -39,15 +47,6 @@ export class OpenCodeCatalogAbortError extends Error {
     this.name = 'OpenCodeCatalogAbortError'
   }
 }
-
-type Child = Readonly<{
-  pid: number
-  stdin: { write(value: string): number; end(): void }
-  stdout: ReadableStream<Uint8Array>
-  exited: Promise<number>
-  kill(signal?: NodeJS.Signals | number): void
-  unref(): void
-}>
 
 export type OpenCodeCatalogAuthorityLaunch = (input: Readonly<{
   cacheHome: string
@@ -80,77 +79,18 @@ function cacheHome(): string {
     'claude-multimodel-nodejs')
 }
 
-function artifactName(base: string): string {
-  return `${base}${process.platform === 'win32' ? '.exe' : ''}`
-}
-
-export function resolveOpenCodeCatalogSourceArtifacts(sourceRoot: string,
-  platform: NodeJS.Platform = process.platform,
-  exists: (filePath: string) => boolean = existsSync): {
-    launcherPath: string; workerPath: string; profile: 'release' | 'debug' | 'missing'
-  } {
-  const suffix = platform === 'win32' ? '.exe' : ''
-  const pair = (profile: 'release' | 'debug') => ({
-    launcherPath: path.join(sourceRoot, 'native', 'opencode-catalog-launcher', 'target', profile,
-      `opencode-catalog-launcher${suffix}`),
-    workerPath: path.join(sourceRoot, 'native', 'opencode-catalog-authority', 'target', profile,
-      `opencode-catalog-authority${suffix}`),
-  })
-  for (const profile of ['release', 'debug'] as const) {
-    const candidate = pair(profile)
-    if (exists(candidate.launcherPath) && exists(candidate.workerPath)) return { ...candidate, profile }
-  }
-  return { ...pair('release'), profile: 'missing' }
-}
-
 function resolveArtifacts(options: OpenCodeCatalogAuthorityClientOptions): {
   launcherPath: string; workerPath: string
 } {
-  if (options.launcherPath && options.workerPath) {
-    return { launcherPath: options.launcherPath, workerPath: options.workerPath }
-  }
-  const bunHostedBundle = /(?:^|[\\/])bun(?:\.exe)?$/i.test(process.execPath)
-  const packaged = bunHostedBundle ? import.meta.dir : path.dirname(process.execPath)
-  const sourceRoot = path.resolve(import.meta.dir, '../../..')
-  const launcherName = artifactName('opencode-catalog-launcher')
-  const workerName = artifactName('opencode-catalog-authority')
-  const sourceRuntime = import.meta.url.endsWith('.ts')
-  const source = resolveOpenCodeCatalogSourceArtifacts(sourceRoot)
-  return {
-    launcherPath: options.launcherPath ?? (sourceRuntime
-      ? source.launcherPath
-      : path.join(packaged, launcherName)),
-    workerPath: options.workerPath ?? (sourceRuntime
-      ? source.workerPath
-      : path.join(packaged, workerName)),
-  }
-}
-
-function verifyRegularOwnedArtifact(filePath: string): void {
-  const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  try {
-    const held = fstatSync(fd, { bigint: true })
-    const named = lstatSync(filePath, { bigint: true })
-    if (!held.isFile() || !named.isFile() || named.isSymbolicLink()
-      || held.dev !== named.dev || held.ino !== named.ino
-      || (typeof process.getuid === 'function' && held.uid !== BigInt(process.getuid()))
-      // Windows mode bits are synthesized as 0666 even when the containing
-      // release ACL is not writable. The native launcher supplies the real
-      // delete/write-denying same-object check there.
-      || (process.platform !== 'win32' && (held.mode & 0o022n) !== 0n)) {
-      throw new Error('untrusted native catalog artifact')
-    }
-  } finally { closeSync(fd) }
+  return resolveOpenCodeNativeAuthorityArtifacts(options)
 }
 
 function productionLaunch(input: Readonly<{ cacheHome: string; launcherPath: string; workerPath: string }>): Child {
   // The launcher opens and retains the worker with no-follow and executes that
   // exact object (execveat/fexecve, or a delete-denying Windows handle + job).
   // Bun only names the small launcher; it never names the authority worker.
-  return Bun.spawn({
-    cmd: [input.launcherPath, input.workerPath, input.cacheHome],
-    stdin: 'pipe', stdout: 'pipe', stderr: 'ignore',
-  }) as unknown as Child
+  return launchOpenCodeNativeAuthority({ launcherPath: input.launcherPath,
+    workerPath: input.workerPath, argument: input.cacheHome })
 }
 
 export class OpenCodeCatalogAuthorityClient {
@@ -176,8 +116,7 @@ export class OpenCodeCatalogAuthorityClient {
       if (!existsSync(artifacts.launcherPath) || !existsSync(artifacts.workerPath)) {
         throw new Error('native catalog artifacts are missing; run ./cli-source --prepare-native-catalog')
       }
-      verifyRegularOwnedArtifact(artifacts.launcherPath)
-      verifyRegularOwnedArtifact(artifacts.workerPath)
+      verifyOpenCodeNativeAuthorityArtifacts(artifacts)
     }
     this.#child = (options.launch ?? productionLaunch)({
       cacheHome: options.cacheHome ?? cacheHome(), ...artifacts,

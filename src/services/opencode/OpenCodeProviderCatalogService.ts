@@ -19,6 +19,10 @@ import {
   prepareOpenCodeProviderCatalogProductionProfile,
   type OpenCodeProviderCatalogProductionProfileManager,
 } from './OpenCodeProviderCatalogProduction.js'
+import {
+  finalizeOpenCodeScopedProfileAuth,
+  rollbackOpenCodeScopedProfileAuth,
+} from './OpenCodeScopedProfileAuthPublication.js'
 
 import type { OpenCodeScopedPreparedProfile } from './types.js'
 
@@ -406,6 +410,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     const workDeadline = deadline - cleanupReserveMs
     let authority: AuthorityAttempt | null = null
     let profile: OpenCodeScopedPreparedProfile | null = null
+    let profileSettled = false
     let hostKey: string | null = null
     let acknowledgedPrior: Persisted | null = null
     let resultAfterCommit: OpenCodeProviderCatalogLoadResult | null = null
@@ -471,6 +476,10 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       }
       if (controller.signal.aborted || performance.now() >= workDeadline) throw failure()
       const identity = profileIdentity(profile, providerId, projectOf(profile, canonicalProjectPath))
+      const finalizePrepared = this.deps.finalizePreparedProfile
+        ?? (this.deps.prepareProfile ? async () => {} : finalizeOpenCodeScopedProfileAuth)
+      await within(finalizePrepared(profile))
+      profileSettled = true
       const boundIdentity = authorityIdentity(identity)
       const bound = await within(authority.bindAndRead(begun.generation, begun.attemptIdentity, boundIdentity))
       if (bound.previousEnvelope !== null) {
@@ -578,7 +587,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // An uncertain host release keeps both the HostManager ownership and the
       // attempt profile intact for bounded janitor/reconciliation. Deleting
       // its live filesystem would falsely claim cleanup and strand the host.
-      if (profile && !authority?.committed && !hostKey) scheduleProfileCleanup(profile)
+      if (profile && !profileSettled) {
+        const rollbackPrepared = this.deps.rollbackPreparedProfile
+          ?? (this.deps.prepareProfile ? async () => {} : rollbackOpenCodeScopedProfileAuth)
+        try { await rollbackPrepared(profile); profileSettled = true } catch {}
+      }
+      if (profile && profileSettled && !authority?.committed && !hostKey) scheduleProfileCleanup(profile)
       if (authority?.committed) {
         void Promise.resolve().then(() => authority?.close()).catch(() => undefined)
       } else {

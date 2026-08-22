@@ -21,7 +21,7 @@ const profileAuthTransactions = new WeakMap<object, ProfileAuthTransactionRecord
 const signalAuthTransactions = new WeakMap<AbortSignal, ProfileAuthTransactionRecord>()
 
 const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) => {
-  const directory = await OpenCodeSafePublicationDirectory.open(directoryPath)
+  const directory = await OpenCodeSafePublicationDirectory.open(directoryPath, { abortSignal: signal })
   let transaction: OpenCodeSafePublicationTransaction | null = null
   try {
     await directory.writeFileAtomic(fileName, bytes, 0o600, signal, {

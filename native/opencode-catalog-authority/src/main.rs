@@ -19,6 +19,8 @@ mod posix_vfs;
 #[cfg(windows)]
 mod windows_identity;
 #[cfg(windows)]
+mod windows_publication;
+#[cfg(windows)]
 mod windows_vfs;
 
 #[cfg(windows)]
@@ -2366,6 +2368,11 @@ fn main() {
         Some(v) => v,
         None => return,
     };
+    if cache_home == "--windows-publication-authority-v1" {
+        #[cfg(windows)]
+        windows_publication::run();
+        return;
+    }
     let mut db: Option<Db> = None;
     let mut root_entered = false;
     let stdin = io::stdin();

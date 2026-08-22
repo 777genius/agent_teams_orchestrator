@@ -241,9 +241,16 @@ jobs:
           $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
           $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
           $expectedMachine = if ($env:EXPECTED_PLATFORM -eq "win32-arm64") { 0xaa64 } else { 0x8664 }
-          if ($machine -ne $expectedMachine) {
-            throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
-          }
+           if ($machine -ne $expectedMachine) {
+             throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
+           }
+
+      - name: Prove packaged Windows retained publication
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR = (Resolve-Path dist)
+          bun test scripts/windows-publication-native.test.ts
 
       - name: Package runtime archive
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'

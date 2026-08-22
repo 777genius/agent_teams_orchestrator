@@ -26,7 +26,7 @@ import {
   OPEN_CODE_PASSIVE_TRANSACTION_MARKER,
   OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT,
 } from './OpenCodePassiveSnapshotTransaction.js'
-import { ensureOpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+import { ensureOpenCodeSafePublicationDirectory, OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 export const OPEN_CODE_PASSIVE_DATABASE = 'passive-status.sqlite3'
 const SCHEMA_VERSION = 1
@@ -39,6 +39,10 @@ const LEGACY_GENERATION_FENCE = 1_000_000_000_000_000
 
 type StoreHooks = Readonly<{
   afterRootOpened?: () => void | Promise<void>
+  afterDatabasePinned?: () => void | Promise<void>
+  beforeDatabaseOpen?: () => void | Promise<void>
+  afterDatabaseClosed?: () => void | Promise<void>
+  afterRootClosed?: () => void | Promise<void>
   afterTransactionMarker?: () => void | Promise<void>
   afterGenerationDirectoryCreated?: () => void | Promise<void>
   afterProjectSnapshotPublished?: () => void | Promise<void>
@@ -127,6 +131,7 @@ async function commitOpenCodePassiveSnapshot(
   if (signal.aborted) throw cancelled()
   const root = await ensureOpenCodeSafePublicationDirectory(
     options.rootDirectory, true, options.hooks?.ancestorDirectorySynced,
+    { abortSignal: signal },
   )
   let database: Database | null = null
   try {
@@ -135,7 +140,10 @@ async function commitOpenCodePassiveSnapshot(
       try { await root.publishImmutableFile(OPEN_CODE_PASSIVE_DATABASE, '', 0o600) }
       catch { /* a racing owner may have published the same managed file */ }
     }
+    await root.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+    await options.hooks?.afterDatabasePinned?.()
     await assertSafeDatabaseArtifacts(options.rootDirectory, true, options.platform)
+    await options.hooks?.beforeDatabaseOpen?.()
     database = openDatabase(options.rootDirectory, false)
     await ensureDatabaseReady(database, signal)
     await protectDatabaseArtifacts(options.rootDirectory, options.platform)
@@ -191,6 +199,7 @@ async function commitOpenCodePassiveSnapshot(
       await options.hooks?.afterGenerationParentSynced?.()
       if (signal.aborted) throw cancelled()
       await options.hooks?.beforeCommitPublished?.()
+      await root.validate()
       database.exec('COMMIT')
       await options.hooks?.afterCommitPublished?.()
       return id
@@ -198,7 +207,10 @@ async function commitOpenCodePassiveSnapshot(
       rollback(database)
       throw error
     }
-  } finally { database?.close(false); await root.close() }
+  } finally {
+    if (database) { database.close(false); await options.hooks?.afterDatabaseClosed?.() }
+    await root.close(); await options.hooks?.afterRootClosed?.()
+  }
 }
 
 export async function replaceOpenCodePassiveSnapshot(
@@ -231,9 +243,16 @@ export async function readOpenCodePassiveSnapshot(
 ): Promise<{ transactionId: number; text: string; value: OpenCodeRedactedSnapshotV1 } | null> {
   rejectUnsupportedPlatform(options.platform)
   if (signal.aborted) throw cancelled()
-  await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform)
-  const database = openDatabase(rootDirectory, true)
+  let root: OpenCodeSafePublicationDirectory | null = null
+  if (process.platform === 'win32') {
+    try { root = await OpenCodeSafePublicationDirectory.open(rootDirectory, { abortSignal: signal }) }
+    catch { return null }
+  }
+  let database: Database | null = null
   try {
+    await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+    await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform)
+    database = openDatabase(rootDirectory, true)
     verifySchema(database)
     database.exec('BEGIN')
     try {
@@ -260,16 +279,29 @@ export async function readOpenCodePassiveSnapshot(
       database.exec('COMMIT')
       return value && text ? { transactionId: row.transactionId, text, value } : null
     } catch (error) { rollback(database); throw error }
-  } finally { database.close(false) }
+  } catch (error) {
+    if (process.platform === 'win32') return null
+    throw error
+  } finally { database?.close(false); await root?.close() }
 }
 
 export async function maintainOpenCodePassiveStore(rootDirectory: string, platform?: NodeJS.Platform): Promise<void> {
   rejectUnsupportedPlatform(platform)
   if (!await openCodePassiveDatabaseExists(rootDirectory)) return
-  await assertSafeDatabaseArtifacts(rootDirectory, true, platform)
-  const database = openDatabase(rootDirectory, false)
-  try { verifySchema(database); database.exec('PRAGMA wal_checkpoint(PASSIVE)') }
-  finally { database.close(false) }
+  let root: OpenCodeSafePublicationDirectory | null = null
+  if (process.platform === 'win32') {
+    try { root = await OpenCodeSafePublicationDirectory.open(rootDirectory) }
+    catch { return }
+  }
+  let database: Database | null = null
+  try {
+    await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+    await assertSafeDatabaseArtifacts(rootDirectory, true, platform)
+    database = openDatabase(rootDirectory, false)
+    verifySchema(database); database.exec('PRAGMA wal_checkpoint(PASSIVE)')
+  } catch (error) {
+    if (process.platform !== 'win32') throw error
+  } finally { database?.close(false); await root?.close() }
 }
 
 function openDatabase(rootDirectory: string, readonly: boolean): Database {

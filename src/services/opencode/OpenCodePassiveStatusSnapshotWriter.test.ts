@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
@@ -124,5 +125,16 @@ describe('OpenCode passive transaction writer boundary', () => {
       } }).write(snapshot(), new AbortController().signal)
       expect(order).toEqual(['new', 'nested', 'store', 'DATABASE_DURABLE', 'COMMIT'])
     } finally { await rm(parent, { recursive: true, force: true }) }
+  })
+
+  test('pins before SQLite opens and closes SQLite before releasing the retained root', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'passive-sqlite-order-')); const order: string[] = []
+    try {
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
+        afterDatabasePinned: () => { order.push('PIN') }, beforeDatabaseOpen: () => { order.push('OPEN') },
+        afterDatabaseClosed: () => { order.push('DB_CLOSE') }, afterRootClosed: () => { order.push('ROOT_CLOSE') },
+      } }).write(snapshot(), new AbortController().signal)
+      expect(order).toEqual(['PIN', 'OPEN', 'DB_CLOSE', 'ROOT_CLOSE'])
+    } finally { await rm(root, { recursive: true, force: true }) }
   })
 })
