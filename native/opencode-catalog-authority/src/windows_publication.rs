@@ -13,6 +13,47 @@ use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 const MAX_WIRE: usize = 64 * 1024;
 
+fn reserved_device(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    let folded = stem.to_ascii_uppercase();
+    matches!(folded.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || ((folded.starts_with("COM") || folded.starts_with("LPT"))
+            && matches!(
+                &folded[3..],
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            ))
+}
+
+fn valid_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !matches!(component.chars().last(), Some('.' | ' '))
+        && !component
+            .chars()
+            .any(|c| c == '\0' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        && !reserved_device(component)
+}
+
+fn valid_root_input(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3
+        || bytes.len() > 32_767
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+        || value.starts_with("\\\\")
+        || value.contains('/')
+        || value[2..].contains(':')
+    {
+        return false;
+    }
+    let components = value[3..].split('\\').collect::<Vec<_>>();
+    components.iter().enumerate().all(|(index, component)| {
+        (component.is_empty() && index + 1 == components.len()) || valid_component(component)
+    })
+}
+
 struct HeldComponent {
     path: PathBuf,
     handle: std::fs::File,
@@ -93,6 +134,9 @@ impl RetainedWindowsRoot {
         create: bool,
         durable: bool,
     ) -> Result<(Self, Vec<String>), &'static str> {
+        if !valid_root_input(target.to_str().ok_or("ROOT_REJECTED")?) {
+            return Err("ROOT_REJECTED");
+        }
         let (root_path, wide) = volume_root(&target)?;
         verify_ntfs(&wide)?;
         let root_handle = open_directory(&root_path)?;
@@ -174,7 +218,7 @@ impl RetainedWindowsRoot {
         sync_directory(&self.target)
     }
 
-    fn pin(&mut self, name: &str) -> Result<Value, &'static str> {
+    fn pin(&mut self, name: &str, deny_writes: bool) -> Result<Value, &'static str> {
         if !valid_leaf(name) {
             return Err("LEAF_REJECTED");
         }
@@ -182,7 +226,12 @@ impl RetainedWindowsRoot {
         let path = self.target.join(name);
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(if deny_writes {
+                // Immutable passive reads retain a content-stable object.
+                FILE_SHARE_READ
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            })
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(|_| "FILE_REJECTED")?;
@@ -199,12 +248,32 @@ impl RetainedWindowsRoot {
 }
 
 fn valid_leaf(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && !matches!(name.chars().last(), Some('.' | ' '))
-        && !name.chars().any(|c| c == '\0' || c == '/' || c == '\\')
+    name.len() <= 255 && valid_component(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_leaf, valid_root_input};
+
+    #[test]
+    fn rejects_win32_alias_and_namespace_syntax() {
+        for path in [
+            r"C:\safe:stream",
+            r"\\?\C:\safe",
+            r"\\.\C:\safe",
+            r"C:\safe\..\escape",
+            r"C:\safe\.\child",
+            r"C:\CON\child",
+            r"C:\safe\NUL.txt",
+            r"C:\safe\\child",
+        ] {
+            assert!(!valid_root_input(path), "accepted {path}");
+        }
+        assert!(valid_root_input(r"C:\safe\child"));
+        for leaf in ["auth.json:stream", "CON", "nul.txt", "COM1.log", ".."] {
+            assert!(!valid_leaf(leaf), "accepted {leaf}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -224,6 +293,12 @@ enum Request {
         wait_ms: u32,
     },
     PIN_REGULAR {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        name: String,
+    },
+    PIN_REGULAR_READONLY {
         version: u8,
         id: String,
         wait_ms: u32,
@@ -256,6 +331,12 @@ impl Request {
                 wait_ms,
             }
             | Self::PIN_REGULAR {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::PIN_REGULAR_READONLY {
                 version,
                 id,
                 wait_ms,
@@ -329,7 +410,13 @@ pub fn run() {
             Request::PIN_REGULAR { name, .. } => (
                 root.as_mut()
                     .ok_or("ROOT_REQUIRED")
-                    .and_then(|v| v.pin(&name)),
+                    .and_then(|v| v.pin(&name, false)),
+                false,
+            ),
+            Request::PIN_REGULAR_READONLY { name, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.pin(&name, true)),
                 false,
             ),
             Request::SYNC_ROOT { .. } => (

@@ -4,7 +4,8 @@ import {
   verifyOpenCodeNativeAuthorityArtifacts, type OpenCodeNativeAuthorityChild,
 } from './OpenCodeNativeAuthorityArtifacts.js'
 import { decodeOpenCodeWindowsPublicationReply, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
-  validOpenCodePublicationLeaf, type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
+  validOpenCodePublicationLeaf, validOpenCodePublicationRoot,
+  type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
   T extends OpenCodeWindowsPublicationRequest ? Omit<T, 'version' | 'wait_ms'> : never
@@ -36,6 +37,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
 
   async openRoot(rootPath: string, createMissing: boolean, durableAncestors: boolean): Promise<Readonly<{ volumeSerial: string; fileId: string; createdPaths: string[] }>> {
+    if (!validOpenCodePublicationRoot(rootPath)) throw unavailable()
     const value = await this.#request({ id: randomUUID(), op: 'OPEN_ROOT', root_path: rootPath, create_missing: createMissing, durable_ancestors: durableAncestors }) as Record<string, unknown>
     if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
       || !Array.isArray(value?.createdPaths) || !value.createdPaths.every(v => typeof v === 'string')) throw unavailable()
@@ -45,9 +47,10 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async validateRoot(): Promise<void> { await this.#request({ id: randomUUID(), op: 'VALIDATE_ROOT' }) }
   async syncRoot(): Promise<void> { await this.#request({ id: randomUUID(), op: 'SYNC_ROOT' }) }
-  async pinRegular(name: string): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string }>> {
+  async pinRegular(name: string, denyWrites = false): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string }>> {
     if (!validOpenCodePublicationLeaf(name)) throw unavailable()
-    const value = await this.#request({ id: randomUUID(), op: 'PIN_REGULAR', name }) as Record<string, unknown>
+    const value = await this.#request({ id: randomUUID(),
+      op: denyWrites ? 'PIN_REGULAR_READONLY' : 'PIN_REGULAR', name }) as Record<string, unknown>
     if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId)) || !/^\d+$/.test(String(value?.size))) throw unavailable()
     return value as { volumeSerial: string; fileId: string; size: string }
   }

@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -71,6 +71,24 @@ async function status(root: string, providerIds = ['deepinfra']) {
 }
 
 describe('OpenCode passive SQLite transaction consistency', () => {
+  test.skipIf(process.platform !== 'win32')(
+    'Windows production read preserves every publication entry and exact object identity', async () => {
+      const root = await mkdtemp(path.join(process.cwd(), '.passive-windows-readonly-'))
+      const entries = async () => Promise.all((await readdir(root)).sort().map(async name => {
+        const value = await lstat(path.join(root, name), { bigint: true })
+        return [name, value.dev, value.ino, value.size, value.mode] as const
+      }))
+      try {
+        await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+          .write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
+        const before = await entries()
+        const observed = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+        expect(observed?.value.binary.value.version).toBe('1.0.0')
+        expect(await entries()).toEqual(before)
+      } finally { await rm(root, { recursive: true, force: true }) }
+    },
+  )
+
   test('32 real processes allocate unique monotonic generations and merge same-scope mutations', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-processes-'))
     try {

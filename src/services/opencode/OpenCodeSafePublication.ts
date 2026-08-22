@@ -6,6 +6,8 @@ import {
   OpenCodeWindowsPublicationAuthorityClient,
   type OpenCodeWindowsPublicationAuthorityFactory,
 } from './OpenCodeWindowsPublicationAuthorityClient.js'
+import { validOpenCodePublicationLeaf,
+  validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 export type OpenCodeSafePublicationTransaction = Readonly<{
   commit(): Promise<void>
@@ -29,7 +31,8 @@ function descriptorRoot(fd: number): string {
 }
 
 function childName(value: string): string {
-  if (!value || value === '.' || value === '..' || path.basename(value) !== value) return fail()
+  if (!value || value === '.' || value === '..' || path.basename(value) !== value
+    || (process.platform === 'win32' && !validOpenCodePublicationLeaf(value))) return fail()
   return value
 }
 
@@ -59,6 +62,7 @@ export class OpenCodeSafePublicationDirectory {
 
   static async open(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
     if (process.platform === 'win32') {
+      if (!validOpenCodePublicationRoot(directoryPath)) fail()
       const resolved = path.resolve(directoryPath)
       const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
         deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
@@ -125,8 +129,8 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   /** Retains the primary SQLite object without delete sharing until this directory closes. */
-  async pinRegularFile(name: string): Promise<void> {
-    if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name)).catch(fail)
+  async pinRegularFile(name: string, denyWrites = false): Promise<void> {
+    if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name), denyWrites).catch(fail)
   }
 
   async openChildDirectory(name: string): Promise<OpenCodeSafePublicationDirectory> {
@@ -232,20 +236,21 @@ export class OpenCodeSafePublicationDirectory {
     try {
       await this.#assertWindowsRoot()
       await rename(this.child(name), this.child(retiredName))
-      await this.#handle?.sync().catch(fail)
+      await this.sync()
     } finally { await opened.close().catch(() => undefined) }
     // The retired name is unguessable and no publisher can reuse it. A failure
     // here is harmless unreachable garbage and is retried by a later writer.
     await rm(this.child(retiredName), { recursive: true, force: true })
+    await this.sync()
     await this.#assertWindowsRoot()
   }
 
-  async readBoundedRegularFile(
+  async readBoundedRegularBytes(
     name: string,
     maximumBytes: number,
     abortSignal?: AbortSignal,
     testHooks?: { afterPathIdentityCaptured?: () => void | Promise<void> },
-  ): Promise<string | null> {
+  ): Promise<Uint8Array | null> {
     await this.#assertWindowsRoot()
     const target = this.child(name)
     let before
@@ -275,10 +280,20 @@ export class OpenCodeSafePublicationDirectory {
         || afterHeld.size !== opened.size) fail()
       await this.#assertWindowsRoot()
       if (abortSignal?.aborted) throw new Error('OpenCode safe publication cancelled')
-      return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, result.bytesRead))
+      return bytes.subarray(0, result.bytesRead)
     } finally {
       await held.close()
     }
+  }
+
+  async readBoundedRegularFile(
+    name: string,
+    maximumBytes: number,
+    abortSignal?: AbortSignal,
+    testHooks?: { afterPathIdentityCaptured?: () => void | Promise<void> },
+  ): Promise<string | null> {
+    const bytes = await this.readBoundedRegularBytes(name, maximumBytes, abortSignal, testHooks)
+    return bytes && new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   }
 
   async removeRegularFile(name: string): Promise<void> {
@@ -289,7 +304,7 @@ export class OpenCodeSafePublicationDirectory {
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
     if (!metadata.isFile() || metadata.isSymbolicLink()) fail()
     await unlink(target)
-    await this.#handle?.sync().catch(fail)
+    await this.sync()
     await this.#assertWindowsRoot()
   }
 
@@ -324,6 +339,7 @@ export class OpenCodeSafePublicationDirectory {
     testHooks?: {
       afterRenameBeforeVerification?: () => void | Promise<void>
       afterRollbackOwnershipCaptured?: () => void | Promise<void>
+      beforeSettlementSync?: () => void | Promise<void>
       retainTransaction?: (transaction: OpenCodeSafePublicationTransaction) => void
     },
   ): Promise<void> {
@@ -386,6 +402,7 @@ export class OpenCodeSafePublicationDirectory {
       renameSync(temporaryPath, this.child(finalName))
       published = true
       if (this.#handle) fsyncSync(this.#handle.fd)
+      else await this.sync()
       if (testHooks?.afterRenameBeforeVerification) {
         await testHooks.afterRenameBeforeVerification()
         if (abortSignal?.aborted) {
@@ -435,7 +452,8 @@ export class OpenCodeSafePublicationDirectory {
             await unlink(backupPath).catch(error => {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
             })
-            await this.#handle?.sync().catch(fail)
+            await testHooks.beforeSettlementSync?.()
+            await this.sync()
             settled = true
           })()
           try { await settlement }
@@ -445,7 +463,10 @@ export class OpenCodeSafePublicationDirectory {
           commit: () => finish(false),
           rollback: () => finish(true),
         }))
-      } else if (priorLinked) unlinkSync(backupPath)
+      } else if (priorLinked) {
+        unlinkSync(backupPath)
+        await this.sync()
+      }
     } catch (error) {
       if (handle) await handle.close().catch(() => undefined)
       await unlink(temporaryPath).catch(() => undefined)
@@ -475,13 +496,13 @@ export class OpenCodeSafePublicationDirectory {
               if ((restoreError as NodeJS.ErrnoException).code !== 'EEXIST') fail()
             }
           }
-          await this.#handle?.sync().catch(fail)
         } catch (rollbackError) {
           if ((rollbackError as NodeJS.ErrnoException).code !== 'ENOENT') throw rollbackError
         }
       }
       await unlink(quarantinePath).catch(() => undefined)
       await unlink(backupPath).catch(() => undefined)
+      await this.sync()
       throw error
     }
   }
@@ -521,7 +542,7 @@ export class OpenCodeSafePublicationDirectory {
         // refers to an inode until all immutable bytes have been synchronized.
         if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
         await link(temporaryPath, target)
-        await this.#handle?.sync().catch(fail)
+        await this.sync()
       } catch (error) {
         if ((error as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') throw error
       }
@@ -530,6 +551,7 @@ export class OpenCodeSafePublicationDirectory {
     } finally {
       if (created) await created.close().catch(() => undefined)
       await unlink(temporaryPath).catch(() => undefined)
+      await this.sync()
     }
     const held = await open(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)).catch(fail)
     try {
@@ -565,6 +587,7 @@ export async function ensureOpenCodeSafePublicationDirectory(
 ): Promise<OpenCodeSafePublicationDirectory> {
   const resolved = path.resolve(directoryPath)
   if (process.platform === 'win32') {
+    if (!validOpenCodePublicationRoot(directoryPath)) fail()
     const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
       deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
     })

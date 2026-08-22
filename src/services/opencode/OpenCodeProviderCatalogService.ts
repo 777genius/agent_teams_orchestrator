@@ -22,6 +22,7 @@ import {
 import {
   finalizeOpenCodeScopedProfileAuth,
   rollbackOpenCodeScopedProfileAuth,
+  rollbackOpenCodeScopedProfileAuthSignal,
 } from './OpenCodeScopedProfileAuthPublication.js'
 
 import type { OpenCodeScopedPreparedProfile } from './types.js'
@@ -418,10 +419,15 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     let inputSignal: AbortSignal | undefined
     let rejectDeadline: ((error: Error) => void) | null = null
     let finalizeInFlight = false
+    let preparation: Promise<OpenCodeScopedPreparedProfile> | null = null
     const deadlineFailure = new Promise<never>((_resolve, reject) => { rejectDeadline = reject })
     const expire = () => {
       if (authority?.committed) return
       controller.abort(failure())
+      // Auth publication is the last preparation phase, but a manager may do
+      // additional work before resolving its profile.  Settle the transaction
+      // by signal even when the caller-facing deadline wins that final gap.
+      void rollbackOpenCodeScopedProfileAuthSignal(controller.signal).catch(() => undefined)
       authority?.kill()
       if (finalizeInFlight) return
       rejectDeadline?.(failure())
@@ -458,9 +464,23 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           .openCodeProfileManager as unknown as OpenCodeProviderCatalogProductionProfileManager
         return prepareOpenCodeProviderCatalogProductionProfile(manager, plan)
       })
-      profile = await within(prepare({ purpose: 'provider-catalog', providerId,
+      preparation = prepare({ purpose: 'provider-catalog', providerId,
         runtimeInstanceId: `catalog-g${begun.generation}-${randomUUID()}`, projectPath: canonicalProjectPath,
-        abortSignal: controller.signal }))
+        abortSignal: controller.signal })
+      // Preserve the losing promise. A late successful preparation owns real
+      // auth/root authority and must be settled rather than becoming an
+      // unobserved retained lease after this request has returned.
+      void preparation.then(async lateProfile => {
+        if (!controller.signal.aborted || profile === lateProfile) return
+        const rollbackPrepared = this.deps.rollbackPreparedProfile
+          ?? (this.deps.prepareProfile ? async () => {} : rollbackOpenCodeScopedProfileAuth)
+        try { await rollbackPrepared(lateProfile) } catch {
+          try { await rollbackOpenCodeScopedProfileAuthSignal(controller.signal) } catch {}
+          return
+        }
+        scheduleProfileCleanup(lateProfile)
+      }, () => undefined)
+      profile = await within(preparation)
       const leaseProfile = profile as unknown as Record<string, unknown>
       if (typeof leaseProfile.profileRootPath === 'string'
         && typeof leaseProfile.runtimeInstanceId === 'string'

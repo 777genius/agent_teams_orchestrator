@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { createHash } from 'node:crypto'
 import { lstatSync } from 'node:fs'
-import { chmod, lstat, opendir, readFile } from 'node:fs/promises'
+import { chmod, lstat, opendir, readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 
 import {
@@ -33,6 +33,7 @@ const SCHEMA_VERSION = 1
 const HISTORY_PER_SCOPE = 2
 const LEGACY_SCAN_LIMIT = 128
 const GLOBAL_SCOPE_LIMIT = 128
+const MAX_PASSIVE_DATABASE_BYTES = 32 * 1024 * 1024
 // Deployed v1/v2 generations were millisecond timestamps. A fixed fence makes
 // an imported or rejected legacy store subordinate without trusting its clock.
 const LEGACY_GENERATION_FENCE = 1_000_000_000_000_000
@@ -249,10 +250,30 @@ export async function readOpenCodePassiveSnapshot(
     catch { return null }
   }
   let database: Database | null = null
+  let windowsBaseline: Map<string, string> | null = null
   try {
-    await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+    if (process.platform === 'win32') {
+      windowsBaseline = await directoryIdentitySnapshot(rootDirectory)
+      // Bun's SQLite VFS has no no-create/no-write contract for WAL support.
+      // A passive reader therefore refuses any sidecar-bearing store instead
+      // of allowing a nominally read-only connection to create or mutate SHM.
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        if (windowsBaseline.has(`${OPEN_CODE_PASSIVE_DATABASE}${suffix}`)) return null
+      }
+    }
+    await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE, true)
     await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform)
-    database = openDatabase(rootDirectory, true)
+    if (root) {
+      const checkpoint = await root.readBoundedRegularBytes(
+        OPEN_CODE_PASSIVE_DATABASE, MAX_PASSIVE_DATABASE_BYTES, signal,
+      )
+      if (!checkpoint) return null
+      // The passive connection has no filesystem VFS at all: SQLite consumes
+      // an exact, bounded, no-follow copy as a read-only in-memory database.
+      database = Database.deserialize(checkpoint, { readonly: true, strict: true })
+      await root.close()
+      root = null
+    } else database = openDatabase(rootDirectory, true)
     verifySchema(database)
     database.exec('BEGIN')
     try {
@@ -282,7 +303,16 @@ export async function readOpenCodePassiveSnapshot(
   } catch (error) {
     if (process.platform === 'win32') return null
     throw error
-  } finally { database?.close(false); await root?.close() }
+  } finally {
+    database?.close(false)
+    let publicationChanged = false
+    if (windowsBaseline) {
+      const after = await directoryIdentitySnapshot(rootDirectory).catch(() => null)
+      publicationChanged = !after || !sameDirectoryIdentitySnapshot(windowsBaseline, after)
+    }
+    await root?.close()
+    if (publicationChanged) return null
+  }
 }
 
 export async function maintainOpenCodePassiveStore(rootDirectory: string, platform?: NodeJS.Platform): Promise<void> {
@@ -643,6 +673,19 @@ async function assertSafeDatabaseArtifacts(
       if (databaseRequired && suffix === '') throw error
     }
   }
+}
+
+async function directoryIdentitySnapshot(root: string): Promise<Map<string, string>> {
+  const snapshot = new Map<string, string>()
+  for (const name of (await readdir(root)).sort()) {
+    const metadata = await lstat(path.join(root, name), { bigint: true })
+    snapshot.set(name, `${metadata.dev}:${metadata.ino}:${metadata.mode & 0o170000n}`)
+  }
+  return snapshot
+}
+
+function sameDirectoryIdentitySnapshot(left: Map<string, string>, right: Map<string, string>): boolean {
+  return left.size === right.size && [...left].every(([name, identity]) => right.get(name) === identity)
 }
 
 async function protectDatabaseArtifacts(

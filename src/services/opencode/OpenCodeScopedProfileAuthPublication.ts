@@ -41,8 +41,11 @@ const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) 
       await directory.close()
     },
     rollback: async () => {
-      try { await transaction!.rollback() }
-      finally { await directory.close().catch(() => undefined) }
+      // The retained directory is part of the retryable transaction. Releasing
+      // it after a failed rollback would let the root or backup object be
+      // replaced before the exact same settlement is retried.
+      await transaction!.rollback()
+      await directory.close()
     },
   })
 }

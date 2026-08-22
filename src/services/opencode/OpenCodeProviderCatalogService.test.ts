@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -8,6 +8,7 @@ import { Database } from 'bun:sqlite'
 import { writeOpenCodeCatalogProfileManifest } from './OpenCodeCatalogProfileJanitor.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from './OpenCodeLiveProviderNormalizer.js'
 import { OpenCodeProviderCatalogService, type OpenCodeProviderCatalogServiceDeps } from './OpenCodeProviderCatalogService.js'
+import { commitOpenCodeScopedProfileAuth } from './OpenCodeScopedProfileAuthPublication.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -87,6 +88,60 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
       expect(signal.aborted).toBe(true)
     } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
   })
+
+  test('deadline preserves and settles a preparation that publishes before resolving late', async () => {
+    let fire!: () => void; let entered!: () => void; let resolveProfile!: (value: OpenCodeScopedPreparedProfile) => void
+    const started = new Promise<void>(resolve => { entered = resolve }); const rollbacks: object[] = []
+    const f = await fixture({ setTimer: ((callback: () => void) => {
+      fire = callback; return { unref() {} } as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout, clearTimer: (() => undefined) as typeof clearTimeout,
+    allocateAttempt: () => ({ requestGeneration: 1, attemptIdentity: `sha256:${'1'.repeat(64)}` }),
+    prepareProfile: async plan => {
+      entered()
+      return new Promise<OpenCodeScopedPreparedProfile>(resolve => { resolveProfile = resolve }).then(profile => profile)
+    },
+    rollbackPreparedProfile: async profile => { rollbacks.push(profile) } })
+    const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/late' })
+    await started; fire(); await expect(pending).rejects.toThrow('temporarily unavailable')
+    const late = { purpose: 'provider-catalog', providerId: 'deepinfra', projectPath: '/sandbox/late',
+      profileRootPath: '/fake/late-profile', binaryFingerprint: 'binary', managedConfigFingerprint: 'config',
+      selectedAuthBaselineFingerprint: 'auth', plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile
+    resolveProfile(late)
+    for (let turn = 0; turn < 10 && rollbacks.length === 0; turn += 1) await new Promise(resolve => setImmediate(resolve))
+    expect(rollbacks).toEqual([late])
+  })
+
+  test.skipIf(process.platform !== 'win32')(
+    'Windows deadline releases real retained auth authority before late preparation resolves', async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'catalog-windows-late-auth-')); roots.push(root)
+      const authPath = path.join(root, 'auth.json'); await writeFile(authPath, '{"generation":"prior"}')
+      let fire!: () => void; let published!: () => void; let finish!: () => void
+      const visible = new Promise<void>(resolve => { published = resolve })
+      const finishPreparation = new Promise<void>(resolve => { finish = resolve })
+      const profile = { purpose: 'provider-catalog', providerId: 'deepinfra', projectPath: 'C:\\sandbox',
+        profileRootPath: root, binaryFingerprint: 'binary', managedConfigFingerprint: 'config',
+        selectedAuthBaselineFingerprint: 'auth', plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile
+      const f = await fixture({ setTimer: ((callback: () => void) => {
+        fire = callback; return { unref() {} } as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout, clearTimer: (() => undefined) as typeof clearTimeout,
+      allocateAttempt: () => ({ requestGeneration: 1, attemptIdentity: `sha256:${'1'.repeat(64)}` }),
+      prepareProfile: async input => {
+        await commitOpenCodeScopedProfileAuth({ managedAuthPath: authPath,
+          managedAuthBytes: Buffer.from('{"generation":"attempt"}'), preparedProfile: profile,
+          abortSignal: input.abortSignal })
+        published(); await finishPreparation
+        return profile
+      } })
+      const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: 'C:\\sandbox' })
+      await visible; fire(); await expect(pending).rejects.toThrow('temporarily unavailable')
+      for (let turn = 0; turn < 100 && await readFile(authPath, 'utf8') !== '{"generation":"prior"}'; turn += 1) {
+        await new Promise(resolve => setImmediate(resolve))
+      }
+      expect(await readFile(authPath, 'utf8')).toBe('{"generation":"prior"}')
+      const displaced = `${root}-released`; await rename(root, displaced); await rename(displaced, root)
+      finish()
+    },
+  )
 
   test('uses BEGIN/BIND/FINALIZE natively and hydrates the exact fresh winner after restart', async () => {
     const f = await fixture(); const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME

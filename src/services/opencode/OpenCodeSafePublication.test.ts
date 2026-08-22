@@ -5,6 +5,60 @@ import path from 'node:path'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 describe('OpenCodeSafePublication', () => {
+  test('retained transaction synchronizes each visibility and settlement boundary', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-sync-protocol-'))
+    const protocol: string[] = []
+    const authority = {
+      validateRoot: async () => { protocol.push('VALIDATE_ROOT') },
+      syncRoot: async () => { protocol.push('SYNC_ROOT') }, close: async () => {},
+    }
+    const directory = new OpenCodeSafePublicationDirectory(null, root, { dev: 1n, ino: 1n }, authority as never)
+    try {
+      await writeFile(path.join(root, 'auth.json'), 'old')
+      let commit!: { commit(): Promise<void>; rollback(): Promise<void> }
+      await directory.writeFileAtomic('auth.json', 'new', 0o600, undefined, {
+        afterRenameBeforeVerification: () => { protocol.push('VISIBLE') },
+        retainTransaction: value => { commit = value },
+      })
+      expect(protocol.indexOf('SYNC_ROOT')).toBeLessThan(protocol.indexOf('VISIBLE'))
+      const beforeCommit = protocol.filter(value => value === 'SYNC_ROOT').length
+      await commit.commit()
+      expect(protocol.filter(value => value === 'SYNC_ROOT').length).toBe(beforeCommit + 1)
+
+      let rollback!: { commit(): Promise<void>; rollback(): Promise<void> }
+      await directory.writeFileAtomic('auth.json', 'attempt', 0o600, undefined, {
+        retainTransaction: value => { rollback = value },
+      })
+      const beforeRollback = protocol.filter(value => value === 'SYNC_ROOT').length
+      await rollback.rollback()
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('new')
+      expect(protocol.filter(value => value === 'SYNC_ROOT').length).toBe(beforeRollback + 1)
+    } finally { await directory.close(); await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('real retained publication rollback remains unsettled and retryable after sync failure', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-retry-settlement-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    let transaction!: { commit(): Promise<void>; rollback(): Promise<void> }; let syncAttempts = 0
+    try {
+      await writeFile(path.join(root, 'auth.json'), 'prior')
+      await directory.writeFileAtomic('auth.json', 'attempt', 0o600, undefined, {
+        beforeSettlementSync: () => {
+          syncAttempts += 1
+          if (syncAttempts === 1) throw new Error('injected settlement sync failure')
+        },
+        retainTransaction: value => { transaction = value },
+      })
+      await expect(transaction.rollback()).rejects.toThrow('injected settlement sync failure')
+      // The same transaction, including its retained object identities, is
+      // still live and can finish settlement rather than reconstructing it.
+      await transaction.rollback()
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('prior')
+      expect((await readdir(root)).filter(name => name.includes('.rollback.')
+        || name.includes('.quarantine.'))).toEqual([])
+    } finally { await directory.close(); await rm(root, { recursive: true, force: true }) }
+  })
+
   test('a coordinated parent swap creates zero files in the attacker directory', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-publication-'))
