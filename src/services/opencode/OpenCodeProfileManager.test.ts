@@ -419,6 +419,88 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
+  test.each(['before-config-read', 'after-config-identity'] as const)(
+    'Windows capture preserves the initial config identity across a %s swap',
+    async boundary => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `opencode-windows-config-${boundary}-`))
+      const project = path.join(root, 'project')
+      const snapshots = path.join(root, 'snapshots')
+      const config = path.join(project, 'opencode.json')
+      const displaced = path.join(root, 'captured-config.json')
+      try {
+        await Promise.all([mkdir(project), mkdir(snapshots)])
+        await writeFile(config, '{"model":"captured"}\n')
+        let swapped = false
+        const swap = async (): Promise<void> => {
+          if (swapped) return
+          swapped = true
+          await rename(config, displaced)
+          await writeFile(config, '{"model":"captured"}\n')
+        }
+        await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+          project,
+          path.join(snapshots, 'project-behavior'),
+          {
+            capturePlatform: 'win32',
+            ...(boundary === 'before-config-read'
+              ? { afterWindowsComponentWalk: swap }
+              : { afterWindowsFileIdentityCaptured: async relativePath => {
+                if (relativePath === 'opencode.json') await swap()
+              } }),
+          },
+        )).rejects.toThrow(/changed during capture|changed before capture/)
+        expect(swapped).toBe(true)
+        expect(await readdir(snapshots)).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('Windows capture preserves the initial directory manifest before later walks', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-manifest-baseline-'))
+    const project = path.join(root, 'project')
+    const tools = path.join(project, '.opencode', 'tools')
+    const snapshots = path.join(root, 'snapshots')
+    try {
+      await mkdir(tools, { recursive: true }); await mkdir(snapshots)
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+        project,
+        path.join(snapshots, 'project-behavior'),
+        {
+          capturePlatform: 'win32',
+          afterWindowsComponentWalk: () => writeFile(path.join(tools, 'late.ts'), 'export {}\n'),
+        },
+      )).rejects.toThrow('directory changed during capture')
+      expect(await readdir(snapshots)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows capture preserves an initially missing project root through publication', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-missing-root-'))
+    const project = path.join(root, 'project')
+    const snapshots = path.join(root, 'snapshots')
+    try {
+      await mkdir(snapshots)
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+        project,
+        path.join(snapshots, 'project-behavior'),
+        {
+          capturePlatform: 'win32',
+          afterCaptureBeforeCopy: async () => {
+            await mkdir(project)
+            await writeFile(path.join(project, 'opencode.json'), '{}\n')
+          },
+        },
+      )).rejects.toThrow('path appeared before materialization')
+      expect(await readdir(snapshots)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('production catalog composition captures current evidence through the actual manager and policy', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-catalog-plan-'))
     const fixture = await createScopedTestManager(tempDir)

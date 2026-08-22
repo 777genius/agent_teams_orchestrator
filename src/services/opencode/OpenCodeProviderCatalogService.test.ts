@@ -73,6 +73,29 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
     } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
   })
 
+  test('retains and reaps a prepared profile after rollback settlement fails', async () => {
+    let attempts = 0
+    const f = await fixture({ prepareProfile: async plan => ({ purpose: 'provider-catalog',
+      providerId: plan.providerId, projectPath: plan.projectPath, profileRootPath: '/invalid',
+      binaryFingerprint: '', managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth',
+      plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile),
+    rollbackPreparedProfile: async () => {
+      attempts += 1
+      if (attempts < 3) throw new Error('injected rollback barrier')
+    } })
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = f.cache
+    try {
+      await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/reaper' }))
+        .rejects.toThrow('temporarily unavailable')
+      const deadline = performance.now() + 3_000
+      while (attempts < 3 && performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      expect(attempts).toBe(3)
+    } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
+  })
+
   test('arms one deadline before canonicalization and preempts abort-ignoring preparation', async () => {
     let fire!: () => void; let signal!: AbortSignal
     const f = await fixture({ setTimer: ((callback: () => void) => {
@@ -109,6 +132,33 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
     resolveProfile(late)
     for (let turn = 0; turn < 10 && rollbacks.length === 0; turn += 1) await new Promise(resolve => setImmediate(resolve))
     expect(rollbacks).toEqual([late])
+  })
+
+  test('reaps failed rollback for a preparation that resolves after its deadline', async () => {
+    let fire!: () => void; let entered!: () => void; let resolveProfile!: (value: OpenCodeScopedPreparedProfile) => void
+    const started = new Promise<void>(resolve => { entered = resolve }); let attempts = 0
+    const f = await fixture({ setTimer: ((callback: () => void) => {
+      fire = callback; return { unref() {} } as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout, clearTimer: (() => undefined) as typeof clearTimeout,
+    allocateAttempt: () => ({ requestGeneration: 1, attemptIdentity: `sha256:${'1'.repeat(64)}` }),
+    prepareProfile: async () => {
+      entered()
+      return new Promise<OpenCodeScopedPreparedProfile>(resolve => { resolveProfile = resolve })
+    },
+    rollbackPreparedProfile: async () => {
+      attempts += 1
+      if (attempts < 3) throw new Error('injected late rollback barrier')
+    } })
+    const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/late-reaper' })
+    await started; fire(); await expect(pending).rejects.toThrow('temporarily unavailable')
+    resolveProfile({ purpose: 'provider-catalog', providerId: 'deepinfra', projectPath: '/sandbox/late-reaper',
+      profileRootPath: '/fake/late-reaper', binaryFingerprint: 'binary', managedConfigFingerprint: 'config',
+      selectedAuthBaselineFingerprint: 'auth', plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile)
+    const deadline = performance.now() + 3_000
+    while (attempts < 3 && performance.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(attempts).toBe(3)
   })
 
   test.skipIf(process.platform !== 'win32')(

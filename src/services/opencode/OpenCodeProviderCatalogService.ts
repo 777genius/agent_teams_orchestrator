@@ -303,6 +303,44 @@ function scheduleProfileCleanup(profile: OpenCodeScopedPreparedProfile): void {
   } catch { /* malformed/replaced cleanup state is janitor input, not publication state */ }
 }
 
+type PreparedRollbackRecord = Readonly<{
+  profile: OpenCodeScopedPreparedProfile
+  rollback: (profile: OpenCodeScopedPreparedProfile) => Promise<void>
+  afterSettlement: () => void
+}>
+const preparedRollbackRecords = new WeakMap<object, PreparedRollbackRecord>()
+const preparedRollbackReaper = new Set<PreparedRollbackRecord>()
+
+function reapPreparedProfileRollback(record: PreparedRollbackRecord): void {
+  if (preparedRollbackRecords.has(record.profile)) return
+  preparedRollbackRecords.set(record.profile, record)
+  preparedRollbackReaper.add(record)
+  let attempts = 0
+  const retry = (): void => {
+    attempts += 1
+    void record.rollback(record.profile).then(() => {
+      preparedRollbackRecords.delete(record.profile)
+      preparedRollbackReaper.delete(record)
+      record.afterSettlement()
+    }, () => {
+      if (attempts < 8) {
+        const timer = setTimeout(retry, Math.min(4_000, 100 * 2 ** attempts))
+        timer.unref?.()
+      } else {
+        // Production native auth authority has its own 120 second absolute
+        // deadline. Retain this attempt beyond that boundary, then release the
+        // host record; the native recovery-required marker remains durable.
+        const timer = setTimeout(() => {
+          preparedRollbackRecords.delete(record.profile)
+          preparedRollbackReaper.delete(record)
+        }, 125_000)
+        timer.unref?.()
+      }
+    })
+  }
+  retry()
+}
+
 function projectOf(profile: OpenCodeScopedPreparedProfile, expected: string): string {
   const value = (profile as unknown as Record<string, unknown>).projectPath
   if (value !== expected) throw failure()
@@ -476,6 +514,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           ?? (this.deps.prepareProfile ? async () => {} : rollbackOpenCodeScopedProfileAuth)
         try { await rollbackPrepared(lateProfile) } catch {
           try { await rollbackOpenCodeScopedProfileAuthSignal(controller.signal) } catch {}
+          reapPreparedProfileRollback(Object.freeze({ profile: lateProfile,
+            rollback: rollbackPrepared, afterSettlement: () => scheduleProfileCleanup(lateProfile) }))
           return
         }
         scheduleProfileCleanup(lateProfile)
@@ -610,7 +650,14 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (profile && !profileSettled) {
         const rollbackPrepared = this.deps.rollbackPreparedProfile
           ?? (this.deps.prepareProfile ? async () => {} : rollbackOpenCodeScopedProfileAuth)
-        try { await rollbackPrepared(profile); profileSettled = true } catch {}
+        try { await rollbackPrepared(profile); profileSettled = true } catch {
+          const retainedProfile = profile
+          reapPreparedProfileRollback(Object.freeze({ profile: retainedProfile,
+            rollback: rollbackPrepared,
+            afterSettlement: () => {
+              if (!authority?.committed && !hostKey) scheduleProfileCleanup(retainedProfile)
+            } }))
+        }
       }
       if (profile && profileSettled && !authority?.committed && !hostKey) scheduleProfileCleanup(profile)
       if (authority?.committed) {

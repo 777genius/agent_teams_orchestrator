@@ -28,7 +28,7 @@ struct WindowsRootComponent {
     path: std::path::PathBuf,
     handle: std::fs::File,
     volume: u64,
-    index: u64,
+    index: u128,
 }
 #[cfg(windows)]
 static WINDOWS_ROOT_HANDLES: std::sync::OnceLock<Vec<WindowsRootComponent>> =
@@ -38,7 +38,7 @@ struct WindowsRootMarker {
     path: std::path::PathBuf,
     handle: std::fs::File,
     volume: u64,
-    index: u64,
+    index: u128,
 }
 #[cfg(windows)]
 static WINDOWS_ROOT_MARKER: std::sync::OnceLock<WindowsRootMarker> = std::sync::OnceLock::new();
@@ -569,16 +569,15 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         .position(|v| *v == 0)
         .unwrap_or(fs_name.len());
     let fs = String::from_utf16_lossy(&fs_name[..end]);
-    // GetFileInformationByHandle supplies NTFS's stable 64-bit file reference
-    // number. ReFS identities are 128-bit, so accepting ReFS while retaining
-    // only the legacy fields could make distinct objects compare equal.
+    // This authority retains the complete FILE_ID_128, but its durability and
+    // rename protocol is deliberately proven only for fixed NTFS volumes.
     if fs != "NTFS" {
         return Err("WINDOWS_VOLUME_UNVERIFIED".into());
     }
     let mut root_path = std::path::PathBuf::from(prefix);
     root_path.push("\\");
     let root_handle = std::fs::OpenOptions::new()
-        .read(true)
+        .access_mode(0x0010_0000 | 0x0000_0080 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&root_path)
@@ -603,20 +602,18 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         if matches!(component, Component::Prefix(_) | Component::RootDir) {
             continue;
         }
-        // Creation is not a trust check. Whether this component was already
-        // present or was just created, only the opened no-follow handle below
-        // establishes its type and identity.
-        match std::fs::create_dir(&cursor) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err("ROOT_MKDIR".into()),
+        let parent = held.last().ok_or("ROOT_HANDLE")?;
+        let (file, created) = windows_identity::open_relative_directory(
+            &parent.handle,
+            Path::new(component.as_os_str()),
+            true,
+        )
+        .map_err(|_| "ROOT_HANDLE")?;
+        // Persist a newly-created child while its parent and the exact child
+        // are both retained without delete sharing.
+        if created {
+            parent.handle.sync_all().map_err(|_| "ROOT_SYNC")?;
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&cursor)
-            .map_err(|_| "ROOT_HANDLE")?;
         let opened = file.metadata().map_err(|_| "ROOT_HANDLE")?;
         let opened_identity =
             windows_identity::file_identity(&file).map_err(|_| "ROOT_IDENTITY")?;
@@ -853,12 +850,20 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
             }
             drop(confirmed.take());
             std::fs::remove_file(&confirmed_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-            sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+            held.last()
+                .ok_or("ROOT_HANDLE")?
+                .handle
+                .sync_all()
+                .map_err(|_| "ROOT_STATE_CLEANUP")?;
         } else if pending.is_some() {
             drop(pending.take());
             fault("root-before-state-cleanup");
             std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-            sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+            held.last()
+                .ok_or("ROOT_HANDLE")?
+                .handle
+                .sync_all()
+                .map_err(|_| "ROOT_STATE_CLEANUP")?;
             return retain_windows_root_marker(confirmed_path, confirmed.unwrap(), &expected);
         } else {
             return retain_windows_root_marker(confirmed_path, confirmed.unwrap(), &expected);
@@ -873,12 +878,15 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
         None => create_windows_state_file(&pending_path, b"unconfirmed\n", true)?,
     };
     pending.sync_all().map_err(|_| "ROOT_STATE")?;
-    sync_windows_directory_path(target, "ROOT_STATE_SYNC")?;
+    held.last()
+        .ok_or("ROOT_HANDLE")?
+        .handle
+        .sync_all()
+        .map_err(|_| "ROOT_STATE_SYNC")?;
 
-    for component in held.iter().skip(1) {
+    for parent in held.iter().take(held.len().saturating_sub(1)) {
         fault("root-before-directory-sync");
-        let parent = component.path.parent().ok_or("ROOT_HANDLE")?;
-        sync_windows_directory_path(parent, "ROOT_SYNC")?;
+        parent.handle.sync_all().map_err(|_| "ROOT_SYNC")?;
         validate_windows_root_components(held)?;
     }
 
@@ -890,11 +898,19 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
             file
         }
     };
-    sync_windows_directory_path(target, "ROOT_STATE_SYNC")?;
+    held.last()
+        .ok_or("ROOT_HANDLE")?
+        .handle
+        .sync_all()
+        .map_err(|_| "ROOT_STATE_SYNC")?;
     drop(pending);
     fault("root-before-state-cleanup");
     std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-    sync_windows_directory_path(target, "ROOT_STATE_CLEANUP")?;
+    held.last()
+        .ok_or("ROOT_HANDLE")?
+        .handle
+        .sync_all()
+        .map_err(|_| "ROOT_STATE_CLEANUP")?;
     // A newly created marker handle still has write access. Close it and
     // recapture the immutable marker read-only so its share mask both blocks
     // later mutation and permits same-object validation opens.
@@ -913,49 +929,6 @@ fn validate_windows_root_components(held: &[WindowsRootComponent]) -> Result<(),
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn sync_windows_directory_path(path: &Path, error: &str) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
-    };
-    let encoded = path
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
-    // FlushFileBuffers explicitly requires a handle opened for write.  Never
-    // pass the retained read-only trust handles and never reinterpret a failed
-    // flush as success: first use/migration remain unavailable until this
-    // documented barrier succeeds.
-    let handle = unsafe {
-        CreateFileW(
-            encoded.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(error.into());
-    }
-    let flushed = unsafe { FlushFileBuffers(handle) } != 0;
-    unsafe { CloseHandle(handle) };
-    if flushed {
-        Ok(())
-    } else {
-        Err(error.into())
-    }
 }
 
 fn open_db(deadline: Instant) -> Result<Db, String> {
@@ -1842,8 +1815,14 @@ fn sync_directory() -> Result<(), String> {
 }
 #[cfg(windows)]
 fn sync_directory() -> Result<(), String> {
-    let _ = WINDOWS_ROOT_HANDLES.get().ok_or("DIR_HANDLES")?;
-    sync_windows_directory_path(Path::new("."), "DIR_SYNC")
+    WINDOWS_ROOT_HANDLES
+        .get()
+        .ok_or("DIR_HANDLES")?
+        .last()
+        .ok_or("DIR_HANDLES")?
+        .handle
+        .sync_all()
+        .map_err(|_| "DIR_SYNC".into())
 }
 
 fn validate(db: &Db) -> Result<(), String> {

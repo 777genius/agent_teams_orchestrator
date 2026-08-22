@@ -27,7 +27,7 @@ const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
 
-type Held = (String, File, u64, u64);
+type Held = (String, File, u64, u128);
 static REGISTERED: OnceLock<()> = OnceLock::new();
 static HELD: OnceLock<Mutex<Vec<Held>>> = OnceLock::new();
 
@@ -59,7 +59,7 @@ fn known_name(raw: *const c_char) -> Result<&'static str, c_int> {
     }
 }
 
-fn identity(file: &File) -> Result<(u64, u64), c_int> {
+fn identity(file: &File) -> Result<windows_identity::FileIdentity, c_int> {
     let metadata = file.metadata().map_err(|_| sqlite::SQLITE_IOERR_FSTAT)?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(sqlite::SQLITE_CANTOPEN);

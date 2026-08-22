@@ -3,8 +3,8 @@ import {
   launchOpenCodeNativeAuthority, resolveOpenCodeNativeAuthorityArtifacts,
   verifyOpenCodeNativeAuthorityArtifacts, type OpenCodeNativeAuthorityChild,
 } from './OpenCodeNativeAuthorityArtifacts.js'
-import { decodeOpenCodeWindowsPublicationReply, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
-  validOpenCodePublicationLeaf, validOpenCodePublicationRoot,
+import { decodeOpenCodeWindowsPublicationReply, OpenCodeWindowsPublicationRejectedError, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
+  validOpenCodePublicationLeaf, validOpenCodePublicationMaterializationKey, validOpenCodePublicationRoot,
   type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
@@ -21,10 +21,11 @@ const unavailable = () => new Error('OpenCode Windows publication authority is u
 export class OpenCodeWindowsPublicationAuthorityClient {
   readonly #child: OpenCodeNativeAuthorityChild
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
-  readonly #deadline: number
+  #deadline: number
   readonly #signal?: AbortSignal
   readonly #decoder = new TextDecoder('utf-8', { fatal: true })
   #pending = ''; #pendingBytes = 0; #closed = false; #retained = false
+  #ownerDeadline: ReturnType<typeof setTimeout> | undefined
   #abort = () => this.kill()
 
   constructor(options: OpenCodeWindowsPublicationAuthorityOptions) {
@@ -42,7 +43,10 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
       || !Array.isArray(value?.createdPaths) || !value.createdPaths.every(v => typeof v === 'string')) throw unavailable()
     this.#retained = true
+    this.#deadline = performance.now() + 120_000
     this.#signal?.removeEventListener('abort', this.#abort)
+    // A lost owner cannot strand a no-delete-sharing NTFS lease forever.
+    this.#armOwnerReaper()
     return value as { volumeSerial: string; fileId: string; createdPaths: string[] }
   }
   async validateRoot(): Promise<void> { await this.#request({ id: randomUUID(), op: 'VALIDATE_ROOT' }) }
@@ -54,8 +58,78 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId)) || !/^\d+$/.test(String(value?.size))) throw unavailable()
     return value as { volumeSerial: string; fileId: string; size: string }
   }
+  async createDirectory(name: string): Promise<Readonly<{ volumeSerial: string; fileId: string }>> {
+    if (!validOpenCodePublicationLeaf(name)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'CREATE_DIRECTORY', name }) as Record<string, unknown>
+    if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))) throw unavailable()
+    return value as { volumeSerial: string; fileId: string }
+  }
+  async createChildDirectory(parentKey: string, key: string, name: string): Promise<Readonly<{ volumeSerial: string; fileId: string }>> {
+    return this.#createChild('CREATE_CHILD_DIRECTORY', parentKey, key, name)
+  }
+  async createChildFile(parentKey: string, key: string, name: string): Promise<Readonly<{ volumeSerial: string; fileId: string }>> {
+    return this.#createChild('CREATE_CHILD_FILE', parentKey, key, name)
+  }
+  async #createChild(op: 'CREATE_CHILD_DIRECTORY' | 'CREATE_CHILD_FILE', parentKey: string, key: string,
+    name: string): Promise<Readonly<{ volumeSerial: string; fileId: string }>> {
+    if (!validOpenCodePublicationMaterializationKey(parentKey)
+      || !validOpenCodePublicationMaterializationKey(key)
+      || !validOpenCodePublicationLeaf(name) || key !== `${parentKey}/${name}`) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op, parent_key: parentKey, key, name }) as Record<string, unknown>
+    if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))) throw unavailable()
+    return value as { volumeSerial: string; fileId: string }
+  }
+  async writeChildFile(key: string, offset: number, content: Uint8Array, finish: boolean): Promise<number> {
+    if (!validOpenCodePublicationMaterializationKey(key) || !Number.isSafeInteger(offset) || offset < 0
+      || content.byteLength > 44 * 1024) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'WRITE_CHILD_FILE', key, offset,
+      content_base64: Buffer.from(content).toString('base64'), finish }) as Record<string, unknown>
+    const written = offset + content.byteLength
+    if (String(value?.written) !== String(written) || value?.finished !== finish) throw unavailable()
+    return written
+  }
+  async renameDirectory(from: string, to: string): Promise<Readonly<{ volumeSerial: string; fileId: string }>> {
+    if (!validOpenCodePublicationLeaf(from) || !validOpenCodePublicationLeaf(to)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'RENAME_DIRECTORY', from, to }) as Record<string, unknown>
+    if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))) throw unavailable()
+    return value as { volumeSerial: string; fileId: string }
+  }
+  async rollbackDirectory(rootKey: string): Promise<void> {
+    if (!validOpenCodePublicationLeaf(rootKey)) throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'ROLLBACK_DIRECTORY', root_key: rootKey })
+  }
+  async prepareAtomic(finalName: string, temporaryName: string, backupName: string,
+    quarantineName: string, recoveryName: string, content: Uint8Array): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string }>> {
+    if (![finalName, temporaryName, backupName, quarantineName, recoveryName].every(validOpenCodePublicationLeaf)
+      || content.byteLength > 44 * 1024) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'PREPARE_ATOMIC', final_name: finalName,
+      temporary_name: temporaryName, backup_name: backupName, quarantine_name: quarantineName,
+      recovery_name: recoveryName,
+      content_base64: Buffer.from(content).toString('base64') }) as Record<string, unknown>
+    if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
+      || String(value?.size) !== String(content.byteLength)) throw unavailable()
+    return value as { volumeSerial: string; fileId: string; size: string }
+  }
+  async commitAtomic(): Promise<void> { await this.#request({ id: randomUUID(), op: 'COMMIT_ATOMIC' }) }
+  async rollbackAtomic(): Promise<void> { await this.#request({ id: randomUUID(), op: 'ROLLBACK_ATOMIC' }) }
   async close(): Promise<void> { if (this.#closed) return; try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {} finally { this.kill() } }
-  kill(): void { if (this.#closed) return; this.#closed = true; this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
+  kill(): void { if (this.#closed) return; this.#closed = true; if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
+
+  #armOwnerReaper(): void {
+    if (this.#closed || !this.#retained) return
+    if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
+    const beforeAbsoluteDeadline = Math.max(1, this.#deadline - performance.now() - 10_000)
+    this.#ownerDeadline = setTimeout(
+      () => { void this.#markRecoveryAndKill() },
+      Math.min(90_000, beforeAbsoluteDeadline),
+    )
+    this.#ownerDeadline.unref?.()
+  }
+  async #markRecoveryAndKill(): Promise<void> {
+    if (this.#closed) return
+    try { await this.#request({ id: randomUUID(), op: 'MARK_RECOVERY_REQUIRED' }) } catch {}
+    finally { this.kill() }
+  }
 
   async #request(request: Pending): Promise<unknown> {
     if (this.#closed || (!this.#retained && this.#signal?.aborted) || performance.now() >= this.#deadline) { this.kill(); throw unavailable() }
@@ -67,8 +141,13 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       const line = await Promise.race([this.#readLine(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(unavailable()), remaining); timer.unref?.() }), this.#child.exited.then(() => { throw unavailable() })])
-      return decodeOpenCodeWindowsPublicationReply(line, request.id)
-    } catch { this.kill(); throw unavailable() } finally { if (timer) clearTimeout(timer) }
+      const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
+      if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'CLOSE') this.#armOwnerReaper()
+      return value
+    } catch (error) {
+      if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained) throw unavailable()
+      this.kill(); throw unavailable()
+    } finally { if (timer) clearTimeout(timer) }
   }
   async #readLine(): Promise<string> {
     for (;;) {

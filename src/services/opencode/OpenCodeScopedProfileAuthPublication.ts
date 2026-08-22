@@ -19,6 +19,39 @@ type ProfileAuthTransactionRecord = Readonly<{
 }>
 const profileAuthTransactions = new WeakMap<object, ProfileAuthTransactionRecord>()
 const signalAuthTransactions = new WeakMap<AbortSignal, ProfileAuthTransactionRecord>()
+const settlementReaper = new Set<ProfileAuthTransactionRecord>()
+
+function reapRollback(record: ProfileAuthTransactionRecord): void {
+  if (settlementReaper.has(record)) return
+  settlementReaper.add(record)
+  let attempts = 0
+  const retry = (): void => {
+    attempts += 1
+    void record.transaction.rollback().then(() => {
+      settlementReaper.delete(record)
+      profileAuthTransactions.delete(record.profile)
+      if (record.signal) signalAuthTransactions.delete(record.signal)
+    }, () => {
+      // Bounded owner-side settlement. The native client's independent
+      // retained-root deadline is the final conservative lease reaper.
+      if (attempts < 8) {
+        const timer = setTimeout(retry, Math.min(4_000, 100 * 2 ** attempts))
+        timer.unref?.()
+      } else {
+        // The native owner deadline has conservatively closed every retained
+        // NTFS handle by this point and left recovery-required evidence. Do
+        // not retain an otherwise unreachable profile record indefinitely.
+        const timer = setTimeout(() => {
+          settlementReaper.delete(record)
+          profileAuthTransactions.delete(record.profile)
+          if (record.signal) signalAuthTransactions.delete(record.signal)
+        }, 125_000)
+        timer.unref?.()
+      }
+    })
+  }
+  retry()
+}
 
 const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) => {
   const directory = await OpenCodeSafePublicationDirectory.open(directoryPath, { abortSignal: signal })
@@ -61,7 +94,7 @@ export async function finalizeOpenCodeScopedProfileAuth(preparedProfile: object)
 export async function rollbackOpenCodeScopedProfileAuth(preparedProfile: object): Promise<void> {
   const record = profileAuthTransactions.get(preparedProfile)
   if (!record) return
-  await record.transaction.rollback()
+  try { await record.transaction.rollback() } catch (error) { reapRollback(record); throw error }
   profileAuthTransactions.delete(preparedProfile)
   if (record.signal) signalAuthTransactions.delete(record.signal)
 }
@@ -69,7 +102,7 @@ export async function rollbackOpenCodeScopedProfileAuth(preparedProfile: object)
 export async function rollbackOpenCodeScopedProfileAuthSignal(signal: AbortSignal): Promise<void> {
   const record = signalAuthTransactions.get(signal)
   if (!record) return
-  await record.transaction.rollback()
+  try { await record.transaction.rollback() } catch (error) { reapRollback(record); throw error }
   signalAuthTransactions.delete(signal)
   profileAuthTransactions.delete(record.profile)
 }

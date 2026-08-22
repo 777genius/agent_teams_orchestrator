@@ -960,6 +960,7 @@ type OpenCodeProjectBehaviorCapture = {
     identities: Map<string, WindowsProjectBehaviorPathIdentity>
     directoryManifests: Map<string, string[]>
     fileBytes: Map<string, Buffer>
+    missingPaths: Set<string>
   }
   close(): Promise<void>
 }
@@ -1028,6 +1029,10 @@ function sameWindowsProjectBehaviorIdentity(
  */
 async function captureWindowsProjectBehaviorMetadata(
   projectPath: string,
+  testHooks?: {
+    afterComponentWalk?: () => void | Promise<void>
+    afterFileIdentityCaptured?: (relativePath: string) => void | Promise<void>
+  },
 ): Promise<OpenCodeProjectBehaviorCapture> {
   const resolvedProjectPath = path.resolve(projectPath)
   const identities = new Map<string, WindowsProjectBehaviorPathIdentity>()
@@ -1035,6 +1040,28 @@ async function captureWindowsProjectBehaviorMetadata(
   const entries: string[] = []
   const behaviorSources = new Set<string>()
   const fileBytes = new Map<string, Buffer>()
+  const initiallyMissing = new Set<string>()
+
+  // The first observation is the capture. Later walks are witnesses only:
+  // replacing this entry would turn a detected swap into a new baseline.
+  const retainIdentity = (
+    absolutePath: string,
+    identity: WindowsProjectBehaviorPathIdentity,
+  ): void => {
+    const captured = identities.get(absolutePath)
+    if (captured && !sameWindowsProjectBehaviorIdentity(captured, identity)) {
+      throw new Error('OpenCode Windows project behavior ancestry changed during capture')
+    }
+    if (!captured) identities.set(absolutePath, identity)
+  }
+  const retainDirectoryManifest = (absolutePath: string, manifest: string[]): void => {
+    const captured = directoryManifests.get(absolutePath)
+    const serialized = canonicalSerializeOpenCodePolicyIdentity(manifest)
+    if (captured && canonicalSerializeOpenCodePolicyIdentity(captured) !== serialized) {
+      throw new Error('OpenCode Windows project behavior directory changed during capture')
+    }
+    if (!captured) directoryManifests.set(absolutePath, manifest)
+  }
 
   const assertCanonicalEntry = async (
     targetPath: string,
@@ -1071,6 +1098,7 @@ async function captureWindowsProjectBehaviorMetadata(
     current = path.join(current, component)
     const identity = await assertCanonicalEntry(current, 'directory', true)
     if (!identity) {
+      initiallyMissing.add(current)
       return {
         projectBehaviorFingerprint: hashString(''),
         behaviorSources: [],
@@ -1081,16 +1109,65 @@ async function captureWindowsProjectBehaviorMetadata(
         directories: new Map(),
         directoryEntryManifests: new Map(),
         files: new Map(),
-        windows: { identities, directoryManifests, fileBytes },
+        windows: { identities, directoryManifests, fileBytes, missingPaths: initiallyMissing },
         close: async () => undefined,
       }
     }
-    identities.set(current, identity)
+    retainIdentity(current, identity)
   }
+
+  // Capture presence and identity before any later config/directory walk. A
+  // later observation is never allowed to turn a swap or newly-created path
+  // into the baseline simply because that path had not yet been read.
+  for (const relativePath of PROJECT_BEHAVIOR_FILES) {
+    const absolutePath = path.join(resolvedProjectPath, ...relativePath.split('/'))
+    const identity = await assertCanonicalEntry(absolutePath, 'file', true)
+    if (identity) retainIdentity(absolutePath, identity)
+    else initiallyMissing.add(absolutePath)
+  }
+  const captureDirectoryBaseline = async (absoluteDirectory: string): Promise<void> => {
+    const identity = await assertCanonicalEntry(absoluteDirectory, 'directory')
+    if (!identity) throw new Error('OpenCode Windows project behavior directory disappeared')
+    retainIdentity(absoluteDirectory, identity)
+    const dirents = await readdir(absoluteDirectory, { withFileTypes: true })
+    dirents.sort((left, right) => left.name.localeCompare(right.name))
+    const manifest: string[] = []
+    for (const dirent of dirents) {
+      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
+      const absolutePath = path.join(absoluteDirectory, dirent.name)
+      if (dirent.isDirectory() && !dirent.isSymbolicLink()) {
+        manifest.push(`directory:${dirent.name}`)
+        await captureDirectoryBaseline(absolutePath)
+      } else if (dirent.isFile() && !dirent.isSymbolicLink()) {
+        manifest.push(`file:${dirent.name}`)
+        const fileIdentity = await assertCanonicalEntry(absolutePath, 'file')
+        if (!fileIdentity) throw new Error('OpenCode Windows project behavior file disappeared')
+        retainIdentity(absolutePath, fileIdentity)
+      } else {
+        throw new Error('OpenCode Windows project behavior path contains a reparse point or unsupported entry')
+      }
+    }
+    retainDirectoryManifest(absoluteDirectory, manifest.sort())
+  }
+  for (const relativeDirectory of PROJECT_BEHAVIOR_DIRS) {
+    const absoluteDirectory = path.join(resolvedProjectPath, ...relativeDirectory.split('/'))
+    const identity = await assertCanonicalEntry(absoluteDirectory, 'directory', true)
+    if (identity) {
+      retainIdentity(absoluteDirectory, identity)
+      await captureDirectoryBaseline(absoluteDirectory)
+    }
+    else initiallyMissing.add(absoluteDirectory)
+  }
+  await testHooks?.afterComponentWalk?.()
 
   const captureFile = async (absolutePath: string, relativePath: string): Promise<boolean> => {
     const before = await assertCanonicalEntry(absolutePath, 'file', true)
     if (!before) return false
+    if (initiallyMissing.has(absolutePath)) {
+      throw new Error('OpenCode Windows project behavior path appeared during capture')
+    }
+    retainIdentity(absolutePath, before)
+    await testHooks?.afterFileIdentityCaptured?.(relativePath)
     const handle = await open(absolutePath, fsConstants.O_RDONLY)
     try {
       const openedBefore = windowsProjectBehaviorIdentity(await handle.stat({ bigint: true }))
@@ -1107,7 +1184,6 @@ async function captureWindowsProjectBehaviorMetadata(
       }
       entries.push(`file:${relativePath}:${hashBuffer(bytes)}`)
       behaviorSources.add(relativePath)
-      identities.set(absolutePath, before)
       fileBytes.set(relativePath, bytes)
       return true
     } finally {
@@ -1118,7 +1194,10 @@ async function captureWindowsProjectBehaviorMetadata(
   const captureDirectory = async (absoluteDirectory: string, relativeDirectory: string): Promise<void> => {
     const directoryIdentity = await assertCanonicalEntry(absoluteDirectory, 'directory')
     if (!directoryIdentity) throw new Error('OpenCode Windows project behavior directory disappeared')
-    identities.set(absoluteDirectory, directoryIdentity)
+    if (initiallyMissing.has(absoluteDirectory)) {
+      throw new Error('OpenCode Windows project behavior path appeared during capture')
+    }
+    retainIdentity(absoluteDirectory, directoryIdentity)
     entries.push(`directory:${relativeDirectory}`)
     const dirents = await readdir(absoluteDirectory, { withFileTypes: true })
     dirents.sort((left, right) => left.name.localeCompare(right.name))
@@ -1137,7 +1216,7 @@ async function captureWindowsProjectBehaviorMetadata(
         throw new Error('OpenCode Windows project behavior path contains a reparse point or unsupported entry')
       }
     }
-    directoryManifests.set(absoluteDirectory, manifest.sort())
+    retainDirectoryManifest(absoluteDirectory, manifest.sort())
   }
 
   for (const relativePath of PROJECT_BEHAVIOR_FILES) {
@@ -1145,7 +1224,7 @@ async function captureWindowsProjectBehaviorMetadata(
     const parentPath = path.dirname(absolutePath)
     const parent = await assertCanonicalEntry(parentPath, 'directory', true)
     if (!parent) continue
-    identities.set(parentPath, parent)
+    retainIdentity(parentPath, parent)
     await captureFile(absolutePath, relativePath)
   }
   for (const relativeDirectory of PROJECT_BEHAVIOR_DIRS) {
@@ -1178,6 +1257,13 @@ async function captureWindowsProjectBehaviorMetadata(
       throw new Error('OpenCode Windows project behavior directory changed during capture')
     }
   }
+  for (const absolutePath of initiallyMissing) {
+    const appeared = await lstat(absolutePath).then(() => true, error => {
+      if (getErrnoCode(error) === 'ENOENT') return false
+      throw error
+    })
+    if (appeared) throw new Error('OpenCode Windows project behavior path appeared during capture')
+  }
 
   entries.sort()
   return {
@@ -1190,7 +1276,7 @@ async function captureWindowsProjectBehaviorMetadata(
     directories: new Map(),
     directoryEntryManifests: new Map(),
     files: new Map(),
-    windows: { identities, directoryManifests, fileBytes },
+    windows: { identities, directoryManifests, fileBytes, missingPaths: initiallyMissing },
     close: async () => undefined,
   }
 }
@@ -1224,8 +1310,9 @@ function sameProjectBehaviorFileIdentity(
 async function captureProjectBehaviorMetadata(
   projectPath: string,
   platform: NodeJS.Platform = process.platform,
+  windowsTestHooks?: Parameters<typeof captureWindowsProjectBehaviorMetadata>[1],
 ): Promise<OpenCodeProjectBehaviorCapture> {
-  if (platform === 'win32') return captureWindowsProjectBehaviorMetadata(projectPath)
+  if (platform === 'win32') return captureWindowsProjectBehaviorMetadata(projectPath, windowsTestHooks)
   if (process.platform !== 'linux' && process.platform !== 'darwin') {
     throw new Error('OpenCode descriptor-relative project capture is unsupported [redacted]')
   }
@@ -1551,6 +1638,15 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
         throw new Error('OpenCode Windows project behavior directory changed before materialization')
       }
     }
+    for (const missingPath of retained.missingPaths) {
+      const appeared = await lstat(missingPath).then(() => true, error => {
+        if (getErrnoCode(error) === 'ENOENT') return false
+        throw error
+      })
+      if (appeared) {
+        throw new Error('OpenCode Windows project behavior path appeared before materialization')
+      }
+    }
   }
   const verifyTree = async (root: string): Promise<boolean> => {
     const metadata = await lstat(root, { bigint: true }).catch(() => null)
@@ -1598,19 +1694,44 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
   }
 
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
-  targetPath = publicationDirectory.child(path.basename(targetPath))
-  const temporaryPath = publicationDirectory.child(
-    `${path.basename(targetPath)}.snapshot-${process.pid}-${randomUUID()}`,
-  )
+  const targetLeaf = path.basename(targetPath)
+  targetPath = publicationDirectory.child(targetLeaf)
+  const temporaryLeaf = `${targetLeaf}.snapshot-${process.pid}-${randomUUID()}`
+  const temporaryPath = publicationDirectory.child(temporaryLeaf)
+  let temporaryRoot: OpenCodeSafePublicationDirectory | null = null
+  let completed = false
   try {
     if (await verifyTree(targetPath)) return
-    await mkdir(temporaryPath, { mode: 0o700 })
+    // Native FILE_CREATE both creates and retains this exact NTFS directory
+    // without FILE_SHARE_DELETE before any descendant path write is possible.
+    if (process.platform === 'win32') {
+      temporaryRoot = await publicationDirectory.createChildDirectoryExclusive(temporaryLeaf, 0o700)
+    } else {
+      // Test-only cross-platform Windows policy composition has no Win32
+      // native authority; production Windows must take the retained branch.
+      await mkdir(temporaryPath, { mode: 0o700 })
+    }
     assertActive()
     await testHooks?.afterCaptureBeforeCopy?.()
     await revalidateSource()
-    for (const directory of Array.from(expectedTargetDirectories).sort()) {
+    for (const directory of Array.from(expectedTargetDirectories).sort((left, right) => {
+      const depth = left.split(path.sep).filter(Boolean).length
+        - right.split(path.sep).filter(Boolean).length
+      return depth || left.localeCompare(right)
+    })) {
       assertActive()
-      if (directory) await mkdir(path.join(temporaryPath, directory), { recursive: true, mode: 0o700 })
+      if (directory) {
+        if (process.platform === 'win32') {
+          const normalized = directory.split(path.sep).join('/')
+          const parent = path.dirname(directory)
+          const parentKey = parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent.split(path.sep).join('/')}`
+          await publicationDirectory.createRetainedDescendantDirectory(
+            parentKey, `${temporaryLeaf}/${normalized}`, path.basename(directory),
+          )
+        } else {
+          await mkdir(path.join(temporaryPath, directory), { mode: 0o700 })
+        }
+      }
     }
     for (const [relativeSource, digest] of expectedFiles) {
       assertActive()
@@ -1618,9 +1739,17 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
       if (!bytes || hashBuffer(bytes) !== digest) {
         throw new Error('OpenCode Windows project behavior capture is incomplete')
       }
-      const destination = path.join(temporaryPath, targetName(relativeSource))
-      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
-      await writeFile(destination, bytes, { flag: 'wx', mode: 0o400 })
+      const relativeTarget = targetName(relativeSource)
+      if (process.platform === 'win32') {
+        const normalized = relativeTarget.split(path.sep).join('/')
+        const parent = path.dirname(relativeTarget)
+        const parentKey = parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent.split(path.sep).join('/')}`
+        await publicationDirectory.writeRetainedDescendantFile(
+          parentKey, `${temporaryLeaf}/${normalized}`, path.basename(relativeTarget), bytes,
+        )
+      } else {
+        await writeFile(path.join(temporaryPath, relativeTarget), bytes, { flag: 'wx', mode: 0o400 })
+      }
     }
     await revalidateSource()
     await verifyTree(temporaryPath)
@@ -1628,15 +1757,23 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
     assertActive()
     await verifyTree(temporaryPath)
     assertActive()
-    await rename(temporaryPath, targetPath).catch(async error => {
-      if (!['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '') || !(await verifyTree(targetPath))) {
-        throw error
-      }
-    })
+    if (process.platform === 'win32') {
+      await publicationDirectory.renameRetainedChildDirectory(temporaryLeaf, targetLeaf)
+    } else {
+      await rename(temporaryPath, targetPath)
+    }
     await testHooks?.afterRenameBeforeFinalVerify?.(targetPath)
     await verifyTree(targetPath)
+    completed = true
   } finally {
-    await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+    // The native authority owns the only exact NTFS identities. Never release
+    // them and then recursively remove a pathname that a successor can reuse.
+    if (process.platform === 'win32' && temporaryRoot && !completed) {
+      await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
+    } else if (process.platform !== 'win32') {
+      await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+    }
+    await temporaryRoot?.close().catch(() => undefined)
     await publicationDirectory.close()
   }
 }
@@ -2077,9 +2214,19 @@ export async function publishOpenCodeProjectBehaviorSnapshotForTest(
     afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
     abortSignal?: AbortSignal
+    capturePlatform?: NodeJS.Platform
+    afterWindowsComponentWalk?: () => void | Promise<void>
+    afterWindowsFileIdentityCaptured?: (relativePath: string) => void | Promise<void>
   },
 ): Promise<void> {
-  const capture = await captureProjectBehaviorMetadata(projectPath)
+  const capture = await captureProjectBehaviorMetadata(
+    projectPath,
+    testHooks?.capturePlatform ?? process.platform,
+    {
+      afterComponentWalk: testHooks?.afterWindowsComponentWalk,
+      afterFileIdentityCaptured: testHooks?.afterWindowsFileIdentityCaptured,
+    },
+  )
   try {
     await publishImmutableProjectBehaviorSnapshot(
       capture,

@@ -196,10 +196,52 @@ export class OpenCodeSafePublicationDirectory {
     afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
   ): Promise<OpenCodeSafePublicationDirectory> {
     await this.#assertWindowsRoot()
+    if (process.platform === 'win32' && this.#windowsAuthority) {
+      const identity = await this.#windowsAuthority.createDirectory(childName(name)).catch(fail)
+      await afterCreatedEntrySynced?.(this.child(name))
+      // Borrow the exact child retained by the parent authority. Opening a
+      // second authority would require delete sharing and weaken the lease.
+      return new OpenCodeSafePublicationDirectory(null, this.child(name), {
+        dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId),
+      })
+    }
     await mkdir(this.child(name), { mode })
     await this.sync()
     await afterCreatedEntrySynced?.(this.child(name))
     return this.openChildDirectory(name)
+  }
+
+  /** Renames a Windows child by its retained native handle, never by reopening its path. */
+  async renameRetainedChildDirectory(from: string, to: string): Promise<void> {
+    if (!this.#windowsAuthority) fail()
+    await this.#windowsAuthority.renameDirectory(childName(from), childName(to)).catch(fail)
+    await this.#assertWindowsRoot()
+  }
+
+  /** Deletes only the exact retained attempt tree, and is safe to retry. */
+  async rollbackRetainedChildDirectory(rootKey: string): Promise<void> {
+    if (!this.#windowsAuthority) fail()
+    await this.#windowsAuthority.rollbackDirectory(childName(rootKey)).catch(fail)
+  }
+
+  /** Creates and retains a descendant directory relative to an already-retained parent. */
+  async createRetainedDescendantDirectory(parentKey: string, key: string, name: string): Promise<void> {
+    if (!this.#windowsAuthority) fail()
+    await this.#windowsAuthority.createChildDirectory(parentKey, key, childName(name)).catch(fail)
+  }
+
+  /** Creates and writes a descendant file entirely through its retained native handle. */
+  async writeRetainedDescendantFile(parentKey: string, key: string, name: string, bytes: Uint8Array): Promise<void> {
+    if (!this.#windowsAuthority) fail()
+    await this.#windowsAuthority.createChildFile(parentKey, key, childName(name)).catch(fail)
+    const chunkSize = 32 * 1024
+    let offset = 0
+    do {
+      const end = Math.min(bytes.byteLength, offset + chunkSize)
+      offset = await this.#windowsAuthority.writeChildFile(
+        key, offset, bytes.subarray(offset, end), end === bytes.byteLength,
+      ).catch(fail)
+    } while (offset < bytes.byteLength)
   }
 
   async regularFileModifiedAt(name: string): Promise<number> {
@@ -349,7 +391,45 @@ export class OpenCodeSafePublicationDirectory {
     const temporaryPath = this.child(temporaryName)
     const backupName = childName(`.${finalName}.rollback.${process.pid}.${randomUUID()}`)
     const backupPath = this.child(backupName)
-    const quarantinePath = this.child(`.${finalName}.quarantine.${process.pid}.${randomUUID()}`)
+    const quarantineName = childName(`.${finalName}.quarantine.${process.pid}.${randomUUID()}`)
+    const quarantinePath = this.child(quarantineName)
+    const recoveryName = childName(`.${finalName}.recovery-required.${process.pid}.${randomUUID()}`)
+    if (process.platform === 'win32' && this.#windowsAuthority) {
+      const bytes = typeof content === 'string' ? Buffer.from(content) : new Uint8Array(content)
+      try {
+        const recoveryPrefix = `.${finalName}.recovery-required.`.toLowerCase()
+        const existingNames = await readdir(this.#root).catch(fail)
+        await this.#assertWindowsRoot()
+        if (existingNames.some(existing => existing.toLowerCase().startsWith(recoveryPrefix))) {
+          throw new Error('OpenCode safe publication recovery is required [redacted]')
+        }
+        await this.#windowsAuthority.prepareAtomic(
+          finalName, temporaryName, backupName, quarantineName, recoveryName, bytes,
+        ).catch(fail)
+        await testHooks?.afterRenameBeforeVerification?.()
+        if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
+        if (testHooks?.retainTransaction) {
+          let settled = false
+          let inFlight: Promise<void> | null = null
+          const settle = (rollback: boolean): Promise<void> => {
+            if (settled) return Promise.resolve()
+            if (inFlight) return inFlight
+            inFlight = Promise.resolve().then(() => testHooks.beforeSettlementSync?.())
+              .then(() => rollback ? this.#windowsAuthority!.rollbackAtomic() : this.#windowsAuthority!.commitAtomic())
+              .then(() => { settled = true })
+              .finally(() => { if (!settled) inFlight = null })
+            return inFlight
+          }
+          testHooks.retainTransaction(Object.freeze({ commit: () => settle(false), rollback: () => settle(true) }))
+        } else {
+          await this.#windowsAuthority.commitAtomic().catch(fail)
+        }
+        return
+      } catch (error) {
+        await this.#windowsAuthority.rollbackAtomic().catch(() => undefined)
+        throw error
+      }
+    }
     let handle: FileHandle | null = null
     let temporaryIdentity: Awaited<ReturnType<FileHandle['stat']>> | null = null
     let priorLinked = false

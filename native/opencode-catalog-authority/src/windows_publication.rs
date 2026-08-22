@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -12,6 +12,61 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 const MAX_WIRE: usize = 64 * 1024;
+
+fn decode_bounded_base64(value: &str) -> Result<Vec<u8>, &'static str> {
+    if value.len() > 60 * 1024 || value.len() % 4 != 0 || !value.is_ascii() {
+        return Err("FILE_REJECTED");
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for (offset, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = offset + 1 == bytes.len() / 4;
+        let digit = |byte: u8| -> Option<u8> {
+            match byte {
+                b'A'..=b'Z' => Some(byte - b'A'),
+                b'a'..=b'z' => Some(byte - b'a' + 26),
+                b'0'..=b'9' => Some(byte - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        };
+        let a = digit(chunk[0]).ok_or("FILE_REJECTED")?;
+        let b = digit(chunk[1]).ok_or("FILE_REJECTED")?;
+        let c = if chunk[2] == b'=' {
+            if !last || chunk[3] != b'=' {
+                return Err("FILE_REJECTED");
+            }
+            0
+        } else {
+            digit(chunk[2]).ok_or("FILE_REJECTED")?
+        };
+        let d = if chunk[3] == b'=' {
+            if !last {
+                return Err("FILE_REJECTED");
+            }
+            0
+        } else {
+            digit(chunk[3]).ok_or("FILE_REJECTED")?
+        };
+        if (chunk[2] == b'=' && b & 0x0f != 0)
+            || (chunk[3] == b'=' && chunk[2] != b'=' && c & 0x03 != 0)
+        {
+            return Err("FILE_REJECTED");
+        }
+        output.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((c << 6) | d);
+        }
+    }
+    if output.len() > 44 * 1024 {
+        return Err("FILE_REJECTED");
+    }
+    Ok(output)
+}
 
 fn reserved_device(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component);
@@ -57,16 +112,58 @@ fn valid_root_input(value: &str) -> bool {
 struct HeldComponent {
     path: PathBuf,
     handle: std::fs::File,
-    identity: (u64, u64),
+    identity: crate::windows_identity::FileIdentity,
 }
 
 struct RetainedWindowsRoot {
     target: PathBuf,
     held: Vec<HeldComponent>,
     pinned: Vec<std::fs::File>,
+    pinned_directories: Vec<(String, std::fs::File, crate::windows_identity::FileIdentity)>,
+    pinned_files: Vec<(
+        String,
+        std::fs::File,
+        crate::windows_identity::FileIdentity,
+        u64,
+        bool,
+    )>,
+    materialization_published: bool,
+    materialization_root: Option<String>,
+    materialization_rolled_back: bool,
+    publication: Option<AtomicPublication>,
 }
 
-fn open_directory(path: &Path) -> Result<std::fs::File, &'static str> {
+struct AtomicPublication {
+    final_name: String,
+    backup_name: String,
+    quarantine_name: String,
+    temporary: Option<std::fs::File>,
+    temporary_identity: crate::windows_identity::FileIdentity,
+    prior: Option<std::fs::File>,
+    prior_identity: Option<crate::windows_identity::FileIdentity>,
+    stage: AtomicPublicationStage,
+    backup_created: bool,
+    recovery_name: String,
+    recovery: Option<std::fs::File>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicPublicationStage {
+    Temporary,
+    PriorCaptured,
+    Published,
+}
+
+fn open_volume_directory(path: &Path) -> Result<std::fs::File, &'static str> {
+    std::fs::OpenOptions::new()
+        .access_mode(0x0010_0000 | 0x0000_0080 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| "ROOT_REJECTED")
+}
+
+fn open_directory_probe(path: &Path) -> Result<std::fs::File, &'static str> {
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -75,15 +172,18 @@ fn open_directory(path: &Path) -> Result<std::fs::File, &'static str> {
         .map_err(|_| "ROOT_REJECTED")
 }
 
-fn sync_directory(path: &Path) -> Result<(), &'static str> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|_| "ROOT_REJECTED")
+fn validate_retained_directory(
+    handle: &std::fs::File,
+    expected: crate::windows_identity::FileIdentity,
+) -> Result<(), &'static str> {
+    let metadata = handle.metadata().map_err(|_| "FILE_REJECTED")?;
+    if !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::windows_identity::file_identity(handle).map_err(|_| "FILE_REJECTED")? != expected
+    {
+        return Err("FILE_REJECTED");
+    }
+    Ok(())
 }
 
 fn volume_root(target: &Path) -> Result<(PathBuf, Vec<u16>), &'static str> {
@@ -139,7 +239,7 @@ impl RetainedWindowsRoot {
         }
         let (root_path, wide) = volume_root(&target)?;
         verify_ntfs(&wide)?;
-        let root_handle = open_directory(&root_path)?;
+        let root_handle = open_volume_directory(&root_path)?;
         let root_meta = root_handle.metadata().map_err(|_| "ROOT_REJECTED")?;
         if !root_meta.is_dir() || root_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("ROOT_REJECTED");
@@ -151,25 +251,26 @@ impl RetainedWindowsRoot {
             handle: root_handle,
             identity: root_identity,
         }];
-        let mut cursor = PathBuf::new();
+        let mut cursor = root_path.clone();
         let mut created = Vec::new();
         for component in target.components() {
-            cursor.push(component.as_os_str());
             if matches!(component, Component::Prefix(_) | Component::RootDir) {
                 continue;
             }
-            match std::fs::metadata(&cursor) {
-                Ok(_) => (),
-                Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                    std::fs::create_dir(&cursor).map_err(|_| "ROOT_REJECTED")?;
-                    if durable {
-                        sync_directory(&held.last().ok_or("ROOT_REJECTED")?.path)?;
-                    }
-                    created.push(cursor.to_string_lossy().into_owned());
+            let parent = held.last().ok_or("ROOT_REJECTED")?;
+            let (handle, was_created) = crate::windows_identity::open_relative_directory(
+                &parent.handle,
+                Path::new(component.as_os_str()),
+                create,
+            )
+            .map_err(|_| "ROOT_REJECTED")?;
+            cursor.push(component.as_os_str());
+            if was_created {
+                if durable {
+                    parent.handle.sync_all().map_err(|_| "ROOT_REJECTED")?;
                 }
-                Err(_) => return Err("ROOT_REJECTED"),
+                created.push(cursor.to_string_lossy().into_owned());
             }
-            let handle = open_directory(&cursor)?;
             let metadata = handle.metadata().map_err(|_| "ROOT_REJECTED")?;
             if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             {
@@ -187,6 +288,12 @@ impl RetainedWindowsRoot {
             target,
             held,
             pinned: Vec::new(),
+            pinned_directories: Vec::new(),
+            pinned_files: Vec::new(),
+            materialization_published: false,
+            materialization_root: None,
+            materialization_rolled_back: false,
+            publication: None,
         };
         root.validate()?;
         Ok((root, created))
@@ -195,7 +302,7 @@ impl RetainedWindowsRoot {
     fn validate(&self) -> Result<(), &'static str> {
         for component in &self.held {
             let held_meta = component.handle.metadata().map_err(|_| "ROOT_REJECTED")?;
-            let named = open_directory(&component.path)?;
+            let named = open_directory_probe(&component.path)?;
             let named_meta = named.metadata().map_err(|_| "ROOT_REJECTED")?;
             if !held_meta.is_dir()
                 || !named_meta.is_dir()
@@ -215,7 +322,12 @@ impl RetainedWindowsRoot {
 
     fn sync(&self) -> Result<(), &'static str> {
         self.validate()?;
-        sync_directory(&self.target)
+        self.held
+            .last()
+            .ok_or("ROOT_REJECTED")?
+            .handle
+            .sync_all()
+            .map_err(|_| "ROOT_REJECTED")
     }
 
     fn pin(&mut self, name: &str, deny_writes: bool) -> Result<Value, &'static str> {
@@ -245,15 +357,551 @@ impl RetainedWindowsRoot {
         self.pinned.push(file);
         Ok(value)
     }
+
+    fn create_directory(&mut self, name: &str) -> Result<Value, &'static str> {
+        if !valid_leaf(name)
+            || self.materialization_published
+            || self.materialization_root.is_some()
+            || self.materialization_rolled_back
+        {
+            return Err("LEAF_REJECTED");
+        }
+        self.validate()?;
+        let parent = self
+            .held
+            .last()
+            .ok_or("ROOT_REJECTED")?
+            .handle
+            .try_clone()
+            .map_err(|_| "ROOT_REJECTED")?;
+        let file = crate::windows_identity::create_relative_directory(&parent, Path::new(name))
+            .map_err(|_| "FILE_REJECTED")?;
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("FILE_REJECTED");
+        }
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        self.pinned_directories
+            .push((name.to_string(), file, identity));
+        self.materialization_root = Some(name.to_string());
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
+    }
+
+    fn create_child_directory(
+        &mut self,
+        parent_key: &str,
+        key: &str,
+        name: &str,
+    ) -> Result<Value, &'static str> {
+        if !valid_leaf(name)
+            || !valid_materialization_key(parent_key)
+            || key != format!("{parent_key}/{name}")
+            || !valid_materialization_key(key)
+            || self.materialization_published
+            || self
+                .pinned_directories
+                .iter()
+                .any(|(candidate, _, _)| candidate == key)
+        {
+            return Err("LEAF_REJECTED");
+        }
+        self.validate()?;
+        let parent = self
+            .pinned_directories
+            .iter()
+            .find(|(candidate, _, _)| candidate == parent_key)
+            .map(|(_, handle, identity)| (handle, *identity))
+            .ok_or("FILE_REJECTED")?;
+        validate_retained_directory(parent.0, parent.1)?;
+        let parent = parent.0.try_clone().map_err(|_| "FILE_REJECTED")?;
+        let file = crate::windows_identity::create_relative_directory(&parent, Path::new(name))
+            .map_err(|_| "FILE_REJECTED")?;
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("FILE_REJECTED");
+        }
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        self.pinned_directories
+            .push((key.to_string(), file, identity));
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
+    }
+
+    fn create_child_file(
+        &mut self,
+        parent_key: &str,
+        key: &str,
+        name: &str,
+    ) -> Result<Value, &'static str> {
+        if !valid_leaf(name)
+            || !valid_materialization_key(parent_key)
+            || key != format!("{parent_key}/{name}")
+            || !valid_materialization_key(key)
+            || self.materialization_published
+            || self
+                .pinned_files
+                .iter()
+                .any(|(candidate, _, _, _, _)| candidate == key)
+        {
+            return Err("LEAF_REJECTED");
+        }
+        self.validate()?;
+        let parent = self
+            .pinned_directories
+            .iter()
+            .find(|(candidate, _, _)| candidate == parent_key)
+            .map(|(_, handle, identity)| (handle, *identity))
+            .ok_or("FILE_REJECTED")?;
+        validate_retained_directory(parent.0, parent.1)?;
+        let parent = parent.0.try_clone().map_err(|_| "FILE_REJECTED")?;
+        let file = crate::windows_identity::create_relative_file(&parent, Path::new(name))
+            .map_err(|_| "FILE_REJECTED")?;
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("FILE_REJECTED");
+        }
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        self.pinned_files
+            .push((key.to_string(), file, identity, 0, false));
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
+    }
+
+    fn write_child_file(
+        &mut self,
+        key: &str,
+        offset: u64,
+        content: &[u8],
+        finish: bool,
+    ) -> Result<Value, &'static str> {
+        if !valid_materialization_key(key) || content.len() > 44 * 1024 {
+            return Err("FILE_REJECTED");
+        }
+        self.validate()?;
+        let (_, file, identity, written, finished) = self
+            .pinned_files
+            .iter_mut()
+            .find(|(candidate, _, _, _, _)| candidate == key)
+            .ok_or("FILE_REJECTED")?;
+        if self.materialization_published
+            || *finished
+            || offset != *written
+            || offset
+                .checked_add(content.len() as u64)
+                .ok_or("FILE_REJECTED")?
+                > 16 * 1024 * 1024
+            || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
+                != *identity
+        {
+            return Err("FILE_REJECTED");
+        }
+        let mut done = 0usize;
+        while done < content.len() {
+            let count = file
+                .seek_write(&content[done..], offset + done as u64)
+                .map_err(|_| "FILE_REJECTED")?;
+            if count == 0 {
+                return Err("FILE_REJECTED");
+            }
+            done += count;
+        }
+        *written += done as u64;
+        if finish {
+            file.sync_all().map_err(|_| "FILE_REJECTED")?;
+            let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+            if !metadata.is_file()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || metadata.file_size() != *written
+                || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
+                    != *identity
+            {
+                return Err("FILE_REJECTED");
+            }
+            *finished = true;
+        }
+        Ok(json!({"written":written.to_string(),"finished":finish}))
+    }
+
+    fn rename_directory(&mut self, from: &str, to: &str) -> Result<Value, &'static str> {
+        if !valid_leaf(from)
+            || !valid_leaf(to)
+            || self.materialization_published
+            || self
+                .pinned_files
+                .iter()
+                .any(|(_, _, _, _, finished)| !finished)
+        {
+            return Err("LEAF_REJECTED");
+        }
+        self.validate()?;
+        let (_, file, expected) = self
+            .pinned_directories
+            .iter()
+            .find(|(name, _, _)| name == from)
+            .ok_or("FILE_REJECTED")?;
+        if crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")? != *expected {
+            return Err("FILE_REJECTED");
+        }
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        crate::windows_identity::rename_relative(file, parent, Path::new(to), false)
+            .map_err(|_| "FILE_REJECTED")?;
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        let named = crate::windows_identity::probe_relative_directory(parent, Path::new(to))
+            .map_err(|_| "FILE_REJECTED")?;
+        if crate::windows_identity::file_identity(&named).map_err(|_| "FILE_REJECTED")? != *expected
+        {
+            return Err("FILE_REJECTED");
+        }
+        self.materialization_published = true;
+        Ok(json!({"volumeSerial":expected.0.to_string(),"fileId":expected.1.to_string()}))
+    }
+
+    fn rollback_directory(&mut self, root_key: &str) -> Result<Value, &'static str> {
+        if !valid_leaf(root_key) || self.materialization_root.as_deref() != Some(root_key) {
+            return Err("LEAF_REJECTED");
+        }
+        if self.materialization_rolled_back {
+            return Ok(json!({"settled":true}));
+        }
+        self.validate()?;
+        while let Some((_, file, _, _, _)) = self.pinned_files.last() {
+            crate::windows_identity::delete_on_close(file).map_err(|_| "FILE_REJECTED")?;
+            self.pinned_files.pop();
+        }
+        while let Some((_, directory, _)) = self.pinned_directories.last() {
+            crate::windows_identity::delete_on_close(directory).map_err(|_| "FILE_REJECTED")?;
+            self.pinned_directories.pop();
+        }
+        self.held
+            .last()
+            .ok_or("ROOT_REJECTED")?
+            .handle
+            .sync_all()
+            .map_err(|_| "ROOT_REJECTED")?;
+        self.materialization_rolled_back = true;
+        Ok(json!({"settled":true}))
+    }
+
+    fn prepare_atomic(
+        &mut self,
+        final_name: &str,
+        temporary_name: &str,
+        backup_name: &str,
+        quarantine_name: &str,
+        recovery_name: &str,
+        content: &[u8],
+    ) -> Result<Value, &'static str> {
+        if self.publication.is_some()
+            || content.len() > 44 * 1024
+            || ![
+                final_name,
+                temporary_name,
+                backup_name,
+                quarantine_name,
+                recovery_name,
+            ]
+            .iter()
+            .all(|v| valid_leaf(v))
+            || final_name == temporary_name
+            || final_name == backup_name
+            || final_name == quarantine_name
+            || temporary_name == backup_name
+            || temporary_name == quarantine_name
+            || backup_name == quarantine_name
+            || recovery_name == final_name
+            || recovery_name == temporary_name
+            || recovery_name == backup_name
+            || recovery_name == quarantine_name
+        {
+            return Err("STATE_REJECTED");
+        }
+        self.validate()?;
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let temporary =
+            crate::windows_identity::create_relative_file(parent, Path::new(temporary_name))
+                .map_err(|_| "FILE_REJECTED")?;
+        let metadata = temporary.metadata().map_err(|_| "FILE_REJECTED")?;
+        let temporary_identity =
+            crate::windows_identity::file_identity(&temporary).map_err(|_| "FILE_REJECTED")?;
+        self.publication = Some(AtomicPublication {
+            final_name: final_name.to_string(),
+            backup_name: backup_name.to_string(),
+            quarantine_name: quarantine_name.to_string(),
+            temporary: Some(temporary),
+            temporary_identity,
+            prior: None,
+            prior_identity: None,
+            stage: AtomicPublicationStage::Temporary,
+            backup_created: false,
+            recovery_name: recovery_name.to_string(),
+            recovery: None,
+        });
+        // Recovery evidence and retained temporary authority exist before any
+        // subsequent fallible phase, including content I/O and prior capture.
+        self.mark_recovery_required()?;
+        let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
+        let temporary = publication.temporary.as_mut().ok_or("FILE_REJECTED")?;
+        temporary.write_all(content).map_err(|_| "FILE_REJECTED")?;
+        temporary.sync_all().map_err(|_| "FILE_REJECTED")?;
+        let metadata = temporary.metadata().map_err(|_| "FILE_REJECTED")?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || metadata.file_size() != content.len() as u64
+        {
+            return Err("FILE_REJECTED");
+        }
+        temporary.rewind().map_err(|_| "FILE_REJECTED")?;
+        let mut observed = Vec::with_capacity(content.len() + 1);
+        Read::by_ref(&mut temporary)
+            .take(content.len() as u64 + 1)
+            .read_to_end(&mut observed)
+            .map_err(|_| "FILE_REJECTED")?;
+        if observed != content {
+            return Err("FILE_REJECTED");
+        }
+        if crate::windows_identity::file_identity(temporary).map_err(|_| "FILE_REJECTED")?
+            != temporary_identity
+        {
+            return Err("FILE_REJECTED");
+        }
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let prior =
+            crate::windows_identity::open_relative_file_optional(parent, Path::new(final_name))
+                .map_err(|_| "FILE_REJECTED")?;
+        let prior_identity = if let Some(file) = prior.as_ref() {
+            let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err("FILE_REJECTED");
+            }
+            let identity =
+                crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?;
+            Some(identity)
+        } else {
+            None
+        };
+        {
+            let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
+            publication.prior = prior;
+            publication.prior_identity = prior_identity;
+            publication.stage = AtomicPublicationStage::PriorCaptured;
+        }
+        if prior_identity.is_some() {
+            let publication = self.publication.as_ref().ok_or("STATE_REJECTED")?;
+            crate::windows_identity::link_relative(
+                publication.prior.as_ref().ok_or("FILE_REJECTED")?,
+                parent,
+                Path::new(backup_name),
+            )
+            .map_err(|_| "FILE_REJECTED")?;
+            self.publication
+                .as_mut()
+                .ok_or("STATE_REJECTED")?
+                .backup_created = true;
+            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        }
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let retained = self.publication.as_ref().ok_or("STATE_REJECTED")?;
+        crate::windows_identity::rename_relative(
+            retained.temporary.as_ref().ok_or("FILE_REJECTED")?,
+            parent,
+            Path::new(final_name),
+            prior_identity.is_some(),
+        )
+        .map_err(|_| "FILE_REJECTED")?;
+        self.publication.as_mut().ok_or("STATE_REJECTED")?.stage =
+            AtomicPublicationStage::Published;
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        let named = crate::windows_identity::probe_relative_file(parent, Path::new(final_name))
+            .map_err(|_| "FILE_REJECTED")?;
+        if crate::windows_identity::file_identity(&named).map_err(|_| "FILE_REJECTED")?
+            != temporary_identity
+        {
+            return Err("FILE_REJECTED");
+        }
+        Ok(
+            json!({"volumeSerial":temporary_identity.0.to_string(),"fileId":temporary_identity.1.to_string(),"size":content.len().to_string()}),
+        )
+    }
+
+    fn mark_recovery_required(&mut self) -> Result<Value, &'static str> {
+        self.validate()?;
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let Some(publication) = self.publication.as_mut() else {
+            return Ok(json!({"marked":false}));
+        };
+        if publication.recovery.is_some() {
+            return Ok(json!({"marked":true}));
+        }
+        let recovery = crate::windows_identity::create_relative_file(
+            parent,
+            Path::new(&publication.recovery_name),
+        )
+        .map_err(|_| "RECOVERY_REQUIRED")?;
+        publication.recovery = Some(recovery);
+        publication
+            .recovery
+            .as_mut()
+            .ok_or("RECOVERY_REQUIRED")?
+            .write_all(b"opencode-windows-atomic-recovery-required-v1\n")
+            .map_err(|_| "RECOVERY_REQUIRED")?;
+        publication
+            .recovery
+            .as_ref()
+            .ok_or("RECOVERY_REQUIRED")?
+            .sync_all()
+            .map_err(|_| "RECOVERY_REQUIRED")?;
+        parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+        Ok(json!({"marked":true}))
+    }
+
+    fn clear_recovery_required(
+        publication: &mut AtomicPublication,
+        parent: &std::fs::File,
+    ) -> Result<(), &'static str> {
+        if let Some(recovery) = publication.recovery.as_ref() {
+            crate::windows_identity::delete_on_close(recovery).map_err(|_| "RECOVERY_REQUIRED")?;
+        }
+        if let Some(recovery) = publication.recovery.take() {
+            drop(recovery);
+            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+        }
+        Ok(())
+    }
+
+    fn settle_atomic(&mut self, rollback: bool) -> Result<Value, &'static str> {
+        self.validate()?;
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
+        if !rollback {
+            if publication.stage != AtomicPublicationStage::Published {
+                return Err("STATE_REJECTED");
+            }
+            // Durability is the commit boundary. Attempt-owned backup cleanup
+            // follows but can only leave conservative garbage; it can never
+            // revoke an already-durable new final or trigger rollback after
+            // the prior link has been removed.
+            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            drop(publication.prior.take());
+            if publication.backup_created {
+                if let Ok(Some(backup)) = crate::windows_identity::open_relative_file_optional(
+                    parent,
+                    Path::new(&publication.backup_name),
+                ) {
+                    if crate::windows_identity::file_identity(&backup).ok()
+                        == publication.prior_identity
+                        && crate::windows_identity::delete_on_close(&backup).is_ok()
+                    {
+                        drop(backup);
+                        let _ = parent.sync_all();
+                    }
+                }
+            }
+            Self::clear_recovery_required(publication, parent)?;
+            self.publication = None;
+            return Ok(json!({"settled":true}));
+        } else if publication.stage != AtomicPublicationStage::Published {
+            // Visibility never changed. Never inspect, rename, or unlink the
+            // final pathname in this state: it may be a racing successor.
+            if let Some(temporary) = publication.temporary.take() {
+                crate::windows_identity::delete_on_close(&temporary)
+                    .map_err(|_| "FILE_REJECTED")?;
+                drop(temporary);
+                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            }
+            // A captured prior remains authoritative until all fallible work
+            // is complete. Its attempt-owned hard-link backup may remain as
+            // conservative evidence; no pathname cleanup justifies releasing
+            // that authority early.
+            Self::clear_recovery_required(publication, parent)?;
+            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            self.publication = None;
+            return Ok(json!({"settled":true}));
+        } else {
+            let named = crate::windows_identity::probe_relative_file_optional(
+                parent,
+                Path::new(&publication.final_name),
+            )
+            .map_err(|_| "FILE_REJECTED")?;
+            let named_identity = named
+                .as_ref()
+                .map(crate::windows_identity::file_identity)
+                .transpose()
+                .map_err(|_| "FILE_REJECTED")?;
+            if named_identity == Some(publication.temporary_identity) {
+                crate::windows_identity::rename_relative(
+                    publication.temporary.as_ref().ok_or("FILE_REJECTED")?,
+                    parent,
+                    Path::new(&publication.quarantine_name),
+                    false,
+                )
+                .map_err(|_| "FILE_REJECTED")?;
+                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            } else if named_identity != publication.prior_identity && named_identity.is_some() {
+                return Err("SUCCESSOR_PRESENT");
+            }
+            let after = crate::windows_identity::probe_relative_file_optional(
+                parent,
+                Path::new(&publication.final_name),
+            )
+            .map_err(|_| "FILE_REJECTED")?;
+            if after.is_none() {
+                if let Some(prior) = publication.prior.as_ref() {
+                    crate::windows_identity::link_relative(
+                        prior,
+                        parent,
+                        Path::new(&publication.final_name),
+                    )
+                    .map_err(|_| "FILE_REJECTED")?;
+                    parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                }
+            }
+            let restored = crate::windows_identity::probe_relative_file_optional(
+                parent,
+                Path::new(&publication.final_name),
+            )
+            .map_err(|_| "FILE_REJECTED")?;
+            let restored_identity = restored
+                .as_ref()
+                .map(crate::windows_identity::file_identity)
+                .transpose()
+                .map_err(|_| "FILE_REJECTED")?;
+            if restored_identity != publication.prior_identity {
+                return Err("FILE_REJECTED");
+            }
+            if let Some(temporary) = publication.temporary.take() {
+                crate::windows_identity::delete_on_close(&temporary)
+                    .map_err(|_| "FILE_REJECTED")?;
+                drop(temporary);
+                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            }
+        }
+        // Keep the prior handle (and therefore every hard link to that exact
+        // object) pinned through the last fallible recovery barrier. Backup
+        // removal after releasing it would create a successor-unlink race, so
+        // rollback deliberately leaves that attempt-owned link as evidence.
+        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        Self::clear_recovery_required(publication, parent)?;
+        self.publication = None;
+        Ok(json!({"settled":true}))
+    }
 }
 
 fn valid_leaf(name: &str) -> bool {
     name.len() <= 255 && valid_component(name)
 }
 
+fn valid_materialization_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 4096 && key.split('/').all(valid_component)
+}
+
 #[cfg(test)]
-mod tests {
-    use super::{valid_leaf, valid_root_input};
+mod path_tests {
+    use super::{decode_bounded_base64, valid_leaf, valid_materialization_key, valid_root_input};
 
     #[test]
     fn rejects_win32_alias_and_namespace_syntax() {
@@ -272,6 +920,28 @@ mod tests {
         assert!(valid_root_input(r"C:\safe\child"));
         for leaf in ["auth.json:stream", "CON", "nul.txt", "COM1.log", ".."] {
             assert!(!valid_leaf(leaf), "accepted {leaf}");
+        }
+    }
+
+    #[test]
+    fn atomic_bytes_require_canonical_bounded_base64() {
+        assert_eq!(decode_bounded_base64("AQID").unwrap(), [1, 2, 3]);
+        for invalid in ["A", "====", "AB==", "AQI=AAAA", "credential!"] {
+            assert!(decode_bounded_base64(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn materialization_keys_are_component_bounded() {
+        assert!(valid_materialization_key("attempt/config/opencode.json"));
+        for invalid in [
+            "",
+            "attempt//file",
+            "attempt/../file",
+            "attempt/NUL",
+            "attempt\\file",
+        ] {
+            assert!(!valid_materialization_key(invalid));
         }
     }
 }
@@ -303,6 +973,76 @@ enum Request {
         id: String,
         wait_ms: u32,
         name: String,
+    },
+    CREATE_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        name: String,
+    },
+    CREATE_CHILD_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        parent_key: String,
+        key: String,
+        name: String,
+    },
+    CREATE_CHILD_FILE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        parent_key: String,
+        key: String,
+        name: String,
+    },
+    WRITE_CHILD_FILE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        key: String,
+        offset: u64,
+        content_base64: String,
+        finish: bool,
+    },
+    RENAME_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        from: String,
+        to: String,
+    },
+    ROLLBACK_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        root_key: String,
+    },
+    PREPARE_ATOMIC {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        final_name: String,
+        temporary_name: String,
+        backup_name: String,
+        quarantine_name: String,
+        recovery_name: String,
+        content_base64: String,
+    },
+    MARK_RECOVERY_REQUIRED {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+    },
+    COMMIT_ATOMIC {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+    },
+    ROLLBACK_ATOMIC {
+        version: u8,
+        id: String,
+        wait_ms: u32,
     },
     SYNC_ROOT {
         version: u8,
@@ -341,6 +1081,63 @@ impl Request {
                 id,
                 wait_ms,
                 ..
+            }
+            | Self::CREATE_DIRECTORY {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::CREATE_CHILD_DIRECTORY {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::CREATE_CHILD_FILE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::WRITE_CHILD_FILE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::RENAME_DIRECTORY {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::ROLLBACK_DIRECTORY {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::PREPARE_ATOMIC {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::MARK_RECOVERY_REQUIRED {
+                version,
+                id,
+                wait_ms,
+            }
+            | Self::COMMIT_ATOMIC {
+                version,
+                id,
+                wait_ms,
+            }
+            | Self::ROLLBACK_ATOMIC {
+                version,
+                id,
+                wait_ms,
             }
             | Self::SYNC_ROOT {
                 version,
@@ -419,6 +1216,101 @@ pub fn run() {
                     .and_then(|v| v.pin(&name, true)),
                 false,
             ),
+            Request::CREATE_DIRECTORY { name, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.create_directory(&name)),
+                false,
+            ),
+            Request::CREATE_CHILD_DIRECTORY {
+                parent_key,
+                key,
+                name,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.create_child_directory(&parent_key, &key, &name)),
+                false,
+            ),
+            Request::CREATE_CHILD_FILE {
+                parent_key,
+                key,
+                name,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.create_child_file(&parent_key, &key, &name)),
+                false,
+            ),
+            Request::WRITE_CHILD_FILE {
+                key,
+                offset,
+                content_base64,
+                finish,
+                ..
+            } => (
+                decode_bounded_base64(&content_base64).and_then(|content| {
+                    root.as_mut()
+                        .ok_or("ROOT_REQUIRED")
+                        .and_then(|v| v.write_child_file(&key, offset, &content, finish))
+                }),
+                false,
+            ),
+            Request::RENAME_DIRECTORY { from, to, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.rename_directory(&from, &to)),
+                false,
+            ),
+            Request::ROLLBACK_DIRECTORY { root_key, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.rollback_directory(&root_key)),
+                false,
+            ),
+            Request::PREPARE_ATOMIC {
+                final_name,
+                temporary_name,
+                backup_name,
+                quarantine_name,
+                recovery_name,
+                content_base64,
+                ..
+            } => (
+                decode_bounded_base64(&content_base64).and_then(|content| {
+                    root.as_mut().ok_or("ROOT_REQUIRED").and_then(|v| {
+                        v.prepare_atomic(
+                            &final_name,
+                            &temporary_name,
+                            &backup_name,
+                            &quarantine_name,
+                            &recovery_name,
+                            &content,
+                        )
+                    })
+                }),
+                false,
+            ),
+            Request::MARK_RECOVERY_REQUIRED { .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.mark_recovery_required()),
+                false,
+            ),
+            Request::COMMIT_ATOMIC { .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.settle_atomic(false)),
+                false,
+            ),
+            Request::ROLLBACK_ATOMIC { .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.settle_atomic(true)),
+                false,
+            ),
             Request::SYNC_ROOT { .. } => (
                 root.as_ref()
                     .ok_or("ROOT_REQUIRED")
@@ -426,10 +1318,17 @@ pub fn run() {
                     .map(|_| json!({})),
                 false,
             ),
-            Request::CLOSE { .. } => {
-                root.take();
-                (Ok(json!({"closed":true})), true)
-            }
+            Request::CLOSE { .. } => match root
+                .as_mut()
+                .ok_or("ROOT_REQUIRED")
+                .and_then(|value| value.mark_recovery_required())
+            {
+                Ok(_) => {
+                    root.take();
+                    (Ok(json!({"closed":true})), true)
+                }
+                Err(error) => (Err(error), false),
+            },
             _ => (Err("STATE_REJECTED"), false),
         };
         let result = if Instant::now() > deadline {
@@ -452,7 +1351,7 @@ pub fn run() {
 }
 
 #[cfg(test)]
-mod tests {
+mod protocol_tests {
     use super::*;
     #[test]
     fn publication_leaf_contract_is_strict() {
@@ -471,5 +1370,86 @@ mod tests {
             r#"{"op":"CLOSE","version":1,"id":"a","wait_ms":1,"secret":"x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn retained_materialization_publish_and_rollback_are_exact_and_retryable() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-publication-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority.create_directory("attempt.snapshot").unwrap();
+        authority
+            .create_child_directory("attempt.snapshot", "attempt.snapshot/config", "config")
+            .unwrap();
+        authority
+            .create_child_file(
+                "attempt.snapshot/config",
+                "attempt.snapshot/config/opencode.json",
+                "opencode.json",
+            )
+            .unwrap();
+        authority
+            .write_child_file(
+                "attempt.snapshot/config/opencode.json",
+                0,
+                b"retained",
+                true,
+            )
+            .unwrap();
+        assert!(authority
+            .write_child_file(
+                "attempt.snapshot/config/opencode.json",
+                8,
+                b"successor",
+                true,
+            )
+            .is_err());
+        authority
+            .rename_directory("attempt.snapshot", "published")
+            .unwrap();
+        authority.rollback_directory("attempt.snapshot").unwrap();
+        authority.rollback_directory("attempt.snapshot").unwrap();
+        assert!(!root.join("published").exists());
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_evidence_is_retained_until_atomic_rollback_is_durable() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-publication-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("auth.json"), b"prior").unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority
+            .prepare_atomic(
+                "auth.json",
+                ".auth.tmp",
+                ".auth.backup",
+                ".auth.quarantine",
+                ".auth.recovery-required",
+                b"attempt",
+            )
+            .unwrap();
+        authority.mark_recovery_required().unwrap();
+        assert!(root.join(".auth.recovery-required").exists());
+        authority.settle_atomic(true).unwrap();
+        assert_eq!(std::fs::read(root.join("auth.json")).unwrap(), b"prior");
+        assert!(!root.join(".auth.recovery-required").exists());
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
