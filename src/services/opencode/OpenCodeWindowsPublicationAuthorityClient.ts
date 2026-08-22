@@ -6,7 +6,9 @@ import {
 import { decodeOpenCodeWindowsPublicationReply, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
   validOpenCodePublicationLeaf, type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
-type Pending = Omit<OpenCodeWindowsPublicationRequest, 'version' | 'wait_ms'>
+type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
+  T extends OpenCodeWindowsPublicationRequest ? Omit<T, 'version' | 'wait_ms'> : never
+type Pending = PendingRequest
 export type OpenCodeWindowsPublicationAuthorityFactory = (options: OpenCodeWindowsPublicationAuthorityOptions) => OpenCodeWindowsPublicationAuthorityClient
 export type OpenCodeWindowsPublicationAuthorityOptions = Readonly<{
   deadline: number; signal?: AbortSignal; launcherPath?: string; workerPath?: string

@@ -19,6 +19,7 @@ import {
   OpenCodeRuntimeDeadline,
   OpenCodeRuntimeDeadlineError,
 } from './OpenCodeRuntimeDeadline.js'
+import type { OpenCodeClient } from './OpenCodeClientFactory.js'
 
 import type {
   OpenCodeHostHandle,
@@ -99,7 +100,7 @@ async function probeTranscriptIdentity(input: {
         sendSessionMessage: async () => ({ info: {}, parts: [] }),
         promptSessionAsync: async () => {},
         abortSession: async () => true,
-      }),
+      } as unknown as OpenCodeClient),
     },
   })
   return probe.probeModel({
@@ -288,7 +289,7 @@ describe('OpenCodeExecutionProbe', () => {
             promptAgent = message.agent ?? null
           },
           abortSession: async () => true,
-        }),
+        } as unknown as OpenCodeClient),
       },
     })
 
@@ -395,7 +396,7 @@ describe('OpenCodeExecutionProbe', () => {
             abortCount += 1
             return true
           },
-        }),
+        } as unknown as OpenCodeClient),
       },
     })
 
