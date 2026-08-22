@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import type { OpenCodePassiveStatusV1 } from './OpenCodePassiveStatusContract.js'
@@ -171,5 +171,109 @@ describe('OpenCode passive command-status production route', () => {
       else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  test('fails closed for outcome file symlinks and late file replacement', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-command-outcome-race-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    try {
+      const directory = path.join(root, 'opencode')
+      const file = path.join(directory, 'command-outcomes.json')
+      const outside = path.join(root, 'outside.json')
+      const accepted = JSON.stringify({ schemaVersion: 1, records: { send: {
+        schemaVersion: 1, command: 'opencode.sendMessage', requestId: 'send-request',
+        deliveryAttemptId: null, status: 'prompt_accepted', safeToRetry: false,
+      } } })
+      await mkdir(directory, { recursive: true })
+      await writeFile(outside, accepted)
+      await symlink(outside, file)
+      const input = { requestId: 'send-request', deliveryAttemptId: null,
+        signal: new AbortController().signal }
+      expect(await readOpenCodeCommandOutcomeReadOnly(input)).toBeNull()
+
+      await rm(file)
+      await writeFile(file, accepted)
+      expect(await readOpenCodeCommandOutcomeReadOnly(input, {
+        afterPathIdentityCaptured: async () => {
+          await rename(file, `${file}.old`)
+          await writeFile(file, accepted)
+        },
+      })).toBeNull()
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('fails closed when an outcome-store ancestor is a symlink', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-command-ancestor-link-'))
+    const outside = await mkdtemp(path.join(process.cwd(), '.passive-command-ancestor-target-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    try {
+      await writeFile(path.join(outside, 'command-outcomes.json'), JSON.stringify({
+        schemaVersion: 1, records: { send: { schemaVersion: 1, command: 'opencode.sendMessage',
+          requestId: 'send-request', deliveryAttemptId: null, status: 'prompt_accepted', safeToRetry: false } },
+      }))
+      await symlink(outside, path.join(root, 'opencode'))
+      expect(await readOpenCodeCommandOutcomeReadOnly({ requestId: 'send-request',
+        deliveryAttemptId: null, signal: new AbortController().signal })).toBeNull()
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('fails closed when the retained outcome root is replaced', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-command-root-race-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    try {
+      const directory = path.join(root, 'opencode')
+      await mkdir(directory, { recursive: true })
+      await writeFile(path.join(directory, 'command-outcomes.json'), JSON.stringify({
+        schemaVersion: 1, records: {},
+      }))
+      const result = await readOpenCodeCommandOutcomeReadOnly({ requestId: 'send-request',
+        deliveryAttemptId: null, signal: new AbortController().signal }, {
+        afterRootRetained: async () => {
+          await rename(directory, `${directory}.old`)
+          await mkdir(directory)
+          await writeFile(path.join(directory, 'command-outcomes.json'), JSON.stringify({
+            schemaVersion: 1, records: { send: { schemaVersion: 1, command: 'opencode.sendMessage',
+              requestId: 'send-request', deliveryAttemptId: null, status: 'prompt_accepted', safeToRetry: false } },
+          }))
+        },
+      })
+      expect(result).toBeNull()
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps the Windows passive contract native, retained, no-follow and replacement-resistant', async () => {
+    const [route, safePublication, client, protocol, native] = await Promise.all([
+      readFile(import.meta.path.replace(/\.test\.ts$/, '.ts'), 'utf8'),
+      readFile(new URL('./OpenCodeSafePublication.ts', import.meta.url), 'utf8'),
+      readFile(new URL('./OpenCodeWindowsPublicationAuthorityClient.ts', import.meta.url), 'utf8'),
+      readFile(new URL('./OpenCodeWindowsPublicationAuthorityProtocol.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../../../native/opencode-catalog-authority/src/windows_publication.rs', import.meta.url), 'utf8'),
+    ])
+    expect(route).toContain("root.pinRegularFile('command-outcomes.json')")
+    expect(safePublication).toContain('await this.#windowsAuthority.pinRegular')
+    expect(client).toContain("op: denyWrites ? 'PIN_REGULAR_READONLY' : 'PIN_REGULAR'")
+    expect(protocol).toContain("'PIN_REGULAR' | 'PIN_REGULAR_READONLY'")
+    expect(native).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
+    expect(native).toContain('pinned: Vec<std::fs::File>')
+    expect(native).not.toContain('FILE_SHARE_DELETE')
   })
 })

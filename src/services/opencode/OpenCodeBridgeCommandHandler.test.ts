@@ -693,6 +693,26 @@ function createDeferred<T>() {
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  test('sanitizes arbitrary provider failures at the common serialized envelope boundary', async () => {
+    const hostile = "EACCES open '/home/alice/.local/share/claude-multimodel/auth.json'; "
+      + 'https://api.example.test/models?token=sk-secret Authorization: Bearer bearer-secret '
+      + 'C:\\Users\\Alice\\AppData\\Local\\secret.json \\\\server\\share\\credential.json'
+    openCodeProvisioningProbe.probe = (async () => { throw new Error(hostile) }) as (
+      typeof openCodeProvisioningProbe.probe
+    )
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {}))
+
+    expect(result).toMatchObject({ ok: false, error: { kind: 'provider_error', retryable: true } })
+    const failed = result as { error: { message: string }; diagnostics: Array<{ message: string }> }
+    const serialized = JSON.stringify(result)
+    expect(serialized).toContain('EACCES')
+    for (const secret of ['alice', 'Alice', 'claude-multimodel', 'auth.json', 'api.example.test',
+      'sk-secret', 'bearer-secret', 'server', 'credential.json']) {
+      expect(serialized).not.toContain(secret)
+    }
+    expect(failed.diagnostics[0]?.message).toBe(failed.error.message)
+  })
   test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
 

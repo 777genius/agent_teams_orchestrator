@@ -61,6 +61,7 @@ import {
   type OpenCodeAuthorizedScopedProfilePlan,
   type OpenCodePlanScopedProfileManagerPort,
 } from './OpenCodePlanScopedProfile.js'
+import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
@@ -749,25 +750,26 @@ class OpenCodeProductionLaunchRuntime {
             authoritativeSessionId,
             registerRecord: () => { records.set(input.memberIdentity, record) },
             registerOwned: input.registerOwned,
-            createSession: () => client.createSession({
-              id: authoritativeSessionId, title: ownershipTitle,
-            }),
+            createSession: () => runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+              () => client.createSession({ id: authoritativeSessionId, title: ownershipTitle })),
           })
           if (session.id !== authoritativeSessionId || session.title !== ownershipTitle) {
             return { outcome: 'unknown_transport', owned }
           }
-          await openCodeHostManager.retainHostLease(handle.hostKey, {
-            teamId: command.teamId, laneId: command.laneId, memberName: member.name,
-            runId: command.runId, sessionId: session.id,
-          })
+          await runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+            () => openCodeHostManager.retainHostLease(handle.hostKey, {
+              teamId: command.teamId, laneId: command.laneId, memberName: member.name,
+              runId: command.runId, sessionId: session.id,
+            }))
           const text = bootstrapText(command, member.name, record.opencodeSessionId, member.prompt)
           const contextHash = createHash('sha256').update(text).digest('hex')
           const briefingHash = createHash('sha256').update(member.prompt ?? '').digest('hex')
           const messageID = `msg_000000000000${createHash('sha256').update(contextHash).digest('hex').slice(0, 14)}`
-          await client.sendSessionMessage(record.opencodeSessionId, {
-            messageID, agent: 'teammate-bootstrap', noReply: true,
-            model: modelParts(command.selectedModel), parts: [{ type: 'text', text }],
-          })
+          await runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+            () => client.sendSessionMessage(record.opencodeSessionId, {
+              messageID, agent: 'teammate-bootstrap', noReply: true,
+              model: modelParts(command.selectedModel), parts: [{ type: 'text', text }],
+            }))
           const written = await client.getSessionMessage?.(record.opencodeSessionId, messageID)
           const writtenInfo = written?.info ?? {}
           if (!written || readOpenCodeExactMessageText(written) !== text

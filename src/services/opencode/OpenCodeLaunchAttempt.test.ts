@@ -202,7 +202,7 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     }
     const result = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     expect(acquisitionDeadlines).toEqual([9_000])
-    expect(subject.deadlines).toEqual([9_000, 9_000, 9_000, 9_000, 9_000, 9_000, 9_000])
+    expect(subject.deadlines).toEqual([9_000, 9_000, 9_000, 9_000, 9_000, 9_000, 9_000, 9_000])
     expect(result.workDeadlineAtMs).toBe(9_000)
     expect(result.absoluteDeadlineAtMs).toBe(10_000)
     expect(result.absoluteDeadlineAtMs - result.workDeadlineAtMs).toBe(1_000)

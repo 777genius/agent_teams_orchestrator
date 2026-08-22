@@ -94,6 +94,7 @@ import {
   OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
 } from './OpenCodePassiveStatusProductionReader.js'
 import { OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS } from './OpenCodePassiveProviderDirectory.js'
+import { sanitizeOpenCodeBridgeFailureMessage } from './OpenCodeBridgeFailureRedaction.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -1199,6 +1200,12 @@ function failure(
   diagnostics: BridgeDiagnosticEvent[] = [],
   details?: Record<string, unknown>,
 ) {
+  const safeMessage = sanitizeOpenCodeBridgeFailureMessage(message)
+  const safeDiagnostics = diagnostics.map(event => ({
+    ...event,
+    message: sanitizeOpenCodeBridgeFailureMessage(event.message),
+    ...(event.data ? { data: sanitizeFailureDiagnosticData(event.data) } : {}),
+  }))
   return {
     ok: false,
     schemaVersion: BRIDGE_SCHEMA_VERSION,
@@ -1208,12 +1215,19 @@ function failure(
     durationMs: Math.max(0, Date.now() - startedAtMs),
     error: {
       kind,
-      message,
+      message: safeMessage,
       retryable,
       ...(details ? { details } : {}),
     },
-    diagnostics,
+    diagnostics: safeDiagnostics,
   }
+}
+
+function sanitizeFailureDiagnosticData(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    typeof item === 'string' ? sanitizeOpenCodeBridgeFailureMessage(item) : item,
+  ]))
 }
 
 function validateEnvelope(input: unknown): BridgeEnvelope {

@@ -1,4 +1,4 @@
-import { open } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
 import type { OpenCodePassiveStatusV1 } from './OpenCodePassiveStatusContract.js'
@@ -8,6 +8,7 @@ import {
   OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
 } from './OpenCodePassiveStatusProductionReader.js'
 import { OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS } from './OpenCodePassiveProviderDirectory.js'
+import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 const MAX_OUTCOME_STORE_BYTES = 1_048_576
 const MAX_OUTCOME_RECORDS = 1_000
@@ -173,17 +174,30 @@ export async function readOpenCodeCommandOutcomeReadOnly(input: {
   requestId: string | null
   deliveryAttemptId: string | null
   signal: AbortSignal
+}, testHooks?: {
+  afterRootRetained?: () => void | Promise<void>
+  afterPathIdentityCaptured?: () => void | Promise<void>
 }): Promise<OpenCodePassiveCommandStatusOutcome | null> {
   if (input.signal.aborted) return null
   const passiveRoot = getOpenCodePassiveStatusRootDirectory()
-  const filePath = path.resolve(passiveRoot, '..', '..', 'command-outcomes.json')
-  let handle
+  const outcomeRootPath = path.resolve(passiveRoot, '..', '..')
+  let root: OpenCodeSafePublicationDirectory | null = null
   try {
-    handle = await open(filePath, 'r')
+    root = await OpenCodeSafePublicationDirectory.open(outcomeRootPath, { abortSignal: input.signal })
+    const retainedIdentity = await root.stableIdentity()
+    await assertVisibleOutcomeRootIdentity(outcomeRootPath, retainedIdentity)
+    await testHooks?.afterRootRetained?.()
     if (input.signal.aborted) return null
-    const metadata = await handle.stat()
-    if (input.signal.aborted || !metadata.isFile() || metadata.size > MAX_OUTCOME_STORE_BYTES) return null
-    const text = await handle.readFile({ encoding: 'utf8', signal: input.signal })
+    // On Windows this retains the exact regular file without delete sharing;
+    // on POSIX the descriptor-relative bounded read below supplies the pin.
+    await root.pinRegularFile('command-outcomes.json')
+    const text = await root.readBoundedRegularFile(
+      'command-outcomes.json', MAX_OUTCOME_STORE_BYTES, input.signal,
+      { afterPathIdentityCaptured: testHooks?.afterPathIdentityCaptured },
+    )
+    if (text === null) return null
+    await assertVisibleOutcomeRootIdentity(outcomeRootPath, retainedIdentity)
+    await root.validate()
     if (input.signal.aborted || Buffer.byteLength(text) > MAX_OUTCOME_STORE_BYTES) return null
     const shape = plainRecord(JSON.parse(text))
     const records = plainRecord(shape?.records)
@@ -200,7 +214,24 @@ export async function readOpenCodeCommandOutcomeReadOnly(input: {
   } catch {
     return null
   } finally {
-    await handle?.close().catch(() => undefined)
+    await root?.close().catch(() => undefined)
+  }
+}
+
+async function assertVisibleOutcomeRootIdentity(
+  rootPath: string,
+  retained: Readonly<{ dev: bigint; ino: bigint }>,
+): Promise<void> {
+  // The Windows safe-publication authority performs the equivalent comparison
+  // through its retained native root handle. POSIX additionally binds the
+  // currently visible name to the retained directory descriptor so rename and
+  // replacement cannot make stale evidence authoritative.
+  if (process.platform === 'win32') return
+  const visible = await lstat(rootPath, { bigint: true })
+  if (!visible.isDirectory() || visible.isSymbolicLink()
+    || visible.dev !== retained.dev || visible.ino !== retained.ino
+    || await realpath(rootPath) !== path.resolve(rootPath)) {
+    throw new Error('OpenCode passive outcome root identity changed [redacted]')
   }
 }
 

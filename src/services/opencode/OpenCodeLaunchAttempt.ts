@@ -23,6 +23,7 @@ import {
   type OpenCodeLaunchJournalReconciliationEvent,
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
+import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
 
 export type OpenCodeLaunchProfile = {
   purpose: 'launch_attempt'
@@ -438,12 +439,13 @@ export class OpenCodeLaunchAttempt {
               this.ensureWork(policy, controller.signal)
               // Once the claim transport is registered its timeout is ambiguous, even if it never replies.
               ambiguousMember = memberIdentity
-              const claimOperation = Promise.resolve().then(() => this.ports.sessions.claimMemberMutation({
-                attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
-                generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
-                claimToken, memberIdentity,
-                deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
-              }))
+              const claimOperation = runOpenCodeMutationWithFreshProof(revalidateMember,
+                () => this.ports.sessions.claimMemberMutation({
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
+                  claimToken, memberIdentity,
+                  deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
+                }))
               trackAmbiguous(claimOperation)
               const claim = await this.ports.deadline.run(claimOperation, budget.memberDeadlineAtMs, controller.signal)
               inFlightAmbiguous = undefined
@@ -476,15 +478,13 @@ export class OpenCodeLaunchAttempt {
                     claimCommitStarted = true
                     this.ensureWork(policy, controller.signal)
                     if (this.ports.clock.monotonicNow() >= budget.memberDeadlineAtMs) throw new DeadlineError()
-                    await revalidateMember()
-                    this.ensureWork(policy, controller.signal)
-                    if (this.ports.clock.monotonicNow() >= budget.memberDeadlineAtMs) throw new DeadlineError()
-                    const transition = await this.ports.sessions.transitionMemberClaim({
-                      attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
-                      generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
-                      claimToken, memberIdentity, linkage, recovery, transition: 'commit',
-                      deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
-                    })
+                    const transition = await runOpenCodeMutationWithFreshProof(revalidateMember,
+                      () => this.ports.sessions.transitionMemberClaim({
+                        attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                        generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
+                        claimToken, memberIdentity, linkage, recovery, transition: 'commit',
+                        deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
+                      }))
                     const result = transition === 'cancelled' ? 'fenced' : transition
                     if (result === 'committed') {
                       claimCommitted = true
