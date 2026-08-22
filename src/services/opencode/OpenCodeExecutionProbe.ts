@@ -106,6 +106,8 @@ type PersistentProbeCachePaths = {
 type ProbeModelParams = {
   selectedModel: string
   projectPath?: string | null
+  /** Resolved provider endpoint. Network fast-fail is safe only for loopback routes. */
+  providerBaseUrl?: string | null
   prompt?: string
   expectedOutput?: string
   contextTokens?: number
@@ -195,10 +197,11 @@ function statusIsRetrying(value: OpenCodeSessionStatusInput | null): boolean {
 
 function classifyRetryStatusFailure(
   value: OpenCodeSessionStatusInput | null,
+  includeProviderNetworkFailure: boolean,
 ): ReturnType<typeof classifyProbeFailure> | null {
   const message = getRetryStatusMessage(value)
   if (!message) return null
-  const classified = classifyProbeFailure({ message })
+  const classified = classifyProbeFailure({ message, includeProviderNetworkFailure })
   return classified.outcome === 'unknown' ? null : classified
 }
 
@@ -215,6 +218,21 @@ function parseProviderScopedModel(selectedModel: string): {
   return {
     providerID: trimmed.slice(0, separatorIndex),
     modelID: trimmed.slice(separatorIndex + 1),
+  }
+}
+
+function isLoopbackProviderBaseUrl(value: string | null | undefined): boolean {
+  if (!value?.trim()) return false
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return hostname === 'localhost'
+      || hostname.endsWith('.localhost')
+      || hostname === '::1'
+      || /^127(?:\.\d{1,3}){3}$/.test(hostname)
+  } catch {
+    return false
   }
 }
 
@@ -260,6 +278,30 @@ function isUsageLimitFailureMessage(lower: string): boolean {
     || /\b429\s+(?:too many requests|rate limit(?:ed)?|resource exhausted)\b/.test(lower)
 }
 
+const PROVIDER_ENDPOINT_UNREACHABLE_ERROR_CODES = [
+  'econnrefused',
+  'econnreset',
+  'econnaborted',
+  'enotfound',
+  'eai_again',
+  'etimedout',
+  'ehostunreach',
+  'enetunreach',
+  'eaddrnotavail',
+  'epipe',
+] as const
+
+function isProviderEndpointUnreachableMessage(lower: string): boolean {
+  return lower.includes('cannot connect to api')
+    || lower.includes('unable to connect')
+    || lower.includes('failed to connect')
+    || lower.includes('connection refused')
+    || lower.includes('connection timed out')
+    || lower.includes('network is unreachable')
+    || lower.includes('network unreachable')
+    || PROVIDER_ENDPOINT_UNREACHABLE_ERROR_CODES.some(code => lower.includes(code))
+}
+
 function extractJsonMessage(value: string): string | null {
   try {
     return extractNestedErrorMessage(JSON.parse(value))
@@ -299,7 +341,14 @@ function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
 
 export function classifyProbeFailure(params: {
   message: string
-}): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
+  /**
+   * A thrown request error usually means the Agent Teams <-> OpenCode host
+   * transport failed, not that the selected provider endpoint is down. Retry
+   * status and assistant payloads originate inside OpenCode, where the same
+   * network marker is provider-facing and safe to classify.
+   */
+  includeProviderNetworkFailure?: boolean
+}): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason' | 'failureCode'> {
   const reason = normalizeFailureMessage(params.message)
   const lower = reason.toLowerCase()
 
@@ -334,6 +383,14 @@ export function classifyProbeFailure(params: {
     }
   }
 
+  if (params.includeProviderNetworkFailure === true && isProviderEndpointUnreachableMessage(lower)) {
+    return {
+      outcome: 'unavailable',
+      reason,
+      failureCode: 'provider_endpoint_unreachable',
+    }
+  }
+
   if (
     lower.includes('model is not supported')
     || lower.includes('model not supported')
@@ -356,6 +413,17 @@ export function classifyProbeFailure(params: {
   return {
     outcome: 'unknown',
     reason,
+  }
+}
+
+function addClassifiedFailureDiagnostic(
+  diagnostics: Set<string>,
+  classified: ReturnType<typeof classifyProbeFailure>,
+): void {
+  if (classified.failureCode === 'provider_endpoint_unreachable') {
+    diagnostics.add(
+      'OpenCode reported that the configured provider endpoint is unreachable',
+    )
   }
 }
 
@@ -823,6 +891,7 @@ export class OpenCodeExecutionProbe {
     sessionId: string
     messageID: string
     context?: OpenCodePhaseContext
+    includeProviderNetworkFailure: boolean
   }): Promise<{
     started: boolean
     classified: ReturnType<typeof classifyProbeFailure> | null
@@ -838,7 +907,10 @@ export class OpenCodeExecutionProbe {
       input.context?.throwIfExpired()
       const statusMap = await input.client.getSessionStatus()
       const rawStatus = statusMap[input.sessionId] ?? null
-      const classified = classifyRetryStatusFailure(rawStatus)
+      const classified = classifyRetryStatusFailure(
+        rawStatus,
+        input.includeProviderNetworkFailure,
+      )
       if (classified) {
         return { started: true, classified, retrying: true }
       }
@@ -855,6 +927,7 @@ export class OpenCodeExecutionProbe {
             if (input.context?.signal.aborted) throwOpenCodeAbortReason(input.context.signal)
             const classified = classifyProbeFailure({
               message: failureMessageFromUnknown(error),
+              includeProviderNetworkFailure: false,
             })
             if (classified.outcome !== 'unknown') throw error
             return null
@@ -1353,6 +1426,7 @@ export class OpenCodeExecutionProbe {
       diagnostics,
       cacheFilePath,
     } = input
+    const includeProviderNetworkFailure = isLoopbackProviderBaseUrl(params.providerBaseUrl)
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
@@ -1438,6 +1512,7 @@ export class OpenCodeExecutionProbe {
               started: false as const,
               classified: classifyProbeFailure({
                 message: failureMessageFromUnknown(error),
+                includeProviderNetworkFailure: false,
               }),
               retrying: false,
             }
@@ -1449,11 +1524,13 @@ export class OpenCodeExecutionProbe {
               sessionId: session.id,
               messageID,
               context,
+              includeProviderNetworkFailure,
             })
           } catch (error) {
             if (context?.signal.aborted) throwOpenCodeAbortReason(context.signal)
             const classified = classifyProbeFailure({
               message: failureMessageFromUnknown(error),
+              includeProviderNetworkFailure: false,
             })
             if (classified.outcome === 'unknown') throw error
             return {
@@ -1472,6 +1549,7 @@ export class OpenCodeExecutionProbe {
           ?? 'OpenCode accepted prompt_async but did not create a user message or enter a running state'
         diagnostics.add(reason)
         if (hasTerminalClassification) {
+          addClassifiedFailureDiagnostic(diagnostics, submitted.classified!)
           diagnostics.add(
             `OpenCode prompt start exposed a terminal provider error in ${Math.max(0, nowMs() - executionSubmitStartedAtMs)}ms`,
           )
@@ -1491,11 +1569,14 @@ export class OpenCodeExecutionProbe {
           toolCallCount: 0,
           errorCount: 1,
           diagnostics: Array.from(diagnostics),
-          failureCode: hasTerminalClassification ? undefined : 'prompt_start_failed',
+          failureCode: hasTerminalClassification
+            ? submitted.classified?.failureCode
+            : 'prompt_start_failed',
         })
       }
 
       if (submitted.classified) {
+        addClassifiedFailureDiagnostic(diagnostics, submitted.classified)
         diagnostics.add(
           `OpenCode retry status exposed a terminal provider error during prompt start in ${Math.max(0, nowMs() - executionSubmitStartedAtMs)}ms`,
         )
@@ -1514,6 +1595,7 @@ export class OpenCodeExecutionProbe {
           toolCallCount: 0,
           errorCount: 1,
           diagnostics: Array.from(diagnostics),
+          failureCode: submitted.classified.failureCode,
         })
       }
 
@@ -1598,8 +1680,10 @@ export class OpenCodeExecutionProbe {
         ): Promise<OpenCodeExecutionProbeResult> | null => {
           const classified = classifyProbeFailure({
             message: failureMessageFromUnknown(error),
+            includeProviderNetworkFailure: false,
           })
           if (classified.outcome === 'unknown') return null
+          addClassifiedFailureDiagnostic(diagnostics, classified)
           diagnostics.add(
             `OpenCode session ${source} request exposed a terminal provider error in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
           )
@@ -1618,6 +1702,7 @@ export class OpenCodeExecutionProbe {
             toolCallCount: latestToolCallCount,
             errorCount: Math.max(1, latestErrorCount),
             diagnostics: Array.from(diagnostics),
+            failureCode: classified.failureCode,
           })
         }
         const checkOriginalProbeRecovered = async () => {
@@ -1664,7 +1749,10 @@ export class OpenCodeExecutionProbe {
                   || summary.latestAssistantPreview?.trim()
                   || null
                 if (!responseText) return null
-                return classifyProbeFailure({ message: responseText }).outcome === 'unknown'
+                return classifyProbeFailure({
+                  message: responseText,
+                  includeProviderNetworkFailure,
+                }).outcome === 'unknown'
                   ? summary
                   : null
               })
@@ -1787,8 +1875,12 @@ export class OpenCodeExecutionProbe {
               }
               const statusMap = statusResult.statusMap
               rawStatus = statusMap[sessionId!] ?? null
-              const retryFailure = classifyRetryStatusFailure(rawStatus)
+              const retryFailure = classifyRetryStatusFailure(
+                rawStatus,
+                includeProviderNetworkFailure,
+              )
               if (retryFailure) {
+                addClassifiedFailureDiagnostic(diagnostics, retryFailure)
                 diagnostics.add(
                   `OpenCode retry status exposed a terminal provider error in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
                 )
@@ -1807,6 +1899,7 @@ export class OpenCodeExecutionProbe {
                   toolCallCount: latestToolCallCount,
                   errorCount: Math.max(1, latestErrorCount),
                   diagnostics: Array.from(diagnostics),
+                  failureCode: retryFailure.failureCode,
                 })
               }
 
@@ -1939,10 +2032,11 @@ export class OpenCodeExecutionProbe {
             ?? null
           const eagerFailure = failureMessage
             && (latestAssistantError || summary.durableState === 'retrying')
-            ? classifyProbeFailure({ message: failureMessage })
+            ? classifyProbeFailure({ message: failureMessage, includeProviderNetworkFailure })
             : null
           if (eagerFailure && eagerFailure.outcome !== 'unknown') {
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
+            addClassifiedFailureDiagnostic(diagnostics, eagerFailure)
             diagnostics.add(
               `OpenCode retry/error payload exposed a terminal provider failure before polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
             )
@@ -1961,6 +2055,7 @@ export class OpenCodeExecutionProbe {
               toolCallCount: summary.toolCallCount,
               errorCount: Math.max(1, summary.errorCount),
               diagnostics: Array.from(diagnostics),
+              failureCode: eagerFailure.failureCode,
             })
           }
           if (!failureMessage && hasCompletedAssistantResponseWithoutText(summary)) {
@@ -2031,8 +2126,12 @@ export class OpenCodeExecutionProbe {
           }
 
           if (failureMessage) {
-            const classified = classifyProbeFailure({ message: failureMessage })
+            const classified = classifyProbeFailure({
+              message: failureMessage,
+              includeProviderNetworkFailure,
+            })
             if (classified.outcome !== 'unknown') {
+              addClassifiedFailureDiagnostic(diagnostics, classified)
               diagnostics.add(
                 `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
               )
@@ -2081,6 +2180,7 @@ export class OpenCodeExecutionProbe {
               toolCallCount: summary.toolCallCount,
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
+              failureCode: classified.failureCode,
             })
           }
 

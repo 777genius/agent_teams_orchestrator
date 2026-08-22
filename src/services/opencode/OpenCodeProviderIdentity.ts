@@ -1,6 +1,6 @@
 import { normalizeOpenCodeProviderId } from './OpenCodeModelRef.js'
 
-const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>([
+export const OPEN_CODE_PROVIDER_ALIAS_ENTRIES = [
   ['minimax-token-plan', 'minimax-coding-plan'],
   ['minimax-token-plan-(minimax.io)', 'minimax-coding-plan'],
   ['xiaomi-token-plan-(europe)', 'xiaomi-token-plan-ams'],
@@ -12,7 +12,9 @@ const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>([
   ['z.ai-coding-plan', 'zai-coding-plan'],
   ['kimi-code-membership', 'kimi-for-coding'],
   ['amazon-q-developer-/-kiro', 'kiro'],
-])
+] as const
+
+const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>(OPEN_CODE_PROVIDER_ALIAS_ENTRIES)
 
 export function canonicalizeOpenCodeProviderId(value: string): string {
   const label = value.trim().toLowerCase().replace(/\s+/g, '-')

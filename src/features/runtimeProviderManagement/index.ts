@@ -4,6 +4,7 @@ export {
 } from './application/featureGate.js'
 export { connectProviderWithApiKey } from './application/connectProviderWithApiKey.js'
 export { connectProvider } from './application/connectProvider.js'
+export { clearProviderProjectDefaultModel } from './application/clearProviderProjectDefaultModel.js'
 export { configureProviderModelLimits } from './application/configureProviderModelLimits.js'
 export { forgetManagedProvider } from './application/forgetManagedProvider.js'
 export { loadProviderDirectory } from './application/loadProviderDirectory.js'
@@ -18,6 +19,7 @@ export {
 } from './adapters/opencode/OpenCodeProviderManagementAdapter.js'
 export { ProviderManagementDialog } from './ui/ProviderManagementDialog.js'
 export type {
+  ClearProjectDefaultModelInput,
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
   ConfigureProviderModelLimitsInput,

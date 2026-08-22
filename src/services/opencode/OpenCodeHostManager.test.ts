@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -122,6 +122,74 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
+  test('profile-plus-live starts serve on cold managed plugin caches without catalog enumeration', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-startup-policy-'))
+    const binaryPath = path.join(tempDir, 'opencode')
+    const commandLogPath = path.join(tempDir, 'commands.log')
+    const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    await writeFile(binaryPath, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$OPENCODE_TEST_COMMAND_LOG"\n')
+    await chmod(binaryPath, 0o755)
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binaryPath
+
+    const profile: OpenCodePreparedProfile = {
+      ...baseProfile,
+      projectPath: tempDir,
+      profileRootPath: path.join(tempDir, 'profile'),
+      xdgCacheHome: path.join(tempDir, 'cache'),
+      managedConfig: {
+        ...baseProfile.managedConfig,
+        plugin: ['opencode-kiro@0.4.0'],
+      },
+      env: { OPENCODE_TEST_COMMAND_LOG: commandLogPath },
+    }
+    const launchedPluginConfigs: unknown[] = []
+    const createManager = () => new OpenCodeHostManager({
+      prepareProfile: async () => profile,
+      allocateLoopbackPort: async () => 43191,
+      spawnHostProcess: launchedProfile => {
+        launchedPluginConfigs.push(launchedProfile.managedConfig.plugin)
+        return createMockChildProcess(43191).child
+      },
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/global/dispose')) {
+          return { status: 200, data: { ok: true } }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    try {
+      const liveManager = createManager()
+      const liveHost = await liveManager.ensureHost({
+        hostLifetime: 'process',
+        resolveConfigFingerprint: false,
+        managedPluginStartupPolicy: 'serve-startup',
+      })
+      expect(liveHost.state).toBe('healthy')
+      expect(await readFile(commandLogPath, 'utf8').catch(() => '')).toBe('')
+      expect(launchedPluginConfigs[0]).toEqual(['opencode-kiro@0.4.0'])
+      await liveManager.releaseHost(liveHost.hostKey)
+
+      const fullManager = createManager()
+      const fullHost = await fullManager.ensureHost({
+        hostLifetime: 'process',
+        resolveConfigFingerprint: false,
+        managedPluginStartupPolicy: 'catalog-prewarm',
+      })
+      expect(await readFile(commandLogPath, 'utf8')).toContain('models --verbose')
+      await fullManager.releaseHost(fullHost.hostKey)
+    } finally {
+      if (originalBinaryPath === undefined) delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      else process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = originalBinaryPath
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('starts a fresh persistent host when managed OpenCode auth changes', async () => {
     let profile = baseProfile
     let port = 43150
@@ -326,6 +394,60 @@ describe('OpenCodeHostManager', () => {
     await manager.releaseHost(handle.hostKey)
 
     expect(killedSignals).toEqual(['SIGTERM'])
+    expect(manager.getHost(handle.hostKey)).toBeNull()
+  })
+
+  test('uses the owned child handle when process-scoped identity is unavailable', async () => {
+    const spawned = createMockChildProcess(43141)
+    const pidKillSignals: NodeJS.Signals[] = []
+    let processAlive = true
+
+    Object.assign(spawned.child, {
+      kill(signal?: NodeJS.Signals) {
+        spawned.killedSignals.push(signal)
+        processAlive = false
+        spawned.child.emit('exit', null, signal ?? null)
+        return true
+      },
+    })
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43141,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/config')) {
+          return { status: 200, data: { default_agent: 'teammate' } }
+        }
+        if (url.endsWith('/global/dispose')) {
+          return { status: 200, data: { ok: true } }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async () => null,
+      killProcess: (_pid, signal) => {
+        pidKillSignals.push(signal)
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const handle = await manager.ensureHost({ hostLifetime: 'process' })
+
+    expect(handle.state).toBe('healthy')
+    expect(handle.processStartedAtMs).toBeNull()
+    expect(
+      handle.diagnostics.some(message => message.includes('owned child process handle')),
+    ).toBe(true)
+
+    await manager.releaseHost(handle.hostKey)
+
+    expect(spawned.killedSignals).toEqual(['SIGTERM'])
+    expect(pidKillSignals).toEqual([])
     expect(manager.getHost(handle.hostKey)).toBeNull()
   })
 

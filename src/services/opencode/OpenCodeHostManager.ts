@@ -52,6 +52,7 @@ const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 const OPENTUI_TEMP_DYLIB_RE = /^\.b[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
+export type OpenCodeManagedPluginStartupPolicy = 'catalog-prewarm' | 'serve-startup'
 
 export async function resolveOpenCodeBinaryHostIdentity(binaryPath: string): Promise<string> {
   let resolvedPath = path.resolve(binaryPath)
@@ -1302,6 +1303,104 @@ export class OpenCodeHostManager {
     }
   }
 
+  private hasOwnedChildExited(child: ChildProcess): boolean {
+    if (typeof child.exitCode === 'number' || child.signalCode) {
+      return true
+    }
+    return !child.pid || !this.isProcessAlive(child.pid)
+  }
+
+  private async killOwnedChildAndWait(
+    child: ChildProcess,
+    signal: NodeJS.Signals,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    if (this.hasOwnedChildExited(child)) {
+      return true
+    }
+
+    return new Promise(resolve => {
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      const finish = (exited: boolean): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        if (timeout) {
+          clearTimeout(timeout)
+        }
+        child.off('exit', handleExit)
+        child.off('close', handleExit)
+        resolve(exited)
+      }
+      const handleExit = (): void => finish(true)
+
+      child.once('exit', handleExit)
+      child.once('close', handleExit)
+      timeout = setTimeout(() => finish(this.hasOwnedChildExited(child)), timeoutMs)
+      timeout.unref?.()
+
+      try {
+        const signalled = child.kill(signal)
+        if (!signalled && this.hasOwnedChildExited(child)) {
+          finish(true)
+        }
+      } catch {
+        finish(this.hasOwnedChildExited(child))
+      }
+    })
+  }
+
+  private async terminateOwnedProcessHostByHandle(entry: ManagedHostEntry): Promise<void> {
+    const child = entry.child
+    if (!child) {
+      throw new Error('Owned process-scoped OpenCode host has no child process handle')
+    }
+
+    entry.handle.state = 'disposed'
+    const pid = child.pid
+    try {
+      await this.fetchJsonWithTimeout(
+        `${entry.handle.baseUrl}/global/dispose`,
+        OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS,
+        { method: 'POST' },
+      )
+    } catch {
+      // Best effort.
+    }
+
+    let terminated = this.hasOwnedChildExited(child)
+    if (!terminated) {
+      terminated = await this.killOwnedChildAndWait(
+        child,
+        'SIGTERM',
+        OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+      )
+    }
+    if (!terminated) {
+      terminated = await this.killOwnedChildAndWait(
+        child,
+        'SIGKILL',
+        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+      )
+    }
+    if (!terminated) {
+      entry.handle.state = 'degraded'
+      throw new Error(
+        `OpenCode host pid ${pid ?? entry.handle.pid} did not exit through its owned child handle; ` +
+        'refusing unsafe PID-based termination without verified process identity',
+      )
+    }
+
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+    child.stdin?.destroy()
+    this.hosts.delete(entry.handle.hostKey)
+    this.pendingHosts.delete(entry.handle.hostKey)
+    await this.cleanupOpenTuiTempArtifactsIfUnused(entry.handle.profile.tmpPath, pid)
+  }
+
   private async createHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
@@ -1369,9 +1468,19 @@ export class OpenCodeHostManager {
         : profile.managedConfigFingerprint
       handle.state = 'healthy'
       handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
-      if (handle.processStartedAtMs === null && !this.deps.spawnHostProcess) {
+      if (
+        handle.processStartedAtMs === null &&
+        lifetime === 'persistent' &&
+        !this.deps.spawnHostProcess
+      ) {
         throw new Error(
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
+        )
+      }
+      if (handle.processStartedAtMs === null && lifetime === 'process') {
+        diagnostics.push(
+          `OpenCode host pid ${handle.pid} process identity was unavailable; ` +
+          'cleanup is restricted to the owned child process handle',
         )
       }
       if (lifetime === 'persistent') {
@@ -1404,6 +1513,7 @@ export class OpenCodeHostManager {
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
       abortSignal?: AbortSignal
+      managedPluginStartupPolicy?: OpenCodeManagedPluginStartupPolicy
     } = {},
   ): Promise<OpenCodeHostHandle> {
     if (params.abortSignal?.aborted) {
@@ -1417,7 +1527,10 @@ export class OpenCodeHostManager {
       params.abortSignal,
     )
     const binaryPath = resolveOpenCodeBinaryPath()
-    if (binaryPath) {
+    if (
+      binaryPath
+      && (params.managedPluginStartupPolicy ?? 'catalog-prewarm') === 'catalog-prewarm'
+    ) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
         profile,
@@ -1431,6 +1544,9 @@ export class OpenCodeHostManager {
         )
       }
     }
+    // `serve` loads every plugin in the prepared managed config. Profile-plus-live
+    // callers use that normal startup path so cold plugin installation cannot
+    // trigger the catalog-enumerating `models --verbose` prewarm.
     const hostLifetime = params.hostLifetime ?? 'persistent'
     const explicitHostKey = params.hostKey?.trim()
     const hostKey = explicitHostKey || await (async () => {
@@ -1611,6 +1727,16 @@ export class OpenCodeHostManager {
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return false
+    }
+
+    if (
+      entry.lifetime === 'process' &&
+      entry.ownedByProcess &&
+      entry.child &&
+      !Number.isFinite(entry.handle.processStartedAtMs)
+    ) {
+      await this.terminateOwnedProcessHostByHandle(entry)
+      return true
     }
 
     await this.terminatePersistentHostRecord(

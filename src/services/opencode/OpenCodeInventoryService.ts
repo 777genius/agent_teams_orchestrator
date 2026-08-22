@@ -132,7 +132,7 @@ async function acquireOpenCodeLock(
   }
 }
 
-type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
+export type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
@@ -505,6 +505,26 @@ async function withOpenCodeInventoryCommandLock<T>(
   }
 }
 
+export function runOpenCodeInventoryPreparedProfileProbe<T>(input: {
+  mode: OpenCodeInventoryProbeMode
+  profile: OpenCodePreparedProfile
+  abortSignal?: AbortSignal
+  probe: () => Promise<T>
+  withCommandLock?: <R>(
+    profile: OpenCodePreparedProfile,
+    callback: () => Promise<R>,
+    abortSignal?: AbortSignal,
+  ) => Promise<R>
+}): Promise<T> {
+  return input.mode === 'profile'
+    ? input.probe()
+    : (input.withCommandLock ?? withOpenCodeInventoryCommandLock)(
+        input.profile,
+        input.probe,
+        input.abortSignal,
+      )
+}
+
 function profileUsesManagedSubscriptionPlugins(profile: OpenCodePreparedProfile): boolean {
   const configuredPlugins = Array.isArray(profile.managedConfig.plugin)
     ? profile.managedConfig.plugin.filter((value): value is string => typeof value === 'string')
@@ -643,7 +663,7 @@ function collectFiniteNumbers(value: unknown): number[] {
   return []
 }
 
-function isFreeCost(cost: unknown): boolean {
+export function isOpenCodeCostFree(cost: unknown): boolean {
   const numbers = collectFiniteNumbers(cost)
   return numbers.length > 0 && numbers.every(value => value === 0)
 }
@@ -733,7 +753,7 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
         cost: raw.cost ?? null,
         context: getModelContextLimit(limits),
         limits,
-        free: isFreeCost(raw.cost),
+        free: isOpenCodeCostFree(raw.cost),
         catalogStatus,
         raw,
       })
@@ -746,6 +766,38 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
   return {
     models,
     modelMetadata,
+  }
+}
+
+export async function resolveOpenCodeModelsWithFallback(input: {
+  mode: OpenCodeInventoryProbeMode
+  modelsResult: OpenCodeCommandResult
+  refreshModels?: boolean
+  execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
+}): Promise<{
+  models: string[]
+  modelMetadata: OpenCodeModelMetadata[]
+  modelsResult: OpenCodeCommandResult
+}> {
+  const verboseModels = input.mode === 'full' && input.modelsResult.code === 0
+    ? parseOpenCodeModelsVerboseOutput(input.modelsResult.stdout)
+    : { models: [], modelMetadata: [] }
+  if (
+    input.mode !== 'full'
+    || input.refreshModels
+    || input.modelsResult.code !== 0
+    || verboseModels.models.length > 0
+  ) {
+    return { ...verboseModels, modelsResult: input.modelsResult }
+  }
+
+  const fallbackModelsResult = await input.execOpenCode(['models'])
+  return {
+    models: fallbackModelsResult.code === 0
+      ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
+      : [],
+    modelMetadata: [],
+    modelsResult: fallbackModelsResult,
   }
 }
 
@@ -984,17 +1036,21 @@ export class OpenCodeInventoryService {
       .finally(() => {
         leaveProfileStep?.()
       })
-    return withOpenCodeInventoryCommandLock(profile, () =>
-      this.probePreparedProfile({
-        mode,
-        resolvedProjectPath,
-        options,
-        cacheKey,
-        cacheEnabled,
-        binaryPath,
-        profile,
-      }), options.abortSignal,
-    )
+    const probePreparedProfile = () => this.probePreparedProfile({
+      mode,
+      resolvedProjectPath,
+      options,
+      cacheKey,
+      cacheEnabled,
+      binaryPath,
+      profile,
+    })
+    return runOpenCodeInventoryPreparedProfileProbe({
+      mode,
+      profile,
+      abortSignal: options.abortSignal,
+      probe: probePreparedProfile,
+    })
   }
 
   private async probePreparedProfile(input: {
@@ -1100,33 +1156,19 @@ export class OpenCodeInventoryService {
       providers: discoveredConnectedProviders,
       version,
     })
-    const verboseModels =
-      mode !== 'full'
-        ? {
-            models: [],
-            modelMetadata: [],
-          }
-        : modelsResult.code === 0
-          ? parseOpenCodeModelsVerboseOutput(modelsResult.stdout)
-          : { models: [], modelMetadata: [] }
-    let models = verboseModels.models
-    let modelMetadata = verboseModels.modelMetadata
-    let finalModelsResult = modelsResult
-    if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, [
-        'models',
-        ...(options.refreshModels ? ['--refresh'] : []),
-      ], profile, {
+    const {
+      models,
+      modelMetadata,
+      modelsResult: finalModelsResult,
+    } = await resolveOpenCodeModelsWithFallback({
+      mode,
+      modelsResult,
+      refreshModels: options.refreshModels,
+      execOpenCode: args => this.execOpenCode(binaryPath, args, profile, {
         abortSignal: options.abortSignal,
         progress: options.progress,
-      })
-      finalModelsResult = fallbackModelsResult
-      models =
-        fallbackModelsResult.code === 0
-          ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
-          : []
-      modelMetadata = []
-    }
+      }),
+    })
     const agents = agentsResult.code === 0 ? parseOpenCodeAgentListOutput(agentsResult.stdout) : []
 
     const availableProviders = Array.from(

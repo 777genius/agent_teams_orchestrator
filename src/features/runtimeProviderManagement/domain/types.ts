@@ -153,6 +153,7 @@ export type ProviderManagementErrorCode =
   | 'auth-required'
   | 'auth-failed'
   | 'model-missing'
+  | 'model-access-unavailable'
   | 'model-test-failed'
   | 'unsupported-auth-method'
 
@@ -376,6 +377,10 @@ export type SetDefaultModelInput = {
   scope?: RuntimeProviderDefaultScope
 } & ProjectScopedProviderManagementInput
 
+export type ClearProjectDefaultModelInput = {
+  runtimeId: ProviderManagementRuntimeId
+} & ProjectScopedProviderManagementInput
+
 export type TestProviderModelInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
@@ -397,6 +402,12 @@ export type ProviderModelTestResult = {
   availability: ProviderModelAvailability
   message: string
   diagnostics: readonly string[]
+  /** Stable runtime-side reason code when a probe did not pass. */
+  failureCode?: string | null
+  /** Safe endpoint reported by OpenCode's resolved provider configuration. */
+  effectiveBaseUrl?: string | null
+  /** OpenCode's provider registration source: env, config, custom, or api. */
+  providerSource?: string | null
 }
 
 export type ProviderModelLimitsResult = {

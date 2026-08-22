@@ -22,6 +22,13 @@ import {
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
+  mergeOpenCodeModelMetadata,
+  normalizeOpenCodeLiveConfigProvidersResponse,
+  normalizeOpenCodeLiveModelMetadata,
+  normalizeOpenCodeLiveProviderAuth,
+  normalizeOpenCodeLiveProviderResponse,
+} from '../../../../services/opencode/OpenCodeLiveProviderNormalizer.js'
+import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION,
@@ -40,9 +47,11 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
 import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
+  clearOpenCodeManagedDefaultModel,
   readOpenCodeManagedRuntimePreferences,
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
@@ -102,6 +111,7 @@ import type {
   ProviderSetupPrompt,
   ProviderSetupPromptCondition,
   ProviderSetupPromptOption,
+  ClearProjectDefaultModelInput,
   RuntimeProviderModel,
   RuntimeProviderModelsView,
   SetDefaultModelInput,
@@ -190,10 +200,12 @@ type OpenCodeProviderManagementAdapterDeps = {
       outputTokens?: number
       bypassCache?: boolean
       runtimeDeadline?: OpenCodeRuntimeDeadline
+      providerBaseUrl?: string | null
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
+    clearProjectDefaultModel?(profileRootPath: string): Promise<unknown>
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
     setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
     setModelLimits?(
@@ -318,13 +330,6 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/deepseek-ai/deepseek-v4-flash',
     'atlascloud/zai-org/glm-5.1',
   ],
-  'github-copilot': [
-    'github-copilot/gpt-5-mini',
-    'github-copilot/gpt-5.5',
-    'github-copilot/claude-haiku-4.5',
-    'github-copilot/claude-sonnet-4.6',
-    'github-copilot/gpt-5.6-luna',
-  ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
       .filter(definition => definition.modelProbePreferences.length > 0)
@@ -355,7 +360,7 @@ const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   'zenmux',
 ])
 const COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE =
-  'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.'
+  'GitHub sign-in succeeded, but no tested explicit Copilot model was usable. GitHub/OpenCode did not report the plan name. This can mean an Auto-only Free or Student account, an organization model policy, or an OpenCode integration restriction blocked the tested models. Agent Teams cannot use Copilot Auto yet.'
 
 function isCopilotExplicitModelUnsupported(reason: string): boolean {
   const normalized = reason.trim().toLowerCase()
@@ -363,6 +368,14 @@ function isCopilotExplicitModelUnsupported(reason: string): boolean {
     || normalized.includes('selected model is not supported')
     || normalized.includes('model is unsupported for this copilot account')
     || normalized.includes('model is not supported for this copilot account')
+    || normalized.includes('model is not available for integrator')
+}
+
+function isExecutionProbeInfrastructureFailure(
+  result: Pick<OpenCodeExecutionProbeResult, 'failureCode'>,
+): boolean {
+  return result.failureCode === 'prompt_start_failed'
+    || result.failureCode === 'execution_timeout'
 }
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
@@ -517,8 +530,10 @@ function normalizeDirectoryCursor(value: string | null | undefined): number {
 }
 
 function normalizeProviderId(value: string | null | undefined): string | null {
-  const normalized = value?.trim().toLowerCase()
-  return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
+  const normalized = value?.trim()
+  if (!normalized) return null
+  const canonical = canonicalizeOpenCodeProviderId(normalized)
+  return /^[a-z0-9][a-z0-9._-]*$/i.test(canonical) ? canonical : null
 }
 
 function normalizePositiveLimit(value: number | null | undefined): number | null {
@@ -790,6 +805,29 @@ function applyManagedDefaultToInventory(
         ...profile.managedConfig,
         ...(effectiveManagedDefaultModelId ? { model: effectiveManagedDefaultModelId } : {}),
       },
+    },
+  }
+}
+
+function applyClearedProjectDefaultToInventory(
+  inventory: OpenCodeInventorySnapshot,
+): OpenCodeInventorySnapshot {
+  const profile = inventory.profile
+  if (!profile) {
+    return inventory
+  }
+  const effectiveManagedDefaultModelId = profile.allProjectsDefaultModelId ?? null
+  const { model: _projectDefaultModel, ...managedConfigWithoutModel } = profile.managedConfig
+  return {
+    ...inventory,
+    profile: {
+      ...profile,
+      projectDefaultModelId: null,
+      effectiveManagedDefaultModelId,
+      effectiveManagedDefaultSource: effectiveManagedDefaultModelId ? 'all_projects' : null,
+      managedConfig: effectiveManagedDefaultModelId
+        ? { ...managedConfigWithoutModel, model: effectiveManagedDefaultModelId }
+        : managedConfigWithoutModel,
     },
   }
 }
@@ -2493,12 +2531,31 @@ async function readLiveView(input: {
     ...safeReadDiagnostics(serverDocResult),
   ]
 
+  const configProviders = configProvidersResult.ok
+    ? normalizeOpenCodeLiveConfigProvidersResponse(configProvidersResult.value)
+    : null
+  const providers = providersResult.ok
+    ? normalizeOpenCodeLiveProviderResponse(providersResult.value)
+    : null
+  const providerAuth = providerAuthResult.ok
+    ? normalizeOpenCodeLiveProviderAuth(providerAuthResult.value)
+    : null
+  const inventory = providers
+    ? {
+        ...input.inventory,
+        modelMetadata: mergeOpenCodeModelMetadata(
+          input.inventory.modelMetadata ?? [],
+          normalizeOpenCodeLiveModelMetadata(providers),
+        ),
+      }
+    : input.inventory
+
   return buildView({
-    inventory: input.inventory,
+    inventory,
     host: input.host,
-    configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-    providers: providersResult.ok ? providersResult.value : null,
-    providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+    configProviders,
+    providers,
+    providerAuth,
     capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
     diagnostics,
   })
@@ -2645,8 +2702,12 @@ function getProviderCredentialValidationModelIds(input: {
   if (defaultModelId) appendCandidates([defaultModelId])
   appendCandidates(modelIds)
 
+  // Copilot's catalog and plan policy change independently. Every explicit
+  // model rejected as unsupported is safe to skip because it never starts a
+  // generation. Do not cap Copilot to a stale hard-coded shortlist: walk the
+  // live catalog and stop at the first model that completes the proof.
   const maxCandidates = input.providerId === 'github-copilot'
-    ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
+    ? candidates.length
     : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
   return candidates.slice(0, maxCandidates)
 }
@@ -2889,12 +2950,58 @@ function mapProbeOutcomeToAvailability(
   return 'unknown'
 }
 
+function sanitizeProviderBaseUrl(value: unknown): string | null {
+  const raw = asString(value)
+  if (!raw) return null
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
+    }
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function sanitizeProviderSource(value: unknown): string | null {
+  const source = asString(value)
+  return source && ['env', 'config', 'custom', 'api'].includes(source) ? source : null
+}
+
+function resolveEffectiveProviderEndpoint(input: {
+  providerId: string
+  configProviders: OpenCodeConfigProvidersResponse | null
+}): { baseUrl: string | null; providerSource: string | null } {
+  const provider = input.configProviders?.providers?.find(candidate =>
+    normalizeProviderId(candidate.id) === input.providerId
+  )
+  const options = asRecord(provider?.options)
+  return {
+    baseUrl: sanitizeProviderBaseUrl(options?.baseURL ?? options?.baseUrl),
+    providerSource: sanitizeProviderSource(provider?.source),
+  }
+}
+
 function buildProviderModelTestResult(input: {
   providerId: string
   modelId: string
   probe: OpenCodeExecutionProbeResult
+  configProviders: OpenCodeConfigProvidersResponse | null
 }): ProviderModelTestResult {
   const availability = mapProbeOutcomeToAvailability(input.probe.outcome)
+  const endpoint = resolveEffectiveProviderEndpoint({
+    providerId: input.providerId,
+    configProviders: input.configProviders,
+  })
+  const diagnostics = [...input.probe.diagnostics]
+  if (endpoint.baseUrl) {
+    diagnostics.push(
+      endpoint.providerSource
+        ? `OpenCode resolved provider endpoint: ${endpoint.baseUrl} (provider source: ${endpoint.providerSource})`
+        : `OpenCode resolved provider endpoint: ${endpoint.baseUrl}`,
+    )
+  }
   return {
     providerId: input.providerId,
     modelId: input.modelId,
@@ -2904,7 +3011,10 @@ function buildProviderModelTestResult(input: {
       input.probe.outcome === 'available'
         ? 'Model probe passed'
         : (input.probe.reason ?? 'Model probe failed'),
-    diagnostics: input.probe.diagnostics,
+    diagnostics,
+    failureCode: input.probe.failureCode ?? null,
+    effectiveBaseUrl: endpoint.baseUrl,
+    providerSource: endpoint.providerSource,
   }
 }
 
@@ -3114,9 +3224,12 @@ export class OpenCodeProviderManagementAdapter
       ? {
           ...configured,
           read: configured.read ?? readOpenCodeManagedRuntimePreferences,
+          clearProjectDefaultModel:
+            configured.clearProjectDefaultModel ?? clearOpenCodeManagedDefaultModel,
         }
       : {
         read: readOpenCodeManagedRuntimePreferences,
+        clearProjectDefaultModel: clearOpenCodeManagedDefaultModel,
         setDefaultModel: setOpenCodeManagedDefaultModel,
         setModelLimits: setOpenCodeManagedModelLimits,
         setAllProjectsDefaultModel: (modelId: string) =>
@@ -3307,6 +3420,7 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const failedCandidates: string[] = []
+    const infrastructureFailures: string[] = []
     let copilotUnsupportedCandidateCount = 0
     for (const validationModelId of validationModelIds) {
       const runtimeDeadline = new OpenCodeRuntimeDeadline(
@@ -3321,18 +3435,24 @@ export class OpenCodeProviderManagementAdapter
           // exhaust tiny overrides before emitting the verification response.
           bypassCache: true,
           runtimeDeadline,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId: input.providerId,
+            configProviders: input.configProviders,
+          }).baseUrl,
         })
       } catch (error) {
         const reason = redactSecret(
           error instanceof Error ? error.message : String(error),
           input.secretToRedact ?? '',
         )
-        failedCandidates.push(`${validationModelId}: ${reason}`)
         if (
           input.providerId === 'github-copilot'
           && isCopilotExplicitModelUnsupported(reason)
         ) {
+          failedCandidates.push(`${validationModelId}: ${reason}`)
           copilotUnsupportedCandidateCount += 1
+        } else {
+          infrastructureFailures.push(`${validationModelId}: ${reason}`)
         }
         continue
       } finally {
@@ -3362,16 +3482,28 @@ export class OpenCodeProviderManagementAdapter
             : `Provider authentication failed for ${validationModelId}`,
         )
       }
+      if (isExecutionProbeInfrastructureFailure(probeResult)) {
+        infrastructureFailures.push(`${validationModelId}: ${probeReason}`)
+        continue
+      }
       failedCandidates.push(`${validationModelId}: ${probeReason}`)
     }
 
     if (
       input.providerId === 'github-copilot'
+      && infrastructureFailures.length === 0
       && copilotUnsupportedCandidateCount === validationModelIds.length
     ) {
       return providerManagementError(
-        'model-test-failed',
+        'model-access-unavailable',
         COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE,
+      )
+    }
+
+    if (infrastructureFailures.length > 0) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        `OpenCode connected to ${input.providerId}, but runtime verification could not determine model access. Retry verification. Diagnostics: ${infrastructureFailures.join('; ')}`,
       )
     }
 
@@ -3431,6 +3563,9 @@ export class OpenCodeProviderManagementAdapter
         projectPath: inventory.projectPath,
         hostLifetime,
         resolveConfigFingerprint: false,
+        managedPluginStartupPolicy: options.inventoryMode === 'profile'
+          ? 'serve-startup'
+          : 'catalog-prewarm',
       })
       if (hostLifetime === 'persistent') {
         hostLease = await this.retainProviderManagementHost(hostManager, host)
@@ -3471,7 +3606,9 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, request.projectPath)
+    const inventory = await this.probeInventory(inventoryService, request.projectPath, {
+      mode: 'profile',
+    })
 
     if (!inventory.detected) {
       return {
@@ -3514,6 +3651,7 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime: 'persistent',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        managedPluginStartupPolicy: 'serve-startup',
       })
       hostLease = await this.retainProviderManagementHost(hostManager, host)
       const client = clientFactory.create(host.baseUrl)
@@ -3630,6 +3768,7 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        managedPluginStartupPolicy: input.refresh ? 'catalog-prewarm' : 'serve-startup',
       })
       hostLease = await this.retainProviderManagementHost(hostManager, host)
       const cacheKey = this.getDirectoryCacheKey({
@@ -3669,6 +3808,15 @@ export class OpenCodeProviderManagementAdapter
           serverDocRead,
         ])
       const directoryVersion = inventory.version ?? host.version
+      const liveConfigProviders = configProvidersResult.ok
+        ? normalizeOpenCodeLiveConfigProvidersResponse(configProvidersResult.value)
+        : null
+      const liveProviders = providersResult.ok
+        ? normalizeOpenCodeLiveProviderResponse(providersResult.value)
+        : null
+      const liveProviderAuth = providerAuthResult.ok
+        ? normalizeOpenCodeLiveProviderAuth(providerAuthResult.value)
+        : null
       const {
         connectedProviders: directoryConnectedProviders,
         unsupportedSuperGrokOAuth,
@@ -3679,6 +3827,12 @@ export class OpenCodeProviderManagementAdapter
       const directoryInventory = {
         ...inventory,
         version: directoryVersion,
+        modelMetadata: liveProviders && !input.refresh
+          ? mergeOpenCodeModelMetadata(
+              inventory.modelMetadata ?? [],
+              normalizeOpenCodeLiveModelMetadata(liveProviders),
+            )
+          : inventory.modelMetadata,
         connectedProviders: directoryConnectedProviders,
         diagnostics: [
           ...inventory.diagnostics.filter(
@@ -3700,9 +3854,9 @@ export class OpenCodeProviderManagementAdapter
       ]
       const directorySource = {
         inventory: directoryInventory,
-        configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-        providers: providersResult.ok ? providersResult.value : null,
-        providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+        configProviders: liveConfigProviders,
+        providers: liveProviders,
+        providerAuth: liveProviderAuth,
         capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
         diagnostics,
       }
@@ -4808,6 +4962,10 @@ export class OpenCodeProviderManagementAdapter
             selectedModel: modelId,
             projectPath: inventory.projectPath,
             bypassCache: true,
+            providerBaseUrl: resolveEffectiveProviderEndpoint({
+              providerId,
+              configProviders,
+            }).baseUrl,
           })
           if (probeResult.outcome !== 'available') {
             if (probeResult.outcome === 'not_authenticated') {
@@ -4854,6 +5012,7 @@ export class OpenCodeProviderManagementAdapter
           inventory.projectPath,
           {
             bypassCache: true,
+            mode: 'summary',
           },
         )
         const refresh = useActionRefreshInventory(
@@ -4876,7 +5035,61 @@ export class OpenCodeProviderManagementAdapter
           value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
+    )
+  }
+
+  async clearProjectDefaultModel(
+    input: ClearProjectDefaultModelInput,
+  ): Promise<ProviderManagementResult<ProviderManagementView>> {
+    const projectPath = input.projectPath?.trim()
+    if (!projectPath) {
+      return providerManagementError(
+        'runtime-misconfigured',
+        'A project path is required to clear its OpenCode default model',
+      )
+    }
+    return this.withManagedOpenCodeClient(
+      input.runtimeId,
+      projectPath,
+      async ({ inventory, inventoryService, host, client }) => {
+        const profile = inventory.profile
+        if (!profile) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode managed profile is unavailable',
+          )
+        }
+
+        await this.getManagedPreferences().clearProjectDefaultModel(profile.profileRootPath)
+        this.invalidateDirectoryCache()
+        inventoryService.clearCache?.()
+
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+            mode: 'summary',
+          },
+        )
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          applyClearedProjectDefaultToInventory,
+        )
+        const view = await readLiveView({
+          inventory: refresh.inventory,
+          host,
+          client,
+          diagnostics: refresh.inventory.diagnostics,
+        })
+        return {
+          ok: true,
+          value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
+        }
+      },
+      { failureCode: 'runtime-unhealthy', inventoryMode: 'summary' },
     )
   }
 
@@ -4942,6 +5155,10 @@ export class OpenCodeProviderManagementAdapter
           selectedModel: modelId,
           projectPath: inventory.projectPath,
           bypassCache: true,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId,
+            configProviders,
+          }).baseUrl,
         })
         return {
           ok: true,
@@ -4949,10 +5166,11 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             modelId,
             probe,
+            configProviders,
           }),
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
     )
   }
 
@@ -5045,6 +5263,10 @@ export class OpenCodeProviderManagementAdapter
           contextTokens,
           outputTokens,
           bypassCache: true,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId,
+            configProviders,
+          }).baseUrl,
         })
         const verified = probe.outcome === 'available'
         if (!verified) {
@@ -5092,7 +5314,7 @@ export class OpenCodeProviderManagementAdapter
           },
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
     )
   }
 }

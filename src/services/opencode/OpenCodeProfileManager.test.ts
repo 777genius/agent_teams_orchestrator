@@ -16,6 +16,7 @@ import {
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
+  withOpenCodeLoopbackProxyBypass,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -212,6 +213,43 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         },
       },
     })
+  })
+
+  test('tracks nested OpenCode config files as project behavior sources', async () => {
+    await mkdir(path.join(tempDir, '.opencode'), { recursive: true })
+    const before = await collectProjectBehaviorMetadata(tempDir)
+    await writeFile(
+      path.join(tempDir, '.opencode', 'opencode.json'),
+      '{ "provider": { "ollama": {} } }\n',
+      'utf8',
+    )
+    await writeFile(
+      path.join(tempDir, '.opencode', 'opencode.jsonc'),
+      '{ "provider": { "ollama": {} } }\n',
+      'utf8',
+    )
+
+    const after = await collectProjectBehaviorMetadata(tempDir)
+
+    expect(after.projectBehaviorFingerprint).not.toBe(before.projectBehaviorFingerprint)
+    expect(after.behaviorSources.map(normalizePath)).toEqual([
+      '.opencode/opencode.json',
+      '.opencode/opencode.jsonc',
+    ])
+  })
+
+  test('keeps loopback OpenCode providers out of inherited proxies without mutating the source env', () => {
+    const inheritedEnv = {
+      HTTPS_PROXY: 'http://proxy.example.test:8080',
+      NO_PROXY: 'internal.example.test',
+    }
+
+    const profileEnv = withOpenCodeLoopbackProxyBypass(inheritedEnv)
+
+    expect(inheritedEnv.NO_PROXY).toBe('internal.example.test')
+    expect(profileEnv.HTTPS_PROXY).toBe('http://proxy.example.test:8080')
+    expect(profileEnv.NO_PROXY).toBe('internal.example.test,localhost,127.0.0.1,::1,[::1]')
+    expect(profileEnv.no_proxy).toBe(profileEnv.NO_PROXY)
   })
 
   test('can build a manual approval teammate profile while keeping app MCP allowed', () => {
@@ -1035,7 +1073,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   }, 15_000)
 
-  test('imports only safe user OpenCode config into managed profile content', async () => {
+  test('stages safe user file config below project config while keeping inherited inline config high priority', async () => {
     const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
     const previousOpenCodeConfig = process.env.OPENCODE_CONFIG
     const previousOpenCodeConfigContent = process.env.OPENCODE_CONFIG_CONTENT
@@ -1047,6 +1085,19 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const customConfigPath = path.join(tempDir, 'custom-opencode.jsonc')
     await mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
     await writeFile(
+      path.join(xdgConfigHome, 'opencode', 'config.json'),
+      JSON.stringify({
+        provider: {
+          'legacy-local': {
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:7777/v1' },
+            models: { legacy: {} },
+          },
+        },
+      }),
+      'utf8',
+    )
+    await writeFile(
       path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
       `{
         // Local Ollama route should be imported.
@@ -1054,7 +1105,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         "provider": {
           "ollama": {
             "npm": "@ai-sdk/openai-compatible",
-            "options": { "baseURL": "http://127.0.0.1:11434/v1" },
+            "options": {
+              "baseURL": "http://127.0.0.1:11434/v1",
+              "apiKey": "{file:./ollama-api-key}"
+            },
             "models": { "qwen2.5-coder:0.5b": {} }
           }
         },
@@ -1096,34 +1150,82 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
 
     try {
+      const projectPath = path.join(tempDir, 'project-config-import')
+      await mkdir(projectPath, { recursive: true })
+      await writeFile(
+        path.join(projectPath, 'opencode.json'),
+        JSON.stringify({
+          provider: {
+            ollama: {
+              options: { baseURL: 'http://127.0.0.1:9999/v1' },
+            },
+          },
+        }),
+        'utf8',
+      )
       const manager = new OpenCodeProfileManager()
-      const profile = await manager.prepareProfile(path.join(tempDir, 'project-config-import'))
-      const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
-      const providers = managedConfig.provider as Record<string, unknown>
-      const agents = managedConfig.agent as Record<string, unknown>
-      const mcp = (managedConfig.mcp ?? {}) as Record<string, unknown>
+      const profile = await manager.prepareProfile(projectPath)
+      const inlineConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
+      const inlineProviders = inlineConfig.provider as Record<string, unknown>
+      const stagedFileConfig = JSON.parse(
+        await readFile(path.join(profile.xdgConfigHome, 'opencode', 'opencode.json'), 'utf8'),
+      ) as Record<string, unknown>
+      const stagedProviders = stagedFileConfig.provider as Record<string, unknown>
+      const stagedOllama = stagedProviders.ollama as Record<string, unknown>
+      const stagedOllamaOptions = stagedOllama.options as Record<string, unknown>
+      const completeProviders = profile.managedConfig.provider as Record<string, unknown>
+      const agents = inlineConfig.agent as Record<string, unknown>
+      const mcp = (inlineConfig.mcp ?? {}) as Record<string, unknown>
 
       expect(profile.env.OPENCODE_CONFIG).toBeUndefined()
-      expect(providers.ollama).toMatchObject({
+      expect(stagedProviders.ollama).toMatchObject({
         models: { 'qwen2.5-coder:0.5b': {} },
       })
-      expect(providers['llama.cpp']).toMatchObject({
+      expect(stagedOllamaOptions.apiKey).toBe(
+        `{file:${path.join(xdgConfigHome, 'opencode', 'ollama-api-key')}}`,
+      )
+      expect(stagedProviders['llama.cpp']).toMatchObject({
         options: { baseURL: 'http://127.0.0.1:8080/v1' },
       })
-      expect(providers.lmstudio).toMatchObject({
+      expect(stagedProviders['legacy-local']).toMatchObject({
+        options: { baseURL: 'http://127.0.0.1:7777/v1' },
+      })
+      expect(inlineProviders.ollama).toBeUndefined()
+      expect(inlineProviders['llama.cpp']).toBeUndefined()
+      expect(inlineProviders.lmstudio).toMatchObject({
         models: { 'google/gemma-3n-e4b': {} },
       })
-      expect(managedConfig.model).toBe('ollama/qwen2.5-coder:0.5b')
-      expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
-      expect(managedConfig.plugin).toEqual([
+      expect(profile.managedConfig.model).toBe('ollama/qwen2.5-coder:0.5b')
+      expect(profile.managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
+      expect(completeProviders.ollama).toMatchObject({
+        options: { baseURL: 'http://127.0.0.1:11434/v1' },
+      })
+      expect(inlineConfig.plugin).toEqual([
         'opencode-kiro@0.4.0',
         '@rama_nigg/open-cursor@2.5.2',
       ])
-      expect(managedConfig).not.toHaveProperty('permission')
-      expect(managedConfig).not.toHaveProperty('command')
+      expect(inlineConfig).not.toHaveProperty('permission')
+      expect(inlineConfig).not.toHaveProperty('command')
       expect(mcp.unsafe).toBeUndefined()
       expect(agents.teammate).toBeDefined()
       expect(agents.unsafe).toBeUndefined()
+
+      const isolatedConfigDirectory = path.join(profile.xdgConfigHome, 'opencode')
+      await writeFile(
+        path.join(isolatedConfigDirectory, 'config.json'),
+        JSON.stringify({ model: 'stale/config-model' }),
+        'utf8',
+      )
+      await writeFile(
+        path.join(isolatedConfigDirectory, 'opencode.jsonc'),
+        JSON.stringify({ model: 'stale/jsonc-model' }),
+        'utf8',
+      )
+      await manager.prepareProfile(projectPath)
+      await expect(readFile(path.join(isolatedConfigDirectory, 'config.json'), 'utf8'))
+        .rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(readFile(path.join(isolatedConfigDirectory, 'opencode.jsonc'), 'utf8'))
+        .rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       if (previousXdgConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME
@@ -1205,10 +1307,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       const profile = await new OpenCodeProfileManager().prepareProfile(
         path.join(tempDir, 'project-ollama-cloud-import'),
       )
-      const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
-      const providers = managedConfig.provider as Record<string, unknown>
+      const providers = profile.managedConfig.provider as Record<string, unknown>
 
-      expect(managedConfig.model).toBe('ollama/kimi-k2.6:cloud')
+      expect(profile.managedConfig.model).toBe('ollama/kimi-k2.6:cloud')
       expect(providers.ollama).toMatchObject({
         models: {
           'kimi-k2.6:cloud': {

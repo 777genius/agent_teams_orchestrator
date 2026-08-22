@@ -2,6 +2,11 @@ import { describe, expect, test } from 'bun:test'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
+import {
+  buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
+  evaluateOpenCodeModelAccess,
+} from './OpenCodeModelAccessPolicy.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -70,6 +75,106 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
+  test('forwards profile inventory mode through public probe methods', async () => {
+    const modes: Array<string | undefined> = []
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          modes.push(options?.mode)
+          return { ...inventory, detected: false }
+        },
+      },
+    })
+
+    await probe.probe('/tmp/project', { inventoryMode: 'profile', bypassCache: true })
+    await probe.probeRetainingHost('/tmp/project', { inventoryMode: 'profile' })
+    await probe.probe('/tmp/project', { bypassCache: true })
+
+    expect(modes).toEqual(['profile', 'profile', 'full'])
+  })
+
+  test('normalizes live provider model metadata for profile-mode compatibility checks', async () => {
+    let hostOptions: Record<string, unknown> | null = null
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: { probe: async () => ({ ...inventory, models: [], modelMetadata: [] }) },
+      hostManager: {
+        ensureHost: async options => {
+          hostOptions = options
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => ({
+            default_agent: 'teammate',
+            share: 'disabled',
+            autoupdate: false,
+            snapshot: true,
+          }),
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{
+              id: 'openrouter',
+              models: {
+                'text-model': {
+                  capabilities: { output: { text: true }, toolcall: true },
+                },
+                'legacy-text-model': {
+                  modalities: { input: ['text'], output: ['text'] },
+                  tool_call: true,
+                },
+                'image-model': { modalities: { input: ['text'], output: ['image'] }, tool_call: false },
+                'no-tools-model': {
+                  capabilities: { output: { text: true }, toolcall: false },
+                },
+                'null-model': null,
+                'primitive-model': true,
+                'empty-model': {},
+                'incomplete-model': { capabilities: { output: { text: true } } },
+              },
+            }],
+            default: {},
+            connected: ['openrouter'],
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          listAgents: async () => [{ name: 'teammate', mode: 'primary' }],
+        }) as never,
+      },
+    })
+
+    const snapshot = await probe.probe('/tmp/project', {
+      inventoryMode: 'profile',
+      ensureAppMcp: false,
+      bypassCache: true,
+    })
+
+    expect(snapshot.providers?.connected).toEqual(['openrouter'])
+    expect(hostOptions).toMatchObject({ managedPluginStartupPolicy: 'serve-startup' })
+    expect(resolveOpenCodeProviderScopedModel('openrouter/text-model', snapshot)).toBe(
+      'openrouter/text-model',
+    )
+    expect(evaluateOpenCodeModelAccess({
+      selectedModel: 'openrouter/text-model',
+      catalog: buildOpenCodeModelAccessCatalogFromProvisioningSnapshot(snapshot),
+    })).toMatchObject({ kind: 'credentialed', launchAllowed: true })
+    expect(() => resolveOpenCodeProviderScopedModel('openrouter/image-model', snapshot)).toThrow(
+      'does not produce text responses',
+    )
+    expect(resolveOpenCodeProviderScopedModel('openrouter/legacy-text-model', snapshot)).toBe(
+      'openrouter/legacy-text-model',
+    )
+    for (const modelId of [
+      'no-tools-model',
+      'null-model',
+      'primitive-model',
+      'empty-model',
+      'incomplete-model',
+    ]) {
+      expect(() => resolveOpenCodeProviderScopedModel(`openrouter/${modelId}`, snapshot)).toThrow()
+    }
+  })
+
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({
       inventoryService: {

@@ -147,6 +147,20 @@ export type RuntimeProviderSubscriptionRateLimitSnapshot = {
   secondary: RuntimeProviderSubscriptionRateLimitWindow | null
 }
 
+/** Whether this payload is a complete runtime observation or only a safe fallback. */
+export type RuntimeProviderStatusCheckOutcome =
+  | 'authoritative'
+  | 'pending'
+  | 'transient_error'
+  | 'model_only'
+
+/** Machine-readable reason for an incomplete provider-status observation. */
+export type RuntimeProviderStatusCheckErrorCode =
+  | 'timeout'
+  | 'unavailable'
+  | 'runtime_missing'
+  | 'partial_response'
+
 export type RuntimeBackendOptionStatus = {
   id: RuntimeBackendId
   label: string
@@ -175,6 +189,9 @@ export type RuntimeProviderStatus = {
   authenticated: boolean
   authMethod: string | null
   verificationState: 'verified' | 'unknown' | 'offline' | 'error'
+  /** Optional so consumers of older runtime status payloads remain compatible. */
+  statusCheckOutcome?: RuntimeProviderStatusCheckOutcome
+  statusCheckErrorCode?: RuntimeProviderStatusCheckErrorCode
   canLoginFromUi: boolean
   capabilities: {
     teamLaunch: boolean

@@ -1,9 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 
-import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  OPEN_CODE_PROVIDER_ALIAS_ENTRIES,
+  canonicalizeOpenCodeProviderId,
+} from './OpenCodeProviderIdentity.js'
 
 describe('canonicalizeOpenCodeProviderId', () => {
   test.each([
+    ...OPEN_CODE_PROVIDER_ALIAS_ENTRIES,
     ['MiniMax Token Plan (minimax.io)', 'minimax-coding-plan'],
     ['Xiaomi Token Plan (Europe)', 'xiaomi-token-plan-ams'],
     ['Xiaomi Token Plan (Singapore)', 'xiaomi-token-plan-sgp'],

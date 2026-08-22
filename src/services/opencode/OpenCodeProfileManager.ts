@@ -17,6 +17,7 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
@@ -457,6 +458,8 @@ async function runAfterSettled(previous: Promise<void> | undefined): Promise<voi
 const PROJECT_BEHAVIOR_FILES = [
   'opencode.json',
   'opencode.jsonc',
+  '.opencode/opencode.json',
+  '.opencode/opencode.jsonc',
   'AGENTS.md',
   'CLAUDE.md',
   '.opencode/package.json',
@@ -1165,13 +1168,29 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
   return safe
 }
 
+type SafeOpenCodeRuntimeConfigImport = {
+  /**
+   * User global, XDG, and explicit config files. This is written to the
+   * isolated profile's XDG config path, which OpenCode reads below project
+   * configuration.
+   */
+  fileConfig: Record<string, unknown>
+  /**
+   * OPENCODE_CONFIG_CONTENT is intentionally an OpenCode high-priority layer,
+   * so preserve its semantics when composing the managed inline overlay.
+   */
+  inlineConfig: Record<string, unknown>
+}
+
 function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
   const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
   const candidates = [
+    path.join(os.homedir(), '.config', 'opencode', 'config.json'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
     // An explicit XDG config is closer to the invoking runtime than the
     // canonical user config and must win model/provider conflicts.
+    path.join(xdgConfigHome, 'opencode', 'config.json'),
     path.join(xdgConfigHome, 'opencode', 'opencode.json'),
     path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
   ]
@@ -1186,7 +1205,8 @@ async function readSafeOpenCodeRuntimeConfigFile(
   filePath: string,
 ): Promise<Record<string, unknown>> {
   try {
-    return pickSafeOpenCodeRuntimeConfig(safeParseJSONC(await readFile(filePath, 'utf8')))
+    const safe = pickSafeOpenCodeRuntimeConfig(safeParseJSONC(await readFile(filePath, 'utf8')))
+    return rebaseOpenCodeFileReferences(safe, filePath) as Record<string, unknown>
   } catch (error) {
     if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') {
       return {}
@@ -1195,23 +1215,122 @@ async function readSafeOpenCodeRuntimeConfigFile(
   }
 }
 
+function rebaseOpenCodeFileReferences(value: unknown, sourcePath: string): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\{file:([^}]+)\}/g, (token, rawPath: string) => {
+      const filePath = rawPath.trim()
+      if (!filePath) return token
+      const resolvedPath = filePath.startsWith('~/') || filePath.startsWith('~\\')
+        ? path.join(os.homedir(), filePath.slice(2))
+        : path.isAbsolute(filePath)
+          ? filePath
+          : path.resolve(path.dirname(sourcePath), filePath)
+      return `{file:${resolvedPath}}`
+    })
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => rebaseOpenCodeFileReferences(entry, sourcePath))
+  }
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      rebaseOpenCodeFileReferences(entry, sourcePath),
+    ]),
+  )
+}
+
 async function readSafeOpenCodeRuntimeConfigImport(
   env: NodeJS.ProcessEnv,
-): Promise<Record<string, unknown>> {
-  let importedConfig: Record<string, unknown> = {}
+): Promise<SafeOpenCodeRuntimeConfigImport> {
+  let fileConfig: Record<string, unknown> = {}
   for (const configPath of getOpenCodeConfigImportPaths(env)) {
-    importedConfig = deepMergeOpenCodeConfig(
-      importedConfig,
+    fileConfig = deepMergeOpenCodeConfig(
+      fileConfig,
       await readSafeOpenCodeRuntimeConfigFile(configPath),
     )
   }
 
-  importedConfig = deepMergeOpenCodeConfig(
-    importedConfig,
-    pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env.OPENCODE_CONFIG_CONTENT)),
-  )
+  return {
+    fileConfig,
+    inlineConfig: pickSafeOpenCodeRuntimeConfig(
+      safeParseJSONC(env.OPENCODE_CONFIG_CONTENT),
+    ),
+  }
+}
 
-  return importedConfig
+const OPEN_CODE_LOOPBACK_NO_PROXY_HOSTS = [
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '[::1]',
+] as const
+
+function hasInheritedProxy(env: NodeJS.ProcessEnv): boolean {
+  return [env.HTTP_PROXY, env.HTTPS_PROXY, env.http_proxy, env.https_proxy]
+    .some(value => Boolean(value?.trim()))
+}
+
+/**
+ * OpenCode inherits proxy variables from the desktop process. Keep that proxy
+ * behavior for remote providers, while ensuring the conventional loopback
+ * routes used by Ollama and other local OpenAI-compatible providers stay
+ * direct. This returns a child-process environment and never mutates
+ * process.env.
+ */
+export function withOpenCodeLoopbackProxyBypass(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (!hasInheritedProxy(env)) {
+    return { ...env }
+  }
+
+  const existingEntries = [env.no_proxy, env.NO_PROXY]
+    .flatMap(value => value?.split(/[\s,]+/) ?? [])
+    .map(value => value.trim())
+    .filter(Boolean)
+  if (existingEntries.includes('*')) {
+    return {
+      ...env,
+      NO_PROXY: '*',
+      no_proxy: '*',
+    }
+  }
+
+  const seen = new Set<string>()
+  const normalizedEntries = [...existingEntries, ...OPEN_CODE_LOOPBACK_NO_PROXY_HOSTS]
+    .filter(value => {
+      const normalized = value.toLowerCase()
+      if (seen.has(normalized)) return false
+      seen.add(normalized)
+      return true
+    })
+  const noProxy = normalizedEntries.join(',')
+  return {
+    ...env,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  }
+}
+
+async function writeIsolatedOpenCodeGlobalConfig(
+  xdgConfigHome: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  const configDirectory = path.join(xdgConfigHome, 'opencode')
+  const configPath = path.join(configDirectory, 'opencode.json')
+  await writeFileAtomic(
+    configPath,
+    `${JSON.stringify(config, null, 2)}\n`,
+    { encoding: 'utf8', mode: 0o600 },
+  )
+  // OpenCode merges config.json -> opencode.json -> opencode.jsonc. These are
+  // app-owned profile files, so stale siblings must not override the freshly
+  // staged safe config without participating in the managed fingerprint.
+  await Promise.all([
+    rm(path.join(configDirectory, 'config.json'), { force: true }),
+    rm(path.join(configDirectory, 'opencode.jsonc'), { force: true }),
+  ])
 }
 
 function applyManagedPathEnvironmentToMcpConfig(
@@ -1436,22 +1555,33 @@ export class OpenCodeProfileManager {
       })),
       ...(options.modelOutputLimitOverrides ?? []),
     ]
-    const managedConfig = deepMergeOpenCodeConfig(
-      importedRuntimeConfig,
+    // Keep user file configuration in the isolated XDG global config, not in
+    // OPENCODE_CONFIG_CONTENT. OpenCode applies inline content after project
+    // files, so embedding global/XDG/custom provider config there made a user
+    // global baseURL incorrectly override a project's provider route.
+    const managedInlineConfig = deepMergeOpenCodeConfig(
+      importedRuntimeConfig.inlineConfig,
       buildManagedConfig(appMcpConfig, {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
         defaultModelId: effectiveManagedDefaultModelId,
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
-    applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
+    applyOpenCodeModelLimitOverrides(managedInlineConfig, effectiveModelOutputLimitOverrides)
     if (options.includeManagedSubscriptionPlugins !== false) {
-      applyOpenCodeManagedSubscriptionPlugins(managedConfig)
+      applyOpenCodeManagedSubscriptionPlugins(managedInlineConfig)
     }
-    applyManagedPathEnvironmentToMcpConfig(managedConfig, {
+    applyManagedPathEnvironmentToMcpConfig(managedInlineConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
     })
+    // Keep this merged representation for host identity, diagnostics, and
+    // callers that inspect the complete managed profile. The child receives
+    // only managedInlineConfig through OPENCODE_CONFIG_CONTENT.
+    const managedConfig = deepMergeOpenCodeConfig(
+      importedRuntimeConfig.fileConfig,
+      managedInlineConfig,
+    )
     const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
@@ -1484,6 +1614,7 @@ export class OpenCodeProfileManager {
       mkdir(sharedNpmCachePath, { recursive: true }),
       mkdir(sharedToolCachePath, { recursive: true }),
     ])
+    await writeIsolatedOpenCodeGlobalConfig(xdgConfigHome, importedRuntimeConfig.fileConfig)
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (options.includeManagedSubscriptionPlugins !== false) {
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
@@ -1554,7 +1685,7 @@ export class OpenCodeProfileManager {
       }
     })()
 
-    const env: NodeJS.ProcessEnv = {
+    const env = withOpenCodeLoopbackProxyBypass({
       ...process.env,
       HOME: homePath,
       USERPROFILE: homePath,
@@ -1573,8 +1704,8 @@ export class OpenCodeProfileManager {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
       OPENCODE_DISABLE_CLAUDE_CODE: '1',
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
-    }
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(managedInlineConfig),
+    })
     if (nativeCliCredentialBridge) {
       env.PATH = [nativeCliCredentialBridge.binPath, process.env.PATH]
         .filter((value): value is string => Boolean(value))

@@ -1,8 +1,8 @@
 import {
   formatOpenCodeModelRef,
-  normalizeOpenCodeProviderId,
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { isOpenCodeBuiltinFreeModelId } from './OpenCodeInventoryService.js'
 
 import type {
@@ -80,8 +80,14 @@ const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([
   'vllm',
 ])
 
+const PROVIDERS_REQUIRING_PER_MODEL_EXECUTION_PROOF = new Set([
+  // Copilot's catalog can include models that the connected account plan or
+  // organization policy still rejects when explicitly selected.
+  'github-copilot',
+])
+
 export function isKnownAuthlessOpenCodeProviderId(providerId: string | null | undefined): boolean {
-  const normalized = normalizeOpenCodeProviderId(providerId)
+  const normalized = providerId ? canonicalizeOpenCodeProviderId(providerId) : null
   return normalized ? KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(normalized) : false
 }
 
@@ -98,13 +104,14 @@ function asString(value: unknown): string | null {
 function normalizeProviderIdSet(providerIds: readonly string[]): Set<string> {
   return new Set(
     providerIds
-      .map(providerId => normalizeOpenCodeProviderId(providerId))
+      .map(providerId => canonicalizeOpenCodeProviderId(providerId))
       .filter((providerId): providerId is string => Boolean(providerId)),
   )
 }
 
 function getProviderEntryId(entry: OpenCodeProviderListEntry): string | null {
-  return normalizeOpenCodeProviderId(asString(entry.id))
+  const providerId = asString(entry.id)
+  return providerId ? canonicalizeOpenCodeProviderId(providerId) : null
 }
 
 function getProviderEntryModels(entry: OpenCodeProviderListEntry): Record<string, unknown> | null {
@@ -177,7 +184,13 @@ function hasKnownOpenCodeModel(
 ): boolean {
   const scopedModel = formatOpenCodeModelRef(providerId, modelId)
   if (
-    catalog.models.some(model => parseOpenCodeProviderScopedModelRef(model)?.raw === scopedModel)
+    catalog.models.some(model => {
+      const parsed = parseOpenCodeProviderScopedModelRef(model)
+      return parsed
+        ? formatOpenCodeModelRef(canonicalizeOpenCodeProviderId(parsed.providerId), parsed.modelId)
+          === scopedModel
+        : false
+    })
   ) {
     return true
   }
@@ -198,9 +211,7 @@ function isAuthlessCapableKnownModel(
     return true
   }
   return KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(providerId)
-    && catalog.models.some(model =>
-      parseOpenCodeProviderScopedModelRef(model)?.raw === formatOpenCodeModelRef(providerId, modelId)
-    )
+    && hasKnownOpenCodeModel(catalog, providerId, modelId)
 }
 
 export function isOpenCodeAuthlessCapableKnownModel(
@@ -234,7 +245,17 @@ export function evaluateOpenCodeModelAccess(input: {
     }
   }
 
-  const parsed = parseOpenCodeProviderScopedModelRef(selected)
+  const rawParsed = parseOpenCodeProviderScopedModelRef(selected)
+  const parsed = rawParsed
+    ? {
+        ...rawParsed,
+        providerId: canonicalizeOpenCodeProviderId(rawParsed.providerId),
+        raw: formatOpenCodeModelRef(
+          canonicalizeOpenCodeProviderId(rawParsed.providerId),
+          rawParsed.modelId,
+        ),
+      }
+    : null
   if (!parsed) {
     return {
       kind: 'unknown_model',
@@ -293,6 +314,16 @@ export function evaluateOpenCodeModelAccess(input: {
   }
 
   if (normalizeProviderIdSet(input.catalog.connectedProviders).has(parsed.providerId)) {
+    if (PROVIDERS_REQUIRING_PER_MODEL_EXECUTION_PROOF.has(parsed.providerId)) {
+      return {
+        kind: 'credentialed',
+        providerId: parsed.providerId,
+        modelId: parsed.modelId,
+        launchAllowed: false,
+        requiresExecutionProof: true,
+        reason: `OpenCode reports provider "${parsed.providerId}" as connected, but selected model "${parsed.raw}" requires execution verification because account plan and organization policies can restrict individual models`,
+      }
+    }
     return {
       kind: 'credentialed',
       providerId: parsed.providerId,
@@ -441,7 +472,10 @@ export function hasOpenCodeConfiguredAuthlessModel(
   catalog: OpenCodeModelAccessCatalog,
 ): boolean {
   for (const model of catalog.models) {
-    const parsed = parseOpenCodeProviderScopedModelRef(model)
+    const rawParsed = parseOpenCodeProviderScopedModelRef(model)
+    const parsed = rawParsed
+      ? { ...rawParsed, providerId: canonicalizeOpenCodeProviderId(rawParsed.providerId) }
+      : null
     if (!parsed || normalizeProviderIdSet(catalog.connectedProviders).has(parsed.providerId)) {
       continue
     }

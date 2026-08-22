@@ -233,6 +233,8 @@ export type OpenCodeProvisioningSnapshot = {
   projectPath: string
   models?: string[]
   modelMetadata?: OpenCodeModelMetadata[]
+  /** Require selected models to be affirmatively verified by the live profile catalog. */
+  profileLiveModelVerification?: boolean
   profile: OpenCodePreparedProfile | null
   host: OpenCodeHostHandle | null
   config: OpenCodeConfigResponse | null
@@ -522,6 +524,11 @@ export type OpenCodeExecutionProbeOutcome =
   | 'not_authenticated'
   | 'unknown'
 
+export type OpenCodeExecutionProbeFailureCode =
+  | 'prompt_start_failed'
+  | 'execution_timeout'
+  | 'provider_endpoint_unreachable'
+
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'
   modelId: string
@@ -537,7 +544,7 @@ export type OpenCodeExecutionProbeResult = {
   toolCallCount: number
   errorCount: number
   diagnostics: string[]
-  failureCode?: 'prompt_start_failed' | 'execution_timeout'
+  failureCode?: OpenCodeExecutionProbeFailureCode
   verifiedAt?: string
 }
 

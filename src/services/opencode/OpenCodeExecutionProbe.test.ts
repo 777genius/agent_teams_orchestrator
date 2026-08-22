@@ -115,6 +115,33 @@ describe('OpenCodeExecutionProbe', () => {
     )
   })
 
+  test('classifies OpenCode provider connectivity failures with a stable endpoint code', () => {
+    const message = 'Cannot connect to API: Unable to connect. Is the computer able to access the url?'
+
+    expect(classifyProbeFailure({
+      message,
+      includeProviderNetworkFailure: true,
+    })).toEqual({
+      outcome: 'unavailable',
+      reason: message,
+      failureCode: 'provider_endpoint_unreachable',
+    })
+    for (const transportError of [
+      'connect ECONNREFUSED 127.0.0.1:11434',
+      'getaddrinfo ENOTFOUND ollama.internal.test',
+      'request ETIMEDOUT 127.0.0.1:11434',
+    ]) {
+      expect(classifyProbeFailure({
+        message: transportError,
+        includeProviderNetworkFailure: true,
+      }).failureCode)
+        .toBe('provider_endpoint_unreachable')
+    }
+    expect(classifyProbeFailure({
+      message: 'connect ECONNREFUSED 127.0.0.1:4096',
+    }).outcome).toBe('unknown')
+  })
+
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
     let promptAsyncCount = 0
     let sendMessageCount = 0
@@ -1200,6 +1227,133 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.diagnostics.join('\n')).toContain('retry status exposed')
     expect(nativeProbeCalls).toBe(1)
     expect(messageCalls).toBe(0)
+  })
+
+  test('fails fast when OpenCode retry status cannot reach a local provider endpoint', async () => {
+    let messageCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-ollama-unreachable' }),
+          getSession: async () => ({ id: 'session-ollama-unreachable' }),
+          getSessionStatus: async () => ({
+            'session-ollama-unreachable': {
+              type: 'retry',
+              attempt: 1,
+              message: 'Cannot connect to API: Unable to connect. Is the computer able to access the url?',
+            },
+          }),
+          getSessionMessages: async () => {
+            messageCalls += 1
+            return []
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'ollama/llama3.2:latest',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      providerBaseUrl: 'http://127.0.0.1:11434/v1',
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unavailable',
+      failureCode: 'provider_endpoint_unreachable',
+      reason: 'Cannot connect to API: Unable to connect. Is the computer able to access the url?',
+    })
+    expect(result.diagnostics).toContain(
+      'OpenCode reported that the configured provider endpoint is unreachable',
+    )
+    expect(result.diagnostics.join('\n')).not.toContain('Model verification timed out')
+    expect(messageCalls).toBe(0)
+  })
+
+  test('keeps a remote provider connectivity retry alive until the session recovers', async () => {
+    let statusCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-remote-retry' }),
+          getSession: async () => ({ id: 'session-remote-retry' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return {
+              'session-remote-retry': statusCalls === 1
+                ? {
+                    type: 'retry',
+                    attempt: 1,
+                    message: 'Cannot connect to API: temporary upstream failure',
+                  }
+                : 'idle',
+            }
+          },
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-remote',
+                role: 'user',
+                sessionID: 'session-remote-retry',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-remote',
+                role: 'assistant',
+                parentID: 'msg-user-remote',
+                sessionID: 'session-remote-retry',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'openrouter/test-model',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      providerBaseUrl: 'https://openrouter.ai/api/v1',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.failureCode).toBeUndefined()
+    expect(statusCalls).toBeGreaterThanOrEqual(2)
   })
 
   test('rechecks retry status while the session messages request is pending', async () => {

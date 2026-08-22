@@ -66,6 +66,7 @@ import {
   getCodexRuntimeModelCatalog,
   getVisibleCodexRuntimeModels,
 } from './codexModelCatalog.js'
+import { getOpenCodeRuntimeStatusCheck } from './opencodeStatusCheck.js'
 import type {
   RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
@@ -627,6 +628,7 @@ async function buildOpenCodeStatus(
       onTimeout: () => abortController.abort(),
     },
   )
+  const statusCheck = getOpenCodeRuntimeStatusCheck(snapshot)
   const runtimeModels = snapshot.models
   const agentModels = filterOpenCodeAgentModels(runtimeModels, snapshot.modelMetadata)
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
@@ -637,15 +639,10 @@ async function buildOpenCodeStatus(
   const hasConfiguredAuthlessModel = hasOpenCodeConfiguredAuthlessModel(
     buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot),
   )
-  const accessCatalog =
-    buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
-  const authenticated =
-    hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
+  const accessCatalog = buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
+  const authenticated = hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
   const fetchedAt = new Date()
-  const defaultModel =
-    agentModels.find((model) => model === 'opencode/big-pickle') ??
-    agentModels[0] ??
-    null
+  const defaultModel = agentModels.find((model) => model === 'opencode/big-pickle') ?? agentModels[0] ?? null
   const metadataByModelId = new Map(
     snapshot.modelMetadata?.map((metadata) => [metadata.id, metadata]) ?? [],
   )
@@ -719,6 +716,7 @@ async function buildOpenCodeStatus(
         : hasConfiguredAuthlessModel
           ? 'opencode_configured_local'
           : null,
+    ...statusCheck,
     verificationState: !snapshot.detected
       ? 'offline'
       : snapshot.probeError && snapshot.models.length === 0 && !authenticated

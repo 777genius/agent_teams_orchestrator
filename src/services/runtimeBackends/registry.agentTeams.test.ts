@@ -688,6 +688,8 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         expect(opencode?.supported).toBe(true)
         expect(opencode?.authenticated).toBe(false)
         expect(opencode?.verificationState).toBe('error')
+        expect(opencode?.statusCheckOutcome).toBe('transient_error')
+        expect(opencode?.statusCheckErrorCode).toBe('timeout')
         expect(opencode?.statusMessage).toBe('OpenCode probe incomplete')
         expect(opencode?.detailMessage).toContain('OpenCode inventory probe timed out after 1ms')
         expect(opencode?.models).toEqual([])
@@ -702,6 +704,74 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     },
     30_000,
   )
+
+  test('opencode runtime status marks a confirmed missing CLI as authoritative', async () => {
+    const registryModulePath = new URL('./registry.js', import.meta.url).href
+    const { getUnifiedRuntimeStatusPayload } = await import(
+      `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+
+    const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+      getOpenCodeInventorySnapshot: async () => ({
+        detected: false,
+        binaryPath: null,
+        version: null,
+        projectPath: '/tmp/project',
+        profile: null,
+        connectedProviders: [],
+        availableProviders: [],
+        models: [],
+        modelMetadata: [],
+        agents: [],
+        authStorePath: null,
+        probeError: null,
+        diagnostics: ['OpenCode CLI not detected on PATH'],
+      }),
+    }, { detailLevel: 'summary' })
+    const opencode = payload.providers.opencode
+
+    expect(opencode).toMatchObject({
+      providerId: 'opencode',
+      supported: false,
+      verificationState: 'offline',
+      statusCheckOutcome: 'authoritative',
+      statusCheckErrorCode: 'runtime_missing',
+    })
+  })
+
+  test('opencode runtime status keeps a failed probe transient even when detection is false', async () => {
+    const registryModulePath = new URL('./registry.js', import.meta.url).href
+    const { getUnifiedRuntimeStatusPayload } = await import(
+      `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+
+    const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+      getOpenCodeInventorySnapshot: async () => ({
+        detected: false,
+        binaryPath: null,
+        version: null,
+        projectPath: '/tmp/project',
+        profile: null,
+        connectedProviders: [],
+        availableProviders: [],
+        models: [],
+        modelMetadata: [],
+        agents: [],
+        authStorePath: null,
+        probeError: 'OpenCode profile preparation failed: EACCES',
+        diagnostics: ['OpenCode profile preparation failed: EACCES'],
+      }),
+    }, { detailLevel: 'summary' })
+    const opencode = payload.providers.opencode
+
+    expect(opencode).toMatchObject({
+      providerId: 'opencode',
+      supported: false,
+      verificationState: 'offline',
+      statusCheckOutcome: 'transient_error',
+      statusCheckErrorCode: 'unavailable',
+    })
+  })
 
   test(
     'summary runtime status omits full catalogs without losing live provider state',
@@ -988,6 +1058,8 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.providerId).toBe('opencode')
       expect(opencode?.supported).toBe(true)
       expect(opencode?.authenticated).toBe(true)
+      expect(opencode?.statusCheckOutcome).toBe('authoritative')
+      expect(opencode?.statusCheckErrorCode).toBeUndefined()
       expect(opencode?.models).toEqual([
         'opencode/big-pickle',
         'openai/gpt-5.4',

@@ -23,6 +23,7 @@ import {
 import {
   hasOpenCodeBuiltinFreeModel,
   openCodeInventoryService,
+  type OpenCodeInventoryProbeMode,
 } from './OpenCodeInventoryService.js'
 import {
   buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
@@ -36,6 +37,7 @@ import {
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -1793,11 +1795,10 @@ function readinessData(
         ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
         : 'Agent Teams MCP tools are not visible in OpenCode',
     )
-  } else if (
-    selectedModelAccess.kind === 'configured_authless'
-    && selectedModelAccess.requiresExecutionProof
-  ) {
-    state = 'not_authenticated'
+  } else if (selectedModelAccess.requiresExecutionProof) {
+    state = selectedModelAccess.kind === 'configured_authless'
+      ? 'not_authenticated'
+      : 'model_unavailable'
     launchAllowed = false
     missing.push(selectedModelAccess.reason ?? 'OpenCode selected model requires execution verification')
   } else if (selectedModelAccess.kind === 'unknown_model') {
@@ -1848,6 +1849,15 @@ function getOpenCodeAccessPolicyModels(snapshot: OpenCodeProvisioningSnapshot): 
       ?? []),
     ...(snapshot.models ?? []),
   ])).sort()
+}
+
+function getLaunchCriticalInventoryMode(
+  selectedModel: string | null | undefined,
+): OpenCodeInventoryProbeMode {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  return parsed && canonicalizeOpenCodeProviderId(parsed.providerId) !== 'opencode'
+    ? 'profile'
+    : 'full'
 }
 
 function getOpenCodeAccessPolicyCatalog(snapshot: OpenCodeProvisioningSnapshot) {
@@ -2141,7 +2151,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
     return
   }
 
-  if (access.kind !== 'configured_authless' || !access.requiresExecutionProof) {
+  if (!access.requiresExecutionProof) {
     throw new Error(access.reason ?? 'OpenCode selected model provider is not connected')
   }
 
@@ -2215,7 +2225,7 @@ function assertOpenCodeSelectedModelReconcilable(
   })
   if (
     access.launchAllowed
-    || (access.kind === 'configured_authless' && access.requiresExecutionProof)
+    || access.requiresExecutionProof
   ) {
     return
   }
@@ -2324,6 +2334,7 @@ async function runReadiness(
   const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
   const selectedModel = asString(envelope.body.selectedModel)
+  const inventoryMode = getLaunchCriticalInventoryMode(selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
   const runProvisioningPhase = async (
@@ -2438,6 +2449,7 @@ async function runReadiness(
     disposeHostOnRelease: disposeReadinessHostOnRelease,
     ensureAppMcp: !shouldProbeSelectedModel,
     bypassCache: shouldProbeSelectedModel,
+    inventoryMode,
   })
   let snapshot = modelSnapshot
   let executionModel: string | null = null
@@ -2500,7 +2512,7 @@ async function runReadiness(
       !selectedModelAccess.launchAllowed &&
       (
         selectedModelAccess.kind === 'not_authenticated' ||
-        selectedModelAccess.kind === 'configured_authless'
+        selectedModelAccess.requiresExecutionProof
       )
     ) {
       return {
@@ -2523,8 +2535,7 @@ async function runReadiness(
       catalog: getOpenCodeAccessPolicyCatalog(snapshot),
     })
     if (
-      selectedModelAccess.kind === 'configured_authless'
-      && selectedModelAccess.requiresExecutionProof
+      selectedModelAccess.requiresExecutionProof
       && modelSnapshot.host
     ) {
       if (!directToolProof.ok) {
@@ -2593,6 +2604,7 @@ async function runReadiness(
       disposeHostOnRelease: disposeReadinessHostOnRelease,
       ensureAppMcp: true,
       bypassCache: true,
+      inventoryMode,
     })
   }
   directToolProof ??= await runDirectToolProof()
@@ -2781,7 +2793,11 @@ async function runLaunch(
     retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
       pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
         asString(body.projectPath) ?? envelope.cwd,
-        { toolApprovalMode, phaseContext: context },
+        {
+          toolApprovalMode,
+          phaseContext: context,
+          inventoryMode: getLaunchCriticalInventoryMode(selectedModel),
+        },
       )
       return pendingProbe
     })
@@ -4375,6 +4391,7 @@ async function handleEnvelope(
         ? null
         : await openCodeProvisioningProbe.probe(envelope.cwd, {
           disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
+          inventoryMode: getLaunchCriticalInventoryMode(asString(envelope.body.selectedModel)),
         })
       const identity = createBridgeServerIdentity(snapshot, {
         runtimeStoreManifestHighWatermark: lightweightLaunchHandshake

@@ -3,9 +3,19 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
-import { openCodeInventoryService } from './OpenCodeInventoryService.js'
+import {
+  openCodeInventoryService,
+  type OpenCodeInventoryProbeMode,
+} from './OpenCodeInventoryService.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  mergeOpenCodeModelMetadata,
+  normalizeOpenCodeLiveConfigProvidersResponse,
+  normalizeOpenCodeLiveModelMetadata,
+  normalizeOpenCodeLiveProviderAuth,
+  normalizeOpenCodeLiveProviderResponse,
+} from './OpenCodeLiveProviderNormalizer.js'
 import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
@@ -42,6 +52,7 @@ type OpenCodeProvisioningProbeOptions = {
   bypassCache?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
   phaseContext?: OpenCodePhaseContext
+  inventoryMode?: OpenCodeInventoryProbeMode
 }
 
 type RetainedProvisioningProbe = {
@@ -88,19 +99,24 @@ export class OpenCodeProvisioningProbe {
       ensureAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
       phaseContext: options.phaseContext,
+      inventoryMode: options.inventoryMode,
     })
     return result.snapshot
   }
 
   async probeRetainingHost(
     projectPath?: string | null,
-    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> = {},
+    options: Pick<
+      OpenCodeProvisioningProbeOptions,
+      'toolApprovalMode' | 'phaseContext' | 'inventoryMode'
+    > = {},
   ): Promise<RetainedProvisioningProbe> {
     return this.probeWithHost(projectPath, {
       retainHost: true,
       useCache: false,
       toolApprovalMode: options.toolApprovalMode,
       phaseContext: options.phaseContext,
+      inventoryMode: options.inventoryMode,
     })
   }
 
@@ -113,6 +129,7 @@ export class OpenCodeProvisioningProbe {
       ensureAppMcp?: boolean
       toolApprovalMode?: OpenCodeToolApprovalMode
       phaseContext?: OpenCodePhaseContext
+      inventoryMode?: OpenCodeInventoryProbeMode
     },
   ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
@@ -121,6 +138,7 @@ export class OpenCodeProvisioningProbe {
       includeAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
       abortSignal: options.phaseContext?.signal,
+      mode: options.inventoryMode ?? 'full',
     })
     const cacheKey = [
       inventory.projectPath,
@@ -129,6 +147,7 @@ export class OpenCodeProvisioningProbe {
       inventory.profile?.managedConfigFingerprint ?? 'none',
       options.ensureAppMcp === false ? 'without-app-mcp' : 'with-app-mcp',
       options.toolApprovalMode ?? 'auto',
+      options.inventoryMode ?? 'full',
     ].join('::')
     const cached = options.useCache ? this.cache.get(cacheKey) : undefined
     if (cached && cached.expiresAt > Date.now()) {
@@ -195,6 +214,9 @@ export class OpenCodeProvisioningProbe {
         hostLifetime: options.retainHost || options.disposeHostOnRelease === false
           ? 'persistent'
           : 'process',
+        managedPluginStartupPolicy: options.inventoryMode === 'profile'
+          ? 'serve-startup'
+          : 'catalog-prewarm',
       })
       host = await ensurePromise
       if (options.phaseContext?.signal.aborted) {
@@ -249,13 +271,16 @@ export class OpenCodeProvisioningProbe {
     const client = clientFactory.create(host.baseUrl, requestContext)
 
     try {
-      const [config, configProviders, providers, providerAuth, agents] = await Promise.all([
+      const [config, rawConfigProviders, rawProviders, rawProviderAuth, agents] = await Promise.all([
         client.getConfig(),
         client.getConfigProviders(),
         client.getProviders(),
         client.getProviderAuth(),
         client.listAgents(),
       ])
+      const configProviders = normalizeOpenCodeLiveConfigProvidersResponse(rawConfigProviders)
+      const providers = normalizeOpenCodeLiveProviderResponse(rawProviders)
+      const providerAuth = normalizeOpenCodeLiveProviderAuth(rawProviderAuth)
       const appMcp = options.ensureAppMcp === false
         ? null
         : await mcpManager.ensureAppMcp({
@@ -323,12 +348,19 @@ export class OpenCodeProvisioningProbe {
         diagnostics.push(...appMcp.summary.diagnostics)
       }
 
+      const modelMetadata = options.inventoryMode === 'profile'
+        ? mergeOpenCodeModelMetadata(
+            inventory.modelMetadata ?? [],
+            normalizeOpenCodeLiveModelMetadata(providers),
+          )
+        : [...(inventory.modelMetadata ?? [])]
       const snapshot: OpenCodeProvisioningSnapshot = {
         detected: true,
         hostHealthy: host.state === 'healthy',
         projectPath: inventory.projectPath,
         models: [...inventory.models],
-        modelMetadata: [...(inventory.modelMetadata ?? [])],
+        modelMetadata,
+        profileLiveModelVerification: options.inventoryMode === 'profile',
         profile: inventory.profile,
         host: cloneHost(host),
         config,

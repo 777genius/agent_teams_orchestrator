@@ -47,6 +47,34 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(false)
   })
 
+  test('requires per-model execution proof for connected GitHub Copilot routes', () => {
+    const connectedCatalog = catalog({
+      connectedProviders: ['github-copilot'],
+      models: ['github-copilot/gpt-5-mini'],
+    })
+    const unverified = evaluateOpenCodeModelAccess({
+      selectedModel: 'github-copilot/gpt-5-mini',
+      catalog: connectedCatalog,
+    })
+    const verified = evaluateOpenCodeModelAccess({
+      selectedModel: 'github-copilot/gpt-5-mini',
+      catalog: connectedCatalog,
+      executionOutcome: { outcome: 'available', reason: null },
+    })
+
+    expect(unverified).toMatchObject({
+      kind: 'credentialed',
+      launchAllowed: false,
+      requiresExecutionProof: true,
+    })
+    expect(unverified.reason).toContain('plan and organization policies')
+    expect(verified).toMatchObject({
+      kind: 'verified',
+      launchAllowed: true,
+      requiresExecutionProof: false,
+    })
+  })
+
   test('allows built-in free OpenCode models without connected providers', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'opencode/big-pickle',

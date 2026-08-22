@@ -82,6 +82,25 @@ function readNumberOption(args: string[], name: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
+async function runHostedControlFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'hosted-control' || hasHelpOption(args)) return false
+  if (!feature('HOSTED_CONTROL')) {
+    throw new Error('Hosted control is not included in this build')
+  }
+  const configPath = readOption(args.slice(1), '--config')
+  if (!configPath) throw new Error('Missing required option --config <absolute-path>')
+  const hosted = await import('../utils/udsMessaging.js')
+  process.env[hosted.HOSTED_CONTROL_CONFIG_ENV] = configPath
+  await hosted.startProductionHostedControlFromEnvironment()
+  await new Promise<void>(resolve => {
+    const stop = () => resolve()
+    process.once('SIGINT', stop)
+    process.once('SIGTERM', stop)
+  })
+  await hosted.stopHostedControl()
+  return true
+}
+
 function parseOpenCodeCommandOptions(args: string[]): {
   input: string
   json?: boolean
@@ -116,6 +135,7 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   const provider = readOption(providerArgs, '--provider') ?? ''
   const model = readOption(providerArgs, '--model') ?? ''
   const {
+    runtimeProvidersClearProjectDefault,
     runtimeProvidersConnect,
     runtimeProvidersConnectApiKey,
     runtimeProvidersDirectory,
@@ -198,6 +218,12 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
         compact: hasOption(providerArgs, '--compact'),
       })
       return true
+    case 'clear-project-default':
+      await runtimeProvidersClearProjectDefault({
+        ...common,
+        compact: hasOption(providerArgs, '--compact'),
+      })
+      return true
     default:
       return false
   }
@@ -217,6 +243,11 @@ async function main(): Promise<void> {
   // For all other paths, load the startup profiler
   const { profileCheckpoint } = await import('../utils/startupProfiler.js')
   profileCheckpoint('cli_entry')
+
+  if (await runHostedControlFastPath(args)) {
+    profileCheckpoint('cli_hosted_control_path')
+    return
+  }
 
   if (
     args[0] === 'runtime' &&
