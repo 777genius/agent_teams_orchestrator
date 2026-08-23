@@ -48,11 +48,15 @@ describe('OpenCode Windows retained caller layer', () => {
     ])
     expect(safe).toContain('OpenCodeWindowsRetainedNamespacePort')
     expect(safe).toContain('namespaceList(this.#windowsKey)')
+    expect(safe).toContain("namespaceModifiedAt(this.#relative(name), 'file')")
+    expect(safe).toContain('.namespaceRecoverAtomic(this.#relative(finalName), recoveryPrefix)')
     expect(safe).toContain('namespacePublishImmutable(this.#relative(finalName)')
     expect(safe).toContain('namespaceRemoveTree(this.#relative(retiredName))')
     expect(safe).toContain('namespaceAcquireLock(this.#relative(name)')
     expect(manager).toContain("process.platform === 'win32'\n      ? earlyLockDirectory.acquireRetainedLock")
     expect(manager).toContain("process.platform === 'win32'\n        ? scopedLockDirectory.acquireRetainedLock")
+    expect(manager).toContain('acquireOpenCodeProfilePathLock(lockPath)')
+    expect(manager).toContain('acquireOpenCodeProfilePathLock(migrationLockPath)')
   })
 
   test('active caller dispatches namespace work through one retained authority port', async () => {
@@ -60,6 +64,10 @@ describe('OpenCode Windows retained caller layer', () => {
     const authority = {
       validateRoot: async () => { operations.push('validate') },
       namespaceList: async (key: string) => { operations.push(`list:${key}`); return ['owned'] },
+      namespaceModifiedAt: async (key: string, kind: string) => {
+        operations.push(`modified:${key}:${kind}`); return 123
+      },
+      namespaceRecoverAtomic: async () => 'none' as const,
       namespacePublishImmutable: async (key: string, bytes: Uint8Array) => {
         operations.push(`immutable:${key}:${new TextDecoder().decode(bytes)}`)
       },
@@ -76,6 +84,7 @@ describe('OpenCode Windows retained caller layer', () => {
       null, 'C:\\path-that-must-not-be-opened', { dev: 1n, ino: 2n }, authority as never,
     )
     expect(await directory.childNames()).toEqual(['owned'])
+    expect(await directory.regularFileModifiedAt('owned')).toBe(123)
     await directory.publishImmutableFile('bridge.exe', 'complete', 0o500)
     await directory.retireChildDirectory('old', '.retired')
     const release = await directory.acquireRetainedLock('profile.lock', {
@@ -84,7 +93,7 @@ describe('OpenCode Windows retained caller layer', () => {
     await release()
     await directory.close()
     expect(operations).toEqual([
-      'list:.', 'validate', 'immutable:bridge.exe:complete', 'sync:.',
+      'list:.', 'validate', 'modified:owned:file', 'validate', 'immutable:bridge.exe:complete', 'sync:.',
       'rename:old:.retired', 'remove-tree:.retired', 'sync:.',
       'lock:profile.lock', 'unlock:profile.lock', 'close',
     ])

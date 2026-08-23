@@ -30,6 +30,9 @@ export type OpenCodeSafePublicationOpenOptions = Readonly<{
  */
 export type OpenCodeWindowsRetainedNamespacePort = Readonly<{
   namespaceList(path: string): Promise<readonly string[]>
+  namespaceModifiedAt(path: string, kind: 'file' | 'directory'): Promise<number>
+  /** Settles prior recovery records below path's retained parent before a successor publication. */
+  namespaceRecoverAtomic(path: string, recoveryPrefix: string): Promise<'none' | 'recovered'>
   namespacePublishImmutable(path: string, content: Uint8Array): Promise<void>
   namespaceRemoveTree(path: string): Promise<void>
   namespaceAcquireLock(
@@ -152,6 +155,8 @@ export class OpenCodeSafePublicationDirectory {
     if (!candidate || typeof candidate.namespaceList !== 'function'
       || typeof candidate.namespacePublishImmutable !== 'function'
       || typeof candidate.namespaceRemoveTree !== 'function'
+      || typeof candidate.namespaceModifiedAt !== 'function'
+      || typeof candidate.namespaceRecoverAtomic !== 'function'
       || typeof candidate.namespaceAcquireLock !== 'function') fail()
     return candidate as OpenCodeWindowsRetainedNamespacePort
   }
@@ -331,6 +336,7 @@ export class OpenCodeSafePublicationDirectory {
 
   async regularFileModifiedAt(name: string): Promise<number> {
     await this.#assertWindowsRoot()
+    if (this.#windowsAuthority) return this.#namespacePort().namespaceModifiedAt(this.#relative(name), 'file')
     const metadata = await lstat(this.child(name))
     if (!metadata.isFile() || metadata.isSymbolicLink()) fail()
     return metadata.mtimeMs
@@ -338,6 +344,7 @@ export class OpenCodeSafePublicationDirectory {
 
   async childDirectoryModifiedAt(name: string): Promise<number> {
     await this.#assertWindowsRoot()
+    if (this.#windowsAuthority) return this.#namespacePort().namespaceModifiedAt(this.#relative(name), 'directory')
     const metadata = await lstat(this.child(name))
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) fail()
     return metadata.mtimeMs
@@ -531,11 +538,10 @@ export class OpenCodeSafePublicationDirectory {
       const bytes = typeof content === 'string' ? Buffer.from(content) : new Uint8Array(content)
       try {
         const recoveryPrefix = `.${finalName}.recovery-required.`.toLowerCase()
-        const existingNames = await this.#namespacePort().namespaceList(this.#windowsKey).catch(fail)
+        const recovery = await this.#namespacePort()
+          .namespaceRecoverAtomic(this.#relative(finalName), recoveryPrefix).catch(fail)
+        if (recovery !== 'none' && recovery !== 'recovered') fail()
         await this.#assertWindowsRoot()
-        if (existingNames.some(existing => existing.toLowerCase().startsWith(recoveryPrefix))) {
-          throw new Error('OpenCode safe publication recovery is required [redacted]')
-        }
         await this.#windowsAuthority.prepareAtomic(
           finalName, temporaryName, backupName, quarantineName, recoveryName, bytes,
           testHooks?.expectedPriorSha256,

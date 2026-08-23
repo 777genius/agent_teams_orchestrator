@@ -349,13 +349,32 @@ const OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS = {
   },
 }
 
+async function acquireOpenCodeProfilePathLock(lockPath: string): Promise<() => Promise<void>> {
+  if (process.platform !== 'win32') {
+    await writeFile(lockPath, '', { flag: 'a' })
+    return lockfile.lock(lockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  }
+  const directory = await OpenCodeSafePublicationDirectory.open(path.dirname(lockPath))
+  try {
+    const release = await directory.acquireRetainedLock(
+      path.basename(lockPath), OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+    )
+    return async () => {
+      try { await release() }
+      finally { await directory.close() }
+    }
+  } catch (error) {
+    await directory.close().catch(() => undefined)
+    throw error
+  }
+}
+
 async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
   const lockPath = `${linkPath}.prepare-lock`
-  await writeFile(lockPath, '', { flag: 'a' })
-  const release = await lockfile.lock(lockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  const release = await acquireOpenCodeProfilePathLock(lockPath)
 
   try {
     await ensureDirectorySymlinkUnlocked(linkPath, targetPath)
@@ -426,8 +445,7 @@ async function preserveRealDirectoryContents(
   }
 
   const migrationLockPath = `${targetPath}.migration-lock`
-  await writeFile(migrationLockPath, '', { flag: 'a' })
-  const release = await lockfile.lock(migrationLockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  const release = await acquireOpenCodeProfilePathLock(migrationLockPath)
   try {
     await copyDirectoryContentsPreservingExisting(sourcePath, targetPath)
   } finally {
