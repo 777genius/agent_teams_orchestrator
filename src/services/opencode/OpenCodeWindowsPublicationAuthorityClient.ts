@@ -21,6 +21,8 @@ export type OpenCodeWindowsPublicationAuthorityOptions = Readonly<{
 const unavailable = () => new Error('OpenCode Windows publication authority is unavailable [redacted]')
 
 export class OpenCodeWindowsPublicationAuthorityClient {
+  /** Settles only after the native process has exited and the OS has released every retained handle. */
+  readonly physicalSettlement: Promise<void>
   readonly #child: OpenCodeNativeAuthorityChild
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
   readonly #deadline: number
@@ -30,6 +32,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #cancel!: () => void
   #pending = ''; #pendingBytes = 0; #closed = false; #retained = false
   #queue: Promise<void> = Promise.resolve()
+  #closePromise: Promise<void> | undefined
   #ownerDeadline: ReturnType<typeof setTimeout> | undefined
   #abort = () => { this.kill() }
 
@@ -39,6 +42,9 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     const artifacts = resolveOpenCodeNativeAuthorityArtifacts(options)
     if (!options.launch) verifyOpenCodeNativeAuthorityArtifacts(artifacts)
     this.#child = (options.launch ?? launchOpenCodeNativeAuthority)({ ...artifacts, argument: '--windows-publication-authority-v1' })
+    // Attach both branches immediately: a hostile/test child must not create an
+    // unhandled rejection, and process exit is the definitive OS handle-release boundary.
+    this.physicalSettlement = this.#child.exited.then(() => undefined, () => undefined)
     this.#child.unref(); this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline; this.#signal = options.signal
     options.signal?.addEventListener('abort', this.#abort, { once: true })
   }
@@ -271,7 +277,14 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (signal?.aborted) abort()
     return release
   }
-  async close(): Promise<void> { if (this.#closed) return; try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {} finally { this.kill() } }
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise
+    this.#closePromise = (async () => {
+      try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {}
+      finally { this.kill() }
+    })()
+    return this.#closePromise
+  }
   kill(): void { if (this.#closed) return; this.#closed = true; this.#cancel(); if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
 
   #armOwnerReaper(): void {

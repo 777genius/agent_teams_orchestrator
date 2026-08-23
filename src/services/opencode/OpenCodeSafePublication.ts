@@ -73,6 +73,7 @@ export class OpenCodeSafePublicationDirectory {
   readonly #windowsPassiveAuthority: OpenCodeWindowsPassiveReadAuthority | null
   readonly #windowsKey: string
   readonly #ownsWindowsAuthority: boolean
+  #closePromise: Promise<void> | undefined
 
   constructor(
     handle: FileHandle | null,
@@ -835,10 +836,20 @@ export class OpenCodeSafePublicationDirectory {
     return this.#namespacePort().namespaceAcquireLock(this.#relative(name), options, signal)
   }
 
-  async close(): Promise<void> {
-    this.#windowsPassiveAuthority?.close()
-    if (this.#windowsAuthority && this.#ownsWindowsAuthority) await this.#windowsAuthority.close()
-    else await this.#handle?.close()
+  /** Physical release boundary for every handle owned by this directory. Read after close() starts. */
+  get physicalSettlement(): Promise<void> {
+    if (this.#windowsAuthority && this.#ownsWindowsAuthority) return this.#windowsAuthority.physicalSettlement
+    return this.#closePromise ?? Promise.resolve()
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise
+    this.#closePromise = (async () => {
+      this.#windowsPassiveAuthority?.close()
+      if (this.#windowsAuthority && this.#ownsWindowsAuthority) await this.#windowsAuthority.close()
+      else await this.#handle?.close()
+    })()
+    return this.#closePromise
   }
 }
 

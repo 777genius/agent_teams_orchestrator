@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { OpenCodeWindowsPublicationAuthorityClient } from './OpenCodeWindowsPublicationAuthorityClient.js'
 
-function fake(rejectLockAttempts = 0) {
+function fake(rejectLockAttempts = 0, exitOnKill = true) {
   let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0; let closes = 0; const operations: string[] = []; const requests: Record<string, unknown>[] = []
+  let resolveExit!: (code: number) => void; let exited = false
+  const exit = (code = 0) => { if (exited) return; exited = true; try { controller.close() } catch {}; resolveExit(code) }
   const encoder = new TextEncoder(); const stdout = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
-  const child = { pid: 123, stdout, exited: new Promise<number>(() => {}), unref() {},
-    kill() { kills += 1; try { controller.close() } catch {} },
+  const child = { pid: 123, stdout, exited: new Promise<number>(resolve => { resolveExit = resolve }), unref() {},
+    kill() { kills += 1; if (exitOnKill) exit(-1) },
     stdin: { end() { closes += 1 }, write(line: string) {
       const request = JSON.parse(line); requests.push(request); operations.push(request.op); const value = request.op === 'OPEN_ROOT'
         ? { volumeSerial: '1', fileId: '2', createdPaths: [] }
@@ -42,7 +44,7 @@ function fake(rejectLockAttempts = 0) {
         ? { version: 1, id: request.id, ok: false, error: 'NS_EXISTS' }
         : { version: 1, id: request.id, ok: true, value })}\n`)); return line.length
     } } }
-  return { child, kills: () => kills, closes: () => closes, operations, requests }
+  return { child, kills: () => kills, closes: () => closes, operations, requests, exit }
 }
 
 describe('OpenCodeWindowsPublicationAuthorityClient', () => {
@@ -55,6 +57,35 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     await expect(client.pinRegular('passive-status.sqlite3')).rejects.toThrow('unavailable [redacted]')
     await client.close(); await client.close(); expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
     expect(process.operations).toEqual(['OPEN_ROOT'])
+  })
+  test('does not report physical settlement when kill precedes controlled child exit', async () => {
+    const process = fake(0, false)
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+      launch: () => process.child })
+    let settled = false
+    void client.physicalSettlement.then(() => { settled = true })
+    client.kill(); await new Promise(resolve => setTimeout(resolve, 0))
+    expect(process.kills()).toBe(1); expect(settled).toBeFalse()
+    process.exit(-1); await client.physicalSettlement
+    expect(settled).toBeTrue()
+  })
+  test('close is idempotent while controlled child exit and physical release are delayed', async () => {
+    const process = fake(0, false)
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+      launch: () => process.child })
+    await client.openRoot('C:\\safe', false, false)
+    const first = client.close(); const second = client.close()
+    expect(first).toBe(second)
+    await first
+    expect(process.operations).toEqual(['OPEN_ROOT', 'CLOSE'])
+    expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
+    let physicallySettled = false
+    void client.physicalSettlement.then(() => { physicallySettled = true })
+    await new Promise(resolve => setTimeout(resolve, 0)); expect(physicallySettled).toBeFalse()
+    process.exit(); await client.physicalSettlement
+    expect(physicallySettled).toBeTrue()
+    await client.close(); client.kill()
+    expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
   })
   test('fails before launch on an expired deadline', () => {
     expect(() => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() - 1,

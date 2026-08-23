@@ -15,6 +15,7 @@ import {
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeSessionRecord } from './types.js'
+import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 const identity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
 
@@ -135,6 +136,53 @@ test('proof cleanup refuses an expired immutable launch deadline before publicat
       deadlineAtMs: performance.now() - 1, signal: new AbortController().signal,
     })).rejects.toThrow('deadline expired')
     await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('proof cleanup bounds a previous physical lease wait without releasing successor serialization', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-physical-'))
+  try {
+    const controlled = controlledProofDirectories()
+    const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'), controlled.open)
+    const firstDeadline = performance.now() + 5_000
+    await ledger.read({ deadlineAtMs: firstDeadline, signal: new AbortController().signal })
+    expect(controlled.opens()).toBe(1)
+
+    const expired = performance.now() + 30
+    await expect(ledger.read({ deadlineAtMs: expired, signal: new AbortController().signal }))
+      .rejects.toThrow('deadline expired')
+    expect(controlled.opens()).toBe(1)
+
+    const successorDeadline = performance.now() + 5_000
+    const successor = ledger.read({ deadlineAtMs: successorDeadline, signal: new AbortController().signal })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(controlled.opens()).toBe(1)
+    controlled.settle(0)
+    await successor
+    expect(controlled.opens()).toBe(2)
+    expect(controlled.deadlines()).toEqual([firstDeadline, successorDeadline])
+    controlled.settle(1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('proof cleanup cancellation abandons only its queued caller and preserves the physical predecessor', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-cancel-'))
+  try {
+    const controlled = controlledProofDirectories()
+    const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'), controlled.open)
+    await ledger.read({ deadlineAtMs: performance.now() + 5_000, signal: new AbortController().signal })
+    const abort = new AbortController()
+    const cancelled = ledger.read({ deadlineAtMs: performance.now() + 5_000, signal: abort.signal })
+    abort.abort(new Error('caller cancelled'))
+    await expect(cancelled).rejects.toThrow('caller cancelled')
+    expect(controlled.opens()).toBe(1)
+
+    const successor = ledger.read({ deadlineAtMs: performance.now() + 5_000,
+      signal: new AbortController().signal })
+    await new Promise(resolve => setTimeout(resolve, 0)); expect(controlled.opens()).toBe(1)
+    controlled.settle(0); await successor
+    expect(controlled.opens()).toBe(2)
+    controlled.settle(1)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -278,6 +326,32 @@ test('committed projection recovery reports absent, mismatched and foreign remot
 })
 
 function notFound(): Error { return new Error('request failed (404 Not Found)') }
+function controlledProofDirectories() {
+  const settlements: Array<() => void> = []
+  const observedDeadlines: Array<number | undefined> = []
+  let openCount = 0
+  return {
+    opens: () => openCount,
+    deadlines: () => observedDeadlines,
+    settle(index: number) { settlements[index]?.() },
+    open: async (directoryPath: string, options: Readonly<{ abortSignal?: AbortSignal; deadline?: number }>) => {
+      openCount += 1; observedDeadlines.push(options.deadline)
+      const actual = await OpenCodeSafePublicationDirectory.open(directoryPath, options)
+      let settle!: () => void
+      const controlledSettlement = new Promise<void>(resolve => { settle = resolve })
+      settlements.push(settle)
+      return new Proxy(actual, {
+        get(target, property, receiver) {
+          if (property === 'physicalSettlement') {
+            return Promise.all([target.physicalSettlement, controlledSettlement]).then(() => undefined)
+          }
+          const value = Reflect.get(target, property, receiver)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    },
+  }
+}
 function storeContext() { return { deadlineAtMs: Date.now() + 10_000,
   signal: new AbortController().signal, monotonicNow: Date.now } }
 function linkageForTest(memberIdentity: OpenCodeOpaqueIdentity, record: OpenCodeSessionRecord): OpenCodeLaunchMemberLinkage {

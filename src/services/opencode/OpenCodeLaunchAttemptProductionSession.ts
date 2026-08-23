@@ -49,6 +49,14 @@ export type OpenCodeProofLedgerContext = Readonly<{
   signal: AbortSignal
 }>
 
+type OpenCodeProofLedgerDirectory = Pick<OpenCodeSafePublicationDirectory,
+  'readBoundedRegularFile' | 'writeFileAtomic' | 'close' | 'physicalSettlement'>
+
+type OpenCodeProofLedgerDirectoryOpen = (
+  directoryPath: string,
+  options: Readonly<{ abortSignal?: AbortSignal; deadline?: number }>,
+) => Promise<OpenCodeProofLedgerDirectory>
+
 /**
  * Durable proof-generation ledger.  Every create is preceded by an active
  * generation record.  A later nonce can be registered only after the prior
@@ -56,7 +64,11 @@ export type OpenCodeProofLedgerContext = Readonly<{
  */
 export class OpenCodeProofSessionCleanupLedger {
   #tail: Promise<void> = Promise.resolve()
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly openDirectory: OpenCodeProofLedgerDirectoryOpen = (directoryPath, options) =>
+      OpenCodeSafePublicationDirectory.open(directoryPath, options),
+  ) {}
 
   async read(context?: OpenCodeProofLedgerContext): Promise<OpenCodeProofSessionCleanupRecord | null> {
     return this.exclusive(context, async directory => {
@@ -138,7 +150,7 @@ export class OpenCodeProofSessionCleanupLedger {
     })
   }
 
-  private async readFile(directory: OpenCodeSafePublicationDirectory, signal?: AbortSignal): Promise<ProofLedgerFile | null> {
+  private async readFile(directory: OpenCodeProofLedgerDirectory, signal?: AbortSignal): Promise<ProofLedgerFile | null> {
     try {
       const text = await directory.readBoundedRegularFile(path.basename(this.filePath), 1_048_576, signal)
       if (text === null) return null
@@ -149,7 +161,7 @@ export class OpenCodeProofSessionCleanupLedger {
     }
   }
 
-  private async write(directory: OpenCodeSafePublicationDirectory, record: ProofLedgerFile, signal?: AbortSignal,
+  private async write(directory: OpenCodeProofLedgerDirectory, record: ProofLedgerFile, signal?: AbortSignal,
     expected?: ProofLedgerFile | null): Promise<void> {
     const currentText = await directory.readBoundedRegularFile(path.basename(this.filePath), 1_048_576, signal)
     const current = currentText === null ? null : normalizeProofLedger(JSON.parse(currentText))
@@ -164,19 +176,53 @@ export class OpenCodeProofSessionCleanupLedger {
   }
 
   private async exclusive<T>(context: OpenCodeProofLedgerContext | undefined,
-    operation: (directory: OpenCodeSafePublicationDirectory) => Promise<T>): Promise<T> {
+    operation: (directory: OpenCodeProofLedgerDirectory) => Promise<T>): Promise<T> {
     const previous = this.#tail
     let release!: () => void
-    this.#tail = new Promise<void>(resolve => { release = resolve })
-    await previous
-    if (context && (context.signal.aborted || performance.now() >= context.deadlineAtMs)) {
-      release(); throw context.signal.reason ?? new Error('OpenCode proof cleanup deadline expired')
-    }
-    const directory = await OpenCodeSafePublicationDirectory.open(path.dirname(this.filePath), {
-      abortSignal: context?.signal, deadline: context?.deadlineAtMs,
-    }).catch(error => { release(); throw error })
-    try { return await operation(directory) }
-    finally { await directory.close().finally(release) }
+    const released = new Promise<void>(resolve => { release = resolve })
+    // A waiter that times out still remains chained behind the physical owner;
+    // it can relinquish only its own place, never bypass the predecessor.
+    this.#tail = previous.then(() => released, () => released)
+    try { await awaitProofLedgerContext(previous, context) }
+    catch (error) { release(); throw error }
+    let directory: OpenCodeProofLedgerDirectory | undefined
+    const foreground = (async () => {
+      directory = await this.openDirectory(path.dirname(this.filePath), {
+        abortSignal: context?.signal, deadline: context?.deadlineAtMs,
+      })
+      try { return await operation(directory) }
+      finally { await directory.close() }
+    })()
+    const physicalSettlement = foreground.then(
+      async () => { await directory?.physicalSettlement },
+      async () => { await directory?.physicalSettlement },
+    )
+    // close() may be only the caller-visible protocol boundary on Windows.
+    // Keep the successor lease until child exit closes the retained OS handles.
+    void physicalSettlement.then(release, release)
+    return await awaitProofLedgerContext(foreground, context)
+  }
+}
+
+async function awaitProofLedgerContext<T>(operation: Promise<T>, context?: OpenCodeProofLedgerContext): Promise<T> {
+  if (!context) return operation
+  if (context.signal.aborted) throw context.signal.reason ?? new Error('OpenCode proof cleanup cancelled')
+  const remaining = context.deadlineAtMs - performance.now()
+  if (remaining <= 0) throw new Error('OpenCode proof cleanup deadline expired')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let abort!: () => void
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(context.signal.reason ?? new Error('OpenCode proof cleanup cancelled'))
+    context.signal.addEventListener('abort', abort, { once: true })
+  })
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('OpenCode proof cleanup deadline expired')), remaining)
+    timer.unref?.()
+  })
+  try { return await Promise.race([operation, cancelled, expired]) }
+  finally {
+    if (timer) clearTimeout(timer)
+    context.signal.removeEventListener('abort', abort)
   }
 }
 
