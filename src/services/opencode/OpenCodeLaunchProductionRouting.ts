@@ -28,7 +28,7 @@ export function decodeStrictOpenCodeProductionLaunch(
 ): OpenCodeLaunchAttemptRequest {
   const candidate = addOptionalProductionVersion(value)
   const decoded = decodeOpenCodeLaunchAttemptRequest(candidate)
-  if (!decoded.ok) {
+  if (decoded.ok === false) {
     throw new OpenCodeLaunchRoutingError(
       decoded.error.code === 'unsupported_version' ? 'unsupported' : 'not_authorized',
       decoded.error.field,

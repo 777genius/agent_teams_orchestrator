@@ -22,10 +22,27 @@ function completeness(states: Partial<Record<keyof NonNullable<OpenCodeInventory
 
 function managedProfile(...providerIds: string[]): NonNullable<OpenCodeInventorySnapshot['profile']> {
   return {
+    projectPath: '/project/secret-name',
+    profileRootKey: 'test-profile',
+    profileRootPath: '/redacted/profile',
+    projectBehaviorFingerprint: 'test-project-behavior',
+    behaviorSources: [],
     managedConfig: {
       provider: Object.fromEntries(providerIds.map(providerId => [providerId, {}])),
     },
-  } as NonNullable<OpenCodeInventorySnapshot['profile']>
+    managedConfigFingerprint: 'test-managed-config',
+    homePath: '/redacted/home',
+    tmpPath: '/redacted/tmp',
+    xdgConfigHome: '/redacted/config',
+    xdgDataHome: '/redacted/data',
+    xdgCacheHome: '/redacted/cache',
+    managedAuthPath: '/redacted/auth.json',
+    sourceAuthPath: null,
+    sourceAuthFingerprint: null,
+    managedAuthFingerprint: null,
+    authState: 'ok',
+    env: {},
+  }
 }
 
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
@@ -242,7 +259,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     expect(serialized).not.toBeNull()
     const decoded = decodeOpenCodeRedactedSnapshotV1(serialized!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.capturedAt).toBe(301_001)
     expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')?.executionVerified)
       .toEqual({
@@ -305,7 +322,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     }))
     let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')).toMatchObject({
       configured: { value: 'not_configured', observedAt: 2_000 },
       lastConnected: { value: { state: 'not_connected' }, observedAt: 2_000 },
@@ -323,7 +340,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     expect(harness.writes()).toBe(writesBeforeTransient)
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')?.lastConnected)
       .toMatchObject({ value: { state: 'connected', at: 3_000 }, observedAt: 3_000 })
   })
@@ -340,7 +357,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     }))
     let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     let deepinfra = decoded.value.providers.find(provider => provider.providerId === 'deepinfra')!
     expect(deepinfra.configured).toMatchObject({ value: 'not_configured', observedAt: 2_000 })
     expect(deepinfra.lastConnected).toMatchObject({ value: { state: 'connected', at: 1_000 }, observedAt: 1_000 })
@@ -355,7 +372,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     }))
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     deepinfra = decoded.value.providers.find(provider => provider.providerId === 'deepinfra')!
     expect(deepinfra.configured).toMatchObject({ value: 'not_configured', observedAt: 3_000 })
     expect(deepinfra.lastConnected).toMatchObject({ value: { state: 'connected' }, observedAt: 1_000 })
@@ -375,7 +392,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     }))
     let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0]).toMatchObject({
       lastConnected: { value: { state: 'connected' }, observedAt: 1_000 },
       catalogAvailable: { value: 'available', observedAt: 1_000 },
@@ -387,7 +404,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     }))
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0]).toMatchObject({
       configured: { value: 'not_configured', observedAt: 3_000 },
       lastConnected: { value: { state: 'not_connected' }, observedAt: 3_000 },
@@ -402,7 +419,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     await harness.publisher.publishInventory(inventory())
     let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0].catalogIdentity).toMatch(/^sha256:[0-9a-f]{64}$/)
 
     clock.now = 2_000
@@ -411,7 +428,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     })
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0].catalogIdentity).toBeUndefined()
     expect(decoded.value.providers[0].modelIds).toBeUndefined()
 
@@ -428,12 +445,17 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     })
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0].catalogIdentity).toMatch(/^sha256:[0-9a-f]{64}$/)
   })
 
-  test('invalidates retained IDs when redacted config or auth fingerprints change', async () => {
-    for (const field of ['managedConfigFingerprint', 'managedAuthFingerprint'] as const) {
+  test('invalidates retained IDs when prepared profile evidence fingerprints change', async () => {
+    for (const field of [
+      'managedConfigFingerprint',
+      'managedAuthFingerprint',
+      'providerEnvironmentFingerprint',
+      'binaryFingerprint',
+    ] as const) {
       const clock = { now: 1_000 }
       const harness = publisherHarness(clock)
       await harness.publisher.publishInventory(inventory())
@@ -446,7 +468,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
       }))
       const decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
       expect(decoded.ok).toBe(true)
-      if (!decoded.ok) throw new Error(decoded.issueCode)
+      if (decoded.ok === false) throw new Error(decoded.issueCode)
       expect(decoded.value.providers[0].catalogAvailable.value).toBe('available')
       expect(decoded.value.providers[0].catalogIdentity).toBeUndefined()
       const passive = await productionReader(clock, harness.stored).reader.read({
@@ -484,7 +506,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     ])
     const decoded = decodeOpenCodeRedactedSnapshotV1(stored!)
     expect(decoded.ok).toBe(true)
-    if (!decoded.ok) throw new Error(decoded.issueCode)
+    if (decoded.ok === false) throw new Error(decoded.issueCode)
     expect(decoded.value.providers.map(provider => provider.providerId)).toEqual(['deepinfra', 'ollama'])
   })
 })

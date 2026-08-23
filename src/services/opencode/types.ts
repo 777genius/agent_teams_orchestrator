@@ -145,6 +145,10 @@ export type OpenCodePreparedProfile = {
   behaviorSources: string[]
   managedConfig: Record<string, unknown>
   managedConfigFingerprint: string
+  /** Present when preparation captured the provider-facing environment. */
+  providerEnvironmentFingerprint?: string
+  /** Present when preparation resolved and fingerprinted the executable bytes. */
+  binaryFingerprint?: string
   homePath: string
   tmpPath: string
   xdgConfigHome: string

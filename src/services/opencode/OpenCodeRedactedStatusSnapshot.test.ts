@@ -51,7 +51,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     ;(dirty.providers[0] as unknown as Record<string, unknown>).plugin = { env: { API_KEY: 'secret' }, rawBody: 'prompt response' }
     const encoded = encodeOpenCodeRedactedSnapshotV1(dirty)
     expect(encoded.ok).toBe(true)
-    if (!encoded.ok) throw new Error('fixture did not encode')
+    if (encoded.ok === false) throw new Error('fixture did not encode')
     expect(Object.isFrozen(encoded.value)).toBe(true)
     expect(Object.isFrozen(encoded.value.providers[0].configured)).toBe(true)
     const text = new TextDecoder().decode(encoded.bytes)
@@ -119,7 +119,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     delete provider.catalogAuthFingerprint
     const encoded = encodeOpenCodeRedactedSnapshotV1(legacy)
     expect(encoded.ok).toBe(true)
-    if (!encoded.ok) throw new Error(encoded.issueCode)
+    if (encoded.ok === false) throw new Error(encoded.issueCode)
     expect(encoded.value.providers[0].catalogAvailable.value).toBe('available')
     expect(encoded.value.providers[0].catalogIdentity).toBeUndefined()
     expect(encoded.value.providers[0].modelIds).toBeUndefined()
@@ -193,7 +193,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     candidate.providers[0].modelIds = Array.from({ length: 257 }, (_, index) => `deepinfra/model-${index}`)
     const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
     expect(encoded.ok).toBe(true)
-    if (!encoded.ok) throw new Error(encoded.issueCode)
+    if (encoded.ok === false) throw new Error(encoded.issueCode)
     expect(encoded.value.providers[0]).toMatchObject({
       modelIdsTotal: 257,
       modelIdsTruncated: true,
@@ -207,7 +207,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     large.providers[0].modelIds = Array.from({ length: 5_000 }, (_, index) => `deepinfra/large-${index}`)
     const largeEncoded = encodeOpenCodeRedactedSnapshotV1(large)
     expect(largeEncoded.ok).toBe(true)
-    if (!largeEncoded.ok) throw new Error(largeEncoded.issueCode)
+    if (largeEncoded.ok === false) throw new Error(largeEncoded.issueCode)
     expect(largeEncoded.value.providers[0]).toMatchObject({ modelIdsTotal: 5_000, modelIdsTruncated: true })
     expect(largeEncoded.value.providers[0].modelIds).toHaveLength(OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS)
 
@@ -215,7 +215,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     reversed.providers[0].modelIds = [...candidate.providers[0].modelIds].reverse()
     const reversedEncoded = encodeOpenCodeRedactedSnapshotV1(reversed)
     expect(reversedEncoded.ok).toBe(true)
-    if (!reversedEncoded.ok) throw new Error(reversedEncoded.issueCode)
+    if (reversedEncoded.ok === false) throw new Error(reversedEncoded.issueCode)
     expect(reversedEncoded.value.providers[0].modelIdsFingerprint)
       .toBe(encoded.value.providers[0].modelIdsFingerprint)
     expect(new TextDecoder().decode(reversedEncoded.bytes)).toBe(new TextDecoder().decode(encoded.bytes))

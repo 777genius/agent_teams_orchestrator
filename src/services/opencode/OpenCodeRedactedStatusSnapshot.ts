@@ -157,7 +157,7 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
     const metadataPresent = provider.modelIdsTotal !== undefined
       || provider.modelIdsTruncated !== undefined || provider.modelIdsFingerprint !== undefined
     if (metadataPresent) {
-      if (!Number.isSafeInteger(provider.modelIdsTotal) || provider.modelIdsTotal < 0
+      if (!timestamp(provider.modelIdsTotal)
         || typeof provider.modelIdsTruncated !== 'boolean'
         || !isOpenCodeOpaqueSha256(provider.modelIdsFingerprint)) return invalid()
       const retained = decoded.modelIds?.length ?? 0
@@ -578,7 +578,7 @@ function decodeObservation<T>(
     } else return null
   }
   if (record.evidenceGeneration !== undefined
-    && (!Number.isSafeInteger(record.evidenceGeneration) || record.evidenceGeneration <= 0)) return null
+    && (!timestamp(record.evidenceGeneration) || record.evidenceGeneration <= 0)) return null
   return inertRecord({ value: decodedValue, authority: record.authority, freshness: record.freshness, condition: record.condition, observedAt: record.observedAt, validUntil: record.validUntil, issueCode: record.issueCode,
     ...(record.evidenceGeneration === undefined ? {} : { evidenceGeneration: record.evidenceGeneration }) }) as OpenCodeRedactedEvidenceObservation<T>
 }
