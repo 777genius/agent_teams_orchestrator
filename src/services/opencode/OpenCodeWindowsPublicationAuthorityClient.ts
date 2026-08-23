@@ -35,8 +35,9 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #pending = ''; #pendingBytes = 0; #closed = false; #retained = false
   #queue: Promise<void> = Promise.resolve()
   #closePromise: Promise<void> | undefined
+  #callerDeadline: ReturnType<typeof setTimeout> | undefined
   #ownerDeadline: ReturnType<typeof setTimeout> | undefined
-  #abort = () => { this.#cancel() }
+  #abort = () => { this.#cancelCaller() }
 
   constructor(options: OpenCodeWindowsPublicationAuthorityOptions) {
     if (!Number.isFinite(options.deadline) || options.deadline <= openCodeMonotonicNow() || options.signal?.aborted) throw unavailable()
@@ -55,6 +56,8 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     this.#child.unref(); this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline
     this.#settlementDeadline = defaultSettlementDeadline; this.#signal = options.signal
     options.signal?.addEventListener('abort', this.#abort, { once: true })
+    this.#callerDeadline = setTimeout(() => this.#cancelCaller(), Math.max(1, options.deadline - openCodeMonotonicNow()))
+    this.#callerDeadline.unref?.()
   }
 
   async openRoot(rootPath: string, createMissing: boolean, durableAncestors: boolean): Promise<Readonly<{ volumeSerial: string; fileId: string; createdPaths: string[] }>> {
@@ -294,7 +297,9 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     })()
     return this.#closePromise
   }
-  kill(): void { if (this.#closed) return; this.#closed = true; this.#cancel(); if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
+  kill(): void { if (this.#closed) return; this.#closed = true; this.#cancelCaller(); if (this.#callerDeadline) clearTimeout(this.#callerDeadline); if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
+
+  #cancelCaller(): void { this.#cancel() }
 
   #armOwnerReaper(): void {
     if (this.#closed || !this.#retained) return
@@ -321,8 +326,14 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
 
   async #executeRequest(request: Pending, settlementCommand: boolean): Promise<unknown> {
-    const physicalDeadline = settlementCommand ? this.#settlementDeadline : this.#deadline
-    if (this.#closed || openCodeMonotonicNow() >= physicalDeadline) throw unavailable()
+    const now = openCodeMonotonicNow()
+    if (this.#closed || (!settlementCommand && now >= this.#deadline)) throw unavailable()
+    // Once a root is retained, an already-started caller command physically owns
+    // the wire until the existing cleanup reserve expires. The caller still loses
+    // its race at #deadline/#signal, but the reply remains serialized ahead of
+    // attempt-owned rollback and CLOSE instead of killing their authority.
+    const physicalDeadline = settlementCommand || this.#retained ? this.#settlementDeadline : this.#deadline
+    if (now >= physicalDeadline) throw unavailable()
     const remaining = Math.max(0, physicalDeadline - openCodeMonotonicNow())
     const wire = { version: 1, ...request, wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeWindowsPublicationRequest
     const encoded = `${JSON.stringify(wire)}\n`

@@ -120,14 +120,13 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
     expect(process.operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT', 'CLOSE'])
   })
-  test('preserves the caller absolute deadline after retaining the root', async () => {
+  test('preserves the caller deadline while retained wire work uses only the cleanup reserve', async () => {
     const process = fake(); const deadline = Date.now() + 30_000
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, launch: () => process.child })
     await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
-    const callerWaits = process.requests.filter(request => request.op !== 'CLOSE')
-      .map(request => Number(request.wait_ms))
-    expect(callerWaits.every(wait => wait <= deadline - Date.now() + 100)).toBeTrue()
-    expect(Math.max(...callerWaits)).toBeLessThan(30_100)
+    expect(Number(process.requests[0]!.wait_ms)).toBeLessThan(30_100)
+    expect(Number(process.requests[1]!.wait_ms)).toBeGreaterThan(Number(process.requests[0]!.wait_ms))
+    expect(Number(process.requests[1]!.wait_ms)).toBeLessThan(31_100)
     expect(Number(process.requests.at(-1)!.wait_ms)).toBeLessThan(31_100)
   })
   test('does not reap a live retained owner at the former 90 second lease', async () => {
@@ -182,7 +181,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     await expect(client.validateRoot()).rejects.toThrow('unavailable [redacted]')
     expect(writes).toBe(2); expect(kills).toBe(1)
   })
-  test('kills retained native synchronous I/O at the immutable deadline', async () => {
+  test('rejects retained synchronous I/O at the caller deadline without killing cleanup authority', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0
     const encoder = new TextEncoder(); const operations: string[] = []
     const child = { pid: 123, stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
@@ -195,7 +194,8 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       launch: () => child })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.syncRoot()).rejects.toThrow('unavailable [redacted]')
-    expect(operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT']); expect(kills).toBe(1)
+    expect(operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT']); expect(kills).toBe(0)
+    client.kill(); expect(kills).toBe(1)
   })
   test('cancels a caller wait without killing its pending retained physical operation', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0
@@ -212,6 +212,63 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     const pending = client.syncRoot(); await new Promise(resolve => setTimeout(resolve, 0)); abort.abort()
     await expect(pending).rejects.toThrow('unavailable [redacted]'); expect(kills).toBe(0)
     client.kill(); expect(kills).toBe(1)
+  })
+  test('lets delayed retained creation settle before queued rollback within cleanup reserve', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    let resolveExit!: (code: number) => void
+    let kills = 0; let closes = 0; let exited = false
+    const encoder = new TextEncoder(); const requests: Record<string, unknown>[] = []
+    const materializations = new Set<string>()
+    const exit = (code: number) => {
+      if (exited) return
+      exited = true; try { controller.close() } catch {}; resolveExit(code)
+    }
+    const reply = (request: Record<string, unknown>, value: unknown) => controller.enqueue(encoder.encode(
+      `${JSON.stringify({ version: 1, id: request.id, ok: true, value })}\n`,
+    ))
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
+      exited: new Promise<number>(resolve => { resolveExit = resolve }),
+      unref() {},
+      kill() { kills += 1; exit(-1) },
+      stdin: { end() { closes += 1 }, write(line: string) {
+        const request = JSON.parse(line) as Record<string, unknown>; requests.push(request)
+        if (request.op === 'OPEN_ROOT') {
+          reply(request, { volumeSerial: '1', fileId: '2', createdPaths: [] })
+        } else if (request.op === 'ROLLBACK_DIRECTORY') {
+          materializations.delete(String(request.root_key)); reply(request, {})
+        } else if (request.op === 'CLOSE') reply(request, {})
+        return line.length
+      } },
+    }
+    const abort = new AbortController(); const deadline = Date.now() + 80
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, signal: abort.signal,
+      launch: () => child })
+    await client.openRoot('C:\\safe', false, false)
+    const creation = client.createDirectory('plugins.snapshot-attempt')
+    while (!requests.some(request => request.op === 'CREATE_DIRECTORY')) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    const createRequest = requests.find(request => request.op === 'CREATE_DIRECTORY')!
+    abort.abort(new Error('cancel while native creation is in flight'))
+    await expect(creation).rejects.toThrow('unavailable [redacted]')
+    const rollback = client.rollbackDirectory('plugins.snapshot-attempt')
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, deadline - Date.now() + 25)))
+    expect(Date.now()).toBeGreaterThan(deadline)
+    expect(kills).toBe(0)
+    materializations.add('plugins.snapshot-attempt')
+    reply(createRequest, { volumeSerial: '1', fileId: '5' })
+    await rollback
+    expect(materializations).toEqual(new Set())
+    expect(requests.map(request => request.op)).toEqual([
+      'OPEN_ROOT', 'CREATE_DIRECTORY', 'ROLLBACK_DIRECTORY',
+    ])
+    await client.close(); await client.physicalSettlement
+    expect(requests.map(request => request.op)).toEqual([
+      'OPEN_ROOT', 'CREATE_DIRECTORY', 'ROLLBACK_DIRECTORY', 'CLOSE',
+    ])
+    expect(kills).toBe(1); expect(closes).toBe(1)
   })
   test('rejects unsafe Win32 roots and leaves without publishing them to native stdin', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
@@ -351,7 +408,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(process.operations).toEqual(['OPEN_ROOT', 'NS_ACQUIRE_LOCK', 'NS_RELEASE_LOCK'])
     await client.close()
   })
-  test('retries with only the caller deadline remaining and stops writing after cancellation', async () => {
+  test('retries with bounded physical reserve and stops writing after cancellation', async () => {
     const process = fake(2); const abort = new AbortController(); const deadline = Date.now() + 500
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, signal: abort.signal,
       launch: () => process.child })
@@ -370,6 +427,6 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     await new Promise(resolve => setTimeout(resolve, 60))
     expect(process.requests.filter(request => request.op === 'NS_ACQUIRE_LOCK')).toHaveLength(2)
     expect(Math.max(...process.requests.map(request => Number(request.wait_ms))))
-      .toBeLessThanOrEqual(500)
+      .toBeLessThanOrEqual(1_500)
   })
 })

@@ -960,8 +960,9 @@ async function publishImmutableUserPluginSnapshot(
       await publicationDirectory.renameRetainedChildDirectory(temporaryLeaf, targetLeaf)
       published = true
     } finally {
-      if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
-      await temporaryRoot.close().catch(() => undefined)
+      try {
+        if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf)
+      } finally { await temporaryRoot.close().catch(() => undefined) }
     }
     return
   }
@@ -1117,8 +1118,9 @@ async function publishImmutablePluginDependencySnapshot(
       await publicationDirectory.renameRetainedChildDirectory(temporaryLeaf, targetLeaf)
       published = true
     } finally {
-      if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
-      await temporaryRoot.close().catch(() => undefined)
+      try {
+        if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf)
+      } finally { await temporaryRoot.close().catch(() => undefined) }
     }
     return
   }
@@ -2021,13 +2023,16 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
   } finally {
     // The native authority owns the only exact NTFS identities. Never release
     // them and then recursively remove a pathname that a successor can reuse.
-    if (process.platform === 'win32' && temporaryRoot && !completed) {
-      await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
-    } else if (process.platform !== 'win32') {
-      await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+    try {
+      if (process.platform === 'win32' && temporaryRoot && !completed) {
+        await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf)
+      } else if (process.platform !== 'win32') {
+        await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+      }
+    } finally {
+      await temporaryRoot?.close().catch(() => undefined)
+      await publicationDirectory.close()
     }
-    await temporaryRoot?.close().catch(() => undefined)
-    await publicationDirectory.close()
   }
 }
 
