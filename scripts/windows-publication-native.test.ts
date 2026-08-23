@@ -33,6 +33,21 @@ describe('Windows retained publication native contract', () => {
     await expect(rename(path.join(root, 'passive-status.sqlite3'), path.join(root, 'moved.sqlite3'))).rejects.toBeDefined()
     client.kill(); await rename(root, displaced); await rename(displaced, root)
   })
+  windowsTest('retains both pre-existing and atomically-created root components', async () => {
+    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-root-components-')); roots.push(sandbox)
+    const existing = path.join(sandbox, 'existing'); const created = path.join(existing, 'created')
+    const target = path.join(created, 'nested'); const displaced = path.join(sandbox, 'displaced')
+    await mkdir(existing)
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const opened = await client.openRoot(target, true, true)
+    expect(opened.createdPaths.map(value => value.toLowerCase())).toEqual([
+      created.toLowerCase(), target.toLowerCase(),
+    ])
+    await expect(rename(existing, displaced)).rejects.toBeDefined()
+    await expect(rename(created, path.join(existing, 'created-old'))).rejects.toBeDefined()
+    await client.close()
+    await rename(existing, displaced); await rename(displaced, existing)
+  })
   windowsTest('read-only pin denies in-place SQLite writes until the bounded copy releases', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-readonly-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')

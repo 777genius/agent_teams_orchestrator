@@ -582,6 +582,7 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&root_path)
         .map_err(|_| "ROOT_HANDLE")?;
+    windows_identity::validate_local_ntfs(&root_handle).map_err(|_| "WINDOWS_VOLUME_UNVERIFIED")?;
     let root_metadata = root_handle.metadata().map_err(|_| "ROOT_HANDLE")?;
     if !root_metadata.is_dir()
         || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0

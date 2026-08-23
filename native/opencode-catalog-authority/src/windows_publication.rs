@@ -240,6 +240,7 @@ impl RetainedWindowsRoot {
         let (root_path, wide) = volume_root(&target)?;
         verify_ntfs(&wide)?;
         let root_handle = open_volume_directory(&root_path)?;
+        crate::windows_identity::validate_local_ntfs(&root_handle).map_err(|_| "ROOT_REJECTED")?;
         let root_meta = root_handle.metadata().map_err(|_| "ROOT_REJECTED")?;
         if !root_meta.is_dir() || root_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("ROOT_REJECTED");

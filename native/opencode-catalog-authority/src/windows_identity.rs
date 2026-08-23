@@ -6,7 +6,7 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
-    SetFileInformationByHandle, FILE_ID_INFO,
+    GetVolumeInformationByHandleW, SetFileInformationByHandle, FILE_DEVICE_DISK, FILE_ID_INFO,
 };
 
 /// A volume-qualified, full FILE_ID_128 identity.  Do not truncate this to the
@@ -58,6 +58,12 @@ struct IoStatusBlock {
     information: usize,
 }
 
+#[repr(C)]
+struct FileFsDeviceInformation {
+    device_type: u32,
+    characteristics: u32,
+}
+
 #[link(name = "ntdll")]
 extern "system" {
     fn NtCreateFile(
@@ -80,6 +86,68 @@ extern "system" {
         length: u32,
         file_information_class: i32,
     ) -> i32;
+    fn NtQueryVolumeInformationFile(
+        file_handle: HANDLE,
+        io_status_block: *mut IoStatusBlock,
+        fs_information: *mut c_void,
+        length: u32,
+        fs_information_class: i32,
+    ) -> i32;
+}
+
+/// Prove the filesystem and device class on the retained volume handle. Path
+/// queries such as GetDriveTypeW/GetVolumeInformationW are only an early
+/// rejection filter: a drive mapping can change between those queries and the
+/// authority-producing open.
+pub(super) fn validate_local_ntfs(file: &File) -> Result<(), ()> {
+    let mut filesystem = [0u16; 32];
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    } == 0
+    {
+        return Err(());
+    }
+    let end = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    if filesystem[..end] != ['N' as u16, 'T' as u16, 'F' as u16, 'S' as u16] {
+        return Err(());
+    }
+    let mut status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut device = FileFsDeviceInformation {
+        device_type: 0,
+        characteristics: 0,
+    };
+    // FileFsDeviceInformation is FS_INFORMATION_CLASS 4. Reject removable and
+    // remote devices even if a path-level drive query previously said fixed.
+    if unsafe {
+        NtQueryVolumeInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            &mut device as *mut _ as *mut c_void,
+            std::mem::size_of::<FileFsDeviceInformation>() as u32,
+            4,
+        )
+    } < 0
+        || device.device_type != FILE_DEVICE_DISK
+        || device.characteristics & (0x0000_0001 | 0x0000_0010) != 0
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 pub(super) fn open_relative_directory(
@@ -431,6 +499,24 @@ mod tests {
         let root = fixture("relative-directory");
         let parent = directory(&root);
         let child = create_relative_directory(&parent, Path::new("child")).unwrap();
+        let expected = file_identity(&child).unwrap();
+        assert_eq!(
+            file_identity(&probe_relative_directory(&parent, Path::new("child")).unwrap()).unwrap(),
+            expected
+        );
+        assert!(std::fs::rename(root.join("child"), root.join("swapped")).is_err());
+        drop(child);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preexisting_child_is_opened_and_retained_in_one_relative_operation() {
+        let root = fixture("relative-preexisting-directory");
+        std::fs::create_dir(root.join("child")).unwrap();
+        let parent = directory(&root);
+        let (child, created) = open_relative_directory(&parent, Path::new("child"), false).unwrap();
+        assert!(!created);
         let expected = file_identity(&child).unwrap();
         assert_eq!(
             file_identity(&probe_relative_directory(&parent, Path::new("child")).unwrap()).unwrap(),
