@@ -16,6 +16,7 @@ export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; expected_prior: string; content_base64: string }
   | { version: 1; id: string; op: 'MARK_RECOVERY_REQUIRED'; wait_ms: number }
   | { version: 1; id: string; op: 'COMMIT_ATOMIC' | 'ROLLBACK_ATOMIC'; wait_ms: number }
+  | { version: 1; id: string; op: 'RECOVER_ATOMIC'; wait_ms: number; recovery_name: string; decision: 'commit' | 'rollback' }
   | { version: 1; id: string; op: 'NS_STAT'; wait_ms: number; path: string }
   | { version: 1; id: string; op: 'NS_MKDIR'; wait_ms: number; path: string }
   | { version: 1; id: string; op: 'NS_OPEN'; wait_ms: number; path: string; token: string; mode: 'read' | 'readwrite' | 'create_file' | 'directory' }
@@ -62,8 +63,10 @@ export function decodeOpenCodeWindowsPublicationReply(line: string, id: string):
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('OpenCode Windows publication authority failed [redacted]')
   const reply = value as Record<string, unknown>
   if (reply.version !== 1 || reply.id !== id || typeof reply.ok !== 'boolean') throw new Error('OpenCode Windows publication authority failed [redacted]')
+  const keys = Object.keys(reply).sort().join(',')
+  if (keys !== (reply.ok ? 'id,ok,value,version' : 'error,id,ok,version')) throw new Error('OpenCode Windows publication authority failed [redacted]')
   if (!reply.ok) throw new OpenCodeWindowsPublicationRejectedError(
-    ['NS_NOT_FOUND', 'NS_EXISTS', 'NS_NOT_EMPTY'].includes(String(reply.error)) ? String(reply.error) : 'REJECTED',
+    typeof reply.error === 'string' && ['NS_NOT_FOUND', 'NS_EXISTS', 'NS_NOT_EMPTY'].includes(reply.error) ? reply.error : 'REJECTED',
   )
   return reply.value
 }

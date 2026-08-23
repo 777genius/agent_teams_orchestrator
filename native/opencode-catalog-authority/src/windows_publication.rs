@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, Read, Seek, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -177,6 +177,7 @@ struct RetainedWindowsRoot {
 
 struct AtomicPublication {
     final_name: String,
+    temporary_name: String,
     backup_name: String,
     quarantine_name: String,
     temporary: Option<std::fs::File>,
@@ -186,14 +187,50 @@ struct AtomicPublication {
     stage: AtomicPublicationStage,
     backup_created: bool,
     recovery_name: String,
+    expected_prior: String,
     recovery: Option<std::fs::File>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomicPublicationStage {
+    Preparing,
     Temporary,
     PriorCaptured,
     Published,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AtomicRecoveryRecord {
+    version: u8,
+    final_name: String,
+    temporary_name: String,
+    backup_name: String,
+    quarantine_name: String,
+    recovery_name: String,
+    expected_prior: String,
+    temporary_volume_serial: Option<String>,
+    temporary_file_id: Option<String>,
+    prior_volume_serial: Option<String>,
+    prior_file_id: Option<String>,
+    backup_volume_serial: Option<String>,
+    backup_file_id: Option<String>,
+    stage: String,
+}
+
+fn append_atomic_recovery_record(
+    recovery: &mut std::fs::File,
+    parent: &std::fs::File,
+    record: &AtomicRecoveryRecord,
+) -> Result<(), &'static str> {
+    recovery
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(|_| "RECOVERY_REQUIRED")?;
+    serde_json::to_writer(&mut *recovery, record).map_err(|_| "RECOVERY_REQUIRED")?;
+    recovery.write_all(b"\n").map_err(|_| "RECOVERY_REQUIRED")?;
+    recovery.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+    parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+    Ok(())
 }
 
 fn open_volume_directory(path: &Path) -> Result<std::fs::File, &'static str> {
@@ -1150,6 +1187,29 @@ impl RetainedWindowsRoot {
         }
         self.validate()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let mut recovery =
+            crate::windows_identity::create_relative_file(parent, Path::new(recovery_name))
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+        append_atomic_recovery_record(
+            &mut recovery,
+            parent,
+            &AtomicRecoveryRecord {
+                version: 1,
+                final_name: final_name.to_string(),
+                temporary_name: temporary_name.to_string(),
+                backup_name: backup_name.to_string(),
+                quarantine_name: quarantine_name.to_string(),
+                recovery_name: recovery_name.to_string(),
+                expected_prior: expected_prior.to_string(),
+                temporary_volume_serial: None,
+                temporary_file_id: None,
+                prior_volume_serial: None,
+                prior_file_id: None,
+                backup_volume_serial: None,
+                backup_file_id: None,
+                stage: "intent".to_string(),
+            },
+        )?;
         let temporary =
             crate::windows_identity::create_relative_file(parent, Path::new(temporary_name))
                 .map_err(|_| "FILE_REJECTED")?;
@@ -1158,19 +1218,21 @@ impl RetainedWindowsRoot {
             crate::windows_identity::file_identity(&temporary).map_err(|_| "FILE_REJECTED")?;
         self.publication = Some(AtomicPublication {
             final_name: final_name.to_string(),
+            temporary_name: temporary_name.to_string(),
             backup_name: backup_name.to_string(),
             quarantine_name: quarantine_name.to_string(),
             temporary: Some(temporary),
             temporary_identity,
             prior: None,
             prior_identity: None,
-            stage: AtomicPublicationStage::Temporary,
+            stage: AtomicPublicationStage::Preparing,
             backup_created: false,
             recovery_name: recovery_name.to_string(),
-            recovery: None,
+            expected_prior: expected_prior.to_string(),
+            recovery: Some(recovery),
         });
-        // Recovery evidence and retained temporary authority exist before any
-        // subsequent fallible phase, including content I/O and prior capture.
+        // Exact temporary identity is appended before content I/O. The prior
+        // intent record remains a durable fallback if creation was interrupted.
         self.mark_recovery_required()?;
         let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
         let temporary = publication.temporary.as_mut().ok_or("FILE_REJECTED")?;
@@ -1197,6 +1259,9 @@ impl RetainedWindowsRoot {
         {
             return Err("FILE_REJECTED");
         }
+        self.publication.as_mut().ok_or("STATE_REJECTED")?.stage =
+            AtomicPublicationStage::Temporary;
+        self.write_recovery_record()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let prior =
             crate::windows_identity::open_relative_file_optional(parent, Path::new(final_name))
@@ -1236,6 +1301,7 @@ impl RetainedWindowsRoot {
             publication.prior_identity = prior_identity;
             publication.stage = AtomicPublicationStage::PriorCaptured;
         }
+        self.write_recovery_record()?;
         if prior_identity.is_some() {
             let publication = self.publication.as_ref().ok_or("STATE_REJECTED")?;
             crate::windows_identity::link_relative(
@@ -1250,6 +1316,7 @@ impl RetainedWindowsRoot {
                 .backup_created = true;
             parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
         }
+        self.write_recovery_record()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let retained = self.publication.as_ref().ok_or("STATE_REJECTED")?;
         crate::windows_identity::rename_relative(
@@ -1262,6 +1329,8 @@ impl RetainedWindowsRoot {
         self.publication.as_mut().ok_or("STATE_REJECTED")?.stage =
             AtomicPublicationStage::Published;
         parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        self.write_recovery_record()?;
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let named = crate::windows_identity::probe_relative_file(parent, Path::new(final_name))
             .map_err(|_| "FILE_REJECTED")?;
         if crate::windows_identity::file_identity(&named).map_err(|_| "FILE_REJECTED")?
@@ -1274,34 +1343,48 @@ impl RetainedWindowsRoot {
         )
     }
 
-    fn mark_recovery_required(&mut self) -> Result<Value, &'static str> {
+    fn write_recovery_record(&mut self) -> Result<(), &'static str> {
         self.validate()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let Some(publication) = self.publication.as_mut() else {
-            return Ok(json!({"marked":false}));
+            return Err("STATE_REJECTED");
         };
-        if publication.recovery.is_some() {
-            return Ok(json!({"marked":true}));
+        let prior = publication.prior_identity;
+        let record = AtomicRecoveryRecord {
+            version: 1,
+            final_name: publication.final_name.clone(),
+            temporary_name: publication.temporary_name.clone(),
+            backup_name: publication.backup_name.clone(),
+            quarantine_name: publication.quarantine_name.clone(),
+            recovery_name: publication.recovery_name.clone(),
+            expected_prior: publication.expected_prior.clone(),
+            temporary_volume_serial: Some(publication.temporary_identity.0.to_string()),
+            temporary_file_id: Some(publication.temporary_identity.1.to_string()),
+            prior_volume_serial: prior.map(|identity| identity.0.to_string()),
+            prior_file_id: prior.map(|identity| identity.1.to_string()),
+            backup_volume_serial: prior
+                .filter(|_| publication.backup_created)
+                .map(|identity| identity.0.to_string()),
+            backup_file_id: prior
+                .filter(|_| publication.backup_created)
+                .map(|identity| identity.1.to_string()),
+            stage: match publication.stage {
+                AtomicPublicationStage::Preparing => "preparing",
+                AtomicPublicationStage::Temporary => "temporary",
+                AtomicPublicationStage::PriorCaptured => "prior_captured",
+                AtomicPublicationStage::Published => "published",
+            }
+            .to_string(),
+        };
+        let recovery = publication.recovery.as_mut().ok_or("RECOVERY_REQUIRED")?;
+        append_atomic_recovery_record(recovery, parent, &record)
+    }
+
+    fn mark_recovery_required(&mut self) -> Result<Value, &'static str> {
+        if self.publication.is_none() {
+            return Ok(json!({"marked":false}));
         }
-        let recovery = crate::windows_identity::create_relative_file(
-            parent,
-            Path::new(&publication.recovery_name),
-        )
-        .map_err(|_| "RECOVERY_REQUIRED")?;
-        publication.recovery = Some(recovery);
-        publication
-            .recovery
-            .as_mut()
-            .ok_or("RECOVERY_REQUIRED")?
-            .write_all(b"opencode-windows-atomic-recovery-required-v1\n")
-            .map_err(|_| "RECOVERY_REQUIRED")?;
-        publication
-            .recovery
-            .as_ref()
-            .ok_or("RECOVERY_REQUIRED")?
-            .sync_all()
-            .map_err(|_| "RECOVERY_REQUIRED")?;
-        parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+        self.write_recovery_record()?;
         Ok(json!({"marked":true}))
     }
 
@@ -1317,6 +1400,368 @@ impl RetainedWindowsRoot {
             parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
         }
         Ok(())
+    }
+
+    fn recover_atomic(
+        &mut self,
+        recovery_name: &str,
+        decision: &str,
+    ) -> Result<Value, &'static str> {
+        if self.publication.is_some()
+            || !valid_leaf(recovery_name)
+            || !matches!(decision, "commit" | "rollback")
+        {
+            return Err("STATE_REJECTED");
+        }
+        self.validate()?;
+        let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
+        let Some(mut recovery) =
+            crate::windows_identity::open_relative_file_optional(parent, Path::new(recovery_name))
+                .map_err(|_| "RECOVERY_REQUIRED")?
+        else {
+            return Ok(json!({"recovered":false}));
+        };
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut recovery)
+            .take(MAX_WIRE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "RECOVERY_REQUIRED")?;
+        if bytes.len() > MAX_WIRE {
+            return Err("RECOVERY_REQUIRED");
+        }
+        if bytes.is_empty() || bytes == b"opencode-windows-atomic-recovery-required-v1\n" {
+            if decision != "rollback" {
+                return Err("RECOVERY_REQUIRED");
+            }
+            crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
+            drop(recovery);
+            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            return Ok(json!({"recovered":true}));
+        }
+        let Some(complete_length) = bytes.iter().rposition(|value| *value == b'\n') else {
+            // Temporary creation is ordered after the first newline-terminated,
+            // synced intent record. A torn first record therefore has no
+            // transaction-owned namespace object and is safe to clear only as
+            // an explicit rollback decision.
+            if decision != "rollback" {
+                return Err("RECOVERY_REQUIRED");
+            }
+            crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
+            drop(recovery);
+            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            return Ok(json!({"recovered":true}));
+        };
+        let mut records = Vec::new();
+        for line in bytes[..complete_length].split(|value| *value == b'\n') {
+            if line.is_empty() {
+                return Err("RECOVERY_REQUIRED");
+            }
+            records.push(
+                serde_json::from_slice::<AtomicRecoveryRecord>(line)
+                    .map_err(|_| "RECOVERY_REQUIRED")?,
+            );
+        }
+        let stage_rank = |stage: &str| match stage {
+            "intent" => Some(0),
+            "preparing" => Some(1),
+            "temporary" => Some(2),
+            "prior_captured" => Some(3),
+            "published" => Some(4),
+            _ => None,
+        };
+        for entry in &records {
+            let temporary_paired =
+                entry.temporary_volume_serial.is_some() == entry.temporary_file_id.is_some();
+            let prior_paired = entry.prior_volume_serial.is_some() == entry.prior_file_id.is_some();
+            let backup_paired =
+                entry.backup_volume_serial.is_some() == entry.backup_file_id.is_some();
+            if stage_rank(&entry.stage).is_none()
+                || !temporary_paired
+                || !prior_paired
+                || !backup_paired
+                || (entry.stage == "intent"
+                    && (entry.temporary_volume_serial.is_some()
+                        || entry.prior_volume_serial.is_some()
+                        || entry.backup_volume_serial.is_some()))
+                || (entry.stage != "intent" && entry.temporary_volume_serial.is_none())
+                || (matches!(entry.stage.as_str(), "preparing" | "temporary")
+                    && (entry.prior_volume_serial.is_some()
+                        || entry.backup_volume_serial.is_some()))
+                || (entry.backup_volume_serial.is_some()
+                    && (entry.backup_volume_serial != entry.prior_volume_serial
+                        || entry.backup_file_id != entry.prior_file_id))
+            {
+                return Err("RECOVERY_REQUIRED");
+            }
+        }
+        for pair in records.windows(2) {
+            let prior = &pair[0];
+            let next = &pair[1];
+            if prior.version != next.version
+                || prior.final_name != next.final_name
+                || prior.temporary_name != next.temporary_name
+                || prior.backup_name != next.backup_name
+                || prior.quarantine_name != next.quarantine_name
+                || prior.recovery_name != next.recovery_name
+                || prior.expected_prior != next.expected_prior
+                || stage_rank(&prior.stage).ok_or("RECOVERY_REQUIRED")?
+                    > stage_rank(&next.stage).ok_or("RECOVERY_REQUIRED")?
+                || (prior.temporary_volume_serial.is_some()
+                    && (prior.temporary_volume_serial != next.temporary_volume_serial
+                        || prior.temporary_file_id != next.temporary_file_id))
+                || (prior.prior_volume_serial.is_some()
+                    && (prior.prior_volume_serial != next.prior_volume_serial
+                        || prior.prior_file_id != next.prior_file_id))
+                || (prior.backup_volume_serial.is_some()
+                    && (prior.backup_volume_serial != next.backup_volume_serial
+                        || prior.backup_file_id != next.backup_file_id))
+            {
+                return Err("RECOVERY_REQUIRED");
+            }
+        }
+        let record = records.pop().ok_or("RECOVERY_REQUIRED")?;
+        if record.version != 1
+            || record.recovery_name != recovery_name
+            || (record.expected_prior != "any"
+                && record.expected_prior != "absent"
+                && !(record.expected_prior.len() == 64
+                    && record
+                        .expected_prior
+                        .bytes()
+                        .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())))
+            || !matches!(
+                record.stage.as_str(),
+                "intent" | "preparing" | "temporary" | "prior_captured" | "published"
+            )
+            || ![
+                &record.final_name,
+                &record.temporary_name,
+                &record.backup_name,
+                &record.quarantine_name,
+                &record.recovery_name,
+            ]
+            .iter()
+            .all(|name| valid_leaf(name))
+            || {
+                let names = [
+                    record.final_name.as_str(),
+                    record.temporary_name.as_str(),
+                    record.backup_name.as_str(),
+                    record.quarantine_name.as_str(),
+                    record.recovery_name.as_str(),
+                ];
+                names
+                    .iter()
+                    .enumerate()
+                    .any(|(index, name)| names[index + 1..].contains(name))
+            }
+        {
+            return Err("RECOVERY_REQUIRED");
+        }
+        if record.stage == "intent" {
+            if decision != "rollback"
+                || record.temporary_volume_serial.is_some()
+                || record.temporary_file_id.is_some()
+                || record.prior_volume_serial.is_some()
+                || record.prior_file_id.is_some()
+                || record.backup_volume_serial.is_some()
+                || record.backup_file_id.is_some()
+            {
+                return Err("RECOVERY_REQUIRED");
+            }
+            crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
+            drop(recovery);
+            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            return Ok(json!({"recovered":true}));
+        }
+        let temporary_identity = match (&record.temporary_volume_serial, &record.temporary_file_id)
+        {
+            (Some(volume), Some(file)) => (
+                volume.parse::<u64>().map_err(|_| "RECOVERY_REQUIRED")?,
+                file.parse::<u128>().map_err(|_| "RECOVERY_REQUIRED")?,
+            ),
+            _ => return Err("RECOVERY_REQUIRED"),
+        };
+        let prior_identity = match (&record.prior_volume_serial, &record.prior_file_id) {
+            (None, None) => None,
+            (Some(volume), Some(file)) => Some((
+                volume.parse::<u64>().map_err(|_| "RECOVERY_REQUIRED")?,
+                file.parse::<u128>().map_err(|_| "RECOVERY_REQUIRED")?,
+            )),
+            _ => return Err("RECOVERY_REQUIRED"),
+        };
+        let backup_identity = match (&record.backup_volume_serial, &record.backup_file_id) {
+            (None, None) => None,
+            (Some(volume), Some(file)) => Some((
+                volume.parse::<u64>().map_err(|_| "RECOVERY_REQUIRED")?,
+                file.parse::<u128>().map_err(|_| "RECOVERY_REQUIRED")?,
+            )),
+            _ => return Err("RECOVERY_REQUIRED"),
+        };
+        if matches!(record.stage.as_str(), "preparing" | "temporary")
+            && (prior_identity.is_some() || backup_identity.is_some())
+        {
+            return Err("RECOVERY_REQUIRED");
+        }
+        let root_volume = self.held.last().ok_or("ROOT_REJECTED")?.identity.0;
+        if temporary_identity.0 != root_volume
+            || prior_identity.is_some_and(|identity| identity.0 != root_volume)
+            || backup_identity.is_some_and(|identity| identity.0 != root_volume)
+            || backup_identity.is_some_and(|identity| Some(identity) != prior_identity)
+        {
+            return Err("RECOVERY_REQUIRED");
+        }
+        let identity_at =
+            |name: &str| -> Result<Option<crate::windows_identity::FileIdentity>, &'static str> {
+                crate::windows_identity::probe_relative_file_optional(parent, Path::new(name))
+                    .map_err(|_| "RECOVERY_REQUIRED")?
+                    .as_ref()
+                    .map(crate::windows_identity::file_identity)
+                    .transpose()
+                    .map_err(|_| "RECOVERY_REQUIRED")
+            };
+        let mut final_identity = identity_at(&record.final_name)?;
+        if decision == "commit" {
+            if record.stage == "preparing" {
+                return Err("RECOVERY_REQUIRED");
+            }
+            if final_identity != Some(temporary_identity) {
+                if final_identity != prior_identity {
+                    return Err("SUCCESSOR_PRESENT");
+                }
+                let temporary = crate::windows_identity::open_relative_file(
+                    parent,
+                    Path::new(&record.temporary_name),
+                )
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+                if crate::windows_identity::file_identity(&temporary)
+                    .map_err(|_| "RECOVERY_REQUIRED")?
+                    != temporary_identity
+                {
+                    return Err("SUCCESSOR_PRESENT");
+                }
+                if let Some(expected) = prior_identity {
+                    match identity_at(&record.backup_name)? {
+                        Some(identity) if identity == expected => {}
+                        Some(_) => return Err("SUCCESSOR_PRESENT"),
+                        None => {
+                            let prior = crate::windows_identity::open_relative_file(
+                                parent,
+                                Path::new(&record.final_name),
+                            )
+                            .map_err(|_| "RECOVERY_REQUIRED")?;
+                            if crate::windows_identity::file_identity(&prior)
+                                .map_err(|_| "RECOVERY_REQUIRED")?
+                                != expected
+                            {
+                                return Err("SUCCESSOR_PRESENT");
+                            }
+                            crate::windows_identity::link_relative(
+                                &prior,
+                                parent,
+                                Path::new(&record.backup_name),
+                            )
+                            .map_err(|_| "RECOVERY_REQUIRED")?;
+                            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                        }
+                    }
+                }
+                crate::windows_identity::rename_relative(
+                    &temporary,
+                    parent,
+                    Path::new(&record.final_name),
+                    final_identity.is_some(),
+                )
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+                parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                final_identity = identity_at(&record.final_name)?;
+            }
+            if final_identity != Some(temporary_identity) {
+                return Err("RECOVERY_REQUIRED");
+            }
+        } else if !matches!(record.stage.as_str(), "preparing" | "temporary") {
+            if final_identity == Some(temporary_identity) {
+                let published = crate::windows_identity::open_relative_file(
+                    parent,
+                    Path::new(&record.final_name),
+                )
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+                if identity_at(&record.quarantine_name)? == Some(temporary_identity) {
+                    let old = crate::windows_identity::open_relative_file(
+                        parent,
+                        Path::new(&record.quarantine_name),
+                    )
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+                    crate::windows_identity::delete_on_close(&old)
+                        .map_err(|_| "RECOVERY_REQUIRED")?;
+                    drop(old);
+                }
+                crate::windows_identity::rename_relative(
+                    &published,
+                    parent,
+                    Path::new(&record.quarantine_name),
+                    false,
+                )
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+                parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                final_identity = identity_at(&record.final_name)?;
+            }
+            if final_identity != prior_identity {
+                if final_identity.is_some() {
+                    return Err("SUCCESSOR_PRESENT");
+                }
+                if let Some(expected) = prior_identity {
+                    let backup = crate::windows_identity::open_relative_file(
+                        parent,
+                        Path::new(&record.backup_name),
+                    )
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+                    if crate::windows_identity::file_identity(&backup)
+                        .map_err(|_| "RECOVERY_REQUIRED")?
+                        != expected
+                    {
+                        return Err("SUCCESSOR_PRESENT");
+                    }
+                    crate::windows_identity::link_relative(
+                        &backup,
+                        parent,
+                        Path::new(&record.final_name),
+                    )
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+                    parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                }
+            }
+            if identity_at(&record.final_name)? != prior_identity {
+                return Err("RECOVERY_REQUIRED");
+            }
+        }
+        for (name, expected) in [
+            (&record.temporary_name, temporary_identity),
+            (&record.quarantine_name, temporary_identity),
+        ] {
+            if identity_at(name)? == Some(expected) {
+                let file = crate::windows_identity::open_relative_file(parent, Path::new(name))
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+                crate::windows_identity::delete_on_close(&file).map_err(|_| "RECOVERY_REQUIRED")?;
+                drop(file);
+            }
+        }
+        if let Some(expected) = prior_identity {
+            if identity_at(&record.backup_name)? == Some(expected) {
+                let backup = crate::windows_identity::open_relative_file(
+                    parent,
+                    Path::new(&record.backup_name),
+                )
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+                crate::windows_identity::delete_on_close(&backup)
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+                drop(backup);
+            }
+        }
+        crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
+        drop(recovery);
+        parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+        Ok(json!({"recovered":true}))
     }
 
     fn settle_atomic(&mut self, rollback: bool) -> Result<Value, &'static str> {
@@ -1601,6 +2046,13 @@ enum Request {
         id: String,
         wait_ms: u32,
     },
+    RECOVER_ATOMIC {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        recovery_name: String,
+        decision: String,
+    },
     NS_STAT {
         version: u8,
         id: String,
@@ -1771,6 +2223,12 @@ impl Request {
                 id,
                 wait_ms,
             }
+            | Self::RECOVER_ATOMIC {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
             | Self::SYNC_ROOT {
                 version,
                 id,
@@ -1860,10 +2318,23 @@ pub fn run() {
             Err(_) => break,
         };
         let (version, id, wait_ms) = request.common();
-        if version != 1 || id.is_empty() || id.len() > 64 || !id.is_ascii() || wait_ms == 0 {
+        if version != 1 || !valid_id(id) || wait_ms == 0 {
             break;
         }
         let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
+        // Synchronous NTFS calls are deliberately used to retain exact object
+        // authority. A per-command process watchdog is their cancellation
+        // boundary: deadline expiry closes every retained handle even if the
+        // worker thread is blocked inside a filesystem call.
+        let (deadline_cancel, deadline_wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if matches!(
+                deadline_wait.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                std::process::exit(124);
+            }
+        });
         let (result, close): (Result<Value, &'static str>, bool) = match request {
             Request::OPEN_ROOT {
                 root_path,
@@ -2020,6 +2491,16 @@ pub fn run() {
                     .and_then(|v| v.settle_atomic(true)),
                 false,
             ),
+            Request::RECOVER_ATOMIC {
+                recovery_name,
+                decision,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.recover_atomic(&recovery_name, &decision)),
+                false,
+            ),
             Request::SYNC_ROOT { .. } => (
                 root.as_ref()
                     .ok_or("ROOT_REQUIRED")
@@ -2133,6 +2614,7 @@ pub fn run() {
         {
             break;
         }
+        let _ = deadline_cancel.send(());
     }
 }
 
@@ -2228,6 +2710,7 @@ mod protocol_tests {
                 ".auth.quarantine",
                 ".auth.recovery-required",
                 b"attempt",
+                "any",
             )
             .unwrap();
         authority.mark_recovery_required().unwrap();
@@ -2236,6 +2719,139 @@ mod protocol_tests {
         assert_eq!(std::fs::read(root.join("auth.json")).unwrap(), b"prior");
         assert!(!root.join(".auth.recovery-required").exists());
         drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_atomic_record_recovers_after_authority_restart() {
+        for decision in ["commit", "rollback"] {
+            let root = std::env::temp_dir().join(format!(
+                "opencode-publication-restart-{}-{}-{decision}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("auth.json"), b"prior").unwrap();
+            {
+                let (mut authority, _) =
+                    RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+                authority
+                    .prepare_atomic(
+                        "auth.json",
+                        ".auth.tmp",
+                        ".auth.backup",
+                        ".auth.quarantine",
+                        ".auth.recovery-required",
+                        b"attempt",
+                        "any",
+                    )
+                    .unwrap();
+            }
+            let recovery_bytes = std::fs::read(root.join(".auth.recovery-required")).unwrap();
+            let records = recovery_bytes
+                .split(|value| *value == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<AtomicRecoveryRecord>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.stage.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "intent",
+                    "preparing",
+                    "temporary",
+                    "prior_captured",
+                    "prior_captured",
+                    "published"
+                ]
+            );
+            let record = records.last().unwrap();
+            assert_eq!(record.stage, "published");
+            assert_eq!(record.final_name, "auth.json");
+            assert!(record
+                .temporary_file_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.join(".auth.recovery-required"))
+                .unwrap()
+                .write_all(b"{\"torn\":")
+                .unwrap();
+            let (mut successor, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            assert_eq!(
+                successor
+                    .recover_atomic(".auth.recovery-required", decision)
+                    .unwrap(),
+                json!({"recovered":true})
+            );
+            assert_eq!(
+                std::fs::read(root.join("auth.json")).unwrap(),
+                if decision == "commit" {
+                    &b"attempt"[..]
+                } else {
+                    &b"prior"[..]
+                }
+            );
+            assert!(!root.join(".auth.recovery-required").exists());
+            drop(successor);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn intent_record_unwedges_failed_creation_without_adopting_unknown_temporary() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-publication-intent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("auth.json"), b"prior").unwrap();
+        std::fs::write(root.join(".auth.tmp"), b"foreign").unwrap();
+        {
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            assert!(authority
+                .prepare_atomic(
+                    "auth.json",
+                    ".auth.tmp",
+                    ".auth.backup",
+                    ".auth.quarantine",
+                    ".auth.recovery-required",
+                    b"attempt",
+                    "any",
+                )
+                .is_err());
+        }
+        let record: AtomicRecoveryRecord = serde_json::from_slice(
+            std::fs::read(root.join(".auth.recovery-required"))
+                .unwrap()
+                .split(|value| *value == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.stage, "intent");
+        assert!(record.temporary_file_id.is_none());
+        let (mut successor, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        assert_eq!(
+            successor
+                .recover_atomic(".auth.recovery-required", "rollback")
+                .unwrap(),
+            json!({"recovered":true})
+        );
+        assert_eq!(std::fs::read(root.join("auth.json")).unwrap(), b"prior");
+        assert_eq!(std::fs::read(root.join(".auth.tmp")).unwrap(), b"foreign");
+        assert!(!root.join(".auth.recovery-required").exists());
+        drop(successor);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
