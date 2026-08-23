@@ -4139,16 +4139,22 @@ export class OpenCodeProfileManager {
       earlyPreparationLockRoot,
       `${canonicalFingerprint({ projectPath, purpose: plan.purpose, providerId, modelId })}.lock`,
     )
-    const earlyLockDirectory = await OpenCodeSafePublicationDirectory.open(earlyPreparationLockRoot)
-    const earlyLockName = path.basename(earlyPreparationLockPath)
-    await earlyLockDirectory.ensureRegularFile(earlyLockName, 0o600, preparationSignal).catch(async error => {
-      await earlyLockDirectory.close()
-      throw error
+    const earlyLockDirectory = await OpenCodeSafePublicationDirectory.open(earlyPreparationLockRoot, {
+      abortSignal: preparationSignal,
+      deadline: preparationDeadlineAtMs,
     })
-    const earlyLockAcquisition = lockfile.lock(
-      earlyLockDirectory.child(earlyLockName),
-      OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
-    )
+    const earlyLockName = path.basename(earlyPreparationLockPath)
+    if (process.platform !== 'win32') {
+      await earlyLockDirectory.ensureRegularFile(earlyLockName, 0o600, preparationSignal).catch(async error => {
+        await earlyLockDirectory.close()
+        throw error
+      })
+    }
+    const earlyLockAcquisition = process.platform === 'win32'
+      ? earlyLockDirectory.acquireRetainedLock(
+        earlyLockName, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS, preparationSignal,
+      )
+      : lockfile.lock(earlyLockDirectory.child(earlyLockName), OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
     const releaseEarlyPreparationLock = await raceOpenCodeAbortSignal(
       earlyLockAcquisition,
       preparationSignal,
@@ -4563,16 +4569,20 @@ export class OpenCodeProfileManager {
       )
       const scopedLockDirectory = await OpenCodeSafePublicationDirectory.open(
         path.dirname(preparationLockPath),
+        { abortSignal: preparationSignal, deadline: preparationDeadlineAtMs },
       )
       const scopedLockName = path.basename(preparationLockPath)
-      await scopedLockDirectory.ensureRegularFile(scopedLockName, 0o600, preparationSignal).catch(async error => {
-        await scopedLockDirectory.close()
-        throw error
-      })
-      const scopedLockAcquisition = lockfile.lock(
-        scopedLockDirectory.child(scopedLockName),
-        OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
-      )
+      if (process.platform !== 'win32') {
+        await scopedLockDirectory.ensureRegularFile(scopedLockName, 0o600, preparationSignal).catch(async error => {
+          await scopedLockDirectory.close()
+          throw error
+        })
+      }
+      const scopedLockAcquisition = process.platform === 'win32'
+        ? scopedLockDirectory.acquireRetainedLock(
+          scopedLockName, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS, preparationSignal,
+        )
+        : lockfile.lock(scopedLockDirectory.child(scopedLockName), OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
       const releaseScopedLock = await raceOpenCodeAbortSignal(
         scopedLockAcquisition,
         preparationSignal,

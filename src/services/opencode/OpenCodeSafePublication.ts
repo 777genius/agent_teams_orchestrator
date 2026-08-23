@@ -21,6 +21,24 @@ export type OpenCodeSafePublicationOpenOptions = Readonly<{
   windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
 }>
 
+/**
+ * Caller-side contract for Windows operations not yet exposed by the native
+ * retained namespace protocol. Implementations must resolve every name below
+ * the already-open root and retain that root until the returned operation (or
+ * release function) physically settles. They must never reopen an absolute
+ * pathname.
+ */
+export type OpenCodeWindowsRetainedNamespacePort = Readonly<{
+  namespaceList(path: string): Promise<readonly string[]>
+  namespacePublishImmutable(path: string, content: Uint8Array): Promise<void>
+  namespaceRemoveTree(path: string): Promise<void>
+  namespaceAcquireLock(
+    path: string,
+    options: Readonly<{ stale: number; update: number; retries: Readonly<{ retries: number; minTimeout: number; maxTimeout: number }> }>,
+    signal?: AbortSignal,
+  ): Promise<() => Promise<void>>
+}>
+
 function fail(): never {
   throw new Error('OpenCode safe publication primitive is unavailable [redacted]')
 }
@@ -124,6 +142,20 @@ export class OpenCodeSafePublicationDirectory {
     return path.join(this.#root, childName(name))
   }
 
+  #relative(name: string): string {
+    const leaf = childName(name)
+    return this.#windowsKey === '.' ? leaf : `${this.#windowsKey}/${leaf}`
+  }
+
+  #namespacePort(): OpenCodeWindowsRetainedNamespacePort {
+    const candidate = this.#windowsAuthority as unknown as Partial<OpenCodeWindowsRetainedNamespacePort> | null
+    if (!candidate || typeof candidate.namespaceList !== 'function'
+      || typeof candidate.namespacePublishImmutable !== 'function'
+      || typeof candidate.namespaceRemoveTree !== 'function'
+      || typeof candidate.namespaceAcquireLock !== 'function') fail()
+    return candidate as OpenCodeWindowsRetainedNamespacePort
+  }
+
   async #assertWindowsRoot(): Promise<void> {
     if (this.#windowsPassiveAuthority) this.#windowsPassiveAuthority.validate()
     if (!this.#windowsAuthority) return
@@ -198,6 +230,13 @@ export class OpenCodeSafePublicationDirectory {
   async ensureChildDirectory(name: string, mode = 0o700): Promise<OpenCodeSafePublicationDirectory> {
     await this.#assertWindowsRoot()
     const child = this.child(name)
+    if (process.platform === 'win32' && this.#windowsAuthority) {
+      await this.#windowsAuthority.namespaceMkdir(this.#relative(name)).catch(error => {
+        if (!(error instanceof Error && 'authorityCode' in error
+          && (error as { authorityCode: string }).authorityCode === 'NS_EXISTS')) throw error
+      })
+      return this.openChildDirectory(name)
+    }
     try { await mkdir(child, { mode }) }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
     const opened = await this.openChildDirectory(name)
@@ -213,6 +252,16 @@ export class OpenCodeSafePublicationDirectory {
   ): Promise<OpenCodeSafePublicationDirectory> {
     await this.#assertWindowsRoot()
     const child = this.child(name)
+    if (process.platform === 'win32' && this.#windowsAuthority) {
+      let created = false
+      await this.#windowsAuthority.namespaceMkdir(this.#relative(name)).then(() => { created = true }, error => {
+        if (!(error instanceof Error && 'authorityCode' in error
+          && (error as { authorityCode: string }).authorityCode === 'NS_EXISTS')) throw error
+      })
+      await this.#windowsAuthority.namespaceSyncDirectory(this.#windowsKey)
+      if (created) await afterCreatedEntrySynced?.(child)
+      return this.openChildDirectory(name)
+    }
     let created = false
     try { await mkdir(child, { mode }); created = true }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
@@ -239,7 +288,7 @@ export class OpenCodeSafePublicationDirectory {
       // second authority would require delete sharing and weaken the lease.
       return new OpenCodeSafePublicationDirectory(null, this.child(name), {
         dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId),
-      })
+      }, this.#windowsAuthority, childName(name), false)
     }
     await mkdir(this.child(name), { mode })
     await this.sync()
@@ -295,6 +344,8 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async childNames(): Promise<readonly string[]> {
+    if (this.#windowsPassiveAuthority) return this.#windowsPassiveAuthority.childNames()
+    if (this.#windowsAuthority) return this.#namespacePort().namespaceList(this.#windowsKey)
     await this.#assertWindowsRoot()
     const names = await readdir(this.#root)
     await this.#assertWindowsRoot()
@@ -310,6 +361,12 @@ export class OpenCodeSafePublicationDirectory {
 
   /** Atomically detaches a proven real child directory before bounded garbage cleanup. */
   async retireChildDirectory(name: string, retiredName: string): Promise<void> {
+    if (this.#windowsAuthority) {
+      await this.#windowsAuthority.namespaceRename(this.#relative(name), this.#relative(retiredName)).catch(fail)
+      await this.#namespacePort().namespaceRemoveTree(this.#relative(retiredName)).catch(fail)
+      await this.#windowsAuthority.namespaceSyncDirectory(this.#windowsKey).catch(fail)
+      return
+    }
     const opened = await this.openChildDirectory(name)
     try {
       await this.#assertWindowsRoot()
@@ -379,6 +436,20 @@ export class OpenCodeSafePublicationDirectory {
 
   async removeRegularFile(name: string): Promise<void> {
     await this.#assertWindowsRoot()
+    if (this.#windowsAuthority) {
+      const relative = this.#relative(name)
+      try {
+        const metadata = await this.#windowsAuthority.namespaceStat(relative)
+        if (metadata.kind !== 'file') fail()
+        await this.#windowsAuthority.namespaceUnlink(relative, false)
+        await this.#windowsAuthority.namespaceSyncDirectory(this.#windowsKey)
+        return
+      } catch (error) {
+        if (error instanceof Error && 'authorityCode' in error
+          && (error as { authorityCode: string }).authorityCode === 'NS_NOT_FOUND') return
+        throw error
+      }
+    }
     const target = this.child(name)
     let metadata
     try { metadata = await lstat(target) }
@@ -393,6 +464,23 @@ export class OpenCodeSafePublicationDirectory {
     if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     await this.#assertWindowsRoot()
     if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
+    if (this.#windowsAuthority) {
+      const relative = this.#relative(name)
+      let token: string | null = null
+      try {
+        token = (await this.#windowsAuthority.namespaceOpen(relative, 'create_file')).token
+        await this.#windowsAuthority.namespaceSyncHandle(token)
+      } catch (error) {
+        if (!(error instanceof Error && 'authorityCode' in error
+          && (error as { authorityCode: string }).authorityCode === 'NS_EXISTS')) throw error
+        const existing = await this.#windowsAuthority.namespaceStat(relative)
+        if (existing.kind !== 'file') fail()
+      } finally {
+        if (token) await this.#windowsAuthority.namespaceCloseHandle(token).catch(fail)
+      }
+      await this.#windowsAuthority.namespaceSyncDirectory(this.#windowsKey)
+      return
+    }
     const handle = await open(
       this.child(name),
       fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0),
@@ -443,7 +531,7 @@ export class OpenCodeSafePublicationDirectory {
       const bytes = typeof content === 'string' ? Buffer.from(content) : new Uint8Array(content)
       try {
         const recoveryPrefix = `.${finalName}.recovery-required.`.toLowerCase()
-        const existingNames = await readdir(this.#root).catch(fail)
+        const existingNames = await this.#namespacePort().namespaceList(this.#windowsKey).catch(fail)
         await this.#assertWindowsRoot()
         if (existingNames.some(existing => existing.toLowerCase().startsWith(recoveryPrefix))) {
           throw new Error('OpenCode safe publication recovery is required [redacted]')
@@ -643,6 +731,13 @@ export class OpenCodeSafePublicationDirectory {
     if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     await this.#assertWindowsRoot()
     const finalName = childName(name)
+    if (this.#windowsAuthority) {
+      await testHooks?.afterTemporaryWrite?.()
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
+      await this.#namespacePort().namespacePublishImmutable(this.#relative(finalName), Buffer.from(content)).catch(fail)
+      await this.#windowsAuthority.namespaceSyncDirectory(this.#windowsKey).catch(fail)
+      return
+    }
     const target = this.child(finalName)
     const expected = Buffer.from(content)
     const temporaryPath = this.child(`.${finalName}.immutable.${process.pid}.${randomUUID()}`)
@@ -696,6 +791,16 @@ export class OpenCodeSafePublicationDirectory {
       await held.close()
     }
     await this.#assertWindowsRoot()
+  }
+
+  /** Cross-process lock whose namespace is owned by this retained authority. */
+  async acquireRetainedLock(
+    name: string,
+    options: Readonly<{ stale: number; update: number; retries: Readonly<{ retries: number; minTimeout: number; maxTimeout: number }> }>,
+    signal?: AbortSignal,
+  ): Promise<() => Promise<void>> {
+    if (!this.#windowsAuthority) fail()
+    return this.#namespacePort().namespaceAcquireLock(this.#relative(name), options, signal)
   }
 
   async close(): Promise<void> {
