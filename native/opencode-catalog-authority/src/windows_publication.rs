@@ -147,6 +147,12 @@ fn valid_root_input(value: &str) -> bool {
     })
 }
 
+fn materialization_evidence_within_limit(written: u64, additional: usize) -> bool {
+    written
+        .checked_add(additional as u64)
+        .is_some_and(|total| total <= 64 * 1024 * 1024)
+}
+
 struct HeldComponent {
     handle: std::fs::File,
     identity: crate::windows_identity::FileIdentity,
@@ -1373,6 +1379,16 @@ impl RetainedWindowsRoot {
             return Err("FILE_REJECTED");
         }
         self.validate()?;
+        let cumulative_written = self
+            .pinned_files
+            .iter()
+            .try_fold(0u64, |total, (_, _, _, written, _)| {
+                total.checked_add(*written)
+            })
+            .ok_or("FILE_REJECTED")?;
+        if !materialization_evidence_within_limit(cumulative_written, content.len()) {
+            return Err("FILE_REJECTED");
+        }
         let (_, file, identity, written, finished) = self
             .pinned_files
             .iter_mut()
@@ -1381,10 +1397,6 @@ impl RetainedWindowsRoot {
         if self.materialization_published
             || *finished
             || offset != *written
-            || offset
-                .checked_add(content.len() as u64)
-                .ok_or("FILE_REJECTED")?
-                > 16 * 1024 * 1024
             || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
                 != *identity
         {
@@ -3168,6 +3180,19 @@ mod protocol_tests {
         for value in ["", ".", "..", "a/b", "a\\b", "trailing.", "trailing "] {
             assert!(!valid_leaf(value));
         }
+    }
+    #[test]
+    fn materialization_evidence_limit_is_cumulative_and_inclusive() {
+        assert!(materialization_evidence_within_limit(0, 64 * 1024 * 1024));
+        assert!(materialization_evidence_within_limit(
+            32 * 1024 * 1024,
+            32 * 1024 * 1024
+        ));
+        assert!(!materialization_evidence_within_limit(
+            32 * 1024 * 1024,
+            32 * 1024 * 1024 + 1,
+        ));
+        assert!(!materialization_evidence_within_limit(u64::MAX, 1));
     }
     #[test]
     fn publication_frames_reject_unknown_fields() {

@@ -783,7 +783,7 @@ async function collectBehaviorDirectoryEntries(
   return entries
 }
 
-const OPEN_CODE_RETAINED_SNAPSHOT_FILE_MAX_BYTES = 16 * 1024 * 1024
+const OPEN_CODE_RETAINED_SNAPSHOT_CUMULATIVE_MAX_BYTES = 64 * 1024 * 1024
 
 /** Windows tree verification never leaves the retained native namespace. */
 async function verifyWindowsRetainedSnapshotTree(
@@ -802,6 +802,7 @@ async function verifyWindowsRetainedSnapshotTree(
     name.split(path.sep).join('/'), digest,
   ]))
   const expectedDirectories = new Set<string>([''])
+  let verifiedBytes = 0
   for (const file of normalizedFiles.keys()) {
     let directory = path.posix.dirname(file)
     while (directory !== '.') {
@@ -827,10 +828,14 @@ async function verifyWindowsRetainedSnapshotTree(
       const childRelative = relative ? `${relative}/${name}` : name
       const digest = normalizedFiles.get(childRelative)
       if (digest !== undefined) {
+        const remaining = OPEN_CODE_RETAINED_SNAPSHOT_CUMULATIVE_MAX_BYTES - verifiedBytes
         const bytes = await directory.readBoundedRegularBytes(
-          name, OPEN_CODE_RETAINED_SNAPSHOT_FILE_MAX_BYTES, abortSignal,
+          name, Math.min(OPEN_CODE_RETAINED_SNAPSHOT_CUMULATIVE_MAX_BYTES, remaining + 1), abortSignal,
         )
-        if (!bytes || hashBuffer(Buffer.from(bytes)) !== digest) {
+        if (!bytes) throw new Error('OpenCode retained snapshot fingerprint mismatch')
+        verifiedBytes += bytes.byteLength
+        if (verifiedBytes > OPEN_CODE_RETAINED_SNAPSHOT_CUMULATIVE_MAX_BYTES
+          || hashBuffer(Buffer.from(bytes)) !== digest) {
           throw new Error('OpenCode retained snapshot fingerprint mismatch')
         }
         continue

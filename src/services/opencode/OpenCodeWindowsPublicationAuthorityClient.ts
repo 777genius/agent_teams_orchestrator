@@ -19,6 +19,7 @@ export type OpenCodeWindowsPublicationAuthorityOptions = Readonly<{
 }>
 
 const unavailable = () => new Error('OpenCode Windows publication authority is unavailable [redacted]')
+const OPEN_CODE_WINDOWS_PUBLICATION_SETTLEMENT_RESERVE_MS = 1_000
 
 export class OpenCodeWindowsPublicationAuthorityClient {
   /** Settles only after the native process has exited and the OS has released every retained handle. */
@@ -26,6 +27,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   readonly #child: OpenCodeNativeAuthorityChild
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
   readonly #deadline: number
+  readonly #settlementDeadline: number
   readonly #signal?: AbortSignal
   readonly #decoder = new TextDecoder('utf-8', { fatal: true })
   readonly #cancelled: Promise<void>
@@ -34,10 +36,15 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #queue: Promise<void> = Promise.resolve()
   #closePromise: Promise<void> | undefined
   #ownerDeadline: ReturnType<typeof setTimeout> | undefined
-  #abort = () => { this.kill() }
+  #abort = () => { this.#cancel() }
 
   constructor(options: OpenCodeWindowsPublicationAuthorityOptions) {
     if (!Number.isFinite(options.deadline) || options.deadline <= openCodeMonotonicNow() || options.signal?.aborted) throw unavailable()
+    const defaultSettlementDeadline = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      options.deadline + OPEN_CODE_WINDOWS_PUBLICATION_SETTLEMENT_RESERVE_MS,
+    )
+    if (!Number.isFinite(defaultSettlementDeadline) || defaultSettlementDeadline < options.deadline) throw unavailable()
     this.#cancelled = new Promise(resolve => { this.#cancel = resolve })
     const artifacts = resolveOpenCodeNativeAuthorityArtifacts(options)
     if (!options.launch) verifyOpenCodeNativeAuthorityArtifacts(artifacts)
@@ -45,7 +52,8 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     // Attach both branches immediately: a hostile/test child must not create an
     // unhandled rejection, and process exit is the definitive OS handle-release boundary.
     this.physicalSettlement = this.#child.exited.then(() => undefined, () => undefined)
-    this.#child.unref(); this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline; this.#signal = options.signal
+    this.#child.unref(); this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline
+    this.#settlementDeadline = defaultSettlementDeadline; this.#signal = options.signal
     options.signal?.addEventListener('abort', this.#abort, { once: true })
   }
 
@@ -161,7 +169,8 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     return value as { token: string; volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }
   }
   async namespaceRead(token: string, size: number): Promise<Uint8Array> {
-    if (!/^[0-9a-f-]{36}$/.test(token) || !Number.isSafeInteger(size) || size < 0 || size > 1_048_576) throw unavailable()
+    if (!/^[0-9a-f-]{36}$/.test(token) || !Number.isSafeInteger(size) || size < 0
+      || size > 64 * 1024 * 1024) throw unavailable()
     const chunks: Uint8Array[] = []; let offset = 0
     while (offset < size) {
       const length = Math.min(32 * 1024, size - offset)
@@ -290,28 +299,31 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #armOwnerReaper(): void {
     if (this.#closed || !this.#retained) return
     if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
-    const remaining = Math.max(1, this.#deadline - openCodeMonotonicNow())
+    const remaining = Math.max(1, this.#settlementDeadline - openCodeMonotonicNow())
     // A live owner retains authority for its complete launch deadline. Owner
-    // loss is signalled by AbortSignal; this timer is only the immutable
-    // absolute-deadline backstop, never an independent lease.
+    // Caller cancellation only ends caller waits. This cleanup-only backstop
+    // bounds retained authority while queued physical rollback settles.
     this.#ownerDeadline = setTimeout(() => this.kill(), remaining)
     this.#ownerDeadline.unref?.()
   }
 
   async #request(request: Pending): Promise<unknown> {
+    const settlementCommand = request.op === 'ROLLBACK_DIRECTORY' || request.op === 'ROLLBACK_ATOMIC'
+      || request.op === 'MARK_RECOVERY_REQUIRED' || request.op === 'NS_RELEASE_LOCK' || request.op === 'CLOSE'
     let resolve!: (value: unknown) => void; let reject!: (reason?: unknown) => void
     const result = new Promise<unknown>((yes, no) => { resolve = yes; reject = no })
     const scheduled = this.#queue.then(async () => {
-      try { resolve(await this.#executeRequest(request)) } catch (error) { reject(error) }
+      try { resolve(await this.#executeRequest(request, settlementCommand)) } catch (error) { reject(error) }
     })
     this.#queue = scheduled.catch(() => {})
-    return result
+    if (settlementCommand) return result
+    return Promise.race([result, this.#cancelled.then(() => { throw unavailable() })])
   }
 
-  async #executeRequest(request: Pending): Promise<unknown> {
-    const settlementCommand = request.op === 'MARK_RECOVERY_REQUIRED' || request.op === 'NS_RELEASE_LOCK' || request.op === 'CLOSE'
-    if (this.#closed || this.#signal?.aborted || openCodeMonotonicNow() >= this.#deadline) throw unavailable()
-    const remaining = Math.max(0, this.#deadline - openCodeMonotonicNow())
+  async #executeRequest(request: Pending, settlementCommand: boolean): Promise<unknown> {
+    const physicalDeadline = settlementCommand ? this.#settlementDeadline : this.#deadline
+    if (this.#closed || openCodeMonotonicNow() >= physicalDeadline) throw unavailable()
+    const remaining = Math.max(0, physicalDeadline - openCodeMonotonicNow())
     const wire = { version: 1, ...request, wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeWindowsPublicationRequest
     const encoded = `${JSON.stringify(wire)}\n`
     if (new TextEncoder().encode(encoded).byteLength > OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES) throw unavailable()
@@ -319,12 +331,9 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     try {
       this.#child.stdin.write(encoded)
       const physical = Promise.race([this.#readLine(), this.#child.exited.then(() => { throw unavailable() })])
-      const line = await Promise.race([physical, this.#cancelled.then(() => { throw unavailable() }),
+      const line = await Promise.race([physical,
         new Promise<never>((_, reject) => { timer = setTimeout(() => { this.kill(); reject(unavailable()) }, remaining); timer.unref?.() })])
       const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
-      if (!settlementCommand && (this.#signal?.aborted || openCodeMonotonicNow() >= this.#deadline)) {
-        this.kill(); throw unavailable()
-      }
       if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'NS_RELEASE_LOCK' && request.op !== 'CLOSE') this.#armOwnerReaper()
       return value
     } catch (error) {

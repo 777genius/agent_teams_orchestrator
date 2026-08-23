@@ -130,6 +130,42 @@ describe('retained Windows profile snapshot verification', () => {
     expect(operations).toEqual(['list:parent', 'open:parent/plugins', 'list:root',
       'open:root/nested', 'list:nested', 'read:nested/plugin.js', 'close:nested', 'close:root'])
   })
+
+  test('accepts the inclusive 64 MiB retained evidence boundary without a per-file cap', async () => {
+    const first = Buffer.alloc(32 * 1024 * 1024, 0x61)
+    const second = Buffer.alloc(32 * 1024 * 1024, 0x62)
+    const maxima: number[] = []
+    const root = {
+      childNames: async () => ['first.bin', 'second.bin'],
+      readBoundedRegularBytes: async (name: string, maximum: number) => {
+        maxima.push(maximum); return name === 'first.bin' ? first : second
+      },
+      close: async () => {},
+    }
+    const parent = { childNames: async () => ['snapshot'], openChildDirectory: async () => root }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never,
+      'snapshot',
+      new Map([['first.bin', pureDigest(first)], ['second.bin', pureDigest(second)]]),
+    )).resolves.toBe(true)
+    expect(maxima).toEqual([64 * 1024 * 1024, 32 * 1024 * 1024 + 1])
+  })
+
+  test('rejects one byte beyond the cumulative 64 MiB retained evidence boundary', async () => {
+    const first = Buffer.alloc(32 * 1024 * 1024, 0x61)
+    const second = Buffer.alloc(32 * 1024 * 1024 + 1, 0x62)
+    const root = {
+      childNames: async () => ['first.bin', 'second.bin'],
+      readBoundedRegularBytes: async (name: string) => name === 'first.bin' ? first : second,
+      close: async () => {},
+    }
+    const parent = { childNames: async () => ['snapshot'], openChildDirectory: async () => root }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never,
+      'snapshot',
+      new Map([['first.bin', pureDigest(first)], ['second.bin', pureDigest(second)]]),
+    )).rejects.toThrow('fingerprint mismatch')
+  })
 })
 
 describe('pure planScopedProfile contract', () => {
