@@ -26,6 +26,14 @@ function fake() {
                     ? { content_base64: Buffer.from('abc').subarray(request.offset, request.offset + request.length).toString('base64') }
                     : request.op === 'NS_WRITE'
                       ? { written: String(request.offset + Buffer.from(request.content_base64, 'base64').length) }
+                      : request.op === 'NS_LIST'
+                        ? { names: ['journal', 'lock'] }
+                        : request.op === 'NS_MODIFIED_AT'
+                          ? { modifiedAt: 1234 }
+                          : request.op === 'NS_RECOVER_ATOMIC'
+                            ? { result: 'recovered' }
+                            : request.op === 'NS_ACQUIRE_LOCK'
+                              ? { token: request.token }
               : request.op === 'WRITE_CHILD_FILE'
                 ? { written: String(request.offset + Buffer.from(request.content_base64, 'base64').length), finished: request.finish }
                 : {}
@@ -239,5 +247,49 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(process.operations).toEqual(['OPEN_ROOT', 'NS_MKDIR', 'NS_OPEN', 'NS_WRITE',
       'NS_SYNC_HANDLE', 'NS_READ', 'NS_RENAME', 'NS_STAT', 'NS_CLOSE_HANDLE', 'NS_UNLINK',
       'NS_UNLINK', 'NS_SYNC_DIRECTORY', 'CLOSE'])
+  })
+  test('wires the complete retained namespace publication boundary and releases locks once', async () => {
+    const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: performance.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.namespaceList('nested')).resolves.toEqual(['journal', 'lock'])
+    await expect(client.namespaceModifiedAt('nested/journal', 'file')).resolves.toBe(1234)
+    await expect(client.namespaceRecoverAtomic('nested/auth.json', '.auth.json.recovery-required.'))
+      .resolves.toBe('recovered')
+    await client.namespacePublishImmutable('nested/evidence.json', new Uint8Array([1, 2, 3]))
+    await client.namespaceRemoveTree('nested/retired')
+    const release = await client.namespaceAcquireLock('nested/owner.lock', {
+      stale: 10_000, update: 1_000, retries: { retries: 0, minTimeout: 1, maxTimeout: 1 },
+    })
+    await release(); await release(); await client.close()
+    expect(process.operations).toEqual(['OPEN_ROOT', 'NS_LIST', 'NS_MODIFIED_AT', 'NS_RECOVER_ATOMIC',
+      'NS_PUBLISH_IMMUTABLE', 'NS_REMOVE_TREE', 'NS_ACQUIRE_LOCK', 'NS_RELEASE_LOCK', 'CLOSE'])
+    expect(process.requests[4]).toMatchObject({ path: 'nested/evidence.json', content_base64: 'AQID' })
+  })
+  test('rejects malformed retained namespace paths without writing protocol frames', async () => {
+    const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: performance.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.namespaceList('../escape')).rejects.toThrow('unavailable [redacted]')
+    await expect(client.namespacePublishImmutable('safe/NUL', new Uint8Array())).rejects.toThrow('unavailable [redacted]')
+    await expect(client.namespaceRecoverAtomic('auth.json', '../recovery')).rejects.toThrow('unavailable [redacted]')
+    await expect(client.namespaceRemoveTree('.')).rejects.toThrow('unavailable [redacted]')
+    expect(process.operations).toEqual(['OPEN_ROOT'])
+    client.kill()
+  })
+  test('physically releases an acquired retained lock when its caller cancels', async () => {
+    const process = fake(); const abort = new AbortController()
+    const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: performance.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await client.namespaceAcquireLock('owner.lock', {
+      stale: 10_000, update: 1_000, retries: { retries: 0, minTimeout: 1, maxTimeout: 1 },
+    }, abort.signal)
+    abort.abort(); await new Promise(resolve => setTimeout(resolve, 0))
+    expect(process.operations).toEqual(['OPEN_ROOT', 'NS_ACQUIRE_LOCK', 'NS_RELEASE_LOCK'])
+    await client.close()
   })
 })

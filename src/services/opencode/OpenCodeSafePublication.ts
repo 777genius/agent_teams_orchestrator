@@ -397,6 +397,28 @@ export class OpenCodeSafePublicationDirectory {
       return this.#windowsPassiveAuthority.readBounded(childName(name), maximumBytes, abortSignal)
     }
     await this.#assertWindowsRoot()
+    if (this.#windowsAuthority) {
+      const relative = this.#relative(name)
+      let metadata
+      try { metadata = await this.#windowsAuthority.namespaceStat(relative) }
+      catch (error) {
+        if (error instanceof Error && 'authorityCode' in error
+          && (error as { authorityCode: string }).authorityCode === 'NS_NOT_FOUND') return null
+        throw error
+      }
+      if (metadata.kind !== 'file' || BigInt(metadata.size) > BigInt(maximumBytes)) fail()
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
+      const opened = await this.#windowsAuthority.namespaceOpen(relative, 'read').catch(fail)
+      try {
+        if (opened.kind !== 'file' || opened.volumeSerial !== metadata.volumeSerial
+          || opened.fileId !== metadata.fileId || opened.size !== metadata.size) fail()
+        await testHooks?.afterPathIdentityCaptured?.()
+        if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
+        const bytes = await this.#windowsAuthority.namespaceRead(opened.token, Number(opened.size)).catch(fail)
+        if (bytes.byteLength !== Number(opened.size)) fail()
+        return bytes
+      } finally { await this.#windowsAuthority.namespaceCloseHandle(opened.token).catch(fail) }
+    }
     const target = this.child(name)
     let before
     try { before = await lstat(target, { bigint: true }) }
@@ -544,7 +566,7 @@ export class OpenCodeSafePublicationDirectory {
         await this.#assertWindowsRoot()
         await this.#windowsAuthority.prepareAtomic(
           finalName, temporaryName, backupName, quarantineName, recoveryName, bytes,
-          testHooks?.expectedPriorSha256,
+          testHooks?.expectedPriorSha256, this.#windowsKey,
         ).catch(fail)
         await testHooks?.afterRenameBeforeVerification?.()
         if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')

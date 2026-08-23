@@ -111,10 +111,10 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async prepareAtomic(finalName: string, temporaryName: string, backupName: string,
     quarantineName: string, recoveryName: string, content: Uint8Array,
-    expectedPrior: string | null | undefined = undefined): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string }>> {
+    expectedPrior: string | null | undefined = undefined, parentKey = '.'): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string }>> {
     if (![finalName, temporaryName, backupName, quarantineName, recoveryName].every(validOpenCodePublicationLeaf)
-      || content.byteLength > 44 * 1024) throw unavailable()
-    const value = await this.#request({ id: randomUUID(), op: 'PREPARE_ATOMIC', final_name: finalName,
+      || content.byteLength > 44 * 1024 || (parentKey !== '.' && !validOpenCodePublicationMaterializationKey(parentKey))) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'PREPARE_ATOMIC', parent_key: parentKey, final_name: finalName,
       temporary_name: temporaryName, backup_name: backupName, quarantine_name: quarantineName,
       recovery_name: recoveryName,
       expected_prior: expectedPrior === undefined ? 'any' : expectedPrior === null ? 'absent' : expectedPrior,
@@ -196,6 +196,80 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
     await this.#request({ id: randomUUID(), op: 'NS_SYNC_DIRECTORY', path: relativePath })
   }
+  async namespaceList(relativePath = '.'): Promise<readonly string[]> {
+    if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'NS_LIST', path: relativePath }) as Record<string, unknown>
+    if (!Array.isArray(value?.names) || !value.names.every(name => typeof name === 'string' && validOpenCodePublicationLeaf(name))) throw unavailable()
+    return value.names as string[]
+  }
+  async namespaceModifiedAt(relativePath: string, kind: 'file' | 'directory'): Promise<number> {
+    if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'NS_MODIFIED_AT', path: relativePath, kind }) as Record<string, unknown>
+    if (!Number.isFinite(value?.modifiedAt) || (value.modifiedAt as number) < 0) throw unavailable()
+    return value.modifiedAt as number
+  }
+  async namespaceRecoverAtomic(relativePath: string, recoveryPrefix: string): Promise<'none' | 'recovered'> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.'
+      || !recoveryPrefix || recoveryPrefix.length > 255 || /[<>:"/\\|?*\x00-\x1f]/.test(recoveryPrefix)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'NS_RECOVER_ATOMIC', path: relativePath,
+      recovery_prefix: recoveryPrefix }) as Record<string, unknown>
+    if (value?.result !== 'none' && value?.result !== 'recovered') throw unavailable()
+    return value.result
+  }
+  async namespacePublishImmutable(relativePath: string, content: Uint8Array): Promise<void> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.' || content.byteLength > 44 * 1024) throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_PUBLISH_IMMUTABLE', path: relativePath, token: randomUUID(),
+      content_base64: Buffer.from(content).toString('base64') })
+  }
+  async namespaceRemoveTree(relativePath: string): Promise<void> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_REMOVE_TREE', path: relativePath })
+  }
+  async namespaceAcquireLock(relativePath: string,
+    options: Readonly<{ stale: number; update: number; retries: Readonly<{ retries: number; minTimeout: number; maxTimeout: number }> }>,
+    signal?: AbortSignal): Promise<() => Promise<void>> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.'
+      || ![options.stale, options.update, options.retries.retries, options.retries.minTimeout, options.retries.maxTimeout]
+        .every(value => Number.isSafeInteger(value) && value >= 0 && value <= 0xffff_ffff)
+      || options.retries.retries > 100
+      || options.update <= 0 || options.stale <= options.update || options.retries.maxTimeout < options.retries.minTimeout
+      || signal?.aborted) throw unavailable()
+    const token = randomUUID()
+    let attempt = 0
+    for (;;) {
+      try {
+        await this.#request({ id: randomUUID(), op: 'NS_ACQUIRE_LOCK', path: relativePath, token, stale_ms: options.stale })
+        break
+      } catch (error) {
+        if (!(error instanceof OpenCodeWindowsPublicationRejectedError && error.authorityCode === 'NS_EXISTS')
+          || attempt >= options.retries.retries || signal?.aborted) throw error
+        const delay = Math.min(options.retries.maxTimeout, options.retries.minTimeout * (2 ** attempt++))
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, delay); timer.unref?.()
+          const abort = () => { clearTimeout(timer); reject(unavailable()) }
+          signal?.addEventListener('abort', abort, { once: true })
+        })
+      }
+    }
+    let released = false; let refreshFailed = false; let inFlight: Promise<void> | null = null
+    const refresh = setInterval(() => {
+      if (!released && !refreshFailed) void this.#request({ id: randomUUID(), op: 'NS_REFRESH_LOCK', token }).catch(() => {
+        refreshFailed = true; clearInterval(refresh); this.kill()
+      })
+    }, options.update)
+    refresh.unref?.()
+    const release = async (): Promise<void> => {
+      if (released) return
+      if (inFlight) return inFlight
+      clearInterval(refresh); signal?.removeEventListener('abort', abort)
+      inFlight = this.#request({ id: randomUUID(), op: 'NS_RELEASE_LOCK', token }).then(() => { released = true })
+      try { await inFlight } finally { if (!released) inFlight = null }
+    }
+    const abort = () => { void release().catch(() => this.kill()) }
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
+    return release
+  }
   async close(): Promise<void> { if (this.#closed) return; try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {} finally { this.kill() } }
   kill(): void { if (this.#closed) return; this.#closed = true; this.#cancel(); if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
 
@@ -221,7 +295,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
 
   async #executeRequest(request: Pending): Promise<unknown> {
-    const settlementCommand = request.op === 'MARK_RECOVERY_REQUIRED' || request.op === 'CLOSE'
+    const settlementCommand = request.op === 'MARK_RECOVERY_REQUIRED' || request.op === 'NS_RELEASE_LOCK' || request.op === 'CLOSE'
     if (this.#closed || this.#signal?.aborted || performance.now() >= this.#deadline) throw unavailable()
     const remaining = Math.max(0, this.#deadline - performance.now())
     const wire = { version: 1, ...request, wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeWindowsPublicationRequest
@@ -237,7 +311,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
       if (!settlementCommand && (this.#signal?.aborted || performance.now() >= this.#deadline)) {
         this.kill(); throw unavailable()
       }
-      if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'CLOSE') this.#armOwnerReaper()
+      if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'NS_RELEASE_LOCK' && request.op !== 'CLOSE') this.#armOwnerReaper()
       return value
     } catch (error) {
       if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained

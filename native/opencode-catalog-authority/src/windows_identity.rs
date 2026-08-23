@@ -93,6 +93,97 @@ extern "system" {
         length: u32,
         fs_information_class: i32,
     ) -> i32;
+    fn NtQueryDirectoryFile(
+        file_handle: HANDLE,
+        event: HANDLE,
+        apc_routine: *mut c_void,
+        apc_context: *mut c_void,
+        io_status_block: *mut IoStatusBlock,
+        file_information: *mut c_void,
+        length: u32,
+        file_information_class: i32,
+        return_single_entry: u8,
+        file_name: *mut UnicodeString,
+        restart_scan: u8,
+    ) -> i32;
+}
+
+/// Enumerate names from the retained directory object itself.  No DOS/Win32
+/// pathname is reconstructed, so replacement of any ancestor cannot redirect
+/// the scan.
+pub(super) fn list_relative_names(directory: &File) -> Result<Vec<String>, ()> {
+    let mut output = Vec::new();
+    let mut restart = 1u8;
+    loop {
+        let mut buffer = vec![0u8; 32 * 1024];
+        let mut status = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let result = unsafe {
+            NtQueryDirectoryFile(
+                directory.as_raw_handle(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut status,
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer.len() as u32,
+                12, // FileNamesInformation
+                0,
+                std::ptr::null_mut(),
+                restart,
+            )
+        };
+        restart = 0;
+        if result as u32 == 0x8000_0006 {
+            // STATUS_NO_MORE_FILES
+            break;
+        }
+        if result < 0 || status.information > buffer.len() {
+            return Err(());
+        }
+        let mut offset = 0usize;
+        loop {
+            if offset + 12 > status.information {
+                return Err(());
+            }
+            let next =
+                u32::from_ne_bytes(buffer[offset..offset + 4].try_into().map_err(|_| ())?) as usize;
+            let name_bytes =
+                u32::from_ne_bytes(buffer[offset + 8..offset + 12].try_into().map_err(|_| ())?)
+                    as usize;
+            if name_bytes % 2 != 0 || offset + 12 + name_bytes > status.information {
+                return Err(());
+            }
+            let wide = buffer[offset + 12..offset + 12 + name_bytes]
+                .chunks_exact(2)
+                .map(|value| u16::from_le_bytes([value[0], value[1]]))
+                .collect::<Vec<_>>();
+            let name = String::from_utf16(&wide).map_err(|_| ())?;
+            if name != "." && name != ".." {
+                if output.len() >= 4096
+                    || output.iter().map(String::len).sum::<usize>() + name.len() > 48 * 1024
+                {
+                    return Err(());
+                }
+                output.push(name);
+            }
+            if next == 0 {
+                break;
+            }
+            if next < 12
+                || offset
+                    .checked_add(next)
+                    .filter(|value| *value < status.information)
+                    .is_none()
+            {
+                return Err(());
+            }
+            offset += next;
+        }
+    }
+    Ok(output)
 }
 
 /// Prove the filesystem and device class on the retained volume handle. Path
@@ -176,6 +267,18 @@ pub(super) fn create_relative_directory(parent: &File, component: &Path) -> Resu
 pub(super) fn probe_relative_directory(parent: &File, component: &Path) -> Result<File, ()> {
     let (file, created) =
         open_relative_directory_with_disposition(parent, component, 1, false, false)?;
+    if created {
+        return Err(());
+    }
+    Ok(file)
+}
+
+pub(super) fn open_relative_directory_for_delete(
+    parent: &File,
+    component: &Path,
+) -> Result<File, ()> {
+    let (file, created) =
+        open_relative_directory_with_disposition(parent, component, 1, true, true)?;
     if created {
         return Err(());
     }

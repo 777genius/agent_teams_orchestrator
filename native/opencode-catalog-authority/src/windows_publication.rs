@@ -13,6 +13,10 @@ use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 const MAX_WIRE: usize = 64 * 1024;
 
+fn default_parent_key() -> String {
+    ".".to_string()
+}
+
 fn valid_id(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
@@ -118,9 +122,9 @@ fn valid_component(component: &str) -> bool {
         && component != "."
         && component != ".."
         && !matches!(component.chars().last(), Some('.' | ' '))
-        && !component
-            .chars()
-            .any(|c| c == '\0' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        && !component.chars().any(|c| {
+            c <= '\u{1f}' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
         && !reserved_device(component)
 }
 
@@ -165,6 +169,7 @@ struct RetainedWindowsRoot {
     materialization_root: Option<String>,
     materialization_rolled_back: bool,
     publication: Option<AtomicPublication>,
+    publication_parent_retained: bool,
     namespace_directories: Vec<(String, std::fs::File, crate::windows_identity::FileIdentity)>,
     namespace_handles: Vec<(
         String,
@@ -172,6 +177,12 @@ struct RetainedWindowsRoot {
         std::fs::File,
         crate::windows_identity::FileIdentity,
         bool,
+    )>,
+    namespace_locks: Vec<(
+        String,
+        String,
+        std::fs::File,
+        crate::windows_identity::FileIdentity,
     )>,
 }
 
@@ -308,6 +319,29 @@ fn verify_ntfs(wide: &[u16]) -> Result<(), &'static str> {
 }
 
 impl RetainedWindowsRoot {
+    fn begin_publication_parent(&mut self, parent_key: &str) -> Result<(), &'static str> {
+        if self.publication.is_some() || self.publication_parent_retained {
+            return Err("STATE_REJECTED");
+        }
+        if parent_key == "." {
+            return Ok(());
+        }
+        let (handle, identity) = self.namespace_directory(parent_key)?;
+        self.held.push(HeldComponent {
+            path: self.target.clone(),
+            handle,
+            identity,
+        });
+        self.publication_parent_retained = true;
+        Ok(())
+    }
+
+    fn finish_publication_parent(&mut self) {
+        if self.publication_parent_retained && self.publication.is_none() {
+            self.held.pop();
+            self.publication_parent_retained = false;
+        }
+    }
     fn validate_namespace(&self) -> Result<(), &'static str> {
         let final_component = self.held.last().ok_or("ROOT_REJECTED")?;
         crate::windows_identity::validate_local_ntfs(&final_component.handle)
@@ -728,6 +762,321 @@ impl RetainedWindowsRoot {
         directory.sync_all().map_err(|_| "FILE_REJECTED")?;
         Ok(json!({}))
     }
+
+    fn namespace_list(&mut self, path: &str) -> Result<Value, &'static str> {
+        let (directory, identity) = self.namespace_directory(path)?;
+        validate_retained_directory(&directory, identity)?;
+        let mut names = crate::windows_identity::list_relative_names(&directory)
+            .map_err(|_| "FILE_REJECTED")?;
+        if names.iter().any(|name| !valid_leaf(name)) {
+            return Err("FILE_REJECTED");
+        }
+        names.sort_unstable();
+        Ok(json!({"names":names}))
+    }
+
+    fn namespace_modified_at(&mut self, path: &str, kind: &str) -> Result<Value, &'static str> {
+        let file = if path == "." || kind == "directory" {
+            let (file, identity) = self.namespace_directory(path)?;
+            validate_retained_directory(&file, identity)?;
+            file
+        } else if kind == "file" {
+            let (parent_key, name) = Self::namespace_parent(path)?;
+            let (parent, _) = self.namespace_directory(parent_key)?;
+            crate::windows_identity::open_relative_file(&parent, Path::new(name))
+                .map_err(|_| "NS_NOT_FOUND")?
+        } else {
+            return Err("STATE_REJECTED");
+        };
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if (kind == "file" && !metadata.is_file())
+            || (kind == "directory" && !metadata.is_dir())
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err("FILE_REJECTED");
+        }
+        const WINDOWS_TO_UNIX_100NS: u64 = 116_444_736_000_000_000;
+        let modified = metadata
+            .last_write_time()
+            .saturating_sub(WINDOWS_TO_UNIX_100NS)
+            / 10_000;
+        Ok(json!({"modifiedAt":modified}))
+    }
+
+    fn namespace_publish_immutable(
+        &mut self,
+        path: &str,
+        token: &str,
+        content: &[u8],
+    ) -> Result<Value, &'static str> {
+        if !valid_id(token) {
+            return Err("STATE_REJECTED");
+        }
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        let temporary_name = format!(".{name}.immutable.{token}");
+        if !valid_leaf(&temporary_name) {
+            return Err("LEAF_REJECTED");
+        }
+        let mut temporary =
+            crate::windows_identity::create_relative_file(&parent, Path::new(&temporary_name))
+                .map_err(|_| "FILE_REJECTED")?;
+        let result = (|| {
+            temporary.write_all(content).map_err(|_| "FILE_REJECTED")?;
+            temporary.sync_all().map_err(|_| "FILE_REJECTED")?;
+            match crate::windows_identity::link_relative(&temporary, &parent, Path::new(name)) {
+                Ok(()) => parent.sync_all().map_err(|_| "FILE_REJECTED")?,
+                Err(()) => {}
+            }
+            let mut published =
+                crate::windows_identity::open_relative_file(&parent, Path::new(name))
+                    .map_err(|_| "FILE_REJECTED")?;
+            let metadata = published.metadata().map_err(|_| "FILE_REJECTED")?;
+            if !metadata.is_file() || metadata.file_size() != content.len() as u64 {
+                return Err("FILE_REJECTED");
+            }
+            let mut actual = Vec::with_capacity(content.len() + 1);
+            Read::by_ref(&mut published)
+                .take(content.len() as u64 + 1)
+                .read_to_end(&mut actual)
+                .map_err(|_| "FILE_REJECTED")?;
+            if actual != content {
+                return Err("FILE_REJECTED");
+            }
+            published.sync_all().map_err(|_| "FILE_REJECTED")?;
+            Ok(json!({}))
+        })();
+        crate::windows_identity::delete_on_close(&temporary).map_err(|_| "FILE_REJECTED")?;
+        drop(temporary);
+        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        result
+    }
+
+    fn remove_tree_entry(
+        parent: &std::fs::File,
+        name: &str,
+        depth: usize,
+    ) -> Result<(), &'static str> {
+        if !valid_leaf(name) || depth > 256 {
+            return Err("LEAF_REJECTED");
+        }
+        if let Ok(directory) =
+            crate::windows_identity::open_relative_directory_for_delete(parent, Path::new(name))
+        {
+            let names = crate::windows_identity::list_relative_names(&directory)
+                .map_err(|_| "FILE_REJECTED")?;
+            for child in names {
+                Self::remove_tree_entry(&directory, &child, depth + 1)?;
+            }
+            crate::windows_identity::delete_on_close(&directory).map_err(|_| "NS_NOT_EMPTY")?;
+            drop(directory);
+        } else {
+            let file = crate::windows_identity::open_relative_file(parent, Path::new(name))
+                .map_err(|_| "NS_NOT_FOUND")?;
+            crate::windows_identity::delete_on_close(&file).map_err(|_| "FILE_REJECTED")?;
+            drop(file);
+        }
+        parent.sync_all().map_err(|_| "FILE_REJECTED")
+    }
+
+    fn namespace_remove_tree(&mut self, path: &str) -> Result<Value, &'static str> {
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        self.namespace_handles
+            .retain(|(_, key, _, _, _)| key != path && !key.starts_with(&format!("{path}/")));
+        self.namespace_directories
+            .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        Self::remove_tree_entry(&parent, name, 0)?;
+        Ok(json!({}))
+    }
+
+    fn namespace_acquire_lock(
+        &mut self,
+        path: &str,
+        token: &str,
+        stale_ms: u64,
+    ) -> Result<Value, &'static str> {
+        if !valid_id(token)
+            || stale_ms == 0
+            || self
+                .namespace_locks
+                .iter()
+                .any(|(value, _, _, _)| value == token)
+        {
+            return Err("STATE_REJECTED");
+        }
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        let mut file = match crate::windows_identity::create_relative_file(&parent, Path::new(name))
+        {
+            Ok(file) => file,
+            Err(()) => {
+                let existing =
+                    crate::windows_identity::open_relative_file(&parent, Path::new(name))
+                        .map_err(|_| "NS_EXISTS")?;
+                const WINDOWS_TO_UNIX_100NS: u64 = 116_444_736_000_000_000;
+                let modified = existing
+                    .metadata()
+                    .map_err(|_| "NS_EXISTS")?
+                    .last_write_time()
+                    .saturating_sub(WINDOWS_TO_UNIX_100NS)
+                    / 10_000;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "NS_EXISTS")?
+                    .as_millis() as u64;
+                if now.saturating_sub(modified) <= stale_ms {
+                    return Err("NS_EXISTS");
+                }
+                crate::windows_identity::delete_on_close(&existing).map_err(|_| "NS_EXISTS")?;
+                drop(existing);
+                parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+                crate::windows_identity::create_relative_file(&parent, Path::new(name))
+                    .map_err(|_| "NS_EXISTS")?
+            }
+        };
+        file.write_all(token.as_bytes())
+            .map_err(|_| "FILE_REJECTED")?;
+        file.sync_all().map_err(|_| "FILE_REJECTED")?;
+        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        self.namespace_locks
+            .push((token.to_string(), path.to_string(), file, identity));
+        Ok(json!({"token":token}))
+    }
+
+    fn namespace_refresh_lock(&mut self, token: &str) -> Result<Value, &'static str> {
+        let (_, _, file, identity) = self
+            .namespace_locks
+            .iter_mut()
+            .find(|(value, _, _, _)| value == token)
+            .ok_or("STATE_REJECTED")?;
+        if crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")? != *identity {
+            return Err("FILE_REJECTED");
+        }
+        file.set_len(0).map_err(|_| "FILE_REJECTED")?;
+        file.write_all(token.as_bytes())
+            .map_err(|_| "FILE_REJECTED")?;
+        file.sync_all().map_err(|_| "FILE_REJECTED")?;
+        Ok(json!({}))
+    }
+
+    fn namespace_release_lock(&mut self, token: &str) -> Result<Value, &'static str> {
+        let Some(index) = self
+            .namespace_locks
+            .iter()
+            .position(|(value, _, _, _)| value == token)
+        else {
+            return Ok(json!({"released":false}));
+        };
+        let (_, path, file, identity) = &self.namespace_locks[index];
+        if crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")? != *identity {
+            return Err("FILE_REJECTED");
+        }
+        crate::windows_identity::delete_on_close(file).map_err(|_| "FILE_REJECTED")?;
+        let path = path.clone();
+        let (_, _, file, _) = self.namespace_locks.remove(index);
+        drop(file);
+        let (parent_key, _) = Self::namespace_parent(&path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        Ok(json!({"released":true}))
+    }
+
+    fn release_all_namespace_locks(&mut self) -> Result<(), &'static str> {
+        while let Some((token, _, _, _)) = self.namespace_locks.last() {
+            let token = token.clone();
+            self.namespace_release_lock(&token)?;
+        }
+        Ok(())
+    }
+
+    fn namespace_recover_atomic(
+        &mut self,
+        path: &str,
+        prefix: &str,
+    ) -> Result<Value, &'static str> {
+        if prefix.is_empty()
+            || prefix.len() > 255
+            || prefix.chars().any(|value| {
+                value <= '\u{1f}'
+                    || matches!(value, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            })
+        {
+            return Err("LEAF_REJECTED");
+        }
+        let (parent_key, final_name) = Self::namespace_parent(path)?;
+        let (parent, identity) = self.namespace_directory(parent_key)?;
+        let prefix = prefix.to_ascii_lowercase();
+        let mut recovery_names = crate::windows_identity::list_relative_names(&parent)
+            .map_err(|_| "RECOVERY_REQUIRED")?
+            .into_iter()
+            .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        recovery_names.sort_unstable();
+        if recovery_names.is_empty() {
+            return Ok(json!({"result":"none"}));
+        }
+        let mut recovery_root = RetainedWindowsRoot {
+            target: self.target.clone(),
+            held: vec![HeldComponent {
+                path: self.target.clone(),
+                handle: parent,
+                identity,
+            }],
+            pinned: Vec::new(),
+            pinned_directories: Vec::new(),
+            pinned_files: Vec::new(),
+            materialization_published: false,
+            materialization_root: None,
+            materialization_rolled_back: false,
+            publication: None,
+            publication_parent_retained: false,
+            namespace_directories: Vec::new(),
+            namespace_handles: Vec::new(),
+            namespace_locks: Vec::new(),
+        };
+        for recovery_name in recovery_names {
+            if !valid_leaf(&recovery_name) {
+                return Err("RECOVERY_REQUIRED");
+            }
+            let parent = &recovery_root.held.last().ok_or("ROOT_REJECTED")?.handle;
+            let mut record_file =
+                crate::windows_identity::open_relative_file(parent, Path::new(&recovery_name))
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut record_file)
+                .take(MAX_WIRE as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "RECOVERY_REQUIRED")?;
+            if bytes.len() > MAX_WIRE {
+                return Err("RECOVERY_REQUIRED");
+            }
+            let complete_length = bytes.iter().rposition(|value| *value == b'\n').unwrap_or(0);
+            let last_record = bytes[..complete_length]
+                .split(|value| *value == b'\n')
+                .filter(|line| !line.is_empty())
+                .last()
+                .and_then(|line| serde_json::from_slice::<AtomicRecoveryRecord>(line).ok());
+            let decision = match last_record {
+                Some(record)
+                    if record.final_name == final_name && record.recovery_name == recovery_name =>
+                {
+                    if record.stage == "published" {
+                        "commit"
+                    } else {
+                        "rollback"
+                    }
+                }
+                Some(_) => return Err("RECOVERY_REQUIRED"),
+                None => "rollback",
+            };
+            drop(record_file);
+            recovery_root.recover_atomic(&recovery_name, decision)?;
+        }
+        Ok(json!({"result":"recovered"}))
+    }
     fn open(
         target: PathBuf,
         create: bool,
@@ -794,8 +1143,10 @@ impl RetainedWindowsRoot {
             materialization_root: None,
             materialization_rolled_back: false,
             publication: None,
+            publication_parent_retained: false,
             namespace_directories: Vec::new(),
             namespace_handles: Vec::new(),
+            namespace_locks: Vec::new(),
         };
         root.validate()?;
         Ok((root, created))
@@ -823,7 +1174,7 @@ impl RetainedWindowsRoot {
     }
 
     fn sync(&self) -> Result<(), &'static str> {
-        self.validate()?;
+        self.validate_namespace()?;
         self.held
             .last()
             .ok_or("ROOT_REJECTED")?
@@ -1185,7 +1536,7 @@ impl RetainedWindowsRoot {
         {
             return Err("STATE_REJECTED");
         }
-        self.validate()?;
+        self.validate_namespace()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let mut recovery =
             crate::windows_identity::create_relative_file(parent, Path::new(recovery_name))
@@ -1344,7 +1695,7 @@ impl RetainedWindowsRoot {
     }
 
     fn write_recovery_record(&mut self) -> Result<(), &'static str> {
-        self.validate()?;
+        self.validate_namespace()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let Some(publication) = self.publication.as_mut() else {
             return Err("STATE_REJECTED");
@@ -1413,7 +1764,7 @@ impl RetainedWindowsRoot {
         {
             return Err("STATE_REJECTED");
         }
-        self.validate()?;
+        self.validate_namespace()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let Some(mut recovery) =
             crate::windows_identity::open_relative_file_optional(parent, Path::new(recovery_name))
@@ -1765,7 +2116,7 @@ impl RetainedWindowsRoot {
     }
 
     fn settle_atomic(&mut self, rollback: bool) -> Result<Value, &'static str> {
-        self.validate()?;
+        self.validate_namespace()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
         if !rollback {
@@ -2023,6 +2374,8 @@ enum Request {
         version: u8,
         id: String,
         wait_ms: u32,
+        #[serde(default = "default_parent_key")]
+        parent_key: String,
         final_name: String,
         temporary_name: String,
         backup_name: String,
@@ -2121,6 +2474,60 @@ enum Request {
         id: String,
         wait_ms: u32,
         path: String,
+    },
+    NS_LIST {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+    },
+    NS_MODIFIED_AT {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        kind: String,
+    },
+    NS_RECOVER_ATOMIC {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        recovery_prefix: String,
+    },
+    NS_PUBLISH_IMMUTABLE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        token: String,
+        content_base64: String,
+    },
+    NS_REMOVE_TREE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+    },
+    NS_ACQUIRE_LOCK {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        token: String,
+        stale_ms: u64,
+    },
+    NS_REFRESH_LOCK {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
+    },
+    NS_RELEASE_LOCK {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
     },
     SYNC_ROOT {
         version: u8,
@@ -2294,6 +2701,54 @@ impl Request {
                 wait_ms,
                 ..
             }
+            | Self::NS_LIST {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_MODIFIED_AT {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_RECOVER_ATOMIC {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_PUBLISH_IMMUTABLE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_REMOVE_TREE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_ACQUIRE_LOCK {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_REFRESH_LOCK {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_RELEASE_LOCK {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
             | Self::CLOSE {
                 version,
                 id,
@@ -2449,6 +2904,7 @@ pub fn run() {
                 false,
             ),
             Request::PREPARE_ATOMIC {
+                parent_key,
                 final_name,
                 temporary_name,
                 backup_name,
@@ -2460,7 +2916,8 @@ pub fn run() {
             } => (
                 decode_bounded_base64(&content_base64).and_then(|content| {
                     root.as_mut().ok_or("ROOT_REQUIRED").and_then(|v| {
-                        v.prepare_atomic(
+                        v.begin_publication_parent(&parent_key)?;
+                        let result = v.prepare_atomic(
                             &final_name,
                             &temporary_name,
                             &backup_name,
@@ -2468,7 +2925,11 @@ pub fn run() {
                             &recovery_name,
                             &content,
                             &expected_prior,
-                        )
+                        );
+                        if result.is_err() && v.publication.is_none() {
+                            v.finish_publication_parent();
+                        }
+                        result
                     })
                 }),
                 false,
@@ -2480,15 +2941,23 @@ pub fn run() {
                 false,
             ),
             Request::COMMIT_ATOMIC { .. } => (
-                root.as_mut()
-                    .ok_or("ROOT_REQUIRED")
-                    .and_then(|v| v.settle_atomic(false)),
+                root.as_mut().ok_or("ROOT_REQUIRED").and_then(|v| {
+                    let result = v.settle_atomic(false);
+                    if result.is_ok() {
+                        v.finish_publication_parent();
+                    }
+                    result
+                }),
                 false,
             ),
             Request::ROLLBACK_ATOMIC { .. } => (
-                root.as_mut()
-                    .ok_or("ROOT_REQUIRED")
-                    .and_then(|v| v.settle_atomic(true)),
+                root.as_mut().ok_or("ROOT_REQUIRED").and_then(|v| {
+                    let result = v.settle_atomic(true);
+                    if result.is_ok() {
+                        v.finish_publication_parent();
+                    }
+                    result
+                }),
                 false,
             ),
             Request::RECOVER_ATOMIC {
@@ -2585,11 +3054,75 @@ pub fn run() {
                     .and_then(|v| v.namespace_sync_directory(&path)),
                 false,
             ),
-            Request::CLOSE { .. } => match root
-                .as_mut()
-                .ok_or("ROOT_REQUIRED")
-                .and_then(|value| value.mark_recovery_required())
-            {
+            Request::NS_LIST { path, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_list(&path)),
+                false,
+            ),
+            Request::NS_MODIFIED_AT { path, kind, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_modified_at(&path, &kind)),
+                false,
+            ),
+            Request::NS_RECOVER_ATOMIC {
+                path,
+                recovery_prefix,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_recover_atomic(&path, &recovery_prefix)),
+                false,
+            ),
+            Request::NS_PUBLISH_IMMUTABLE {
+                path,
+                token,
+                content_base64,
+                ..
+            } => (
+                decode_bounded_base64(&content_base64).and_then(|content| {
+                    root.as_mut()
+                        .ok_or("ROOT_REQUIRED")
+                        .and_then(|v| v.namespace_publish_immutable(&path, &token, &content))
+                }),
+                false,
+            ),
+            Request::NS_REMOVE_TREE { path, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_remove_tree(&path)),
+                false,
+            ),
+            Request::NS_ACQUIRE_LOCK {
+                path,
+                token,
+                stale_ms,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_acquire_lock(&path, &token, stale_ms)),
+                false,
+            ),
+            Request::NS_REFRESH_LOCK { token, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_refresh_lock(&token)),
+                false,
+            ),
+            Request::NS_RELEASE_LOCK { token, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_release_lock(&token)),
+                false,
+            ),
+            Request::CLOSE { .. } => match root.as_mut().ok_or("ROOT_REQUIRED").and_then(|value| {
+                value
+                    .mark_recovery_required()
+                    .and_then(|_| value.release_all_namespace_locks())
+            }) {
                 Ok(_) => {
                     root.take();
                     (Ok(json!({"closed":true})), true)

@@ -13,7 +13,7 @@ export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'WRITE_CHILD_FILE'; wait_ms: number; key: string; offset: number; content_base64: string; finish: boolean }
   | { version: 1; id: string; op: 'RENAME_DIRECTORY'; wait_ms: number; from: string; to: string }
   | { version: 1; id: string; op: 'ROLLBACK_DIRECTORY'; wait_ms: number; root_key: string }
-  | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; expected_prior: string; content_base64: string }
+  | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; parent_key: string; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; expected_prior: string; content_base64: string }
   | { version: 1; id: string; op: 'MARK_RECOVERY_REQUIRED'; wait_ms: number }
   | { version: 1; id: string; op: 'COMMIT_ATOMIC' | 'ROLLBACK_ATOMIC'; wait_ms: number }
   | { version: 1; id: string; op: 'RECOVER_ATOMIC'; wait_ms: number; recovery_name: string; decision: 'commit' | 'rollback' }
@@ -26,11 +26,18 @@ export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'NS_RENAME'; wait_ms: number; from: string; to: string }
   | { version: 1; id: string; op: 'NS_UNLINK'; wait_ms: number; path: string; directory: boolean }
   | { version: 1; id: string; op: 'NS_SYNC_DIRECTORY'; wait_ms: number; path: string }
+  | { version: 1; id: string; op: 'NS_LIST'; wait_ms: number; path: string }
+  | { version: 1; id: string; op: 'NS_MODIFIED_AT'; wait_ms: number; path: string; kind: 'file' | 'directory' }
+  | { version: 1; id: string; op: 'NS_RECOVER_ATOMIC'; wait_ms: number; path: string; recovery_prefix: string }
+  | { version: 1; id: string; op: 'NS_PUBLISH_IMMUTABLE'; wait_ms: number; path: string; token: string; content_base64: string }
+  | { version: 1; id: string; op: 'NS_REMOVE_TREE'; wait_ms: number; path: string }
+  | { version: 1; id: string; op: 'NS_ACQUIRE_LOCK'; wait_ms: number; path: string; token: string; stale_ms: number }
+  | { version: 1; id: string; op: 'NS_REFRESH_LOCK' | 'NS_RELEASE_LOCK'; wait_ms: number; token: string }
 
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|clock\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\..*)?$/i
 
 function validWindowsComponent(value: string): boolean {
-  return value.length > 0 && value !== '.' && value !== '..' && !/[<>:"/\\|?*\0]/.test(value)
+  return value.length > 0 && value !== '.' && value !== '..' && !/[<>:"/\\|?*\x00-\x1f]/.test(value)
     && !/[. ]$/.test(value) && !WINDOWS_DEVICE.test(value)
 }
 

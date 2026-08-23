@@ -50,6 +50,8 @@ describe('OpenCode Windows retained caller layer', () => {
     expect(safe).toContain('namespaceList(this.#windowsKey)')
     expect(safe).toContain("namespaceModifiedAt(this.#relative(name), 'file')")
     expect(safe).toContain('.namespaceRecoverAtomic(this.#relative(finalName), recoveryPrefix)')
+    expect(safe).toContain('testHooks?.expectedPriorSha256, this.#windowsKey')
+    expect(safe).toContain("namespaceOpen(relative, 'read')")
     expect(safe).toContain('namespacePublishImmutable(this.#relative(finalName)')
     expect(safe).toContain('namespaceRemoveTree(this.#relative(retiredName))')
     expect(safe).toContain('namespaceAcquireLock(this.#relative(name)')

@@ -5,7 +5,7 @@ import { decodeOpenCodeWindowsPublicationReply, validOpenCodePublicationLeaf,
 describe('OpenCodeWindowsPublicationAuthorityProtocol', () => {
   test('accepts bounded correlated replies and rejects unsafe leaves', () => {
     expect(decodeOpenCodeWindowsPublicationReply('{"version":1,"id":"a","ok":true,"value":{}}', 'a')).toEqual({})
-    for (const leaf of ['', '.', '..', 'a/b', 'a\\b', 'trailing.', 'trailing ',
+    for (const leaf of ['', '.', '..', 'a/b', 'a\\b', 'line\nbreak', 'trailing.', 'trailing ',
       'auth.json:secret', 'CON', 'nul.txt', 'COM1.log']) expect(validOpenCodePublicationLeaf(leaf)).toBe(false)
     expect(validOpenCodePublicationLeaf('passive-status.sqlite3')).toBe(true)
     for (const root of ['C:\\safe:stream', '\\\\?\\C:\\safe', '\\\\.\\C:\\safe',

@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -157,20 +158,19 @@ describe('Windows retained publication native contract', () => {
     }
     await root.close()
 
-    let sequence = 0
     for (const candidate of [`${sandbox}:stream`, `\\\\?\\${sandbox}`, `\\\\.\\${sandbox}`,
       `${sandbox}\\..\\${path.basename(sandbox)}`, `${sandbox}\\.\\child`, `${sandbox}\\NUL`]) {
-      const id = `native-root-${++sequence}`
+      const id = randomUUID()
       const [reply] = await nativeRequests([{ version: 1, id, op: 'OPEN_ROOT', wait_ms: 5_000,
         root_path: candidate, create_missing: false, durable_ancestors: false }])
       expect(reply).toMatchObject({ version: 1, id, ok: false })
     }
     for (const leaf of ['auth.json:stream', 'CON', 'NUL.txt', 'COM1.log', '..']) {
-      const openId = `native-open-${++sequence}`; const leafId = `native-leaf-${sequence}`
+      const openId = randomUUID(); const leafId = randomUUID()
       const replies = await nativeRequests([
         { version: 1, id: openId, op: 'OPEN_ROOT', wait_ms: 5_000, root_path: sandbox,
           create_missing: false, durable_ancestors: false },
-        { version: 1, id: leafId, op: 'PIN_REGULAR', wait_ms: 5_000, name: leaf },
+        { version: 1, id: leafId, op: 'PIN_REGULAR', wait_ms: 5_000, parent_key: '.', name: leaf },
       ])
       expect(replies[0]).toMatchObject({ version: 1, id: openId, ok: true })
       expect(replies[1]).toMatchObject({ version: 1, id: leafId, ok: false })
@@ -224,26 +224,48 @@ describe('Windows retained publication native contract', () => {
     expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"old":true}')
     await rename(root, displaced); await rename(displaced, root)
   })
-  windowsTest('a crashed atomic publication leaves recovery-required evidence and blocks retry', async () => {
+  windowsTest('retained namespace primitives list, publish, clean and release without pathname fallback', async () => {
+    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-namespace-primitives-')); roots.push(sandbox)
+    await mkdir(path.join(sandbox, 'retired', 'nested'), { recursive: true })
+    await writeFile(path.join(sandbox, 'retired', 'nested', 'old.txt'), 'old')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    await client.openRoot(sandbox, false, false)
+    expect(await client.namespaceList('.')).toContain('retired')
+    expect(await client.namespaceModifiedAt('retired', 'directory')).toBeGreaterThan(0)
+    await client.namespacePublishImmutable('evidence.json', Buffer.from('{"stable":true}'))
+    await client.namespacePublishImmutable('evidence.json', Buffer.from('{"stable":true}'))
+    expect(await readFile(path.join(sandbox, 'evidence.json'), 'utf8')).toBe('{"stable":true}')
+    await client.namespaceRemoveTree('retired')
+    expect(await readdir(sandbox)).not.toContain('retired')
+    const release = await client.namespaceAcquireLock('owner.lock', {
+      stale: 5_000, update: 1_000, retries: { retries: 1, minTimeout: 1, maxTimeout: 1 },
+    })
+    expect(await readFile(path.join(sandbox, 'owner.lock'), 'utf8')).not.toBe('')
+    await release(); await release()
+    expect(await readdir(sandbox)).not.toContain('owner.lock')
+    await client.close()
+  })
+  windowsTest('a crashed atomic publication is identity-recovered and never wedges its successor', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-crash-evidence-')); roots.push(sandbox)
     const root = path.join(sandbox, 'profile'); await mkdir(root)
     await writeFile(path.join(root, 'auth.json'), '{"prior":true}')
     const replies = await nativeRequests([
-      { version: 1, id: 'crash-open', op: 'OPEN_ROOT', wait_ms: 5_000, root_path: root,
+      { version: 1, id: randomUUID(), op: 'OPEN_ROOT', wait_ms: 5_000, root_path: root,
         create_missing: false, durable_ancestors: false },
-      { version: 1, id: 'crash-prepare', op: 'PREPARE_ATOMIC', wait_ms: 5_000,
+      { version: 1, id: randomUUID(), op: 'PREPARE_ATOMIC', wait_ms: 5_000,
         final_name: 'auth.json', temporary_name: '.auth.json.tmp.crash',
         backup_name: '.auth.json.rollback.crash', quarantine_name: '.auth.json.quarantine.crash',
         recovery_name: '.auth.json.recovery-required.crash',
+        expected_prior: 'any',
         content_base64: Buffer.from('{"attempt":true}').toString('base64') },
     ])
     expect(replies).toMatchObject([{ ok: true }, { ok: true }])
     expect(await readFile(path.join(root, '.auth.json.recovery-required.crash'), 'utf8'))
-      .toBe('opencode-windows-atomic-recovery-required-v1\n')
+      .toContain('"stage":"published"')
     const directory = await OpenCodeSafePublicationDirectory.open(root)
-    await expect(directory.writeFileAtomic('auth.json', '{"retry":true}'))
-      .rejects.toThrow('recovery is required [redacted]')
+    await directory.writeFileAtomic('auth.json', '{"retry":true}')
     await directory.close()
-    expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"attempt":true}')
+    expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"retry":true}')
+    expect((await readdir(root)).filter(name => name.includes('recovery-required'))).toEqual([])
   })
 })
