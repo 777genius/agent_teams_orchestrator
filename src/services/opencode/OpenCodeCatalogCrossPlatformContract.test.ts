@@ -105,7 +105,10 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('windows_vfs::name()')
     expect(source).toContain('windows_vfs::release()')
     expect(source.match(/windows_vfs::release\(\)/g)?.length).toBe(1)
-    expect(source).toContain('GENERIC_READ | GENERIC_WRITE')
+    expect(identity).toContain('root_directory: parent.as_raw_handle()')
+    expect(identity).toContain('FILE_OPEN_IF makes creation/open one indivisible')
+    expect(identity).toContain('0x0010_0000')
+    expect(identity).toContain('0x0000_0002 | 0x0000_0004')
     expect(source).not.toContain('FlushFileBuffers(parent.as_raw_handle()')
     expect(vfs).toContain('sqlite3_vfs_register')
     expect(vfs).toContain('.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)')
@@ -116,13 +119,17 @@ describe('native catalog cross-platform source contract', () => {
     expect(vfs).toContain('JOURNAL_REPLACED')
     expect(vfs).toContain('Release the retained baselines only when the attempt closes')
     expect(vfs).not.toContain('FILE_SHARE_DELETE')
-    expect(identity).toContain('GetFileInformationByHandle')
-    expect(identity).toContain('BY_HANDLE_FILE_INFORMATION')
+    expect(identity).toContain('GetFileInformationByHandleEx')
+    expect(identity).toContain('FILE_ID_INFO')
     expect(identity).toContain('file.as_raw_handle()')
-    expect(identity).toContain('nFileIndexHigh as u64) << 32')
+    expect(identity).toContain('u128::from_le_bytes(information.FileId.Identifier)')
+    expect(identity).toContain('GetVolumeInformationByHandleW')
+    expect(identity).toContain('NtQueryVolumeInformationFile')
+    expect(identity).toContain('device.device_type != FILE_DEVICE_DISK')
+    expect(identity).toContain('device.characteristics & (0x0000_0001 | 0x0000_0010) != 0')
+    expect(source).toContain('windows_identity::validate_local_ntfs(&root_handle)')
     expect(source).toContain('Win32::System::WindowsProgramming::DRIVE_FIXED')
-    expect(source).toMatch(/Win32::Foundation::\{[^}]*GENERIC_READ,[^}]*GENERIC_WRITE,[^}]*INVALID_HANDLE_VALUE/)
-    expect(source).not.toMatch(/Win32::Storage::FileSystem::\{[^}]*\b(?:DRIVE_FIXED|GENERIC_READ|GENERIC_WRITE)\b/)
+    expect(source).not.toMatch(/Win32::Storage::FileSystem::\{[^}]*\bDRIVE_FIXED\b/)
     for (const unstable of ['.volume_serial_number()', '.file_index()']) {
       expect(source).not.toContain(unstable)
       expect(vfs).not.toContain(unstable)
@@ -147,8 +154,12 @@ describe('native catalog cross-platform source contract', () => {
       'CreateJobObjectW', 'SetInformationJobObject']) expect(launcher).toContain(symbol)
     for (const feature of ['Win32_Foundation', 'Win32_Security', 'Win32_Storage_FileSystem',
       'Win32_System_IO', 'Win32_System_WindowsProgramming']) expect(authorityToml).toContain(feature)
-    for (const symbol of ['CreateFileW', 'FlushFileBuffers', 'GENERIC_WRITE',
-      'FILE_FLAG_BACKUP_SEMANTICS']) expect(authority).toContain(symbol)
+    for (const symbol of ['FILE_FLAG_BACKUP_SEMANTICS', 'FILE_FLAG_OPEN_REPARSE_POINT']) {
+      expect(authority).toContain(symbol)
+    }
+    const identity = await readFile('native/opencode-catalog-authority/src/windows_identity.rs', 'utf8')
+    for (const symbol of ['GetFileInformationByHandleEx', 'GetVolumeInformationByHandleW',
+      'FILE_DEVICE_DISK']) expect(identity).toContain(symbol)
   })
 
   test('production build is online-clean by default with explicit offline verification opt-in', async () => {

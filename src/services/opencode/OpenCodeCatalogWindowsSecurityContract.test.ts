@@ -13,7 +13,7 @@ function windowsEnterRoot(source: string): string {
 }
 
 describe('OpenCode catalog Windows authority security contract', () => {
-  test('admits only NTFS for the retained 64-bit file identity representation', async () => {
+  test('admits only local NTFS for the retained full 128-bit file identity', async () => {
     const [source, identity] = await Promise.all([
       readFile(authorityPath, 'utf8'),
       readFile(identityPath, 'utf8'),
@@ -23,17 +23,30 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(enterRoot).toMatch(/if fs != "NTFS" \{\s*return Err\("WINDOWS_VOLUME_UNVERIFIED"\.into\(\)\);\s*\}/)
     expect(enterRoot).not.toMatch(/fs\s*!=\s*"NTFS"\s*&&/)
     expect(enterRoot).not.toContain('"ReFS"')
-    expect(identity).toContain('stable NTFS object identity')
-    expect(identity).toMatch(/\(\(information\.nFileIndexHigh as u64\) << 32\)\s*\|\s*information\.nFileIndexLow as u64/)
-    expect(identity).toContain('information.dwVolumeSerialNumber as u64')
-    expect(identity).toContain('ReFS requires the distinct 128-bit')
+    expect(identity).toContain('full FILE_ID_128 identity')
+    expect(identity).toContain('pub(super) type FileIdentity = (u64, u128)')
+    expect(identity).toContain('GetFileInformationByHandleEx')
+    expect(identity).toContain('FileIdInfo')
+    expect(identity).toContain('information.VolumeSerialNumber')
+    expect(identity).toContain('u128::from_le_bytes(information.FileId.Identifier)')
+    expect(identity).toContain('GetVolumeInformationByHandleW')
+    expect(identity).toContain('NtQueryVolumeInformationFile')
+    expect(identity).toContain('device.device_type != FILE_DEVICE_DISK')
+    expect(identity).toContain('device.characteristics & (0x0000_0001 | 0x0000_0010) != 0')
+    expect(enterRoot.indexOf('windows_identity::validate_local_ntfs(&root_handle)')).toBeGreaterThan(
+      enterRoot.indexOf('.open(&root_path)'),
+    )
   })
 
   test('captures each component from its no-follow handle without pathname metadata trust', async () => {
-    const enterRoot = windowsEnterRoot(await readFile(authorityPath, 'utf8'))
+    const [source, identity] = await Promise.all([
+      readFile(authorityPath, 'utf8'),
+      readFile(identityPath, 'utf8'),
+    ])
+    const enterRoot = windowsEnterRoot(source)
     const loopStart = enterRoot.indexOf('for component in target.components()')
     const loop = enterRoot.slice(loopStart)
-    const open = loop.indexOf('.open(&cursor)')
+    const open = loop.indexOf('windows_identity::open_relative_directory(')
     const handleMetadata = loop.indexOf('file.metadata()', open)
     const handleIdentity = loop.indexOf('windows_identity::file_identity(&file)', handleMetadata)
     const retain = loop.indexOf('held.push(WindowsRootComponent', handleIdentity)
@@ -42,15 +55,18 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(loopStart).toBeGreaterThanOrEqual(0)
     expect(loop).not.toContain('symlink_metadata')
     expect(loop).not.toContain('cursor.exists()')
-    expect(loop).toMatch(/create_dir\(&cursor\)[\s\S]*ErrorKind::AlreadyExists/)
-    expect(loop).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
+    expect(loop).not.toContain('create_dir(&cursor)')
+    expect(loop).not.toContain('.open(&cursor)')
     expect(open).toBeGreaterThanOrEqual(0)
     expect(handleMetadata).toBeGreaterThan(open)
     expect(handleIdentity).toBeGreaterThan(handleMetadata)
     expect(retain).toBeGreaterThan(handleIdentity)
     expect(durabilityProtocol).toBeGreaterThan(retain)
-    expect(loop).toContain('.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)')
-    expect(loop).not.toContain('FILE_SHARE_DELETE')
+    expect(identity).toContain('root_directory: parent.as_raw_handle()')
+    expect(identity).toContain('if create { 3 } else { 1 }')
+    expect(identity).toContain('FILE_OPEN_IF makes creation/open one indivisible')
+    expect(identity).toContain('0x0020_0000, // DIRECTORY|SYNC_NONALERT|OPEN_REPARSE_POINT')
+    expect(identity).toContain('FILE_SHARE_READ; deliberately no write/delete')
   })
 
   test('missing root confirmation persistently retries the complete parent barrier chain', async () => {
@@ -63,11 +79,11 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(protocol).toContain('WINDOWS_ROOT_PENDING')
     expect(protocol).toContain('WINDOWS_ROOT_CONFIRMED')
     expect(protocol).toMatch(/open_windows_state_file\(&confirmed_path, false\)/)
-    expect(protocol).toMatch(/held\.iter\(\)\.skip\(1\)/)
-    expect(protocol).toMatch(/fault\("root-before-directory-sync"\)[\s\S]*sync_windows_directory_path\(parent, "ROOT_SYNC"\)/)
+    expect(protocol).toMatch(/held\.iter\(\)\.take\(held\.len\(\)\.saturating_sub\(1\)\)/)
+    expect(protocol).toMatch(/fault\("root-before-directory-sync"\)[\s\S]*parent\.handle\.sync_all\(\)[\s\S]*validate_windows_root_components\(held\)/)
     expect(protocol).toMatch(/pending\.is_none\(\)[\s\S]*!expected\.starts_with\(&contents\)/)
     expect(protocol.indexOf('create_windows_state_file(&confirmed_path')).toBeGreaterThan(
-      protocol.indexOf('held.iter().skip(1)'))
+      protocol.indexOf('held.iter().take(held.len().saturating_sub(1))'))
     expect(protocol.lastIndexOf('remove_file(&pending_path)')).toBeGreaterThan(
       protocol.indexOf('create_windows_state_file(&confirmed_path'))
     expect(protocol).toContain('"ROOT_STATE_CLEANUP"')
