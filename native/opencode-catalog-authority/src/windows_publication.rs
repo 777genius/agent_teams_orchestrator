@@ -331,22 +331,79 @@ impl RetainedWindowsRoot {
             .map_err(|_| "ROOT_REJECTED")
     }
 
-    fn pin(&mut self, name: &str, deny_writes: bool) -> Result<Value, &'static str> {
-        if !valid_leaf(name) {
+    fn retained_directory(
+        &self,
+        key: &str,
+    ) -> Result<(&std::fs::File, crate::windows_identity::FileIdentity), &'static str> {
+        if key == "." {
+            let component = self.held.last().ok_or("ROOT_REJECTED")?;
+            return Ok((&component.handle, component.identity));
+        }
+        self.pinned_directories
+            .iter()
+            .find(|(candidate, _, _)| candidate == key)
+            .map(|(_, handle, identity)| (handle, *identity))
+            .ok_or("FILE_REJECTED")
+    }
+
+    fn open_child_directory(
+        &mut self,
+        parent_key: &str,
+        key: &str,
+        name: &str,
+    ) -> Result<Value, &'static str> {
+        if !valid_leaf(name)
+            || !valid_materialization_key(key)
+            || key
+                != if parent_key == "." {
+                    name.to_string()
+                } else {
+                    format!("{parent_key}/{name}")
+                }
+            || (parent_key != "." && !valid_materialization_key(parent_key))
+            || self
+                .pinned_directories
+                .iter()
+                .any(|(candidate, _, _)| candidate == key)
+        {
             return Err("LEAF_REJECTED");
         }
         self.validate()?;
-        let path = self.target.join(name);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(if deny_writes {
-                // Immutable passive reads retain a content-stable object.
-                FILE_SHARE_READ
-            } else {
-                FILE_SHARE_READ | FILE_SHARE_WRITE
-            })
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
+        let (parent, identity) = self.retained_directory(parent_key)?;
+        validate_retained_directory(parent, identity)?;
+        let (file, created) =
+            crate::windows_identity::open_relative_directory(parent, Path::new(name), false)
+                .map_err(|_| "FILE_REJECTED")?;
+        if created {
+            return Err("FILE_REJECTED");
+        }
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("FILE_REJECTED");
+        }
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        self.pinned_directories
+            .push((key.to_string(), file, identity));
+        Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
+    }
+
+    fn pin(
+        &mut self,
+        parent_key: &str,
+        name: &str,
+        _deny_writes: bool,
+    ) -> Result<Value, &'static str> {
+        if !valid_leaf(name) || (parent_key != "." && !valid_materialization_key(parent_key)) {
+            return Err("LEAF_REJECTED");
+        }
+        self.validate()?;
+        let (parent, identity) = self.retained_directory(parent_key)?;
+        validate_retained_directory(parent, identity)?;
+        // The retained relative open is no-follow and denies write/delete
+        // sharing. The legacy PIN_REGULAR spelling remains wire-compatible;
+        // all consumers now receive the stronger content-stable lease.
+        let file = crate::windows_identity::open_relative_file(parent, Path::new(name))
             .map_err(|_| "FILE_REJECTED")?;
         let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -595,9 +652,16 @@ impl RetainedWindowsRoot {
         quarantine_name: &str,
         recovery_name: &str,
         content: &[u8],
+        expected_prior: &str,
     ) -> Result<Value, &'static str> {
         if self.publication.is_some()
             || content.len() > 44 * 1024
+            || (expected_prior != "any"
+                && expected_prior != "absent"
+                && !(expected_prior.len() == 64
+                    && expected_prior
+                        .bytes()
+                        .all(|v| v.is_ascii_hexdigit() && !v.is_ascii_uppercase())))
             || ![
                 final_name,
                 temporary_name,
@@ -685,6 +749,23 @@ impl RetainedWindowsRoot {
         } else {
             None
         };
+        if (expected_prior == "absent" && prior.is_some())
+            || (expected_prior != "any" && expected_prior != "absent" && prior.is_none())
+        {
+            return Err("CAS_REJECTED");
+        }
+        if expected_prior != "any" && expected_prior != "absent" {
+            let file = prior.as_ref().ok_or("CAS_REJECTED")?;
+            let mut reader = file.try_clone().map_err(|_| "FILE_REJECTED")?;
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut reader)
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "FILE_REJECTED")?;
+            if bytes.len() > 1024 * 1024 || crate::sha256_hex(&bytes) != expected_prior {
+                return Err("CAS_REJECTED");
+            }
+        }
         {
             let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
             publication.prior = prior;
@@ -967,12 +1048,22 @@ enum Request {
         version: u8,
         id: String,
         wait_ms: u32,
+        parent_key: String,
         name: String,
     },
     PIN_REGULAR_READONLY {
         version: u8,
         id: String,
         wait_ms: u32,
+        parent_key: String,
+        name: String,
+    },
+    OPEN_CHILD_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        parent_key: String,
+        key: String,
         name: String,
     },
     CREATE_DIRECTORY {
@@ -1028,6 +1119,7 @@ enum Request {
         backup_name: String,
         quarantine_name: String,
         recovery_name: String,
+        expected_prior: String,
         content_base64: String,
     },
     MARK_RECOVERY_REQUIRED {
@@ -1078,6 +1170,12 @@ impl Request {
                 ..
             }
             | Self::PIN_REGULAR_READONLY {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::OPEN_CHILD_DIRECTORY {
                 version,
                 id,
                 wait_ms,
@@ -1205,16 +1303,31 @@ pub fn run() {
                     .map(|_| json!({})),
                 false,
             ),
-            Request::PIN_REGULAR { name, .. } => (
+            Request::PIN_REGULAR {
+                parent_key, name, ..
+            } => (
                 root.as_mut()
                     .ok_or("ROOT_REQUIRED")
-                    .and_then(|v| v.pin(&name, false)),
+                    .and_then(|v| v.pin(&parent_key, &name, false)),
                 false,
             ),
-            Request::PIN_REGULAR_READONLY { name, .. } => (
+            Request::PIN_REGULAR_READONLY {
+                parent_key, name, ..
+            } => (
                 root.as_mut()
                     .ok_or("ROOT_REQUIRED")
-                    .and_then(|v| v.pin(&name, true)),
+                    .and_then(|v| v.pin(&parent_key, &name, true)),
+                false,
+            ),
+            Request::OPEN_CHILD_DIRECTORY {
+                parent_key,
+                key,
+                name,
+                ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.open_child_directory(&parent_key, &key, &name)),
                 false,
             ),
             Request::CREATE_DIRECTORY { name, .. } => (
@@ -1277,6 +1390,7 @@ pub fn run() {
                 backup_name,
                 quarantine_name,
                 recovery_name,
+                expected_prior,
                 content_base64,
                 ..
             } => (
@@ -1289,6 +1403,7 @@ pub fn run() {
                             &quarantine_name,
                             &recovery_name,
                             &content,
+                            &expected_prior,
                         )
                     })
                 }),

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import type { OpenCodePassiveStatusV1 } from './OpenCodePassiveStatusContract.js'
@@ -260,6 +260,34 @@ describe('OpenCode passive command-status production route', () => {
     }
   })
 
+  test('Windows denies a pre-open writable outcome handle and same-size mutation', async () => {
+    if (process.platform !== 'win32') return
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-command-write-race-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    let writable: Awaited<ReturnType<typeof open>> | undefined
+    try {
+      const directory = path.join(root, 'opencode')
+      await mkdir(directory, { recursive: true })
+      const target = path.join(directory, 'command-outcomes.json')
+      const original = JSON.stringify({ schemaVersion: 1, records: {} })
+      await writeFile(target, original)
+      writable = await open(target, 'r+')
+      const replacement = original.replace('records', 'recordz')
+      const result = await readOpenCodeCommandOutcomeReadOnly({ requestId: 'send-request',
+        deliveryAttemptId: null, signal: new AbortController().signal }, {
+        afterRootRetained: () => writable!.write(Buffer.from(replacement), 0, Buffer.byteLength(replacement), 0),
+      })
+      expect(result).toBeNull()
+      expect((await readFile(target, 'utf8')).length).toBe(original.length)
+    } finally {
+      await writable?.close().catch(() => undefined)
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('keeps the Windows passive contract native, retained, no-follow and replacement-resistant', async () => {
     const [route, safePublication, client, protocol, native] = await Promise.all([
       readFile(import.meta.path.replace(/\.test\.ts$/, '.ts'), 'utf8'),
@@ -268,7 +296,8 @@ describe('OpenCode passive command-status production route', () => {
       readFile(new URL('./OpenCodeWindowsPublicationAuthorityProtocol.ts', import.meta.url), 'utf8'),
       readFile(new URL('../../../native/opencode-catalog-authority/src/windows_publication.rs', import.meta.url), 'utf8'),
     ])
-    expect(route).toContain("root.pinRegularFile('command-outcomes.json')")
+    expect(route).toContain('OpenCodeSafePublicationDirectory.openReadOnly')
+    expect(route).toContain("root.pinRegularFile('command-outcomes.json', true)")
     expect(safePublication).toContain('await this.#windowsAuthority.pinRegular')
     expect(client).toContain("op: denyWrites ? 'PIN_REGULAR_READONLY' : 'PIN_REGULAR'")
     expect(protocol).toContain("'PIN_REGULAR' | 'PIN_REGULAR_READONLY'")

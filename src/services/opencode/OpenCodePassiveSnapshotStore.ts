@@ -246,7 +246,7 @@ export async function readOpenCodePassiveSnapshot(
   if (signal.aborted) throw cancelled()
   let root: OpenCodeSafePublicationDirectory | null = null
   if (process.platform === 'win32') {
-    try { root = await OpenCodeSafePublicationDirectory.open(rootDirectory, { abortSignal: signal }) }
+    try { root = await OpenCodeSafePublicationDirectory.openReadOnly(rootDirectory, { abortSignal: signal }) }
     catch { return null }
   }
   let database: Database | null = null

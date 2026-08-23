@@ -13,7 +13,7 @@ function fake() {
           ? { volumeSerial: '1', fileId: '3', size: '4' }
           : request.op === 'PREPARE_ATOMIC'
             ? { volumeSerial: '1', fileId: '4', size: String(Buffer.from(request.content_base64, 'base64').length) }
-            : request.op === 'CREATE_DIRECTORY' || request.op === 'RENAME_DIRECTORY'
+            : request.op === 'CREATE_DIRECTORY' || request.op === 'RENAME_DIRECTORY' || request.op === 'OPEN_CHILD_DIRECTORY'
               || request.op === 'CREATE_CHILD_DIRECTORY' || request.op === 'CREATE_CHILD_FILE'
               ? { volumeSerial: '1', fileId: '5' }
               : request.op === 'WRITE_CHILD_FILE'
@@ -25,13 +25,15 @@ function fake() {
 }
 
 describe('OpenCodeWindowsPublicationAuthorityClient', () => {
-  test('retains across cancellation and closes exactly once', async () => {
+  test('keeps cancellation connected and marks recovery after physical settlement', async () => {
     const process = fake(); const abort = new AbortController()
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
       signal: abort.signal, launch: () => process.child })
     await expect(client.openRoot('C:\\root', false, false)).resolves.toMatchObject({ fileId: '2' })
-    abort.abort(); await expect(client.pinRegular('passive-status.sqlite3')).resolves.toMatchObject({ size: '4' })
+    abort.abort(); await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(client.pinRegular('passive-status.sqlite3')).rejects.toThrow('unavailable [redacted]')
     await client.close(); await client.close(); expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
+    expect(process.operations).toEqual(['OPEN_ROOT', 'MARK_RECOVERY_REQUIRED'])
   })
   test('fails before launch on an expired deadline', () => {
     expect(() => new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() - 1,
@@ -43,6 +45,14 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     })
     await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
     expect(process.operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT', 'CLOSE'])
+  })
+  test('preserves the caller absolute deadline after retaining the root', async () => {
+    const process = fake(); const deadline = performance.now() + 30_000
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, launch: () => process.child })
+    await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
+    const waits = process.requests.map(request => Number(request.wait_ms))
+    expect(waits.every(wait => wait <= deadline - performance.now() + 100)).toBeTrue()
+    expect(Math.max(...waits)).toBeLessThan(31_000)
   })
   test('rejects unsafe Win32 roots and leaves without publishing them to native stdin', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
@@ -93,5 +103,18 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       'ROLLBACK_DIRECTORY', 'CLOSE'])
     expect(process.requests[4]).toMatchObject({ key: 'attempt.snapshot/config/opencode.json', offset: 0,
       content_base64: 'AQI=', finish: false })
+  })
+  test('opens legacy descendants and pins their files through the original authority', async () => {
+    const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: performance.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await client.openChildDirectory('.', 'legacy', 'legacy')
+    await client.openChildDirectory('legacy', 'legacy/snapshot', 'snapshot')
+    await client.pinRegular('status.json', true, 'legacy/snapshot')
+    await client.close()
+    expect(process.operations).toEqual(['OPEN_ROOT', 'OPEN_CHILD_DIRECTORY', 'OPEN_CHILD_DIRECTORY',
+      'PIN_REGULAR_READONLY', 'CLOSE'])
+    expect(process.requests[3]).toMatchObject({ parent_key: 'legacy/snapshot', name: 'status.json' })
   })
 })

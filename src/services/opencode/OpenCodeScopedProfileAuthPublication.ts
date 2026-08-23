@@ -10,6 +10,7 @@ type PublishAuth = (
   fileName: string,
   bytes: Uint8Array,
   signal?: AbortSignal,
+  deadlineAtMs?: number,
 ) => Promise<OpenCodeSafePublicationTransaction | null | void>
 
 type ProfileAuthTransactionRecord = Readonly<{
@@ -53,8 +54,10 @@ function reapRollback(record: ProfileAuthTransactionRecord): void {
   retry()
 }
 
-const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) => {
-  const directory = await OpenCodeSafePublicationDirectory.open(directoryPath, { abortSignal: signal })
+const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal, deadlineAtMs) => {
+  const directory = await OpenCodeSafePublicationDirectory.open(directoryPath, {
+    abortSignal: signal, deadline: deadlineAtMs,
+  })
   let transaction: OpenCodeSafePublicationTransaction | null = null
   try {
     await directory.writeFileAtomic(fileName, bytes, 0o600, signal, {
@@ -113,6 +116,7 @@ export async function commitOpenCodeScopedProfileAuth<T>(input: Readonly<{
   managedAuthBytes: Uint8Array
   preparedProfile: T
   abortSignal?: AbortSignal
+  deadlineAtMs?: number
   /** Deterministic fake-only publisher seam. */
   publish?: PublishAuth
 }>): Promise<T> {
@@ -126,6 +130,7 @@ export async function commitOpenCodeScopedProfileAuth<T>(input: Readonly<{
     path.basename(input.managedAuthPath),
     input.managedAuthBytes,
     input.abortSignal,
+    input.deadlineAtMs,
   )
   if (transaction && input.preparedProfile && typeof input.preparedProfile === 'object') {
     const purpose = Object.getOwnPropertyDescriptor(input.preparedProfile, 'purpose')?.value

@@ -4,13 +4,14 @@ export class OpenCodeWindowsPublicationRejectedError extends Error {}
 export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'OPEN_ROOT'; wait_ms: number; root_path: string; create_missing: boolean; durable_ancestors: boolean }
   | { version: 1; id: string; op: 'VALIDATE_ROOT' | 'SYNC_ROOT' | 'CLOSE'; wait_ms: number }
-  | { version: 1; id: string; op: 'PIN_REGULAR' | 'PIN_REGULAR_READONLY'; wait_ms: number; name: string }
+  | { version: 1; id: string; op: 'PIN_REGULAR' | 'PIN_REGULAR_READONLY'; wait_ms: number; parent_key: string; name: string }
+  | { version: 1; id: string; op: 'OPEN_CHILD_DIRECTORY'; wait_ms: number; parent_key: string; key: string; name: string }
   | { version: 1; id: string; op: 'CREATE_DIRECTORY'; wait_ms: number; name: string }
   | { version: 1; id: string; op: 'CREATE_CHILD_DIRECTORY' | 'CREATE_CHILD_FILE'; wait_ms: number; parent_key: string; key: string; name: string }
   | { version: 1; id: string; op: 'WRITE_CHILD_FILE'; wait_ms: number; key: string; offset: number; content_base64: string; finish: boolean }
   | { version: 1; id: string; op: 'RENAME_DIRECTORY'; wait_ms: number; from: string; to: string }
   | { version: 1; id: string; op: 'ROLLBACK_DIRECTORY'; wait_ms: number; root_key: string }
-  | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; content_base64: string }
+  | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; expected_prior: string; content_base64: string }
   | { version: 1; id: string; op: 'MARK_RECOVERY_REQUIRED'; wait_ms: number }
   | { version: 1; id: string; op: 'COMMIT_ATOMIC' | 'ROLLBACK_ATOMIC'; wait_ms: number }
 

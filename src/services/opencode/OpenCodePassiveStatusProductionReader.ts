@@ -364,7 +364,7 @@ export class OpenCodePassiveStatusProductionReader {
     let generations: OpenCodeSafePublicationDirectory | null = null
     let generation: OpenCodeSafePublicationDirectory | null = null
     try {
-      root = await OpenCodeSafePublicationDirectory.open(this.#rootDirectory)
+      root = await OpenCodeSafePublicationDirectory.openReadOnly(this.#rootDirectory)
       // Opening the marker proves that a same-named symlink/junction cannot be
       // treated as legacy migration state.
       if (await root.readBoundedRegularFile(
@@ -441,7 +441,7 @@ async function readTransactionalStoreState(
   catch (error) { if (isMissingFile(error)) return 'legacy'; throw error }
   let root: OpenCodeSafePublicationDirectory | null = null
   try {
-    root = await OpenCodeSafePublicationDirectory.open(rootPath)
+    root = await OpenCodeSafePublicationDirectory.openReadOnly(rootPath)
     if (signal.aborted) throw cancelledError()
     const names = await root.childNames()
     if (names.includes(OPEN_CODE_PASSIVE_TRANSACTION_MARKER)) {
@@ -620,7 +620,7 @@ export async function readBoundedSnapshotText(filePath: string, signal: AbortSig
       const scope = `sha256:${path.basename(filePath, '.json')}` as const
       return (await readOpenCodePassiveSnapshot(rootPath, scope, signal))?.text ?? null
     }
-    root = await OpenCodeSafePublicationDirectory.open(rootPath)
+    root = await OpenCodeSafePublicationDirectory.openReadOnly(rootPath)
     if (signal.aborted) throw cancelledError()
     const names = await root.childNames()
     if (names.includes(OPEN_CODE_PASSIVE_TRANSACTION_MARKER)) {

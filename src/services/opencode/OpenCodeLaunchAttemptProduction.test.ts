@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import path from 'node:path'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 
 import { createHash } from 'node:crypto'
@@ -122,6 +122,20 @@ test('production proof composition retires an exact crashed generation before a 
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('proof cleanup refuses an expired immutable launch deadline before publication', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-deadline-'))
+  try {
+    const file = path.join(directory, 'proof.json')
+    const ledger = new OpenCodeProofSessionCleanupLedger(file)
+    await expect(ledger.reconcileAndRegister({ attemptId: 'attempt-a', requestGeneration: 1,
+      hostKeyIdentity: identity, ownership: generation => ({ authoritativeSessionId: `proof-${generation}`,
+        ownershipTitle: `owned-${generation}` }), reconcile: async () => 'absent' }, {
+      deadlineAtMs: performance.now() - 1, signal: new AbortController().signal,
+    })).rejects.toThrow('deadline expired')
+    await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('proof generations continue after absent/deleted truth but never pass unresolved or foreign ownership', async () => {

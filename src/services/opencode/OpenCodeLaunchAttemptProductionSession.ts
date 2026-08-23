@@ -1,11 +1,11 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 
 import type { OpenCodeLaunchOwnedResources } from './OpenCodeLaunchAttempt.js'
 import type { OpenCodeLaunchMutationClaimRecord } from './OpenCodeLaunchMutationLedger.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeMessage, OpenCodeSessionRecord, OpenCodeSessionSummary } from './types.js'
+import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
@@ -44,20 +44,30 @@ type ProofLedgerFile = {
   retired: OpenCodeProofSessionGenerationRecord[]
 }
 
+export type OpenCodeProofLedgerContext = Readonly<{
+  deadlineAtMs: number
+  signal: AbortSignal
+}>
+
 /**
  * Durable proof-generation ledger.  Every create is preceded by an active
  * generation record.  A later nonce can be registered only after the prior
  * exact id/title/host has been reconciled and atomically moved to `retired`.
  */
 export class OpenCodeProofSessionCleanupLedger {
+  #tail: Promise<void> = Promise.resolve()
   constructor(private readonly filePath: string) {}
 
-  async read(): Promise<OpenCodeProofSessionCleanupRecord | null> {
-    const ledger = await this.readFile()
-    return ledger?.active ? { version: 2, attemptId: ledger.attemptId, ...ledger.active } : null
+  async read(context?: OpenCodeProofLedgerContext): Promise<OpenCodeProofSessionCleanupRecord | null> {
+    return this.exclusive(context, async directory => {
+      const ledger = await this.readFile(directory, context?.signal)
+      return ledger?.active ? { version: 2, attemptId: ledger.attemptId, ...ledger.active } : null
+    })
   }
 
-  async readGenerations(): Promise<ProofLedgerFile | null> { return this.readFile() }
+  async readGenerations(context?: OpenCodeProofLedgerContext): Promise<ProofLedgerFile | null> {
+    return this.exclusive(context, directory => this.readFile(directory, context?.signal))
+  }
 
   async reconcileAndRegister(input: {
     attemptId: string
@@ -65,8 +75,10 @@ export class OpenCodeProofSessionCleanupLedger {
     hostKeyIdentity: OpenCodeOpaqueIdentity
     ownership(generation: number): { authoritativeSessionId: string; ownershipTitle: string }
     reconcile(record: OpenCodeProofSessionCleanupRecord): Promise<OpenCodeOwnedSessionReconciliation>
-  }): Promise<{ record: OpenCodeProofSessionCleanupRecord; created: boolean; priorOutcome?: OpenCodeOwnedSessionReconciliation }> {
-    let ledger = await this.readFile()
+  }, context?: OpenCodeProofLedgerContext): Promise<{ record: OpenCodeProofSessionCleanupRecord; created: boolean; priorOutcome?: OpenCodeOwnedSessionReconciliation }> {
+    return this.exclusive(context, async directory => {
+    let ledger = await this.readFile(directory, context?.signal)
+    let persistedLedger = ledger
     if (ledger && ledger.attemptId !== input.attemptId) {
       throw new Error('OpenCode proof cleanup ledger ownership mismatch')
     }
@@ -83,7 +95,8 @@ export class OpenCodeProofSessionCleanupLedger {
         : await input.reconcile(prior)
       const settled = { ...ledger.active, state: priorOutcome, updatedAt: new Date().toISOString() }
       ledger = { ...ledger, active: settled }
-      await this.write(ledger)
+      await this.write(directory, ledger, context?.signal, persistedLedger)
+      persistedLedger = ledger
       if (priorOutcome !== 'absent' && priorOutcome !== 'deleted') {
         return { record: { version: 2, attemptId: ledger.attemptId, ...settled }, created: false, priorOutcome }
       }
@@ -97,17 +110,20 @@ export class OpenCodeProofSessionCleanupLedger {
       state: 'registered', updatedAt: new Date().toISOString(),
     }
     ledger = { ...ledger, active }
-    await this.write(ledger)
+    await this.write(directory, ledger, context?.signal, persistedLedger)
     return { record: { version: 2, attemptId: ledger.attemptId, ...active }, created: true,
       ...(priorOutcome ? { priorOutcome } : {}) }
+    })
   }
 
   async recordState(
     expected: Pick<OpenCodeProofSessionCleanupRecord,
       'attemptId' | 'generation' | 'hostKeyIdentity' | 'authoritativeSessionId' | 'ownershipTitle'>,
     state: Exclude<OpenCodeProofSessionGenerationRecord['state'], 'registered'>,
+    context?: OpenCodeProofLedgerContext,
   ): Promise<OpenCodeProofSessionCleanupRecord> {
-    const ledger = await this.readFile()
+    return this.exclusive(context, async directory => {
+    const ledger = await this.readFile(directory, context?.signal)
     const current = ledger?.active
     if (!ledger || !current || ledger.attemptId !== expected.attemptId
       || current.generation !== expected.generation
@@ -117,48 +133,63 @@ export class OpenCodeProofSessionCleanupLedger {
       throw new Error('OpenCode proof cleanup ledger ownership mismatch')
     }
     const active = { ...current, state, updatedAt: new Date().toISOString() }
-    await this.write({ ...ledger, active })
+    await this.write(directory, { ...ledger, active }, context?.signal, ledger)
     return { version: 2, attemptId: ledger.attemptId, ...active }
+    })
   }
 
-  private async readFile(): Promise<ProofLedgerFile | null> {
+  private async readFile(directory: OpenCodeSafePublicationDirectory, signal?: AbortSignal): Promise<ProofLedgerFile | null> {
     try {
-      const value = JSON.parse(await readFile(this.filePath, 'utf8')) as unknown
-      if (isLegacyProofRecord(value)) {
-        return { version: 2, attemptId: value.attemptId, active: {
-          generation: 1, requestGeneration: 1, hostKeyIdentity: value.hostKeyIdentity,
-          authoritativeSessionId: value.authoritativeSessionId, ownershipTitle: value.ownershipTitle,
-          state: value.state, updatedAt: value.updatedAt,
-        }, retired: [] }
-      }
-      validateProofLedger(value)
-      return value
+      const text = await directory.readBoundedRegularFile(path.basename(this.filePath), 1_048_576, signal)
+      if (text === null) return null
+      return normalizeProofLedger(JSON.parse(text))
     } catch (error) {
       if (isAbsent(error)) return null
       throw error
     }
   }
 
-  private async write(record: ProofLedgerFile): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true })
-    const temporaryPath = `${this.filePath}.tmp-${process.pid}-${randomUUID()}`
-    const temporary = await open(temporaryPath, 'wx', 0o600)
-    try {
-      try { await temporary.writeFile(`${JSON.stringify(record)}\n`, 'utf8'); await temporary.sync() }
-      finally { await temporary.close() }
-      await rename(temporaryPath, this.filePath)
-    } catch (error) {
-      await temporary.close().catch(() => undefined)
-      await unlink(temporaryPath).catch(() => undefined)
-      throw error
+  private async write(directory: OpenCodeSafePublicationDirectory, record: ProofLedgerFile, signal?: AbortSignal,
+    expected?: ProofLedgerFile | null): Promise<void> {
+    const currentText = await directory.readBoundedRegularFile(path.basename(this.filePath), 1_048_576, signal)
+    const current = currentText === null ? null : normalizeProofLedger(JSON.parse(currentText))
+    if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected)) {
+      throw new Error('OpenCode proof cleanup ledger ownership mismatch')
     }
-    let directory: Awaited<ReturnType<typeof open>> | undefined
-    try { directory = await open(path.dirname(this.filePath), 'r'); await directory.sync() }
-    catch (error) {
-      if (!['EACCES', 'EBADF', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM']
-        .includes((error as NodeJS.ErrnoException).code ?? '')) throw error
-    } finally { await directory?.close().catch(() => undefined) }
+    await directory.writeFileAtomic(path.basename(this.filePath), `${JSON.stringify(record)}\n`, 0o600, signal, {
+      expectedPriorSha256: currentText === null
+        ? null
+        : createHash('sha256').update(currentText).digest('hex'),
+    })
   }
+
+  private async exclusive<T>(context: OpenCodeProofLedgerContext | undefined,
+    operation: (directory: OpenCodeSafePublicationDirectory) => Promise<T>): Promise<T> {
+    const previous = this.#tail
+    let release!: () => void
+    this.#tail = new Promise<void>(resolve => { release = resolve })
+    await previous
+    if (context && (context.signal.aborted || performance.now() >= context.deadlineAtMs)) {
+      release(); throw context.signal.reason ?? new Error('OpenCode proof cleanup deadline expired')
+    }
+    const directory = await OpenCodeSafePublicationDirectory.open(path.dirname(this.filePath), {
+      abortSignal: context?.signal, deadline: context?.deadlineAtMs,
+    }).catch(error => { release(); throw error })
+    try { return await operation(directory) }
+    finally { await directory.close().finally(release) }
+  }
+}
+
+function normalizeProofLedger(value: unknown): ProofLedgerFile {
+  if (isLegacyProofRecord(value)) {
+    return { version: 2, attemptId: value.attemptId, active: {
+      generation: 1, requestGeneration: 1, hostKeyIdentity: value.hostKeyIdentity,
+      authoritativeSessionId: value.authoritativeSessionId, ownershipTitle: value.ownershipTitle,
+      state: value.state, updatedAt: value.updatedAt,
+    }, retired: [] }
+  }
+  validateProofLedger(value)
+  return value
 }
 
 function validateProofLedger(value: unknown): asserts value is ProofLedgerFile {

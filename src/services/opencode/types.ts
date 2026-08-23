@@ -93,7 +93,7 @@ export type OpenCodePlanScopedProfileInput = Omit<OpenCodeScopedProfilePlan, 'ab
 export type OpenCodeScopedProfilePreparationInput = Omit<
   OpenCodePlanScopedProfileInput,
   'abortSignal'
-> & { abortSignal?: AbortSignal }
+> & { abortSignal?: AbortSignal; deadlineAtMs?: number }
 
 /** Pure, redacted and read-only contract passed from planning to preparation. */
 export type OpenCodeScopedProfilePlanContract = {

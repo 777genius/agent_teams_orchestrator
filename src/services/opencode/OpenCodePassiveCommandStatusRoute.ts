@@ -183,14 +183,14 @@ export async function readOpenCodeCommandOutcomeReadOnly(input: {
   const outcomeRootPath = path.resolve(passiveRoot, '..', '..')
   let root: OpenCodeSafePublicationDirectory | null = null
   try {
-    root = await OpenCodeSafePublicationDirectory.open(outcomeRootPath, { abortSignal: input.signal })
+    root = await OpenCodeSafePublicationDirectory.openReadOnly(outcomeRootPath, { abortSignal: input.signal })
     const retainedIdentity = await root.stableIdentity()
     await assertVisibleOutcomeRootIdentity(outcomeRootPath, retainedIdentity)
     await testHooks?.afterRootRetained?.()
     if (input.signal.aborted) return null
     // On Windows this retains the exact regular file without delete sharing;
     // on POSIX the descriptor-relative bounded read below supplies the pin.
-    await root.pinRegularFile('command-outcomes.json')
+    await root.pinRegularFile('command-outcomes.json', true)
     const text = await root.readBoundedRegularFile(
       'command-outcomes.json', MAX_OUTCOME_STORE_BYTES, input.signal,
       { afterPathIdentityCaptured: testHooks?.afterPathIdentityCaptured },

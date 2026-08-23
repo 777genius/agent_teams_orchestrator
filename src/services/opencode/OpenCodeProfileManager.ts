@@ -4048,11 +4048,12 @@ export class OpenCodeProfileManager {
     // first await and deliberately shadow the parameters so no continuation
     // can observe caller mutation after preparation yields.
     const preparationSignal = plan.abortSignal
+    const preparationDeadlineAtMs = plan.deadlineAtMs
     const assertPreparationActive = () => {
       if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
     }
     assertPreparationActive()
-    const { abortSignal: _abortSignal, ...planWithoutSignal } = plan
+    const { abortSignal: _abortSignal, deadlineAtMs: _deadlineAtMs, ...planWithoutSignal } = plan
     plan = cloneAndDeepFreezeScopedInput(planWithoutSignal) as OpenCodePlanScopedProfileInput
     expectedPlan = cloneAndDeepFreezeScopedInput(expectedPlan)
     if (!plan || typeof plan !== 'object') {
@@ -4780,6 +4781,7 @@ export class OpenCodeProfileManager {
           managedAuthBytes,
           preparedProfile,
           abortSignal: preparationSignal,
+          deadlineAtMs: preparationDeadlineAtMs,
         })
         profileTransactionCommitted = true
         return committedProfile

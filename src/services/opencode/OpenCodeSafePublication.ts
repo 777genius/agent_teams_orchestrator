@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants as fsConstants, fsyncSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
@@ -8,6 +8,7 @@ import {
 } from './OpenCodeWindowsPublicationAuthorityClient.js'
 import { validOpenCodePublicationLeaf,
   validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
+import { OpenCodeWindowsPassiveReadAuthority } from './OpenCodeWindowsPassiveReadAuthority.js'
 
 export type OpenCodeSafePublicationTransaction = Readonly<{
   commit(): Promise<void>
@@ -47,17 +48,36 @@ export class OpenCodeSafePublicationDirectory {
   readonly #root: string
   readonly #windowsIdentity: { dev: bigint; ino: bigint } | null
   readonly #windowsAuthority: OpenCodeWindowsPublicationAuthorityClient | null
+  readonly #windowsPassiveAuthority: OpenCodeWindowsPassiveReadAuthority | null
+  readonly #windowsKey: string
+  readonly #ownsWindowsAuthority: boolean
 
   constructor(
     handle: FileHandle | null,
     root?: string,
     windowsIdentity: { dev: bigint; ino: bigint } | null = null,
     windowsAuthority: OpenCodeWindowsPublicationAuthorityClient | null = null,
+    windowsKey = '.',
+    ownsWindowsAuthority = true,
+    windowsPassiveAuthority: OpenCodeWindowsPassiveReadAuthority | null = null,
   ) {
     this.#handle = handle
     this.#root = root ?? descriptorRoot(handle!.fd)
     this.#windowsIdentity = windowsIdentity
     this.#windowsAuthority = windowsAuthority
+    this.#windowsKey = windowsKey
+    this.#ownsWindowsAuthority = ownsWindowsAuthority
+    this.#windowsPassiveAuthority = windowsPassiveAuthority
+  }
+
+  static async openReadOnly(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
+    if (process.platform !== 'win32') return this.open(directoryPath, options)
+    const resolved = path.resolve(directoryPath)
+    const passive = OpenCodeWindowsPassiveReadAuthority.open(resolved)
+    try {
+      const stable = passive.stableIdentity()
+      return new OpenCodeSafePublicationDirectory(null, resolved, stable, null, '.', false, passive)
+    } catch (error) { passive.close(); throw error }
   }
 
   static async open(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
@@ -105,6 +125,7 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async #assertWindowsRoot(): Promise<void> {
+    if (this.#windowsPassiveAuthority) this.#windowsPassiveAuthority.validate()
     if (!this.#windowsAuthority) return
     await this.#windowsAuthority.validateRoot().catch(fail)
   }
@@ -116,6 +137,7 @@ export class OpenCodeSafePublicationDirectory {
 
   /** Stable identity captured by the opened directory, even when Windows uses its shared pathname. */
   async stableIdentity(): Promise<Readonly<{ dev: bigint; ino: bigint }>> {
+    if (this.#windowsPassiveAuthority) return this.#windowsPassiveAuthority.stableIdentity()
     if (this.#windowsIdentity) return this.#windowsIdentity
     const metadata = await this.#handle!.stat({ bigint: true }).catch(fail)
     if (!metadata.isDirectory()) fail()
@@ -123,6 +145,7 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async validate(): Promise<void> {
+    if (this.#windowsPassiveAuthority) return this.#windowsPassiveAuthority.validate()
     if (this.#windowsAuthority) return this.#assertWindowsRoot()
     const metadata = await this.#handle!.stat().catch(fail)
     if (!metadata.isDirectory()) fail()
@@ -130,13 +153,26 @@ export class OpenCodeSafePublicationDirectory {
 
   /** Retains the primary SQLite object without delete sharing until this directory closes. */
   async pinRegularFile(name: string, denyWrites = false): Promise<void> {
-    if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name), denyWrites).catch(fail)
+    if (this.#windowsPassiveAuthority) { this.#windowsPassiveAuthority.pinRegular(childName(name)); return }
+    if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name), denyWrites, this.#windowsKey).catch(fail)
   }
 
   async openChildDirectory(name: string): Promise<OpenCodeSafePublicationDirectory> {
     await this.#assertWindowsRoot()
     const child = this.child(name)
-    if (process.platform === 'win32') return OpenCodeSafePublicationDirectory.open(child)
+    if (process.platform === 'win32') {
+      if (this.#windowsPassiveAuthority) {
+        const passive = this.#windowsPassiveAuthority.openChild(childName(name))
+        const stable = passive.stableIdentity()
+        return new OpenCodeSafePublicationDirectory(null, child, stable, null, '.', false, passive)
+      }
+      if (!this.#windowsAuthority) fail()
+      const childKey = this.#windowsKey === '.' ? childName(name) : `${this.#windowsKey}/${childName(name)}`
+      const identity = await this.#windowsAuthority.openChildDirectory(this.#windowsKey, childKey, childName(name)).catch(fail)
+      return new OpenCodeSafePublicationDirectory(null, child, {
+        dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId),
+      }, this.#windowsAuthority, childKey, false)
+    }
     let handle: FileHandle
     try {
       handle = await open(
@@ -293,6 +329,9 @@ export class OpenCodeSafePublicationDirectory {
     abortSignal?: AbortSignal,
     testHooks?: { afterPathIdentityCaptured?: () => void | Promise<void> },
   ): Promise<Uint8Array | null> {
+    if (this.#windowsPassiveAuthority) {
+      return this.#windowsPassiveAuthority.readBounded(childName(name), maximumBytes, abortSignal)
+    }
     await this.#assertWindowsRoot()
     const target = this.child(name)
     let before
@@ -383,6 +422,7 @@ export class OpenCodeSafePublicationDirectory {
       afterRollbackOwnershipCaptured?: () => void | Promise<void>
       beforeSettlementSync?: () => void | Promise<void>
       retainTransaction?: (transaction: OpenCodeSafePublicationTransaction) => void
+      expectedPriorSha256?: string | null
     },
   ): Promise<void> {
     await this.#assertWindowsRoot()
@@ -394,6 +434,11 @@ export class OpenCodeSafePublicationDirectory {
     const quarantineName = childName(`.${finalName}.quarantine.${process.pid}.${randomUUID()}`)
     const quarantinePath = this.child(quarantineName)
     const recoveryName = childName(`.${finalName}.recovery-required.${process.pid}.${randomUUID()}`)
+    if (!this.#windowsAuthority && testHooks && Object.hasOwn(testHooks, 'expectedPriorSha256')) {
+      const current = await this.readBoundedRegularBytes(finalName, 1_048_576, abortSignal)
+      const observed = current === null ? null : createHash('sha256').update(current).digest('hex')
+      if (observed !== testHooks.expectedPriorSha256) fail()
+    }
     if (process.platform === 'win32' && this.#windowsAuthority) {
       const bytes = typeof content === 'string' ? Buffer.from(content) : new Uint8Array(content)
       try {
@@ -405,6 +450,7 @@ export class OpenCodeSafePublicationDirectory {
         }
         await this.#windowsAuthority.prepareAtomic(
           finalName, temporaryName, backupName, quarantineName, recoveryName, bytes,
+          testHooks?.expectedPriorSha256,
         ).catch(fail)
         await testHooks?.afterRenameBeforeVerification?.()
         if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
@@ -653,7 +699,8 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async close(): Promise<void> {
-    if (this.#windowsAuthority) await this.#windowsAuthority.close()
+    this.#windowsPassiveAuthority?.close()
+    if (this.#windowsAuthority && this.#ownsWindowsAuthority) await this.#windowsAuthority.close()
     else await this.#handle?.close()
   }
 }
