@@ -13,6 +13,40 @@ use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 const MAX_WIRE: usize = 64 * 1024;
 
+fn valid_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            }
+        })
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let value = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        output.push(TABLE[((value >> 18) & 63) as usize] as char);
+        output.push(TABLE[((value >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
 fn decode_bounded_base64(value: &str) -> Result<Vec<u8>, &'static str> {
     if value.len() > 60 * 1024 || value.len() % 4 != 0 || !value.is_ascii() {
         return Err("FILE_REJECTED");
@@ -131,6 +165,14 @@ struct RetainedWindowsRoot {
     materialization_root: Option<String>,
     materialization_rolled_back: bool,
     publication: Option<AtomicPublication>,
+    namespace_directories: Vec<(String, std::fs::File, crate::windows_identity::FileIdentity)>,
+    namespace_handles: Vec<(
+        String,
+        String,
+        std::fs::File,
+        crate::windows_identity::FileIdentity,
+        bool,
+    )>,
 }
 
 struct AtomicPublication {
@@ -229,6 +271,426 @@ fn verify_ntfs(wide: &[u16]) -> Result<(), &'static str> {
 }
 
 impl RetainedWindowsRoot {
+    fn validate_namespace(&self) -> Result<(), &'static str> {
+        let final_component = self.held.last().ok_or("ROOT_REJECTED")?;
+        crate::windows_identity::validate_local_ntfs(&final_component.handle)
+            .map_err(|_| "ROOT_REJECTED")?;
+        for component in &self.held {
+            let metadata = component.handle.metadata().map_err(|_| "ROOT_REJECTED")?;
+            if !metadata.is_dir()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || crate::windows_identity::file_identity(&component.handle)
+                    .map_err(|_| "ROOT_REJECTED")?
+                    != component.identity
+            {
+                return Err("ROOT_REJECTED");
+            }
+        }
+        Ok(())
+    }
+    fn valid_namespace_path(value: &str) -> bool {
+        value == "."
+            || (value.len() <= 4096 && !value.is_empty() && value.split('/').all(valid_leaf))
+    }
+
+    fn namespace_parent(value: &str) -> Result<(&str, &str), &'static str> {
+        if !Self::valid_namespace_path(value) || value == "." {
+            return Err("LEAF_REJECTED");
+        }
+        Ok(value.rsplit_once('/').unwrap_or((".", value)))
+    }
+
+    fn namespace_directory(
+        &mut self,
+        key: &str,
+    ) -> Result<(std::fs::File, crate::windows_identity::FileIdentity), &'static str> {
+        self.validate_namespace()?;
+        if !Self::valid_namespace_path(key) {
+            return Err("LEAF_REJECTED");
+        }
+        if key == "." {
+            let held = self.held.last().ok_or("ROOT_REJECTED")?;
+            return Ok((
+                held.handle.try_clone().map_err(|_| "ROOT_REJECTED")?,
+                held.identity,
+            ));
+        }
+        let mut parent = self
+            .held
+            .last()
+            .ok_or("ROOT_REJECTED")?
+            .handle
+            .try_clone()
+            .map_err(|_| "ROOT_REJECTED")?;
+        let mut prefix = String::new();
+        let mut identity = self.held.last().ok_or("ROOT_REJECTED")?.identity;
+        for component in key.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if let Some((_, handle, expected)) = self
+                .namespace_directories
+                .iter()
+                .find(|(candidate, _, _)| candidate == &prefix)
+            {
+                validate_retained_directory(handle, *expected)?;
+                parent = handle.try_clone().map_err(|_| "FILE_REJECTED")?;
+                identity = *expected;
+                continue;
+            }
+            let (opened, created) = crate::windows_identity::open_relative_directory(
+                &parent,
+                Path::new(component),
+                false,
+            )
+            .map_err(|_| "FILE_REJECTED")?;
+            if created {
+                return Err("FILE_REJECTED");
+            }
+            let metadata = opened.metadata().map_err(|_| "FILE_REJECTED")?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err("FILE_REJECTED");
+            }
+            identity =
+                crate::windows_identity::file_identity(&opened).map_err(|_| "FILE_REJECTED")?;
+            parent = opened.try_clone().map_err(|_| "FILE_REJECTED")?;
+            self.namespace_directories
+                .push((prefix.clone(), opened, identity));
+        }
+        Ok((parent, identity))
+    }
+
+    fn namespace_value(
+        file: &std::fs::File,
+        identity: crate::windows_identity::FileIdentity,
+    ) -> Result<Value, &'static str> {
+        let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("FILE_REJECTED");
+        }
+        Ok(
+            json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string(),
+            "size":metadata.file_size().to_string(),"kind":if metadata.is_dir(){"directory"}else{"file"}}),
+        )
+    }
+
+    fn namespace_stat(&mut self, path: &str) -> Result<Value, &'static str> {
+        self.validate_namespace()?;
+        if path == "." {
+            let (file, identity) = self.namespace_directory(path)?;
+            return Self::namespace_value(&file, identity);
+        }
+        if let Some((_, file, identity)) = self
+            .namespace_directories
+            .iter()
+            .find(|(key, _, _)| key == path)
+        {
+            return Self::namespace_value(file, *identity);
+        }
+        if let Some((_, _, file, identity, _)) = self
+            .namespace_handles
+            .iter()
+            .find(|(_, key, _, _, _)| key == path)
+        {
+            return Self::namespace_value(file, *identity);
+        }
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        if let Ok((file, created)) =
+            crate::windows_identity::open_relative_directory(&parent, Path::new(name), false)
+        {
+            if created {
+                return Err("FILE_REJECTED");
+            }
+            let identity =
+                crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+            return Self::namespace_value(&file, identity);
+        }
+        let file = crate::windows_identity::open_relative_file(&parent, Path::new(name))
+            .map_err(|_| "NS_NOT_FOUND")?;
+        let identity =
+            crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+        Self::namespace_value(&file, identity)
+    }
+
+    fn namespace_mkdir(&mut self, path: &str) -> Result<Value, &'static str> {
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        if crate::windows_identity::probe_relative_directory(&parent, Path::new(name)).is_ok()
+            || crate::windows_identity::probe_relative_file(&parent, Path::new(name)).is_ok()
+        {
+            return Err("NS_EXISTS");
+        }
+        let directory =
+            crate::windows_identity::create_relative_directory(&parent, Path::new(name))
+                .map_err(|_| "FILE_REJECTED")?;
+        let identity =
+            crate::windows_identity::file_identity(&directory).map_err(|_| "FILE_REJECTED")?;
+        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        self.namespace_directories
+            .push((path.to_string(), directory, identity));
+        Ok(json!({}))
+    }
+
+    fn namespace_open(
+        &mut self,
+        path: &str,
+        token: &str,
+        mode: &str,
+    ) -> Result<Value, &'static str> {
+        if !valid_id(token)
+            || self
+                .namespace_handles
+                .iter()
+                .any(|(candidate, _, _, _, _)| candidate == token)
+        {
+            return Err("STATE_REJECTED");
+        }
+        let (file, identity, directory) = if mode == "directory" {
+            let (file, identity) = self.namespace_directory(path)?;
+            (file, identity, true)
+        } else {
+            let (parent_key, name) = Self::namespace_parent(path)?;
+            let (parent, _) = self.namespace_directory(parent_key)?;
+            let file = if mode == "create_file" {
+                crate::windows_identity::create_relative_file(&parent, Path::new(name))
+            } else if mode == "read" || mode == "readwrite" {
+                crate::windows_identity::open_relative_file(&parent, Path::new(name))
+            } else {
+                return Err("STATE_REJECTED");
+            }
+            .map_err(|_| {
+                if mode == "create_file" {
+                    "NS_EXISTS"
+                } else {
+                    "NS_NOT_FOUND"
+                }
+            })?;
+            let identity =
+                crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
+            (file, identity, false)
+        };
+        let mut value = Self::namespace_value(&file, identity)?;
+        value["token"] = json!(token);
+        self.namespace_handles.push((
+            token.to_string(),
+            path.to_string(),
+            file,
+            identity,
+            directory,
+        ));
+        Ok(value)
+    }
+
+    fn namespace_read(
+        &self,
+        token: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Value, &'static str> {
+        self.validate_namespace()?;
+        if length > 32 * 1024 {
+            return Err("FILE_REJECTED");
+        }
+        let (_, _, file, identity, directory) = self
+            .namespace_handles
+            .iter()
+            .find(|(candidate, _, _, _, _)| candidate == token)
+            .ok_or("FILE_REJECTED")?;
+        if *directory
+            || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
+                != *identity
+        {
+            return Err("FILE_REJECTED");
+        }
+        let mut bytes = vec![0u8; length];
+        let count = file
+            .seek_read(&mut bytes, offset)
+            .map_err(|_| "FILE_REJECTED")?;
+        bytes.truncate(count);
+        Ok(json!({"content_base64":encode_base64(&bytes)}))
+    }
+
+    fn namespace_write(
+        &mut self,
+        token: &str,
+        offset: u64,
+        truncate: bool,
+        content: &[u8],
+    ) -> Result<Value, &'static str> {
+        self.validate_namespace()?;
+        let (_, _, file, identity, directory) = self
+            .namespace_handles
+            .iter_mut()
+            .find(|(candidate, _, _, _, _)| candidate == token)
+            .ok_or("FILE_REJECTED")?;
+        if *directory
+            || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
+                != *identity
+        {
+            return Err("FILE_REJECTED");
+        }
+        if truncate {
+            file.set_len(0).map_err(|_| "FILE_REJECTED")?;
+        }
+        let count = file
+            .seek_write(content, offset)
+            .map_err(|_| "FILE_REJECTED")?;
+        if count != content.len() {
+            return Err("FILE_REJECTED");
+        }
+        Ok(json!({"written":(offset + count as u64).to_string()}))
+    }
+
+    fn namespace_sync_handle(&self, token: &str) -> Result<Value, &'static str> {
+        self.validate_namespace()?;
+        let (_, _, file, identity, _) = self
+            .namespace_handles
+            .iter()
+            .find(|(candidate, _, _, _, _)| candidate == token)
+            .ok_or("FILE_REJECTED")?;
+        if crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")? != *identity {
+            return Err("FILE_REJECTED");
+        }
+        file.sync_all().map_err(|_| "FILE_REJECTED")?;
+        Ok(json!({}))
+    }
+
+    fn namespace_close_handle(&mut self, token: &str) -> Result<Value, &'static str> {
+        let index = self
+            .namespace_handles
+            .iter()
+            .position(|(candidate, _, _, _, _)| candidate == token)
+            .ok_or("FILE_REJECTED")?;
+        self.namespace_handles.remove(index);
+        Ok(json!({}))
+    }
+
+    fn namespace_rename(&mut self, from: &str, to: &str) -> Result<Value, &'static str> {
+        let (from_parent, from_name) = Self::namespace_parent(from)?;
+        let (to_parent, to_name) = Self::namespace_parent(to)?;
+        let (source_parent, _) = self.namespace_directory(from_parent)?;
+        let (destination_parent, _) = self.namespace_directory(to_parent)?;
+        let retained_index = self
+            .namespace_directories
+            .iter()
+            .position(|(key, _, _)| key == from);
+        let retained_handle_index = self
+            .namespace_handles
+            .iter()
+            .position(|(_, key, _, _, _)| key == from);
+        let source = if let Some(index) = retained_handle_index {
+            self.namespace_handles[index]
+                .2
+                .try_clone()
+                .map_err(|_| "FILE_REJECTED")?
+        } else if let Some(index) = retained_index {
+            self.namespace_directories.remove(index).1
+        } else {
+            match crate::windows_identity::open_relative_directory(
+                &source_parent,
+                Path::new(from_name),
+                false,
+            ) {
+                Ok((file, false)) => file,
+                _ => crate::windows_identity::open_relative_file(
+                    &source_parent,
+                    Path::new(from_name),
+                )
+                .map_err(|_| "FILE_REJECTED")?,
+            }
+        };
+        let source_identity =
+            crate::windows_identity::file_identity(&source).map_err(|_| "FILE_REJECTED")?;
+        let source_is_directory = source.metadata().map_err(|_| "FILE_REJECTED")?.is_dir();
+        if source_is_directory
+            && (crate::windows_identity::probe_relative_directory(
+                &destination_parent,
+                Path::new(to_name),
+            )
+            .is_ok()
+                || crate::windows_identity::probe_relative_file(
+                    &destination_parent,
+                    Path::new(to_name),
+                )
+                .is_ok())
+        {
+            return Err("NS_EXISTS");
+        }
+        crate::windows_identity::rename_relative(
+            &source,
+            &destination_parent,
+            Path::new(to_name),
+            !source_is_directory,
+        )
+        .map_err(|_| "FILE_REJECTED")?;
+        source_parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        if from_parent != to_parent {
+            destination_parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        }
+        if source_is_directory {
+            self.namespace_directories
+                .push((to.to_string(), source, source_identity));
+        }
+        let descendant_prefix = format!("{from}/");
+        for (_, key, _, _, _) in &mut self.namespace_handles {
+            if key == from {
+                *key = to.to_string();
+            } else if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
+                *key = format!("{to}/{suffix}");
+            }
+        }
+        for (key, _, _) in &mut self.namespace_directories {
+            if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
+                *key = format!("{to}/{suffix}");
+            }
+        }
+        Ok(json!({}))
+    }
+
+    fn namespace_unlink(&mut self, path: &str, directory: bool) -> Result<Value, &'static str> {
+        let (parent_key, name) = Self::namespace_parent(path)?;
+        let (parent, _) = self.namespace_directory(parent_key)?;
+        let retained_index = self
+            .namespace_directories
+            .iter()
+            .position(|(key, _, _)| key == path);
+        let file = if directory && retained_index.is_some() {
+            self.namespace_directories.remove(retained_index.unwrap()).1
+        } else if directory {
+            let (file, created) =
+                crate::windows_identity::open_relative_directory(&parent, Path::new(name), false)
+                    .map_err(|_| "FILE_REJECTED")?;
+            if created {
+                return Err("FILE_REJECTED");
+            }
+            file
+        } else {
+            crate::windows_identity::open_relative_file(&parent, Path::new(name))
+                .map_err(|_| "FILE_REJECTED")?
+        };
+        crate::windows_identity::delete_on_close(&file).map_err(|_| {
+            if directory {
+                "NS_NOT_EMPTY"
+            } else {
+                "FILE_REJECTED"
+            }
+        })?;
+        drop(file);
+        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        self.namespace_directories
+            .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
+        Ok(json!({}))
+    }
+
+    fn namespace_sync_directory(&mut self, path: &str) -> Result<Value, &'static str> {
+        let (directory, identity) = self.namespace_directory(path)?;
+        validate_retained_directory(&directory, identity)?;
+        directory.sync_all().map_err(|_| "FILE_REJECTED")?;
+        Ok(json!({}))
+    }
     fn open(
         target: PathBuf,
         create: bool,
@@ -295,6 +757,8 @@ impl RetainedWindowsRoot {
             materialization_root: None,
             materialization_rolled_back: false,
             publication: None,
+            namespace_directories: Vec::new(),
+            namespace_handles: Vec::new(),
         };
         root.validate()?;
         Ok((root, created))
@@ -1137,6 +1601,75 @@ enum Request {
         id: String,
         wait_ms: u32,
     },
+    NS_STAT {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+    },
+    NS_MKDIR {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+    },
+    NS_OPEN {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        token: String,
+        mode: String,
+    },
+    NS_READ {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
+        offset: u64,
+        length: usize,
+    },
+    NS_WRITE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
+        offset: u64,
+        truncate: bool,
+        content_base64: String,
+    },
+    NS_SYNC_HANDLE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
+    },
+    NS_CLOSE_HANDLE {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        token: String,
+    },
+    NS_RENAME {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        from: String,
+        to: String,
+    },
+    NS_UNLINK {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+        directory: bool,
+    },
+    NS_SYNC_DIRECTORY {
+        version: u8,
+        id: String,
+        wait_ms: u32,
+        path: String,
+    },
     SYNC_ROOT {
         version: u8,
         id: String,
@@ -1242,6 +1775,66 @@ impl Request {
                 version,
                 id,
                 wait_ms,
+            }
+            | Self::NS_STAT {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_MKDIR {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_OPEN {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_READ {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_WRITE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_SYNC_HANDLE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_CLOSE_HANDLE {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_RENAME {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_UNLINK {
+                version,
+                id,
+                wait_ms,
+                ..
+            }
+            | Self::NS_SYNC_DIRECTORY {
+                version,
+                id,
+                wait_ms,
+                ..
             }
             | Self::CLOSE {
                 version,
@@ -1432,6 +2025,83 @@ pub fn run() {
                     .ok_or("ROOT_REQUIRED")
                     .and_then(|v| v.sync())
                     .map(|_| json!({})),
+                false,
+            ),
+            Request::NS_STAT { path, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_stat(&path)),
+                false,
+            ),
+            Request::NS_MKDIR { path, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_mkdir(&path)),
+                false,
+            ),
+            Request::NS_OPEN {
+                path, token, mode, ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_open(&path, &token, &mode)),
+                false,
+            ),
+            Request::NS_READ {
+                token,
+                offset,
+                length,
+                ..
+            } => (
+                root.as_ref()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_read(&token, offset, length)),
+                false,
+            ),
+            Request::NS_WRITE {
+                token,
+                offset,
+                truncate,
+                content_base64,
+                ..
+            } => (
+                decode_bounded_base64(&content_base64).and_then(|content| {
+                    root.as_mut()
+                        .ok_or("ROOT_REQUIRED")
+                        .and_then(|v| v.namespace_write(&token, offset, truncate, &content))
+                }),
+                false,
+            ),
+            Request::NS_SYNC_HANDLE { token, .. } => (
+                root.as_ref()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_sync_handle(&token)),
+                false,
+            ),
+            Request::NS_CLOSE_HANDLE { token, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_close_handle(&token)),
+                false,
+            ),
+            Request::NS_RENAME { from, to, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_rename(&from, &to)),
+                false,
+            ),
+            Request::NS_UNLINK {
+                path, directory, ..
+            } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_unlink(&path, directory)),
+                false,
+            ),
+            Request::NS_SYNC_DIRECTORY { path, .. } => (
+                root.as_mut()
+                    .ok_or("ROOT_REQUIRED")
+                    .and_then(|v| v.namespace_sync_directory(&path)),
                 false,
             ),
             Request::CLOSE { .. } => match root

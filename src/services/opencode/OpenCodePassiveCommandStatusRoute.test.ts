@@ -276,7 +276,9 @@ describe('OpenCode passive command-status production route', () => {
       const replacement = original.replace('records', 'recordz')
       const result = await readOpenCodeCommandOutcomeReadOnly({ requestId: 'send-request',
         deliveryAttemptId: null, signal: new AbortController().signal }, {
-        afterRootRetained: () => writable!.write(Buffer.from(replacement), 0, Buffer.byteLength(replacement), 0),
+        afterRootRetained: async () => {
+          await writable!.write(Buffer.from(replacement), 0, Buffer.byteLength(replacement), 0)
+        },
       })
       expect(result).toBeNull()
       expect((await readFile(target, 'utf8')).length).toBe(original.length)

@@ -78,6 +78,7 @@ import {
   deriveOpenCodeScopedHostKeyFromPlanDigest,
   planScopedProfile,
   resolveOpenCodeOperationPolicy,
+  type OpenCodePolicyPlugin,
   type OpenCodePreservedPlugin,
 } from './OpenCodeOperationPolicy.js'
 
@@ -3325,7 +3326,7 @@ async function resolveInstalledScopedPluginRoot(
 }
 
 async function captureScopedPluginPlanningEvidence(
-  plugins: readonly OpenCodePreservedPlugin[],
+  plugins: readonly (OpenCodePreservedPlugin | OpenCodePolicyPlugin)[],
   packagesRoot: string,
   projectPath: string,
 ): Promise<OpenCodePlanScopedProfileInput['evidence']['plugins']> {
@@ -3335,7 +3336,7 @@ async function captureScopedPluginPlanningEvidence(
     if (prior) continue
     const resolvedPackage = await resolveInstalledScopedPluginRoot(plugin.spec, packagesRoot, projectPath)
     const sourceRoot = resolvedPackage.root
-    const entries: OpenCodePlanScopedProfileInput['evidence']['plugins'][number]['immutableTreeEntries'] = []
+    const entries: Array<OpenCodePlanScopedProfileInput['evidence']['plugins'][number]['immutableTreeEntries'][number]> = []
     let entryCount = 0
     let byteCount = 0
     const visit = async (directory: string, relative: string): Promise<void> => {
@@ -4160,6 +4161,7 @@ export class OpenCodeProfileManager {
     let behaviorCapture: OpenCodeProjectBehaviorCapture | null = null
     let profileTransactionCommitted = false
     let catalogAttemptRootCreated = false
+    let catalogAttemptRoot: Readonly<{ path: string; key: string }> | null = null
     try {
     const catalogPurpose = plan.purpose === 'provider-catalog'
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
@@ -4486,6 +4488,9 @@ export class OpenCodeProfileManager {
       : profileScopeIdentity
     const profileRootPath = path.join(this.paths.data, 'opencode', 'scoped-profiles', profileRootKey)
     if (policy.purpose === 'provider-catalog') {
+      catalogAttemptRoot = { path: profileRootPath, key: profileRootKey }
+    }
+    if (policy.purpose === 'provider-catalog') {
       const generation = /^catalog-g([1-9][0-9]*)-/.exec(runtimeInstanceId)?.[1]
       const parsedGeneration = generation === undefined ? NaN : Number(generation)
       if (!Number.isSafeInteger(parsedGeneration)) {
@@ -4801,8 +4806,8 @@ export class OpenCodeProfileManager {
         await releaseEarlyPreparationLock().catch(() => undefined)
         await earlyLockDirectory.close().catch(() => undefined)
       } else {
-        if (catalogAttemptRootCreated) {
-          await cleanupOpenCodeCatalogProfile(profileRootPath, profileRootKey).catch(() => undefined)
+        if (catalogAttemptRootCreated && catalogAttemptRoot) {
+          await cleanupOpenCodeCatalogProfile(catalogAttemptRoot.path, catalogAttemptRoot.key).catch(() => undefined)
         }
         await behaviorCapture?.close()
         await releaseEarlyPreparationLock()

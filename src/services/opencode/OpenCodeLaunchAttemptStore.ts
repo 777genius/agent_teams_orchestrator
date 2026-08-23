@@ -4,6 +4,11 @@ import path, { basename, dirname, join, parse, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { dlopen, FFIType, ptr, read } from 'bun:ffi'
 import type { PlatformPath } from 'node:path'
+import {
+  OpenCodeWindowsPublicationAuthorityClient,
+  type OpenCodeWindowsPublicationAuthorityFactory,
+} from './OpenCodeWindowsPublicationAuthorityClient.js'
+import { OpenCodeWindowsPublicationRejectedError } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 import {
   isOpenCodeLaunchAttemptId,
@@ -155,6 +160,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       afterNamespaceAnchored?: () => Promise<void>
       /** Test-only platform selection; production always uses process.platform. */
       platform?: NodeJS.Platform
+      windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
     } = {},
   ) {
     if (!filePath) throw new TypeError('journal path is required')
@@ -162,7 +168,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
 
   async read(context?: OpenCodeLaunchStoreContext): Promise<Uint8Array | null> {
     ensureContext(context)
-    const namespace = await this.getNamespace()
+    const namespace = await this.getNamespace(context)
     await verifyNamespace(namespace)
     try {
       const markerBytes = await readNoFollow(namespace.backend, namespace.marker, 1024, this.testHooks)
@@ -182,7 +188,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
 
   async replaceAndSync(bytes: Uint8Array, context?: OpenCodeLaunchStoreContext): Promise<void> {
     ensureContext(context)
-    const namespace = await this.getNamespace()
+    const namespace = await this.getNamespace(context)
     await verifyNamespace(namespace)
     await rejectSymlink(namespace.backend, namespace.marker)
     let currentSlot: 0 | 1 = 1
@@ -206,7 +212,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
 
   async readFence(context?: OpenCodeLaunchStoreContext): Promise<number | null> {
     ensureContext(context)
-    const namespace = await this.getNamespace()
+    const namespace = await this.getNamespace(context)
     await verifyNamespace(namespace)
     try {
       const bytes = await readNoFollow(namespace.authorityBackend, namespace.fence, 128, this.testHooks)
@@ -224,7 +230,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     if (!Number.isSafeInteger(next) || next !== expected + 1) {
       throw new OpenCodeLaunchJournalError('fenced', 'fence must advance exactly once')
     }
-    const namespace = await this.getNamespace()
+    const namespace = await this.getNamespace(context)
     const actual = await this.readFence(context) ?? 0
     if (actual !== expected) throw new OpenCodeLaunchJournalError('fenced', 'durable fence changed')
     await atomicReplace(namespace, namespace.authorityBackend, namespace.fence,
@@ -232,7 +238,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
   }
 
   async acquireExclusive(context: OpenCodeLaunchStoreContext): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>> {
-    const namespace = await this.getNamespace()
+    const namespace = await this.getNamespace(context)
     await verifyNamespace(namespace)
     await rejectSymlink(namespace.backend, namespace.marker)
     const lock = namespace.lock
@@ -289,10 +295,13 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
             // the deadline bounds waiting, while the operation is explicitly reaped late.
             const physicalRelease = releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle!, lockIdentity,
               this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach)
-            try { await awaitWithContext(physicalRelease, effectiveContext) }
+            try {
+              await awaitWithContext(physicalRelease, effectiveContext)
+              await this.closeNamespace(namespace)
+            }
             catch (error) {
               // A timed-out unlink/rmdir is still reaped when the physical operation settles.
-              void physicalRelease.catch(() => undefined)
+              void physicalRelease.then(() => this.closeNamespace(namespace), () => undefined)
               throw error
             }
           }
@@ -336,7 +345,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     }
   }
 
-  private async getNamespace(): Promise<CanonicalNamespace> {
+  private async getNamespace(context?: OpenCodeLaunchStoreContext): Promise<CanonicalNamespace> {
     if (this.namespace) return this.namespace
     const paths = deriveOpenCodeLaunchNamespacePaths(this.filePath, path)
     const suppliedDirectory = paths.directory
@@ -378,11 +387,20 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     // root around every operation. This intentionally is not described as atomic against an
     // administrator replacing the trusted root; normal first-use is preserved.
     const retained = platform === 'linux' || platform === 'darwin'
+    const nativeWindows = platform === 'win32' && process.platform === 'win32'
+    const deadline = context?.deadlineAtMs ?? performance.now() + 10_000
+    const signal = context?.signal
     const backend: NamespaceBackend = retained
       ? await RetainedDirectoryBackend.create(directory, identity, true)
+      : nativeWindows
+      ? await RetainedWindowsNamespaceBackend.create(directory, identity, true, deadline, signal,
+        this.testHooks.windowsAuthorityFactory)
       : new TrustedRootPathBackend(directory, identity, true, platform)
     const authorityBackend: NamespaceBackend = retained
       ? await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false)
+      : nativeWindows
+      ? await RetainedWindowsNamespaceBackend.create(trustedRoot, trustedIdentity, false, deadline, signal,
+        this.testHooks.windowsAuthorityFactory)
       : new TrustedRootPathBackend(trustedRoot, trustedIdentity, false, platform)
     await this.testHooks.afterNamespaceAnchored?.()
     this.namespace = {
@@ -391,6 +409,12 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       fence: basename(paths.fence), lock: basename(paths.lock),
     }
     return this.namespace
+  }
+
+  private async closeNamespace(expected: CanonicalNamespace): Promise<void> {
+    if (this.namespace !== expected) return
+    this.namespace = undefined
+    await Promise.all([expected.backend.close?.(), expected.authorityBackend.close?.()])
   }
 }
 
@@ -475,6 +499,7 @@ interface NamespaceBackend {
   syncDirectory(name?: string): Promise<void>
   displayPath(name: string): string
   verifyRoot(): Promise<void>
+  close?(): Promise<void>
 }
 
 function normalizedStat(value: {
@@ -522,6 +547,104 @@ class TrustedRootPathBackend implements NamespaceBackend {
   async unlink(name: string) { await this.verifyRoot(); await unlink(this.displayPath(name)) }
   async rmdir(name: string) { await this.verifyRoot(); await rmdir(this.displayPath(name)) }
   async syncDirectory(name = '.') { await this.verifyRoot(); await syncDirectory(this.displayPath(name), this.platform) }
+}
+
+function namespaceAuthorityError(error: unknown): NodeJS.ErrnoException {
+  if (error instanceof OpenCodeWindowsPublicationRejectedError) {
+    const code = error.authorityCode === 'NS_NOT_FOUND' ? 'ENOENT'
+      : error.authorityCode === 'NS_EXISTS' ? 'EEXIST'
+      : error.authorityCode === 'NS_NOT_EMPTY' ? 'ENOTEMPTY' : undefined
+    if (code) { const mapped = new Error('Windows retained namespace operation failed [redacted]') as NodeJS.ErrnoException; mapped.code = code; return mapped }
+  }
+  return error instanceof Error ? error : new Error('Windows retained namespace operation failed [redacted]')
+}
+
+class RetainedWindowsNamespaceBackend implements NamespaceBackend {
+  readonly kind = 'retained-directory' as const
+  private constructor(
+    private readonly root: string,
+    private readonly authority: OpenCodeWindowsPublicationAuthorityClient,
+    private readonly expected: { dev: number | bigint; ino: number | bigint },
+    private readonly logicalNamespace: boolean,
+  ) {}
+  static async create(root: string, expected: { dev: number | bigint; ino: number | bigint },
+    logicalNamespace: boolean, deadline: number, signal?: AbortSignal,
+    factory: OpenCodeWindowsPublicationAuthorityFactory = input => new OpenCodeWindowsPublicationAuthorityClient(input)):
+  Promise<RetainedWindowsNamespaceBackend> {
+    const authority = factory({ deadline, signal })
+    try {
+      const identity = await authority.openRoot(root, false, false)
+      if (BigInt(identity.volumeSerial) !== BigInt(expected.dev) || BigInt(identity.fileId) !== BigInt(expected.ino)) {
+        throw new OpenCodeLaunchJournalError(logicalNamespace ? 'fenced' : 'foreign',
+          'retained Windows journal root identity changed')
+      }
+      return new RetainedWindowsNamespaceBackend(root, authority, expected, logicalNamespace)
+    } catch (error) { await authority.close().catch(() => undefined); throw error }
+  }
+  private name(value: string): string {
+    if (value === '.') return value
+    const normalized = value.replaceAll('\\', '/')
+    if (!normalized || normalized.startsWith('/') || normalized.split('/').some(part => !part || part === '.' || part === '..')) {
+      throw new OpenCodeLaunchJournalError('foreign', 'invalid retained Windows journal name')
+    }
+    return normalized
+  }
+  private value(input: Readonly<{ volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>): NamespaceStat {
+    const file = input.kind === 'file'; const directory = input.kind === 'directory'
+    return { dev: BigInt(input.volumeSerial), ino: BigInt(input.fileId), size: Number(input.size),
+      mode: directory ? 0o700 : 0o600, isFile: () => file, isDirectory: () => directory,
+      isSymbolicLink: () => false }
+  }
+  displayPath(name: string) { return join(this.root, name) }
+  async verifyRoot(): Promise<void> {
+    try {
+      const current = this.value(await this.authority.namespaceStat('.'))
+      if (!sameFileIdentity(current, { ...current, dev: this.expected.dev, ino: this.expected.ino })) {
+        throw new OpenCodeLaunchJournalError(this.logicalNamespace ? 'fenced' : 'foreign',
+          'retained Windows journal root identity changed')
+      }
+    } catch (error) {
+      if (error instanceof OpenCodeLaunchJournalError) throw error
+      throw new OpenCodeLaunchJournalError(this.logicalNamespace ? 'fenced' : 'foreign',
+        'retained Windows journal root is unavailable')
+    }
+  }
+  async lstat(name: string) { try { return this.value(await this.authority.namespaceStat(this.name(name))) } catch (error) { throw namespaceAuthorityError(error) } }
+  async stat(name: string) { return this.lstat(name) }
+  async mkdir(name: string, _mode: number) { try { await this.authority.namespaceMkdir(this.name(name)) } catch (error) { throw namespaceAuthorityError(error) } }
+  async open(name: string, flags: number): Promise<NamespaceHandle> {
+    const mode = (flags & (constants.O_DIRECTORY ?? 0)) !== 0 ? 'directory'
+      : (flags & constants.O_CREAT) !== 0 ? 'create_file'
+      : (flags & (constants.O_RDWR | constants.O_WRONLY)) !== 0 ? 'readwrite' : 'read'
+    try {
+      const opened = await this.authority.namespaceOpen(this.name(name), mode)
+      return new RetainedWindowsNamespaceHandle(this.authority, opened.token, this.value(opened))
+    } catch (error) { throw namespaceAuthorityError(error) }
+  }
+  async rename(from: string, to: string) { try { await this.authority.namespaceRename(this.name(from), this.name(to)) } catch (error) { throw namespaceAuthorityError(error) } }
+  async unlink(name: string) { try { await this.authority.namespaceUnlink(this.name(name), false) } catch (error) { throw namespaceAuthorityError(error) } }
+  async rmdir(name: string) { try { await this.authority.namespaceUnlink(this.name(name), true) } catch (error) { throw namespaceAuthorityError(error) } }
+  async syncDirectory(name = '.') { try { await this.authority.namespaceSyncDirectory(this.name(name)) } catch (error) { throw namespaceAuthorityError(error) } }
+  async close(): Promise<void> { await this.authority.close() }
+}
+
+class RetainedWindowsNamespaceHandle implements NamespaceHandle {
+  #closed = false
+  constructor(private readonly authority: OpenCodeWindowsPublicationAuthorityClient,
+    private readonly token: string, private metadata: NamespaceStat) {}
+  async stat(): Promise<NamespaceStat> { if (this.#closed) throw new Error('retained Windows handle is closed'); return this.metadata }
+  async writeFile(data: string | Uint8Array): Promise<void> {
+    if (this.#closed) throw new Error('retained Windows handle is closed')
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+    await this.authority.namespaceWrite(this.token, bytes)
+    this.metadata = { ...this.metadata, size: bytes.byteLength }
+  }
+  async readFile(): Promise<Uint8Array> {
+    if (this.#closed) throw new Error('retained Windows handle is closed')
+    return this.authority.namespaceRead(this.token, this.metadata.size)
+  }
+  async sync(): Promise<void> { if (this.#closed) throw new Error('retained Windows handle is closed'); await this.authority.namespaceSyncHandle(this.token) }
+  async close(): Promise<void> { if (this.#closed) return; this.#closed = true; await this.authority.namespaceCloseHandle(this.token) }
 }
 
 type NativeSymbols = ReturnType<typeof dlopen>
@@ -933,6 +1056,10 @@ async function releaseOwnedLock(
     if (visibleDetachedOwner.isSymbolicLink() || !sameFileIdentity(visibleDetachedOwner, retainedOwner)) {
       throw new OpenCodeLaunchJournalError('fenced', 'detached lease owner identity changed')
     }
+    // The detached name and complete retained identity have been verified. Release
+    // the owner file before deleting it so Windows need not weaken write/delete
+    // sharing to remove the exact tombstoned lease.
+    await ownerHandle.close()
     await backend.unlink(detachedOwner)
     await backend.rmdir(detached)
     await syncNamespace(namespace, backend, undefined, false)

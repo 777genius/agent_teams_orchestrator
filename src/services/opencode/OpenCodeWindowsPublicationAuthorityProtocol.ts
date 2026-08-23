@@ -1,5 +1,7 @@
 export const OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES = 64 * 1024
-export class OpenCodeWindowsPublicationRejectedError extends Error {}
+export class OpenCodeWindowsPublicationRejectedError extends Error {
+  constructor(readonly authorityCode: string) { super('OpenCode Windows publication authority failed [redacted]') }
+}
 
 export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'OPEN_ROOT'; wait_ms: number; root_path: string; create_missing: boolean; durable_ancestors: boolean }
@@ -14,6 +16,15 @@ export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'PREPARE_ATOMIC'; wait_ms: number; final_name: string; temporary_name: string; backup_name: string; quarantine_name: string; recovery_name: string; expected_prior: string; content_base64: string }
   | { version: 1; id: string; op: 'MARK_RECOVERY_REQUIRED'; wait_ms: number }
   | { version: 1; id: string; op: 'COMMIT_ATOMIC' | 'ROLLBACK_ATOMIC'; wait_ms: number }
+  | { version: 1; id: string; op: 'NS_STAT'; wait_ms: number; path: string }
+  | { version: 1; id: string; op: 'NS_MKDIR'; wait_ms: number; path: string }
+  | { version: 1; id: string; op: 'NS_OPEN'; wait_ms: number; path: string; token: string; mode: 'read' | 'readwrite' | 'create_file' | 'directory' }
+  | { version: 1; id: string; op: 'NS_READ'; wait_ms: number; token: string; offset: number; length: number }
+  | { version: 1; id: string; op: 'NS_WRITE'; wait_ms: number; token: string; offset: number; truncate: boolean; content_base64: string }
+  | { version: 1; id: string; op: 'NS_SYNC_HANDLE' | 'NS_CLOSE_HANDLE'; wait_ms: number; token: string }
+  | { version: 1; id: string; op: 'NS_RENAME'; wait_ms: number; from: string; to: string }
+  | { version: 1; id: string; op: 'NS_UNLINK'; wait_ms: number; path: string; directory: boolean }
+  | { version: 1; id: string; op: 'NS_SYNC_DIRECTORY'; wait_ms: number; path: string }
 
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|clock\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\..*)?$/i
 
@@ -28,6 +39,10 @@ export function validOpenCodePublicationLeaf(name: string): boolean {
 
 export function validOpenCodePublicationMaterializationKey(key: string): boolean {
   return key.length > 0 && key.length <= 4096 && key.split('/').every(validWindowsComponent)
+}
+
+export function validOpenCodePublicationRelativePath(value: string): boolean {
+  return value === '.' || (value.length <= 4096 && value.split('/').every(validWindowsComponent))
 }
 
 /** Strict Win32 drive path accepted by the native NTFS publication boundary. */
@@ -47,6 +62,8 @@ export function decodeOpenCodeWindowsPublicationReply(line: string, id: string):
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('OpenCode Windows publication authority failed [redacted]')
   const reply = value as Record<string, unknown>
   if (reply.version !== 1 || reply.id !== id || typeof reply.ok !== 'boolean') throw new Error('OpenCode Windows publication authority failed [redacted]')
-  if (!reply.ok) throw new OpenCodeWindowsPublicationRejectedError('OpenCode Windows publication authority failed [redacted]')
+  if (!reply.ok) throw new OpenCodeWindowsPublicationRejectedError(
+    ['NS_NOT_FOUND', 'NS_EXISTS', 'NS_NOT_EMPTY'].includes(String(reply.error)) ? String(reply.error) : 'REJECTED',
+  )
   return reply.value
 }

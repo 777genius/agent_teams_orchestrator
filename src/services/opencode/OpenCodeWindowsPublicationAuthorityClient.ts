@@ -5,6 +5,7 @@ import {
 } from './OpenCodeNativeAuthorityArtifacts.js'
 import { decodeOpenCodeWindowsPublicationReply, OpenCodeWindowsPublicationRejectedError, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
   validOpenCodePublicationLeaf, validOpenCodePublicationMaterializationKey, validOpenCodePublicationRoot,
+  validOpenCodePublicationRelativePath,
   type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
@@ -21,11 +22,11 @@ const unavailable = () => new Error('OpenCode Windows publication authority is u
 export class OpenCodeWindowsPublicationAuthorityClient {
   readonly #child: OpenCodeNativeAuthorityChild
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
-  #deadline: number
+  readonly #deadline: number
   readonly #signal?: AbortSignal
   readonly #decoder = new TextDecoder('utf-8', { fatal: true })
   #pending = ''; #pendingBytes = 0; #closed = false; #retained = false
-  #physicalSettlement: Promise<unknown> = Promise.resolve()
+  readonly #physicalSettlements = new Set<Promise<unknown>>()
   #ownerDeadline: ReturnType<typeof setTimeout> | undefined
   #abort = () => { void this.#cancelAfterSettlement() }
 
@@ -121,6 +122,70 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async commitAtomic(): Promise<void> { await this.#request({ id: randomUUID(), op: 'COMMIT_ATOMIC' }) }
   async rollbackAtomic(): Promise<void> { await this.#request({ id: randomUUID(), op: 'ROLLBACK_ATOMIC' }) }
+  async namespaceStat(relativePath: string): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>> {
+    if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
+    const value = await this.#request({ id: randomUUID(), op: 'NS_STAT', path: relativePath }) as Record<string, unknown>
+    if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
+      || !/^\d+$/.test(String(value?.size)) || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
+    return value as { volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }
+  }
+  async namespaceMkdir(relativePath: string): Promise<void> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_MKDIR', path: relativePath })
+  }
+  async namespaceOpen(relativePath: string, mode: 'read' | 'readwrite' | 'create_file' | 'directory'):
+  Promise<Readonly<{ token: string; volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>> {
+    if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
+    const token = randomUUID()
+    const value = await this.#request({ id: randomUUID(), op: 'NS_OPEN', path: relativePath, token, mode }) as Record<string, unknown>
+    if (typeof value?.token !== 'string' || !/^[0-9a-f-]{36}$/.test(value.token)
+      || !/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
+      || value.token !== token || !/^\d+$/.test(String(value?.size)) || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
+    return value as { token: string; volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }
+  }
+  async namespaceRead(token: string, size: number): Promise<Uint8Array> {
+    if (!/^[0-9a-f-]{36}$/.test(token) || !Number.isSafeInteger(size) || size < 0 || size > 1_048_576) throw unavailable()
+    const chunks: Uint8Array[] = []; let offset = 0
+    while (offset < size) {
+      const length = Math.min(32 * 1024, size - offset)
+      const value = await this.#request({ id: randomUUID(), op: 'NS_READ', token, offset, length }) as Record<string, unknown>
+      if (typeof value?.content_base64 !== 'string') throw unavailable()
+      const chunk = Buffer.from(value.content_base64, 'base64')
+      if (chunk.byteLength > length || (chunk.byteLength === 0 && offset < size)) throw unavailable()
+      chunks.push(chunk); offset += chunk.byteLength
+      if (chunk.byteLength < length) break
+    }
+    return Buffer.concat(chunks)
+  }
+  async namespaceWrite(token: string, bytes: Uint8Array): Promise<void> {
+    if (!/^[0-9a-f-]{36}$/.test(token) || bytes.byteLength > 1_048_576) throw unavailable()
+    let offset = 0
+    do {
+      const end = Math.min(bytes.byteLength, offset + 32 * 1024)
+      const value = await this.#request({ id: randomUUID(), op: 'NS_WRITE', token, offset,
+        truncate: offset === 0, content_base64: Buffer.from(bytes.subarray(offset, end)).toString('base64') }) as Record<string, unknown>
+      if (String(value?.written) !== String(end)) throw unavailable()
+      offset = end
+    } while (offset < bytes.byteLength)
+  }
+  async namespaceSyncHandle(token: string): Promise<void> { await this.#namespaceToken('NS_SYNC_HANDLE', token) }
+  async namespaceCloseHandle(token: string): Promise<void> { await this.#namespaceToken('NS_CLOSE_HANDLE', token) }
+  async #namespaceToken(op: 'NS_SYNC_HANDLE' | 'NS_CLOSE_HANDLE', token: string): Promise<void> {
+    if (!/^[0-9a-f-]{36}$/.test(token)) throw unavailable()
+    await this.#request({ id: randomUUID(), op, token })
+  }
+  async namespaceRename(from: string, to: string): Promise<void> {
+    if (![from, to].every(validOpenCodePublicationRelativePath) || from === '.' || to === '.') throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_RENAME', from, to })
+  }
+  async namespaceUnlink(relativePath: string, directory: boolean): Promise<void> {
+    if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_UNLINK', path: relativePath, directory })
+  }
+  async namespaceSyncDirectory(relativePath = '.'): Promise<void> {
+    if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
+    await this.#request({ id: randomUUID(), op: 'NS_SYNC_DIRECTORY', path: relativePath })
+  }
   async close(): Promise<void> { if (this.#closed) return; try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {} finally { this.kill() } }
   kill(): void { if (this.#closed) return; this.#closed = true; if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
 
@@ -137,6 +202,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async #markRecoveryAndKill(): Promise<void> {
     if (this.#closed) return
+    await Promise.allSettled([...this.#physicalSettlements])
     try { await this.#request({ id: randomUUID(), op: 'MARK_RECOVERY_REQUIRED' }) } catch {}
     finally { this.kill() }
   }
@@ -145,7 +211,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     // Abort never tears a native mutation out from under its retained NTFS
     // handles.  First observe physical command settlement, then publish the
     // recovery marker through the same authority, and only then terminate it.
-    await this.#physicalSettlement.catch(() => undefined)
+    await Promise.allSettled([...this.#physicalSettlements])
     if (this.#closed) return
     if (this.#retained) await this.#markRecoveryAndKill()
     else this.kill()
@@ -163,15 +229,29 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (new TextEncoder().encode(encoded).byteLength > OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES) throw unavailable()
     this.#child.stdin.write(encoded)
     let timer: ReturnType<typeof setTimeout> | undefined
+    let physical: Promise<string> | undefined
     try {
-      const physical = Promise.race([this.#readLine(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(unavailable()), remaining); timer.unref?.() }), this.#child.exited.then(() => { throw unavailable() })])
-      this.#physicalSettlement = physical
-      const line = await physical
+      physical = Promise.race([this.#readLine(), this.#child.exited.then(() => { throw unavailable() })])
+      this.#physicalSettlements.add(physical)
+      void physical.then(() => this.#physicalSettlements.delete(physical!),
+        () => this.#physicalSettlements.delete(physical!))
+      const line = await (this.#retained ? physical : Promise.race([physical,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(unavailable()), remaining); timer.unref?.() })]))
       const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
+      if (!settlementCommand && (this.#signal?.aborted || performance.now() >= this.#deadline)) {
+        void this.#markRecoveryAndKill(); throw unavailable()
+      }
       if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'CLOSE') this.#armOwnerReaper()
       return value
     } catch (error) {
+      if (this.#retained && !settlementCommand
+        && (this.#signal?.aborted || performance.now() >= this.#deadline)) {
+        void this.#markRecoveryAndKill(); throw unavailable()
+      }
+      if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained
+        && request.op.startsWith('NS_')) throw error
       if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained) throw unavailable()
+      if (this.#retained) { void this.#cancelAfterSettlement(); throw unavailable() }
       this.kill(); throw unavailable()
     } finally { if (timer) clearTimeout(timer) }
   }

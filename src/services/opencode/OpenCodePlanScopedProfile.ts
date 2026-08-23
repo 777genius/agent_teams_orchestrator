@@ -4,6 +4,7 @@ import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPol
 import type {
   OpenCodeCurrentScopedProfilePlan,
   OpenCodeScopedPreparedProfile,
+  OpenCodeScopedProfilePreparationInput,
   OpenCodeScopedProfilePlan,
   OpenCodeScopedProfilePlanContract,
 } from './types.js'
@@ -21,7 +22,7 @@ export type OpenCodePlanScopedProfileManagerPort = {
   ) => Promise<OpenCodeCurrentScopedProfilePlan>
   planScopedProfile?: (input: OpenCodeCurrentScopedProfilePlan) => OpenCodeScopedProfilePlanContract
   prepareScopedProfile?: (
-    input: OpenCodeCurrentScopedProfilePlan,
+    input: OpenCodeScopedProfilePreparationInput,
     expectedPlan: OpenCodeExpectedScopedProfilePlan,
   ) => Promise<OpenCodeScopedPreparedProfile>
 }
@@ -58,7 +59,9 @@ export async function authorizeOpenCodeLaunchScopedProfile(
 
 export async function prepareAuthorizedOpenCodeLaunchScopedProfile(
   manager: OpenCodePlanScopedProfileManagerPort,
-  authorization: OpenCodeAuthorizedScopedProfilePlan,
+  authorization: Omit<OpenCodeAuthorizedScopedProfilePlan, 'input'> & {
+    input: OpenCodeScopedProfilePreparationInput
+  },
 ): Promise<OpenCodeScopedPreparedProfile> {
   if (typeof manager.prepareScopedProfile !== 'function') {
     throw new Error('OpenCode PlanScopedProfile preparation contract is unavailable')

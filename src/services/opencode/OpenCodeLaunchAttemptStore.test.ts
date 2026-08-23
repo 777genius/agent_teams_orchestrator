@@ -601,6 +601,31 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(outer, { recursive: true, force: true }) }
   })
 
+  test('real Windows retains journal and coordination roots across the replacement boundary', async () => {
+    if (process.platform !== 'win32') return
+    const outer = await workspaceTemp('windows-retained-native-authority')
+    const live = join(outer, 'live')
+    const displaced = join(outer, 'displaced')
+    const journal = join(live, 'attempt.json')
+    const startedAtMs = performance.now()
+    const context = { deadlineAtMs: startedAtMs + 15_000,
+      monotonicNow: performance.now.bind(performance), signal: new AbortController().signal }
+    const liveIdentity = { ...identity, startedAtMs, totalBudgetMs: 15_000 }
+    let replacementDenied = false
+    try {
+      const store = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(journal, {
+        afterNamespaceAnchored: async () => {
+          try { await rename(live, displaced) }
+          catch { replacementDenied = true }
+        },
+      }))
+      await store.withGeneration(liveIdentity, 'begin', async lease => {
+        await lease.append({ type: 'member_intent', memberIdentity: member }, context)
+      }, context)
+      expect(replacementDenied).toBe(true)
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
   test('trusted-root Windows backend shares authority across a final-directory swap', async () => {
     const outer = await workspaceTemp('windows-two-store-anchor')
     const parent = join(outer, 'parent')

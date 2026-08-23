@@ -16,6 +16,14 @@ function fake() {
             : request.op === 'CREATE_DIRECTORY' || request.op === 'RENAME_DIRECTORY' || request.op === 'OPEN_CHILD_DIRECTORY'
               || request.op === 'CREATE_CHILD_DIRECTORY' || request.op === 'CREATE_CHILD_FILE'
               ? { volumeSerial: '1', fileId: '5' }
+              : request.op === 'NS_STAT'
+                ? { volumeSerial: '1', fileId: '8', size: '3', kind: request.path === '.' ? 'directory' : 'file' }
+                : request.op === 'NS_OPEN'
+                  ? { token: request.token, volumeSerial: '1', fileId: '9', size: '3', kind: request.mode === 'directory' ? 'directory' : 'file' }
+                  : request.op === 'NS_READ'
+                    ? { content_base64: Buffer.from('abc').subarray(request.offset, request.offset + request.length).toString('base64') }
+                    : request.op === 'NS_WRITE'
+                      ? { written: String(request.offset + Buffer.from(request.content_base64, 'base64').length) }
               : request.op === 'WRITE_CHILD_FILE'
                 ? { written: String(request.offset + Buffer.from(request.content_base64, 'base64').length), finished: request.finish }
                 : {}
@@ -116,5 +124,26 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(process.operations).toEqual(['OPEN_ROOT', 'OPEN_CHILD_DIRECTORY', 'OPEN_CHILD_DIRECTORY',
       'PIN_REGULAR_READONLY', 'CLOSE'])
     expect(process.requests[3]).toMatchObject({ parent_key: 'legacy/snapshot', name: 'status.json' })
+  })
+  test('keeps journal namespace I/O on retained native tokens', async () => {
+    const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: performance.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await client.namespaceMkdir('lease.pending')
+    const handle = await client.namespaceOpen('lease.pending/owner.json', 'create_file')
+    await client.namespaceWrite(handle.token, Buffer.from('abc'))
+    await client.namespaceSyncHandle(handle.token)
+    expect(new TextDecoder().decode(await client.namespaceRead(handle.token, 3))).toBe('abc')
+    await client.namespaceRename('lease.pending', 'lease')
+    expect(await client.namespaceStat('lease/owner.json')).toMatchObject({ kind: 'file', size: '3' })
+    await client.namespaceCloseHandle(handle.token)
+    await client.namespaceUnlink('lease/owner.json', false)
+    await client.namespaceUnlink('lease', true)
+    await client.namespaceSyncDirectory('.')
+    await client.close()
+    expect(process.operations).toEqual(['OPEN_ROOT', 'NS_MKDIR', 'NS_OPEN', 'NS_WRITE',
+      'NS_SYNC_HANDLE', 'NS_READ', 'NS_RENAME', 'NS_STAT', 'NS_CLOSE_HANDLE', 'NS_UNLINK',
+      'NS_UNLINK', 'NS_SYNC_DIRECTORY', 'CLOSE'])
   })
 })

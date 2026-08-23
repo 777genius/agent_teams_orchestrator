@@ -173,7 +173,10 @@ async function commitOpenCodePassiveSnapshot(
       const changedDomains = normalized ? mutationDomains(normalized, next) : snapshotDomains(next)
       assignChangedGenerations(next, id, new Set([...reconciled.changedDomains, ...changedDomains]))
       const encoded = encodeOpenCodeRedactedSnapshotV1(next)
-      if (!encoded.ok || !encoded.bytes) throw new TypeError(`Passive snapshot mutation is invalid: ${encoded.issueCode}`)
+      if (!encoded.ok || !encoded.bytes) {
+        const issue = 'issueCode' in encoded ? encoded.issueCode : 'snapshot_invalid_field'
+        throw new TypeError(`Passive snapshot mutation is invalid: ${issue}`)
+      }
       const payload = new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
       if (!decodeDurable(payload, id, projectScope)) throw new TypeError('Passive snapshot authority is invalid')
       await options.hooks?.afterProjectSnapshotPublished?.()
@@ -1083,13 +1086,16 @@ function assignChangedGenerations(snapshot: OpenCodeRedactedSnapshotV1, generati
 function decodeDurable(text: string, generation: number, scope: `sha256:${string}`): OpenCodeRedactedSnapshotV1 | null {
   const decoded = decodeOpenCodeRedactedSnapshotV1(text)
   if (!decoded.ok || decoded.value.projectScope !== scope) return null
-  const observations = [decoded.value.binary, ...decoded.value.providers.flatMap(provider => [
-    provider.configured, provider.lastConnected, provider.catalogAvailable, provider.executionVerified,
-  ])]
-  if (observations.some(observation => observation.authority === 'none'
-    ? observation.evidenceGeneration !== undefined
-    : !Number.isSafeInteger(observation.evidenceGeneration)
-      || observation.evidenceGeneration! <= 0 || observation.evidenceGeneration! > generation)) return null
+  const invalidGeneration = (observation: Readonly<{ authority: string; evidenceGeneration?: number }>) =>
+    observation.authority === 'none'
+      ? observation.evidenceGeneration !== undefined
+      : !Number.isSafeInteger(observation.evidenceGeneration)
+        || observation.evidenceGeneration! <= 0 || observation.evidenceGeneration! > generation
+  if (invalidGeneration(decoded.value.binary)
+    || decoded.value.providers.some(provider => invalidGeneration(provider.configured)
+      || invalidGeneration(provider.lastConnected)
+      || invalidGeneration(provider.catalogAvailable)
+      || invalidGeneration(provider.executionVerified))) return null
   return decoded.value
 }
 
@@ -1097,11 +1103,15 @@ function validateMutation(mutation: OpenCodeRedactedSnapshotMutation): void {
   if (!/^sha256:[0-9a-f]{64}$/.test(mutation.projectScope)
     || !Number.isSafeInteger(mutation.capturedAt) || mutation.capturedAt < 0) throw new TypeError('Invalid passive mutation')
   const ids = new Set<string>()
-  const supplied = [mutation.binary, ...Object.values(mutation.providerDefaults ?? {}).flatMap(value =>
-    value && typeof value === 'object' && 'available' in value ? [value.available] : [value]),
-    ...(mutation.providers ?? []).flatMap(provider => [provider.configured, provider.lastConnected,
-      provider.catalog?.available, provider.executionVerified])].filter(Boolean) as Array<{ evidenceGeneration?: number }>
-  if (supplied.some(observation => observation.evidenceGeneration !== undefined)) {
+  const suppliesGeneration = (value: unknown): boolean => Boolean(value && typeof value === 'object'
+    && 'evidenceGeneration' in value
+    && (value as Readonly<{ evidenceGeneration?: number }>).evidenceGeneration !== undefined)
+  if (suppliesGeneration(mutation.binary)
+    || Object.values(mutation.providerDefaults ?? {}).some(value => value && typeof value === 'object'
+      && 'available' in value ? suppliesGeneration(value.available) : suppliesGeneration(value))
+    || (mutation.providers ?? []).some(provider => suppliesGeneration(provider.configured)
+      || suppliesGeneration(provider.lastConnected) || suppliesGeneration(provider.catalog?.available)
+      || suppliesGeneration(provider.executionVerified))) {
     throw new TypeError('Passive mutation cannot supply durable authority')
   }
   if (mutation.providerDefaults?.catalog?.modelIds) throw new TypeError('Default catalog mutation cannot own models')
