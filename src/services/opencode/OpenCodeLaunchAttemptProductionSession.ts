@@ -5,6 +5,7 @@ import type { OpenCodeLaunchOwnedResources } from './OpenCodeLaunchAttempt.js'
 import type { OpenCodeLaunchMutationClaimRecord } from './OpenCodeLaunchMutationLedger.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeMessage, OpenCodeSessionRecord, OpenCodeSessionSummary } from './types.js'
+import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
@@ -207,7 +208,7 @@ export class OpenCodeProofSessionCleanupLedger {
 async function awaitProofLedgerContext<T>(operation: Promise<T>, context?: OpenCodeProofLedgerContext): Promise<T> {
   if (!context) return operation
   if (context.signal.aborted) throw context.signal.reason ?? new Error('OpenCode proof cleanup cancelled')
-  const remaining = context.deadlineAtMs - performance.now()
+  const remaining = context.deadlineAtMs - openCodeMonotonicNow()
   if (remaining <= 0) throw new Error('OpenCode proof cleanup deadline expired')
   let timer: ReturnType<typeof setTimeout> | undefined
   let abort!: () => void

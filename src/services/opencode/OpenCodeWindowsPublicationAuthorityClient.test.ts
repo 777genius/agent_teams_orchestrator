@@ -60,7 +60,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('does not report physical settlement when kill precedes controlled child exit', async () => {
     const process = fake(0, false)
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       launch: () => process.child })
     let settled = false
     void client.physicalSettlement.then(() => { settled = true })
@@ -71,7 +71,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('close is idempotent while controlled child exit and physical release are delayed', async () => {
     const process = fake(0, false)
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       launch: () => process.child })
     await client.openRoot('C:\\safe', false, false)
     const first = client.close(); const second = client.close()

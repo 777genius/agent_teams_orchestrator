@@ -28,7 +28,7 @@ describe('Windows retained publication native contract', () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const displaced = path.join(sandbox, 'displaced')
     await mkdir(root); await writeFile(path.join(root, 'passive-status.sqlite3'), '')
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await client.openRoot(root, false, false); await expect(rename(root, displaced)).rejects.toBeDefined()
     await client.pinRegular('passive-status.sqlite3')
     await expect(rename(path.join(root, 'passive-status.sqlite3'), path.join(root, 'moved.sqlite3'))).rejects.toBeDefined()
@@ -39,7 +39,7 @@ describe('Windows retained publication native contract', () => {
     const existing = path.join(sandbox, 'existing'); const created = path.join(existing, 'created')
     const target = path.join(created, 'nested'); const displaced = path.join(sandbox, 'displaced')
     await mkdir(existing)
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     const opened = await client.openRoot(target, true, true)
     expect(opened.createdPaths.map(value => value.toLowerCase())).toEqual([
       created.toLowerCase(), target.toLowerCase(),
@@ -53,7 +53,7 @@ describe('Windows retained publication native contract', () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-readonly-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
     await mkdir(root); await writeFile(database, 'stable-checkpoint')
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await client.openRoot(root, false, false); await client.pinRegular('passive-status.sqlite3', true)
     await expect(writeFile(database, 'mutated')).rejects.toBeDefined()
     await client.close(); await writeFile(database, 'after-close')
@@ -61,7 +61,7 @@ describe('Windows retained publication native contract', () => {
   windowsTest('creates and publishes a temp root through one retained relative handle', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-retained-temp-root-')); roots.push(sandbox)
     const displaced = path.join(sandbox, 'displaced')
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await client.openRoot(sandbox, false, false)
     await client.createDirectory('attempt.snapshot')
     await expect(rename(path.join(sandbox, 'attempt.snapshot'), displaced)).rejects.toBeDefined()
@@ -140,12 +140,12 @@ describe('Windows retained publication native contract', () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-junction-')); roots.push(sandbox)
     const attacker = path.join(sandbox, 'attacker'); const junction = path.join(sandbox, 'junction')
     await mkdir(attacker); await symlink(attacker, junction, 'junction')
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await expect(client.openRoot(junction, false, false)).rejects.toThrow('unavailable [redacted]'); await client.close()
   })
   windowsTest('rejects ADS, devices, extended paths, and traversal at the native boundary', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-path-rejection-')); roots.push(sandbox)
-    const client = () => new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = () => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     for (const candidate of [`${sandbox}:stream`, `\\\\?\\${sandbox}`, `\\\\.\\${sandbox}`,
       `${sandbox}\\..\\${path.basename(sandbox)}`, `${sandbox}\\.\\child`, `${sandbox}\\NUL`]) {
       const authority = client()
@@ -228,7 +228,7 @@ describe('Windows retained publication native contract', () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-namespace-primitives-')); roots.push(sandbox)
     await mkdir(path.join(sandbox, 'retired', 'nested'), { recursive: true })
     await writeFile(path.join(sandbox, 'retired', 'nested', 'old.txt'), 'old')
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 10_000, ...artifacts() })
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await client.openRoot(sandbox, false, false)
     expect(await client.namespaceList('.')).toContain('retired')
     expect(await client.namespaceModifiedAt('retired', 'directory')).toBeGreaterThan(0)

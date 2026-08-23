@@ -133,7 +133,7 @@ test('proof cleanup refuses an expired immutable launch deadline before publicat
     await expect(ledger.reconcileAndRegister({ attemptId: 'attempt-a', requestGeneration: 1,
       hostKeyIdentity: identity, ownership: generation => ({ authoritativeSessionId: `proof-${generation}`,
         ownershipTitle: `owned-${generation}` }), reconcile: async () => 'absent' }, {
-      deadlineAtMs: performance.now() - 1, signal: new AbortController().signal,
+      deadlineAtMs: Date.now() - 1, signal: new AbortController().signal,
     })).rejects.toThrow('deadline expired')
     await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' })
   } finally { await rm(directory, { recursive: true, force: true }) }
@@ -144,16 +144,16 @@ test('proof cleanup bounds a previous physical lease wait without releasing succ
   try {
     const controlled = controlledProofDirectories()
     const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'), controlled.open)
-    const firstDeadline = performance.now() + 5_000
+    const firstDeadline = Date.now() + 5_000
     await ledger.read({ deadlineAtMs: firstDeadline, signal: new AbortController().signal })
     expect(controlled.opens()).toBe(1)
 
-    const expired = performance.now() + 30
+    const expired = Date.now() + 30
     await expect(ledger.read({ deadlineAtMs: expired, signal: new AbortController().signal }))
       .rejects.toThrow('deadline expired')
     expect(controlled.opens()).toBe(1)
 
-    const successorDeadline = performance.now() + 5_000
+    const successorDeadline = Date.now() + 5_000
     const successor = ledger.read({ deadlineAtMs: successorDeadline, signal: new AbortController().signal })
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(controlled.opens()).toBe(1)
@@ -170,14 +170,14 @@ test('proof cleanup cancellation abandons only its queued caller and preserves t
   try {
     const controlled = controlledProofDirectories()
     const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'), controlled.open)
-    await ledger.read({ deadlineAtMs: performance.now() + 5_000, signal: new AbortController().signal })
+    await ledger.read({ deadlineAtMs: Date.now() + 5_000, signal: new AbortController().signal })
     const abort = new AbortController()
-    const cancelled = ledger.read({ deadlineAtMs: performance.now() + 5_000, signal: abort.signal })
+    const cancelled = ledger.read({ deadlineAtMs: Date.now() + 5_000, signal: abort.signal })
     abort.abort(new Error('caller cancelled'))
     await expect(cancelled).rejects.toThrow('caller cancelled')
     expect(controlled.opens()).toBe(1)
 
-    const successor = ledger.read({ deadlineAtMs: performance.now() + 5_000,
+    const successor = ledger.read({ deadlineAtMs: Date.now() + 5_000,
       signal: new AbortController().signal })
     await new Promise(resolve => setTimeout(resolve, 0)); expect(controlled.opens()).toBe(1)
     controlled.settle(0); await successor

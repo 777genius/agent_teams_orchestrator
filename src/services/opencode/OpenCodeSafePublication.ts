@@ -97,7 +97,7 @@ export class OpenCodeSafePublicationDirectory {
     if (process.platform !== 'win32') return this.open(directoryPath, options)
     const resolved = path.resolve(directoryPath)
     const passive = OpenCodeWindowsPassiveReadAuthority.open(resolved, {
-      deadline: options.deadline ?? performance.now() + 10_000,
+      deadline: options.deadline ?? openCodeMonotonicNow() + 10_000,
       signal: options.abortSignal,
     })
     try {

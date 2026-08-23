@@ -1,6 +1,7 @@
 import { dlopen, FFIType, ptr } from 'bun:ffi'
 
 import { validOpenCodePublicationLeaf, validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
+import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 
 type Handle = bigint
 type Identity = Readonly<{ volumeSerial: bigint; fileId: bigint; size: bigint; directory: boolean }>
@@ -133,7 +134,7 @@ const nativeContract: PassiveNativeContract = {
 
 function guard(options: OpenOptions): void {
   if (options.signal?.aborted || options.deadline !== undefined
-    && (!Number.isFinite(options.deadline) || performance.now() >= options.deadline)) throw rejected()
+    && (!Number.isFinite(options.deadline) || openCodeMonotonicNow() >= options.deadline)) throw rejected()
 }
 
 type RetainedRoot = Readonly<{ root: Handle; rootIdentity: Identity; volume: Handle; volumeIdentity: Identity }>
