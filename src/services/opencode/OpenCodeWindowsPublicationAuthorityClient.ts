@@ -7,6 +7,7 @@ import { decodeOpenCodeWindowsPublicationReply, OpenCodeWindowsPublicationReject
   validOpenCodePublicationLeaf, validOpenCodePublicationMaterializationKey, validOpenCodePublicationRoot,
   validOpenCodePublicationRelativePath,
   type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
+import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 
 type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
   T extends OpenCodeWindowsPublicationRequest ? Omit<T, 'version' | 'wait_ms'> : never
@@ -33,7 +34,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #abort = () => { this.kill() }
 
   constructor(options: OpenCodeWindowsPublicationAuthorityOptions) {
-    if (!Number.isFinite(options.deadline) || options.deadline <= performance.now() || options.signal?.aborted) throw unavailable()
+    if (!Number.isFinite(options.deadline) || options.deadline <= openCodeMonotonicNow() || options.signal?.aborted) throw unavailable()
     this.#cancelled = new Promise(resolve => { this.#cancel = resolve })
     const artifacts = resolveOpenCodeNativeAuthorityArtifacts(options)
     if (!options.launch) verifyOpenCodeNativeAuthorityArtifacts(artifacts)
@@ -276,7 +277,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   #armOwnerReaper(): void {
     if (this.#closed || !this.#retained) return
     if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
-    const remaining = Math.max(1, this.#deadline - performance.now())
+    const remaining = Math.max(1, this.#deadline - openCodeMonotonicNow())
     // A live owner retains authority for its complete launch deadline. Owner
     // loss is signalled by AbortSignal; this timer is only the immutable
     // absolute-deadline backstop, never an independent lease.
@@ -296,8 +297,8 @@ export class OpenCodeWindowsPublicationAuthorityClient {
 
   async #executeRequest(request: Pending): Promise<unknown> {
     const settlementCommand = request.op === 'MARK_RECOVERY_REQUIRED' || request.op === 'NS_RELEASE_LOCK' || request.op === 'CLOSE'
-    if (this.#closed || this.#signal?.aborted || performance.now() >= this.#deadline) throw unavailable()
-    const remaining = Math.max(0, this.#deadline - performance.now())
+    if (this.#closed || this.#signal?.aborted || openCodeMonotonicNow() >= this.#deadline) throw unavailable()
+    const remaining = Math.max(0, this.#deadline - openCodeMonotonicNow())
     const wire = { version: 1, ...request, wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeWindowsPublicationRequest
     const encoded = `${JSON.stringify(wire)}\n`
     if (new TextEncoder().encode(encoded).byteLength > OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES) throw unavailable()
@@ -308,7 +309,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
       const line = await Promise.race([physical, this.#cancelled.then(() => { throw unavailable() }),
         new Promise<never>((_, reject) => { timer = setTimeout(() => { this.kill(); reject(unavailable()) }, remaining); timer.unref?.() })])
       const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
-      if (!settlementCommand && (this.#signal?.aborted || performance.now() >= this.#deadline)) {
+      if (!settlementCommand && (this.#signal?.aborted || openCodeMonotonicNow() >= this.#deadline)) {
         this.kill(); throw unavailable()
       }
       if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'NS_RELEASE_LOCK' && request.op !== 'CLOSE') this.#armOwnerReaper()

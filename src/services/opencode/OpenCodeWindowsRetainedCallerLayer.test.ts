@@ -65,6 +65,14 @@ describe('OpenCode Windows retained caller layer', () => {
     expect(manager).toContain("process.platform === 'win32'\n        ? scopedLockDirectory.acquireRetainedLock")
     expect(manager).toContain('acquireOpenCodeProfilePathLock(lockPath)')
     expect(manager).toContain('acquireOpenCodeProfilePathLock(migrationLockPath)')
+    expect(manager).toContain('verifyWindowsRetainedSnapshotTree(')
+    expect(manager).toContain('createRetainedDescendantDirectory(')
+    expect(manager).toContain('writeRetainedDescendantFile(')
+    expect(manager).toContain('renameRetainedChildDirectory(temporaryLeaf, targetLeaf)')
+    expect(manager).toContain('rollbackRetainedChildDirectory(temporaryLeaf)')
+    expect(manager).toContain('retained snapshot root is a replacement or junction')
+    expect(manager).toContain('abortSignal, deadline: deadlineAtMs')
+    expect(manager).not.toContain('deadline: performance.now() + 10_000')
   })
 
   test('active caller dispatches namespace work through one retained authority port', async () => {

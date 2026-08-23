@@ -38,7 +38,6 @@ import {
 } from './OpenCodeCuratedSubscriptionCatalog.js'
 import {
   OpenCodeSafePublicationDirectory,
-  withOpenCodeSafePublicationDirectory,
 } from './OpenCodeSafePublication.js'
 import { commitOpenCodeScopedProfileAuth } from './OpenCodeScopedProfileAuthPublication.js'
 import { janitorOpenCodeCatalogProfiles,
@@ -65,6 +64,7 @@ import {
 } from './OpenCodeManagedPaths.js'
 import { ensureOpenCodeWindowsManagedDirectoryPath } from './OpenCodeWindowsManagedDirectory.js'
 import {
+  openCodeMonotonicNow,
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
@@ -783,17 +783,183 @@ async function collectBehaviorDirectoryEntries(
   return entries
 }
 
+const OPEN_CODE_RETAINED_SNAPSHOT_FILE_MAX_BYTES = 16 * 1024 * 1024
+
+/** Windows tree verification never leaves the retained native namespace. */
+async function verifyWindowsRetainedSnapshotTree(
+  publicationDirectory: OpenCodeSafePublicationDirectory,
+  targetLeaf: string,
+  expectedFiles: ReadonlyMap<string, string>,
+  abortSignal?: AbortSignal,
+): Promise<boolean> {
+  if (!(await publicationDirectory.childNames()).includes(targetLeaf)) return false
+  let root: OpenCodeSafePublicationDirectory
+  try { root = await publicationDirectory.openChildDirectory(targetLeaf) }
+  catch (error) {
+    throw new Error('OpenCode retained snapshot root is a replacement or junction', { cause: error })
+  }
+  const normalizedFiles = new Map(Array.from(expectedFiles, ([name, digest]) => [
+    name.split(path.sep).join('/'), digest,
+  ]))
+  const expectedDirectories = new Set<string>([''])
+  for (const file of normalizedFiles.keys()) {
+    let directory = path.posix.dirname(file)
+    while (directory !== '.') {
+      expectedDirectories.add(directory)
+      directory = path.posix.dirname(directory)
+    }
+  }
+  const walk = async (directory: OpenCodeSafePublicationDirectory, relative: string): Promise<void> => {
+    const names = [...await directory.childNames()].sort()
+    const expectedNames = new Set<string>()
+    for (const file of normalizedFiles.keys()) {
+      if (path.posix.dirname(file) === (relative || '.')) expectedNames.add(path.posix.basename(file))
+    }
+    for (const child of expectedDirectories) {
+      if (child && path.posix.dirname(child) === (relative || '.')) expectedNames.add(path.posix.basename(child))
+    }
+    if (canonicalSerializeOpenCodePolicyIdentity(names)
+      !== canonicalSerializeOpenCodePolicyIdentity([...expectedNames].sort())) {
+      throw new Error('OpenCode retained snapshot contains unexpected entries')
+    }
+    for (const name of names) {
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+      const childRelative = relative ? `${relative}/${name}` : name
+      const digest = normalizedFiles.get(childRelative)
+      if (digest !== undefined) {
+        const bytes = await directory.readBoundedRegularBytes(
+          name, OPEN_CODE_RETAINED_SNAPSHOT_FILE_MAX_BYTES, abortSignal,
+        )
+        if (!bytes || hashBuffer(Buffer.from(bytes)) !== digest) {
+          throw new Error('OpenCode retained snapshot fingerprint mismatch')
+        }
+        continue
+      }
+      let child: OpenCodeSafePublicationDirectory
+      try { child = await directory.openChildDirectory(name) }
+      catch (error) {
+        throw new Error('OpenCode retained snapshot contains a replacement or junction', { cause: error })
+      }
+      try { await walk(child, childRelative) } finally { await child.close() }
+    }
+  }
+  try { await walk(root, '') } finally { await root.close() }
+  return true
+}
+
+/** Deterministic retained-authority regression seam; production uses the same verifier. */
+export async function verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+  publicationDirectory: OpenCodeSafePublicationDirectory,
+  targetLeaf: string,
+  expectedFiles: ReadonlyMap<string, string>,
+  abortSignal?: AbortSignal,
+): Promise<boolean> {
+  return verifyWindowsRetainedSnapshotTree(
+    publicationDirectory, targetLeaf, expectedFiles, abortSignal,
+  )
+}
+
 async function publishImmutableUserPluginSnapshot(
   sourcePath: string,
   targetPath: string,
   expectedEntries: readonly string[],
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<void> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
-  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
-  targetPath = publicationDirectory.child(path.basename(targetPath))
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath), {
+    abortSignal, deadline: deadlineAtMs,
+  })
+  const targetLeaf = path.basename(targetPath)
+  targetPath = publicationDirectory.child(targetLeaf)
   try {
+  const windowsExpectedFiles = new Map(expectedEntries.map(entry => {
+    const separator = entry.lastIndexOf(':')
+    if (separator <= 0 || !/^[a-f0-9]{64}$/.test(entry.slice(separator + 1))) {
+      throw new Error('OpenCode managed user plugin manifest is invalid')
+    }
+    const relative = entry.slice(0, separator).split(path.sep).join('/')
+    const prefix = `${targetLeaf}/`
+    if (!relative.startsWith(prefix)) throw new Error('OpenCode managed user plugin manifest is invalid')
+    return [relative.slice(prefix.length), entry.slice(separator + 1)] as const
+  }))
+  if (process.platform === 'win32') {
+    if (await verifyWindowsRetainedSnapshotTree(
+      publicationDirectory, targetLeaf, windowsExpectedFiles, abortSignal,
+    )) return
+    const temporaryLeaf = `${targetLeaf}.snapshot-${process.pid}-${randomUUID()}`
+    const temporaryRoot = await publicationDirectory.createChildDirectoryExclusive(temporaryLeaf, 0o700)
+    let published = false
+    try {
+      const files: Array<readonly [string, Buffer]> = []
+      const capture = async (sourceDirectory: string, relativeDirectory: string): Promise<void> => {
+        assertActive()
+        const sourceMetadata = await lstat(sourceDirectory)
+        if (!sourceMetadata.isDirectory() || sourceMetadata.isSymbolicLink()) {
+          throw new Error('OpenCode user plugin directory changed during snapshot')
+        }
+        const dirents = await readdir(sourceDirectory, { withFileTypes: true })
+        dirents.sort((left, right) => left.name.localeCompare(right.name))
+        for (const dirent of dirents) {
+          assertActive()
+          if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
+          const relative = relativeDirectory ? `${relativeDirectory}/${dirent.name}` : dirent.name
+          const sourceEntry = path.join(sourceDirectory, dirent.name)
+          if (dirent.isDirectory()) { await capture(sourceEntry, relative); continue }
+          if (!dirent.isFile()) throw new Error('OpenCode user plugin entry changed to an unsupported type during snapshot')
+          const sourceHandle = await open(sourceEntry, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+          try {
+            const metadata = await sourceHandle.stat()
+            if (!metadata.isFile()) throw new Error('OpenCode user plugin entry is not a regular file')
+            files.push([relative, await sourceHandle.readFile()])
+          } finally { await sourceHandle.close() }
+        }
+      }
+      await capture(sourcePath, '')
+      const actual = files.map(([relative, bytes]) => `${targetLeaf}/${relative}:${hashBuffer(bytes)}`).sort()
+      const expected = Array.from(windowsExpectedFiles, ([relative, digest]) =>
+        `${targetLeaf}/${relative}:${digest}`).sort()
+      if (canonicalSerializeOpenCodePolicyIdentity(actual)
+        !== canonicalSerializeOpenCodePolicyIdentity(expected)) {
+        throw new Error('OpenCode user plugin bytes changed during snapshot')
+      }
+      const directories = new Set<string>()
+      for (const [relative] of files) {
+        let directory = path.posix.dirname(relative)
+        while (directory !== '.') { directories.add(directory); directory = path.posix.dirname(directory) }
+      }
+      for (const relative of [...directories].sort((left, right) =>
+        left.split('/').length - right.split('/').length || left.localeCompare(right))) {
+        assertActive()
+        const parent = path.posix.dirname(relative)
+        await publicationDirectory.createRetainedDescendantDirectory(
+          parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent}`,
+          `${temporaryLeaf}/${relative}`, path.posix.basename(relative),
+        )
+      }
+      for (const [relative, bytes] of files.sort(([left], [right]) => left.localeCompare(right))) {
+        assertActive()
+        const parent = path.posix.dirname(relative)
+        await publicationDirectory.writeRetainedDescendantFile(
+          parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent}`,
+          `${temporaryLeaf}/${relative}`, path.posix.basename(relative), bytes,
+        )
+      }
+      assertActive()
+      await publicationDirectory.renameRetainedChildDirectory(temporaryLeaf, targetLeaf)
+      published = true
+    } finally {
+      if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
+      await temporaryRoot.close().catch(() => undefined)
+    }
+    return
+  }
   const verifyTarget = async (): Promise<boolean> => {
     const metadata = await lstat(targetPath).catch(() => null)
     if (!metadata) return false
@@ -881,11 +1047,20 @@ async function publishImmutablePluginDependencySnapshot(
   targetPath: string,
   plugins: OpenCodePlanScopedProfileInput['evidence']['plugins'],
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<void> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
-  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
-  targetPath = publicationDirectory.child(path.basename(targetPath))
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath), {
+    abortSignal, deadline: deadlineAtMs,
+  })
+  const targetLeaf = path.basename(targetPath)
+  targetPath = publicationDirectory.child(targetLeaf)
   try {
   const entries = new Map<string, { bytes: Buffer; mode: 0o400 | 0o500 }>()
   for (const plugin of plugins) {
@@ -898,6 +1073,49 @@ async function publishImmutablePluginDependencySnapshot(
       )) throw new Error('OpenCode scoped plugin dependency snapshot collision')
       entries.set(relativePath, { bytes, mode: entry.mode })
     }
+  }
+  if (process.platform === 'win32') {
+    const expectedFiles = new Map(Array.from(entries, ([relative, entry]) => [
+      relative.split(path.sep).join('/'), hashBuffer(entry.bytes),
+    ]))
+    if (await verifyWindowsRetainedSnapshotTree(
+      publicationDirectory, targetLeaf, expectedFiles, abortSignal,
+    )) return
+    const temporaryLeaf = `${targetLeaf}.dependencies-${process.pid}-${randomUUID()}`
+    const temporaryRoot = await publicationDirectory.createChildDirectoryExclusive(temporaryLeaf, 0o700)
+    let published = false
+    try {
+      const directories = new Set<string>()
+      for (const relative of entries.keys()) {
+        let directory = path.posix.dirname(relative.split(path.sep).join('/'))
+        while (directory !== '.') { directories.add(directory); directory = path.posix.dirname(directory) }
+      }
+      for (const relative of [...directories].sort((left, right) =>
+        left.split('/').length - right.split('/').length || left.localeCompare(right))) {
+        assertActive()
+        const parent = path.posix.dirname(relative)
+        await publicationDirectory.createRetainedDescendantDirectory(
+          parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent}`,
+          `${temporaryLeaf}/${relative}`, path.posix.basename(relative),
+        )
+      }
+      for (const [relativePath, entry] of [...entries].sort(([left], [right]) => left.localeCompare(right))) {
+        assertActive()
+        const relative = relativePath.split(path.sep).join('/')
+        const parent = path.posix.dirname(relative)
+        await publicationDirectory.writeRetainedDescendantFile(
+          parent === '.' ? temporaryLeaf : `${temporaryLeaf}/${parent}`,
+          `${temporaryLeaf}/${relative}`, path.posix.basename(relative), entry.bytes,
+        )
+      }
+      assertActive()
+      await publicationDirectory.renameRetainedChildDirectory(temporaryLeaf, targetLeaf)
+      published = true
+    } finally {
+      if (!published) await publicationDirectory.rollbackRetainedChildDirectory(temporaryLeaf).catch(() => undefined)
+      await temporaryRoot.close().catch(() => undefined)
+    }
+    return
   }
   const verify = async (): Promise<boolean> => {
     const metadata = await lstat(targetPath).catch(() => null)
@@ -1587,8 +1805,14 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
   },
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<void> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
   const retained = capture.windows
   if (!retained) throw new Error('OpenCode Windows project behavior capture is missing')
@@ -1712,7 +1936,9 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
     return true
   }
 
-  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath), {
+    abortSignal, deadline: deadlineAtMs,
+  })
   const targetLeaf = path.basename(targetPath)
   targetPath = publicationDirectory.child(targetLeaf)
   const temporaryLeaf = `${targetLeaf}.snapshot-${process.pid}-${randomUUID()}`
@@ -1782,7 +2008,10 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
       await rename(temporaryPath, targetPath)
     }
     await testHooks?.afterRenameBeforeFinalVerify?.(targetPath)
-    await verifyTree(targetPath)
+    // RENAME_DIRECTORY verifies the retained root and every retained descendant
+    // immediately after publication. Reopening targetPath here would exchange
+    // that authority for a racy pathname observation.
+    if (process.platform !== 'win32') await verifyTree(targetPath)
     completed = true
   } finally {
     // The native authority owns the only exact NTFS identities. Never release
@@ -1807,16 +2036,24 @@ async function publishImmutableProjectBehaviorSnapshot(
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
   },
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<void> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
   if (capture?.windows) {
     await publishImmutableWindowsProjectBehaviorSnapshot(
-      capture, targetPath, expectedEntries, testHooks, abortSignal,
+      capture, targetPath, expectedEntries, testHooks, abortSignal, deadlineAtMs,
     )
     return
   }
-  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath), {
+    abortSignal, deadline: deadlineAtMs,
+  })
   targetPath = publicationDirectory.child(path.basename(targetPath))
   try {
   const expectedFiles = new Map<string, string>()
@@ -2863,9 +3100,18 @@ async function publishImmutableBridgeFile(
   content: string,
   mode: number,
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<void> {
-  await withOpenCodeSafePublicationDirectory(path.dirname(filePath), directory =>
-    directory.publishImmutableFile(path.basename(filePath), content, mode, undefined, abortSignal))
+  if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+  if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+    throw new Error('OpenCode profile publication deadline expired')
+  }
+  const directory = await OpenCodeSafePublicationDirectory.open(path.dirname(filePath), {
+    abortSignal, deadline: deadlineAtMs,
+  })
+  try {
+    await directory.publishImmutableFile(path.basename(filePath), content, mode, undefined, abortSignal)
+  } finally { await directory.close() }
 }
 
 export async function fingerprintOpenCodeNativeCredentialBridge(
@@ -2908,6 +3154,7 @@ export function ensureOpenCodeNativeCliCredentialBridge(
   platform: NodeJS.Platform,
   selectedProviderId: 'kiro' | 'cursor-acp',
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<OpenCodeNativeCliCredentialBridge>
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
@@ -2915,8 +3162,14 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   platform: NodeJS.Platform = process.platform,
   selectedProviderId: 'kiro' | 'cursor-acp' | null = null,
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
   const hostHomePath = (
     platform === 'win32'
@@ -2947,6 +3200,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       buildCursorAgentResourceExhaustedPreloadScript(),
       0o400,
       abortSignal,
+      deadlineAtMs,
     )
   }
 
@@ -2972,7 +3226,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
-      await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal)
+      await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal, deadlineAtMs)
       return bridgePath
     }
 
@@ -2994,7 +3248,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
-    await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal)
+    await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal, deadlineAtMs)
     return bridgePath
   }
 
@@ -3480,8 +3734,14 @@ async function publishImmutableNativeExecutable(
   profileRootPath: string,
   fingerprint: string,
   abortSignal?: AbortSignal,
+  deadlineAtMs?: number,
 ): Promise<string> {
-  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  const assertActive = () => {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (deadlineAtMs !== undefined && openCodeMonotonicNow() >= deadlineAtMs) {
+      throw new Error('OpenCode profile publication deadline expired')
+    }
+  }
   assertActive()
   const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
   let bytes: Buffer | null = null
@@ -3513,8 +3773,14 @@ async function publishImmutableNativeExecutable(
     }
   }
   const targetPath = path.join(targetDirectory, path.basename(sourcePath))
-  await withOpenCodeSafePublicationDirectory(targetDirectory, directory =>
-    directory.publishImmutableFile(path.basename(targetPath), bytes!, 0o500, undefined, abortSignal))
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(targetDirectory, {
+    abortSignal, deadline: deadlineAtMs,
+  })
+  try {
+    await publicationDirectory.publishImmutableFile(
+      path.basename(targetPath), bytes!, 0o500, undefined, abortSignal,
+    )
+  } finally { await publicationDirectory.close() }
   assertActive()
   await chmod(targetDirectory, 0o500)
   if (await fingerprintScopedBinary(targetPath) !== fingerprint) {
@@ -4070,6 +4336,10 @@ export class OpenCodeProfileManager {
     const preparationDeadlineAtMs = plan.deadlineAtMs
     const assertPreparationActive = () => {
       if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
+      if (preparationDeadlineAtMs !== undefined
+        && openCodeMonotonicNow() >= preparationDeadlineAtMs) {
+        throw new Error('OpenCode profile publication deadline expired')
+      }
     }
     assertPreparationActive()
     const { abortSignal: _abortSignal, deadlineAtMs: _deadlineAtMs, ...planWithoutSignal } = plan
@@ -4238,6 +4508,7 @@ export class OpenCodeProfileManager {
           path.join(this.paths.data, 'opencode', 'scoped-native-proof'),
           nativeTargetExecutableFingerprint,
           preparationSignal,
+          preparationDeadlineAtMs,
         )
       : null
     assertPreparationActive()
@@ -4627,6 +4898,7 @@ export class OpenCodeProfileManager {
             path.join(xdgConfigHome, 'opencode', 'plugins'),
             automaticUserPluginEntries,
             preparationSignal,
+            preparationDeadlineAtMs,
           )
           assertPreparationActive()
         }
@@ -4638,6 +4910,7 @@ export class OpenCodeProfileManager {
             pluginNodeModulesPath,
             plan.evidence.plugins,
             preparationSignal,
+            preparationDeadlineAtMs,
           )
           assertPreparationActive()
         }
@@ -4647,6 +4920,7 @@ export class OpenCodeProfileManager {
           expectedEntryManifest.projectBehaviorEntryManifest,
           undefined,
           preparationSignal,
+          preparationDeadlineAtMs,
         )
         assertPreparationActive()
         const nativeTargetExecutablePath = nativeProofExecutablePath
@@ -4655,6 +4929,7 @@ export class OpenCodeProfileManager {
               profileRootPath,
               nativeTargetExecutableFingerprint,
               preparationSignal,
+              preparationDeadlineAtMs,
             )
           : null
         assertPreparationActive()
@@ -4677,6 +4952,7 @@ export class OpenCodeProfileManager {
             process.platform,
             nativeBridgeProviderId,
             preparationSignal,
+            preparationDeadlineAtMs,
           )
           assertPreparationActive()
           const executablePath = nativeBridgeProviderId === 'kiro'

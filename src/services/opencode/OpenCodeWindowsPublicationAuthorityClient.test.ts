@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { OpenCodeWindowsPublicationAuthorityClient } from './OpenCodeWindowsPublicationAuthorityClient.js'
 
-function fake() {
+function fake(rejectLockAttempts = 0) {
   let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0; let closes = 0; const operations: string[] = []; const requests: Record<string, unknown>[] = []
   const encoder = new TextEncoder(); const stdout = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
   const child = { pid: 123, stdout, exited: new Promise<number>(() => {}), unref() {},
@@ -37,7 +37,10 @@ function fake() {
               : request.op === 'WRITE_CHILD_FILE'
                 ? { written: String(request.offset + Buffer.from(request.content_base64, 'base64').length), finished: request.finish }
                 : {}
-      controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1, id: request.id, ok: true, value })}\n`)); return line.length
+      const rejected = request.op === 'NS_ACQUIRE_LOCK' && rejectLockAttempts-- > 0
+      controller.enqueue(encoder.encode(`${JSON.stringify(rejected
+        ? { version: 1, id: request.id, ok: false, error: 'NS_EXISTS' }
+        : { version: 1, id: request.id, ok: true, value })}\n`)); return line.length
     } } }
   return { child, kills: () => kills, closes: () => closes, operations, requests }
 }
@@ -45,7 +48,7 @@ function fake() {
 describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   test('cancels the native worker immediately after owner loss', async () => {
     const process = fake(); const abort = new AbortController()
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       signal: abort.signal, launch: () => process.child })
     await expect(client.openRoot('C:\\root', false, false)).resolves.toMatchObject({ fileId: '2' })
     abort.abort(); await new Promise(resolve => setTimeout(resolve, 0))
@@ -54,22 +57,22 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(process.operations).toEqual(['OPEN_ROOT'])
   })
   test('fails before launch on an expired deadline', () => {
-    expect(() => new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() - 1,
+    expect(() => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() - 1,
       launch: () => fake().child })).toThrow('unavailable [redacted]')
   })
   test('encodes SYNC_ROOT as an acknowledged native protocol barrier', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
     expect(process.operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT', 'CLOSE'])
   })
   test('preserves the caller absolute deadline after retaining the root', async () => {
-    const process = fake(); const deadline = performance.now() + 30_000
+    const process = fake(); const deadline = Date.now() + 30_000
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, launch: () => process.child })
     await client.openRoot('C:\\safe', false, false); await client.syncRoot(); await client.close()
     const waits = process.requests.map(request => Number(request.wait_ms))
-    expect(waits.every(wait => wait <= deadline - performance.now() + 100)).toBeTrue()
+    expect(waits.every(wait => wait <= deadline - Date.now() + 100)).toBeTrue()
     expect(Math.max(...waits)).toBeLessThan(31_000)
   })
   test('does not reap a live retained owner at the former 90 second lease', async () => {
@@ -78,7 +81,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       delays.push(Number(timeout)); return original(handler, timeout, ...args)
     }) as typeof setTimeout
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 120_000, launch: () => process.child,
+      deadline: Date.now() + 120_000, launch: () => process.child,
     })
     try {
       await client.openRoot('C:\\safe', false, false)
@@ -96,7 +99,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       stdin: { end() {}, write(line: string) { writes.push(JSON.parse(line)); return line.length } } }
     const reply = (request: Record<string, unknown>, value: unknown) => controller.enqueue(encoder.encode(
       `${JSON.stringify({ version: 1, id: request.id, ok: true, value })}\n`))
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       launch: () => child })
     const opening = client.openRoot('C:\\safe', false, false)
     await new Promise(resolve => setTimeout(resolve, 0)); expect(writes).toHaveLength(1)
@@ -118,7 +121,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
             value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`
           + '{"version":1,"id":"00000000-0000-0000-0000-000000000000","ok":true,"value":{}}\n'))
         return line.length } } }
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       launch: () => child })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.validateRoot()).rejects.toThrow('unavailable [redacted]')
@@ -133,7 +136,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
         if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
           id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
         return line.length } } }
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 150,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 150,
       launch: () => child })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.syncRoot()).rejects.toThrow('unavailable [redacted]')
@@ -148,7 +151,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
         if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
           id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
         return line.length } } }
-    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: performance.now() + 5_000,
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
       signal: abort.signal, launch: () => child })
     await client.openRoot('C:\\safe', false, false)
     const pending = client.syncRoot(); await new Promise(resolve => setTimeout(resolve, 0)); abort.abort()
@@ -156,7 +159,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('rejects unsafe Win32 roots and leaves without publishing them to native stdin', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     for (const root of ['C:\\safe:stream', '\\\\?\\C:\\safe', 'C:\\safe\\..\\escape', 'C:\\NUL']) {
       await expect(client.openRoot(root, false, false)).rejects.toThrow('unavailable [redacted]')
@@ -169,7 +172,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('encodes retained directory and pinned atomic settlement as single native operations', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await client.createDirectory('attempt.snapshot')
@@ -185,7 +188,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('exposes explicit idempotent successor recovery decisions', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.recoverAtomic('.auth.recovery-required', 'rollback')).resolves.toBe(true)
@@ -195,7 +198,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('materializes descendants only through retained parent and file tokens', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await client.createDirectory('attempt.snapshot')
@@ -216,7 +219,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('opens legacy descendants and pins their files through the original authority', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await client.openChildDirectory('.', 'legacy', 'legacy')
@@ -229,7 +232,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('keeps journal namespace I/O on retained native tokens', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await client.namespaceMkdir('lease.pending')
@@ -250,7 +253,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('wires the complete retained namespace publication boundary and releases locks once', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.namespaceList('nested')).resolves.toEqual(['journal', 'lock'])
@@ -269,7 +272,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   })
   test('rejects malformed retained namespace paths without writing protocol frames', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await expect(client.namespaceList('../escape')).rejects.toThrow('unavailable [redacted]')
@@ -282,7 +285,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
   test('physically releases an acquired retained lock when its caller cancels', async () => {
     const process = fake(); const abort = new AbortController()
     const client = new OpenCodeWindowsPublicationAuthorityClient({
-      deadline: performance.now() + 5_000, launch: () => process.child,
+      deadline: Date.now() + 5_000, launch: () => process.child,
     })
     await client.openRoot('C:\\safe', false, false)
     await client.namespaceAcquireLock('owner.lock', {
@@ -291,5 +294,26 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     abort.abort(); await new Promise(resolve => setTimeout(resolve, 0))
     expect(process.operations).toEqual(['OPEN_ROOT', 'NS_ACQUIRE_LOCK', 'NS_RELEASE_LOCK'])
     await client.close()
+  })
+  test('retries with only the caller deadline remaining and stops writing after cancellation', async () => {
+    const process = fake(2); const abort = new AbortController(); const deadline = Date.now() + 500
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline, signal: abort.signal,
+      launch: () => process.child })
+    await client.openRoot('C:\\safe', false, false)
+    const acquisition = client.namespaceAcquireLock('owner.lock', {
+      stale: 10_000, update: 1_000, retries: { retries: 5, minTimeout: 40, maxTimeout: 40 },
+    }, abort.signal)
+    while (process.requests.filter(request => request.op === 'NS_ACQUIRE_LOCK').length < 2) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    abort.abort(new Error('late publication abort'))
+    await expect(acquisition).rejects.toThrow('unavailable [redacted]')
+    const attempts = process.requests.filter(request => request.op === 'NS_ACQUIRE_LOCK')
+    expect(attempts).toHaveLength(2)
+    expect(Number(attempts[1]!.wait_ms)).toBeLessThan(Number(attempts[0]!.wait_ms))
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(process.requests.filter(request => request.op === 'NS_ACQUIRE_LOCK')).toHaveLength(2)
+    expect(Math.max(...process.requests.map(request => Number(request.wait_ms))))
+      .toBeLessThanOrEqual(500)
   })
 })

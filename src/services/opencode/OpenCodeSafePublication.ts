@@ -9,6 +9,7 @@ import {
 import { validOpenCodePublicationLeaf,
   validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 import { OpenCodeWindowsPassiveReadAuthority } from './OpenCodeWindowsPassiveReadAuthority.js'
+import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 
 export type OpenCodeSafePublicationTransaction = Readonly<{
   commit(): Promise<void>
@@ -109,7 +110,7 @@ export class OpenCodeSafePublicationDirectory {
       if (!validOpenCodePublicationRoot(directoryPath)) fail()
       const resolved = path.resolve(directoryPath)
       const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
-        deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
+        deadline: options.deadline ?? openCodeMonotonicNow() + 10_000, signal: options.abortSignal,
       })
       try {
         const identity = await authority.openRoot(resolved, false, false)
@@ -852,7 +853,7 @@ export async function ensureOpenCodeSafePublicationDirectory(
   if (process.platform === 'win32') {
     if (!validOpenCodePublicationRoot(directoryPath)) fail()
     const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
-      deadline: options.deadline ?? performance.now() + 10_000, signal: options.abortSignal,
+      deadline: options.deadline ?? openCodeMonotonicNow() + 10_000, signal: options.abortSignal,
     })
     try {
       const identity = await authority.openRoot(resolved, true, durableAncestors)

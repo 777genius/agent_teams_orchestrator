@@ -27,6 +27,7 @@ import {
   orderOpenCodeAuthSyncSources,
   publishOpenCodeProjectBehaviorSnapshotForTest,
   revalidateOpenCodeScopedPreparedProfileInputs,
+  verifyOpenCodeWindowsRetainedSnapshotTreeForTest,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -80,6 +81,56 @@ const fakeResolvedIdentity = (
     dependencyTreeFingerprint: treeFingerprint,
   }))}`
 }
+
+describe('retained Windows profile snapshot verification', () => {
+  test('rejects an already-expired preparation deadline before planning or writes', async () => {
+    const manager = new OpenCodeProfileManager()
+    await expect(manager.prepareScopedProfile(
+      { deadlineAtMs: Date.now() - 1 } as never, {} as never,
+    )).rejects.toThrow('publication deadline expired')
+  })
+
+  test('rejects a target junction without a pathname verification fallback', async () => {
+    let childOpens = 0
+    const retained = {
+      childNames: async () => ['plugins'],
+      openChildDirectory: async () => { childOpens += 1; throw new Error('reparse point') },
+    }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      retained as never, 'plugins', new Map([['plugin.js', pureDigest('trusted')]]),
+    )).rejects.toThrow('replacement or junction')
+    expect(childOpens).toBe(1)
+  })
+
+  test('verifies nested bytes only through retained directory and file authority', async () => {
+    const operations: string[] = []
+    const nested = {
+      childNames: async () => { operations.push('list:nested'); return ['plugin.js'] },
+      readBoundedRegularBytes: async (name: string) => {
+        operations.push(`read:nested/${name}`); return Buffer.from('trusted')
+      },
+      close: async () => { operations.push('close:nested') },
+    }
+    const root = {
+      childNames: async () => { operations.push('list:root'); return ['nested'] },
+      openChildDirectory: async (name: string) => {
+        operations.push(`open:root/${name}`); return nested
+      },
+      close: async () => { operations.push('close:root') },
+    }
+    const parent = {
+      childNames: async () => { operations.push('list:parent'); return ['plugins'] },
+      openChildDirectory: async (name: string) => {
+        operations.push(`open:parent/${name}`); return root
+      },
+    }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never, 'plugins', new Map([['nested/plugin.js', pureDigest('trusted')]]),
+    )).resolves.toBe(true)
+    expect(operations).toEqual(['list:parent', 'open:parent/plugins', 'list:root',
+      'open:root/nested', 'list:nested', 'read:nested/plugin.js', 'close:nested', 'close:root'])
+  })
+})
 
 describe('pure planScopedProfile contract', () => {
   const evidence = () => ({
