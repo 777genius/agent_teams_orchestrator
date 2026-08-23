@@ -821,7 +821,7 @@ fn retain_windows_root_marker(
             volume: identity.0,
             index: identity.1,
         })
-        .map_err(|_| "ROOT_STATE")
+        .map_err(|_| "ROOT_STATE".to_string())
 }
 
 #[cfg(windows)]
