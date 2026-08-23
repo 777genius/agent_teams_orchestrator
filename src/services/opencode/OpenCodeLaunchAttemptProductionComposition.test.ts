@@ -117,8 +117,7 @@ describe('OpenCode production launch composition', () => {
     expect(performance.now() - started).toBeLessThan(500)
   })
 
-  test('canonicalizes a real project and its symlink alias before authorization and digesting', async () => {
-    if (process.platform === 'win32') return
+  test.skipIf(process.platform === 'win32')('canonicalizes a real project and its symlink alias before authorization and digesting', async () => {
     const project = path.join(projectPath, 'canonical-project')
     const alias = path.join(projectPath, 'canonical-alias')
     await mkdir(project); await symlink(project, alias)

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join, posix, win32 } from 'node:path'
 
 import {
@@ -461,8 +461,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
-  test('fences a retained final directory and blocks a second store on the stable logical-path anchor', async () => {
-    if (process.platform === 'win32') return
+  test.skipIf(process.platform === 'win32')('fences a retained final directory and blocks a second store on the stable logical-path anchor', async () => {
     const outer = await workspaceTemp('final-swap-anchor')
     const parent = join(outer, 'parent')
     const live = join(parent, 'live')
@@ -512,8 +511,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(outer, { recursive: true, force: true }) }
   })
 
-  test('fences a parent swap, survives rename-back, and continues after store restart', async () => {
-    if (process.platform === 'win32') return
+  test.skipIf(process.platform === 'win32')('fences a parent swap, survives rename-back, and continues after store restart', async () => {
     const outer = await workspaceTemp('parent-swap-restart')
     const parent = join(outer, 'parent')
     const final = join(parent, 'final')
@@ -601,12 +599,65 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(outer, { recursive: true, force: true }) }
   })
 
-  test('real Windows retains journal and coordination roots across the replacement boundary', async () => {
-    if (process.platform !== 'win32') return
+  test('propagates one retained Windows authority session to relative member-claim persistence', async () => {
+    const outer = await workspaceTemp('windows-relative-authority-contract')
+    const data = join(outer, 'data')
+    const opencode = join(data, 'opencode')
+    const attempts = join(opencode, 'launch-attempts')
+    const claims = join(attempts, 'member-claims')
+    await mkdir(claims, { recursive: true })
+    const openedRoots: string[] = []
+    const relativePaths: string[] = []
+    let factoryCalls = 0
+    let closeCalls = 0
+    let retainedRoot = ''
+    const fakeAuthority = {
+      async openRoot(root: string) {
+        retainedRoot = root; openedRoots.push(root)
+        const value = await lstat(root)
+        return { volumeSerial: String(value.dev), fileId: String(value.ino), createdPaths: [] }
+      },
+      async namespaceStat(relativePath: string) {
+        relativePaths.push(relativePath)
+        const value = await lstat(relativePath === '.' ? retainedRoot : join(retainedRoot, relativePath))
+        return { volumeSerial: String(value.dev), fileId: String(value.ino), size: String(value.size),
+          kind: value.isDirectory() ? 'directory' as const : 'file' as const }
+      },
+      async namespaceOpen(relativePath: string) {
+        relativePaths.push(relativePath)
+        await lstat(join(retainedRoot, relativePath))
+        throw new Error('contract fake opens no files')
+      },
+      async openChildDirectory(_parentKey: string, key: string) {
+        relativePaths.push(`retain:${key}`)
+        const value = await lstat(join(retainedRoot, key))
+        return { volumeSerial: String(value.dev), fileId: String(value.ino) }
+      },
+      async close() { closeCalls += 1 },
+    }
+    const factory = (() => { factoryCalls += 1; return fakeAuthority }) as never
+    try {
+      const attempt = new OpenCodeLaunchFileJournalPersistence(join(attempts, 'attempt.journal'), {
+        platform: 'win32', windowsAuthorityFactory: factory,
+      })
+      const claim = attempt.createRelativePersistence(join(claims, `${'a'.repeat(64)}.claim`))
+      expect(await Promise.all([attempt.read(), claim.read()])).toEqual([null, null])
+      expect(factoryCalls).toBe(1)
+      expect(openedRoots).toEqual([data])
+      expect(relativePaths).toContain('retain:opencode')
+      expect(relativePaths).toContain('retain:opencode/launch-attempts/member-claims')
+      expect(relativePaths).toContain('opencode/launch-attempts')
+      expect(relativePaths).toContain('opencode/launch-attempts/member-claims')
+      expect(relativePaths.every(value => !value.includes(outer))).toBe(true)
+      expect(closeCalls).toBe(0)
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform !== 'win32')('real Windows retains journal and coordination roots across the replacement boundary', async () => {
     const outer = await workspaceTemp('windows-retained-native-authority')
-    const live = join(outer, 'live')
+    const live = join(outer, 'data', 'opencode')
     const displaced = join(outer, 'displaced')
-    const journal = join(live, 'attempt.json')
+    const journal = join(live, 'launch-attempts', 'attempt.json')
     const startedAtMs = performance.now()
     const context = { deadlineAtMs: startedAtMs + 15_000,
       monotonicNow: performance.now.bind(performance), signal: new AbortController().signal }

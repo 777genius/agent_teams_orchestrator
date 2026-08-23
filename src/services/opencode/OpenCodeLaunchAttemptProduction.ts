@@ -205,12 +205,14 @@ class OpenCodeProductionLaunchRuntime {
     }>()
     let currentSnapshot: OpenCodeProvisioningSnapshot | null = null
     const launchDirectory = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'launch-attempts')
-    const mutationLedger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'))
     const journalPath = path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.journal`)
+    const attemptPersistence = new OpenCodeLaunchFileJournalPersistence(journalPath)
+    const mutationLedger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'),
+      filePath => attemptPersistence.createRelativePersistence(filePath))
     const proofCleanupLedger = new OpenCodeProofSessionCleanupLedger(
       path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.proof-cleanup.json`),
     )
-    const attemptStore = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(journalPath))
+    const attemptStore = new OpenCodeLaunchAttemptStore(attemptPersistence)
     const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
       OpenCodeLaunchMutationLedger.targetDigest({
         teamId: command.teamId, laneId: command.laneId,

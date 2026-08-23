@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
+import { OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 
 const oid = (character: string) => `sha256:${character.repeat(64)}` as OpenCodeOpaqueIdentity
@@ -47,6 +48,20 @@ describe('OpenCodeLaunchMutationLedger', () => {
       expect(await ledger.claim(target, identity('123e4567-e89b-42d3-a456-426614174001', 'claim-a'), context())).toBe('claimed')
       expect((await ledger.read(target, context()))?.idempotencyIdentity)
         .toBe(OpenCodeLaunchMutationLedger.idempotencyIdentity(target))
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('routes every global claim through the supplied attempt-authority persistence factory', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-claim-authority-'))
+    const directory = join(root, 'member-claims')
+    const paths: string[] = []
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(directory, filePath => {
+        paths.push(filePath)
+        return new OpenCodeLaunchFileJournalPersistence(filePath)
+      })
+      await ledger.read(target, context())
+      expect(paths).toEqual([join(directory, `${target}.claim`)])
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 

@@ -146,6 +146,9 @@ export class OpenCodeLaunchPoisonedLeaseError extends OpenCodeLaunchJournalError
 /** Crash-safe filesystem persistence. The journal never contains its filesystem path. */
 export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJournalPersistence {
   private namespace?: CanonicalNamespace
+  private sharedWindowsRoot?: SharedWindowsRoot
+  private sharedWindowsRootOpening?: Promise<SharedWindowsRoot>
+  private retainedAuthoritySource?: OpenCodeLaunchFileJournalPersistence
 
   constructor(
     private readonly filePath: string,
@@ -164,6 +167,17 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     } = {},
   ) {
     if (!filePath) throw new TypeError('journal path is required')
+  }
+
+  /**
+   * Creates a nested journal/global-claim persistence under this persistence's retained root.
+   * On native Windows both instances use one authority process and one retained root handle;
+   * child paths are submitted only as relative tokens to that authority.
+   */
+  createRelativePersistence(filePath: string): OpenCodeLaunchFileJournalPersistence {
+    const child = new OpenCodeLaunchFileJournalPersistence(filePath, this.testHooks)
+    child.retainedAuthoritySource = this.retainedAuthoritySource ?? this
+    return child
   }
 
   async read(context?: OpenCodeLaunchStoreContext): Promise<Uint8Array | null> {
@@ -387,26 +401,38 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     // root around every operation. This intentionally is not described as atomic against an
     // administrator replacing the trusted root; normal first-use is preserved.
     const retained = platform === 'linux' || platform === 'darwin'
-    const nativeWindows = platform === 'win32' && process.platform === 'win32'
+    const nativeWindows = platform === 'win32'
+      && (process.platform === 'win32' || this.testHooks.windowsAuthorityFactory !== undefined)
     const deadline = context?.deadlineAtMs ?? performance.now() + 10_000
     const signal = context?.signal
-    const backend: NamespaceBackend = retained
-      ? await RetainedDirectoryBackend.create(directory, identity, true)
-      : nativeWindows
-      ? await RetainedWindowsNamespaceBackend.create(directory, identity, true, deadline, signal,
-        this.testHooks.windowsAuthorityFactory)
-      : new TrustedRootPathBackend(directory, identity, true, platform)
-    const authorityBackend: NamespaceBackend = retained
-      ? await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false)
-      : nativeWindows
-      ? await RetainedWindowsNamespaceBackend.create(trustedRoot, trustedIdentity, false, deadline, signal,
-        this.testHooks.windowsAuthorityFactory)
-      : new TrustedRootPathBackend(trustedRoot, trustedIdentity, false, platform)
+    let releaseRetainedRoot: (() => Promise<void>) | undefined
+    let backend: NamespaceBackend
+    let authorityBackend: NamespaceBackend
+    if (retained) {
+      backend = await RetainedDirectoryBackend.create(directory, identity, true)
+      authorityBackend = await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false)
+    } else if (nativeWindows) {
+      const retainedRoot = await this.acquireSharedWindowsRoot(deadline, signal)
+      releaseRetainedRoot = retainedRoot.release
+      try {
+        const directoryPrefix = relativeRetainedName(retainedRoot.root, directory)
+        const authorityPrefix = relativeRetainedName(retainedRoot.root, trustedRoot)
+        await Promise.all([retainedRoot.retain(directoryPrefix), retainedRoot.retain(authorityPrefix)])
+        backend = new RelativeNamespaceBackend(retainedRoot.backend, directoryPrefix, identity, true)
+        authorityBackend = new RelativeNamespaceBackend(retainedRoot.backend,
+          authorityPrefix, trustedIdentity, false)
+        await Promise.all([backend.verifyRoot(), authorityBackend.verifyRoot()])
+      } catch (error) { await releaseRetainedRoot(); throw error }
+    } else {
+      backend = new TrustedRootPathBackend(directory, identity, true, platform)
+      authorityBackend = new TrustedRootPathBackend(trustedRoot, trustedIdentity, false, platform)
+    }
     await this.testHooks.afterNamespaceAnchored?.()
     this.namespace = {
       backend, authorityBackend, marker,
       slots: [`${marker}.slot0`, `${marker}.slot1`],
       fence: basename(paths.fence), lock: basename(paths.lock),
+      releaseRetainedRoot,
     }
     return this.namespace
   }
@@ -414,7 +440,42 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
   private async closeNamespace(expected: CanonicalNamespace): Promise<void> {
     if (this.namespace !== expected) return
     this.namespace = undefined
-    await Promise.all([expected.backend.close?.(), expected.authorityBackend.close?.()])
+    if (expected.releaseRetainedRoot) await expected.releaseRetainedRoot()
+    else await Promise.all([expected.backend.close?.(), expected.authorityBackend.close?.()])
+  }
+
+  private async acquireSharedWindowsRoot(deadline: number, signal?: AbortSignal): Promise<{
+    root: string; identity: { dev: number | bigint; ino: number | bigint }
+    backend: RetainedWindowsNamespaceBackend; retain(relativePath: string): Promise<void>; release(): Promise<void>
+  }> {
+    const owner = this.retainedAuthoritySource ?? this
+    if (owner !== this) return owner.acquireSharedWindowsRoot(deadline, signal)
+    if (!owner.sharedWindowsRoot) {
+      const opening = owner.sharedWindowsRootOpening ??= (async () => {
+        const root = deriveOpenCodeLaunchNamespacePaths(owner.filePath, path).trustedRoot
+        const canonicalRoot = await realpath(root)
+        if (canonicalRoot !== root) throw new OpenCodeLaunchJournalError('foreign', 'retained authority root is a symlink')
+        const identity = await stat(root)
+        const backend = await RetainedWindowsNamespaceBackend.create(root, identity, false, deadline, signal,
+          owner.testHooks.windowsAuthorityFactory)
+        return { root, identity, backend, references: 0, retainedDirectories: new Map() }
+      })()
+      try { owner.sharedWindowsRoot = await opening }
+      finally { if (owner.sharedWindowsRootOpening === opening) owner.sharedWindowsRootOpening = undefined }
+    }
+    const shared = owner.sharedWindowsRoot
+    shared.references += 1
+    let released = false
+    return { root: shared.root, identity: shared.identity, backend: shared.backend,
+      retain: relativePath => retainWindowsDirectory(shared, relativePath), release: async () => {
+      if (released) return
+      released = true
+      shared.references -= 1
+      if (shared.references === 0 && owner.sharedWindowsRoot === shared) {
+        owner.sharedWindowsRoot = undefined
+        await shared.backend.close()
+      }
+    } }
   }
 }
 
@@ -472,6 +533,15 @@ type CanonicalNamespace = {
   slots: readonly [string, string]
   fence: string
   lock: string
+  releaseRetainedRoot?: () => Promise<void>
+}
+
+type SharedWindowsRoot = {
+  root: string
+  identity: { dev: number | bigint; ino: number | bigint }
+  backend: RetainedWindowsNamespaceBackend
+  references: number
+  retainedDirectories: Map<string, Promise<void>>
 }
 
 type NamespaceStat = {
@@ -599,7 +669,7 @@ class RetainedWindowsNamespaceBackend implements NamespaceBackend {
   async verifyRoot(): Promise<void> {
     try {
       const current = this.value(await this.authority.namespaceStat('.'))
-      if (!sameFileIdentity(current, { ...current, dev: this.expected.dev, ino: this.expected.ino })) {
+      if (!sameNumericFileIdentity(current, this.expected)) {
         throw new OpenCodeLaunchJournalError(this.logicalNamespace ? 'fenced' : 'foreign',
           'retained Windows journal root identity changed')
       }
@@ -625,7 +695,83 @@ class RetainedWindowsNamespaceBackend implements NamespaceBackend {
   async unlink(name: string) { try { await this.authority.namespaceUnlink(this.name(name), false) } catch (error) { throw namespaceAuthorityError(error) } }
   async rmdir(name: string) { try { await this.authority.namespaceUnlink(this.name(name), true) } catch (error) { throw namespaceAuthorityError(error) } }
   async syncDirectory(name = '.') { try { await this.authority.namespaceSyncDirectory(this.name(name)) } catch (error) { throw namespaceAuthorityError(error) } }
+  async retainChildDirectory(parentKey: string, key: string, name: string): Promise<void> {
+    try { await this.authority.openChildDirectory(parentKey, key, name) }
+    catch (error) { throw namespaceAuthorityError(error) }
+  }
   async close(): Promise<void> { await this.authority.close() }
+}
+
+/** A scoped view whose every operation remains relative to one retained native root. */
+class RelativeNamespaceBackend implements NamespaceBackend {
+  readonly kind = 'retained-directory' as const
+  constructor(
+    private readonly retainedRoot: RetainedWindowsNamespaceBackend,
+    private readonly prefix: string,
+    private readonly expected: { dev: number | bigint; ino: number | bigint },
+    private readonly logicalNamespace: boolean,
+  ) {}
+  private name(name: string): string {
+    if (name === '.') return this.prefix
+    return this.prefix === '.' ? name : `${this.prefix}/${name}`
+  }
+  displayPath(name: string): string { return this.retainedRoot.displayPath(this.name(name)) }
+  async verifyRoot(): Promise<void> {
+    await this.retainedRoot.verifyRoot()
+    let current: NamespaceStat
+    try { current = await this.retainedRoot.stat(this.prefix) }
+    catch (error) {
+      if (this.logicalNamespace && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new OpenCodeLaunchJournalError('fenced', 'relative journal root is detached')
+      }
+      throw error
+    }
+    if (!current.isDirectory() || !sameNumericFileIdentity(current, this.expected)) {
+      throw new OpenCodeLaunchJournalError(this.logicalNamespace ? 'fenced' : 'foreign',
+        'relative journal root identity changed')
+    }
+  }
+  async lstat(name: string) { await this.verifyRoot(); return this.retainedRoot.lstat(this.name(name)) }
+  async stat(name: string) { await this.verifyRoot(); return this.retainedRoot.stat(this.name(name)) }
+  async mkdir(name: string, mode: number) { await this.verifyRoot(); await this.retainedRoot.mkdir(this.name(name), mode) }
+  async open(name: string, flags: number, mode?: number) {
+    void mode
+    await this.verifyRoot(); return this.retainedRoot.open(this.name(name), flags)
+  }
+  async rename(from: string, to: string) {
+    await this.verifyRoot(); await this.retainedRoot.rename(this.name(from), this.name(to))
+  }
+  async unlink(name: string) { await this.verifyRoot(); await this.retainedRoot.unlink(this.name(name)) }
+  async rmdir(name: string) { await this.verifyRoot(); await this.retainedRoot.rmdir(this.name(name)) }
+  async syncDirectory(name = '.') {
+    await this.verifyRoot(); await this.retainedRoot.syncDirectory(this.name(name))
+  }
+}
+
+function relativeRetainedName(root: string, descendant: string): string {
+  const relative = path.relative(root, descendant).replaceAll('\\', '/')
+  if (!relative) return '.'
+  if (relative.startsWith('../') || relative === '..' || path.isAbsolute(relative)
+    || relative.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new OpenCodeLaunchJournalError('foreign', 'journal namespace escapes retained authority root')
+  }
+  return relative
+}
+
+async function retainWindowsDirectory(shared: SharedWindowsRoot, relativePath: string): Promise<void> {
+  if (relativePath === '.') return
+  let parentKey = '.'
+  for (const name of relativePath.split('/')) {
+    const key = parentKey === '.' ? name : `${parentKey}/${name}`
+    let retained = shared.retainedDirectories.get(key)
+    if (!retained) {
+      retained = shared.backend.retainChildDirectory(parentKey, key, name)
+      shared.retainedDirectories.set(key, retained)
+      void retained.catch(() => { if (shared.retainedDirectories.get(key) === retained) shared.retainedDirectories.delete(key) })
+    }
+    await retained
+    parentKey = key
+  }
 }
 
 class RetainedWindowsNamespaceHandle implements NamespaceHandle {
@@ -811,6 +957,13 @@ function sameFileIdentity(
   right: { dev: number | bigint; ino: number | bigint },
 ): boolean {
   return left.dev === right.dev && left.ino === right.ino
+}
+
+function sameNumericFileIdentity(
+  left: { dev: number | bigint; ino: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint },
+): boolean {
+  return BigInt(left.dev) === BigInt(right.dev) && BigInt(left.ino) === BigInt(right.ino)
 }
 
 async function rejectSymlink(backend: NamespaceBackend, name: string): Promise<void> {

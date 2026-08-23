@@ -51,7 +51,11 @@ const DIGEST = /^[a-f0-9]{64}$/
  * authorize creation of the same team/lane/member session.
  */
 export class OpenCodeLaunchMutationLedger {
-  constructor(private readonly directory: string) {}
+  constructor(
+    private readonly directory: string,
+    private readonly persistenceFactory: (filePath: string) => OpenCodeLaunchFileJournalPersistence =
+      filePath => new OpenCodeLaunchFileJournalPersistence(filePath),
+  ) {}
 
   static targetDigest(input: {
     teamId: string; laneId: string; projectIdentity: string; memberIdentity: OpenCodeOpaqueIdentity
@@ -117,7 +121,7 @@ export class OpenCodeLaunchMutationLedger {
 
   private persistence(targetDigest: string): OpenCodeLaunchFileJournalPersistence {
     if (!DIGEST.test(targetDigest)) throw new TypeError('invalid launch mutation target digest')
-    return new OpenCodeLaunchFileJournalPersistence(join(this.directory, `${targetDigest}.claim`))
+    return this.persistenceFactory(join(this.directory, `${targetDigest}.claim`))
   }
 
   private async withLock<T>(targetDigest: string, context: OpenCodeLaunchStoreContext,
