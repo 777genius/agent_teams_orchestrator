@@ -79,6 +79,7 @@ jobs:
           src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
           src/services/opencode/OpenCodeWindowsPublicationAuthorityProtocol.test.ts
           src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.test.ts
+          src/services/opencode/OpenCodeWindowsPassiveReadAuthority.test.ts
           src/services/opencode/OpenCodeWindowsRetainedCallerLayer.test.ts
           src/services/opencode/OpenCodeSafePublication.test.ts
           src/services/opencode/OpenCodeScopedProfileAuthPublication.test.ts

@@ -1,9 +1,10 @@
-import { dlopen, FFIType, ptr, read } from 'bun:ffi'
+import { dlopen, FFIType, ptr } from 'bun:ffi'
 
 import { validOpenCodePublicationLeaf, validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 
 type Handle = bigint
 type Identity = Readonly<{ volumeSerial: bigint; fileId: bigint; size: bigint; directory: boolean }>
+type OpenOptions = Readonly<{ deadline?: number; signal?: AbortSignal }>
 
 const INVALID_HANDLE = 0xffff_ffff_ffff_ffffn
 const FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -23,6 +24,9 @@ const FILE_NON_DIRECTORY_FILE = 0x0000_0040
 const FILE_OPEN_REPARSE_POINT = 0x0020_0000
 const FILE_BOTH_DIRECTORY_INFORMATION = 3
 const STATUS_NO_MORE_FILES = -0x7fff_fffa
+const FILE_DEVICE_DISK = 7
+const FILE_REMOVABLE_MEDIA = 0x0000_0001
+const FILE_REMOTE_DEVICE = 0x0000_0010
 
 let kernel32: ReturnType<typeof dlopen> | undefined
 let ntdll: ReturnType<typeof dlopen> | undefined
@@ -30,9 +34,8 @@ function win32(): any {
   kernel32 ??= dlopen('kernel32.dll', {
     CreateFileW: { args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u64], returns: FFIType.u64 },
     CloseHandle: { args: [FFIType.u64], returns: FFIType.bool },
-    GetFileInformationByHandle: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.bool },
-    GetDriveTypeW: { args: [FFIType.ptr], returns: FFIType.u32 },
-    GetVolumeInformationW: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.bool },
+    GetFileInformationByHandleEx: { args: [FFIType.u64, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.bool },
+    GetVolumeInformationByHandleW: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.bool },
     ReadFile: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
   } as any)
   return kernel32.symbols as any
@@ -43,6 +46,8 @@ function nt(): any {
       FFIType.u32, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
     NtQueryDirectoryFile: { args: [FFIType.u64, FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr,
       FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.bool, FFIType.ptr, FFIType.bool], returns: FFIType.i32 },
+    NtQueryInformationFile: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.u32], returns: FFIType.i32 },
+    NtQueryVolumeInformationFile: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.u32], returns: FFIType.i32 },
   } as any)
   return ntdll.symbols as any
 }
@@ -85,42 +90,114 @@ function openRelative(parent: Handle, name: string, directory: boolean): Handle 
 }
 
 function identity(handle: Handle): Identity {
-  const info = Buffer.alloc(52)
-  if (!win32().GetFileInformationByHandle(handle, ptr(info))) throw rejected()
-  const attributes = read.u32(ptr(info), 0)
-  const size = (BigInt(read.u32(ptr(info), 32)) << 32n) | BigInt(read.u32(ptr(info), 36))
-  const fileId = (BigInt(read.u32(ptr(info), 44)) << 32n) | BigInt(read.u32(ptr(info), 48))
+  // FileIdInfo is volume-qualified and carries the complete FILE_ID_128 on
+  // both x64 and ARM64. FileBasicInformation (class 4) attests the object
+  // behind the same handle; no pathname is consulted after the open.
+  const fileIdInfo = Buffer.alloc(24)
+  if (!win32().GetFileInformationByHandleEx(handle, 18, ptr(fileIdInfo), fileIdInfo.byteLength)) throw rejected()
+  const basic = Buffer.alloc(40)
+  const io = Buffer.alloc(16)
+  if (Number(nt().NtQueryInformationFile(handle, ptr(io), ptr(basic), basic.byteLength, 4)) < 0) throw rejected()
+  const attributes = basic.readUInt32LE(32)
+  const standard = Buffer.alloc(24)
+  if (Number(nt().NtQueryInformationFile(handle, ptr(io), ptr(standard), standard.byteLength, 5)) < 0) throw rejected()
+  const size = standard.readBigUInt64LE(8)
+  const fileId = fileIdInfo.readBigUInt64LE(8) | (fileIdInfo.readBigUInt64LE(16) << 64n)
   if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0 || fileId === 0n) throw rejected()
-  return { volumeSerial: BigInt(read.u32(ptr(info), 28)), fileId, size,
+  return { volumeSerial: fileIdInfo.readBigUInt64LE(0), fileId, size,
     directory: (attributes & FILE_ATTRIBUTE_DIRECTORY) !== 0 }
 }
 
-function verifyFixedNtfs(rootPath: string): void {
-  const drive = wide(`${rootPath.slice(0, 3)}`)
-  if (win32().GetDriveTypeW(ptr(drive)) !== 3) throw rejected()
+function verifyFixedNtfs(handle: Handle): void {
   const filesystem = Buffer.alloc(64)
-  if (!win32().GetVolumeInformationW(ptr(drive), null, 0, null, null, null, ptr(filesystem), 32)) throw rejected()
+  if (!win32().GetVolumeInformationByHandleW(handle, null, 0, null, null, null, ptr(filesystem), 32)) throw rejected()
   if (filesystem.toString('utf16le').split('\0', 1)[0] !== 'NTFS') throw rejected()
+  const device = Buffer.alloc(8)
+  const io = Buffer.alloc(16)
+  if (Number(nt().NtQueryVolumeInformationFile(handle, ptr(io), ptr(device), device.byteLength, 4)) < 0
+    || device.readUInt32LE(0) !== FILE_DEVICE_DISK
+    || (device.readUInt32LE(4) & (FILE_REMOVABLE_MEDIA | FILE_REMOTE_DEVICE)) !== 0) throw rejected()
+}
+
+type PassiveNativeContract = Readonly<{
+  openAbsolute(target: string): Handle
+  openRelative(parent: Handle, name: string, directory: boolean): Handle
+  identity(handle: Handle): Identity
+  verifyFixedNtfs(handle: Handle): void
+  close(handle: Handle): void
+}>
+
+const nativeContract: PassiveNativeContract = {
+  openAbsolute, openRelative, identity, verifyFixedNtfs, close: closeHandle,
+}
+
+function guard(options: OpenOptions): void {
+  if (options.signal?.aborted || options.deadline !== undefined
+    && (!Number.isFinite(options.deadline) || performance.now() >= options.deadline)) throw rejected()
+}
+
+type RetainedRoot = Readonly<{ root: Handle; rootIdentity: Identity; volume: Handle; volumeIdentity: Identity }>
+
+/** Retain the volume first, then resolve exactly one no-follow component at a time. */
+function retainRoot(contract: PassiveNativeContract, rootPath: string, options: OpenOptions): RetainedRoot {
+  guard(options)
+  const volume = contract.openAbsolute(rootPath.slice(0, 3))
+  let current = volume
+  try {
+    const volumeIdentity = contract.identity(volume)
+    if (!volumeIdentity.directory) throw rejected()
+    contract.verifyFixedNtfs(volume)
+    guard(options)
+    const components = rootPath.slice(3).split('\\').filter(Boolean)
+    for (const component of components) {
+      const child = contract.openRelative(current, component, true)
+      if (current !== volume) contract.close(current)
+      current = child
+      const value = contract.identity(current)
+      if (!value.directory || value.volumeSerial !== volumeIdentity.volumeSerial) throw rejected()
+      guard(options)
+    }
+    const rootIdentity = current === volume ? volumeIdentity : contract.identity(current)
+    return { root: current, rootIdentity, volume, volumeIdentity }
+  } catch (error) {
+    if (current !== volume) contract.close(current)
+    contract.close(volume)
+    throw error
+  }
+}
+
+/** Linux-safe native-contract seam; production always supplies the private FFI contract. */
+export function testRetainWindowsPassiveRoot(
+  contract: PassiveNativeContract, rootPath: string, options: OpenOptions = {},
+): RetainedRoot {
+  if (!validOpenCodePublicationRoot(rootPath)) throw rejected()
+  return retainRoot(contract, rootPath, options)
 }
 
 /** In-process, zero-write Windows lease. Child access is relative to retained handles. */
 export class OpenCodeWindowsPassiveReadAuthority {
   readonly #root: Handle
   readonly #rootIdentity: Identity
+  readonly #volume: Handle | null
+  readonly #volumeIdentity: Identity
+  readonly #options: OpenOptions
   readonly #pins: Handle[] = []
   #closed = false
 
-  private constructor(root: Handle, rootIdentity: Identity) { this.#root = root; this.#rootIdentity = rootIdentity }
+  private constructor(
+    root: Handle, rootIdentity: Identity, volumeIdentity: Identity, options: OpenOptions, volume: Handle | null = null,
+  ) {
+    this.#root = root; this.#rootIdentity = rootIdentity; this.#volumeIdentity = volumeIdentity
+    this.#options = options; this.#volume = volume
+  }
 
-  static open(rootPath: string): OpenCodeWindowsPassiveReadAuthority {
+  static open(rootPath: string, options: OpenOptions = {}): OpenCodeWindowsPassiveReadAuthority {
     if (!validOpenCodePublicationRoot(rootPath)) throw rejected()
-    verifyFixedNtfs(rootPath)
-    const root = openAbsolute(rootPath)
-    try {
-      const rootIdentity = identity(root)
-      if (!rootIdentity.directory) throw rejected()
-      return new OpenCodeWindowsPassiveReadAuthority(root, rootIdentity)
-    } catch (error) { closeHandle(root); throw error }
+    const retained = retainRoot(nativeContract, rootPath, options)
+    return new OpenCodeWindowsPassiveReadAuthority(
+      retained.root, retained.rootIdentity, retained.volumeIdentity, options,
+      retained.volume === retained.root ? null : retained.volume,
+    )
   }
 
   stableIdentity(): Readonly<{ dev: bigint; ino: bigint }> {
@@ -128,7 +205,13 @@ export class OpenCodeWindowsPassiveReadAuthority {
   }
 
   validate(): void {
+    guard(this.#options)
     if (this.#closed) throw rejected()
+    if (this.#volume) {
+      const volume = identity(this.#volume)
+      if (!volume.directory || volume.volumeSerial !== this.#volumeIdentity.volumeSerial
+        || volume.fileId !== this.#volumeIdentity.fileId) throw rejected()
+    }
     const current = identity(this.#root)
     if (!current.directory || current.volumeSerial !== this.#rootIdentity.volumeSerial
       || current.fileId !== this.#rootIdentity.fileId) throw rejected()
@@ -141,7 +224,7 @@ export class OpenCodeWindowsPassiveReadAuthority {
     try {
       const childIdentity = identity(child)
       if (!childIdentity.directory || childIdentity.volumeSerial !== this.#rootIdentity.volumeSerial) throw rejected()
-      return new OpenCodeWindowsPassiveReadAuthority(child, childIdentity)
+      return new OpenCodeWindowsPassiveReadAuthority(child, childIdentity, this.#volumeIdentity, this.#options)
     } catch (error) { closeHandle(child); throw error }
   }
 
@@ -160,6 +243,7 @@ export class OpenCodeWindowsPassiveReadAuthority {
   pinRegular(name: string): Identity { return this.#pinRegular(name).value }
 
   async readBounded(name: string, maximumBytes: number, signal?: AbortSignal): Promise<Uint8Array | null> {
+    guard(this.#options)
     if (signal?.aborted || !Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw rejected()
     const pinned = this.#pinRegular(name)
     if (pinned.value.size > BigInt(maximumBytes)) return null
@@ -167,6 +251,7 @@ export class OpenCodeWindowsPassiveReadAuthority {
     const count = Buffer.alloc(4)
     if (!win32().ReadFile(pinned.handle, ptr(bytes), bytes.byteLength, ptr(count), null)) throw rejected()
     const bytesRead = count.readUInt32LE(0)
+    guard(this.#options)
     if (bytesRead > maximumBytes || signal?.aborted) return null
     const after = identity(pinned.handle)
     if (after.size !== pinned.value.size || after.fileId !== pinned.value.fileId
@@ -184,12 +269,14 @@ export class OpenCodeWindowsPassiveReadAuthority {
       const io = Buffer.alloc(16)
       const status = Number(nt().NtQueryDirectoryFile(this.#root, 0n, null, null, ptr(io), ptr(output),
         output.byteLength, FILE_BOTH_DIRECTORY_INFORMATION, false, null, restart))
+      guard(this.#options)
       restart = false
       if (status === STATUS_NO_MORE_FILES) break
       if (status < 0) throw rejected()
       const used = Number(io.readBigUInt64LE(8))
       let offset = 0
       while (offset + 94 <= used) {
+        guard(this.#options)
         const next = output.readUInt32LE(offset)
         const length = output.readUInt32LE(offset + 60)
         if ((length & 1) !== 0 || offset + 94 + length > used) throw rejected()
@@ -209,5 +296,6 @@ export class OpenCodeWindowsPassiveReadAuthority {
     this.#closed = true
     for (const handle of this.#pins.splice(0)) closeHandle(handle)
     closeHandle(this.#root)
+    if (this.#volume) closeHandle(this.#volume)
   }
 }

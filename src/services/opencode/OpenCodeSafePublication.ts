@@ -94,7 +94,10 @@ export class OpenCodeSafePublicationDirectory {
   static async openReadOnly(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
     if (process.platform !== 'win32') return this.open(directoryPath, options)
     const resolved = path.resolve(directoryPath)
-    const passive = OpenCodeWindowsPassiveReadAuthority.open(resolved)
+    const passive = OpenCodeWindowsPassiveReadAuthority.open(resolved, {
+      deadline: options.deadline ?? performance.now() + 10_000,
+      signal: options.abortSignal,
+    })
     try {
       const stable = passive.stableIdentity()
       return new OpenCodeSafePublicationDirectory(null, resolved, stable, null, '.', false, passive)
