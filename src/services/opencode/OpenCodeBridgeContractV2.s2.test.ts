@@ -158,6 +158,7 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
       ok: true,
       value: {
         openCodeLaunchAttemptContract: 0,
+        openCodeLaunchRequestCorrelationContract: 0,
         purposeScopedProfiles: 0,
         freshRetainedHostProof: 0,
         idempotentContinuation: 0,
@@ -166,6 +167,7 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
     })
     const advertised = {
       openCodeLaunchAttemptContract: 1,
+      openCodeLaunchRequestCorrelationContract: 1,
       purposeScopedProfiles: 1,
       freshRetainedHostProof: 1,
       idempotentContinuation: 1,

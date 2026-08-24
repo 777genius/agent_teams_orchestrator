@@ -17,7 +17,11 @@ import type {
   OpenCodeBridgeCommandHandlerPorts,
   OpenCodeLaunchBridgeMember,
 } from './OpenCodeLaunchAttemptBridge.js'
-import { getOpenCodeLaunchAttemptProductionPorts } from './OpenCodeLaunchAttemptBridge.js'
+import {
+  getOpenCodeLaunchAttemptProductionPorts,
+  OPEN_CODE_LAUNCH_REQUEST_CORRELATION_CONTRACT_VERSION,
+  validateOpenCodeLaunchRequestCorrelation,
+} from './OpenCodeLaunchAttemptBridge.js'
 import { ensureOpenCodeLaunchAttemptProductionComposition } from './OpenCodeLaunchAttemptProduction.js'
 import { decodeStrictOpenCodeProductionLaunch } from './OpenCodeLaunchProductionRouting.js'
 import {
@@ -976,7 +980,10 @@ function createBridgeServerIdentity(
 ) {
   const launchContractCapability = {
     openCodeLaunchAttemptContract: OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION,
-  } satisfies Pick<OpenCodeBridgeCapabilityVersions, 'openCodeLaunchAttemptContract'>
+    openCodeLaunchRequestCorrelationContract:
+      OPEN_CODE_LAUNCH_REQUEST_CORRELATION_CONTRACT_VERSION,
+  } satisfies Pick<OpenCodeBridgeCapabilityVersions,
+    'openCodeLaunchAttemptContract' | 'openCodeLaunchRequestCorrelationContract'>
   return {
     schemaVersion: BRIDGE_SCHEMA_VERSION,
     peer: 'agent_teams_orchestrator',
@@ -2839,52 +2846,72 @@ async function runLaunch(
     // optional envelope discriminator, but they still have to supply the full
     // launch-attempt contract. A genuinely legacy body fails before the
     // provisioning/profile/session code below can observe it.
-    const request = decodeStrictOpenCodeProductionLaunch(body)
-    if (!ports?.launchAttempt) {
-      throw new Error('OpenCode launch-attempt runtime is not configured')
-    }
-    if (request.launchAttempt.modelId !== selectedModel) {
-      throw new Error('OpenCode launch-attempt selectedModel does not match launchAttempt.modelId')
-    }
+    const command = buildOpenCodeLaunchCorrelationCommand(envelope, runtimeDeadline)
+    validateOpenCodeLaunchRequestCorrelation(command)
     validateOpenCodeBridgeStateChangingPreconditions({
       body,
       runtime: createRuntimePreconditionSnapshot(null),
     })
-    const preconditions = validateOpenCodeLaunchBoundaryPreconditions(
-      parseOpenCodeBridgePreconditions(body.preconditions), request.launchAttempt.attemptId)
-    const members: OpenCodeLaunchBridgeMember[] = membersRaw.map((item, index) => {
-      const member = asRecord(item)
-      const name = asString(member?.name)
-      const memberIdentity = member?.memberIdentity
-      if (!name || !isOpenCodeOpaqueIdentity(memberIdentity)) {
-        throw new Error(`Invalid OpenCode launch-attempt member at index ${index}`)
-      }
-      return {
-        name,
-        memberIdentity,
-        ...(asString(member?.prompt) ? { prompt: asString(member?.prompt)! } : {}),
-        ...(asString(member?.effort) ? { effort: asString(member?.effort)! } : {}),
-      }
-    })
-    const continuation = body.continuation === true
-      || request.launchAttempt.continuationToken !== undefined
-    const result = await ports.launchAttempt.execute({
-      request,
-      members,
-      runId,
-      laneId,
-      teamId,
-      projectPath: asString(body.projectPath) ?? envelope.cwd,
-      selectedModel,
-      toolApprovalMode,
-      continuation,
-      requestedBudgetMs: envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000,
-      outerRemainingBudgetMs: runtimeDeadline.remainingMs(),
-      deadlineAtMs: runtimeDeadline.deadlineAtMs,
-      signal: runtimeDeadline.signal,
-      preconditions,
-    })
+    if (!ports?.launchAttempt) {
+      throw new Error('OpenCode launch-attempt runtime is not configured')
+    }
+    const result = await ports.launchAttempt.execute(command)
     return result
+  }
+}
+
+function buildOpenCodeLaunchCorrelationCommand(
+  envelope: BridgeEnvelope,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+): Parameters<OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']>[0] {
+  const body = envelope.body
+  const request = decodeStrictOpenCodeProductionLaunch(body)
+  const runId = asString(body.runId)
+  const laneId = asString(body.laneId)
+  const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const selectedModel = asString(body.selectedModel)
+  const membersRaw = Array.isArray(body.members) ? body.members : []
+  if (!runId || !laneId || !teamId || !selectedModel || membersRaw.length === 0) {
+    throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
+  }
+  if (request.launchAttempt.modelId !== selectedModel) {
+    throw new Error('OpenCode launch-attempt selectedModel does not match launchAttempt.modelId')
+  }
+  assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
+  const preconditions = validateOpenCodeLaunchBoundaryPreconditions(
+    parseOpenCodeBridgePreconditions(body.preconditions), request.launchAttempt.attemptId)
+  const members: OpenCodeLaunchBridgeMember[] = membersRaw.map((item, index) => {
+    const member = asRecord(item)
+    const name = asString(member?.name)
+    const memberIdentity = member?.memberIdentity
+    if (!name || !isOpenCodeOpaqueIdentity(memberIdentity)) {
+      throw new Error(`Invalid OpenCode launch-attempt member at index ${index}`)
+    }
+    return {
+      name,
+      memberIdentity,
+      ...(asString(member?.prompt) ? { prompt: asString(member?.prompt)! } : {}),
+      ...(asString(member?.effort) ? { effort: asString(member?.effort)! } : {}),
+    }
+  })
+  const projectPath = asString(body.projectPath) ?? envelope.cwd
+  return {
+    request,
+    members,
+    runId,
+    laneId,
+    teamId,
+    projectPath,
+    requestProjectPath: projectPath,
+    selectedModel,
+    toolApprovalMode: resolveLaunchToolApprovalMode(body),
+    continuation: body.continuation === true
+      || request.launchAttempt.continuationToken !== undefined,
+    requestedBudgetMs: envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000,
+    outerRemainingBudgetMs: runtimeDeadline.remainingMs(),
+    deadlineAtMs: runtimeDeadline.deadlineAtMs,
+    signal: runtimeDeadline.signal,
+    preconditions,
   }
 }
 
@@ -4613,11 +4640,20 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
   try {
+    let resolvedPorts = ports ?? getOpenCodeLaunchAttemptProductionPorts()
+    if (!resolvedPorts) {
+      if (envelope.command === 'opencode.launchTeam') {
+        if (!runtimeDeadline) throw new Error('OpenCode launch preflight deadline was not initialized')
+        validateOpenCodeLaunchRequestCorrelation(
+          buildOpenCodeLaunchCorrelationCommand(envelope, runtimeDeadline),
+        )
+      }
+      resolvedPorts = ensureOpenCodeLaunchAttemptProductionComposition()
+    }
     const result = await handleEnvelope(
       envelope,
       runtimeDeadline,
-      ports ?? getOpenCodeLaunchAttemptProductionPorts()
-        ?? ensureOpenCodeLaunchAttemptProductionComposition(),
+      resolvedPorts,
     )
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()

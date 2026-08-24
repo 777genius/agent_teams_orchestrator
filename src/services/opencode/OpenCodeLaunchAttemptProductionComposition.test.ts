@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createOpenCodeLaunchAttemptProductionBridge } from './OpenCodeLaunchAttemptProductionComposition.js'
 import {
   computeOpenCodeLaunchCommandInputDigest,
+  computeOpenCodeLaunchRequestCorrelationDigest,
   type OpenCodeLaunchAttemptBridgePort,
 } from './OpenCodeLaunchAttemptBridge.js'
 import type { OpenCodeLaunchAttemptResult } from './OpenCodeLaunchAttempt.js'
@@ -169,14 +170,31 @@ describe('OpenCode production launch composition', () => {
 
     await bridge.execute({ ...command(), projectPath: project })
     await bridge.execute({ ...command(), projectPath: alias })
+    const correlatedAlias = {
+      ...command(),
+      projectPath: alias,
+      requestProjectPath: alias,
+      effectiveProfilePlanDigest: 'f'.repeat(64),
+    }
+    correlatedAlias.request.launchAttempt.requestCorrelationDigest =
+      computeOpenCodeLaunchRequestCorrelationDigest(correlatedAlias)
+    await bridge.execute(correlatedAlias)
 
-    expect(observed).toHaveLength(2)
+    expect(observed).toHaveLength(3)
     expect(observed[0]!.projectPath).toBe(project)
     expect(observed[1]!.projectPath).toBe(project)
     expect(observed[0]!.projectIdentity).toBe(observed[1]!.projectIdentity)
     expect(computeOpenCodeLaunchCommandInputDigest(observed[0]!))
       .toBe(computeOpenCodeLaunchCommandInputDigest(observed[1]!))
-    const targets = observed.map(value => OpenCodeLaunchMutationLedger.targetDigest({
+    expect(observed[2]).toMatchObject({
+      projectPath: project,
+      projectIdentity: project,
+      requestProjectPath: alias,
+      effectiveProfilePlanDigest: 'f'.repeat(64),
+    })
+    expect(observed[2]!.request.launchAttempt.requestCorrelationDigest)
+      .toBe(computeOpenCodeLaunchRequestCorrelationDigest(observed[2]!))
+    const targets = observed.slice(0, 2).map(value => OpenCodeLaunchMutationLedger.targetDigest({
       teamId: value.teamId,
       laneId: value.laneId,
       projectIdentity: value.projectIdentity!,

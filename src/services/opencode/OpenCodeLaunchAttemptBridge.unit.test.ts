@@ -4,6 +4,7 @@ import {
   getOpenCodeLaunchAttemptProductionPorts,
   computeOpenCodeLaunchCommandInputDigest,
   computeOpenCodeLaunchCommandImmutableDigest,
+  computeOpenCodeLaunchRequestCorrelationDigest,
   installOpenCodeLaunchAttemptPortsForTests,
   OpenCodeLaunchAttemptBridge,
   resetOpenCodeLaunchAttemptProductionPortsForTests,
@@ -151,6 +152,25 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     expect(coreInput?.requestedBudgetMs).toBe(12_345)
     expect(coreInput?.signal).toBe(baseline.signal)
     expect(coreInput?.commandInputDigest).toBe(computeOpenCodeLaunchCommandInputDigest(baseline))
+  })
+
+  test('rejects request-correlation mismatch before ledger, core, or projection', async () => {
+    const candidate = command()
+    candidate.request = structuredClone(candidate.request)
+    candidate.request.launchAttempt.requestCorrelationDigest =
+      computeOpenCodeLaunchRequestCorrelationDigest(candidate)
+    candidate.members = [{ ...candidate.members[0]!, prompt: 'mutated after caller digest' }]
+    const calls: string[] = []
+    const bridge = new OpenCodeLaunchAttemptBridge({
+      commandLedger: { read: async () => { calls.push('ledger'); return { status: 'absent' } } },
+      attempt: { run: async () => { calls.push('core'); return result } },
+      projection: { fromDurableResult: async () => {
+        calls.push('projection'); return { snapshot, data: null }
+      } },
+    })
+
+    await expect(bridge.execute(candidate)).rejects.toThrow('request correlation digest mismatch')
+    expect(calls).toEqual([])
   })
 
   test('binds the proof nonce only into the exact-generation input authority', () => {

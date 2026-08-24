@@ -16,6 +16,7 @@ export const OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION = 1 as const
 
 export type OpenCodeBridgeCapabilityVersions = {
   openCodeLaunchAttemptContract: number
+  openCodeLaunchRequestCorrelationContract: number
   purposeScopedProfiles: number
   freshRetainedHostProof: number
   idempotentContinuation: number
@@ -56,6 +57,8 @@ export type OpenCodeLaunchAttempt = {
   requiredMcpTools: string[]
   continuationToken?: string
   requireFreshRetainedHostProof: true
+  /** Optional caller-authored digest of the exact pre-enrichment launch wire values. */
+  requestCorrelationDigest?: string
 }
 export type OpenCodeLaunchAttemptRequest = {
   launchContractVersion: 1
@@ -98,6 +101,8 @@ export type OpenCodeLaunchAttemptDetails = {
   inputDigest: string
   /** Orchestrator-authored stable digest for the immutable ordered launch plan. */
   immutableDigest: string
+  /** Exact echo of the optional caller-authored launch request correlation digest. */
+  requestCorrelationDigest?: string
   outcome: OpenCodeLaunchAttemptOutcome
   phase: OpenCodeLaunchAttemptPhase
   startedAt: number
@@ -134,6 +139,8 @@ export type OpenCodeRetainedHostProof = {
   verifiedAt: number
   authorizationSource: 'fresh_live_attempt'
   cacheUsed: false
+  /** Exact echo of the optional caller-authored launch request correlation digest. */
+  requestCorrelationDigest?: string
 }
 export type OpenCodeLaunchMemberLinkage = {
   memberIdentity: OpenCodeOpaqueIdentity
@@ -159,7 +166,8 @@ export type DecodedOpenCodeLaunchAttemptResponse =
   | { kind: 'v2'; response: OpenCodeLaunchAttemptResponse }
 
 const capabilityFields = [
-  'openCodeLaunchAttemptContract', 'purposeScopedProfiles', 'freshRetainedHostProof',
+  'openCodeLaunchAttemptContract', 'openCodeLaunchRequestCorrelationContract',
+  'purposeScopedProfiles', 'freshRetainedHostProof',
   'idempotentContinuation', 'typedFailureDiagnostics',
 ] as const satisfies readonly (keyof OpenCodeBridgeCapabilityVersions)[]
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -410,6 +418,11 @@ export function decodeOpenCodeLaunchAttemptRequest(
       return invalid('launchAttempt.continuationToken')
     }
     const ownedContinuationToken = continuationToken as string | undefined
+    const requestCorrelationDigest = attempt.requestCorrelationDigest
+    if (requestCorrelationDigest !== undefined && !isOpenCodeLaunchPayloadHash(requestCorrelationDigest)) {
+      return invalid('launchAttempt.requestCorrelationDigest')
+    }
+    const ownedRequestCorrelationDigest = requestCorrelationDigest as string | undefined
     return { ok: true, value: { kind: 'v2', request: {
       launchContractVersion: 1,
       launchAttempt: {
@@ -423,6 +436,9 @@ export function decodeOpenCodeLaunchAttemptRequest(
         requiredMcpTools: [...requiredMcpTools],
         ...(ownedContinuationToken === undefined ? {} : { continuationToken: ownedContinuationToken }),
         requireFreshRetainedHostProof: true,
+        ...(ownedRequestCorrelationDigest === undefined ? {} : {
+          requestCorrelationDigest: ownedRequestCorrelationDigest,
+        }),
       },
     } } }
   } catch { return invalid('$') }
@@ -488,6 +504,11 @@ function decodeLaunchAttempt(value: unknown): OpenCodeBridgeDecodeResult<OpenCod
   if (!positiveInteger(source.generation)) return invalid('launchAttempt.generation')
   if (!isOpenCodeLaunchPayloadHash(source.inputDigest)) return invalid('launchAttempt.inputDigest')
   if (!isOpenCodeLaunchPayloadHash(source.immutableDigest)) return invalid('launchAttempt.immutableDigest')
+  const requestCorrelationDigest = source.requestCorrelationDigest
+  if (requestCorrelationDigest !== undefined && !isOpenCodeLaunchPayloadHash(requestCorrelationDigest)) {
+    return invalid('launchAttempt.requestCorrelationDigest')
+  }
+  const ownedRequestCorrelationDigest = requestCorrelationDigest as string | undefined
   if (!member(outcomes, source.outcome)) return invalid('launchAttempt.outcome')
   if (!member(phases, source.phase)) return invalid('launchAttempt.phase')
   const startedAt = source.startedAt
@@ -548,6 +569,9 @@ function decodeLaunchAttempt(value: unknown): OpenCodeBridgeDecodeResult<OpenCod
     generation: source.generation,
     inputDigest: source.inputDigest,
     immutableDigest: source.immutableDigest,
+    ...(ownedRequestCorrelationDigest === undefined ? {} : {
+      requestCorrelationDigest: ownedRequestCorrelationDigest,
+    }),
     outcome: source.outcome,
     phase: source.phase,
     startedAt,
@@ -595,6 +619,11 @@ function decodeProof(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeRetaine
   if (!safeInteger(source.verifiedAt)) return invalid('proof.verifiedAt')
   if (source.authorizationSource !== 'fresh_live_attempt') return invalid('proof.authorizationSource')
   if (source.cacheUsed !== false) return invalid('proof.cacheUsed')
+  const requestCorrelationDigest = source.requestCorrelationDigest
+  if (requestCorrelationDigest !== undefined && !isOpenCodeLaunchPayloadHash(requestCorrelationDigest)) {
+    return invalid('proof.requestCorrelationDigest')
+  }
+  const ownedRequestCorrelationDigest = requestCorrelationDigest as string | undefined
   return { ok: true, value: {
     generation: source.generation,
     attemptId: source.attemptId,
@@ -610,6 +639,9 @@ function decodeProof(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeRetaine
     verifiedAt: source.verifiedAt,
     authorizationSource: 'fresh_live_attempt',
     cacheUsed: false,
+    ...(ownedRequestCorrelationDigest === undefined ? {} : {
+      requestCorrelationDigest: ownedRequestCorrelationDigest,
+    }),
   } }
 }
 
@@ -719,6 +751,10 @@ function decodeResponse(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeLaun
     failure = decodedFailure.value
   }
   const { outcome } = launchAttempt.value
+  if (proof !== undefined && proof.requestCorrelationDigest
+    !== launchAttempt.value.requestCorrelationDigest) {
+    return invalid('proof.requestCorrelationDigest')
+  }
   if ((outcome === 'succeeded' || outcome === 'partial') && proof === undefined) return invalid('proof')
   if (outcome === 'succeeded'
     && (members.value.failed.length > 0 || members.value.pending.length > 0
@@ -872,6 +908,8 @@ export function validateOpenCodeLaunchAttemptCorrelation(
       ['launchAttempt.attemptId', result.attemptId, attempt.attemptId],
       ['launchAttempt.payloadHash', result.payloadHash, attempt.payloadHash],
       ['launchAttempt.generation', result.generation, attempt.generation],
+      ['launchAttempt.requestCorrelationDigest', result.requestCorrelationDigest,
+        attempt.requestCorrelationDigest],
       ['launchAttempt.providerId', result.providerId, attempt.providerId],
       ['launchAttempt.expectedProviderId', result.providerId, context.expectedProviderId],
       ['launchAttempt.modelId', result.modelId, attempt.modelId],
@@ -892,6 +930,8 @@ export function validateOpenCodeLaunchAttemptCorrelation(
       ['proof.modelId', proof.modelId, attempt.modelId],
       ['proof.nonceHash', proof.nonceHash, context.expectedNonceHash],
       ['proof.cacheUsed', proof.cacheUsed, false],
+      ['proof.requestCorrelationDigest', proof.requestCorrelationDigest,
+        attempt.requestCorrelationDigest],
     ]
     for (const [field, actual, expected] of exact) if (actual !== expected) return correlationViolation(field)
     for (const [field, actual] of [

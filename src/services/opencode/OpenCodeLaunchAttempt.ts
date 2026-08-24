@@ -1145,6 +1145,8 @@ export function validateOpenCodeDurableFinalResponse(
   if (final.launchAttempt.inputDigest !== expected.inputDigest
     || final.launchAttempt.immutableDigest !== expected.immutableDigest
     || final.launchAttempt.generation !== expected.generation
+    || final.launchAttempt.requestCorrelationDigest
+      !== request.launchAttempt.requestCorrelationDigest
     || (accepted !== undefined && JSON.stringify(final.proof) !== JSON.stringify(accepted.proof))) {
     throw new OpenCodeLaunchAttemptError('durableFinal.correlation')
   }
@@ -1265,6 +1267,9 @@ function terminalFailureBasis(
         hostKeyIdentity: terminal('host'), processId: 1, processStartedAtMs: 0,
         profileScopeIdentity: profileIdentity,
       },
+      ...(request.launchAttempt.requestCorrelationDigest === undefined ? {} : {
+        requestCorrelationDigest: request.launchAttempt.requestCorrelationDigest,
+      }),
     },
     members: { committed: [], failed: result.failed.map(item => ({ memberIdentity: item.memberIdentity,
       failure: desktopFailure(item.failure) })), pending: result.pending,

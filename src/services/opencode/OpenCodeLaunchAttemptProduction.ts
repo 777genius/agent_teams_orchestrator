@@ -854,6 +854,9 @@ class OpenCodeProductionLaunchRuntime {
               pluginPolicyIdentity: input.profile.pluginPolicyIdentity, cacheIdentity: input.profile.cacheIdentity,
               binaryIdentity: input.profile.binaryIdentity,
               retainedHostIdentity: input.host,
+              ...(input.request.launchAttempt.requestCorrelationDigest === undefined ? {} : {
+                requestCorrelationDigest: input.request.launchAttempt.requestCorrelationDigest,
+              }),
             },
             proof: {
               generation: input.request.launchAttempt.generation,
@@ -866,6 +869,9 @@ class OpenCodeProductionLaunchRuntime {
               promptMessageIdentity: opaque({ kind: 'proof-prompt', prompt }),
               assistantMessageIdentity, verifiedAt,
               authorizationSource: 'fresh_live_attempt', cacheUsed: false,
+              ...(input.request.launchAttempt.requestCorrelationDigest === undefined ? {} : {
+                requestCorrelationDigest: input.request.launchAttempt.requestCorrelationDigest,
+              }),
             },
             members: { committed: [], failed: [], pending: [], cleanupPending: [] },
           }

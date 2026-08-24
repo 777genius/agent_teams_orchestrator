@@ -130,6 +130,7 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
       ok: true,
       value: {
         openCodeLaunchAttemptContract: 0,
+        openCodeLaunchRequestCorrelationContract: 0,
         purposeScopedProfiles: 0,
         freshRetainedHostProof: 0,
         idempotentContinuation: 0,
@@ -138,6 +139,7 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
     })
     const advertised = {
       openCodeLaunchAttemptContract: 1,
+      openCodeLaunchRequestCorrelationContract: 1,
       purposeScopedProfiles: 1,
       freshRetainedHostProof: 1,
       idempotentContinuation: 1,
@@ -307,6 +309,66 @@ describe('OpenCodeBridgeContractV2 canonical failures', () => {
 })
 
 describe('OpenCodeBridgeContractV2 proof correlation', () => {
+  test('whitelists and exactly correlates the optional request digest through attempt and proof', () => {
+    const digest = 'f'.repeat(64)
+    const correlatedRequest = request()
+    correlatedRequest.launchAttempt.requestCorrelationDigest = digest
+    const correlatedResponse = response()
+    correlatedResponse.launchAttempt.requestCorrelationDigest = digest
+    correlatedResponse.proof!.requestCorrelationDigest = digest
+
+    expect(encodeOpenCodeLaunchAttemptRequest(correlatedRequest).launchAttempt.requestCorrelationDigest)
+      .toBe(digest)
+    expect(encodeOpenCodeLaunchAttemptResponse(correlatedResponse)).toMatchObject({
+      launchAttempt: { requestCorrelationDigest: digest },
+      proof: { requestCorrelationDigest: digest },
+    })
+    const context = {
+      currentGeneration: 7,
+      expectedNonceHash: nonceHash,
+      expectedProfilePurpose: 'launch',
+      expectedProviderId: 'xai',
+      expectedProjectIdentity: identity('a'),
+      expectedConfigIdentity: identity('b'),
+      expectedAuthIdentity: identity('c'),
+      expectedPluginPolicyIdentity: identity('5'),
+      expectedCacheIdentity: identity('6'),
+      expectedBinaryIdentity: identity('0'),
+      expectedRetainedHostIdentity: retainedHostIdentity(),
+      requiredMcpTools: ['mcp.read', 'mcp.write'],
+    }
+    expect(validateOpenCodeLaunchAttemptCorrelation(correlatedRequest, correlatedResponse, context).ok)
+      .toBe(true)
+    const internallyMismatched = structuredClone(correlatedResponse)
+    internallyMismatched.proof!.requestCorrelationDigest = '0'.repeat(64)
+    expect(validateOpenCodeLaunchAttemptCorrelation(correlatedRequest, internallyMismatched, context))
+      .toMatchObject({ ok: false, failure: { field: 'proof.requestCorrelationDigest' } })
+    const requestMismatched = structuredClone(correlatedResponse)
+    requestMismatched.launchAttempt.requestCorrelationDigest = '0'.repeat(64)
+    requestMismatched.proof!.requestCorrelationDigest = '0'.repeat(64)
+    expect(validateOpenCodeLaunchAttemptCorrelation(correlatedRequest, requestMismatched, context))
+      .toMatchObject({ ok: false, failure: { field: 'launchAttempt.requestCorrelationDigest' } })
+    const legacyResponse = response()
+    expect(encodeOpenCodeLaunchAttemptRequest(request()).launchAttempt.requestCorrelationDigest)
+      .toBeUndefined()
+    expect(encodeOpenCodeLaunchAttemptResponse(legacyResponse).launchAttempt.requestCorrelationDigest)
+      .toBeUndefined()
+  })
+
+  test('accepts only lowercase SHA-256 request-correlation digests', () => {
+    const malformedRequest = request()
+    malformedRequest.launchAttempt.requestCorrelationDigest = 'A'.repeat(64)
+    expect(decodeOpenCodeLaunchAttemptRequest(malformedRequest)).toMatchObject({
+      ok: false, error: { field: 'launchAttempt.requestCorrelationDigest' },
+    })
+    const malformedResponse = response()
+    malformedResponse.launchAttempt.requestCorrelationDigest = 'A'.repeat(64)
+    malformedResponse.proof!.requestCorrelationDigest = 'A'.repeat(64)
+    expect(decodeOpenCodeLaunchAttemptResponse(malformedResponse)).toMatchObject({
+      ok: false, error: { field: 'launchAttempt.requestCorrelationDigest' },
+    })
+  })
+
   test('retains every proof field and validates exact request/current-generation/MCP correlation', () => {
     const decoded = decodeOpenCodeLaunchAttemptResponse(response())
     expect(decoded).toEqual({ ok: true, value: { kind: 'v2', response: response() } })

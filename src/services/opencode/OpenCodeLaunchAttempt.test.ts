@@ -1336,6 +1336,56 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(replay.acceptedProofResponse?.proof).toEqual(journal.acceptedProofResponse.proof)
   })
 
+  test('persists and exactly replays the request correlation digest through proof and final response', async () => {
+    const digest = '7'.repeat(64)
+    const correlatedRequest = request()
+    correlatedRequest.launchAttempt.requestCorrelationDigest = digest
+    const subject = setup({ proof: response => {
+      response.launchAttempt.requestCorrelationDigest = digest
+      response.proof!.requestCorrelationDigest = digest
+    } })
+
+    const first = await subject.launch.run({
+      request: correlatedRequest, members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(first.acceptedProofResponse).toMatchObject({
+      launchAttempt: { requestCorrelationDigest: digest },
+      proof: { requestCorrelationDigest: digest },
+    })
+    expect(first.durableFinalResponse).toMatchObject({
+      launchAttempt: { requestCorrelationDigest: digest },
+      proof: { requestCorrelationDigest: digest },
+    })
+    const effects = subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'proof' || call.startsWith('create:')).length
+
+    const replay = await subject.launch.run({
+      request: correlatedRequest, members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(replay.durableFinalResponse).toEqual(first.durableFinalResponse)
+    expect(subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'proof' || call.startsWith('create:'))).toHaveLength(effects)
+  })
+
+  test('echoes the request correlation digest in a proof-null terminal failure', async () => {
+    const digest = '6'.repeat(64)
+    const correlatedRequest = request()
+    correlatedRequest.launchAttempt.requestCorrelationDigest = digest
+    const subject = setup()
+    subject.ports.profile.createSelectedProviderProfile = async () => {
+      throw new Error('fake profile preparation failure')
+    }
+
+    const failed = await subject.launch.run({
+      request: correlatedRequest, members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(failed.status).toBe('failed')
+    expect(failed.durableFinalResponse).toMatchObject({
+      launchAttempt: { requestCorrelationDigest: digest },
+    })
+    expect(failed.durableFinalResponse?.proof).toBeUndefined()
+  })
+
   test('replays the exact authoritative response after a crash immediately after publication', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative })

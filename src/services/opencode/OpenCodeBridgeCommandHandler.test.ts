@@ -15,6 +15,10 @@ import {
   executeOpenCodeBridgeCommandEnvelope as executeStrictOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
 import type { OpenCodeBridgeCommandHandlerPorts } from './OpenCodeLaunchAttemptBridge.js'
+import {
+  computeOpenCodeLaunchRequestCorrelationDigest,
+  OPEN_CODE_LAUNCH_REQUEST_CORRELATION_CONTRACT_VERSION,
+} from './OpenCodeLaunchAttemptBridge.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -771,6 +775,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.ok).toBe(true)
     expect(result.data.server.bridgeProtocol.openCodeLaunchAttemptContract)
       .toBe(OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION)
+    expect(result.data.server.bridgeProtocol.openCodeLaunchRequestCorrelationContract)
+      .toBe(OPEN_CODE_LAUNCH_REQUEST_CORRELATION_CONTRACT_VERSION)
     expect(decodeOpenCodeBridgeCapabilities(result.data.server.bridgeProtocol)).toMatchObject({
       ok: true,
       value: { openCodeLaunchAttemptContract: OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION },
@@ -899,6 +905,54 @@ describe('OpenCodeBridgeCommandHandler', () => {
   }
 
   describe('strict launch state-changing preconditions', () => {
+    test('rejects a mismatched request digest before port dispatch or runtime effects', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        throw new Error('request digest mismatch must not trigger a capability probe')
+      }) as typeof openCodeProvisioningProbe.probe
+      const envelope = buildStrictLaunchEnvelope()
+      const body = envelope.body
+      const launchAttempt = body.launchAttempt as Parameters<
+        OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+      >[0]['request']['launchAttempt']
+      const members = body.members as Parameters<
+        OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+      >[0]['members']
+      launchAttempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest({
+        request: { launchContractVersion: 1, launchAttempt },
+        members,
+        runId: body.runId as string,
+        laneId: body.laneId as string,
+        teamId: body.teamId as string,
+        projectPath: body.projectPath as string,
+        selectedModel: body.selectedModel as string,
+        toolApprovalMode: 'auto',
+        continuation: false,
+        requestedBudgetMs: envelope.timeoutMs,
+        preconditions: body.preconditions as Parameters<
+          OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+        >[0]['preconditions'],
+      })
+      body.projectPath = '/tmp/mutated-after-correlation'
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(envelope, {
+        launchAttempt: {
+          execute: async () => {
+            launchPortCalls += 1
+            throw new Error('strict launch port must not run')
+          },
+        },
+      })
+
+      expect(result).toMatchObject({ ok: false, error: {
+        message: expect.stringContaining('request correlation digest mismatch'),
+      } })
+      expect(probeCalls).toBe(0)
+      expect(launchPortCalls).toBe(0)
+    })
+
     test('returns a retryable before-effects diagnostic for a stale capability snapshot', async () => {
       let launchPortCalls = 0
       let probeCalls = 0

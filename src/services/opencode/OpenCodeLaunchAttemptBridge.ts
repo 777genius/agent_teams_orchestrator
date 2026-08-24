@@ -44,6 +44,8 @@ export type OpenCodeLaunchAttemptBridgePort = {
     laneId: string
     teamId: string
     projectPath: string
+    /** Original parsed wire spelling, retained when production canonicalizes projectPath. */
+    requestProjectPath?: string
     /** Frozen canonical real-path identity. Production composition authors this once. */
     projectIdentity?: string
     selectedModel: string
@@ -169,6 +171,7 @@ export class OpenCodeLaunchAttemptBridge implements OpenCodeLaunchAttemptBridgeP
   async execute(
     input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
   ): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
+    validateOpenCodeLaunchRequestCorrelation(input)
     const attempt = input.request.launchAttempt
     validateOpenCodeLaunchBoundaryPreconditions(input.preconditions, attempt.attemptId)
     validateOpenCodeLaunchContinuation({
@@ -234,6 +237,9 @@ export function computeOpenCodeLaunchCommandInputDigest(
     continuation: input.continuation,
     requestedBudgetMs: input.requestedBudgetMs,
     effectiveProfilePlanDigest: input.effectiveProfilePlanDigest ?? null,
+    ...(attempt.requestCorrelationDigest === undefined ? {} : {
+      requestCorrelationDigest: attempt.requestCorrelationDigest,
+    }),
     preconditions: input.preconditions,
     members: input.members.map(member => ({
       memberIdentity: member.memberIdentity,
@@ -242,6 +248,72 @@ export function computeOpenCodeLaunchCommandInputDigest(
       effort: member.effort ?? null,
     })),
   })).digest('hex')
+}
+
+export const OPEN_CODE_LAUNCH_REQUEST_CORRELATION_CONTRACT_VERSION = 1 as const
+export const OPEN_CODE_LAUNCH_REQUEST_CORRELATION_DOMAIN =
+  'agent-teams/opencode-launch-request-correlation/v1' as const
+
+/**
+ * Cross-repository wire digest. It intentionally uses only parsed request values,
+ * before project canonicalization, profile-plan enrichment, deadlines, or signals.
+ */
+export function computeOpenCodeLaunchRequestCorrelationDigest(
+  input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
+): string {
+  const attempt = input.request.launchAttempt
+  return createHash('sha256').update(JSON.stringify({
+    domain: OPEN_CODE_LAUNCH_REQUEST_CORRELATION_DOMAIN,
+    launchContractVersion: input.request.launchContractVersion,
+    attemptId: attempt.attemptId,
+    payloadHash: attempt.payloadHash,
+    generation: attempt.generation,
+    proofNonce: attempt.proofNonce,
+    parent: {
+      sessionIdentity: attempt.parent.sessionIdentity,
+      messageIdentity: attempt.parent.messageIdentity,
+    },
+    providerId: attempt.providerId,
+    modelId: attempt.modelId,
+    requiredMcpTools: [...attempt.requiredMcpTools],
+    continuationToken: attempt.continuationToken ?? null,
+    requireFreshRetainedHostProof: attempt.requireFreshRetainedHostProof,
+    runId: input.runId,
+    laneId: input.laneId,
+    teamId: input.teamId,
+    projectPath: input.requestProjectPath ?? input.projectPath,
+    selectedModel: input.selectedModel,
+    toolApprovalMode: input.toolApprovalMode,
+    continuation: input.continuation,
+    requestedBudgetMs: input.requestedBudgetMs,
+    preconditions: {
+      handshakeIdentityHash: input.preconditions.handshakeIdentityHash,
+      laneId: input.preconditions.laneId,
+      expectedRunId: input.preconditions.expectedRunId,
+      expectedCapabilitySnapshotId: input.preconditions.expectedCapabilitySnapshotId,
+      expectedBehaviorFingerprint: input.preconditions.expectedBehaviorFingerprint,
+      expectedManifestHighWatermark: input.preconditions.expectedManifestHighWatermark,
+      commandLeaseId: input.preconditions.commandLeaseId,
+      idempotencyKey: input.preconditions.idempotencyKey,
+    },
+    members: input.members.map(member => ({
+      memberIdentity: member.memberIdentity,
+      name: member.name,
+      prompt: member.prompt ?? null,
+      effort: member.effort ?? null,
+    })),
+  })).digest('hex')
+}
+
+/** Rejects an optional correlation digest before any launch runtime side effect. */
+export function validateOpenCodeLaunchRequestCorrelation(
+  input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
+): void {
+  const supplied = input.request.launchAttempt.requestCorrelationDigest
+  if (supplied !== undefined
+    && supplied !== computeOpenCodeLaunchRequestCorrelationDigest(input)) {
+    throw new Error('OpenCode launch request correlation digest mismatch')
+  }
 }
 
 export function computeOpenCodeLaunchCommandImmutableDigest(

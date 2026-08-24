@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 
 import {
   OpenCodeLaunchAttemptBridge,
+  validateOpenCodeLaunchRequestCorrelation,
   type OpenCodeLaunchAttemptBridgePort,
 } from './OpenCodeLaunchAttemptBridge.js'
 import type { OpenCodeLaunchAttemptResult } from './OpenCodeLaunchAttempt.js'
@@ -89,6 +90,8 @@ export function createOpenCodeLaunchAttemptProductionBridge(
     }
 
     override async execute(command: Command): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
+      // Validate while projectPath is still the exact parsed wire spelling.
+      validateOpenCodeLaunchRequestCorrelation(command)
       const budget = command.outerRemainingBudgetMs ?? command.requestedBudgetMs
       const now = monotonicNow()
       const legacyDeadlineAtMs = now + Math.max(0, budget)

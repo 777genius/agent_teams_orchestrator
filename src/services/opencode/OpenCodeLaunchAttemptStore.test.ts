@@ -341,6 +341,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const store = new OpenCodeLaunchAttemptStore(persistence)
     const exactIdentity = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
     const publishedFinal = finalResponse()
+    publishedFinal.launchAttempt.requestCorrelationDigest = '1'.repeat(64)
+    publishedFinal.proof!.requestCorrelationDigest = '1'.repeat(64)
     let releaseCleanup!: () => void
     const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
     let deferredCleanup!: Promise<void>
