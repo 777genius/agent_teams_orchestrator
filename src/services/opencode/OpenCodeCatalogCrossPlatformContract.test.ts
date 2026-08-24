@@ -69,6 +69,13 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('CREATE_SUSPENDED')
     expect(source).toContain('ancestor_handles')
     expect(source).toContain('PROC_THREAD_ATTRIBUTE_JOB_LIST')
+    expect(source).toContain('PROC_THREAD_ATTRIBUTE_HANDLE_LIST')
+    expect(source).toContain('DuplicateHandle')
+    expect(source).toContain('STARTF_USESTDHANDLES')
+    expect(source).toContain('startup.StartupInfo.hStdInput = protocol_handles[0]')
+    expect(source).toContain('startup.StartupInfo.hStdOutput = protocol_handles[1]')
+    expect(source).toContain('startup.StartupInfo.hStdError = protocol_handles[2]')
+    expect(source).toMatch(/CreateProcessW\([\s\S]*?\n\s*1,\n\s*CREATE_SUSPENDED/)
     expect(source).toContain('InitializeProcThreadAttributeList')
     expect(source).toContain('UpdateProcThreadAttribute')
     expect(source).toContain('STARTUPINFOEXW')
@@ -156,9 +163,10 @@ describe('native catalog cross-platform source contract', () => {
       expect(lock).toMatch(/name = "windows-sys"\r?\nversion = "0\.61\.2"/)
     }
     for (const feature of ['Win32_Foundation', 'Win32_Security', 'Win32_Storage_FileSystem',
-      'Win32_System_JobObjects', 'Win32_System_Threading']) expect(launcherToml).toContain(feature)
-    for (const symbol of ['CreateProcessW', 'STARTUPINFOEXW', 'PROC_THREAD_ATTRIBUTE_JOB_LIST',
-      'CreateJobObjectW', 'SetInformationJobObject']) expect(launcher).toContain(symbol)
+      'Win32_System_Console', 'Win32_System_JobObjects', 'Win32_System_Threading']) expect(launcherToml).toContain(feature)
+    for (const symbol of ['CreateProcessW', 'STARTUPINFOEXW', 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST',
+      'PROC_THREAD_ATTRIBUTE_JOB_LIST', 'GetStdHandle', 'DuplicateHandle', 'CreateJobObjectW',
+      'SetInformationJobObject']) expect(launcher).toContain(symbol)
     for (const feature of ['Win32_Foundation', 'Win32_Security', 'Win32_Storage_FileSystem',
       'Win32_System_IO', 'Win32_System_WindowsProgramming']) expect(authorityToml).toContain(feature)
     for (const symbol of ['FILE_FLAG_BACKUP_SEMANTICS', 'FILE_FLAG_OPEN_REPARSE_POINT']) {

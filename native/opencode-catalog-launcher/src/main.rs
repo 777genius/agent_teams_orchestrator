@@ -103,22 +103,28 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, GENERIC_READ, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, GetVolumeInformationByHandleW,
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
         InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTUPINFOEXW,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW,
     };
     let mut args = std::env::args_os();
     let _ = args.next();
@@ -299,15 +305,45 @@ fn main() {
         std::process::exit(126)
     }
 
+    // The launcher is itself started with Bun protocol pipes. CreateProcessW
+    // does not forward those standard handles unless they are explicitly
+    // inheritable and selected in STARTUPINFO. Duplicate only the three
+    // protocol handles and allowlist them so no unrelated inheritable launcher
+    // handle crosses into the authority process.
+    let current_process = unsafe { GetCurrentProcess() };
+    let mut protocol_handles = [std::ptr::null_mut(); 3];
+    for (index, standard) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
+    {
+        let source = unsafe { GetStdHandle(standard) };
+        if source.is_null()
+            || source == INVALID_HANDLE_VALUE
+            || unsafe {
+                DuplicateHandle(
+                    current_process,
+                    source,
+                    current_process,
+                    &mut protocol_handles[index],
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+        {
+            std::process::exit(126)
+        }
+    }
+
     let mut attribute_bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_bytes) };
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attribute_bytes) };
     let mut attribute_storage = vec![
         0usize;
         (attribute_bytes + std::mem::size_of::<usize>() - 1)
             / std::mem::size_of::<usize>()
     ];
     let attributes = attribute_storage.as_mut_ptr() as *mut _;
-    if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut attribute_bytes) } == 0
+    if unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &mut attribute_bytes) } == 0
         || unsafe {
             UpdateProcThreadAttribute(
                 attributes,
@@ -319,11 +355,26 @@ fn main() {
                 std::ptr::null_mut(),
             )
         } == 0
+        || unsafe {
+            UpdateProcThreadAttribute(
+                attributes,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                protocol_handles.as_mut_ptr().cast(),
+                std::mem::size_of_val(&protocol_handles),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
     {
         std::process::exit(126)
     }
     let mut startup = unsafe { std::mem::zeroed::<STARTUPINFOEXW>() };
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = protocol_handles[0];
+    startup.StartupInfo.hStdOutput = protocol_handles[1];
+    startup.StartupInfo.hStdError = protocol_handles[2];
     startup.lpAttributeList = attributes;
     let mut process = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
     let created = unsafe {
@@ -332,7 +383,7 @@ fn main() {
             command_w.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            0,
+            1,
             CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT,
             std::ptr::null(),
             std::ptr::null(),
@@ -341,6 +392,9 @@ fn main() {
         )
     };
     unsafe { DeleteProcThreadAttributeList(attributes) };
+    for handle in protocol_handles {
+        unsafe { CloseHandle(handle) };
+    }
     if created == 0 {
         std::process::exit(126)
     }

@@ -75,6 +75,9 @@ jobs:
           cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
       - name: Regress first Windows passive production read in an owned child
         timeout-minutes: 2
+        env:
+          OPENCODE_WINDOWS_NATIVE_EXPECTED_ARCH: ${{ matrix.arch }}
+          OPENCODE_WINDOWS_NATIVE_EXPECTED_PROFILE: debug
         run: >-
           bun test
           src/services/opencode/OpenCodePassiveSnapshotConsistency.test.ts
