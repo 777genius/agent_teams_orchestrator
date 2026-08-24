@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import { HostedApprovalRuntimeBindingFenceRegistry } from '../hostedControl/HostedApprovalRuntimeBindingFence.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 const baseRecord = {
@@ -31,7 +32,7 @@ const baseRecord = {
 let tempDir = ''
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-store-test-'))
+  tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-session-store-test-')))
 })
 
 afterEach(async () => {
@@ -84,5 +85,49 @@ describe('OpenCodeSessionStore', () => {
       await store.get(baseRecord.teamId, 'secondary:opencode:alice', baseRecord.memberName),
     ).toEqual(secondary)
     expect(await store.list()).toHaveLength(2)
+  })
+
+  test('effect token binds the exact persisted manual session image', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const manual = { ...baseRecord, toolApprovalMode: 'manual' as const }
+    await store.upsert(manual)
+    const token = await store.prepareEffectToken(
+      manual.teamId,
+      manual.laneId,
+      manual.memberName,
+      manual,
+    )
+    expect(token).not.toBeNull()
+    await store.upsert({ ...manual, selectedVariant: 'high' })
+    expect(token!.consume()).toBe(false)
+
+    const fresh = await store.prepareEffectToken(
+      manual.teamId,
+      manual.laneId,
+      manual.memberName,
+      { ...manual, selectedVariant: 'high' },
+    )
+    expect(fresh?.consume()).toBe(true)
+    expect(fresh?.consume()).toBe(false)
+  })
+
+  test('upsert, markStale, and delete share the per-team transition fence', async () => {
+    const fences = new HostedApprovalRuntimeBindingFenceRegistry()
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), fences)
+    await store.upsert(baseRecord)
+    const pin = fences.forTeam(baseRecord.teamId).tryAcquirePin()
+    if (!pin) throw new Error('expected team binding pin')
+    const settled: string[] = []
+    const stale = store.markStale(baseRecord.teamId, baseRecord.memberName, 'fenced')
+      .then(() => { settled.push('stale') })
+    const upsert = store.upsert({ ...baseRecord, memberName: 'bob' })
+      .then(() => { settled.push('upsert') })
+    const deletion = store.delete(baseRecord.teamId, baseRecord.memberName)
+      .then(() => { settled.push('delete') })
+    await Promise.resolve()
+    expect(settled).toEqual([])
+    pin.release()
+    await Promise.all([stale, upsert, deletion])
+    expect(settled.sort()).toEqual(['delete', 'stale', 'upsert'])
   })
 })

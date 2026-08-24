@@ -1612,6 +1612,7 @@ export class OpenCodeProfileManager {
       globalAuthPath,
       managedAuthPath,
       sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
+      sourceAuthSources: sourceAuthSources.map(source => ({ ...source })),
       sourceAuthFingerprint,
       managedAuthFingerprint,
       authState,

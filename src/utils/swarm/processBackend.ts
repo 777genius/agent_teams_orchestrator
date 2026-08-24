@@ -1,17 +1,43 @@
 import { parseArguments } from '../argumentSubstitution.js'
-import { execFileNoThrow } from '../execFileNoThrow.js'
-import { isProcessAlive, killProcessTree } from '../processKill.js'
+import {
+  isProcessAlive,
+  getProcessTreeContainmentCapability,
+  killProcessTreeAndWait,
+  readProcessCommandLine,
+  readProcessStartTimeMs,
+  type ProcessKillAndWaitDependencies,
+} from '../processKill.js'
+
+export type ProcessBackendIdentity = {
+  pid: number
+  startedAtMs: number
+  agentId: string
+  teamName: string
+  ownerToken: string
+  runId: string
+  osIdentity: string
+}
+
+export type ProcessBackendDependencies = {
+  isProcessAlive?: (pid: number) => boolean
+  readProcessStartTimeMs?: (pid: number) => Promise<number | null>
+  readProcessCommandLine?: (pid: number) => Promise<string | null>
+  killProcessTreeAndWait?: typeof killProcessTreeAndWait
+  processKillDependencies?: ProcessKillAndWaitDependencies
+}
+
+export type ProcessBackendRuntimeState =
+  | 'confirmed'
+  | 'gone'
+  | 'changed'
+  | 'legacy_unverifiable'
 
 export function parseProcessBackendPid(value: string | undefined): number | null {
   const trimmed = value?.trim()
-  if (!trimmed) {
-    return null
-  }
+  if (!trimmed) return null
 
   const match = trimmed.match(/^process:(\d+)$/) ?? trimmed.match(/^(\d+)$/)
-  if (!match) {
-    return null
-  }
+  if (!match) return null
 
   const pid = Number.parseInt(match[1]!, 10)
   return Number.isFinite(pid) && pid > 0 ? pid : null
@@ -38,59 +64,115 @@ export function isProcessBackendCommandForTeammate(
   command: string,
   teammateId: string,
   teamName: string,
+  ownerToken?: string,
+  runId?: string,
 ): boolean {
   return (
     commandHasFlagValue(command, '--agent-id', teammateId) &&
-    commandHasFlagValue(command, '--team-name', teamName)
+    commandHasFlagValue(command, '--team-name', teamName) &&
+    (ownerToken === undefined ||
+      commandHasFlagValue(command, '--process-owner-token', ownerToken)) &&
+    (runId === undefined || commandHasFlagValue(command, '--parent-session-id', runId))
   )
 }
 
-const PROCESS_COMMAND_LOOKUP_TIMEOUT_MS = 3_000
+type ProcessBackendIdentityState = 'confirmed' | 'gone' | 'changed' | 'unverified'
 
-async function getProcessCommandLine(pid: number): Promise<string | null> {
-  if (process.platform === 'win32') {
-    const result = await execFileNoThrow(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`,
-      ],
-      {
-        timeout: PROCESS_COMMAND_LOOKUP_TIMEOUT_MS,
-        useCwd: false,
-        stdin: 'ignore',
-      },
-    )
-    return result.code === 0 && result.stdout.trim()
-      ? result.stdout.trim()
-      : null
+async function inspectProcessBackendIdentity(
+  expected: ProcessBackendIdentity,
+  dependencies: ProcessBackendDependencies,
+): Promise<ProcessBackendIdentityState> {
+  const alive = dependencies.isProcessAlive ?? isProcessAlive
+  const readStartedAt = dependencies.readProcessStartTimeMs ?? readProcessStartTimeMs
+  const readCommand = dependencies.readProcessCommandLine ?? readProcessCommandLine
+
+  if (!alive(expected.pid)) return 'gone'
+  const startedAtBefore = await readStartedAt(expected.pid).catch(() => null)
+  if (startedAtBefore === null) return alive(expected.pid) ? 'unverified' : 'gone'
+  if (startedAtBefore !== expected.startedAtMs) return 'changed'
+
+  // Windows' root is the Job supervisor, so its command does not expose the
+  // child's semantic argv. The unguessable persisted Job name is the stronger
+  // kernel ownership identity. Unix still verifies semantic argv as defense in
+  // depth before using the exact process group.
+  if (!expected.osIdentity.startsWith('win32-job:')) {
+    const command = await readCommand(expected.pid).catch(() => null)
+    if (!command) return alive(expected.pid) ? 'unverified' : 'gone'
+    if (!isProcessBackendCommandForTeammate(command, expected.agentId, expected.teamName, expected.ownerToken, expected.runId)) {
+      return 'changed'
+    }
   }
 
-  const result = await execFileNoThrow('ps', ['-p', String(pid), '-o', 'args='], {
-    timeout: PROCESS_COMMAND_LOOKUP_TIMEOUT_MS,
-    useCwd: false,
-    stdin: 'ignore',
-  })
-  return result.code === 0 && result.stdout.trim() ? result.stdout.trim() : null
+  // Fence PID reuse during the slower command-line lookup.
+  const startedAtAfter = await readStartedAt(expected.pid).catch(() => null)
+  if (startedAtAfter === null) return alive(expected.pid) ? 'unverified' : 'gone'
+  return startedAtAfter === expected.startedAtMs ? 'confirmed' : 'changed'
 }
 
 export async function isProcessBackendRuntimeAlive(
   pid: number,
   teammateId: string,
   teamName: string,
+  options: {
+    expectedStartedAtMs?: number | null
+    expectedOwnerToken?: string | null
+    expectedRunId?: string | null
+    expectedOsIdentity?: string | null
+    dependencies?: ProcessBackendDependencies
+  } = {},
 ): Promise<boolean> {
-  if (!isProcessAlive(pid)) {
-    return false
-  }
+  return (await getProcessBackendRuntimeState(pid, teammateId, teamName, options)) === 'confirmed'
+}
 
-  const command = await getProcessCommandLine(pid)
-  if (!command) {
-    return false
+export async function getProcessBackendRuntimeState(
+  pid: number,
+  teammateId: string,
+  teamName: string,
+  options: {
+    expectedStartedAtMs?: number | null
+    expectedOwnerToken?: string | null
+    expectedRunId?: string | null
+    expectedOsIdentity?: string | null
+    dependencies?: ProcessBackendDependencies
+  } = {},
+): Promise<ProcessBackendRuntimeState> {
+  const ownerToken = options.expectedOwnerToken?.trim()
+  const runId = options.expectedRunId?.trim()
+  const osIdentity = options.expectedOsIdentity?.trim() ?? `unix-pgid:${pid}`
+  if (
+    !Number.isFinite(options.expectedStartedAtMs) ||
+    options.expectedStartedAtMs === null ||
+    !ownerToken ||
+    !runId
+  ) {
+    return (options.dependencies?.isProcessAlive ?? isProcessAlive)(pid)
+      ? 'legacy_unverifiable'
+      : 'gone'
   }
+  const expectedStartedAtMs = options.expectedStartedAtMs as number
+  const state = await inspectProcessBackendIdentity(
+      {
+        pid,
+        startedAtMs: expectedStartedAtMs,
+        agentId: teammateId,
+        teamName,
+        ownerToken,
+        runId,
+        osIdentity,
+      },
+      options.dependencies ?? {},
+    )
+  if (state === 'gone') {
+    // Root exit alone never proves a process tree empty. Windows callers that
+    // need completion must go through killProcessBackendRuntime so the named
+    // Job itself is terminated and queried.
+    return 'legacy_unverifiable'
+  }
+  return state === 'unverified' ? 'legacy_unverifiable' : state
+}
 
-  return isProcessBackendCommandForTeammate(command, teammateId, teamName)
+function dependenciesPlatform(dependencies: ProcessBackendDependencies | undefined): NodeJS.Platform {
+  return dependencies?.processKillDependencies?.platform ?? process.platform
 }
 
 export async function killProcessBackendRuntime(
@@ -99,31 +181,75 @@ export async function killProcessBackendRuntime(
     signal?: NodeJS.Signals
     expectedAgentId?: string
     teamName?: string
+    expectedStartedAtMs?: number | null
+    expectedOwnerToken?: string | null
+    expectedRunId?: string | null
+    expectedOsIdentity?: string | null
+    dependencies?: ProcessBackendDependencies
   } = {},
 ): Promise<boolean> {
   const pid = parseProcessBackendPid(paneId)
-  if (!pid) {
-    return false
-  }
-  if (!isProcessAlive(pid)) {
-    return false
-  }
-
-  const signal = options.signal ?? 'SIGTERM'
-  const expectedAgentId = options.expectedAgentId
-  const teamName = options.teamName
-  if (!expectedAgentId || !teamName) {
-    return false
-  }
-
-  const command = await getProcessCommandLine(pid)
+  const ownerToken = options.expectedOwnerToken?.trim()
+  const runId = options.expectedRunId?.trim()
+  const osIdentity = options.expectedOsIdentity?.trim() ?? `unix-pgid:${pid}`
   if (
-    !command ||
-    !isProcessBackendCommandForTeammate(command, expectedAgentId, teamName)
+    !pid ||
+    !options.expectedAgentId ||
+    !options.teamName ||
+    !Number.isFinite(options.expectedStartedAtMs) ||
+    options.expectedStartedAtMs === null ||
+    !ownerToken ||
+    !runId
   ) {
     return false
   }
+  const expectedStartedAtMs = options.expectedStartedAtMs as number
 
-  killProcessTree(pid, signal)
-  return true
+  const dependencies = options.dependencies ?? {}
+  const expected: ProcessBackendIdentity = {
+    pid,
+    startedAtMs: expectedStartedAtMs,
+    agentId: options.expectedAgentId,
+    teamName: options.teamName,
+    ownerToken,
+    runId,
+    osIdentity,
+  }
+  const identity = await inspectProcessBackendIdentity(expected, dependencies)
+  if (identity === 'gone') {
+    if (getProcessTreeContainmentCapability(
+      expected.osIdentity,
+      dependenciesPlatform(dependencies),
+    ) !== 'exact') return false
+    return (dependencies.killProcessTreeAndWait ?? killProcessTreeAndWait)(
+      pid,
+      options.signal ?? 'SIGTERM',
+      {
+        expectedStartedAtMs: expected.startedAtMs,
+        expectedOsIdentity: expected.osIdentity,
+        dependencies: {
+          isProcessAlive: dependencies.isProcessAlive,
+          readProcessStartTimeMs: dependencies.readProcessStartTimeMs,
+          ...dependencies.processKillDependencies,
+        },
+      },
+    )
+  }
+  if (identity !== 'confirmed') return false
+
+  return (dependencies.killProcessTreeAndWait ?? killProcessTreeAndWait)(
+    pid,
+    options.signal ?? 'SIGTERM',
+    {
+      expectedStartedAtMs: expected.startedAtMs,
+      expectedOsIdentity: expected.osIdentity,
+      verifyExpectedIdentity: async () =>
+        (await inspectProcessBackendIdentity(expected, dependencies)) === 'confirmed',
+      dependencies: {
+        isProcessAlive: dependencies.isProcessAlive,
+        readProcessStartTimeMs: dependencies.readProcessStartTimeMs,
+        ...dependencies.processKillDependencies,
+      },
+    },
+  )
 }

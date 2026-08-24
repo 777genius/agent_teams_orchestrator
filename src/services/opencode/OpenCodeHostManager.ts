@@ -7,15 +7,22 @@ import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
+import { errorMessage } from '../../utils/errors.js'
 import { sleep } from '../../utils/sleep.js'
 import {
-  killProcessTree,
   killProcessTreeAndWait,
   readProcessCommandLine,
   readProcessStartTimeMs,
+  signalExpectedProcessStable,
 } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import {
+  prepareExecutingOpenCodeArtifactDigestToken,
+  resolveOpenCodeArtifactDigest,
+  resolveExecutingOpenCodeArtifactDigest,
+  type OpenCodeArtifactDigest,
+} from './OpenCodeArtifactDigest.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
@@ -113,8 +120,11 @@ type OpenCodeHostManagerDeps = {
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
+  killProcessTreeAndWait?: typeof killProcessTreeAndWait
   now?: () => Date
   persistentRegistryPath?: string | null
+  beforeTempOwnershipMarkerPublish?: () => Promise<void>
+  resolveOpenCodeArtifactDigest?: (binaryPath: string) => OpenCodeArtifactDigest | null
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -335,7 +345,13 @@ function buildLeaseKey(input: OpenCodeHostLeaseInput): string {
   if (!teamId || !memberName) {
     throw new Error('OpenCode host lease requires teamId and memberName')
   }
-  return `${teamId}::${laneId}::${memberName}`
+  const sessionId = input.sessionId?.trim()
+  if (sessionId) return `${teamId}::${laneId}::${memberName}::session:${sessionId}`
+  const runId = input.runId?.trim()
+  if (!runId) {
+    throw new Error('Provisional OpenCode host lease requires an exact runId')
+  }
+  return `${teamId}::${laneId}::${memberName}::run:${runId}::__pre_session__`
 }
 
 function normalizeOpenCodeHostHealthTimeoutMs(timeoutMs?: number | null): number {
@@ -376,7 +392,7 @@ export function createOpenCodePreflightHostLeaseInput(scope: string): OpenCodeHo
     teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
     laneId: OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID,
     memberName: `${normalizedScope}-${process.pid}-${randomUUID()}`,
-    runId: null,
+    runId: `preflight_${process.pid}_${randomUUID()}`,
     sessionId: null,
   }
 }
@@ -462,8 +478,19 @@ export class OpenCodeHostManager {
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
+  private installedArtifact: { binaryPath: string; digest: OpenCodeArtifactDigest | null } | null = null
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
+
+  private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
+    if (!binaryPath || this.deps.spawnHostProcess || process.platform !== 'linux') return null
+    // A manager retains one resolved production launcher. Re-proving the source
+    // belongs at the effect edge; repeated ensureHost calls must not rehash it.
+    if (this.installedArtifact?.binaryPath === binaryPath) return this.installedArtifact.digest
+    const digest = (this.deps.resolveOpenCodeArtifactDigest ?? resolveOpenCodeArtifactDigest)(binaryPath)
+    this.installedArtifact = { binaryPath, digest }
+    return digest
+  }
 
   private async prepareProfile(
     projectPath?: string | null,
@@ -526,14 +553,6 @@ export class OpenCodeHostManager {
 
   private isProcessAlive(pid: number): boolean {
     return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
-  }
-
-  private killProcess(pid: number, signal: NodeJS.Signals): void {
-    if (this.deps.killProcess) {
-      this.deps.killProcess(pid, signal)
-      return
-    }
-    killProcessTree(pid, signal)
   }
 
   private async readProcessStartTimeMs(pid: number): Promise<number | null> {
@@ -689,7 +708,15 @@ export class OpenCodeHostManager {
       await this.sleepMs(Math.min(timeoutMs, 250)).catch(() => undefined)
       return !this.isProcessAlive(pid)
     }
-    return killProcessTreeAndWait(pid, signal, { timeoutMs, expectedStartedAtMs })
+    return (this.deps.killProcessTreeAndWait ?? killProcessTreeAndWait)(pid, signal, {
+      timeoutMs,
+      expectedStartedAtMs,
+      dependencies: {
+        isProcessAlive: this.deps.isProcessAlive,
+        readProcessStartTimeMs: this.deps.readProcessStartTimeMs,
+        signalExpectedProcess: signalExpectedProcessStable,
+      },
+    })
   }
 
   private now(): Date {
@@ -724,14 +751,71 @@ export class OpenCodeHostManager {
     return false
   }
 
+  private getTempOwnershipMarkerPath(tempPath: string): string {
+    return path.join(tempPath, '.opencode-host-owners')
+  }
+
+  private async withTempOwnershipLock<T>(
+    tempPath: string,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    await mkdir(tempPath, { recursive: true })
+    const lockPath = path.join(tempPath, '.opencode-host-owners.lock')
+    await writeFile(lockPath, '', { flag: 'a' })
+    const release = await lockfile.lock(lockPath, {
+      realpath: false,
+      stale: 30_000,
+      retries: { retries: 80, minTimeout: 5, maxTimeout: 50 },
+    })
+    try {
+      return await callback()
+    } finally {
+      await release()
+    }
+  }
+
+  private async publishTempOwnershipMarker(tempPath: string, pid: number): Promise<void> {
+    if (pid <= 0) return
+    await this.withTempOwnershipLock(tempPath, async () => {
+      await this.publishTempOwnershipMarkerUnlocked(tempPath, pid)
+    })
+  }
+
+  private async publishTempOwnershipMarkerUnlocked(tempPath: string, pid: number): Promise<void> {
+    if (pid <= 0) throw new Error('OpenCode host did not publish a process id')
+    const markerDir = this.getTempOwnershipMarkerPath(tempPath)
+    await mkdir(markerDir, { recursive: true })
+    await writeJsonFileAtomic(path.join(markerDir, `${pid}.json`), {
+      pid,
+      startedAtMs: await this.readProcessStartTimeMs(pid).catch(() => null),
+    })
+  }
+
+  private async hasLiveTempOwnershipMarker(tempPath: string): Promise<boolean> {
+    const markerDir = this.getTempOwnershipMarkerPath(tempPath)
+    const markers = await readdir(markerDir).catch(() => [])
+    for (const name of markers) {
+      const marker = await readFile(path.join(markerDir, name), 'utf8').then(value => JSON.parse(value) as {
+        pid?: unknown
+        startedAtMs?: unknown
+      }).catch(() => null)
+      if (!marker || typeof marker.pid !== 'number' || !this.isProcessAlive(marker.pid)) continue
+      if (typeof marker.startedAtMs !== 'number') return true
+      if ((await this.readProcessStartTimeMs(marker.pid).catch(() => null)) === marker.startedAtMs) return true
+    }
+    return false
+  }
+
   private async cleanupOpenTuiTempArtifactsIfUnused(tempPath: string, pid?: number): Promise<void> {
-    if (typeof pid === 'number' && pid > 0 && this.isProcessAlive(pid)) {
-      return
-    }
-    if (this.hasTrackedAliveHostUsingTempPath(tempPath, pid)) {
-      return
-    }
-    await cleanupOpenTuiTempDylibs(tempPath).catch(() => undefined)
+    await this.withTempOwnershipLock(tempPath, async () => {
+      if (typeof pid === 'number' && pid > 0 && this.isProcessAlive(pid)) return
+      if (this.hasTrackedAliveHostUsingTempPath(tempPath, pid)) return
+      if (await this.hasLiveTempOwnershipMarker(tempPath)) return
+      // Final recheck is under the same ownership lock used by publishers.
+      if (this.hasTrackedAliveHostUsingTempPath(tempPath, pid)) return
+      if (await this.hasLiveTempOwnershipMarker(tempPath)) return
+      await cleanupOpenTuiTempDylibs(tempPath).catch(() => undefined)
+    })
   }
 
   private async cleanupStaleManagedProfileTempDylibs(
@@ -752,23 +836,23 @@ export class OpenCodeHostManager {
         continue
       }
       const tmpPath = path.join(profilesRootPath, profile.name, 'tmp')
-      const entries = await readdir(tmpPath, { withFileTypes: true }).catch(() => [])
-      for (const entry of entries) {
-        if (!entry.isFile() || !OPENTUI_TEMP_DYLIB_RE.test(entry.name)) {
-          continue
+      await this.withTempOwnershipLock(tmpPath, async () => {
+        if (await this.hasLiveTempOwnershipMarker(tmpPath)) return
+        const entries = await readdir(tmpPath, { withFileTypes: true }).catch(() => [])
+        for (const entry of entries) {
+          if (!entry.isFile() || !OPENTUI_TEMP_DYLIB_RE.test(entry.name)) continue
+          const filePath = path.join(tmpPath, entry.name)
+          const metadata = await stat(filePath).catch(() => null)
+          if (!metadata || metadata.mtimeMs > staleBeforeMs) continue
+          if (await this.hasLiveTempOwnershipMarker(tmpPath)) return
+          await unlink(filePath).catch(() => undefined)
+          const stillExists = await stat(filePath).then(() => true).catch(() => false)
+          if (!stillExists) {
+            removed += 1
+            bytes += metadata.size
+          }
         }
-        const filePath = path.join(tmpPath, entry.name)
-        const metadata = await stat(filePath).catch(() => null)
-        if (!metadata || metadata.mtimeMs > staleBeforeMs) {
-          continue
-        }
-        await unlink(filePath).catch(() => undefined)
-        const stillExists = await stat(filePath).then(() => true).catch(() => false)
-        if (!stillExists) {
-          removed += 1
-          bytes += metadata.size
-        }
-      }
+      })
     }
 
     return { removed, bytes }
@@ -932,6 +1016,32 @@ export class OpenCodeHostManager {
     })
   }
 
+  private async upsertPersistentHostWithLease(
+    handle: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput,
+  ): Promise<void> {
+    if (!this.persistentRegistryPath || handle.pid <= 0) return
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      const previous = registry.hosts[handle.hostKey]
+      const record = this.buildPersistentHostRecord(handle, previous)
+      const now = this.nowIso()
+      const leaseKey = buildLeaseKey(lease)
+      record.leases[leaseKey] = {
+        leaseKey,
+        teamId: lease.teamId.trim(),
+        laneId: lease.laneId?.trim() || 'primary',
+        memberName: lease.memberName.trim(),
+        runId: lease.runId?.trim() || null,
+        sessionId: lease.sessionId?.trim() || null,
+        createdAt: record.leases[leaseKey]?.createdAt ?? now,
+        updatedAt: now,
+      }
+      registry.hosts[handle.hostKey] = { ...record, updatedAt: now }
+      await this.writePersistentRegistryUnlocked(registry)
+    })
+  }
+
   private async removePersistentHost(hostKey: string): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
@@ -956,6 +1066,7 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
+    if (this.hosts.get(hostKey)?.lifetime === 'process') return
 
     await this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
@@ -964,10 +1075,19 @@ export class OpenCodeHostManager {
       if (!record) {
         const entry = this.hosts.get(hostKey)
         if (!entry) {
-          return
+          throw new Error(`OpenCode host ${hostKey} is unavailable for lease publication`)
         }
         if (entry.lifetime !== 'persistent') {
           return
+        }
+        const identity = await this.inspectPersistentHostProcessIdentity({
+          ...this.buildPersistentHostRecord(entry.handle),
+          processStartedAtMs: entry.handle.processStartedAtMs,
+        })
+        if (identity.state !== 'confirmed') {
+          throw new Error(
+            `OpenCode host ${hostKey} cannot publish a lease because its process identity is ${identity.state}`,
+          )
         }
         record = this.buildPersistentHostRecord(entry.handle)
         registry.hosts[hostKey] = record
@@ -1057,22 +1177,48 @@ export class OpenCodeHostManager {
   private async adoptPersistentHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    openCodeArtifactDigest: OpenCodeArtifactDigest | null,
     resolveConfigFingerprint: boolean,
+    lease?: OpenCodeHostLeaseInput,
   ): Promise<OpenCodeHostHandle | null> {
-    const record = (await this.readPersistentRegistry()).hosts[hostKey]
+    let leaseReserved = false
+    const record = lease && this.persistentRegistryPath
+      ? await this.withPersistentRegistryLock(async () => {
+          const registry = await this.readPersistentRegistryUnlocked()
+          const candidate = registry.hosts[hostKey]
+          if (!candidate) return null
+          const now = this.nowIso()
+          const leaseKey = buildLeaseKey(lease)
+          candidate.leases[leaseKey] = {
+            leaseKey,
+            teamId: lease.teamId.trim(),
+            laneId: lease.laneId?.trim() || 'primary',
+            memberName: lease.memberName.trim(),
+            runId: lease.runId?.trim() || null,
+            sessionId: lease.sessionId?.trim() || null,
+            createdAt: candidate.leases[leaseKey]?.createdAt ?? now,
+            updatedAt: now,
+          }
+          candidate.updatedAt = now
+          await this.writePersistentRegistryUnlocked(registry)
+          leaseReserved = true
+          return candidate
+        })
+      : (await this.readPersistentRegistry()).hosts[hostKey]
     if (!record) {
       return null
     }
-    if (
+    try {
+      if (
       record.projectPath !== profile.projectPath ||
       record.profileRootKey !== profile.profileRootKey ||
       record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint ||
       record.managedConfigFingerprint !== profile.managedConfigFingerprint ||
       !this.isProcessAlive(record.pid)
-    ) {
-      await this.removePersistentHost(hostKey).catch(() => undefined)
-      return null
-    }
+      ) {
+        await this.removePersistentHost(hostKey).catch(() => undefined)
+        return null
+      }
     const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
     if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
       await this.removePersistentHost(hostKey).catch(() => undefined)
@@ -1109,12 +1255,15 @@ export class OpenCodeHostManager {
     const processStartedAtMs = processIdentity.state === 'unverified'
       ? await this.verifyLegacyPersistentHostIdentity(record, processIdentity.startedAtMs)
       : processIdentity.startedAtMs ?? record.processStartedAtMs
+    const executingArtifactMatches = !!openCodeArtifactDigest && process.platform === 'linux' &&
+      resolveExecutingOpenCodeArtifactDigest(record.pid) === openCodeArtifactDigest
 
     const handle: OpenCodeHostHandle = {
       hostKey,
       profileRootKey: record.profileRootKey,
       projectPath: record.projectPath,
       projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+      openCodeArtifactDigest: executingArtifactMatches ? openCodeArtifactDigest : null,
       baseUrl: record.baseUrl,
       port: record.port,
       pid: record.pid,
@@ -1137,8 +1286,18 @@ export class OpenCodeHostManager {
       ownedByProcess: false,
       lifetime: 'persistent',
     })
-    await this.upsertPersistentHost(handle).catch(() => undefined)
-    return handle
+      if (!leaseReserved) {
+        if (lease) await this.upsertPersistentHostWithLease(handle, lease)
+        else await this.upsertPersistentHost(handle).catch(() => undefined)
+      }
+      return handle
+    } catch (error) {
+      this.hosts.delete(hostKey)
+      if (leaseReserved && lease) {
+        await this.releaseHostLease(hostKey, lease).catch(() => undefined)
+      }
+      throw error
+    }
   }
 
   private async waitForHealthyHost(
@@ -1277,44 +1436,110 @@ export class OpenCodeHostManager {
     })
   }
 
-  private async forceKillSpawnedHostProcess(child: ChildProcess): Promise<void> {
+  private async forceKillSpawnedHostProcess(
+    child: ChildProcess,
+    expectedStartedAtMs?: number | null,
+  ): Promise<boolean> {
     const pid = child.pid
     try {
       if (pid) {
-        if (await this.killProcessAndWait(pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)) {
-          return
+        if (
+          await this.killProcessAndWait(
+            pid,
+            'SIGTERM',
+            OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+            expectedStartedAtMs,
+          )
+        ) {
+          return true
         }
-      } else {
-        child.kill('SIGTERM')
       }
     } catch {
       // Best effort.
     }
 
     if (!pid) {
-      return
+      return child.exitCode !== null || child.signalCode !== null
     }
 
     try {
-      await this.killProcessAndWait(pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
+      return await this.killProcessAndWait(
+        pid,
+        'SIGKILL',
+        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+        expectedStartedAtMs,
+      )
     } catch {
-      // Best effort.
+      return false
     }
   }
 
   private async createHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    openCodeArtifactDigest: OpenCodeArtifactDigest | null,
     lifetime: OpenCodeHostLifetime,
     resolveConfigFingerprint: boolean,
     abortSignal?: AbortSignal,
+    lease?: OpenCodeHostLeaseInput,
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
-    await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
-    const child = this.spawnHost(profile, port, lifetime)
-
     const diagnostics: string[] = []
+    let child: ChildProcess | null = null
+    try {
+      // Sweep and spawn use the same cross-process lock, so no OpenTUI dylib
+      // can be removed between process creation and ownership publication.
+      child = await this.withTempOwnershipLock(profile.tmpPath, async () => {
+        child = this.spawnHost(profile, port, lifetime)
+        await this.deps.beforeTempOwnershipMarkerPublish?.()
+        await this.publishTempOwnershipMarkerUnlocked(profile.tmpPath, child.pid ?? -1)
+        return child
+      })
+    } catch (error) {
+      const terminated = child
+        ? await this.forceKillSpawnedHostProcess(
+            child,
+            child.pid
+              ? await this.captureProcessStartTimeMs(child.pid).catch(() => null)
+              : null,
+          ).catch(() => false)
+        : true
+      if (child && !terminated) {
+        const recoveryHandle: OpenCodeHostHandle = {
+          hostKey,
+          profileRootKey: profile.profileRootKey,
+          projectPath: profile.projectPath,
+          projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+          openCodeArtifactDigest,
+          baseUrl,
+          port,
+          pid: child.pid ?? -1,
+          version: null,
+          state: 'degraded',
+          profile,
+          resolvedConfigFingerprint: null,
+          diagnostics: [
+            `ownership publication failed: ${errorMessage(error)}`,
+            'spawned process termination was not confirmed',
+          ],
+        }
+        const recoveryEntry: ManagedHostEntry = {
+          handle: recoveryHandle,
+          child,
+          refCount: 0,
+          ownedByProcess: true,
+          lifetime,
+        }
+        this.hosts.set(hostKey, recoveryEntry)
+        this.bindHostLifecycle(hostKey, recoveryEntry)
+      }
+      throw new Error(
+        `OpenCode host ownership publication failed: ${errorMessage(error)}; ` +
+        `spawned process termination ${terminated ? 'confirmed' : 'not confirmed'}`,
+      )
+    }
+    if (!child) throw new Error('OpenCode host spawn returned no process')
     const captureOutput = (source: 'stdout' | 'stderr') => (chunk: Buffer | string) => {
       const message = chunk.toString('utf8').trim()
       if (!message) {
@@ -1334,6 +1559,7 @@ export class OpenCodeHostManager {
       profileRootKey: profile.profileRootKey,
       projectPath: profile.projectPath,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      openCodeArtifactDigest,
       baseUrl,
       port,
       pid: child.pid ?? -1,
@@ -1374,17 +1600,33 @@ export class OpenCodeHostManager {
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
         )
       }
+      if (!openCodeArtifactDigest || this.deps.spawnHostProcess || process.platform !== 'linux' ||
+        resolveExecutingOpenCodeArtifactDigest(handle.pid) !== openCodeArtifactDigest) {
+        // Ordinary startup remains available, but only a direct Linux executable
+        // whose installed and executed immutable bytes match publishes authority.
+        handle.openCodeArtifactDigest = null
+      }
       if (lifetime === 'persistent') {
-        await this.upsertPersistentHost(handle)
+        if (lease) await this.upsertPersistentHostWithLease(handle, lease)
+        else await this.upsertPersistentHost(handle)
       }
       return handle
     } catch (error) {
       handle.state = 'degraded'
       const message = error instanceof Error ? error.message : String(error)
       diagnostics.push(message)
-      this.hosts.delete(hostKey)
-      await this.forceKillSpawnedHostProcess(child)
-      await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
+      const expectedStartedAtMs =
+        handle.processStartedAtMs ??
+        (await this.captureProcessStartTimeMs(handle.pid).catch(() => null))
+      const terminated = await this.forceKillSpawnedHostProcess(child, expectedStartedAtMs)
+      if (terminated) {
+        this.hosts.delete(hostKey)
+        await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
+      } else {
+        diagnostics.push(
+          `OpenCode host pid ${handle.pid} termination was not confirmed; retaining recovery state`,
+        )
+      }
       if (abortSignal?.aborted && abortSignal.reason instanceof Error) {
         throw abortSignal.reason
       }
@@ -1404,6 +1646,7 @@ export class OpenCodeHostManager {
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
       abortSignal?: AbortSignal
+      lease?: OpenCodeHostLeaseInput
     } = {},
   ): Promise<OpenCodeHostHandle> {
     if (params.abortSignal?.aborted) {
@@ -1417,6 +1660,9 @@ export class OpenCodeHostManager {
       params.abortSignal,
     )
     const binaryPath = resolveOpenCodeBinaryPath()
+    // Test/custom process factories do not prove which executable they run;
+    // only the production resolver/spawn path may publish artifact identity.
+    const openCodeArtifactDigest = this.resolveInstalledArtifact(binaryPath)
     if (binaryPath) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
@@ -1434,12 +1680,12 @@ export class OpenCodeHostManager {
     const hostLifetime = params.hostLifetime ?? 'persistent'
     const explicitHostKey = params.hostKey?.trim()
     const hostKey = explicitHostKey || await (async () => {
-      const binaryHostIdentity = binaryPath
+      const binaryHostIdentity = openCodeArtifactDigest ?? (binaryPath
         ? await raceOpenCodeAbortSignal(
             resolveOpenCodeBinaryHostIdentity(binaryPath),
             params.abortSignal,
           )
-        : 'missing-binary'
+        : 'missing-binary')
       const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${profile.managedAuthFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
@@ -1450,9 +1696,19 @@ export class OpenCodeHostManager {
     const existing = this.hosts.get(hostKey)
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
+      if (params.lease) {
+        try {
+          await this.retainHostLease(hostKey, params.lease)
+          if (this.hosts.get(hostKey)?.handle !== existing.handle) {
+            throw new Error(`OpenCode host ${hostKey} was disposed before its lease was published`)
+          }
+        } catch (error) {
+          existing.refCount = Math.max(0, existing.refCount - 1)
+          throw error
+        }
+      }
       return existing.handle
     }
-
     const pending = this.pendingHosts.get(hostKey)
     if (pending) {
       this.pendingHostHealthTimeoutMs.set(
@@ -1464,7 +1720,30 @@ export class OpenCodeHostManager {
       if (pendingEntry) {
         pendingEntry.refCount += 1
       }
+      if (params.lease) {
+        try {
+          await this.retainHostLease(hostKey, params.lease)
+          if (this.hosts.get(hostKey)?.handle !== handle) {
+            throw new Error(`OpenCode host ${hostKey} was disposed before its lease was published`)
+          }
+        } catch (error) {
+          if (pendingEntry) pendingEntry.refCount = Math.max(0, pendingEntry.refCount - 1)
+          throw error
+        }
+      }
       return handle
+    }
+
+    if (existing) {
+      try {
+        await this.disposeHost(hostKey)
+      } catch (error) {
+        throw new Error(
+          `OpenCode host ${hostKey} has retained recovery state and could not be safely replaced: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
     }
 
     this.pendingRefCounts.set(hostKey, 1)
@@ -1473,15 +1752,18 @@ export class OpenCodeHostManager {
       return this.withPersistentHostStartupLock(hostKey, async () => {
         const adopted =
           hostLifetime === 'persistent'
-            ? await this.adoptPersistentHost(hostKey, profile, resolveConfigFingerprint)
+            ? await this.adoptPersistentHost(hostKey, profile, openCodeArtifactDigest, resolveConfigFingerprint, params.lease)
             : null
-        return adopted ?? this.createHost(
+        const handle = adopted ?? await this.createHost(
           hostKey,
           profile,
+          openCodeArtifactDigest,
           hostLifetime,
           resolveConfigFingerprint,
           params.abortSignal,
+          params.lease,
         )
+        return handle
       }, params.abortSignal)
     })().finally(() => {
       this.pendingHosts.delete(hostKey)
@@ -1509,12 +1791,76 @@ export class OpenCodeHostManager {
     return entry.handle.resolvedConfigFingerprint
   }
 
+  /**
+   * Freshly proves the exact process and resolved configuration immediately
+   * before a security-sensitive provider effect. Cached handle fields are not
+   * sufficient here: both PID reuse and in-place configuration drift must fail
+   * closed.
+   */
+  async verifyEffectHost(input: {
+    hostKey: string
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+    openCodeArtifactDigest?: `sha256:${string}` | null
+  }): Promise<boolean> {
+    const entry = this.hosts.get(input.hostKey)
+    if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
+      input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
+    if (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
+      entry.handle.openCodeArtifactDigest !== input.openCodeArtifactDigest ||
+      resolveExecutingOpenCodeArtifactDigest(input.pid) !== input.openCodeArtifactDigest) return false
+    const startedBefore = await this.readProcessStartTimeMs(input.pid).catch(() => null)
+    if (startedBefore !== input.processStartedAtMs) return false
+    if (!(await this.checkHealthyHostOnce(entry.handle.baseUrl))) return false
+    const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
+    if (!fingerprint || fingerprint !== input.resolvedConfigFingerprint) return false
+    const startedAfter = await this.readProcessStartTimeMs(input.pid).catch(() => null)
+    return startedAfter === input.processStartedAtMs && this.isProcessAlive(input.pid)
+  }
+
+  /**
+   * Re-proves the OS process/config identity and returns a synchronous,
+   * one-use invocation token. The token prevents an in-process host rotation
+   * from being interleaved between the last proof and provider invocation.
+   */
+  async prepareEffectHostToken(input: {
+    hostKey: string
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+    openCodeArtifactDigest?: `sha256:${string}` | null
+  }): Promise<{ consume(): boolean } | null> {
+    const entry = this.hosts.get(input.hostKey)
+    if (!entry || !input.openCodeArtifactDigest || !(await this.verifyEffectHost(input))) return null
+    const executingToken = prepareExecutingOpenCodeArtifactDigestToken(
+      input.pid,
+      input.openCodeArtifactDigest,
+    )
+    if (!executingToken) return null
+    const handle = entry.handle
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        const live = this.hosts.get(input.hostKey)
+        const retained = live === entry && live.handle === handle &&
+          handle.pid === input.pid && handle.processStartedAtMs === input.processStartedAtMs &&
+          handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
+          handle.openCodeArtifactDigest === input.openCodeArtifactDigest &&
+          this.isProcessAlive(input.pid)
+        const executingCurrent = executingToken.consume()
+        return retained && executingCurrent
+      },
+    }
+  }
+
   private async terminatePersistentHostRecord(
     record: PersistentHostRegistryRecord,
     options: { force: boolean },
   ): Promise<void> {
     const entry = this.hosts.get(record.hostKey)
-    const baseUrl = entry?.handle.baseUrl ?? record.baseUrl
     const pid = entry?.handle.pid ?? record.pid
     let terminated = false
 
@@ -1532,19 +1878,9 @@ export class OpenCodeHostManager {
       )
     }
 
-    if (!terminated) {
-      try {
-        await this.fetchJsonWithTimeout(
-          `${baseUrl}/global/dispose`,
-          OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS,
-          {
-            method: 'POST',
-          },
-        )
-      } catch {
-        // Best effort.
-      }
-    }
+    // Do not call /global/dispose: loopback port ownership can change between
+    // process identity validation and HTTP delivery. OS-identity-fenced
+    // signaling below is the only safe termination primitive.
 
     if (!terminated && pid > 0 && this.isProcessAlive(pid)) {
       const identityBeforeKill = await this.assertPersistentHostProcessIdentity(
@@ -1568,8 +1904,6 @@ export class OpenCodeHostManager {
           processIdentity.startedAtMs,
         )
       }
-    } else if (!terminated && entry?.child) {
-      entry.child.kill('SIGTERM')
     }
 
     if (options.force && pid > 0 && !terminated && this.isProcessAlive(pid)) {
@@ -1613,25 +1947,43 @@ export class OpenCodeHostManager {
       return false
     }
 
-    await this.terminatePersistentHostRecord(
-      {
-        hostKey,
-        profileRootKey: entry.handle.profileRootKey,
-        projectPath: entry.handle.projectPath,
-        projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
-        baseUrl: entry.handle.baseUrl,
-        port: entry.handle.port,
-        pid: entry.handle.pid,
-        processStartedAtMs: entry.handle.processStartedAtMs,
-        version: entry.handle.version,
-        resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
-        updatedAt: this.nowIso(),
-        leases: {},
-      },
-      { force: true },
-    )
-    await this.removePersistentHost(hostKey).catch(() => undefined)
-    return true
+    const dispose = async (): Promise<boolean> => {
+      const registered = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
+      if (registered && Object.keys(normalizePersistentHostLeases(registered.leases)).length > 0) {
+        return false
+      }
+      try {
+        await this.terminatePersistentHostRecord(
+          {
+            hostKey,
+            profileRootKey: entry.handle.profileRootKey,
+            projectPath: entry.handle.projectPath,
+            projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
+            baseUrl: entry.handle.baseUrl,
+            port: entry.handle.port,
+            pid: entry.handle.pid,
+            processStartedAtMs: entry.handle.processStartedAtMs,
+            version: entry.handle.version,
+            resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
+            updatedAt: this.nowIso(),
+            leases: {},
+          },
+          { force: true },
+        )
+      } catch (error) {
+        entry.handle.state = 'degraded'
+        throw error
+      }
+      const registry = await this.readPersistentRegistryUnlocked()
+      if (registry.hosts[hostKey]) {
+        delete registry.hosts[hostKey]
+        await this.writePersistentRegistryUnlocked(registry)
+      }
+      return true
+    }
+    return this.persistentRegistryPath
+      ? this.withPersistentRegistryLock(dispose)
+      : dispose()
   }
 
   async disposeUnregisteredOwnedHosts(): Promise<{
@@ -1979,6 +2331,12 @@ export class OpenCodeHostManager {
     if (entry.refCount === 0) {
       if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
         return
+      }
+      if (entry.lifetime === 'persistent') {
+        const registryRecord = (await this.readPersistentRegistry()).hosts[hostKey]
+        if (registryRecord && Object.keys(normalizePersistentHostLeases(registryRecord.leases)).length > 0) {
+          return
+        }
       }
       if (entry.ownedByProcess) {
         await this.disposeHost(hostKey)

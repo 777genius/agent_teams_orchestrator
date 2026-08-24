@@ -33,6 +33,12 @@ export type TeammateStatus = {
   isHidden?: boolean // Whether the pane is currently hidden from the swarm view
   backendType?: BackendType // The backend type used for this teammate
   mode?: string // Current permission mode for this teammate
+  processStartedAtMs?: number
+  processOsIdentity?: string
+  processOwnerToken?: string
+  processRunId?: string
+  spawnClaimToken?: string
+  spawnClaimRunId?: string
 }
 
 /**
@@ -68,6 +74,15 @@ export function getTeammateStatuses(teamName: string): TeammateStatus[] {
         : typeof member.runtimePid === 'number' && member.runtimePid > 0
           ? 'process'
         : undefined
+    const conservativeBackendType = backendType ?? (
+      paneId === 'in-process'
+        ? 'in-process'
+        : paneId
+          ? paneId.startsWith('%') || paneId.startsWith('tmux:')
+            ? 'tmux'
+            : undefined
+          : undefined
+    )
 
     statuses.push({
       name: member.name,
@@ -81,8 +96,14 @@ export function getTeammateStatuses(teamName: string): TeammateStatus[] {
       cwd: member.cwd,
       worktreePath: member.worktreePath,
       isHidden: hiddenPaneIds.has(paneId),
-      backendType,
+      backendType: conservativeBackendType,
       mode: member.mode,
+      processStartedAtMs: member.processStartedAtMs,
+      processOsIdentity: member.processOsIdentity,
+      processOwnerToken: member.processOwnerToken,
+      processRunId: member.processRunId,
+      spawnClaimToken: member.spawnClaimToken,
+      spawnClaimRunId: member.spawnClaimRunId,
     })
   }
 

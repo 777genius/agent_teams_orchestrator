@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import type { ChildProcess } from 'node:child_process'
 import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -21,6 +22,7 @@ import {
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
   supportsOpenCodeSuperGrokOAuth,
+  signalSpawnedOpenCodeChildBestEffort,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
 
@@ -61,6 +63,16 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('labels spawned-child timeout signaling as best effort', () => {
+    let ownedSignals = 0
+    const owned = {
+      pid: 42,
+      kill: () => (++ownedSignals, true),
+    } as unknown as ChildProcess
+
+    expect(signalSpawnedOpenCodeChildBestEffort(owned, 'SIGKILL')).toBe(true)
+    expect(ownedSignals).toBe(1)
+  })
   test('requires an OpenCode version with native SuperGrok OAuth support', () => {
     expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
     expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)
