@@ -33,7 +33,7 @@ beforeAll(async () => { projectPath = await mkdtemp(path.join(os.tmpdir(), 'open
 afterAll(async () => { await rm(projectPath, { recursive: true, force: true }) })
 
 function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
-  return {
+  const value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
     request: {
       launchContractVersion: 1,
       launchAttempt: {
@@ -59,6 +59,17 @@ function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
       idempotencyKey: '018f47a2-4a13-7c2f-8d44-c0ffee123456',
     },
   }
+  value.request.launchAttempt.requestCorrelationDigest =
+    computeOpenCodeLaunchRequestCorrelationDigest(value)
+  return value
+}
+
+function correlate(
+  value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
+): typeof value {
+  value.request.launchAttempt.requestCorrelationDigest =
+    computeOpenCodeLaunchRequestCorrelationDigest(value)
+  return value
 }
 
 describe('OpenCode production launch composition', () => {
@@ -95,6 +106,23 @@ describe('OpenCode production launch composition', () => {
     expect(calls).toEqual(['plan', 'command-ledger'])
   })
 
+  test('missing correlation fails before realpath, authorization, ledger, or effects', async () => {
+    const calls: string[] = []
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async value => { calls.push('plan'); return value },
+      inspect: async () => { calls.push('command-ledger'); return null },
+      executeAfterPreflight: async () => {
+        calls.push('profile', 'host', 'member')
+        return { output: { snapshot, data: null }, result }
+      },
+    }, { canonicalizeProject: async value => { calls.push('realpath'); return value } })
+    const value = command()
+    delete value.request.launchAttempt.requestCorrelationDigest
+
+    await expect(bridge.execute(value)).rejects.toThrow('correlation digest is required')
+    expect(calls).toEqual([])
+  })
+
   test('completed and unknown replay compare the exact generation input key', async () => {
     for (const status of ['succeeded', 'reconciliation_required'] as const) {
       let durableKey: { attemptId: string; payloadHash: string; generation: number; inputDigest: string } | undefined
@@ -114,10 +142,13 @@ describe('OpenCode production launch composition', () => {
       changedGeneration.request.launchAttempt.generation = 2
       changedGeneration.request.launchAttempt.continuationToken = 'changed-token'
       changedGeneration.continuation = true
+      correlate(changedGeneration)
       await expect(bridge.execute(changedGeneration)).rejects.toThrow('exact replay mismatch')
       const changedMode = command(); changedMode.continuation = true
+      correlate(changedMode)
       await expect(bridge.execute(changedMode)).rejects.toThrow()
       const changedToken = command(); changedToken.request.launchAttempt.continuationToken = 'changed-token'
+      correlate(changedToken)
       await expect(bridge.execute(changedToken)).rejects.toThrow()
       expect(effects).toBe(0)
     }
@@ -140,7 +171,7 @@ describe('OpenCode production launch composition', () => {
   })
 
   test('a hanging authorization is bounded by the one outer absolute deadline', async () => {
-    const value = { ...command(), requestedBudgetMs: 250, outerRemainingBudgetMs: 250 }
+    const value = correlate({ ...command(), requestedBudgetMs: 250, outerRemainingBudgetMs: 250 })
     let authorizationSignal: AbortSignal | undefined
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
       authorize: async (_command, controls) => {
@@ -156,7 +187,7 @@ describe('OpenCode production launch composition', () => {
     expect(performance.now() - started).toBeLessThan(500)
   })
 
-  test.skipIf(process.platform === 'win32')('canonicalizes a real project and its symlink alias before authorization and digesting', async () => {
+  test.skipIf(process.platform === 'win32')('canonicalizes aliases for mutations while request correlation retains exact path spelling', async () => {
     const project = path.join(projectPath, 'canonical-project')
     const alias = path.join(projectPath, 'canonical-alias')
     await mkdir(project); await symlink(project, alias)
@@ -168,8 +199,8 @@ describe('OpenCode production launch composition', () => {
       executeAfterPreflight: async () => { throw new Error('effects must not run') },
     })
 
-    await bridge.execute({ ...command(), projectPath: project })
-    await bridge.execute({ ...command(), projectPath: alias })
+    await bridge.execute(correlate({ ...command(), projectPath: project }))
+    await bridge.execute(correlate({ ...command(), projectPath: alias }))
     const correlatedAlias = {
       ...command(),
       projectPath: alias,
@@ -185,7 +216,7 @@ describe('OpenCode production launch composition', () => {
     expect(observed[1]!.projectPath).toBe(project)
     expect(observed[0]!.projectIdentity).toBe(observed[1]!.projectIdentity)
     expect(computeOpenCodeLaunchCommandInputDigest(observed[0]!))
-      .toBe(computeOpenCodeLaunchCommandInputDigest(observed[1]!))
+      .not.toBe(computeOpenCodeLaunchCommandInputDigest(observed[1]!))
     expect(observed[2]).toMatchObject({
       projectPath: project,
       projectIdentity: project,
@@ -203,6 +234,38 @@ describe('OpenCode production launch composition', () => {
     expect(targets[0]).toBe(targets[1])
     expect(OpenCodeLaunchMutationLedger.idempotencyIdentity(targets[0]!))
       .toBe(OpenCodeLaunchMutationLedger.idempotencyIdentity(targets[1]!))
+  })
+
+  test('retains exact whitespace-bearing path bytes while canonicalizing the production identity', async () => {
+    const rawPath = ` ${projectPath} `
+    const canonicalPath = path.join(projectPath, 'canonical-whitespace-project')
+    const calls: string[] = []
+    let authorized: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] | undefined
+    const output = { snapshot, data: { launchAttempt: { status: 'succeeded' } } }
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async value => { calls.push('plan'); authorized = value; return value },
+      inspect: async () => { calls.push('command-ledger'); return output },
+      executeAfterPreflight: async () => { throw new Error('effects must not run') },
+    }, { canonicalizeProject: async value => {
+      calls.push(`realpath:${value}`)
+      return canonicalPath
+    } })
+    const value = command()
+    value.projectPath = rawPath
+    value.requestProjectPath = rawPath
+    value.request.launchAttempt.requestCorrelationDigest =
+      computeOpenCodeLaunchRequestCorrelationDigest(value)
+
+    await expect(bridge.execute(value)).resolves.toEqual(output)
+
+    expect(calls).toEqual([`realpath:${rawPath}`, 'plan', 'command-ledger'])
+    expect(authorized).toMatchObject({
+      projectPath: canonicalPath,
+      projectIdentity: canonicalPath,
+      requestProjectPath: rawPath,
+    })
+    expect(authorized!.request.launchAttempt.requestCorrelationDigest)
+      .toBe(computeOpenCodeLaunchRequestCorrelationDigest(authorized!))
   })
 
   test('an 80ms durable inspection cannot reset or extend the absolute envelope', async () => {
@@ -225,8 +288,8 @@ describe('OpenCode production launch composition', () => {
         return { output, result }
       },
     }, { monotonicNow: () => now })
-    const value = { ...command(), requestedBudgetMs: 100, outerRemainingBudgetMs: 100,
-      deadlineAtMs: 1_100 }
+    const value = correlate({ ...command(), requestedBudgetMs: 100, outerRemainingBudgetMs: 100,
+      deadlineAtMs: 1_100 })
 
     await expect(bridge.execute(value)).resolves.toBe(output)
     expect(inspectedDeadline).toBe(1_100)

@@ -147,6 +147,13 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
     }
     expect(decodeOpenCodeBridgeCapabilities(encodeOpenCodeBridgeCapabilities(advertised)))
       .toEqual({ ok: true, value: advertised })
+    expect(decodeOpenCodeBridgeCapabilities({
+      openCodeLaunchAttemptContract: 1,
+      openCodeLaunchRequestCorrelationContract: 0,
+    })).toMatchObject({ ok: true, value: {
+      openCodeLaunchAttemptContract: 1,
+      openCodeLaunchRequestCorrelationContract: 0,
+    } })
     for (const legacyOrMalformed of [
       {},
       { executionProof: { reusable: true } },

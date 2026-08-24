@@ -19,9 +19,10 @@ export class OpenCodeLaunchRoutingError extends Error {
 
 /**
  * Decodes the only production launch authorization accepted by the command
- * handler. The envelope version remains optional for the compatibility window,
- * but the complete launchAttempt body never is: genuinely legacy requests fail
- * closed instead of falling through to the former provisioning/session path.
+ * handler. The envelope version remains optional for parse/backward error
+ * handling, not as a claim of launch compatibility. A complete launchAttempt
+ * and its handler-authorized correlation digest are still required before any
+ * production provisioning/session path can run.
  */
 export function decodeStrictOpenCodeProductionLaunch(
   value: unknown,

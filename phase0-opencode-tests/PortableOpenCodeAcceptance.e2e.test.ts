@@ -142,7 +142,8 @@ describe('portable fake evidence through production OpenCode composers', () => {
   test('production bridge/core reaches profile, Windows, host, exact proof, journal, cleanup and idempotent member composition', async () => {
     const [{ OpenCodeLaunchAttempt, computeOpenCodeLaunchAttemptInputDigest,
       computeOpenCodeLaunchAttemptImmutableDigest },
-      { computeOpenCodeLaunchCommandInputDigest, computeOpenCodeLaunchCommandImmutableDigest },
+      { computeOpenCodeLaunchCommandInputDigest, computeOpenCodeLaunchCommandImmutableDigest,
+        computeOpenCodeLaunchRequestCorrelationDigest },
       { createOpenCodeLaunchAttemptProductionBridge },
       { OpenCodeLaunchAttemptStore }, { planScopedProfile }, { ensureOpenCodeWindowsManagedDirectoryPath },
       { canonicalizeOpenCodeProjectIdentity },
@@ -167,22 +168,27 @@ describe('portable fake evidence through production OpenCode composers', () => {
       memberIdentity, sessionIdentity: oid('4'), bootstrapMessageIdentity: oid('5'), commitIdentity: oid('6'),
     }
     let authoritativeLinkage = false
-    const command = (): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] => ({
-      request: { launchContractVersion: 1, launchAttempt: {
-        attemptId, payloadHash, generation: 1, proofNonce: nonce,
-        parent: { sessionIdentity: oid('7'), messageIdentity: oid('8') },
-        providerId: 'openrouter', modelId: 'openrouter/model',
-        requiredMcpTools: ['agent-teams.message_send'], requireFreshRetainedHostProof: true,
-      } },
-      members: [{ name: 'alice', memberIdentity }], runId: 'run', laneId: 'primary', teamId: 'team',
-      projectPath: sandbox, selectedModel: 'openrouter/model', toolApprovalMode: 'auto',
-      continuation: false, requestedBudgetMs: 10_000,
-      preconditions: {
-        handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run',
-        expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
-        expectedManifestHighWatermark: null, commandLeaseId: 'lease-1', idempotencyKey: attemptId,
-      },
-    })
+    const command = (): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] => {
+      const value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
+        request: { launchContractVersion: 1, launchAttempt: {
+          attemptId, payloadHash, generation: 1, proofNonce: nonce,
+          parent: { sessionIdentity: oid('7'), messageIdentity: oid('8') },
+          providerId: 'openrouter', modelId: 'openrouter/model',
+          requiredMcpTools: ['agent-teams.message_send'], requireFreshRetainedHostProof: true,
+        } },
+        members: [{ name: 'alice', memberIdentity }], runId: 'run', laneId: 'primary', teamId: 'team',
+        projectPath: sandbox, selectedModel: 'openrouter/model', toolApprovalMode: 'auto',
+        continuation: false, requestedBudgetMs: 10_000,
+        preconditions: {
+          handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run',
+          expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
+          expectedManifestHighWatermark: null, commandLeaseId: 'lease-1', idempotencyKey: attemptId,
+        },
+      }
+      value.request.launchAttempt.requestCorrelationDigest =
+        computeOpenCodeLaunchRequestCorrelationDigest(value)
+      return value
+    }
     type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
     const productionDigests = (value: Command) => {
       const requestedBudgetMs = value.deadlineAtMs === undefined
@@ -209,12 +215,14 @@ describe('portable fake evidence through production OpenCode composers', () => {
         outcome: 'succeeded', phase: 'complete', startedAt: 0, absoluteDeadlineAt: 10_000,
         workDeadlineAt: 9_000, cleanupReserveMs: 1_000, elapsedMs: 1,
         providerId: 'openrouter', modelId: 'openrouter/model', profilePurpose: 'launch_attempt',
+        requestCorrelationDigest: command().request.launchAttempt.requestCorrelationDigest,
         projectIdentity: oid('9'), profileIdentity: oid('3'), configIdentity: oid('a'),
         authIdentity: oid('b'), pluginPolicyIdentity: oid('c'), cacheIdentity: oid('d'), binaryIdentity: oid('e'),
         retainedHostIdentity: retainedHost,
       },
       proof: {
         generation: 1, attemptId, parent: command().request.launchAttempt.parent,
+        requestCorrelationDigest: command().request.launchAttempt.requestCorrelationDigest,
         providerId: 'openrouter', modelId: 'openrouter/model', retainedHostIdentity: retainedHost,
         observedMcpTools: ['agent-teams.message_send'],
         nonceHash: createHash('sha256').update(issuedNonce).digest('hex'), sessionIdentity: oid('f'),

@@ -91,17 +91,20 @@ export function createOpenCodeLaunchAttemptProductionBridge(
 
     override async execute(command: Command): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
       // Validate while projectPath is still the exact parsed wire spelling.
-      validateOpenCodeLaunchRequestCorrelation(command)
-      const budget = command.outerRemainingBudgetMs ?? command.requestedBudgetMs
+      const exactCommand = command.requestProjectPath === undefined
+        ? { ...command, requestProjectPath: command.projectPath }
+        : command
+      validateOpenCodeLaunchRequestCorrelation(exactCommand)
+      const budget = exactCommand.outerRemainingBudgetMs ?? exactCommand.requestedBudgetMs
       const now = monotonicNow()
       const legacyDeadlineAtMs = now + Math.max(0, budget)
-      const deadlineAtMs = command.deadlineAtMs === undefined
-        ? legacyDeadlineAtMs : Math.min(command.deadlineAtMs, legacyDeadlineAtMs)
+      const deadlineAtMs = exactCommand.deadlineAtMs === undefined
+        ? legacyDeadlineAtMs : Math.min(exactCommand.deadlineAtMs, legacyDeadlineAtMs)
       const controller = new AbortController()
-      const abort = () => controller.abort(command.signal?.reason
+      const abort = () => controller.abort(exactCommand.signal?.reason
         ?? new Error('OpenCode launch authorization cancelled'))
-      if (command.signal?.aborted) abort()
-      else command.signal?.addEventListener('abort', abort, { once: true })
+      if (exactCommand.signal?.aborted) abort()
+      else exactCommand.signal?.addEventListener('abort', abort, { once: true })
       const timeout = (dependencies.setTimer ?? setTimeout)(() => controller.abort(
         new Error('OpenCode launch absolute deadline expired during authorization'),
       ), Math.max(0, deadlineAtMs - monotonicNow()))
@@ -118,9 +121,9 @@ export function createOpenCodeLaunchAttemptProductionBridge(
       })
       try {
         const projectIdentity = await Promise.race([
-          canonicalizeProject(command.projectPath, { signal: controller.signal }), boundary,
+          canonicalizeProject(exactCommand.projectPath, { signal: controller.signal }), boundary,
         ])
-        const canonicalCommand = Object.freeze({ ...command, projectPath: projectIdentity,
+        const canonicalCommand = Object.freeze({ ...exactCommand, projectPath: projectIdentity,
           projectIdentity, deadlineAtMs, signal: controller.signal })
         const authorized = await Promise.race([
           runtime.authorize(canonicalCommand, controls), boundary,
@@ -148,7 +151,7 @@ export function createOpenCodeLaunchAttemptProductionBridge(
         return await context.run({ command: boundedCommand }, () => super.execute(boundedCommand))
       } finally {
         ;(dependencies.clearTimer ?? clearTimeout)(timeout)
-        command.signal?.removeEventListener('abort', abort)
+        exactCommand.signal?.removeEventListener('abort', abort)
       }
     }
   }

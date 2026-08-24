@@ -648,6 +648,14 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
+/** Validates presence without changing the caller's path bytes used for correlation. */
+function parseExactProjectPath(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.trim().length === 0) {
+    throw new Error('opencode.launchTeam requires a non-empty projectPath')
+  }
+  return value
+}
+
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map(item => asString(item)).filter((item): item is string => item !== null)
@@ -2894,7 +2902,9 @@ function buildOpenCodeLaunchCorrelationCommand(
       ...(asString(member?.effort) ? { effort: asString(member?.effort)! } : {}),
     }
   })
-  const projectPath = asString(body.projectPath) ?? envelope.cwd
+  const projectPath = Object.prototype.hasOwnProperty.call(body, 'projectPath')
+    ? parseExactProjectPath(body.projectPath)
+    : envelope.cwd
   return {
     request,
     members,

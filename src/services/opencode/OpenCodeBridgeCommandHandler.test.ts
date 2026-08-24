@@ -696,7 +696,7 @@ const strictLaunchIdentity = (value: string) =>
   `sha256:${value.repeat(64).slice(0, 64)}` as const
 
 function buildStrictLaunchEnvelope(overrides: Record<string, unknown> = {}) {
-  return buildEnvelope('opencode.launchTeam', {
+  const envelope = buildEnvelope('opencode.launchTeam', {
     runId: 'run-strict-preconditions',
     laneId: 'primary',
     teamId: 'team-strict-preconditions',
@@ -734,6 +734,28 @@ function buildStrictLaunchEnvelope(overrides: Record<string, unknown> = {}) {
     },
     ...overrides,
   })
+  const body = envelope.body
+  const launchAttempt = body.launchAttempt as Parameters<
+    OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+  >[0]['request']['launchAttempt']
+  launchAttempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest({
+    request: { launchContractVersion: 1, launchAttempt },
+    members: body.members as Parameters<
+      OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+    >[0]['members'],
+    runId: body.runId as string,
+    laneId: body.laneId as string,
+    teamId: body.teamId as string,
+    projectPath: body.projectPath as string,
+    selectedModel: body.selectedModel as string,
+    toolApprovalMode: 'auto',
+    continuation: body.continuation === true || launchAttempt.continuationToken !== undefined,
+    requestedBudgetMs: envelope.timeoutMs,
+    preconditions: body.preconditions as Parameters<
+      OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+    >[0]['preconditions'],
+  })
+  return envelope
 }
 
 function createDeferred<T>() {
@@ -952,6 +974,46 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(probeCalls).toBe(0)
       expect(launchPortCalls).toBe(0)
     })
+
+    test('preserves exact whitespace-bearing projectPath bytes through correlation and dispatch', async () => {
+      const exactPath = ' /tmp/project-with-exact-whitespace '
+      let dispatched: Parameters<
+        OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+      >[0] | undefined
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope({ projectPath: exactPath }),
+        { launchAttempt: { execute: async input => {
+          dispatched = input
+          return {
+            snapshot: null as unknown as OpenCodeProvisioningSnapshot,
+            data: { launchAttempt: { status: 'succeeded', generation: 1 } },
+          }
+        } } },
+      )
+
+      expect(result.ok).toBe(true)
+      expect(dispatched?.projectPath).toBe(exactPath)
+      expect(dispatched?.requestProjectPath).toBe(exactPath)
+      expect(dispatched?.request.launchAttempt.requestCorrelationDigest)
+        .toBe(computeOpenCodeLaunchRequestCorrelationDigest(dispatched!))
+    })
+
+    test.each([null, 7, '', '   '])(
+      'rejects invalid exact projectPath %p before port dispatch', async projectPath => {
+        let launchPortCalls = 0
+        const candidate = buildStrictLaunchEnvelope()
+        candidate.body.projectPath = projectPath
+        const result = await executeStrictOpenCodeBridgeCommandEnvelope(candidate, {
+          launchAttempt: { execute: async () => {
+            launchPortCalls += 1
+            throw new Error('strict launch port must not run')
+          } },
+        })
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toContain('non-empty projectPath')
+        expect(launchPortCalls).toBe(0)
+      },
+    )
 
     test('returns a retryable before-effects diagnostic for a stale capability snapshot', async () => {
       let launchPortCalls = 0

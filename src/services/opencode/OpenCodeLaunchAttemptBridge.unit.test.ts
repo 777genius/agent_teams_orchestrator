@@ -51,8 +51,8 @@ const result: OpenCodeLaunchAttemptResult = {
 const snapshot = null as unknown as OpenCodeProvisioningSnapshot
 
 function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
-  return {
-    request,
+  const value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
+    request: structuredClone(request),
     members: [{ name: 'alice', memberIdentity: opaque('d') }],
     runId: 'run-s3',
     laneId: 'primary',
@@ -69,6 +69,9 @@ function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
       idempotencyKey: request.launchAttempt.attemptId,
     },
   }
+  value.request.launchAttempt.requestCorrelationDigest =
+    computeOpenCodeLaunchRequestCorrelationDigest(value)
+  return value
 }
 
 describe('OpenCodeLaunchAttemptBridge', () => {
@@ -156,9 +159,6 @@ describe('OpenCodeLaunchAttemptBridge', () => {
 
   test('rejects request-correlation mismatch before ledger, core, or projection', async () => {
     const candidate = command()
-    candidate.request = structuredClone(candidate.request)
-    candidate.request.launchAttempt.requestCorrelationDigest =
-      computeOpenCodeLaunchRequestCorrelationDigest(candidate)
     candidate.members = [{ ...candidate.members[0]!, prompt: 'mutated after caller digest' }]
     const calls: string[] = []
     const bridge = new OpenCodeLaunchAttemptBridge({
@@ -170,6 +170,22 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     })
 
     await expect(bridge.execute(candidate)).rejects.toThrow('request correlation digest mismatch')
+    expect(calls).toEqual([])
+  })
+
+  test('rejects a missing request correlation before ledger, core, or projection', async () => {
+    const candidate = command()
+    delete candidate.request.launchAttempt.requestCorrelationDigest
+    const calls: string[] = []
+    const bridge = new OpenCodeLaunchAttemptBridge({
+      commandLedger: { read: async () => { calls.push('ledger'); return { status: 'absent' } } },
+      attempt: { run: async () => { calls.push('core'); return result } },
+      projection: { fromDurableResult: async () => {
+        calls.push('projection'); return { snapshot, data: null }
+      } },
+    })
+
+    await expect(bridge.execute(candidate)).rejects.toThrow('correlation digest is required')
     expect(calls).toEqual([])
   })
 
@@ -256,11 +272,15 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     })
     const tokenless = command(); tokenless.request = structuredClone(tokenless.request)
     tokenless.request.launchAttempt.generation = 2; tokenless.continuation = true
+    tokenless.request.launchAttempt.requestCorrelationDigest =
+      computeOpenCodeLaunchRequestCorrelationDigest(tokenless)
     await expect(bridge.execute(tokenless)).rejects.toMatchObject({
       field: 'launchAttempt.continuationToken',
     })
     const initialToken = command(); initialToken.request = structuredClone(initialToken.request)
     initialToken.request.launchAttempt.continuationToken = 'forged'
+    initialToken.request.launchAttempt.requestCorrelationDigest =
+      computeOpenCodeLaunchRequestCorrelationDigest(initialToken)
     await expect(bridge.execute(initialToken)).rejects.toMatchObject({
       field: 'launchAttempt.continuationToken',
     })

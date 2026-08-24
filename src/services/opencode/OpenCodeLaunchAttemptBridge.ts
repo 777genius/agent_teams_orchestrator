@@ -305,13 +305,15 @@ export function computeOpenCodeLaunchRequestCorrelationDigest(
   })).digest('hex')
 }
 
-/** Rejects an optional correlation digest before any launch runtime side effect. */
+/** Requires the exact caller-authored correlation digest before any launch runtime side effect. */
 export function validateOpenCodeLaunchRequestCorrelation(
   input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
 ): void {
   const supplied = input.request.launchAttempt.requestCorrelationDigest
-  if (supplied !== undefined
-    && supplied !== computeOpenCodeLaunchRequestCorrelationDigest(input)) {
+  if (supplied === undefined) {
+    throw new Error('OpenCode launch request correlation digest is required')
+  }
+  if (supplied !== computeOpenCodeLaunchRequestCorrelationDigest(input)) {
     throw new Error('OpenCode launch request correlation digest mismatch')
   }
 }

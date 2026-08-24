@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
 import {
+  computeOpenCodeLaunchRequestCorrelationDigest,
   installOpenCodeLaunchAttemptPortsForTests,
   resetOpenCodeLaunchAttemptProductionPortsForTests,
 } from './OpenCodeLaunchAttemptBridge.js'
@@ -20,7 +21,7 @@ beforeAll(async () => { sandboxProject = await mkdtemp(path.join(os.tmpdir(), 'o
 afterAll(async () => { await rm(sandboxProject, { recursive: true, force: true }) })
 
 function envelope(overrides: Record<string, unknown> = {}) {
-  return {
+  const value = {
     schemaVersion: 1,
     requestId: 'request-s3',
     command: 'opencode.launchTeam',
@@ -56,6 +57,32 @@ function envelope(overrides: Record<string, unknown> = {}) {
       },
       ...overrides,
     },
+  }
+  correlateEnvelope(value)
+  return value
+}
+
+function correlateEnvelope(value: {
+  cwd: string; timeoutMs: number; body: Record<string, unknown>
+}): void {
+  const attempt = value.body.launchAttempt as Parameters<
+    OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']
+  >[0]['request']['launchAttempt'] | undefined
+  if (attempt) {
+    attempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest({
+      request: { launchContractVersion: 1, launchAttempt: attempt },
+      members: value.body.members,
+      runId: value.body.runId,
+      laneId: value.body.laneId,
+      teamId: value.body.teamId,
+      projectPath: typeof value.body.projectPath === 'string'
+        ? value.body.projectPath : value.cwd,
+      selectedModel: value.body.selectedModel,
+      toolApprovalMode: 'auto',
+      continuation: value.body.continuation === true || attempt.continuationToken !== undefined,
+      requestedBudgetMs: value.timeoutMs,
+      preconditions: value.body.preconditions,
+    } as Parameters<OpenCodeBridgeCommandHandlerPorts['launchAttempt']['execute']>[0])
   }
 }
 
@@ -124,6 +151,25 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
     expect(result.ok).toBe(false)
     expect(calls).toBe(0)
     if (!result.ok) expect(result.error.message).toContain('unsupported/not-authorized')
+  })
+
+  test('old Desktop request without correlation fails before realpath, authorization, ledger, or effects', async () => {
+    const calls: string[] = []
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async value => { calls.push('plan'); return value },
+      inspect: async () => { calls.push('ledger'); return null },
+      executeAfterPreflight: async () => {
+        calls.push('profile', 'host', 'member'); throw new Error('must not run')
+      },
+    }, { canonicalizeProject: async value => { calls.push('realpath'); return value } })
+    const candidate = envelope()
+    delete (candidate.body.launchAttempt as Record<string, unknown>).requestCorrelationDigest
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(candidate, { launchAttempt: bridge })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.message).toContain('correlation digest is required')
+    expect(calls).toEqual([])
   })
 
   test('routes an S3 launch only through the narrow injected attempt port', async () => {
@@ -199,6 +245,7 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
     const candidate = envelope()
     ;(candidate.body.launchAttempt as Record<string, unknown>).generation = 2
     ;(candidate.body.launchAttempt as Record<string, unknown>).continuationToken = 'continuation-2'
+    correlateEnvelope(candidate)
     const result = await executeOpenCodeBridgeCommandEnvelope(candidate, {
       launchAttempt: {
         execute: async input => {
