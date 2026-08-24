@@ -317,6 +317,7 @@ export class OpenCodeLaunchAttempt {
           const committed: OpenCodeLaunchMemberLinkage[] = []
           const pending: OpenCodeOpaqueIdentity[] = []
           let acceptedProofResponse: OpenCodeLaunchAttemptResponse | undefined = lease.journal.finalResponse
+            ?? lease.journal.acceptedProofResponse
           const recovery = await this.reconcile(
             lease.journal.events, members, committed, lease.generation,
             { attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, immutableDigest,
@@ -327,19 +328,19 @@ export class OpenCodeLaunchAttempt {
           if (recovery === 'required') {
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, 'reconciliation_required', committed,
-              members, 'unknown_transport_after_side_effect', 'complete', acceptedProofResponse)
+              members, 'unknown_transport_after_side_effect', 'complete', request, acceptedProofResponse)
           }
           if (recovery) {
             const recoveryStatus = recovery === 'unknown_transport_after_side_effect'
               ? 'reconciliation_required' : committed.length ? 'partial' : 'failed'
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, recoveryStatus, committed,
-              members, recovery, 'complete', acceptedProofResponse)
+              members, recovery, 'complete', request, acceptedProofResponse)
           }
           if (committed.length === members.length) {
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, 'succeeded', committed, members,
-              undefined, 'complete', acceptedProofResponse)
+              undefined, 'complete', request, acceptedProofResponse)
           }
 
           const owned: OpenCodeLaunchOwnedResources[] = []
@@ -360,6 +361,7 @@ export class OpenCodeLaunchAttempt {
           let memberUnknownPersisted = false
           let inFlightAmbiguous: Promise<unknown> | undefined
           let inFlightAmbiguousSettled = false
+          let persistenceFailure: unknown
           const trackAmbiguous = <T>(operation: Promise<T>): Promise<T> => {
             inFlightAmbiguous = operation
             inFlightAmbiguousSettled = false
@@ -437,6 +439,11 @@ export class OpenCodeLaunchAttempt {
               throw new OpenCodeLaunchAttemptError('proof.profile')
             }
             acceptedProofResponse = proofResponse
+            await lease.commitAcceptedProofResponse(proofResponse, {
+              deadlineAtMs: policy.workDeadlineAtMs,
+              signal: controller.signal,
+              monotonicNow: () => this.ports.clock.monotonicNow(),
+            })
 
             const memberPhaseStartedAt = this.ports.clock.monotonicNow()
             for (const memberIdentity of members) {
@@ -607,11 +614,14 @@ export class OpenCodeLaunchAttempt {
               }
               if (!memberUnknownPersisted) {
                 const persistenceSignal = new AbortController().signal
-                await lease.append({ type: 'member_unknown', memberIdentity: ambiguousMember,
-                  claimToken: ambiguousClaimToken! }, {
-                  deadlineAtMs: policy.absoluteDeadlineAtMs, signal: persistenceSignal,
-                  monotonicNow: () => this.ports.clock.monotonicNow(),
-                }).then(() => { memberUnknownPersisted = true }).catch(() => undefined)
+                try {
+                  await lease.append({ type: 'member_unknown', memberIdentity: ambiguousMember,
+                    claimToken: ambiguousClaimToken! }, {
+                    deadlineAtMs: policy.absoluteDeadlineAtMs, signal: persistenceSignal,
+                    monotonicNow: () => this.ports.clock.monotonicNow(),
+                  })
+                  memberUnknownPersisted = true
+                } catch (appendError) { persistenceFailure = appendError }
               }
               failure = 'unknown_transport_after_side_effect'
             } else {
@@ -707,11 +717,13 @@ export class OpenCodeLaunchAttempt {
                   for (const resource of uncommitted) {
                     const cleanupClaimToken = claimTokens.get(resource.memberIdentity)
                     if (!cleanupClaimToken) continue
-                    await lease.append({ type: 'cleanup', memberIdentity: resource.memberIdentity,
-                      outcome: cleanup, claimToken: cleanupClaimToken }, {
-                      deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
-                      monotonicNow: () => this.ports.clock.monotonicNow(),
-                    }).catch(() => undefined)
+                    try {
+                      await lease.append({ type: 'cleanup', memberIdentity: resource.memberIdentity,
+                        outcome: cleanup, claimToken: cleanupClaimToken }, {
+                        deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
+                        monotonicNow: () => this.ports.clock.monotonicNow(),
+                      })
+                    } catch (appendError) { persistenceFailure ??= appendError }
                   }
                 })()
                 return cleanupHostChain
@@ -724,6 +736,7 @@ export class OpenCodeLaunchAttempt {
               } else await cleanupHost()
             }
           }
+          if (persistenceFailure !== undefined) throw persistenceFailure
           const status = failure === undefined ? 'succeeded'
             : failure === 'unknown_transport_after_side_effect' ? 'reconciliation_required'
               : committed.length ? 'partial'
@@ -731,7 +744,7 @@ export class OpenCodeLaunchAttempt {
                   : 'failed'
           return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
             immutableDigest, lease.generation, status, committed, members, failure, cleanup,
-            acceptedProofResponse)
+            request, acceptedProofResponse)
         },
         initialStoreContext,
       )
@@ -854,6 +867,7 @@ export class OpenCodeLaunchAttempt {
     members: readonly OpenCodeOpaqueIdentity[],
     failure: OpenCodeLaunchFailureKind | undefined,
     cleanup: OpenCodeLaunchCleanupOutcome,
+    request: OpenCodeLaunchAttemptRequest,
     acceptedProofResponse?: OpenCodeLaunchAttemptResponse,
   ): Promise<OpenCodeLaunchAttemptResult> {
     const aggregateFailure = committed.length > 0 && failure !== undefined
@@ -889,7 +903,40 @@ export class OpenCodeLaunchAttempt {
       workDeadlineAtMs: policy.workDeadlineAtMs,
     })
     const response = createOpenCodeLaunchDesktopResponse(result)
-    if (response) await lease.commitFinalResponse(response)
+    if (response && lease.journal.finalResponse === undefined) {
+      const decoded = decodeOpenCodeLaunchAttemptResponse(response)
+      if (!decoded.ok || decoded.value.kind !== 'v2') {
+        throw new OpenCodeLaunchAttemptError('response')
+      }
+      const accepted = result.acceptedProofResponse!
+      const currentNonceHash = createHash('sha256').update(request.launchAttempt.proofNonce).digest('hex')
+      if (accepted.proof?.nonceHash === currentNonceHash) {
+        const correlation = validateOpenCodeLaunchAttemptCorrelation(request, decoded.value.response, {
+          currentGeneration: generation,
+          expectedNonceHash: currentNonceHash,
+          expectedProfilePurpose: accepted.launchAttempt.profilePurpose,
+          expectedProviderId: accepted.launchAttempt.providerId,
+          expectedProjectIdentity: accepted.launchAttempt.projectIdentity,
+          expectedConfigIdentity: accepted.launchAttempt.configIdentity,
+          expectedAuthIdentity: accepted.launchAttempt.authIdentity,
+          expectedPluginPolicyIdentity: accepted.launchAttempt.pluginPolicyIdentity,
+          expectedCacheIdentity: accepted.launchAttempt.cacheIdentity,
+          expectedBinaryIdentity: accepted.launchAttempt.binaryIdentity,
+          expectedRetainedHostIdentity: accepted.launchAttempt.retainedHostIdentity,
+          requiredMcpTools: request.launchAttempt.requiredMcpTools,
+        })
+        if (!correlation.ok) throw new OpenCodeLaunchAttemptError(correlation.failure.field)
+      } else if (lease.journal.acceptedProofResponse === undefined
+        || JSON.stringify(decoded.value.response.proof) !== JSON.stringify(accepted.proof)) {
+        // Crash recovery uses the journal's already-correlated proof basis. A fresh in-memory
+        // nonce is deliberately irrelevant, but the emitted response must retain that exact proof.
+        throw new OpenCodeLaunchAttemptError('proof.nonceHash')
+      }
+      const responseContext = { deadlineAtMs: policy.absoluteDeadlineAtMs,
+        signal: new AbortController().signal,
+        monotonicNow: () => this.ports.clock.monotonicNow() }
+      await lease.commitFinalResponse(response, responseContext)
+    }
     return result
   }
 }

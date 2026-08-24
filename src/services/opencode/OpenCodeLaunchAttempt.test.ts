@@ -943,7 +943,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     })
     await materializerEntered
     cancellation.abort(new Error('cancelled'))
-    const result = await running
+    await expect(running).rejects.toThrow('journal unavailable')
     expect(cleanupStarted).toBe(false)
     expect(subject.calls).not.toContain('release')
     finish()
@@ -951,7 +951,6 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     await Bun.sleep(0)
     expect(cleanupStarted).toBe(true)
     expect(subject.calls).toContain('release')
-    expect(result.failure?.kind).toBe('unknown_transport_after_side_effect')
     // The failed authoritative write poisons the journal lease, so later cleanup metadata is
     // deliberately not published as authority; safety comes from the completion barrier.
     expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual(['member_intent'])
@@ -996,6 +995,54 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
   })
 
+  test('recovers a crash immediately before final response publication without a fresh launch', async () => {
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative })
+    const replace = subject.persistence.replaceAndSync.bind(subject.persistence)
+    subject.persistence.replaceAndSync = async bytes => {
+      const journal = JSON.parse(new TextDecoder().decode(bytes))
+      if (journal.finalResponse) throw new Error('crash:before-final-response')
+      await replace(bytes)
+    }
+    await expect(subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 }))
+      .rejects.toThrow('crash:before-final-response')
+    expect(subject.persistence.json()).toMatchObject({ acceptedProofResponse: { launchAttempt: { attemptId } } })
+    expect(subject.persistence.json().finalResponse).toBeUndefined()
+    authoritative.set(members[0], linkage(members[0]))
+    subject.persistence.replaceAndSync = replace
+
+    const recovered = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const projected = projectOpenCodeLaunchAttemptResponse(recovered)
+    expect(decodeOpenCodeLaunchAttemptResponse(projected)).toMatchObject({ ok: true, value: { kind: 'v2' } })
+    expect(subject.persistence.json().finalResponse).toEqual(projected)
+    expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
+    expect(subject.calls.filter(call => call === 'proof')).toHaveLength(1)
+  })
+
+  test('replays the exact authoritative response after a crash immediately after publication', async () => {
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative })
+    const replace = subject.persistence.replaceAndSync.bind(subject.persistence)
+    subject.persistence.replaceAndSync = async bytes => {
+      const journal = JSON.parse(new TextDecoder().decode(bytes))
+      await replace(bytes)
+      if (journal.finalResponse) throw new Error('crash:after-final-response')
+    }
+    await expect(subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 }))
+      .rejects.toThrow('crash:after-final-response')
+    const authoritativeResponse = structuredClone(subject.persistence.json().finalResponse)
+    expect(decodeOpenCodeLaunchAttemptResponse(authoritativeResponse)).toMatchObject({
+      ok: true, value: { kind: 'v2' },
+    })
+    authoritative.set(members[0], linkage(members[0]))
+    subject.persistence.replaceAndSync = replace
+
+    const replay = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    expect(projectOpenCodeLaunchAttemptResponse(replay)).toEqual(authoritativeResponse)
+    expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
+    expect(subject.calls.filter(call => call === 'proof')).toHaveLength(1)
+  })
+
   test('reports bounded cleanup timeout at the unchanged absolute deadline', async () => {
     const subject = setup({ materialize: async member => ({
       outcome: 'known_failure', failure: 'pre_side_effect_transport', externalEffect: false,
@@ -1005,12 +1052,11 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       subject.setNow(10_000)
       return new Promise(() => undefined)
     }
-    const result = await subject.launch.run({
+    await expect(subject.launch.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,
-    })
-    expect(result.cleanup).toBe('timed_out')
-    expect(result.absoluteDeadlineAtMs).toBe(10_000)
+    })).rejects.toThrow()
     expect(subject.persistence.json().events.at(-1)).toMatchObject({ type: 'member_failed' })
+    expect(subject.persistence.json().finalResponse).toBeUndefined()
   })
 
   test('returns at the absolute deadline when physical host release never settles', async () => {
@@ -1021,12 +1067,10 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       subject.setNow(input.deadlineAtMs)
       return new Promise<void>(() => undefined)
     }
-    const result = await subject.launch.run({
+    await expect(subject.launch.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,
-    })
-    expect(result.status).toBe('succeeded')
-    expect(result.cleanup).toBe('timed_out')
-    expect(result.absoluteDeadlineAtMs).toBe(10_000)
+    })).rejects.toMatchObject({ code: 'fenced' })
     expect(releaseSignal?.aborted).toBe(true)
+    expect(subject.persistence.json().finalResponse).toBeUndefined()
   })
 })

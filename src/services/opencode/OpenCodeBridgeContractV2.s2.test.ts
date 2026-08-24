@@ -60,6 +60,8 @@ function response(): OpenCodeLaunchAttemptResponse {
       idempotencyKey: 'attemptId',
       payloadHash,
       generation: 7,
+      inputDigest: 'd'.repeat(64),
+      immutableDigest: 'e'.repeat(64),
       outcome: 'partial',
       phase: 'cleanup',
       startedAt: 1_776_600_000_000,

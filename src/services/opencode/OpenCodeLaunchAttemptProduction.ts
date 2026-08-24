@@ -13,6 +13,7 @@ import {
   computeOpenCodeLaunchAttemptInputDigest,
   computeOpenCodeLaunchAttemptImmutableDigest,
   createOpenCodeLaunchAttemptResult,
+  createOpenCodeLaunchDesktopResponse,
   validateOpenCodeLaunchContinuation,
   type OpenCodeLaunchAttemptPorts,
   type OpenCodeLaunchAttemptResult,
@@ -32,13 +33,11 @@ import {
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
 import type {
-  OpenCodeLaunchFailureDetails,
   OpenCodeLaunchAttemptResponse,
   OpenCodeLaunchMemberLinkage,
   OpenCodeOpaqueIdentity,
   OpenCodeRetainedHostIdentity,
 } from './OpenCodeBridgeContractV2.js'
-import { encodeOpenCodeLaunchAttemptResponse } from './OpenCodeBridgeContractV2.js'
 import type {
   OpenCodeHostHandle,
   OpenCodeProvisioningSnapshot,
@@ -74,62 +73,11 @@ import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutation
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
-function wireFailure(
-  failure: NonNullable<OpenCodeLaunchAttemptResult['failure']>,
-): OpenCodeLaunchFailureDetails {
-  const code = failure.kind
-  return {
-    code,
-    origin: code.startsWith('deadline_') || code.includes('budget_exhausted') ? 'deadline'
-      : code === 'contract_violation' || code === 'unknown_transport_after_side_effect' ? 'session'
-        : 'provider',
-    retryDisposition: failure.retryDisposition,
-    retryable: failure.retryable,
-    phase: 'member_materialize',
-    sideEffectsStarted: failure.sideEffectsStarted,
-  }
-}
-
 /** Pure Desktop V1 projection used by production and fake-only contract tests. */
 export function projectOpenCodeLaunchAttemptResponse(
   result: OpenCodeLaunchAttemptResult,
 ): OpenCodeLaunchAttemptResponse | undefined {
-  const accepted = result.acceptedProofResponse
-  if (!accepted) return undefined
-  const cleanupReserveMs = result.absoluteDeadlineAtMs - result.workDeadlineAtMs
-  if (cleanupReserveMs <= 0) return undefined
-  const outcome = result.status
-  const failure = result.failure ? wireFailure(result.failure) : undefined
-  const response: OpenCodeLaunchAttemptResponse = {
-    launchAttempt: {
-      ...accepted.launchAttempt,
-      attemptId: result.attemptId,
-      payloadHash: result.payloadHash,
-      generation: result.generation,
-      inputDigest: result.inputDigest,
-      immutableDigest: result.immutableDigest,
-      outcome,
-      phase: 'complete',
-      startedAt: result.absoluteDeadlineAtMs - (result.absoluteDeadlineAtMs
-        - accepted.launchAttempt.startedAt),
-      workDeadlineAt: result.workDeadlineAtMs,
-      absoluteDeadlineAt: result.absoluteDeadlineAtMs,
-      cleanupReserveMs,
-      elapsedMs: Math.max(0, Math.min(result.absoluteDeadlineAtMs,
-        accepted.proof?.verifiedAt ?? result.absoluteDeadlineAtMs) - accepted.launchAttempt.startedAt),
-    },
-    ...(accepted.proof === undefined ? {} : { proof: { ...accepted.proof, generation: result.generation } }),
-    members: {
-      committed: result.committed,
-      failed: result.failed.map(item => ({ memberIdentity: item.memberIdentity,
-        failure: wireFailure(item.failure) })),
-      pending: result.pending,
-      cleanupPending: result.cleanupPending,
-      ...(result.continuationToken === undefined ? {} : { continuationToken: result.continuationToken }),
-    },
-    ...(failure === undefined ? {} : { failure }),
-  }
-  return encodeOpenCodeLaunchAttemptResponse(response)
+  return createOpenCodeLaunchDesktopResponse(result)
 }
 
 export function createOpenCodeLaunchPreflightResult(input: {
@@ -521,7 +469,16 @@ class OpenCodeProductionLaunchRuntime {
       }
     }
     if (uncertain || completed) {
-      throw new Error('OpenCode authoritative launch-attempt projection is absent')
+      if (!journal?.acceptedProofResponse || !exactCurrentGeneration) {
+        throw new Error('OpenCode launch mutation requires explicit reconciliation: authoritative projection is absent')
+      }
+      // A crash may leave durable member authority after the accepted proof basis but before the
+      // final projection transition. Re-enter only the core reconciliation path; it reconstructs
+      // and persists the full response without preparing a profile, acquiring a host, or launching
+      // a fresh member mutation.
+      for (const item of priorClaims) {
+        if (item.record) records.set(item.member.memberIdentity, item.record)
+      }
     }
     if (inspectionOnly) return null
     }

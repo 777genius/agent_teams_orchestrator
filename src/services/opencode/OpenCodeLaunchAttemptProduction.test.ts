@@ -24,6 +24,11 @@ import {
 } from './OpenCodeLaunchAttemptProduction.js'
 
 const identity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
+const productionContext = () => ({
+  deadlineAtMs: Date.now() + 10_000,
+  signal: new AbortController().signal,
+  monotonicNow: Date.now,
+})
 
 test('production preflight never authorizes reconciliation and omits continuation for completed replay', () => {
   const base = {
@@ -99,23 +104,40 @@ test('production authority continues member 1 committed/member 2 proven failure 
     const targetTwo = OpenCodeLaunchMutationLedger.targetDigest({
       teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: secondMember,
     })
+    const now = new Date().toISOString()
+    const record: OpenCodeSessionRecord = {
+      teamId: 'team', laneId: 'primary', memberName: 'alice', providerId: 'opencode',
+      selectedModel: 'openrouter/model', projectPath: '/fake/project', profileRootKey: 'profile', hostKey: 'host',
+      resolvedBehaviorFingerprint: null, opencodeSessionId: OpenCodeLaunchMutationLedger.idempotencyIdentity(targetOne),
+      lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
+      sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior',
+      staleReason: null, appManagedBootstrap: { schemaVersion: 1, messageID: 'msg',
+        contextHash: '1'.repeat(64), briefingHash: '2'.repeat(64), injectionVerifiedAt: now,
+        model: 'openrouter/model', agent: 'teammate-bootstrap' }, createdAt: now, updatedAt: now,
+    }
+    const firstLinkage = linkageForTest(identity, record)
+    const firstRecovery = { ownershipTitle: 'agent-teams-launch:owned', sessionRecord: record }
     const makeIdentity = (lease: { generation: number; fence: number; acquisitionToken: string },
       claimToken: string, memberIdentity: OpenCodeOpaqueIdentity, inputDigest: string): OpenCodeLaunchMutationIdentity => ({
       attemptId, payloadHash, immutableDigest, inputDigest, memberIdentity, claimToken,
       generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
     })
-    const deadline = context()
+    const deadline = productionContext()
     let continuationToken = ''
+    let failedClaimToken = ''
     await store.withGeneration({ attemptId, payloadHash, immutableDigest, inputDigest: firstDigest,
-      generation: 1 }, 'begin', async lease => {
+      generation: 1, startedAtMs: Date.now(), totalBudgetMs: 10_000 }, 'begin', async lease => {
       const firstClaim = await lease.claim(identity)
       const firstAuthority = makeIdentity(lease, firstClaim, identity, firstDigest)
       expect(await ledger.claim(targetOne, firstAuthority, deadline)).toBe('claimed')
       expect(await transitionOpenCodeProductionMemberClaim(ledger, targetOne,
-        { ...firstAuthority, transition: 'commit', linkage, recovery }, deadline)).toBe('committed')
-      await lease.append({ type: 'member_applied', memberIdentity: identity, linkage, claimToken: firstClaim })
+        { ...firstAuthority, transition: 'commit', linkage: firstLinkage, recovery: firstRecovery }, deadline))
+        .toBe('committed')
+      await lease.append({ type: 'member_applied', memberIdentity: identity,
+        linkage: firstLinkage, claimToken: firstClaim })
 
       const secondClaim = await lease.claim(secondMember)
+      failedClaimToken = secondClaim
       const secondAuthority = makeIdentity(lease, secondClaim, secondMember, firstDigest)
       expect(await ledger.claim(targetTwo, secondAuthority, deadline)).toBe('claimed')
       expect(await transitionOpenCodeProductionMemberClaim(ledger, targetTwo,
@@ -128,6 +150,8 @@ test('production authority continues member 1 committed/member 2 proven failure 
     await store.withGeneration({ attemptId, payloadHash, immutableDigest, inputDigest: secondDigest,
       generation: 2, continuationToken }, 'continue', async lease => {
       expect((await ledger.read(targetOne, deadline))?.state).toBe('committed')
+      await lease.reconcile({ type: 'member_reconciled_absent', memberIdentity: secondMember,
+        claimToken: failedClaimToken })
       const secondClaim = await lease.claim(secondMember)
       const secondAuthority = makeIdentity(lease, secondClaim, secondMember, secondDigest)
       expect(await ledger.claim(targetTwo, secondAuthority, deadline)).toBe('claimed')
@@ -141,13 +165,16 @@ test('production maps unknown transport to permanent unknown and never to reclai
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-unknown-'))
   try {
     const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
+    const unknownTarget = OpenCodeLaunchMutationLedger.targetDigest({
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: identity,
+    })
     const owner = identityForProductionClaim(identity, 1, 'claim-one')
-    expect(await ledger.claim(target, owner, context())).toBe('claimed')
-    expect(await transitionOpenCodeProductionMemberClaim(ledger, target,
-      { ...owner, transition: 'cancel' }, context())).toBe('cancelled')
-    expect((await ledger.read(target, context()))?.state).toBe('unknown')
+    expect(await ledger.claim(unknownTarget, owner, productionContext())).toBe('claimed')
+    expect(await transitionOpenCodeProductionMemberClaim(ledger, unknownTarget,
+      { ...owner, transition: 'cancel' }, productionContext())).toBe('cancelled')
+    expect((await ledger.read(unknownTarget, productionContext()))?.state).toBe('unknown')
     const next = identityForProductionClaim(identity, 2, 'claim-two')
-    expect(await ledger.claim(target, next, context())).toBe('unknown')
+    expect(await ledger.claim(unknownTarget, next, productionContext())).toBe('unknown')
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 

@@ -716,9 +716,7 @@ function decodeResponse(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeLaun
     && (members.value.failed.length > 0 || members.value.pending.length > 0
       || members.value.continuationToken !== undefined || failure !== undefined)) return invalid('members')
   if (outcome === 'partial'
-    && (members.value.committed.length === 0
-      || (members.value.failed.length === 0 && members.value.pending.length === 0)
-      || members.value.continuationToken === undefined)) return invalid('members.continuationToken')
+    && members.value.committed.length === 0) return invalid('members')
   if (outcome === 'failed' && (failure === undefined || members.value.committed.length > 0)) return invalid('failure')
   if (outcome === 'reconciliation_required'
     && (failure === undefined || failure.code !== 'unknown_transport_after_side_effect'

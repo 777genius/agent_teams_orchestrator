@@ -87,6 +87,8 @@ export type OpenCodeLaunchJournal = {
   authorizedMemberIdentities?: OpenCodeOpaqueIdentity[]
   /** Capability consumed to enter this generation; retained for exact same-generation replay. */
   consumedContinuationToken?: string
+  /** Decoder-validated proof response durably accepted before any member mutation starts. */
+  acceptedProofResponse?: OpenCodeLaunchAttemptResponse
   /** Redacted, decoder-validated authoritative Desktop V1 projection for this generation. */
   finalResponse?: OpenCodeLaunchAttemptResponse
   events: OpenCodeLaunchJournalEvent[]
@@ -1291,6 +1293,10 @@ export type OpenCodeLaunchJournalLease = {
     eligibleMemberIdentities: readonly OpenCodeOpaqueIdentity[],
     context?: OpenCodeLaunchStoreContext,
   ): Promise<string>
+  commitAcceptedProofResponse(
+    response: OpenCodeLaunchAttemptResponse,
+    context?: OpenCodeLaunchStoreContext,
+  ): Promise<void>
   commitFinalResponse(response: OpenCodeLaunchAttemptResponse, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
@@ -1394,6 +1400,7 @@ export class OpenCodeLaunchAttemptStore {
             continuation: undefined,
             authorizedMemberIdentities: consumedContinuationMembers,
             consumedContinuationToken: identity.continuationToken,
+            acceptedProofResponse: undefined,
             finalResponse: undefined }
           assertSafePositive(candidate.generation, 'generation')
           assertSafePositive(candidate.fence, 'fence')
@@ -1476,6 +1483,39 @@ export class OpenCodeLaunchAttemptStore {
           Object.assign(lease.journal, candidate)
           return continuation.token
         },
+        commitAcceptedProofResponse: async (response, proofContext) => {
+          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
+            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+          }
+          if (journal!.events.some(event => event.generation === generation && event.type === 'member_intent')) {
+            throw new OpenCodeLaunchJournalError('fenced', 'accepted proof must precede member effects')
+          }
+          const encoded = encodeOpenCodeLaunchAttemptResponse(response)
+          if (encoded.launchAttempt.attemptId !== journal!.attemptId
+            || encoded.launchAttempt.payloadHash !== journal!.payloadHash
+            || encoded.launchAttempt.generation !== generation
+            || (journal!.profileBinding !== undefined
+              && (encoded.launchAttempt.profileIdentity !== journal!.profileBinding.profileIdentity
+                || encoded.launchAttempt.pluginPolicyIdentity !== journal!.profileBinding.pluginPolicyIdentity
+                || encoded.launchAttempt.cacheIdentity !== journal!.profileBinding.cacheIdentity
+                || encoded.launchAttempt.authIdentity !== journal!.profileBinding.authIdentity
+                || encoded.launchAttempt.configIdentity !== journal!.profileBinding.configIdentity
+                || encoded.launchAttempt.binaryIdentity !== journal!.profileBinding.binaryIdentity))) {
+            throw new OpenCodeLaunchJournalError('foreign', 'accepted proof response identity mismatch')
+          }
+          if (journal!.acceptedProofResponse) {
+            if (JSON.stringify(journal!.acceptedProofResponse) !== JSON.stringify(encoded)) {
+              throw new OpenCodeLaunchJournalError('fenced', 'accepted proof response changed')
+            }
+            return
+          }
+          const candidate = { ...journal!, acceptedProofResponse: encoded }
+          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+          await this.persistRecoverableProjection(candidate, proofContext ?? effectiveContext)
+          journal = candidate
+          Object.assign(lease.journal, candidate)
+        },
         commitFinalResponse: async (response, responseContext) => {
           if (!active || journal!.generation !== generation || journal!.fence !== fence) {
             throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
@@ -1497,7 +1537,7 @@ export class OpenCodeLaunchAttemptStore {
           const candidate = { ...journal!, finalResponse: encoded }
           validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
             inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-          await this.persist(candidate, responseContext ?? effectiveContext)
+          await this.persistRecoverableProjection(candidate, responseContext ?? effectiveContext)
           journal = candidate
           Object.assign(lease.journal, candidate)
         },
@@ -1663,6 +1703,40 @@ export class OpenCodeLaunchAttemptStore {
     }
   }
 
+  /**
+   * Projection writes never advance the generation fence. Their atomic replacement can therefore
+   * safely leave either the prior recoverable journal or the complete candidate visible when the
+   * backend reports an error. The error still propagates; an unsettled replacement retains the
+   * exclusive lease until it physically finishes.
+   */
+  private async persistRecoverableProjection(
+    journal: OpenCodeLaunchJournal,
+    context?: OpenCodeLaunchStoreContext,
+  ): Promise<void> {
+    const bytes = new TextEncoder().encode(JSON.stringify(journal))
+    if (bytes.byteLength > OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'journal exceeds size limit')
+    }
+    ensureContext(context)
+    const anchor = await this.readFence(context)
+    if (journal.fence !== anchor || journal.generation !== anchor) {
+      throw new OpenCodeLaunchJournalError('fenced', 'projection journal does not match durable fence')
+    }
+    const replacement = this.persistence.replaceAndSync(bytes, context)
+    let replacementSettled = false
+    const physicalSettlement = replacement.then(
+      () => { replacementSettled = true },
+      () => { replacementSettled = true },
+    )
+    try { await awaitWithContext(replacement, context, false) }
+    catch (error) {
+      if (!replacementSettled) {
+        throw new OpenCodeLaunchPoisonedLeaseError(error, undefined, physicalSettlement)
+      }
+      throw error
+    }
+  }
+
   private async quarantineAmbiguousFence(fence: number, context?: OpenCodeLaunchStoreContext): Promise<void> {
     const quarantineContext = context && context.signal.aborted
       ? { ...context, signal: new AbortController().signal }
@@ -1762,7 +1836,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     'startedAtMs', 'totalBudgetMs', 'generation', 'fence', 'events'] as const
   const allowedJournalKeys = new Set<string>([
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
-    'consumedContinuationToken', 'finalResponse',
+    'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -1811,6 +1885,22 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
       || source.generation <= 1
       || source.authorizedMemberIdentities === undefined)) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid consumed continuation capability')
+  }
+  if (source.acceptedProofResponse !== undefined) {
+    const decoded = decodeOpenCodeLaunchAttemptResponse(source.acceptedProofResponse)
+    if (!decoded.ok || decoded.value.kind !== 'v2'
+      || decoded.value.response.launchAttempt.attemptId !== source.attemptId
+      || decoded.value.response.launchAttempt.payloadHash !== source.payloadHash
+      || decoded.value.response.launchAttempt.generation !== source.generation
+      || (source.profileBinding !== undefined
+        && (decoded.value.response.launchAttempt.profileIdentity !== source.profileBinding.profileIdentity
+          || decoded.value.response.launchAttempt.pluginPolicyIdentity !== source.profileBinding.pluginPolicyIdentity
+          || decoded.value.response.launchAttempt.cacheIdentity !== source.profileBinding.cacheIdentity
+          || decoded.value.response.launchAttempt.authIdentity !== source.profileBinding.authIdentity
+          || decoded.value.response.launchAttempt.configIdentity !== source.profileBinding.configIdentity
+          || decoded.value.response.launchAttempt.binaryIdentity !== source.profileBinding.binaryIdentity))) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid accepted proof response')
+    }
   }
   if (source.finalResponse !== undefined) {
     const decoded = decodeOpenCodeLaunchAttemptResponse(source.finalResponse)
