@@ -9,6 +9,7 @@ import {
   commitOpenCodeMemberProjection,
   createOpenCodeOwnedMemberSession,
   OpenCodeProofSessionCleanupLedger,
+  recoverOpenCodeCommittedMemberLinkage,
   recoverOpenCodeCommittedMemberProjection,
   reconcileOpenCodeOwnedMemberSession,
 } from './OpenCodeLaunchAttemptProductionSession.js'
@@ -605,9 +606,9 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     const authority: OpenCodeLaunchMutationIdentity = { attemptId: '123e4567-e89b-42d3-a456-426614174001',
       payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64), generation: 1, fence: 1,
       immutableDigest: 'c'.repeat(64),
-      acquisitionToken: 'acquire', claimToken: 'claim', memberIdentity }
+      acquisitionToken: 'acquire', claimToken: 'acquire.claim', memberIdentity }
     const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
-    const title = `agent-teams-launch:${authority.attemptId}:${memberIdentity}:${createHash('sha256').update('claim').digest('hex')}`
+    const title = `agent-teams-launch:${authority.attemptId}:${memberIdentity}:${createHash('sha256').update(authority.claimToken).digest('hex')}`
     const text = '<bootstrap-exact>'
     const messageID = 'msg_exact'
     const now = new Date().toISOString()
@@ -633,7 +634,7 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     expect(projected).toHaveLength(0)
     const claim = await new OpenCodeLaunchMutationLedger(path.join(directory, 'claims')).read(target, storeContext())
     let creates = 0
-    const recovered = await recoverOpenCodeCommittedMemberProjection({ claim: claim!, teamId: 'team',
+    const recovered = await recoverOpenCodeCommittedMemberProjection({ claim: claim!, ...authority, teamId: 'team',
       laneId: 'primary', memberName: 'alice', selectedModel: 'openrouter/model', expectedBootstrapText: text,
       getSession: async () => ({ id: sessionId, title }),
       getSessionMessage: async () => ({ info: { id: messageID, sessionID: sessionId,
@@ -645,6 +646,41 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     expect(projected).toHaveLength(1)
     expect(creates).toBe(0)
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('production restart adopts a session projection only for the exact committed member-intent claim', async () => {
+  const base = await committedRecoveryFixture()
+  const otherMember = `sha256:${'9'.repeat(64)}` as OpenCodeOpaqueIdentity
+  const changedMessageRecord = { ...base.record, appManagedBootstrap: {
+    ...base.record.appManagedBootstrap!, messageID: 'msg_substituted',
+  } }
+  const changedSessionRecord = { ...base.record, opencodeSessionId: 'ses_substituted' }
+  const changedCommit = { ...base.linkage, commitIdentity: `sha256:${'8'.repeat(64)}` as OpenCodeOpaqueIdentity }
+  const cases: Array<[string, Parameters<typeof recoverOpenCodeCommittedMemberLinkage>[0]]> = [
+    ['claimless pre-existing record', { ...base.input, claim: null, record: base.record }],
+    ['pending claim', { ...base.input, claim: { ...base.input.claim, state: 'claimed',
+      linkage: undefined, recovery: undefined }, record: base.record } as never],
+    ['released claim', { ...base.input, claim: { ...base.input.claim, state: 'known_failure',
+      linkage: undefined, recovery: undefined }, record: base.record } as never],
+    ['unknown claim', { ...base.input, claim: { ...base.input.claim, state: 'unknown',
+      linkage: undefined, recovery: undefined }, record: base.record } as never],
+    ['stale generation', { ...base.input, generation: base.input.generation + 1, record: base.record }],
+    ['stale fence', { ...base.input, fence: base.input.fence + 1, record: base.record }],
+    ['mismatched claim token', { ...base.input, claimToken: `${base.input.claimToken}.other`, record: base.record }],
+    ['mismatched member', { ...base.input, memberIdentity: otherMember, record: base.record }],
+    ['mismatched session', { ...base.input, record: changedSessionRecord }],
+    ['mismatched bootstrap message', { ...base.input, record: changedMessageRecord }],
+    ['mismatched ownership title', { ...base.input, claim: { ...base.input.claim, recovery: {
+      ...base.input.claim.recovery!, ownershipTitle: `${base.title}:foreign`,
+    } }, record: base.record }],
+    ['mismatched commit identity', { ...base.input, claim: { ...base.input.claim,
+      linkage: changedCommit }, record: base.record }],
+  ]
+  for (const [name, input] of cases) {
+    expect(recoverOpenCodeCommittedMemberLinkage(input), name).toBeNull()
+  }
+  expect(recoverOpenCodeCommittedMemberLinkage({ ...base.input, record: base.record }))
+    .toEqual(base.linkage)
 })
 
 test('projection failpoints preserve authoritative ordering before and after the repairable upsert', async () => {
@@ -729,8 +765,11 @@ function linkageForTest(memberIdentity: OpenCodeOpaqueIdentity, record: OpenCode
 async function committedRecoveryFixture() {
   const memberIdentity = identity
   const attemptId = '123e4567-e89b-42d3-a456-426614174001'
-  const claimToken = 'claim'
-  const sessionId = 'ses_01234567890123456789012345'
+  const acquisitionToken = 'acquire'
+  const claimToken = `${acquisitionToken}.claim`
+  const targetDigest = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
+    projectIdentity: '/fake/project', memberIdentity })
+  const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(targetDigest)
   const title = `agent-teams-launch:${attemptId}:${memberIdentity}:${createHash('sha256').update(claimToken).digest('hex')}`
   const text = '<bootstrap-exact>'
   const now = new Date().toISOString()
@@ -739,18 +778,22 @@ async function committedRecoveryFixture() {
     resolvedBehaviorFingerprint: null, opencodeSessionId: sessionId, lastCanonicalCursor: null,
     lastKnownRawStatus: null, lastKnownDurableState: null, sourceAuthFingerprint: null,
     managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior', staleReason: null,
+    bootstrapMode: 'app_managed_context' as const, bootstrapEvidenceSource: 'app_managed_bootstrap' as const,
     appManagedBootstrap: { schemaVersion: 1 as const, messageID: 'msg_exact',
       contextHash: createHash('sha256').update(text).digest('hex'), briefingHash: createHash('sha256').update('').digest('hex'),
       injectionVerifiedAt: now, model: 'openrouter/model', agent: 'teammate-bootstrap' }, createdAt: now, updatedAt: now }
   const linkage = linkageForTest(memberIdentity, record)
-  const claim = { version: 1 as const, targetDigest: 'd'.repeat(64), idempotencyIdentity: sessionId,
+  const claim = { version: 1 as const, targetDigest, idempotencyIdentity: sessionId,
     state: 'committed' as const, attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
     immutableDigest: 'c'.repeat(64),
-    generation: 1, fence: 1, acquisitionToken: 'acquire', claimToken, memberIdentity, linkage,
+    generation: 1, fence: 1, acquisitionToken, claimToken, memberIdentity, linkage,
     recovery: { ownershipTitle: title, sessionRecord: record } }
   const message = { info: { id: 'msg_exact', sessionID: sessionId,
     providerID: 'openrouter', modelID: 'model' },
     parts: [{ type: 'text' as const, text }] }
-  return { sessionId, title, message, input: { claim, teamId: 'team', laneId: 'primary', memberName: 'alice',
+  return { sessionId, title, message, record, linkage, input: { claim,
+    attemptId, payloadHash: claim.payloadHash, inputDigest: claim.inputDigest,
+    immutableDigest: claim.immutableDigest, generation: claim.generation, fence: claim.fence,
+    claimToken, memberIdentity, teamId: 'team', laneId: 'primary', memberName: 'alice',
     selectedModel: 'openrouter/model', expectedBootstrapText: text } }
 }

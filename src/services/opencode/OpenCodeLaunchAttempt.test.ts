@@ -758,6 +758,46 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().events.map((event: any) => event.type)).not.toContain('member_reconciled_absent')
   })
 
+  test('restart rejects a claimless pre-existing projection and keeps durable outcome conservative', async () => {
+    const subject = setup({ materialize: async member => member === members[0]
+      ? { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } }
+      : { outcome: 'unknown_transport', owned: { memberIdentity: member } } })
+    const replace = subject.persistence.replaceAndSync.bind(subject.persistence)
+    let rejectUnknown = true
+    subject.persistence.replaceAndSync = async bytes => {
+      const journal = JSON.parse(new TextDecoder().decode(bytes))
+      if (rejectUnknown && journal.events.at(-1)?.type === 'member_unknown') {
+        throw new Error('simulated crash after member_intent')
+      }
+      await replace(bytes)
+    }
+    await expect(subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 }))
+      .rejects.toThrow()
+    expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual([
+      'member_intent', 'member_applied', 'member_intent',
+    ])
+
+    rejectUnknown = false
+    subject.ports.sessions.readMemberLinkage = async ({ memberIdentity }) =>
+      memberIdentity === members[0] ? linkage(memberIdentity) : null
+    subject.ports.sessions.createBootstrapAndCommit = async () => ({
+      outcome: 'known_failure', failure: 'contract_violation', externalEffect: false,
+    })
+    const restarted = await subject.launch.run({
+      request: request(), members, requestedBudgetMs: 10_000,
+    })
+    expect(restarted.status).toBe('partial')
+    expect(restarted.committed).toEqual([linkage(members[0])])
+    expect(restarted.continuationToken).toBeUndefined()
+    expect(restarted.failure).toMatchObject({
+      kind: 'contract_violation', retryDisposition: 'never', sideEffectsStarted: false,
+    })
+    expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual([
+      'member_intent', 'member_applied', 'member_intent', 'member_reconciled_absent',
+      'member_intent', 'member_failed',
+    ])
+  })
+
   test('keeps an exact durable reconciliation final passive when projection truth later appears', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative, materialize: async member => ({

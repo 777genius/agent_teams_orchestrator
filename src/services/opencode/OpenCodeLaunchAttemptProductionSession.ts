@@ -339,6 +339,24 @@ export type OpenCodeCommittedProjectionRecoveryResult =
 
 export type OpenCodeLaunchProjectionFailpoint = 'after_commit' | 'before_projection' | 'after_projection'
 
+export type OpenCodeCommittedMemberLinkageRecoveryInput = {
+  claim: OpenCodeLaunchMutationClaimRecord | null
+  attemptId: string
+  payloadHash: string
+  inputDigest: string
+  immutableDigest: string
+  generation: number
+  fence: number
+  claimToken: string
+  memberIdentity: OpenCodeOpaqueIdentity
+  teamId: string
+  laneId: string
+  memberName: string
+  selectedModel: string
+  expectedBootstrapText: string
+  record: OpenCodeSessionRecord | null
+}
+
 /** The authoritative claim is committed first; every later point is recoverable projection work. */
 export async function commitOpenCodeMemberProjection(input: {
   commit(): Promise<'committed' | 'fenced' | 'unknown'>
@@ -356,9 +374,50 @@ export async function commitOpenCodeMemberProjection(input: {
   return 'committed'
 }
 
+/**
+ * Recover a session-store projection only from the exact committed global
+ * mutation authority for the journaled member intent. Session-store presence
+ * is projection evidence, never mutation authority by itself.
+ */
+export function recoverOpenCodeCommittedMemberLinkage(
+  input: OpenCodeCommittedMemberLinkageRecoveryInput,
+): OpenCodeLaunchMemberLinkage | null {
+  const claim = input.claim
+  const record = input.record
+  if (!claim || !record || claim.state !== 'committed' || !claim.linkage || !claim.recovery
+    || claim.attemptId !== input.attemptId || claim.payloadHash !== input.payloadHash
+    || claim.inputDigest !== input.inputDigest || claim.immutableDigest !== input.immutableDigest
+    || claim.generation !== input.generation || claim.fence !== input.fence
+    || claim.claimToken !== input.claimToken || claim.memberIdentity !== input.memberIdentity
+    || !claim.claimToken.startsWith(`${claim.acquisitionToken}.`)
+    || claim.idempotencyIdentity !== deterministicSessionId(claim.targetDigest)) return null
+
+  const expectedTitle = deterministicOwnershipTitle(claim)
+  const committedRecord = claim.recovery.sessionRecord
+  if (claim.recovery.ownershipTitle !== expectedTitle
+    || !hasExactCommittedRecordBinding(committedRecord, input, claim.idempotencyIdentity)
+    || !hasExactCommittedRecordBinding(record, input, claim.idempotencyIdentity)
+    || !sameBootstrapBinding(record, committedRecord)) return null
+
+  const committedLinkage = linkageForRecord(input.memberIdentity, committedRecord)
+  const projectedLinkage = linkageForRecord(input.memberIdentity, record)
+  if (!committedLinkage || !projectedLinkage
+    || !sameLinkage(committedLinkage, claim.linkage)
+    || !sameLinkage(projectedLinkage, claim.linkage)) return null
+  return claim.linkage
+}
+
 /** Verify an exact committed claim before repairing its non-authoritative session projection. */
 export async function recoverOpenCodeCommittedMemberProjection(input: {
   claim: OpenCodeLaunchMutationClaimRecord
+  attemptId: string
+  payloadHash: string
+  inputDigest: string
+  immutableDigest: string
+  generation: number
+  fence: number
+  claimToken: string
+  memberIdentity: OpenCodeOpaqueIdentity
   teamId: string
   laneId: string
   memberName: string
@@ -373,11 +432,20 @@ export async function recoverOpenCodeCommittedMemberProjection(input: {
     return { status: 'unresolved', reason: 'claim_metadata' }
   }
   const record = recovery.sessionRecord
-  const expectedTitle = `agent-teams-launch:${input.claim.attemptId}:${input.claim.memberIdentity}:${
-    createHash('sha256').update(input.claim.claimToken).digest('hex')}`
+  const exactLinkage = recoverOpenCodeCommittedMemberLinkage({
+    claim: input.claim, record,
+    attemptId: input.attemptId, payloadHash: input.payloadHash,
+    inputDigest: input.inputDigest, immutableDigest: input.immutableDigest,
+    generation: input.generation, fence: input.fence, claimToken: input.claimToken,
+    memberIdentity: input.memberIdentity,
+    teamId: input.teamId, laneId: input.laneId, memberName: input.memberName,
+    selectedModel: input.selectedModel, expectedBootstrapText: input.expectedBootstrapText,
+  })
+  if (!exactLinkage) return { status: 'unresolved', reason: 'claim_metadata' }
+  const expectedTitle = deterministicOwnershipTitle(input.claim)
   const bootstrap = record.appManagedBootstrap
   if (recovery.ownershipTitle !== expectedTitle || record.teamId !== input.teamId
-    || (record.laneId ?? 'primary') !== input.laneId || record.memberName !== input.memberName
+    || record.laneId !== input.laneId || record.memberName !== input.memberName
     || record.selectedModel !== input.selectedModel || record.providerId !== 'opencode'
     || record.opencodeSessionId !== input.claim.idempotencyIdentity || record.staleReason !== null || !bootstrap
     || bootstrap.model !== input.selectedModel || bootstrap.agent !== 'teammate-bootstrap'
@@ -405,20 +473,69 @@ export async function recoverOpenCodeCommittedMemberProjection(input: {
     || (info.modelID ?? info.modelId) !== modelId) {
     return { status: 'unresolved', reason: 'remote_mismatch' }
   }
-  const linkage: OpenCodeLaunchMemberLinkage = {
-    memberIdentity: input.claim.memberIdentity,
+  await input.upsert(record)
+  return { status: 'recovered', linkage: exactLinkage, record }
+}
+
+function deterministicSessionId(targetDigest: string): string {
+  return `ses_${targetDigest.slice(0, 26)}`
+}
+
+function deterministicOwnershipTitle(claim: OpenCodeLaunchMutationClaimRecord): string {
+  return `agent-teams-launch:${claim.attemptId}:${claim.memberIdentity}:${
+    createHash('sha256').update(claim.claimToken).digest('hex')}`
+}
+
+function hasExactCommittedRecordBinding(
+  record: OpenCodeSessionRecord,
+  input: Pick<OpenCodeCommittedMemberLinkageRecoveryInput,
+    'teamId' | 'laneId' | 'memberName' | 'selectedModel' | 'expectedBootstrapText'>,
+  sessionId: string,
+): boolean {
+  const bootstrap = record.appManagedBootstrap
+  return record.teamId === input.teamId && record.laneId === input.laneId
+    && record.memberName === input.memberName && record.providerId === 'opencode'
+    && record.selectedModel === input.selectedModel && record.opencodeSessionId === sessionId
+    && record.staleReason === null && record.bootstrapMode === 'app_managed_context'
+    && record.bootstrapEvidenceSource === 'app_managed_bootstrap'
+    && bootstrap?.schemaVersion === 1 && bootstrap.model === input.selectedModel
+    && bootstrap.agent === 'teammate-bootstrap'
+    && bootstrap.contextHash === createHash('sha256').update(input.expectedBootstrapText).digest('hex')
+}
+
+function sameBootstrapBinding(left: OpenCodeSessionRecord, right: OpenCodeSessionRecord): boolean {
+  const leftBootstrap = left.appManagedBootstrap
+  const rightBootstrap = right.appManagedBootstrap
+  return !!leftBootstrap && !!rightBootstrap
+    && leftBootstrap.schemaVersion === rightBootstrap.schemaVersion
+    && leftBootstrap.messageID === rightBootstrap.messageID
+    && leftBootstrap.contextHash === rightBootstrap.contextHash
+    && leftBootstrap.briefingHash === rightBootstrap.briefingHash
+    && leftBootstrap.model === rightBootstrap.model
+    && leftBootstrap.agent === rightBootstrap.agent
+}
+
+function linkageForRecord(
+  memberIdentity: OpenCodeOpaqueIdentity,
+  record: OpenCodeSessionRecord,
+): OpenCodeLaunchMemberLinkage | null {
+  const bootstrap = record.appManagedBootstrap
+  if (!bootstrap) return null
+  return {
+    memberIdentity,
     sessionIdentity: sessionIdentity(record.opencodeSessionId),
     bootstrapMessageIdentity: opaque({ kind: 'opencode-bootstrap', id: bootstrap.messageID }),
     commitIdentity: opaque({ kind: 'opencode-session-commit', teamId: record.teamId,
-      laneId: record.laneId ?? 'primary', memberName: record.memberName,
-      sessionId: record.opencodeSessionId, messageID: bootstrap.messageID,
-      contextHash: bootstrap.contextHash, briefingHash: bootstrap.briefingHash }),
+      laneId: record.laneId, memberName: record.memberName, sessionId: record.opencodeSessionId,
+      messageID: bootstrap.messageID, contextHash: bootstrap.contextHash,
+      briefingHash: bootstrap.briefingHash }),
   }
-  if (JSON.stringify(linkage) !== JSON.stringify(input.claim.linkage)) {
-    return { status: 'unresolved', reason: 'claim_metadata' }
-  }
-  await input.upsert(record)
-  return { status: 'recovered', linkage, record }
+}
+
+function sameLinkage(left: OpenCodeLaunchMemberLinkage, right: OpenCodeLaunchMemberLinkage): boolean {
+  return left.memberIdentity === right.memberIdentity && left.sessionIdentity === right.sessionIdentity
+    && left.bootstrapMessageIdentity === right.bootstrapMessageIdentity
+    && left.commitIdentity === right.commitIdentity
 }
 
 function readMessageText(message: OpenCodeMessage): string {

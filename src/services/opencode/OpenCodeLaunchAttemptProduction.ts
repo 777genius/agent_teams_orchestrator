@@ -62,6 +62,7 @@ import {
   createOpenCodeOwnedMemberSession,
   commitOpenCodeMemberProjection,
   OpenCodeProofSessionCleanupLedger,
+  recoverOpenCodeCommittedMemberLinkage,
   recoverOpenCodeCommittedMemberProjection,
   reconcileOpenCodeOwnedMemberSession,
   type OpenCodeOwnedSessionReconciliation,
@@ -578,7 +579,9 @@ class OpenCodeProductionLaunchRuntime {
       }
       if (claim.state === 'committed' && (!claim.linkage || !linkage
         || JSON.stringify(claim.linkage) !== JSON.stringify(linkage))) {
-        if (record) reconciliationError = 'local_metadata'
+        if (!hasExactOpenCodeClaimReconciliationAuthority(journal, exactCurrentGeneration, claim)) {
+          reconciliationError = 'authority'
+        } else if (record) reconciliationError = 'local_metadata'
         else try {
           const host = await getRecoveryHost()
           if (!claim.recovery || host.hostKey !== claim.recovery.sessionRecord.hostKey) {
@@ -591,7 +594,13 @@ class OpenCodeProductionLaunchRuntime {
             if (!client.getSessionMessage) reconciliationError = 'transport'
             else {
               const recovered = await recoverOpenCodeCommittedMemberProjection({
-                claim, teamId: command.teamId, laneId: command.laneId, memberName: member.name,
+                claim, attemptId: command.request.launchAttempt.attemptId,
+                payloadHash: command.request.launchAttempt.payloadHash,
+                inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest,
+                generation: journal!.generation, fence: journal!.fence,
+                claimToken: journal!.events.findLast(event => event.memberIdentity === member.memberIdentity)!.claimToken,
+                memberIdentity: member.memberIdentity,
+                teamId: command.teamId, laneId: command.laneId, memberName: member.name,
                 selectedModel: command.selectedModel,
                 expectedBootstrapText: bootstrapText(command, member.name,
                   claim.idempotencyIdentity, member.prompt),
@@ -962,14 +971,18 @@ class OpenCodeProductionLaunchRuntime {
             deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow,
           })
           const record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
-          if (record) records.set(input.memberIdentity, record)
-          const projected = record ? linkageFor(input.memberIdentity, record) : null
-          if (durableClaim?.state !== 'committed' || !durableClaim.linkage) return projected
-          if (!projected) return null
-          if (!record) return null
-          if (JSON.stringify(projected) !== JSON.stringify(durableClaim.linkage)) {
-            throw new Error('OpenCode authoritative mutation ledger/session projection mismatch')
-          }
+          const linkage = recoverOpenCodeCommittedMemberLinkage({
+            claim: durableClaim, record,
+            attemptId: input.attemptId, payloadHash: input.payloadHash,
+            inputDigest: input.inputDigest, immutableDigest: input.immutableDigest,
+            generation: input.generation, fence: input.fence, claimToken: input.claimToken,
+            memberIdentity: input.memberIdentity, teamId: command.teamId, laneId: command.laneId,
+            memberName: member.name, selectedModel: command.selectedModel,
+            expectedBootstrapText: bootstrapText(command, member.name,
+              OpenCodeLaunchMutationLedger.idempotencyIdentity(target), member.prompt),
+          })
+          if (!linkage || !record) return null
+          records.set(input.memberIdentity, record)
           // Restart/continuation reconstructs the in-memory operation-reference
           // transfer before cleanup can decide whether the retained host is shared
           // with an already committed member.
@@ -980,7 +993,7 @@ class OpenCodeProductionLaunchRuntime {
               await openCodeHostManager.retainHostLease(hostKey, owner)
             },
           })
-          return durableClaim.linkage
+          return linkage
         },
         claimMemberMutation: async input => {
           const target = targetByMember.get(input.memberIdentity)
