@@ -14,6 +14,7 @@ import {
   computeOpenCodeLaunchAttemptImmutableDigest,
   createOpenCodeLaunchAttemptResult,
   createOpenCodeLaunchDesktopResponse,
+  validateOpenCodeDurableFinalResponse,
   validateOpenCodeLaunchContinuation,
   type OpenCodeLaunchAttemptPorts,
   type OpenCodeLaunchAttemptResult,
@@ -377,6 +378,31 @@ class OpenCodeProductionLaunchRuntime {
         continuationToken: command.request.launchAttempt.continuationToken,
       }) === 'replay'
     }
+    if (journal?.finalResponse && exactCurrentGeneration) {
+      const final = journal.finalResponse
+      validateOpenCodeDurableFinalResponse(command.request, final, {
+        inputDigest,
+        immutableDigest,
+        generation: command.request.launchAttempt.generation,
+        acceptedProofResponse: journal.acceptedProofResponse,
+        profileBinding: journal.profileBinding,
+      })
+      const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
+      const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
+      return {
+        snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
+          profile: null, host: null, config: null, configProviders: null, providers: null,
+          providerAuth: null, agents: [], mcp: null, appMcp: null,
+          probeError: final.launchAttempt.outcome === 'reconciliation_required'
+            ? 'launch mutation requires reconciliation' : null, diagnostics: [] },
+        data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
+          members: Object.fromEntries(command.members.map(member => [member.name, {
+            launchState: committedIds.has(member.memberIdentity) ? 'created'
+              : failedIds.has(member.memberIdentity) ? 'failed' : 'pending',
+            evidence: [], diagnostics: [],
+          }])), launchAttempt: final },
+      }
+    }
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
       recoveryHost ??= (async () => {
@@ -448,26 +474,6 @@ class OpenCodeProductionLaunchRuntime {
       || item.reconciliationError !== null)
     const completed = priorClaims.length > 0 && priorClaims.every(item => item.claim?.state === 'committed'
       && item.linkage !== null)
-    if (journal?.finalResponse && exactCurrentGeneration) {
-      const final = journal.finalResponse
-      const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
-      const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
-      return {
-        snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
-          profile: null, host: null, config: null, configProviders: null, providers: null,
-          providerAuth: null, agents: [], mcp: null, appMcp: null,
-          probeError: final.launchAttempt.outcome === 'reconciliation_required'
-            ? 'launch mutation requires reconciliation' : null, diagnostics: [] },
-        data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
-          members: Object.fromEntries(priorClaims.map(item => [item.member.name, {
-            ...(item.record ? { sessionId: item.record.opencodeSessionId } : {}),
-            launchState: committedIds.has(item.member.memberIdentity) ? 'created'
-              : failedIds.has(item.member.memberIdentity) ? 'failed' : 'pending',
-            evidence: [], diagnostics: item.reconciliationError
-              ? [`committed projection reconciliation unresolved: ${item.reconciliationError}`] : [],
-          }])), launchAttempt: final },
-      }
-    }
     if (uncertain || completed) {
       if (!journal?.acceptedProofResponse || !exactCurrentGeneration) {
         throw new Error('OpenCode launch mutation requires explicit reconciliation: authoritative projection is absent')

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import type { OpenCodeLaunchMemberRecovery } from './OpenCodeLaunchMutationLedger.js'
 import {
   decodeOpenCodeLaunchAttemptResponse,
@@ -238,10 +238,10 @@ export class OpenCodeLaunchAttempt {
   async run(input: OpenCodeLaunchAttemptInput): Promise<OpenCodeLaunchAttemptResult> {
     const suppliedRequest = encodeOpenCodeLaunchAttemptRequest(input.request)
     const members = deepFreeze(structuredClone([...input.members]))
-    const request = deepFreeze(structuredClone({
-      ...suppliedRequest,
-      launchAttempt: { ...suppliedRequest.launchAttempt, proofNonce: randomBytes(32).toString('base64url') },
-    }))
+    // The decoded strict request is the canonical proof authority. Replacing its
+    // nonce here made the durable input key authorize a proof for a different,
+    // unkeyed challenge and allowed a later nonce to replay that response.
+    const request = deepFreeze(structuredClone(suppliedRequest))
     const attempt = request.launchAttempt
     if (new Set(members).size !== members.length || !members.every(isOpenCodeOpaqueIdentity)) {
       throw new OpenCodeLaunchAttemptError('members')
@@ -318,6 +318,16 @@ export class OpenCodeLaunchAttempt {
           const pending: OpenCodeOpaqueIdentity[] = []
           let acceptedProofResponse: OpenCodeLaunchAttemptResponse | undefined = lease.journal.finalResponse
             ?? lease.journal.acceptedProofResponse
+          if (lease.journal.finalResponse) {
+            validateOpenCodeDurableFinalResponse(request, lease.journal.finalResponse, {
+              inputDigest,
+              immutableDigest,
+              generation: lease.generation,
+              acceptedProofResponse: lease.journal.acceptedProofResponse,
+              profileBinding: lease.journal.profileBinding,
+            })
+            return resultFromOpenCodeDurableFinal(lease.journal.finalResponse)
+          }
           const recovery = await this.reconcile(
             lease.journal.events, members, committed, lease.generation,
             { attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, immutableDigest,
@@ -1063,6 +1073,7 @@ export function computeOpenCodeLaunchAttemptInputDigest(
     providerId: attempt.providerId,
     modelId: attempt.modelId,
     requiredMcpTools: [...attempt.requiredMcpTools],
+    proofNonce: attempt.proofNonce,
     ...(attempt.continuationToken === undefined ? {} : { continuationToken: attempt.continuationToken }),
     requireFreshRetainedHostProof: attempt.requireFreshRetainedHostProof,
     mode,
@@ -1072,6 +1083,77 @@ export function computeOpenCodeLaunchAttemptInputDigest(
     ...(commandInputDigest === undefined ? {} : { commandInputDigest }),
   })
   return createHash('sha256').update(canonical).digest('hex')
+}
+
+export function validateOpenCodeDurableFinalResponse(
+  request: OpenCodeLaunchAttemptRequest,
+  final: OpenCodeLaunchAttemptResponse,
+  expected: Readonly<{
+    inputDigest: string
+    immutableDigest: string
+    generation: number
+    acceptedProofResponse?: OpenCodeLaunchAttemptResponse
+    profileBinding?: import('./OpenCodeLaunchAttemptStore.js').OpenCodeLaunchProfileBinding
+  }>,
+): void {
+  const accepted = expected.acceptedProofResponse
+  const basis = accepted ?? final
+  const binding = expected.profileBinding
+  if (final.launchAttempt.inputDigest !== expected.inputDigest
+    || final.launchAttempt.immutableDigest !== expected.immutableDigest
+    || final.launchAttempt.generation !== expected.generation
+    || (accepted !== undefined && JSON.stringify(final.proof) !== JSON.stringify(accepted.proof))) {
+    throw new OpenCodeLaunchAttemptError('durableFinal.correlation')
+  }
+  const correlation = validateOpenCodeLaunchAttemptCorrelation(request, final, {
+    currentGeneration: expected.generation,
+    expectedNonceHash: createHash('sha256').update(request.launchAttempt.proofNonce).digest('hex'),
+    expectedProfilePurpose: basis.launchAttempt.profilePurpose,
+    expectedProviderId: basis.launchAttempt.providerId,
+    expectedProjectIdentity: basis.launchAttempt.projectIdentity,
+    expectedConfigIdentity: binding?.configIdentity ?? basis.launchAttempt.configIdentity,
+    expectedAuthIdentity: binding?.authIdentity ?? basis.launchAttempt.authIdentity,
+    expectedPluginPolicyIdentity: binding?.pluginPolicyIdentity ?? basis.launchAttempt.pluginPolicyIdentity,
+    expectedCacheIdentity: binding?.cacheIdentity ?? basis.launchAttempt.cacheIdentity,
+    expectedBinaryIdentity: binding?.binaryIdentity ?? basis.launchAttempt.binaryIdentity,
+    expectedRetainedHostIdentity: basis.launchAttempt.retainedHostIdentity,
+    requiredMcpTools: request.launchAttempt.requiredMcpTools,
+  })
+  if (!correlation.ok
+    || (binding !== undefined && (
+      final.launchAttempt.profileIdentity !== binding.profileIdentity
+      || final.launchAttempt.pluginPolicyIdentity !== binding.pluginPolicyIdentity
+      || final.launchAttempt.cacheIdentity !== binding.cacheIdentity
+      || final.launchAttempt.authIdentity !== binding.authIdentity
+      || final.launchAttempt.configIdentity !== binding.configIdentity
+      || final.launchAttempt.binaryIdentity !== binding.binaryIdentity
+    ))) throw new OpenCodeLaunchAttemptError(correlation.ok ? 'durableFinal.profileBinding' : correlation.failure.field)
+}
+
+function resultFromOpenCodeDurableFinal(final: OpenCodeLaunchAttemptResponse): OpenCodeLaunchAttemptResult {
+  return createOpenCodeLaunchAttemptResult({
+    attemptId: final.launchAttempt.attemptId,
+    payloadHash: final.launchAttempt.payloadHash,
+    inputDigest: final.launchAttempt.inputDigest,
+    immutableDigest: final.launchAttempt.immutableDigest,
+    generation: final.launchAttempt.generation,
+    status: final.launchAttempt.outcome,
+    committed: final.members.committed,
+    failed: final.members.failed.map(item => ({
+      memberIdentity: item.memberIdentity,
+      failure: classifyOpenCodeLaunchFailure(item.failure.code),
+    })),
+    pending: final.members.pending,
+    cleanupPending: final.members.cleanupPending,
+    ...(final.members.continuationToken === undefined ? {} : {
+      continuationToken: final.members.continuationToken,
+    }),
+    acceptedProofResponse: final,
+    ...(final.failure === undefined ? {} : { failure: classifyOpenCodeLaunchFailure(final.failure.code) }),
+    cleanup: final.members.cleanupPending.length === 0 ? 'complete' : 'timed_out',
+    absoluteDeadlineAtMs: final.launchAttempt.absoluteDeadlineAt,
+    workDeadlineAtMs: final.launchAttempt.workDeadlineAt,
+  })
 }
 
 export function computeOpenCodeLaunchAttemptImmutableDigest(

@@ -16,6 +16,21 @@ export type OpenCodeSafePublicationTransaction = Readonly<{
   rollback(): Promise<void>
 }>
 
+/**
+ * Native COMMIT_ATOMIC may report a cleanup failure after its durable commit
+ * point. The paired rollback request is therefore a settlement retry; native
+ * authority must keep the committed final visible in that state.
+ */
+export async function commitOpenCodeWindowsAtomicPublication(
+  authority: Pick<OpenCodeWindowsPublicationAuthorityClient, 'commitAtomic' | 'rollbackAtomic'>,
+): Promise<void> {
+  try { await authority.commitAtomic() }
+  catch (error) {
+    await authority.rollbackAtomic().catch(() => undefined)
+    throw error
+  }
+}
+
 export type OpenCodeSafePublicationOpenOptions = Readonly<{
   abortSignal?: AbortSignal
   deadline?: number
@@ -563,6 +578,7 @@ export class OpenCodeSafePublicationDirectory {
     }
     if (process.platform === 'win32' && this.#windowsAuthority) {
       const bytes = typeof content === 'string' ? Buffer.from(content) : new Uint8Array(content)
+      let settlementHandled = false
       try {
         const recoveryPrefix = `.${finalName}.recovery-required.`.toLowerCase()
         const recovery = await this.#namespacePort()
@@ -589,11 +605,12 @@ export class OpenCodeSafePublicationDirectory {
           }
           testHooks.retainTransaction(Object.freeze({ commit: () => settle(false), rollback: () => settle(true) }))
         } else {
-          await this.#windowsAuthority.commitAtomic().catch(fail)
+          settlementHandled = true
+          await commitOpenCodeWindowsAtomicPublication(this.#windowsAuthority).catch(fail)
         }
         return
       } catch (error) {
-        await this.#windowsAuthority.rollbackAtomic().catch(() => undefined)
+        if (!settlementHandled) await this.#windowsAuthority.rollbackAtomic().catch(() => undefined)
         throw error
       }
     }

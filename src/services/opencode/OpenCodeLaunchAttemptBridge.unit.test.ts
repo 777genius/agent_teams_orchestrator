@@ -147,6 +147,17 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     expect(coreInput?.commandInputDigest).toBe(computeOpenCodeLaunchCommandInputDigest(baseline))
   })
 
+  test('binds the proof nonce only into the exact-generation input authority', () => {
+    const baseline = command()
+    const changed = command()
+    changed.request = structuredClone(changed.request)
+    changed.request.launchAttempt.proofNonce = `${'m'.repeat(42)}o`
+    expect(computeOpenCodeLaunchCommandInputDigest(changed))
+      .not.toBe(computeOpenCodeLaunchCommandInputDigest(baseline))
+    expect(computeOpenCodeLaunchCommandImmutableDigest(changed))
+      .toBe(computeOpenCodeLaunchCommandImmutableDigest(baseline))
+  })
+
   test('passes an absolute deadline unchanged while preserving the original policy budget', async () => {
     const value = { ...command(), requestedBudgetMs: 42_000, outerRemainingBudgetMs: 8_000,
       deadlineAtMs: 50_000 }

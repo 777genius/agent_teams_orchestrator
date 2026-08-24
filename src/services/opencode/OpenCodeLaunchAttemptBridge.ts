@@ -215,6 +215,7 @@ export function computeOpenCodeLaunchCommandInputDigest(
     providerId: attempt.providerId,
     modelId: attempt.modelId,
     requiredMcpTools: [...attempt.requiredMcpTools],
+    proofNonce: attempt.proofNonce,
     requireFreshRetainedHostProof: attempt.requireFreshRetainedHostProof,
     continuationToken: attempt.continuationToken ?? null,
     runId: input.runId,

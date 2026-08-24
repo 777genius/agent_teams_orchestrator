@@ -240,15 +240,14 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     expect(subject.persistence.json().events).toEqual([])
   })
 
-  test('rejects a stale verifiedAt proof and a caller nonce self-attestation', async () => {
+  test('rejects a stale verifiedAt proof while accepting the canonical caller challenge', async () => {
     const stale = setup({ proof: response => { response.proof!.verifiedAt = 0 } })
     expect((await stale.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })).status).toBe('failed')
     expect(stale.persistence.json().events).toEqual([])
 
-    const suppliedNonceHash = createHash('sha256').update(request().launchAttempt.proofNonce).digest('hex')
-    const selfAttested = setup({ proof: response => { response.proof!.nonceHash = suppliedNonceHash } })
-    expect((await selfAttested.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })).status).toBe('failed')
-    expect(selfAttested.calls.some(call => call.startsWith('create:'))).toBe(false)
+    const canonical = setup()
+    expect((await canonical.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })).status)
+      .toBe('succeeded')
   })
 
   test.each([
@@ -275,7 +274,7 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     expect(claimInput?.inputDigest).not.toBe(hash)
   })
 
-  test('digests the complete decoded launch input, mode and member order but not the generated nonce', async () => {
+  test('digests the complete decoded launch input, including the exact proof nonce, mode and member order', async () => {
     const captured: string[] = []
     const firstRequest = request()
     const first = setup({ claim: async input => { captured.push(input.inputDigest); return 'claimed' } })
@@ -283,7 +282,7 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     const expected = createHash('sha256').update(JSON.stringify({
       contractVersion: 1, attemptId, payloadHash: hash, generation: 1,
       parent: firstRequest.launchAttempt.parent, providerId: 'anthropic', modelId: 'anthropic/claude-sonnet-4-5',
-      requiredMcpTools: ['mcp__app__team'],
+      requiredMcpTools: ['mcp__app__team'], proofNonce: firstRequest.launchAttempt.proofNonce,
       requireFreshRetainedHostProof: true, mode: 'begin',
       requestedBudgetMs: 10_000, effectiveBudgetMs: 10_000, members,
     })).digest('hex')
@@ -293,16 +292,22 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     await same.launch.run({ request: structuredClone(firstRequest), members, requestedBudgetMs: 10_000 })
     expect(captured[2]).toBe(captured[0])
 
+    const changedNonce = setup({ claim: async input => { captured.push(input.inputDigest); return 'claimed' } })
+    const nonceRequest = structuredClone(firstRequest)
+    nonceRequest.launchAttempt.proofNonce = 'BBBBBBBBBBBBBBBBBBBBBA'
+    await changedNonce.launch.run({ request: nonceRequest, members, requestedBudgetMs: 10_000 })
+    expect(captured[4]).not.toBe(captured[0])
+
     const reordered = setup({ claim: async input => { captured.push(input.inputDigest); return 'claimed' } })
     await reordered.launch.run({ request: structuredClone(firstRequest), members: [...members].reverse(), requestedBudgetMs: 10_000 })
-    expect(captured[4]).not.toBe(captured[0])
+    expect(captured[6]).not.toBe(captured[0])
 
     const changedToken = setup({ claim: async input => { captured.push(input.inputDigest); return 'claimed' } })
     const changedRequest = structuredClone(firstRequest)
     changedRequest.launchAttempt.continuationToken = 'opaque-continuation-two'
     await expect(changedToken.launch.run({ request: changedRequest, members, requestedBudgetMs: 10_000 }))
       .rejects.toMatchObject({ field: 'launchAttempt.continuationToken' })
-    expect(captured).toHaveLength(6)
+    expect(captured).toHaveLength(8)
   })
 
   test('passes the complete durable identity and a live tombstone check into materialization', async () => {
@@ -540,7 +545,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().events.map((event: any) => event.type)).not.toContain('member_reconciled_absent')
   })
 
-  test('recovers an applied crash only from exact authoritative noReply linkage and skips resend', async () => {
+  test('keeps an exact durable reconciliation final passive when projection truth later appears', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative, materialize: async member => ({
       outcome: 'unknown_transport', owned: { memberIdentity: member },
@@ -557,18 +562,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     const continued = await subject.launch.run({
       request: continuedRequest, members: [members[0]], requestedBudgetMs: 10_000,
     })
-    expect(continued.status).toBe('succeeded')
-    expect(continued.committed[0]).toEqual(linkage(members[0]))
+    expect(continued.status).toBe('reconciliation_required')
+    expect(continued.committed).toEqual([])
     const originalClaim = subject.persistence.json().events.find((event: any) => event.type === 'member_intent')
-    expect(reconciliationIdentity).toMatchObject({
-      attemptId, payloadHash: hash, generation: 1, fence: 1,
-      currentGeneration: 1, currentFence: 1, memberIdentity: members[0],
-      claimToken: originalClaim.claimToken, inputDigest: originalClaim.inputDigest,
-      deadlineAtMs: 9_000,
-    })
-    expect(reconciliationIdentity?.inputDigest).toBe(subject.persistence.json().inputDigest)
+    expect(originalClaim).toBeDefined()
+    expect(reconciliationIdentity).toBeUndefined()
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(beforeCreates)
-    expect(subject.persistence.json().events.map((event: any) => event.type)).toContain('member_reconciled_applied')
+    expect(subject.persistence.json().events.map((event: any) => event.type)).not.toContain('member_reconciled_applied')
   })
 
   test('preserves committed member 1 when member 2 has unknown transport', async () => {
@@ -985,13 +985,15 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls).toContain('release')
   })
 
-  test('fails closed on committed journal/session-store mismatch', async () => {
+  test('replays a committed durable final without consulting a divergent projection store', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative })
     await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const reads = subject.calls.filter(call => call.startsWith('read:')).length
     authoritative.set(members[0], linkage(members[0], 1))
     const replay = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
-    expect(replay.status).toBe('reconciliation_required')
+    expect(replay.status).toBe('succeeded')
+    expect(subject.calls.filter(call => call.startsWith('read:'))).toHaveLength(reads)
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
   })
 
@@ -1034,13 +1036,45 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(decodeOpenCodeLaunchAttemptResponse(authoritativeResponse)).toMatchObject({
       ok: true, value: { kind: 'v2' },
     })
-    authoritative.set(members[0], linkage(members[0]))
+    // The session projection remains absent; exact final replay must not inspect it.
     subject.persistence.replaceAndSync = replace
+    const passiveCalls = subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'mcp' || call === 'proof' || call.startsWith('proof-observe')
+      || call.startsWith('read:') || call.startsWith('create:')).length
 
     const replay = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     expect(projectOpenCodeLaunchAttemptResponse(replay)).toEqual(authoritativeResponse)
+    expect(subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'mcp' || call === 'proof' || call.startsWith('proof-observe')
+      || call.startsWith('read:') || call.startsWith('create:'))).toHaveLength(passiveCalls)
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(1)
+  })
+
+  test('a different nonce cannot replay a durable proof and reaches no launch port', async () => {
+    const subject = setup()
+    await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const calls = subject.calls.length
+    const changed = request()
+    changed.launchAttempt.proofNonce = 'BBBBBBBBBBBBBBBBBBBBBA'
+
+    await expect(subject.launch.run({ request: changed, members: [members[0]], requestedBudgetMs: 10_000 }))
+      .rejects.toMatchObject({ code: 'foreign' })
+    expect(subject.calls).toHaveLength(calls)
+  })
+
+  test('rejects a decoder-valid stored final whose proof is not correlated to the canonical nonce', async () => {
+    const subject = setup()
+    await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const journal = subject.persistence.json()
+    journal.acceptedProofResponse.proof.nonceHash = 'b'.repeat(64)
+    journal.finalResponse.proof.nonceHash = 'b'.repeat(64)
+    subject.persistence.bytes = new TextEncoder().encode(JSON.stringify(journal))
+    const calls = subject.calls.length
+
+    await expect(subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 }))
+      .rejects.toMatchObject({ field: 'proof.nonceHash' })
+    expect(subject.calls).toHaveLength(calls)
   })
 
   test('reports bounded cleanup timeout at the unchanged absolute deadline', async () => {

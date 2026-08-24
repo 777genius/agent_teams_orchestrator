@@ -212,6 +212,34 @@ enum AtomicPublicationStage {
     Temporary,
     PriorCaptured,
     Published,
+    /// The new final has crossed the durable parent-directory barrier. From
+    /// this point every settlement request is commit cleanup, even if the
+    /// caller asks to roll back after observing a cleanup error.
+    Committed,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_CLEANUP_FAILPOINT: std::cell::RefCell<Option<&'static str>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn fail_atomic_cleanup_boundary(boundary: &'static str) -> Result<(), &'static str> {
+    ATOMIC_CLEANUP_FAILPOINT.with(|point| {
+        if point.borrow().as_ref() == Some(&boundary) {
+            point.replace(None);
+            Err("INJECTED_CLEANUP_FAILURE")
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fail_atomic_cleanup_boundary(_boundary: &'static str) -> Result<(), &'static str> {
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1727,6 +1755,10 @@ impl RetainedWindowsRoot {
                 AtomicPublicationStage::Temporary => "temporary",
                 AtomicPublicationStage::PriorCaptured => "prior_captured",
                 AtomicPublicationStage::Published => "published",
+                // Committed is deliberately recovered as published/commit.
+                // The preceding published record is already durable, and no
+                // cleanup record is needed to authorize the final.
+                AtomicPublicationStage::Committed => "published",
             }
             .to_string(),
         };
@@ -1747,10 +1779,12 @@ impl RetainedWindowsRoot {
         parent: &std::fs::File,
     ) -> Result<(), &'static str> {
         if let Some(recovery) = publication.recovery.as_ref() {
+            fail_atomic_cleanup_boundary("recovery_marker_delete")?;
             crate::windows_identity::delete_on_close(recovery).map_err(|_| "RECOVERY_REQUIRED")?;
         }
         if let Some(recovery) = publication.recovery.take() {
             drop(recovery);
+            fail_atomic_cleanup_boundary("recovery_parent_sync")?;
             parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
         }
         Ok(())
@@ -2142,15 +2176,27 @@ impl RetainedWindowsRoot {
         self.validate_namespace()?;
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         let publication = self.publication.as_mut().ok_or("STATE_REJECTED")?;
-        if !rollback {
-            if publication.stage != AtomicPublicationStage::Published {
+        if !rollback || publication.stage == AtomicPublicationStage::Committed {
+            if !matches!(
+                publication.stage,
+                AtomicPublicationStage::Published | AtomicPublicationStage::Committed
+            ) {
                 return Err("STATE_REJECTED");
             }
             // Durability is the commit boundary. Attempt-owned backup cleanup
             // follows but can only leave conservative garbage; it can never
             // revoke an already-durable new final or trigger rollback after
             // the prior link has been removed.
-            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            if publication.stage == AtomicPublicationStage::Published {
+                // Accepting COMMIT_ATOMIC is the in-process committed point.
+                // PREPARE_ATOMIC already durably synced the published final;
+                // assigning before this additional barrier ensures even its
+                // failure can only be retried as commit cleanup. Crash recovery
+                // independently reaches the same decision from the durable
+                // `published` recovery record.
+                publication.stage = AtomicPublicationStage::Committed;
+                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            }
             drop(publication.prior.take());
             if publication.backup_created {
                 if let Ok(Some(backup)) = crate::windows_identity::open_relative_file_optional(
@@ -3290,6 +3336,54 @@ mod protocol_tests {
         assert!(!root.join(".auth.recovery-required").exists());
         drop(authority);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_atomic_cleanup_failures_never_reinterpret_as_rollback() {
+        for boundary in ["recovery_marker_delete", "recovery_parent_sync"] {
+            for had_prior in [true, false] {
+                let root = std::env::temp_dir().join(format!(
+                    "opencode-publication-committed-cleanup-{}-{}-{boundary}-{had_prior}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                if had_prior {
+                    std::fs::write(root.join("auth.json"), b"prior").unwrap();
+                }
+                let (mut authority, _) =
+                    RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+                authority
+                    .prepare_atomic(
+                        "auth.json",
+                        ".auth.tmp",
+                        ".auth.backup",
+                        ".auth.quarantine",
+                        ".auth.recovery-required",
+                        b"committed",
+                        if had_prior { "any" } else { "absent" },
+                    )
+                    .unwrap();
+                ATOMIC_CLEANUP_FAILPOINT.with(|point| point.replace(Some(boundary)));
+                assert_eq!(
+                    authority.settle_atomic(false),
+                    Err("INJECTED_CLEANUP_FAILURE")
+                );
+                assert_eq!(std::fs::read(root.join("auth.json")).unwrap(), b"committed");
+
+                // This is the exact call made by the JS failure path. Once the
+                // durable commit point was crossed it is idempotent commit
+                // cleanup, never removal of the new final/restoration of old.
+                authority.settle_atomic(true).unwrap();
+                assert_eq!(std::fs::read(root.join("auth.json")).unwrap(), b"committed");
+                assert!(!root.join(".auth.recovery-required").exists());
+                drop(authority);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]

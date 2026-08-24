@@ -2,9 +2,35 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+import {
+  commitOpenCodeWindowsAtomicPublication,
+  OpenCodeSafePublicationDirectory,
+} from './OpenCodeSafePublication.js'
 
 describe('OpenCodeSafePublication', () => {
+  test.each(['recovery-marker deletion', 'recovery parent sync'])(
+    'fake Windows authority keeps the committed final after injected %s failure',
+    async boundary => {
+      let final: 'prior' | 'committed' | null = 'prior'
+      let committed = false
+      const calls: string[] = []
+      const authority = {
+        commitAtomic: async () => {
+          calls.push(`commit:${boundary}`)
+          final = 'committed'; committed = true
+          throw new Error(`injected ${boundary} failure`)
+        },
+        rollbackAtomic: async () => {
+          calls.push('rollback')
+          if (!committed) final = 'prior'
+        },
+      }
+      await expect(commitOpenCodeWindowsAtomicPublication(authority)).rejects.toThrow(`injected ${boundary}`)
+      expect(calls).toEqual([`commit:${boundary}`, 'rollback'])
+      expect(final).toBe('committed')
+    },
+  )
+
   test('retained transaction synchronizes each visibility and settlement boundary', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-sync-protocol-'))
     const protocol: string[] = []
