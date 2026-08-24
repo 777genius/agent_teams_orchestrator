@@ -61,6 +61,12 @@ function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
     toolApprovalMode: 'auto',
     continuation: false,
     requestedBudgetMs: 42_000,
+    preconditions: {
+      handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run-s3',
+      expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
+      expectedManifestHighWatermark: null, commandLeaseId: 'lease-1',
+      idempotencyKey: request.launchAttempt.attemptId,
+    },
   }
 }
 
@@ -157,6 +163,33 @@ describe('OpenCodeLaunchAttemptBridge', () => {
     expect(computeOpenCodeLaunchCommandImmutableDigest(changed))
       .toBe(computeOpenCodeLaunchCommandImmutableDigest(baseline))
   })
+
+  test.each(['handshakeIdentityHash', 'expectedBehaviorFingerprint', 'commandLeaseId', 'idempotencyKey'] as const)(
+    'binds and authoritatively validates strict %s', async field => {
+      const baseline = command()
+      const changed = command()
+      changed.preconditions = { ...changed.preconditions, [field]: `${field}-changed` }
+      expect(computeOpenCodeLaunchCommandInputDigest(changed))
+        .not.toBe(computeOpenCodeLaunchCommandInputDigest(baseline))
+      if (field === 'expectedBehaviorFingerprint' || field === 'idempotencyKey') {
+        expect(computeOpenCodeLaunchCommandImmutableDigest(changed))
+          .not.toBe(computeOpenCodeLaunchCommandImmutableDigest(baseline))
+      } else {
+        expect(computeOpenCodeLaunchCommandImmutableDigest(changed))
+          .toBe(computeOpenCodeLaunchCommandImmutableDigest(baseline))
+      }
+      const invalid = command()
+      invalid.preconditions = { ...invalid.preconditions,
+        [field]: field === 'idempotencyKey' ? 'wrong-attempt' : null } as typeof invalid.preconditions
+      let calls = 0
+      await expect(new OpenCodeLaunchAttemptBridge({
+        commandLedger: { read: async () => { calls += 1; return { status: 'absent' } } },
+        attempt: { run: async () => { calls += 1; return result } },
+        projection: { fromDurableResult: async () => ({ snapshot, data: null }) },
+      }).execute(invalid)).rejects.toThrow()
+      expect(calls).toBe(0)
+    },
+  )
 
   test('passes an absolute deadline unchanged while preserving the original policy budget', async () => {
     const value = { ...command(), requestedBudgetMs: 42_000, outerRemainingBudgetMs: 8_000,

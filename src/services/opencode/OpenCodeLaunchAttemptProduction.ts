@@ -31,6 +31,7 @@ import {
 import {
   OpenCodeLaunchAttemptStore,
   OpenCodeLaunchFileJournalPersistence,
+  type OpenCodeLaunchJournal,
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
 import type {
@@ -48,6 +49,7 @@ import type {
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import {
   OpenCodeLaunchMutationLedger,
+  type OpenCodeLaunchMutationClaimRecord,
   type OpenCodeLaunchMutationIdentity,
 } from './OpenCodeLaunchMutationLedger.js'
 import {
@@ -159,6 +161,27 @@ export function inspectOpenCodeProductionGeneration(
   throw new Error('OpenCode durable command ledger generation mismatch')
 }
 
+/** A remote cleanup is authorized only by the exact, latest journaled mutation intent. */
+export function hasExactOpenCodeClaimReconciliationAuthority(
+  journal: Pick<OpenCodeLaunchJournal,
+    'acceptedProofResponse' | 'generation' | 'fence' | 'inputDigest' | 'immutableDigest' | 'events'> | null,
+  exactCurrentGeneration: boolean,
+  claim: OpenCodeLaunchMutationClaimRecord,
+): boolean {
+  if (!journal?.acceptedProofResponse || !exactCurrentGeneration
+    || claim.generation !== journal.generation
+    || claim.fence !== journal.fence
+    || claim.inputDigest !== journal.inputDigest
+    || claim.immutableDigest !== journal.immutableDigest
+    || !claim.claimToken.startsWith(`${claim.acquisitionToken}.`)) return false
+  const latest = journal.events.findLast(event => event.memberIdentity === claim.memberIdentity)
+  return latest?.type === 'member_intent'
+    && latest.generation === claim.generation
+    && latest.fence === claim.fence
+    && latest.inputDigest === claim.inputDigest
+    && latest.claimToken === claim.claimToken
+}
+
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
 }
@@ -267,6 +290,10 @@ class OpenCodeProductionLaunchRuntime {
         projectPath: command.projectPath, abortSignal: controls.signal,
       },
     )
+    if (authorization.input.evidence.projectBehaviorFingerprint
+      !== command.preconditions.expectedBehaviorFingerprint) {
+      throw new Error('OpenCode launch expected behavior fingerprint is stale')
+    }
     const authorized = { ...command, effectiveProfilePlanDigest: authorization.effectivePlanDigest }
     this.authorizedPlans.set(authorized, authorization)
     return authorized
@@ -386,6 +413,7 @@ class OpenCodeProductionLaunchRuntime {
         generation: command.request.launchAttempt.generation,
         acceptedProofResponse: journal.acceptedProofResponse,
         profileBinding: journal.profileBinding,
+        members: command.members.map(member => member.memberIdentity),
       })
       const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
       const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
@@ -422,7 +450,7 @@ class OpenCodeProductionLaunchRuntime {
     }
     const priorClaims = await Promise.all(command.members.map(async member => {
       const target = targetByMember.get(member.memberIdentity)!
-      const claim = await mutationLedger.read(target, { deadlineAtMs: preflightDeadlineAtMs,
+      let claim = await mutationLedger.read(target, { deadlineAtMs: preflightDeadlineAtMs,
         signal: preflightSignal, monotonicNow: launchMonotonicNow })
       if (!claim) return { member, claim: null, record: null, linkage: null }
       if (claim.attemptId !== command.request.launchAttempt.attemptId
@@ -433,6 +461,33 @@ class OpenCodeProductionLaunchRuntime {
       let record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
       let linkage = record ? linkageFor(member.memberIdentity, record) : null
       let reconciliationError: string | null = null
+      if (claim.state === 'claimed') {
+        if (!hasExactOpenCodeClaimReconciliationAuthority(journal, exactCurrentGeneration, claim)) {
+          reconciliationError = 'authority'
+        } else try {
+          const host = await getRecoveryHost()
+          const client = openCodeClientFactory.create(host.baseUrl, {
+            signal: preflightSignal,
+            remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+          })
+          const ownershipToken = createHash('sha256').update(claim.claimToken).digest('hex')
+          const ownershipTitle = `agent-teams-launch:${claim.attemptId}:${claim.memberIdentity}:${ownershipToken}`
+          const outcome = await reconcileOpenCodeOwnedMemberSession({
+            authoritativeSessionId: claim.idempotencyIdentity,
+            ownershipTitle,
+            getSession: id => client.getSession(id),
+            deleteSession: id => client.deleteSession(id),
+          })
+          if (outcome === 'absent' || outcome === 'deleted') {
+            await mutationLedger.transition(target, claim, 'known_failure', undefined, {
+              deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal,
+              monotonicNow: launchMonotonicNow,
+            })
+            claim = (await mutationLedger.read(target, { deadlineAtMs: preflightDeadlineAtMs,
+              signal: preflightSignal, monotonicNow: launchMonotonicNow }))!
+          } else reconciliationError = outcome
+        } catch { reconciliationError = 'transport' }
+      }
       if (claim.state === 'committed' && (!claim.linkage || !linkage
         || JSON.stringify(claim.linkage) !== JSON.stringify(linkage))) {
         if (record) reconciliationError = 'local_metadata'

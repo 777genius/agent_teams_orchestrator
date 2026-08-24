@@ -1416,6 +1416,7 @@ export class OpenCodeLaunchAttemptStore {
         : []
       let active = true
       let leasePoison: OpenCodeLaunchPoisonedLeaseError | undefined
+      let leaseFailure: unknown
       const lease: OpenCodeLaunchJournalLease = {
         journal,
         generation,
@@ -1583,6 +1584,7 @@ export class OpenCodeLaunchAttemptStore {
           try { await this.persist(candidate, appendContext ?? effectiveContext) }
           catch (error) {
             active = false
+            leaseFailure = error
             if (error instanceof OpenCodeLaunchPoisonedLeaseError) leasePoison = error
             throw error
           }
@@ -1592,7 +1594,8 @@ export class OpenCodeLaunchAttemptStore {
       // Defined after appendEvent so every transition shares the exact same durable validation.
       lease.revalidate = async (memberIdentity, claimToken, revalidateContext) => {
           if (!active) throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
-          const current = await this.load({ ...identity, inputDigest: journal!.inputDigest }, revalidateContext ?? effectiveContext)
+          const current = await this.load({ ...identity, inputDigest: journal!.inputDigest,
+            startedAtMs: undefined, totalBudgetMs: undefined }, revalidateContext ?? effectiveContext)
           if (!current || current.generation !== generation || current.fence !== fence) {
             active = false
             throw new OpenCodeLaunchJournalError('fenced', 'durable generation changed')
@@ -1607,6 +1610,7 @@ export class OpenCodeLaunchAttemptStore {
       try {
         const result = await operation(lease)
         if (leasePoison) throw leasePoison
+        if (leaseFailure) throw leaseFailure
         return result
       } catch (error) {
         if (leasePoison) throw leasePoison
@@ -1653,6 +1657,13 @@ export class OpenCodeLaunchAttemptStore {
     try { value = JSON.parse(new TextDecoder().decode(bytes)) }
     catch { throw new OpenCodeLaunchJournalError('corrupt', 'journal is not valid JSON') }
     const journal = validateJournal(value, identity)
+    // Generation publication is journal-first. If the process died after the atomic journal
+    // marker but before its monotonic anchor, the complete validated candidate is sufficient to
+    // finish the one-step fence transition under the exclusive lease.
+    if (journal.fence === anchor + 1 && journal.generation === journal.fence) {
+      await this.advanceFenceRecoverably(anchor, journal.fence, context)
+      return journal
+    }
     if (journal.fence !== anchor || journal.generation !== anchor) {
       throw new OpenCodeLaunchJournalError('fenced', 'journal does not match durable fence anchor')
     }
@@ -1672,14 +1683,7 @@ export class OpenCodeLaunchAttemptStore {
     if (journal.fence < anchor || journal.generation !== journal.fence || journal.fence > anchor + 1) {
       throw new OpenCodeLaunchJournalError('fenced', 'journal fence cannot roll back or skip anchor')
     }
-    if (journal.fence === anchor + 1) {
-      try { await this.advanceFence(anchor, journal.fence, context) }
-      catch (error) {
-        try { await this.quarantineAmbiguousFence(journal.fence, context) }
-        catch (quarantineError) { throw new OpenCodeLaunchPoisonedLeaseError(error, quarantineError) }
-        throw error
-      }
-    }
+    const advancesGeneration = journal.fence === anchor + 1
     const replacement = this.persistence.replaceAndSync(bytes, context)
     let replacementSettled = false
     const physicalSettlement = replacement.then(
@@ -1691,16 +1695,16 @@ export class OpenCodeLaunchAttemptStore {
       // until the persistence promise settles.
       await awaitWithContext(replacement, context, false)
     } catch (error) {
-      // A backend may report an fsync error after publishing its marker. Authority is the separately
-      // readable committed generation, not the throw or the in-memory candidate.
-      let quarantineFailure: unknown
-      try { await this.quarantineAmbiguousFence(journal.fence, context) }
-      catch (quarantineError) { quarantineFailure = quarantineError }
-      if (!replacementSettled || quarantineFailure !== undefined) {
-        throw new OpenCodeLaunchPoisonedLeaseError(error, quarantineFailure, physicalSettlement)
+      if (!replacementSettled) throw new OpenCodeLaunchPoisonedLeaseError(error, undefined, physicalSettlement)
+      // A publish-then-throw candidate remains a complete recoverable generation. Do not advance a
+      // poison/quarantine fence; the next lease either observes this exact journal or the prior one.
+      const visible = await this.persistence.read(context).catch(() => null)
+      if (advancesGeneration && visible && bytesEqual(visible, bytes)) {
+        await this.advanceFenceRecoverably(anchor, journal.fence, context)
       }
       throw error
     }
+    if (advancesGeneration) await this.advanceFenceRecoverably(anchor, journal.fence, context)
   }
 
   /**
@@ -1734,24 +1738,6 @@ export class OpenCodeLaunchAttemptStore {
         throw new OpenCodeLaunchPoisonedLeaseError(error, undefined, physicalSettlement)
       }
       throw error
-    }
-  }
-
-  private async quarantineAmbiguousFence(fence: number, context?: OpenCodeLaunchStoreContext): Promise<void> {
-    const quarantineContext = context && context.signal.aborted
-      ? { ...context, signal: new AbortController().signal }
-      : context
-    let anchor = await awaitWithContext(this.persistence.readFence(quarantineContext), quarantineContext)
-    if (anchor === fence - 1) {
-      await awaitWithContext(this.persistence.compareAndSwapFence(fence - 1, fence, quarantineContext), quarantineContext, false)
-      anchor = await awaitWithContext(this.persistence.readFence(quarantineContext), quarantineContext)
-    }
-    if (anchor === fence) {
-      await awaitWithContext(this.persistence.compareAndSwapFence(fence, fence + 1, quarantineContext), quarantineContext, false)
-      anchor = await awaitWithContext(this.persistence.readFence(quarantineContext), quarantineContext)
-    }
-    if (anchor !== fence + 1) {
-      throw new OpenCodeLaunchJournalError('fenced', 'ambiguous generation could not be quarantined')
     }
   }
 
@@ -1795,9 +1781,30 @@ export class OpenCodeLaunchAttemptStore {
     return await awaitWithContext(this.persistence.readFence(context), context) ?? 0
   }
 
-  private async advanceFence(expected: number, next: number, context?: OpenCodeLaunchStoreContext): Promise<void> {
-    await awaitWithContext(this.persistence.compareAndSwapFence(expected, next, context), context, false)
+  private async advanceFenceRecoverably(
+    expected: number,
+    next: number,
+    context?: OpenCodeLaunchStoreContext,
+  ): Promise<void> {
+    const publication = this.persistence.compareAndSwapFence(expected, next, context)
+    let settled = false
+    const physicalSettlement = publication.then(() => { settled = true }, () => { settled = true })
+    try { await awaitWithContext(publication, context, false) }
+    catch (error) {
+      if (!settled) throw new OpenCodeLaunchPoisonedLeaseError(error, undefined, physicalSettlement)
+      const observed = await this.readFence(context).catch(() => -1)
+      if (observed === next) return
+      throw error
+    }
   }
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false
+  }
+  return true
 }
 
 async function acquireWithLateReap(

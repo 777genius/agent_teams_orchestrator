@@ -338,8 +338,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     })).rejects.toThrow('ambiguous fsync')
     expect(JSON.parse(persistence.text()).events).toEqual([])
     await expect(stale.append({ type: 'member_intent', memberIdentity: member })).rejects.toMatchObject({ code: 'fenced' })
-    expect(persistence.fence).toBe(2)
-    await expect(new OpenCodeLaunchAttemptStore(persistence).inspect(identity)).rejects.toMatchObject({ code: 'fenced' })
+    expect(persistence.fence).toBe(1)
+    expect(await new OpenCodeLaunchAttemptStore(persistence).inspect(identity)).toMatchObject({ events: [] })
   })
 
   test('keeps the lease through a delayed physical replacement so generation 1 cannot complete after generation 2', async () => {
@@ -374,7 +374,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     })
   })
 
-  test('quarantines publish-then-throw even when visibility matches the candidate', async () => {
+  test('keeps a same-generation publish-then-throw candidate replayable', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     await store.withGeneration(identity, 'begin', async () => undefined)
@@ -382,11 +382,11 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     persistence.replaceAndSync = async bytes => { await replace(bytes); throw new Error('post-publish fsync ambiguity') }
     await expect(store.withGeneration(identity, 'begin', lease =>
       lease.append({ type: 'member_intent', memberIdentity: member }))).rejects.toThrow('post-publish fsync ambiguity')
-    expect(persistence.fence).toBe(2)
-    await expect(store.inspect(identity)).rejects.toMatchObject({ code: 'fenced' })
+    expect(persistence.fence).toBe(1)
+    expect(await store.inspect(identity)).toMatchObject({ events: [{ type: 'member_intent' }] })
   })
 
-  test('keeps a poisoned lease when an ambiguous replacement cannot advance its quarantine fence', async () => {
+  test('does not require a quarantine fence for a settled same-generation replacement error', async () => {
     const persistence = new MemoryPersistence()
     let releases = 0
     persistence.acquireExclusive = async () => async () => { releases += 1 }
@@ -396,16 +396,12 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     persistence.replaceAndSync = async bytes => { await replace(bytes); throw new Error('ambiguous replacement') }
     persistence.compareAndSwapFence = async () => { throw new Error('fence unavailable') }
     await expect(store.withGeneration(identity, 'begin', lease =>
-      lease.append({ type: 'member_intent', memberIdentity: member }))).rejects.toMatchObject({ code: 'fenced' })
-    expect(releases).toBe(1)
-    const controller = new AbortController()
-    const waiting = store.inspect(identity, { deadlineAtMs: 10, monotonicNow: () => 0, signal: controller.signal })
-    controller.abort(new Error('poisoned'))
-    await expect(waiting).rejects.toThrow('poisoned')
-    expect(releases).toBe(1)
+      lease.append({ type: 'member_intent', memberIdentity: member }))).rejects.toThrow('ambiguous replacement')
+    expect(releases).toBe(2)
+    expect(await store.inspect(identity)).toMatchObject({ events: [{ type: 'member_intent' }] })
   })
 
-  test('quarantines a publish-then-throw fence CAS without publishing its journal generation', async () => {
+  test('accepts a journal-first generation when fence CAS publishes then throws', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     await store.withGeneration(identity, 'begin', async () => undefined)
@@ -416,15 +412,15 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       await compare(expected, next)
       if (ambiguous) { ambiguous = false; throw new Error('fence fsync ambiguity') }
     }
-    await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
       continuationToken },
-      'continue', async () => undefined)).rejects.toThrow('fence fsync ambiguity')
-    expect(persistence.fence).toBe(3)
-    expect(JSON.parse(persistence.text())).toMatchObject({ generation: 1, fence: 1 })
-    await expect(store.inspect(identity)).rejects.toMatchObject({ code: 'fenced' })
+      'continue', async () => undefined)
+    expect(persistence.fence).toBe(2)
+    expect(JSON.parse(persistence.text())).toMatchObject({ generation: 2, fence: 2 })
+    expect(await store.inspect({ ...identity, inputDigest: 'b'.repeat(64) })).toMatchObject({ generation: 2 })
   })
 
-  test('poisons the lease when the quarantine CAS itself publishes and throws', async () => {
+  test('recovers a complete same-generation journal without consulting the fence CAS', async () => {
     const persistence = new MemoryPersistence()
     let releases = 0
     persistence.acquireExclusive = async () => async () => { releases += 1 }
@@ -438,12 +434,12 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       throw new Error('quarantine fsync ambiguity')
     }
     await expect(store.withGeneration(identity, 'begin', lease =>
-      lease.append({ type: 'member_intent', memberIdentity: member }))).rejects.toMatchObject({ code: 'fenced' })
-    expect(persistence.fence).toBe(2)
-    expect(releases).toBe(1)
+      lease.append({ type: 'member_intent', memberIdentity: member }))).rejects.toThrow('journal fsync ambiguity')
+    expect(persistence.fence).toBe(1)
+    expect(releases).toBe(2)
   })
 
-  test('cannot release a poisoned lease when the operation swallows the append failure', async () => {
+  test('cannot report success after a swallowed settled append failure', async () => {
     const persistence = new MemoryPersistence()
     let releases = 0
     persistence.acquireExclusive = async () => async () => { releases += 1 }
@@ -455,8 +451,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     await expect(store.withGeneration(identity, 'begin', async lease => {
       await lease.append({ type: 'member_intent', memberIdentity: member }).catch(() => undefined)
       return 'incorrect-success'
-    })).rejects.toMatchObject({ code: 'fenced' })
-    expect(releases).toBe(1)
+    })).rejects.toThrow('ambiguous replacement')
+    expect(releases).toBe(2)
   })
 
   test('rejects fence-anchor rollback, anchor-without-journal, and impossible top-level layouts', async () => {

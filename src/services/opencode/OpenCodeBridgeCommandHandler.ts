@@ -30,6 +30,8 @@ import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
+  parseOpenCodeBridgePreconditions,
+  validateOpenCodeLaunchBoundaryPreconditions,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
 import {
@@ -2848,6 +2850,8 @@ async function runLaunch(
       body,
       runtime: createRuntimePreconditionSnapshot(null),
     })
+    const preconditions = validateOpenCodeLaunchBoundaryPreconditions(
+      parseOpenCodeBridgePreconditions(body.preconditions), request.launchAttempt.attemptId)
     const members: OpenCodeLaunchBridgeMember[] = membersRaw.map((item, index) => {
       const member = asRecord(item)
       const name = asString(member?.name)
@@ -2878,6 +2882,7 @@ async function runLaunch(
       outerRemainingBudgetMs: runtimeDeadline.remainingMs(),
       deadlineAtMs: runtimeDeadline.deadlineAtMs,
       signal: runtimeDeadline.signal,
+      preconditions,
     })
     return result
   }

@@ -14,6 +14,10 @@ import {
 import type { OpenCodeLaunchAttemptStore } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import {
+  validateOpenCodeLaunchBoundaryPreconditions,
+  type OpenCodeBridgeCommandPreconditions,
+} from './OpenCodeBridgePreconditions.js'
 
 export type OpenCodeLaunchBridgeMember = {
   name: string
@@ -53,6 +57,8 @@ export type OpenCodeLaunchAttemptBridgePort = {
     deadlineAtMs?: number
     /** S1-authored immutable plan identity, added only by production composition. */
     effectiveProfilePlanDigest?: string
+    /** Strict handshake/behavior/lease authority, bound into the command ledger identity. */
+    preconditions: OpenCodeBridgeCommandPreconditions
   }): Promise<{
     snapshot: OpenCodeProvisioningSnapshot
     /** Existing bridge response projection, produced only from durable S3 outcomes. */
@@ -164,6 +170,7 @@ export class OpenCodeLaunchAttemptBridge implements OpenCodeLaunchAttemptBridgeP
     input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
   ): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
     const attempt = input.request.launchAttempt
+    validateOpenCodeLaunchBoundaryPreconditions(input.preconditions, attempt.attemptId)
     validateOpenCodeLaunchContinuation({
       attemptId: attempt.attemptId,
       payloadHash: attempt.payloadHash,
@@ -227,6 +234,7 @@ export function computeOpenCodeLaunchCommandInputDigest(
     continuation: input.continuation,
     requestedBudgetMs: input.requestedBudgetMs,
     effectiveProfilePlanDigest: input.effectiveProfilePlanDigest ?? null,
+    preconditions: input.preconditions,
     members: input.members.map(member => ({
       memberIdentity: member.memberIdentity,
       name: member.name,
@@ -257,6 +265,12 @@ export function computeOpenCodeLaunchCommandImmutableDigest(
     toolApprovalMode: input.toolApprovalMode,
     requestedBudgetMs: input.requestedBudgetMs,
     effectiveProfilePlanDigest: input.effectiveProfilePlanDigest ?? null,
+    preconditions: {
+      laneId: input.preconditions.laneId,
+      expectedRunId: input.preconditions.expectedRunId,
+      expectedBehaviorFingerprint: input.preconditions.expectedBehaviorFingerprint,
+      idempotencyKey: input.preconditions.idempotencyKey,
+    },
     members: input.members.map(member => ({
       memberIdentity: member.memberIdentity,
       name: member.name,

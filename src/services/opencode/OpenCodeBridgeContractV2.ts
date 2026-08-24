@@ -1,5 +1,6 @@
 /** Pure optional wire contract. Legacy executionProof is never launch authorization. */
 import { types as nodeUtilTypes } from 'node:util'
+import { createHash } from 'node:crypto'
 import {
   OPEN_CODE_LAUNCH_FAILURE_POLICY,
   type OpenCodeLaunchFailureKind,
@@ -723,6 +724,21 @@ function decodeResponse(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeLaun
       || members.value.continuationToken !== undefined)) return invalid('members.continuationToken')
   if (members.value.continuationToken !== undefined
     && outcome !== 'partial') return invalid('members.continuationToken')
+  if (proof === undefined) {
+    const attempt = launchAttempt.value
+    const terminal = (field: string): OpenCodeOpaqueIdentity => `sha256:${createHash('sha256')
+      .update(`terminal-not-authorized\0${attempt.attemptId}\0${field}`).digest('hex')}`
+    if (outcome === 'succeeded' || outcome === 'partial' || members.value.committed.length > 0
+      || members.value.continuationToken !== undefined
+      || attempt.projectIdentity !== terminal('project') || attempt.profileIdentity !== terminal('profile')
+      || attempt.configIdentity !== terminal('config') || attempt.authIdentity !== terminal('auth')
+      || attempt.pluginPolicyIdentity !== terminal('plugin') || attempt.cacheIdentity !== terminal('cache')
+      || attempt.binaryIdentity !== terminal('binary')
+      || attempt.retainedHostIdentity.hostKeyIdentity !== terminal('host')
+      || attempt.retainedHostIdentity.profileScopeIdentity !== terminal('profile')
+      || attempt.retainedHostIdentity.processId !== 1
+      || attempt.retainedHostIdentity.processStartedAtMs !== 0) return invalid('proof')
+  }
   return { ok: true, value: {
     launchAttempt: launchAttempt.value,
     ...(proof === undefined ? {} : { proof }),

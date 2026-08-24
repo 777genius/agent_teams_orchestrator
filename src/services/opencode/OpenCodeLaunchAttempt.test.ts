@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 
-import { OpenCodeLaunchAttempt, type OpenCodeLaunchAttemptPorts } from './OpenCodeLaunchAttempt.js'
+import { OpenCodeLaunchAttempt, validateOpenCodeLaunchResponseRoster,
+  type OpenCodeLaunchAttemptPorts } from './OpenCodeLaunchAttempt.js'
 import { projectOpenCodeLaunchAttemptResponse } from './OpenCodeLaunchAttemptProduction.js'
 import { decodeOpenCodeLaunchAttemptResponse } from './OpenCodeBridgeContractV2.js'
 import {
@@ -194,6 +195,46 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     expect(result.status).toBe('failed')
     expect(subject.calls.some(call => call.startsWith('create:'))).toBe(false)
     expect(subject.persistence.json().events).toEqual([])
+  })
+
+  test('durably publishes a proof-null terminal failure so an exact duplicate never reruns setup', async () => {
+    const subject = setup({ proof: response => { response.proof!.providerId = 'openai' } })
+    const first = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(first.status).toBe('failed')
+    expect(first.durableFinalResponse).toMatchObject({
+      launchAttempt: { outcome: 'failed' },
+      failure: { code: 'contract_violation', sideEffectsStarted: false },
+    })
+    expect(first.durableFinalResponse?.proof).toBeUndefined()
+    const inventedAuthority = structuredClone(first.durableFinalResponse!)
+    inventedAuthority.launchAttempt.projectIdentity = oid('e')
+    expect(decodeOpenCodeLaunchAttemptResponse(inventedAuthority)).toMatchObject({ ok: false })
+    const calls = subject.calls.length
+    const replay = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay.durableFinalResponse).toEqual(first.durableFinalResponse)
+    expect(subject.calls).toHaveLength(calls)
+  })
+
+  test.each([
+    ['missing roster identity', (value: OpenCodeLaunchAttemptResponse) => { value.members.committed.pop() }],
+    ['invented roster identity', (value: OpenCodeLaunchAttemptResponse) => {
+      value.members.committed[0]!.memberIdentity = oid('e')
+    }],
+    ['overlapping roster partitions', (value: OpenCodeLaunchAttemptResponse) => {
+      value.members.pending.push(value.members.committed[0]!.memberIdentity)
+    }],
+    ['committed cleanup identity', (value: OpenCodeLaunchAttemptResponse) => {
+      value.members.cleanupPending.push(value.members.committed[0]!.memberIdentity)
+    }],
+    ['wrong parent linkage', (value: OpenCodeLaunchAttemptResponse) => {
+      value.proof!.parent.messageIdentity = oid('f')
+    }],
+  ] as const)('rejects Desktop V1 %s against the authoritative roster', async (_name, mutate) => {
+    const subject = setup()
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    const response = structuredClone(result.durableFinalResponse!)
+    mutate(response)
+    expect(() => validateOpenCodeLaunchResponseRoster(response, members, request().launchAttempt.parent)).toThrow()
   })
 
   test('uses capped phase deadlines and one absolute deadline with positive cleanup reserve', async () => {
@@ -404,11 +445,16 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
       if (journal.events.at(-1)?.type === 'member_applied') subject.setNow(9_000)
     }
     const result = await subject.launch.run({
-      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+      request: request(), members, requestedBudgetMs: 10_000,
     })
     expect(result.status).toBe('partial')
     expect(result.failure?.kind).toBe('deadline_after_partial')
     expect(result.committed).toEqual([linkage(members[0])])
+    expect(result.continuationToken).toMatch(/^opencode-launch-continuation-v1\./)
+    expect(subject.persistence.json().finalResponse).toMatchObject({
+      launchAttempt: { outcome: 'partial' },
+      members: { pending: [members[1]], continuationToken: result.continuationToken },
+    })
     expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual([
       'member_intent', 'member_applied',
     ])
@@ -416,6 +462,19 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
 })
 
 describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cleanup', () => {
+  test.each(['contract_violation', 'attempt_budget_exhausted'] as const)(
+    'preserves partial %s taxonomy and never issues a forbidden continuation', async failure => {
+      const subject = setup({ materialize: async member => member === members[0]
+        ? { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } }
+        : { outcome: 'known_failure', failure, externalEffect: false, owned: { memberIdentity: member } } })
+      const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+      expect(result.status).toBe('partial')
+      expect(result.failure?.kind).toBe(failure)
+      expect(result.continuationToken).toBeUndefined()
+      expect(subject.persistence.json().finalResponse.members.continuationToken).toBeUndefined()
+    },
+  )
+
   test('tombstones a timeout after claim and never authorizes a continuation resend from absence', async () => {
     let creates = 0
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
@@ -455,7 +514,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(result.continuationToken).toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]+$/)
     expect(result.committed.map(item => item.memberIdentity)).toEqual([members[0]])
     expect(result.failure).toMatchObject({
-      kind: 'deadline_after_partial', retryDisposition: 'continuation', sideEffectsStarted: true,
+      kind: 'pre_side_effect_transport', retryDisposition: 'automatic', sideEffectsStarted: false,
     })
     const projected = projectOpenCodeLaunchAttemptResponse(result)
     expect(decodeOpenCodeLaunchAttemptResponse(projected)).toMatchObject({
@@ -1019,6 +1078,25 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().finalResponse).toEqual(projected)
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(1)
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(1)
+  })
+
+  test('reuses the durable accepted proof after a partial-roster crash and progresses the remainder', async () => {
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative })
+    const first = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    const journal = subject.persistence.json()
+    journal.events = journal.events.filter((event: any) => event.memberIdentity === members[0])
+    journal.finalResponse = undefined
+    subject.persistence.bytes = new TextEncoder().encode(JSON.stringify(journal))
+    authoritative.set(members[0], first.committed[0]!)
+    const proofs = subject.calls.filter(call => call === 'proof').length
+    const creates = subject.calls.filter(call => call.startsWith('create:')).length
+
+    const replay = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay.status).toBe('succeeded')
+    expect(subject.calls.filter(call => call === 'proof')).toHaveLength(proofs)
+    expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(creates + 1)
+    expect(replay.acceptedProofResponse?.proof).toEqual(journal.acceptedProofResponse.proof)
   })
 
   test('replays the exact authoritative response after a crash immediately after publication', async () => {

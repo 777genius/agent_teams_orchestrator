@@ -83,8 +83,11 @@ export class OpenCodeLaunchMutationLedger {
         if (current.state === 'committed') return 'already_committed'
         if (current.state === 'known_failure') {
           if (sameImmutableAuthority(current, identity)
-            && identity.generation === current.generation + 1
-            && identity.fence === current.fence + 1) {
+            && ((identity.generation === current.generation + 1
+                && identity.fence === current.fence + 1)
+              || (identity.generation === current.generation
+                && identity.fence === current.fence
+                && identity.inputDigest === current.inputDigest))) {
             const reclaimed: ClaimRecord = { ...current, ...identity, state: 'claimed' }
             validateClaimRecord(reclaimed)
             await persistence.replaceAndSync(new TextEncoder().encode(JSON.stringify(reclaimed)), context)

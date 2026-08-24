@@ -51,6 +51,12 @@ function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
     runId: 'run', laneId: 'primary', teamId: 'team', projectPath,
     selectedModel: 'openrouter/model', toolApprovalMode: 'auto', continuation: false,
     requestedBudgetMs: 10_000,
+    preconditions: {
+      handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run',
+      expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
+      expectedManifestHighWatermark: null, commandLeaseId: 'lease-1',
+      idempotencyKey: '018f47a2-4a13-7c2f-8d44-c0ffee123456',
+    },
   }
 }
 

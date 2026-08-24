@@ -19,6 +19,7 @@ import type { OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import {
   createOpenCodeLaunchPreflightResult,
+  hasExactOpenCodeClaimReconciliationAuthority,
   inspectOpenCodeProductionGeneration,
   transitionOpenCodeProductionMemberClaim,
 } from './OpenCodeLaunchAttemptProduction.js'
@@ -84,6 +85,44 @@ test('production inspection accepts only exact current replay or exact next-gene
   expect(() => inspectOpenCodeProductionGeneration(continued, {
     generation: 2, inputDigest: continued.inputDigest, continuation: true, continuationToken: 'changed',
   })).toThrow()
+})
+
+test('claimed remote cleanup requires the exact accepted-proof journal intent authority', () => {
+  const claim = {
+    ...identityForProductionClaim(identity, 1, 'acquisition-1.claim-one'),
+    version: 1 as const,
+    targetDigest: 'f'.repeat(64),
+    idempotencyIdentity: 'ses_authoritative',
+    state: 'claimed' as const,
+  }
+  const journal = {
+    acceptedProofResponse: {} as never,
+    generation: claim.generation,
+    fence: claim.fence,
+    inputDigest: claim.inputDigest,
+    immutableDigest: claim.immutableDigest,
+    events: [{
+      type: 'member_intent' as const,
+      sequence: 1,
+      generation: claim.generation,
+      fence: claim.fence,
+      memberIdentity: claim.memberIdentity,
+      claimToken: claim.claimToken,
+      inputDigest: claim.inputDigest,
+    }],
+  }
+  expect(hasExactOpenCodeClaimReconciliationAuthority(journal, true, claim)).toBe(true)
+  expect(hasExactOpenCodeClaimReconciliationAuthority(journal, false, claim)).toBe(false)
+  expect(hasExactOpenCodeClaimReconciliationAuthority({ ...journal, acceptedProofResponse: undefined }, true, claim))
+    .toBe(false)
+  expect(hasExactOpenCodeClaimReconciliationAuthority({ ...journal, inputDigest: '0'.repeat(64) }, true, claim))
+    .toBe(false)
+  expect(hasExactOpenCodeClaimReconciliationAuthority({ ...journal, events: journal.events.map(event => ({
+    ...event, claimToken: 'acquisition-1.invented',
+  })) }, true, claim)).toBe(false)
+  expect(hasExactOpenCodeClaimReconciliationAuthority({ ...journal, events: [...journal.events, {
+    ...journal.events[0]!, sequence: 2, type: 'member_unknown' as const,
+  }] }, true, claim)).toBe(false)
 })
 
 test('production authority continues member 1 committed/member 2 proven failure only in generation 2', async () => {

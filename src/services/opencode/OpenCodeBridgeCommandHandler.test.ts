@@ -718,6 +718,16 @@ function buildStrictLaunchEnvelope(overrides: Record<string, unknown> = {}) {
       memberIdentity: strictLaunchIdentity('d'),
       prompt: 'fake prompt',
     }],
+    preconditions: {
+      handshakeIdentityHash: '1'.repeat(64),
+      laneId: 'primary',
+      expectedRunId: 'run-strict-preconditions',
+      expectedCapabilitySnapshotId: null,
+      expectedBehaviorFingerprint: '2'.repeat(64),
+      expectedManifestHighWatermark: null,
+      commandLeaseId: 'lease-1',
+      idempotencyKey: '018f47a2-4a13-7c2f-8d44-c0ffee123456',
+    },
     ...overrides,
   })
 }

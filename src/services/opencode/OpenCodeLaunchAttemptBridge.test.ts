@@ -48,6 +48,12 @@ function envelope(overrides: Record<string, unknown> = {}) {
         { name: 'alice', memberIdentity: identity('d'), prompt: 'fake prompt' },
         { name: 'bob', memberIdentity: identity('e') },
       ],
+      preconditions: {
+        handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run-s3',
+        expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
+        expectedManifestHighWatermark: null, commandLeaseId: 'lease-1',
+        idempotencyKey: '018f47a2-4a13-7c2f-8d44-c0ffee123456',
+      },
       ...overrides,
     },
   }
