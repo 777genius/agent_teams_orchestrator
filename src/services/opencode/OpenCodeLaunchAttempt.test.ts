@@ -883,9 +883,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
     expect(result.committed).toEqual([])
     expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
+    expect(subject.persistence.json().events.at(-1)).toMatchObject({
+      type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
+    })
     callerDeadlineExpired = false
     subject.setNow(2)
-    const replay = await subject.launch.run({
+    const restarted = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
+    const replay = await restarted.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,
     })
     expect(replay.cleanup).toBe('timed_out')
@@ -952,7 +956,11 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(cleanupCalls).toBe(1)
     expect(subject.calls).not.toContain('release')
     expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
-    const replay = await subject.launch.run({
+    expect(subject.persistence.json().events.at(-1)).toMatchObject({
+      type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
+    })
+    const restarted = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
+    const replay = await restarted.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,
     })
     expect(replay.cleanup).toBe('timed_out')

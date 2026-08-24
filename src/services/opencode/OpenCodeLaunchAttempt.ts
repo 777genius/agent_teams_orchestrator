@@ -741,10 +741,16 @@ export class OpenCodeLaunchAttempt {
                     if (!cleanupClaimToken) continue
                     try {
                       await lease.append({ type: 'cleanup', memberIdentity: resource.memberIdentity,
-                        outcome: cleanup, claimToken: cleanupClaimToken }, {
-                        deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
-                        monotonicNow: () => this.ports.clock.monotonicNow(),
-                      })
+                        outcome: cleanup, claimToken: cleanupClaimToken }, deferredAuthoritySettlement
+                        ? {
+                          deadlineAtMs: Number.MAX_SAFE_INTEGER,
+                          signal: new AbortController().signal,
+                          monotonicNow: () => this.ports.clock.monotonicNow(),
+                        }
+                        : {
+                          deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
+                          monotonicNow: () => this.ports.clock.monotonicNow(),
+                        })
                     } catch (appendError) { persistenceFailure ??= appendError }
                   }
                 })()
@@ -752,9 +758,11 @@ export class OpenCodeLaunchAttempt {
               }
               if (deferredAuthoritySettlement) {
                 cleanup = 'timed_out'
-                void deferredAuthoritySettlement.then(
+                const deferredCleanupSettlement = deferredAuthoritySettlement.then(
                   () => cleanupHost(), () => cleanupHost(),
-                ).catch(() => undefined)
+                ).then(() => undefined, () => undefined)
+                lease.retainUntilPhysicalSettlement(deferredCleanupSettlement)
+                void deferredCleanupSettlement
               } else await cleanupHost()
             }
           }

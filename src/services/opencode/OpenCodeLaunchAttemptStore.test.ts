@@ -13,7 +13,11 @@ import {
   type OpenCodeLaunchJournalLease,
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
-import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
+import type {
+  OpenCodeLaunchAttemptResponse,
+  OpenCodeLaunchMemberLinkage,
+  OpenCodeOpaqueIdentity,
+} from './OpenCodeBridgeContractV2.js'
 
 const identity = {
   attemptId: '123e4567-e89b-42d3-a456-426614174000',
@@ -25,6 +29,39 @@ const linkage: OpenCodeLaunchMemberLinkage = {
   memberIdentity: member, sessionIdentity: oid('2'),
   bootstrapMessageIdentity: oid('3'), commitIdentity: oid('4'),
 }
+const finalResponse = (): OpenCodeLaunchAttemptResponse => ({
+  launchAttempt: {
+    contractVersion: 1, attemptId: identity.attemptId, idempotencyKey: 'attemptId',
+    payloadHash: identity.payloadHash, generation: 1, inputDigest: 'e'.repeat(64),
+    immutableDigest: 'f'.repeat(64), outcome: 'reconciliation_required', phase: 'complete',
+    startedAt: 0, absoluteDeadlineAt: 10_000, workDeadlineAt: 9_000,
+    cleanupReserveMs: 1_000, elapsedMs: 10_000, providerId: 'anthropic',
+    modelId: 'anthropic/claude-sonnet-4-5', profilePurpose: 'launch_attempt',
+    projectIdentity: oid('5'), profileIdentity: oid('6'), configIdentity: oid('7'),
+    authIdentity: oid('8'), pluginPolicyIdentity: oid('9'), cacheIdentity: oid('a'),
+    binaryIdentity: oid('b'), retainedHostIdentity: {
+      hostKeyIdentity: oid('c'), processId: 410, processStartedAtMs: 991,
+      profileScopeIdentity: oid('d'),
+    },
+  },
+  proof: {
+    generation: 1, attemptId: identity.attemptId,
+    parent: { sessionIdentity: oid('e'), messageIdentity: oid('f') },
+    providerId: 'anthropic', modelId: 'anthropic/claude-sonnet-4-5',
+    retainedHostIdentity: {
+      hostKeyIdentity: oid('c'), processId: 410, processStartedAtMs: 991,
+      profileScopeIdentity: oid('d'),
+    },
+    observedMcpTools: ['mcp__app__team'], nonceHash: '0'.repeat(64),
+    sessionIdentity: oid('2'), promptMessageIdentity: oid('3'), assistantMessageIdentity: oid('4'),
+    verifiedAt: 1, authorizationSource: 'fresh_live_attempt', cacheUsed: false,
+  },
+  members: { committed: [], failed: [], pending: [member], cleanupPending: [member] },
+  failure: {
+    code: 'unknown_transport_after_side_effect', origin: 'session', retryDisposition: 'never',
+    retryable: false, phase: 'member_materialize', sideEffectsStarted: true,
+  },
+})
 const leasePath = (filePath: string) => deriveOpenCodeLaunchNamespacePaths(filePath, posix).lock
 
 async function issueContinuation(
@@ -453,6 +490,56 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       return 'incorrect-success'
     })).rejects.toThrow('ambiguous replacement')
     expect(releases).toBe(2)
+  })
+
+  test.each([
+    ['cleanup candidate, final publish, cleanup resume', 'event'],
+    ['final candidate, cleanup publish, final resume', 'finalResponse'],
+  ] as const)('serializes stale same-lease %s without erasing durable authority', async (_name, pausedKind) => {
+    const persistence = new MemoryPersistence()
+    let armed = false
+    let captured!: () => void
+    let resume!: () => void
+    const atCandidate = new Promise<void>(resolve => { captured = resolve })
+    const candidateGate = new Promise<void>(resolve => { resume = resolve })
+    const store = new OpenCodeLaunchAttemptStore(persistence, {
+      afterMutationCandidateCaptured: async kind => {
+        if (armed && kind === pausedKind) { armed = false; captured(); await candidateGate }
+      },
+    })
+    const exactIdentity = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    const publishedFinal = finalResponse()
+    let detachedAppend!: () => Promise<void>
+    await store.withGeneration(exactIdentity, 'begin', async lease => {
+      const claimToken = await lease.claim(member)
+      await lease.append({ type: 'member_unknown', memberIdentity: member, claimToken })
+      detachedAppend = () => lease.append({ type: 'cleanup', memberIdentity: member,
+        outcome: 'timed_out', claimToken })
+      armed = true
+      const cleanup = detachedAppend()
+      const commitFinal = lease.commitFinalResponse(publishedFinal)
+      await atCandidate
+      if (pausedKind === 'event') await commitFinal
+      else await cleanup
+      resume()
+      await Promise.all([cleanup, commitFinal])
+    })
+
+    const durable = JSON.parse(persistence.text())
+    expect(durable.finalResponse).toEqual(publishedFinal)
+    expect(durable.events.map((event: any) => event.type)).toEqual([
+      'member_intent', 'member_unknown', 'cleanup',
+    ])
+    expect(durable.events.at(-1)).toMatchObject({ outcome: 'timed_out', sequence: 3 })
+    await expect(detachedAppend()).rejects.toMatchObject({ code: 'fenced' })
+    expect(JSON.parse(persistence.text())).toEqual(durable)
+
+    const restarted = new OpenCodeLaunchAttemptStore(persistence)
+    expect(await restarted.inspect(exactIdentity)).toEqual(durable)
+    await restarted.withGeneration(exactIdentity, 'replay', async lease => {
+      expect(lease.journal.finalResponse).toEqual(publishedFinal)
+      expect(lease.journal.events.at(-1)).toMatchObject({ type: 'cleanup', outcome: 'timed_out' })
+    })
   })
 
   test('rejects fence-anchor rollback, anchor-without-journal, and impossible top-level layouts', async () => {

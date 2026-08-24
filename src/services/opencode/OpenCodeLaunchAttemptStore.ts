@@ -1309,6 +1309,13 @@ export type OpenCodeLaunchJournalLease = {
   retainUntilPhysicalSettlement(settlement: Promise<unknown>): void
 }
 
+export type OpenCodeLaunchJournalMutationKind = 'event' | 'finalResponse'
+
+export type OpenCodeLaunchAttemptStoreTestHooks = {
+  /** Test-only boundary after a mutation has captured its candidate but before it joins the lease-local writer queue. */
+  afterMutationCandidateCaptured?: (kind: OpenCodeLaunchJournalMutationKind) => Promise<void>
+}
+
 /**
  * Serializes every writer for an attempt. A continuation advances generation and
  * fence together, so a writer captured before an await cannot append afterward.
@@ -1316,7 +1323,10 @@ export type OpenCodeLaunchJournalLease = {
 export class OpenCodeLaunchAttemptStore {
   private tail: Promise<void> = Promise.resolve()
 
-  constructor(private readonly persistence: OpenCodeLaunchJournalPersistence) {}
+  constructor(
+    private readonly persistence: OpenCodeLaunchJournalPersistence,
+    private readonly testHooks: OpenCodeLaunchAttemptStoreTestHooks = {},
+  ) {}
 
   async inspect(identity: OpenCodeLaunchJournalIdentity, context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournal | null> {
     return this.exclusive(async () => this.load(identity, context), context)
@@ -1329,6 +1339,7 @@ export class OpenCodeLaunchAttemptStore {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<T> {
     let retainedPhysicalSettlement: Promise<void> | undefined
+    let deactivateLease = (): void => undefined
     let acquisitionContext = context
     if (context) {
       const timing = await this.peekTiming(identity, context)
@@ -1415,8 +1426,37 @@ export class OpenCodeLaunchAttemptStore {
           ? consumedContinuationMembers : journal.authorizedMemberIdentities ?? [])]
         : []
       let active = true
+      let externalRevalidationActive = true
+      deactivateLease = () => { active = false }
       let leasePoison: OpenCodeLaunchPoisonedLeaseError | undefined
       let leaseFailure: unknown
+      let mutationTail: Promise<void> = Promise.resolve()
+      const serializeMutation = async <T>(
+        mutation: () => Promise<T>,
+        mutationContext?: OpenCodeLaunchStoreContext,
+      ): Promise<T> => {
+        const previous = mutationTail
+        let releaseMutation!: () => void
+        mutationTail = new Promise<void>(resolve => { releaseMutation = resolve })
+        try {
+          await waitWithContext(previous, mutationContext ?? effectiveContext)
+          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
+            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+          }
+          return await mutation()
+        } finally {
+          releaseMutation()
+        }
+      }
+      const ensureLeaseActive = (): void => {
+        if (!active || journal!.generation !== generation || journal!.fence !== fence) {
+          throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+        }
+      }
+      const pauseAfterCandidateCapture = async (kind: OpenCodeLaunchJournalMutationKind): Promise<void> => {
+        ensureLeaseActive()
+        await this.testHooks.afterMutationCandidateCaptured?.(kind)
+      }
       const lease: OpenCodeLaunchJournalLease = {
         journal,
         generation,
@@ -1425,18 +1465,20 @@ export class OpenCodeLaunchAttemptStore {
         continuationEligibleMemberIdentities,
         bindProfile: async (binding, bindingContext) => {
           validateProfileBinding(binding)
-          if (journal!.profileBinding) {
-            if (!sameProfileBinding(journal!.profileBinding, binding)) {
-              throw new OpenCodeLaunchJournalError('foreign', 'launch profile identity changed')
+          await serializeMutation(async () => {
+            if (journal!.profileBinding) {
+              if (!sameProfileBinding(journal!.profileBinding, binding)) {
+                throw new OpenCodeLaunchJournalError('foreign', 'launch profile identity changed')
+              }
+              return
             }
-            return
-          }
-          const candidate = { ...journal!, profileBinding: structuredClone(binding) }
-          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
-            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-          await this.persist(candidate, bindingContext ?? effectiveContext)
-          journal = candidate
-          Object.assign(lease.journal, candidate)
+            const candidate = { ...journal!, profileBinding: structuredClone(binding) }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, bindingContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, bindingContext)
         },
         claim: async (memberIdentity, claimContext) => {
           const claimToken = `${acquisitionToken}.${randomUUID()}`
@@ -1455,42 +1497,35 @@ export class OpenCodeLaunchAttemptStore {
           await appendEvent(normalEvent, appendContext)
         },
         issueContinuation: async (eligibleMemberIdentities, issueContext) => {
-          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
-            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
-          }
           if (eligibleMemberIdentities.length === 0
             || new Set(eligibleMemberIdentities).size !== eligibleMemberIdentities.length
             || !eligibleMemberIdentities.every(isOpenCodeOpaqueIdentity)) {
             throw new OpenCodeLaunchJournalError('foreign', 'invalid continuation member partition')
           }
-          if (journal!.continuation) {
-            if (journal!.continuation.issuedGeneration !== generation
-              || JSON.stringify(journal!.continuation.eligibleMemberIdentities)
-                !== JSON.stringify(eligibleMemberIdentities)) {
-              throw new OpenCodeLaunchJournalError('fenced', 'continuation partition changed')
+          return serializeMutation(async () => {
+            if (journal!.continuation) {
+              if (journal!.continuation.issuedGeneration !== generation
+                || JSON.stringify(journal!.continuation.eligibleMemberIdentities)
+                  !== JSON.stringify(eligibleMemberIdentities)) {
+                throw new OpenCodeLaunchJournalError('fenced', 'continuation partition changed')
+              }
+              return journal!.continuation.token
             }
-            return journal!.continuation.token
-          }
-          const continuation = {
-            issuedGeneration: generation,
-            token: `opencode-launch-continuation-v1.${randomBytes(32).toString('base64url')}`,
-            eligibleMemberIdentities: [...eligibleMemberIdentities],
-          }
-          const candidate = { ...journal!, continuation }
-          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
-            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-          await this.persist(candidate, issueContext ?? effectiveContext)
-          journal = candidate
-          Object.assign(lease.journal, candidate)
-          return continuation.token
+            const continuation = {
+              issuedGeneration: generation,
+              token: `opencode-launch-continuation-v1.${randomBytes(32).toString('base64url')}`,
+              eligibleMemberIdentities: [...eligibleMemberIdentities],
+            }
+            const candidate = { ...journal!, continuation }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, issueContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+            return continuation.token
+          }, issueContext)
         },
         commitAcceptedProofResponse: async (response, proofContext) => {
-          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
-            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
-          }
-          if (journal!.events.some(event => event.generation === generation && event.type === 'member_intent')) {
-            throw new OpenCodeLaunchJournalError('fenced', 'accepted proof must precede member effects')
-          }
           const encoded = encodeOpenCodeLaunchAttemptResponse(response)
           if (encoded.launchAttempt.attemptId !== journal!.attemptId
             || encoded.launchAttempt.payloadHash !== journal!.payloadHash
@@ -1504,23 +1539,25 @@ export class OpenCodeLaunchAttemptStore {
                 || encoded.launchAttempt.binaryIdentity !== journal!.profileBinding.binaryIdentity))) {
             throw new OpenCodeLaunchJournalError('foreign', 'accepted proof response identity mismatch')
           }
-          if (journal!.acceptedProofResponse) {
-            if (JSON.stringify(journal!.acceptedProofResponse) !== JSON.stringify(encoded)) {
-              throw new OpenCodeLaunchJournalError('fenced', 'accepted proof response changed')
+          await serializeMutation(async () => {
+            if (journal!.events.some(event => event.generation === generation && event.type === 'member_intent')) {
+              throw new OpenCodeLaunchJournalError('fenced', 'accepted proof must precede member effects')
             }
-            return
-          }
-          const candidate = { ...journal!, acceptedProofResponse: encoded }
-          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
-            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-          await this.persistRecoverableProjection(candidate, proofContext ?? effectiveContext)
-          journal = candidate
-          Object.assign(lease.journal, candidate)
+            if (journal!.acceptedProofResponse) {
+              if (JSON.stringify(journal!.acceptedProofResponse) !== JSON.stringify(encoded)) {
+                throw new OpenCodeLaunchJournalError('fenced', 'accepted proof response changed')
+              }
+              return
+            }
+            const candidate = { ...journal!, acceptedProofResponse: encoded }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persistRecoverableProjection(candidate, proofContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, proofContext)
         },
         commitFinalResponse: async (response, responseContext) => {
-          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
-            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
-          }
           const encoded = encodeOpenCodeLaunchAttemptResponse(response)
           if (encoded.launchAttempt.attemptId !== journal!.attemptId
             || encoded.launchAttempt.payloadHash !== journal!.payloadHash
@@ -1529,18 +1566,24 @@ export class OpenCodeLaunchAttemptStore {
             || encoded.launchAttempt.immutableDigest !== journal!.immutableDigest) {
             throw new OpenCodeLaunchJournalError('foreign', 'final response identity mismatch')
           }
-          if (journal!.finalResponse) {
-            if (JSON.stringify(journal!.finalResponse) !== JSON.stringify(encoded)) {
-              throw new OpenCodeLaunchJournalError('fenced', 'final response changed')
-            }
-            return
-          }
-          const candidate = { ...journal!, finalResponse: encoded }
-          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+          const capturedCandidate = { ...journal!, finalResponse: encoded }
+          validateJournal(capturedCandidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
             inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-          await this.persistRecoverableProjection(candidate, responseContext ?? effectiveContext)
-          journal = candidate
-          Object.assign(lease.journal, candidate)
+          await pauseAfterCandidateCapture('finalResponse')
+          await serializeMutation(async () => {
+            if (journal!.finalResponse) {
+              if (JSON.stringify(journal!.finalResponse) !== JSON.stringify(encoded)) {
+                throw new OpenCodeLaunchJournalError('fenced', 'final response changed')
+              }
+              return
+            }
+            const candidate = { ...journal!, finalResponse: encoded }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persistRecoverableProjection(candidate, responseContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, responseContext)
         },
         reconcile: async (event, reconcileContext) => {
           if (!event.claimToken) {
@@ -1557,9 +1600,8 @@ export class OpenCodeLaunchAttemptStore {
         },
       }
       const appendEvent = async (event: OpenCodeLaunchJournalAppendEvent, appendContext?: OpenCodeLaunchStoreContext) => {
-          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
-            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
-          }
+        ensureLeaseActive()
+        const buildCandidate = (): OpenCodeLaunchJournal => {
           const priorClaim = [...journal!.events].reverse().find(candidate =>
             candidate.memberIdentity === event.memberIdentity && candidate.type !== 'cleanup')?.claimToken
           const claimToken = event.claimToken
@@ -1578,7 +1620,14 @@ export class OpenCodeLaunchAttemptStore {
             fence,
           } as OpenCodeLaunchJournalEvent
           validateEvent(next)
-          const candidate = { ...journal!, events: [...journal!.events, next] }
+          return { ...journal!, events: [...journal!.events, next] }
+        }
+        const capturedCandidate = buildCandidate()
+        validateJournal(capturedCandidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+          inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+        await pauseAfterCandidateCapture('event')
+        await serializeMutation(async () => {
+          const candidate = buildCandidate()
           validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
             inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
           try { await this.persist(candidate, appendContext ?? effectiveContext) }
@@ -1590,10 +1639,14 @@ export class OpenCodeLaunchAttemptStore {
           }
           journal = candidate
           Object.assign(lease.journal, candidate)
+        }, appendContext)
       }
       // Defined after appendEvent so every transition shares the exact same durable validation.
       lease.revalidate = async (memberIdentity, claimToken, revalidateContext) => {
-          if (!active) throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+        if (!externalRevalidationActive) {
+          throw new OpenCodeLaunchJournalError('fenced', 'member mutation is no longer active')
+        }
+        await serializeMutation(async () => {
           const current = await this.load({ ...identity, inputDigest: journal!.inputDigest,
             startedAtMs: undefined, totalBudgetMs: undefined }, revalidateContext ?? effectiveContext)
           if (!current || current.generation !== generation || current.fence !== fence) {
@@ -1606,7 +1659,8 @@ export class OpenCodeLaunchAttemptStore {
             || last.claimToken !== claimToken) {
             throw new OpenCodeLaunchJournalError('fenced', 'member mutation is tombstoned or no longer pending')
           }
-        }
+        }, revalidateContext)
+      }
       try {
         const result = await operation(lease)
         if (leasePoison) throw leasePoison
@@ -1615,8 +1669,12 @@ export class OpenCodeLaunchAttemptStore {
       } catch (error) {
         if (leasePoison) throw leasePoison
         throw error
-      } finally { active = false }
-    }, acquisitionContext, () => retainedPhysicalSettlement)
+      } finally { externalRevalidationActive = false }
+    }, acquisitionContext, () => {
+      const settlement = retainedPhysicalSettlement
+      if (!settlement) { deactivateLease(); return undefined }
+      return settlement.finally(deactivateLease)
+    })
   }
 
   private async peekTiming(
