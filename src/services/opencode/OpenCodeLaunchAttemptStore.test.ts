@@ -830,6 +830,70 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     }
   })
 
+  test.skipIf(process.platform === 'win32')('release cannot close a descriptor reused by a contending lease', async () => {
+    const directory = await workspaceTemp('release-reused-descriptor')
+    const path = join(directory, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const contender = new OpenCodeLaunchFileJournalPersistence(path)
+    let releaseContender: ((context?: OpenCodeLaunchStoreContext) => Promise<void>) | undefined
+    const first = new OpenCodeLaunchFileJournalPersistence(path, {
+      afterLeaseOwnerClose: async () => { releaseContender = await contender.acquireExclusive(context) },
+    })
+    try {
+      const releaseFirst = await first.acquireExclusive(context)
+      await releaseFirst(context)
+
+      expect(releaseContender).toBeDefined()
+      expect((await stat(leasePath(path))).isDirectory()).toBe(true)
+      await releaseContender!(context)
+      await expect(stat(leasePath(path))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform === 'win32')('physically closes retained namespace roots once after lease cleanup', async () => {
+    const directory = await workspaceTemp('retained-root-close')
+    const path = join(directory, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const closedRoots: string[] = []
+    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+      afterRetainedDirectoryHandleClosed: async root => {
+        await expect(stat(leasePath(path))).rejects.toMatchObject({ code: 'ENOENT' })
+        closedRoots.push(root)
+      },
+    })
+    try {
+      const release = await persistence.acquireExclusive(context)
+      await release(context)
+      await release(context)
+
+      expect(closedRoots.sort()).toEqual([
+        directory,
+        deriveOpenCodeLaunchNamespacePaths(path, posix).trustedRoot,
+      ].sort())
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform === 'win32')('closes retained namespace roots when anchoring aborts', async () => {
+    const directory = await workspaceTemp('retained-root-partial')
+    const path = join(directory, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const closedRoots: string[] = []
+    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+      afterNamespaceAnchored: async () => { throw new Error('stop after anchoring') },
+      afterRetainedDirectoryHandleClosed: async root => { closedRoots.push(root) },
+    })
+    try {
+      await expect(persistence.acquireExclusive(context)).rejects.toThrow('stop after anchoring')
+      expect(closedRoots.sort()).toEqual([
+        directory,
+        deriveOpenCodeLaunchNamespacePaths(path, posix).trustedRoot,
+      ].sort())
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
   test('fails closed when a live owner birth identity cannot be read', async () => {
     const directory = await workspaceTemp('owner-birth-unreadable')
     const path = join(directory, 'attempt.json')

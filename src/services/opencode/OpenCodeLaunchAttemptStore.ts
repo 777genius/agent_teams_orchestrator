@@ -157,6 +157,10 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       syncLeaseDirectory?: (handle: NamespaceHandle) => Promise<void>
       beforeLeaseDirectoryRemove?: () => Promise<void>
       afterLeaseDirectoryDetach?: () => Promise<void>
+      /** Test-only boundary after the retained lease-owner descriptor is physically closed. */
+      afterLeaseOwnerClose?: () => Promise<void>
+      /** Test-only observation after a retained Unix namespace root is physically closed. */
+      afterRetainedDirectoryHandleClosed?: (root: string) => Promise<void>
       readNoFollowAvailable?: boolean
       afterReadHandleOpened?: (path: string) => Promise<void>
       /** Test-only boundary after the selected backend has anchored or accepted its root. */
@@ -297,7 +301,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         // Cancellation may win immediately after the atomic rename; explicitly reap that late acquisition.
         if (context.signal.aborted || context.monotonicNow() >= context.deadlineAtMs) {
           await releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle, lockIdentity,
-            this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach).catch(() => undefined)
+            this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach,
+            this.testHooks.afterLeaseOwnerClose).catch(() => undefined)
           ensureContext(context)
         }
         let released = false
@@ -308,7 +313,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
             // Start token-checked physical release even when the caller's deadline just expired;
             // the deadline bounds waiting, while the operation is explicitly reaped late.
             const physicalRelease = releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle!, lockIdentity,
-              this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach)
+              this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach,
+              this.testHooks.afterLeaseOwnerClose)
             try {
               await awaitWithContext(physicalRelease, effectiveContext)
               await this.closeNamespace(namespace)
@@ -323,7 +329,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       } catch (error) {
         if (published && ownerHandle) {
           await releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle, await authority.stat(lock),
-            this.testHooks.beforeLeaseDirectoryRemove).catch(() => undefined)
+            this.testHooks.beforeLeaseDirectoryRemove, undefined, this.testHooks.afterLeaseOwnerClose).catch(() => undefined)
         }
         if (!published && ownerHandle && stagingIdentity) {
           await ownerHandle.close().catch(() => undefined)
@@ -342,14 +348,14 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
             catch (killError) {
               if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
                 await releaseOwnedLockByPath(namespace, authority, lock, parsed,
-                  this.testHooks.beforeLeaseDirectoryRemove)
+                  this.testHooks.beforeLeaseDirectoryRemove, undefined, this.testHooks.afterLeaseOwnerClose)
                 continue
               }
             }
             try {
               if (await (this.testHooks.processBirth ?? processBirth)(parsed.pid as number) !== parsed.processBirth) {
                 await releaseOwnedLockByPath(namespace, authority, lock, parsed,
-                  this.testHooks.beforeLeaseDirectoryRemove); continue
+                  this.testHooks.beforeLeaseDirectoryRemove, undefined, this.testHooks.afterLeaseOwnerClose); continue
               }
             } catch { /* A live process with unreadable birth identity is never reaped. */ }
           }
@@ -409,8 +415,15 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     let backend: NamespaceBackend
     let authorityBackend: NamespaceBackend
     if (retained) {
-      backend = await RetainedDirectoryBackend.create(directory, identity, true)
-      authorityBackend = await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false)
+      backend = await RetainedDirectoryBackend.create(directory, identity, true,
+        this.testHooks.afterRetainedDirectoryHandleClosed)
+      try {
+        authorityBackend = await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false,
+          this.testHooks.afterRetainedDirectoryHandleClosed)
+      } catch (error) {
+        await backend.close?.().catch(() => undefined)
+        throw error
+      }
     } else if (nativeWindows) {
       const retainedRoot = await this.acquireSharedWindowsRoot(deadline, signal)
       releaseRetainedRoot = retainedRoot.release
@@ -427,7 +440,13 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       backend = new TrustedRootPathBackend(directory, identity, true, platform)
       authorityBackend = new TrustedRootPathBackend(trustedRoot, trustedIdentity, false, platform)
     }
-    await this.testHooks.afterNamespaceAnchored?.()
+    try {
+      await this.testHooks.afterNamespaceAnchored?.()
+    } catch (error) {
+      if (releaseRetainedRoot) await releaseRetainedRoot().catch(() => undefined)
+      else await Promise.all([backend.close?.().catch(() => undefined), authorityBackend.close?.().catch(() => undefined)])
+      throw error
+    }
     this.namespace = {
       backend, authorityBackend, marker,
       slots: [`${marker}.slot0`, `${marker}.slot1`],
@@ -840,25 +859,32 @@ function cPath(name: string): Buffer {
 
 class RetainedDirectoryBackend implements NamespaceBackend {
   readonly kind = 'retained-directory' as const
+  private closePromise?: Promise<void>
   private constructor(
     private readonly root: string,
     private readonly rootHandle: Awaited<ReturnType<typeof open>>,
     private readonly expected: { dev: number | bigint; ino: number | bigint },
     private readonly logicalNamespace: boolean,
+    private readonly afterHandleClosed?: (root: string) => Promise<void>,
   ) {}
   static async create(
     root: string,
     expected: { dev: number | bigint; ino: number | bigint },
     logicalNamespace: boolean,
+    afterHandleClosed?: (root: string) => Promise<void>,
   ): Promise<RetainedDirectoryBackend> {
     const handle = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
-    const actual = await handle.stat()
-    if (!actual.isDirectory() || !sameFileIdentity(actual, expected)) {
-      await handle.close()
-      throw new OpenCodeLaunchJournalError('foreign', 'journal root changed while retaining descriptor')
+    try {
+      const actual = await handle.stat()
+      if (!actual.isDirectory() || !sameFileIdentity(actual, expected)) {
+        throw new OpenCodeLaunchJournalError('foreign', 'journal root changed while retaining descriptor')
+      }
+      unixSymbols()
+      return new RetainedDirectoryBackend(root, handle, expected, logicalNamespace, afterHandleClosed)
+    } catch (error) {
+      await handle.close().catch(() => undefined)
+      throw error
     }
-    unixSymbols()
-    return new RetainedDirectoryBackend(root, handle, expected, logicalNamespace)
   }
   displayPath(name: string) { return join(this.root, name) }
   async verifyRoot() {
@@ -908,9 +934,16 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     finally { await handle?.close() }
   }
   statFd(fd: number) { return this.fdStat(fd) }
+  close(): Promise<void> {
+    return this.closePromise ??= (async () => {
+      await this.rootHandle.close()
+      await this.afterHandleClosed?.(this.root)
+    })()
+  }
 }
 
 class NativeNamespaceHandle implements NamespaceHandle {
+  #closed = false
   constructor(readonly fd: number, private readonly backend: RetainedDirectoryBackend) {}
   stat() { return this.backend.statFd(this.fd) }
   async writeFile(data: string | Uint8Array) {
@@ -930,7 +963,11 @@ class NativeNamespaceHandle implements NamespaceHandle {
     return new Uint8Array(Buffer.concat(chunks))
   }
   async sync() { if ((unixSymbols().symbols as any).fsync(this.fd) < 0) throw nativeError('fsync') }
-  async close() { if ((unixSymbols().symbols as any).close(this.fd) < 0) throw nativeError('close') }
+  async close() {
+    if (this.#closed) return
+    this.#closed = true
+    if ((unixSymbols().symbols as any).close(this.fd) < 0) throw nativeError('close')
+  }
 }
 
 function decodeNativeStat(buffer: Buffer): NamespaceStat {
@@ -1150,10 +1187,12 @@ async function releaseOwnedLockByPath(
   owner: LockOwner,
   beforeDirectoryRemove?: () => Promise<void>,
   afterDirectoryDetach?: () => Promise<void>,
+  afterOwnerHandleClose?: () => Promise<void>,
 ): Promise<void> {
   const identity = await backend.stat(lock)
   const ownerHandle = await backend.open(join(lock, 'owner.json'), constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
-  await releaseOwnedLock(namespace, backend, lock, owner, ownerHandle, identity, beforeDirectoryRemove, afterDirectoryDetach)
+  await releaseOwnedLock(namespace, backend, lock, owner, ownerHandle, identity, beforeDirectoryRemove,
+    afterDirectoryDetach, afterOwnerHandleClose)
 }
 
 type LockOwner = { version: 1; pid: number; processBirth: string; token: string }
@@ -1167,6 +1206,7 @@ async function releaseOwnedLock(
   identity: NamespaceStat,
   beforeDirectoryRemove?: () => Promise<void>,
   afterDirectoryDetach?: () => Promise<void>,
+  afterOwnerHandleClose?: () => Promise<void>,
 ): Promise<void> {
   try {
     await backend.verifyRoot()
@@ -1213,6 +1253,7 @@ async function releaseOwnedLock(
     // the owner file before deleting it so Windows need not weaken write/delete
     // sharing to remove the exact tombstoned lease.
     await ownerHandle.close()
+    await afterOwnerHandleClose?.()
     await backend.unlink(detachedOwner)
     await backend.rmdir(detached)
     await syncNamespace(namespace, backend, undefined, false)
