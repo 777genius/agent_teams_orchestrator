@@ -52,6 +52,33 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
 }
 
 describe('OpenCodeWindowsPublicationAuthorityClient', () => {
+  test('reports an early native stage before internal teardown can resolve cancellation', async () => {
+    let stdout!: ReadableStreamDefaultController<Uint8Array>
+    let stderr!: ReadableStreamDefaultController<Uint8Array>
+    let resolveExit!: (code: number) => void; let kills = 0
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { stdout = value } }),
+      stderr: new ReadableStream<Uint8Array>({ start(value) { stderr = value } }),
+      exited: new Promise<number>(resolve => { resolveExit = resolve }),
+      unref() {}, kill() { kills += 1 },
+      stdin: { end() {}, flush() { return 0 }, write(line: string) {
+        expect(JSON.parse(line).op).toBe('OPEN_ROOT')
+        stderr.enqueue(new TextEncoder().encode(
+          'OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage=job_attribute win32=5\n',
+        ))
+        stderr.close(); stdout.close(); resolveExit(126)
+        return line.length
+      } },
+    }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
+      launch: () => child })
+    await expect(client.openRoot('C:\\safe', false, false)).rejects.toThrow(
+      'unavailable [redacted] (native_stage=job_attribute win32=5 exit=126)',
+    )
+    expect(kills).toBe(1)
+  })
+
   test('flushes each buffered Bun stdin request before waiting for its reply', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>; let buffered = ''
     const encoder = new TextEncoder(); const operations: string[] = []
@@ -79,7 +106,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     await expect(client.openRoot('C:\\root', false, false)).resolves.toMatchObject({ fileId: '2' })
     abort.abort(); await new Promise(resolve => setTimeout(resolve, 0))
     await expect(client.pinRegular('passive-status.sqlite3')).rejects.toThrow('unavailable [redacted]')
-    await client.close(); await client.close(); expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
+    await client.close(); await client.close(); expect(process.kills()).toBe(0); expect(process.closes()).toBe(1)
     expect(process.operations).toEqual(['OPEN_ROOT', 'PIN_REGULAR', 'CLOSE'])
   })
   test.each(['plugins.snapshot-attempt', 'node_modules.dependencies-attempt'])(
@@ -120,14 +147,14 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(first).toBe(second)
     await first
     expect(process.operations).toEqual(['OPEN_ROOT', 'CLOSE'])
-    expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
+    expect(process.kills()).toBe(0); expect(process.closes()).toBe(1)
     let physicallySettled = false
     void client.physicalSettlement.then(() => { physicallySettled = true })
     await new Promise(resolve => setTimeout(resolve, 0)); expect(physicallySettled).toBeFalse()
     process.exit(); await client.physicalSettlement
     expect(physicallySettled).toBeTrue()
     await client.close(); client.kill()
-    expect(process.kills()).toBe(1); expect(process.closes()).toBe(1)
+    expect(process.kills()).toBe(0); expect(process.closes()).toBe(1)
   })
   test('fails before launch on an expired deadline', () => {
     expect(() => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() - 1,
@@ -283,7 +310,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       exited: new Promise<number>(resolve => { resolveExit = resolve }),
       unref() {},
       kill() { kills += 1; exit(-1) },
-      stdin: { end() { closes += 1 }, flush() { return 0 }, write(line: string) {
+      stdin: { end() { closes += 1; exit(0) }, flush() { return 0 }, write(line: string) {
         const request = JSON.parse(line) as Record<string, unknown>; requests.push(request)
         if (request.op === 'OPEN_ROOT') {
           reply(request, { volumeSerial: '1', fileId: '2', createdPaths: [] })
@@ -319,7 +346,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(requests.map(request => request.op)).toEqual([
       'OPEN_ROOT', 'CREATE_DIRECTORY', 'ROLLBACK_DIRECTORY', 'CLOSE',
     ])
-    expect(kills).toBe(1); expect(closes).toBe(1)
+    expect(kills).toBe(0); expect(closes).toBe(1)
   })
   test('rejects unsafe Win32 roots and leaves without publishing them to native stdin', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({

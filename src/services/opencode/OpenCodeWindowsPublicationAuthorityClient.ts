@@ -8,6 +8,8 @@ import { decodeOpenCodeWindowsPublicationReply, OpenCodeWindowsPublicationReject
   validOpenCodePublicationRelativePath,
   type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
+import { drainOpenCodeNativeLauncherStderr, openCodeNativeAuthorityExitError,
+  OpenCodeNativeAuthorityTransportError } from './OpenCodeNativeLauncherDiagnostic.js'
 
 type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindowsPublicationRequest> =
   T extends OpenCodeWindowsPublicationRequest ? Omit<T, 'version' | 'wait_ms'> : never
@@ -29,6 +31,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   readonly #deadline: number
   readonly #settlementDeadline: number
   readonly #signal?: AbortSignal
+  readonly #exitFailure: Promise<Error>
   readonly #decoder = new TextDecoder('utf-8', { fatal: true })
   readonly #cancelled: Promise<void>
   #cancel!: () => void
@@ -50,6 +53,13 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     const artifacts = resolveOpenCodeNativeAuthorityArtifacts(options)
     if (!options.launch) verifyOpenCodeNativeAuthorityArtifacts(artifacts)
     this.#child = (options.launch ?? launchOpenCodeNativeAuthority)({ ...artifacts, argument: '--windows-publication-authority-v1' })
+    const stderr = drainOpenCodeNativeLauncherStderr(this.#child.stderr)
+    this.#exitFailure = this.#child.exited.then(
+      async code => openCodeNativeAuthorityExitError(await stderr, code),
+      () => new OpenCodeNativeAuthorityTransportError(
+        'OpenCode Windows publication authority is unavailable [redacted] (native_stage=exit_observation)',
+      ),
+    )
     // Attach both branches immediately: a hostile/test child must not create an
     // unhandled rejection, and process exit is the definitive OS handle-release boundary.
     this.physicalSettlement = this.#child.exited.then(() => undefined, () => undefined)
@@ -296,12 +306,42 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise
     this.#closePromise = (async () => {
-      try { if (this.#retained) await this.#request({ id: randomUUID(), op: 'CLOSE' }) } catch {}
-      finally { this.kill() }
+      let acknowledged = false
+      try {
+        if (this.#retained) { await this.#request({ id: randomUUID(), op: 'CLOSE' }); acknowledged = true }
+      } catch {}
+      finally { if (acknowledged) this.#finishCleanClose(); else this.kill() }
     })()
     return this.#closePromise
   }
-  kill(): void { if (this.#closed) return; this.#closed = true; this.#cancelCaller(); if (this.#callerDeadline) clearTimeout(this.#callerDeadline); if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline); this.#signal?.removeEventListener('abort', this.#abort); try { this.#child.stdin.end() } catch {}; try { this.#child.kill('SIGKILL') } catch {} }
+  kill(): void { this.#terminate(true) }
+
+  #terminate(cancelCaller: boolean): void {
+    if (this.#closed) return
+    this.#closed = true
+    if (cancelCaller) this.#cancelCaller()
+    if (this.#callerDeadline) clearTimeout(this.#callerDeadline)
+    if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
+    this.#signal?.removeEventListener('abort', this.#abort)
+    try { this.#child.stdin.end() } catch {}
+    try { this.#child.kill('SIGKILL') } catch {}
+  }
+
+  #finishCleanClose(): void {
+    if (this.#closed) return
+    this.#closed = true
+    if (this.#callerDeadline) clearTimeout(this.#callerDeadline)
+    if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
+    this.#signal?.removeEventListener('abort', this.#abort)
+    try { this.#child.stdin.end() } catch {}
+    const remaining = Math.max(1, this.#settlementDeadline - openCodeMonotonicNow())
+    this.#ownerDeadline = setTimeout(() => { try { this.#child.kill('SIGKILL') } catch {} }, remaining)
+    this.#ownerDeadline.unref?.()
+    void this.#child.exited.then(() => {
+      if (this.#ownerDeadline) clearTimeout(this.#ownerDeadline)
+      this.#ownerDeadline = undefined
+    }, () => {})
+  }
 
   #cancelCaller(): void { this.#cancel() }
 
@@ -350,7 +390,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
       // boundary on Windows; end() happened only during failure cleanup, too
       // late to establish the request/reply protocol boundary.
       await this.#child.stdin.flush()
-      const physical = Promise.race([this.#readLine(), this.#child.exited.then(() => { throw unavailable() })])
+      const physical = Promise.race([this.#readLine(), this.#exitFailure.then(error => { throw error })])
       const line = await Promise.race([physical,
         new Promise<never>((_, reject) => { timer = setTimeout(() => { this.kill(); reject(unavailable()) }, remaining); timer.unref?.() })])
       const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
@@ -360,14 +400,17 @@ export class OpenCodeWindowsPublicationAuthorityClient {
       if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained
         && request.op.startsWith('NS_')) throw error
       if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained) throw unavailable()
-      this.kill(); throw unavailable()
+      const reported = error instanceof OpenCodeNativeAuthorityTransportError ? error : unavailable()
+      // Internal transport teardown must not resolve caller cancellation before
+      // the queued initiating failure rejects with its safe native evidence.
+      this.#terminate(false); throw reported
     } finally { if (timer) clearTimeout(timer) }
   }
   async #readLine(): Promise<string> {
     for (;;) {
       const newline = this.#pending.indexOf('\n')
       if (newline >= 0) { const line = this.#pending.slice(0, newline); this.#pending = this.#pending.slice(newline + 1); this.#pendingBytes = new TextEncoder().encode(this.#pending).byteLength; return line }
-      const next = await this.#reader.read(); if (next.done) throw unavailable()
+      const next = await this.#reader.read(); if (next.done) throw await this.#exitFailure
       this.#pendingBytes += next.value.byteLength; if (this.#pendingBytes > OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES) throw unavailable()
       try { this.#pending += this.#decoder.decode(next.value, { stream: true }) } catch { throw unavailable() }
     }

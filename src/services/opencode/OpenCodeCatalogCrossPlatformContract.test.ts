@@ -94,13 +94,33 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('OPENCODE_LAUNCH_WINDOWS_VOLUME_IDENTITY_UNVERIFIED')
     expect(source).toContain('eprintln!("{WINDOWS_VOLUME_IDENTITY_UNVERIFIED}")')
     expect(source).not.toContain('filesystem == "ReFS"')
-    const volumeGate = source.indexOf('if !volume_verified || !windows_filesystem_has_retained_identity(&filesystem)')
+    const volumeGate = source.indexOf('if !windows_filesystem_has_retained_identity(&filesystem)')
     const createProcess = source.indexOf('CreateProcessW(')
     expect(volumeGate).toBeGreaterThanOrEqual(0)
     expect(createProcess).toBeGreaterThan(volumeGate)
     expect(source).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE')
+    expect(source).toContain('OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage=')
+    for (const stage of ['job_create', 'job_configure', 'job_attribute', 'handle_attribute',
+      'create_process', 'named_worker_identity', 'resume_thread', 'wait_process', 'query_exit_code']) {
+      expect(source).toContain(`"${stage}"`)
+    }
+    expect(source).toMatch(/let wait = unsafe \{ WaitForSingleObject[\s\S]*?if wait != WAIT_OBJECT_0/)
+    expect(source).toMatch(/if unsafe \{ GetExitCodeProcess[\s\S]*?\} == 0/)
     expect(source).toMatch(/Win32::Foundation::\{[^}]*GENERIC_READ/)
     expect(source).not.toMatch(/Win32::Storage::FileSystem::\{[^}]*\bGENERIC_READ\b/)
+  })
+
+  test('Windows launcher diagnostics cross only a bounded redacted stderr contract', async () => {
+    const artifacts = await readFile('src/services/opencode/OpenCodeNativeAuthorityArtifacts.ts', 'utf8')
+    const diagnostic = await readFile('src/services/opencode/OpenCodeNativeLauncherDiagnostic.ts', 'utf8')
+    const client = await readFile('src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.ts', 'utf8')
+    expect(artifacts).toContain("stdin: 'pipe', stdout: 'pipe', stderr: 'pipe'")
+    expect(artifacts).not.toContain("stderr: 'ignore'")
+    expect(diagnostic).toContain('OPEN_CODE_NATIVE_LAUNCHER_STDERR_MAX_BYTES = 1024')
+    expect(diagnostic).toContain('OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage=')
+    expect(diagnostic).not.toContain('${stderr}')
+    expect(client).toContain('drainOpenCodeNativeLauncherStderr(this.#child.stderr)')
+    expect(client).toContain('this.#terminate(false); throw reported')
   })
 
   test('Windows authority rejects reparse components and unverifiable non-local filesystems', async () => {

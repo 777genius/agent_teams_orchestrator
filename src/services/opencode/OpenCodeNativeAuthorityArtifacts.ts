@@ -59,6 +59,7 @@ export type OpenCodeNativeAuthorityChild = Readonly<{
   pid: number
   stdin: { write(value: string): number; flush(): number | Promise<number>; end(): void }
   stdout: ReadableStream<Uint8Array>
+  stderr?: ReadableStream<Uint8Array>
   exited: Promise<number>
   kill(signal?: NodeJS.Signals | number): void
   unref(): void
@@ -66,5 +67,5 @@ export type OpenCodeNativeAuthorityChild = Readonly<{
 
 export function launchOpenCodeNativeAuthority(input: OpenCodeNativeAuthorityArtifacts & Readonly<{ argument: string }>): OpenCodeNativeAuthorityChild {
   return Bun.spawn({ cmd: [input.launcherPath, input.workerPath, input.argument],
-    stdin: 'pipe', stdout: 'pipe', stderr: 'ignore' }) as unknown as OpenCodeNativeAuthorityChild
+    stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' }) as unknown as OpenCodeNativeAuthorityChild
 }

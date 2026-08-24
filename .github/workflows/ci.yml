@@ -73,6 +73,9 @@ jobs:
           cargo test --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
           cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
           cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+      - name: Prove production native launcher round-trip
+        timeout-minutes: 1
+        run: bun test src/services/opencode/OpenCodeWindowsPublicationAuthorityRoundTrip.test.ts
       - name: Regress first Windows passive production read in an owned child
         timeout-minutes: 2
         env:
@@ -87,6 +90,7 @@ jobs:
         run: >-
           bun test
           src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
+          src/services/opencode/OpenCodeNativeLauncherDiagnostic.test.ts
           src/services/opencode/OpenCodeWindowsPublicationAuthorityProtocol.test.ts
           src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.test.ts
           src/services/opencode/OpenCodeWindowsPassiveReadAuthority.test.ts

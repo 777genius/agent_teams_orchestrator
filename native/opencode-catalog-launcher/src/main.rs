@@ -14,6 +14,89 @@ fn windows_filesystem_has_retained_identity(filesystem: &str) -> bool {
     filesystem == "NTFS"
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsLaunchStage {
+    WorkerPath,
+    AncestorOpen,
+    AncestorInformation,
+    AncestorReparse,
+    WorkerOpen,
+    WorkerInformation,
+    WorkerReparse,
+    VolumeInformation,
+    VolumeFilesystem,
+    ExpectedObject,
+    TestGate,
+    JobCreate,
+    JobConfigure,
+    StandardHandle,
+    DuplicateHandle,
+    AttributeStorage,
+    JobAttribute,
+    HandleAttribute,
+    CreateProcess,
+    NamedWorkerOpen,
+    NamedWorkerInformation,
+    NamedWorkerIdentity,
+    ResumeThread,
+    WaitProcess,
+    QueryExitCode,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsLaunchStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerPath => "worker_path",
+            Self::AncestorOpen => "ancestor_open",
+            Self::AncestorInformation => "ancestor_information",
+            Self::AncestorReparse => "ancestor_reparse",
+            Self::WorkerOpen => "worker_open",
+            Self::WorkerInformation => "worker_information",
+            Self::WorkerReparse => "worker_reparse",
+            Self::VolumeInformation => "volume_information",
+            Self::VolumeFilesystem => "volume_filesystem",
+            Self::ExpectedObject => "expected_object",
+            Self::TestGate => "test_gate",
+            Self::JobCreate => "job_create",
+            Self::JobConfigure => "job_configure",
+            Self::StandardHandle => "standard_handle",
+            Self::DuplicateHandle => "duplicate_handle",
+            Self::AttributeStorage => "attribute_storage",
+            Self::JobAttribute => "job_attribute",
+            Self::HandleAttribute => "handle_attribute",
+            Self::CreateProcess => "create_process",
+            Self::NamedWorkerOpen => "named_worker_open",
+            Self::NamedWorkerInformation => "named_worker_information",
+            Self::NamedWorkerIdentity => "named_worker_identity",
+            Self::ResumeThread => "resume_thread",
+            Self::WaitProcess => "wait_process",
+            Self::QueryExitCode => "query_exit_code",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_launch_failure_record(stage: WindowsLaunchStage, win32: Option<u32>) -> String {
+    match win32 {
+        Some(code) => format!(
+            "OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage={} win32={code}",
+            stage.as_str()
+        ),
+        None => format!(
+            "OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage={}",
+            stage.as_str()
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn windows_launch_fail(stage: WindowsLaunchStage, win32: Option<u32>) -> ! {
+    eprintln!("{}", windows_launch_failure_record(stage, win32));
+    std::process::exit(126)
+}
+
 #[cfg(unix)]
 fn main() {
     use std::ffi::CString;
@@ -104,7 +187,8 @@ fn main() {
 fn main() {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, GENERIC_READ, INVALID_HANDLE_VALUE,
+        CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, GENERIC_READ,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, GetVolumeInformationByHandleW,
@@ -163,7 +247,7 @@ fn main() {
     };
     let worker_path = std::path::PathBuf::from(&worker);
     if !worker_path.is_absolute() {
-        std::process::exit(126)
+        windows_launch_fail(WindowsLaunchStage::WorkerPath, None)
     }
     // Retain every named ancestor with share-read only.  Those handles deny
     // both write/delete opens through process creation, while OPEN_REPARSE_POINT
@@ -196,14 +280,20 @@ fn main() {
             )
         };
         let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-        if handle == INVALID_HANDLE_VALUE
-            || unsafe { GetFileInformationByHandle(handle, &mut information) } == 0
-            || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
-            if handle != INVALID_HANDLE_VALUE {
-                unsafe { CloseHandle(handle) };
-            }
-            std::process::exit(126)
+        if handle == INVALID_HANDLE_VALUE {
+            windows_launch_fail(
+                WindowsLaunchStage::AncestorOpen,
+                Some(unsafe { GetLastError() }),
+            )
+        }
+        if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+            let error = unsafe { GetLastError() };
+            unsafe { CloseHandle(handle) };
+            windows_launch_fail(WindowsLaunchStage::AncestorInformation, Some(error))
+        }
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            unsafe { CloseHandle(handle) };
+            windows_launch_fail(WindowsLaunchStage::AncestorReparse, None)
         }
         ancestor_handles.push(handle);
     }
@@ -220,16 +310,23 @@ fn main() {
         )
     };
     if held == INVALID_HANDLE_VALUE {
-        std::process::exit(126)
+        windows_launch_fail(
+            WindowsLaunchStage::WorkerOpen,
+            Some(unsafe { GetLastError() }),
+        )
     }
     let mut before = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    if unsafe { GetFileInformationByHandle(held, &mut before) } == 0
-        || before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        std::process::exit(126)
+    if unsafe { GetFileInformationByHandle(held, &mut before) } == 0 {
+        windows_launch_fail(
+            WindowsLaunchStage::WorkerInformation,
+            Some(unsafe { GetLastError() }),
+        )
+    }
+    if before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        windows_launch_fail(WindowsLaunchStage::WorkerReparse, None)
     }
     let mut fs_name = [0u16; 32];
-    let volume_verified = unsafe {
+    let volume_result = unsafe {
         GetVolumeInformationByHandleW(
             held,
             std::ptr::null_mut(),
@@ -240,15 +337,21 @@ fn main() {
             fs_name.as_mut_ptr(),
             fs_name.len() as u32,
         )
-    } != 0;
+    };
+    if volume_result == 0 {
+        windows_launch_fail(
+            WindowsLaunchStage::VolumeInformation,
+            Some(unsafe { GetLastError() }),
+        )
+    }
     let fs_name_end = fs_name
         .iter()
         .position(|value| *value == 0)
         .unwrap_or(fs_name.len());
     let filesystem = String::from_utf16_lossy(&fs_name[..fs_name_end]);
-    if !volume_verified || !windows_filesystem_has_retained_identity(&filesystem) {
+    if !windows_filesystem_has_retained_identity(&filesystem) {
         eprintln!("{WINDOWS_VOLUME_IDENTITY_UNVERIFIED}");
-        std::process::exit(126)
+        windows_launch_fail(WindowsLaunchStage::VolumeFilesystem, None)
     }
     if let Some((expected_dev, expected_ino, expected_size)) = expected_object {
         let actual_ino = ((before.nFileIndexHigh as u64) << 32) | before.nFileIndexLow as u64;
@@ -257,7 +360,7 @@ fn main() {
             || actual_ino != expected_ino
             || actual_size != expected_size
         {
-            std::process::exit(126)
+            windows_launch_fail(WindowsLaunchStage::ExpectedObject, None)
         }
     }
     // Inputs containing quotes are rejected above. Doubling trailing
@@ -283,26 +386,34 @@ fn main() {
         let mut release = gate;
         release.set_extension("release");
         if std::fs::write(entered, b"").is_err() {
-            std::process::exit(126)
+            windows_launch_fail(WindowsLaunchStage::TestGate, None)
         }
         while !release.exists() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        windows_launch_fail(
+            WindowsLaunchStage::JobCreate,
+            Some(unsafe { GetLastError() }),
+        )
+    }
     let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if job.is_null()
-        || unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                std::mem::size_of_val(&limits) as u32,
-            )
-        } == 0
+    if unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            std::mem::size_of_val(&limits) as u32,
+        )
+    } == 0
     {
-        std::process::exit(126)
+        windows_launch_fail(
+            WindowsLaunchStage::JobConfigure,
+            Some(unsafe { GetLastError() }),
+        )
     }
 
     // The launcher is itself started with Bun protocol pipes. CreateProcessW
@@ -317,21 +428,28 @@ fn main() {
         .enumerate()
     {
         let source = unsafe { GetStdHandle(standard) };
-        if source.is_null()
-            || source == INVALID_HANDLE_VALUE
-            || unsafe {
-                DuplicateHandle(
-                    current_process,
-                    source,
-                    current_process,
-                    &mut protocol_handles[index],
-                    0,
-                    1,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } == 0
+        if source.is_null() || source == INVALID_HANDLE_VALUE {
+            windows_launch_fail(
+                WindowsLaunchStage::StandardHandle,
+                Some(unsafe { GetLastError() }),
+            )
+        }
+        if unsafe {
+            DuplicateHandle(
+                current_process,
+                source,
+                current_process,
+                &mut protocol_handles[index],
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
         {
-            std::process::exit(126)
+            windows_launch_fail(
+                WindowsLaunchStage::DuplicateHandle,
+                Some(unsafe { GetLastError() }),
+            )
         }
     }
 
@@ -343,31 +461,45 @@ fn main() {
             / std::mem::size_of::<usize>()
     ];
     let attributes = attribute_storage.as_mut_ptr() as *mut _;
-    if unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &mut attribute_bytes) } == 0
-        || unsafe {
-            UpdateProcThreadAttribute(
-                attributes,
-                0,
-                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                &job as *const _ as *mut _,
-                std::mem::size_of_val(&job),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } == 0
-        || unsafe {
-            UpdateProcThreadAttribute(
-                attributes,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                protocol_handles.as_mut_ptr().cast(),
-                std::mem::size_of_val(&protocol_handles),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } == 0
+    if unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &mut attribute_bytes) } == 0 {
+        windows_launch_fail(
+            WindowsLaunchStage::AttributeStorage,
+            Some(unsafe { GetLastError() }),
+        )
+    }
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            &job as *const _ as *mut _,
+            std::mem::size_of_val(&job),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
     {
-        std::process::exit(126)
+        windows_launch_fail(
+            WindowsLaunchStage::JobAttribute,
+            Some(unsafe { GetLastError() }),
+        )
+    }
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            protocol_handles.as_mut_ptr().cast(),
+            std::mem::size_of_val(&protocol_handles),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        windows_launch_fail(
+            WindowsLaunchStage::HandleAttribute,
+            Some(unsafe { GetLastError() }),
+        )
     }
     let mut startup = unsafe { std::mem::zeroed::<STARTUPINFOEXW>() };
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -391,12 +523,17 @@ fn main() {
             &mut process,
         )
     };
+    let create_error = if created == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
     unsafe { DeleteProcThreadAttributeList(attributes) };
     for handle in protocol_handles {
         unsafe { CloseHandle(handle) };
     }
-    if created == 0 {
-        std::process::exit(126)
+    if let Some(error) = create_error {
+        windows_launch_fail(WindowsLaunchStage::CreateProcess, Some(error))
     }
     // CreateProcess consumed a pathname. While the retained no-share-write /
     // no-share-delete handles make replacement fail, compare the named object
@@ -414,9 +551,17 @@ fn main() {
         )
     };
     let mut after = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    let same_object = named_after != INVALID_HANDLE_VALUE
-        && unsafe { GetFileInformationByHandle(named_after, &mut after) } != 0
-        && after.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    if named_after == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        unsafe { TerminateProcess(process.hProcess, 126) };
+        windows_launch_fail(WindowsLaunchStage::NamedWorkerOpen, Some(error))
+    }
+    if unsafe { GetFileInformationByHandle(named_after, &mut after) } == 0 {
+        let error = unsafe { GetLastError() };
+        unsafe { TerminateProcess(process.hProcess, 126) };
+        windows_launch_fail(WindowsLaunchStage::NamedWorkerInformation, Some(error))
+    }
+    let same_object = after.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
         && before.dwVolumeSerialNumber == after.dwVolumeSerialNumber
         && before.nFileIndexHigh == after.nFileIndexHigh
         && before.nFileIndexLow == after.nFileIndexLow;
@@ -431,11 +576,12 @@ fn main() {
             CloseHandle(job);
             CloseHandle(held);
         }
-        std::process::exit(126)
+        windows_launch_fail(WindowsLaunchStage::NamedWorkerIdentity, None)
     }
     // PROC_THREAD_ATTRIBUTE_JOB_LIST attached the kill-on-close job as part of
     // creation itself. No uncontained suspended-child interval exists.
     if unsafe { ResumeThread(process.hThread) } == u32::MAX {
+        let error = unsafe { GetLastError() };
         unsafe {
             TerminateProcess(process.hProcess, 126);
             CloseHandle(process.hThread);
@@ -443,15 +589,24 @@ fn main() {
             CloseHandle(job);
             CloseHandle(held);
         }
-        std::process::exit(126)
+        windows_launch_fail(WindowsLaunchStage::ResumeThread, Some(error))
+    }
+    unsafe { CloseHandle(process.hThread) };
+    let wait = unsafe { WaitForSingleObject(process.hProcess, INFINITE) };
+    if wait != WAIT_OBJECT_0 {
+        windows_launch_fail(
+            WindowsLaunchStage::WaitProcess,
+            Some(unsafe { GetLastError() }),
+        )
+    }
+    let mut code = 126u32;
+    if unsafe { GetExitCodeProcess(process.hProcess, &mut code) } == 0 {
+        windows_launch_fail(
+            WindowsLaunchStage::QueryExitCode,
+            Some(unsafe { GetLastError() }),
+        )
     }
     unsafe {
-        CloseHandle(process.hThread);
-        WaitForSingleObject(process.hProcess, INFINITE)
-    };
-    let mut code = 126u32;
-    unsafe {
-        GetExitCodeProcess(process.hProcess, &mut code);
         CloseHandle(process.hProcess);
         CloseHandle(job);
         CloseHandle(held)
@@ -464,7 +619,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::windows_filesystem_has_retained_identity;
+    use super::{
+        windows_filesystem_has_retained_identity, windows_launch_failure_record, WindowsLaunchStage,
+    };
 
     #[test]
     fn retained_windows_identity_accepts_ntfs() {
@@ -476,5 +633,52 @@ mod tests {
         for filesystem in ["ReFS", "refs", "FAT32", "exFAT", ""] {
             assert!(!windows_filesystem_has_retained_identity(filesystem));
         }
+    }
+
+    #[test]
+    fn windows_failure_records_are_stable_bounded_and_path_free() {
+        let record = windows_launch_failure_record(WindowsLaunchStage::CreateProcess, Some(87));
+        assert_eq!(
+            record,
+            "OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage=create_process win32=87"
+        );
+        assert!(record.len() < 128);
+        assert!(!record.contains('\\'));
+        assert!(!record.contains('/'));
+
+        let stages = [
+            WindowsLaunchStage::WorkerPath,
+            WindowsLaunchStage::AncestorOpen,
+            WindowsLaunchStage::AncestorInformation,
+            WindowsLaunchStage::AncestorReparse,
+            WindowsLaunchStage::WorkerOpen,
+            WindowsLaunchStage::WorkerInformation,
+            WindowsLaunchStage::WorkerReparse,
+            WindowsLaunchStage::VolumeInformation,
+            WindowsLaunchStage::VolumeFilesystem,
+            WindowsLaunchStage::ExpectedObject,
+            WindowsLaunchStage::TestGate,
+            WindowsLaunchStage::JobCreate,
+            WindowsLaunchStage::JobConfigure,
+            WindowsLaunchStage::StandardHandle,
+            WindowsLaunchStage::DuplicateHandle,
+            WindowsLaunchStage::AttributeStorage,
+            WindowsLaunchStage::JobAttribute,
+            WindowsLaunchStage::HandleAttribute,
+            WindowsLaunchStage::CreateProcess,
+            WindowsLaunchStage::NamedWorkerOpen,
+            WindowsLaunchStage::NamedWorkerInformation,
+            WindowsLaunchStage::NamedWorkerIdentity,
+            WindowsLaunchStage::ResumeThread,
+            WindowsLaunchStage::WaitProcess,
+            WindowsLaunchStage::QueryExitCode,
+        ];
+        let names = stages.map(WindowsLaunchStage::as_str);
+        let unique = names.into_iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), stages.len());
+        assert!(names.into_iter().all(|name| name.len() <= 32
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')));
     }
 }
