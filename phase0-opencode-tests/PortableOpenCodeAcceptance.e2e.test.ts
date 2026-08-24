@@ -140,14 +140,20 @@ describe('portable fake evidence through production OpenCode composers', () => {
   })
 
   test('production bridge/core reaches profile, Windows, host, exact proof, journal, cleanup and idempotent member composition', async () => {
-    const [{ OpenCodeLaunchAttempt }, { createOpenCodeLaunchAttemptProductionBridge },
+    const [{ OpenCodeLaunchAttempt, computeOpenCodeLaunchAttemptInputDigest,
+      computeOpenCodeLaunchAttemptImmutableDigest },
+      { computeOpenCodeLaunchCommandInputDigest, computeOpenCodeLaunchCommandImmutableDigest },
+      { createOpenCodeLaunchAttemptProductionBridge },
       { OpenCodeLaunchAttemptStore }, { planScopedProfile }, { ensureOpenCodeWindowsManagedDirectoryPath },
+      { canonicalizeOpenCodeProjectIdentity },
       { authorizeOpenCodeLaunchScopedProfile, prepareAuthorizedOpenCodeLaunchScopedProfile }] = await Promise.all([
       import('../src/services/opencode/OpenCodeLaunchAttempt.js'),
+      import('../src/services/opencode/OpenCodeLaunchAttemptBridge.js'),
       import('../src/services/opencode/OpenCodeLaunchAttemptProductionComposition.js'),
       import('../src/services/opencode/OpenCodeLaunchAttemptStore.js'),
       import('../src/services/opencode/OpenCodeOperationPolicy.js'),
       import('../src/services/opencode/OpenCodeWindowsManagedDirectory.js'),
+      import('../src/services/opencode/OpenCodeProjectIdentity.js'),
       import('../src/services/opencode/OpenCodePlanScopedProfile.js'),
     ])
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-production-launch-'))
@@ -171,10 +177,35 @@ describe('portable fake evidence through production OpenCode composers', () => {
       members: [{ name: 'alice', memberIdentity }], runId: 'run', laneId: 'primary', teamId: 'team',
       projectPath: sandbox, selectedModel: 'openrouter/model', toolApprovalMode: 'auto',
       continuation: false, requestedBudgetMs: 10_000,
+      preconditions: {
+        handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run',
+        expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: '2'.repeat(64),
+        expectedManifestHighWatermark: null, commandLeaseId: 'lease-1', idempotencyKey: attemptId,
+      },
     })
-    const proofResponse = (issuedNonce = nonce): OpenCodeLaunchAttemptResponse => ({
+    type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
+    const productionDigests = (value: Command) => {
+      const requestedBudgetMs = value.deadlineAtMs === undefined
+        ? value.outerRemainingBudgetMs ?? value.requestedBudgetMs : value.requestedBudgetMs
+      const effectiveBudgetMs = Math.min(requestedBudgetMs, 300_000)
+      const commandInputDigest = computeOpenCodeLaunchCommandInputDigest(value)
+      const commandImmutableDigest = computeOpenCodeLaunchCommandImmutableDigest(value)
+      return {
+        commandInputDigest,
+        commandImmutableDigest,
+        inputDigest: computeOpenCodeLaunchAttemptInputDigest(value.request,
+          value.members.map(member => member.memberIdentity), value.continuation ? 'continue' : 'begin',
+          requestedBudgetMs, effectiveBudgetMs, commandInputDigest),
+        immutableDigest: computeOpenCodeLaunchAttemptImmutableDigest(value.request,
+          value.members.map(member => member.memberIdentity), requestedBudgetMs,
+          effectiveBudgetMs, commandImmutableDigest),
+      }
+    }
+    type Digests = ReturnType<typeof productionDigests>
+    const proofResponse = (digests: Digests, issuedNonce = nonce): OpenCodeLaunchAttemptResponse => ({
       launchAttempt: {
         contractVersion: 1, attemptId, idempotencyKey: 'attemptId', payloadHash, generation: 1,
+        inputDigest: digests.inputDigest, immutableDigest: digests.immutableDigest,
         outcome: 'succeeded', phase: 'complete', startedAt: 0, absoluteDeadlineAt: 10_000,
         workDeadlineAt: 9_000, cleanupReserveMs: 1_000, elapsedMs: 1,
         providerId: 'openrouter', modelId: 'openrouter/model', profilePurpose: 'launch_attempt',
@@ -216,6 +247,17 @@ describe('portable fake evidence through production OpenCode composers', () => {
         binaryFingerprint: expected.binaryFingerprint,
       }),
     }
+    const fixtureAuthorization = await authorizeOpenCodeLaunchScopedProfile(profileManager, {
+      purpose: 'launch', providerId: 'openrouter', modelId: 'openrouter/model',
+      runtimeInstanceId: attemptId, projectPath: sandbox,
+    })
+    const completeCommand = { ...command(), projectIdentity: await canonicalizeOpenCodeProjectIdentity(sandbox),
+      effectiveProfilePlanDigest: fixtureAuthorization.effectivePlanDigest }
+    const fixtureDigests = productionDigests(completeCommand)
+    const changedRunDigests = productionDigests({ ...completeCommand, runId: 'different-run' })
+    expect(changedRunDigests.inputDigest).not.toBe(fixtureDigests.inputDigest)
+    expect(changedRunDigests.immutableDigest).not.toBe(fixtureDigests.immutableDigest)
+    let executingDigests = fixtureDigests
     let authorizedProfile: Awaited<ReturnType<typeof authorizeOpenCodeLaunchScopedProfile>> | null = null
     const ports: OpenCodeLaunchAttemptPorts = {
       clock: { monotonicNow: () => now },
@@ -236,7 +278,8 @@ describe('portable fake evidence through production OpenCode composers', () => {
       mcp: { verifyAppMcp: async () => { calls.push('mcp:verify'); return { host: retainedHost, observedTools: ['agent-teams.message_send'] } } },
       proof: {
         runFreshExactModelProof: async input => { calls.push(`proof:fresh-exact:${now}`); now += 2; return {
-          response: proofResponse(input.request.launchAttempt.proofNonce), authIdentity: oid('b'), configIdentity: oid('a'), binaryIdentity: oid('e'),
+          response: proofResponse(executingDigests, input.request.launchAttempt.proofNonce),
+          authIdentity: oid('b'), configIdentity: oid('a'), binaryIdentity: oid('e'),
         } },
         observeRetainedProofState: async input => { calls.push('proof:revalidate-same-host'); return {
           host: retainedHost, nonceHash: createHash('sha256').update(input.request.launchAttempt.proofNonce).digest('hex'),
@@ -272,9 +315,10 @@ describe('portable fake evidence through production OpenCode composers', () => {
     const core = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(journal), ports)
     const { decodeOpenCodeLaunchAttemptResponse, validateOpenCodeLaunchAttemptCorrelation } =
       await import('../src/services/opencode/OpenCodeBridgeContractV2.js')
-    const decodedProof = decodeOpenCodeLaunchAttemptResponse(proofResponse())
+    const decodedProof = decodeOpenCodeLaunchAttemptResponse(proofResponse(fixtureDigests))
     if (!decodedProof.ok) throw new Error(`fixture response invalid: ${decodedProof.error.field}`)
-    const fixtureCorrelation = validateOpenCodeLaunchAttemptCorrelation(command().request, proofResponse(), {
+    const fixtureCorrelation = validateOpenCodeLaunchAttemptCorrelation(command().request,
+      proofResponse(fixtureDigests), {
       currentGeneration: 1, expectedNonceHash: createHash('sha256').update(nonce).digest('hex'),
       expectedProfilePurpose: 'launch_attempt', expectedProviderId: 'openrouter',
       expectedProjectIdentity: oid('9'), expectedConfigIdentity: oid('a'), expectedAuthIdentity: oid('b'),
@@ -295,26 +339,48 @@ describe('portable fake evidence through production OpenCode composers', () => {
       },
       inspect: async () => null,
       executeAfterPreflight: async value => {
-        const result = await core.run({ request: value.request, members: [memberIdentity], requestedBudgetMs: 10_000 })
+        executingDigests = productionDigests(value)
+        expect(executingDigests).toEqual(fixtureDigests)
+        const result = await core.run({
+          request: value.request, members: value.members.map(member => member.memberIdentity),
+          requestedBudgetMs: value.deadlineAtMs === undefined
+            ? value.outerRemainingBudgetMs ?? value.requestedBudgetMs : value.requestedBudgetMs,
+          deadlineAtMs: value.deadlineAtMs, continuation: value.continuation, signal: value.signal,
+          commandInputDigest: executingDigests.commandInputDigest,
+          commandImmutableDigest: executingDigests.commandImmutableDigest,
+        })
         return { output: { snapshot, data: { launchAttempt: result } }, result }
       },
-    })
+    }, { monotonicNow: () => now })
     try {
       const first = await bridge.execute(command())
       if ((first.data as { launchAttempt: { status: string } }).launchAttempt.status !== 'succeeded') {
         throw new Error(JSON.stringify({ launch: (first.data as { launchAttempt: unknown }).launchAttempt, calls }))
       }
       expect((first.data as { launchAttempt: { status: string } }).launchAttempt.status).toBe('succeeded')
+      expect(calls.findIndex(call => call.startsWith('plan:'))).toBeLessThan(calls.indexOf('profile:launch:openrouter'))
+      expect(calls.indexOf('windows-policy')).toBeLessThan(calls.indexOf('host:acquire'))
       expect(calls.findIndex(call => call.startsWith('proof:fresh-exact'))).toBeLessThan(calls.indexOf('member:create'))
       expect(calls.indexOf('proof:revalidate-same-host')).toBeLessThan(calls.indexOf('member:create'))
       expect(calls).toContain('windows-policy')
       expect(journal.bytes).not.toBeNull()
-      expect(JSON.parse(new TextDecoder().decode(journal.bytes!)).events.map((event: { type: string }) => event.type))
+      const journalBeforeReplay = journal.bytes!.slice()
+      const durableJournal = JSON.parse(new TextDecoder().decode(journal.bytes!))
+      expect(durableJournal).toMatchObject({
+        inputDigest: fixtureDigests.inputDigest, immutableDigest: fixtureDigests.immutableDigest,
+        acceptedProofResponse: { launchAttempt: {
+          inputDigest: fixtureDigests.inputDigest, immutableDigest: fixtureDigests.immutableDigest,
+        } },
+      })
+      expect(durableJournal.events.map((event: { type: string }) => event.type))
         .toEqual(['member_intent', 'member_applied'])
       const memberCreates = calls.filter(call => call === 'member:create').length
+      const proofRuns = calls.filter(call => call.startsWith('proof:')).length
       const replay = await bridge.execute(command())
       expect((replay.data as { launchAttempt: { status: string } }).launchAttempt.status).toBe('succeeded')
       expect(calls.filter(call => call === 'member:create')).toHaveLength(memberCreates)
+      expect(calls.filter(call => call.startsWith('proof:'))).toHaveLength(proofRuns)
+      expect(journal.bytes).toEqual(journalBeforeReplay)
     } finally { await rm(sandbox, { recursive: true, force: true }) }
   })
 })
