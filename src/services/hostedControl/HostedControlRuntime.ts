@@ -34,7 +34,11 @@ import {
 export type HostedControlRuntimePorts = {
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
-  /** Deliberately optional until the external lifecycle approval owner is installed. */
+  /**
+   * Deliberately optional until the external lifecycle approval owner is installed.
+   * When activation is composed, this is the stable activation-managed port: it
+   * must fail closed before activation and synchronously after session revocation.
+   */
   approvals?: HostedApprovalWirePort
   /** Per-connection O2-C activation boundary; omitted for legacy composition. */
   activationSessionFactory?: HostedApprovalActivationSessionFactory

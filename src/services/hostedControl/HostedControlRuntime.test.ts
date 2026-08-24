@@ -13,6 +13,11 @@ import { HostedControlRuntime, type HostedControlRuntimePortFactoryContext } fro
 import { createHostedLifecycleOwnerIdentityChecksum } from './HostedControlDispatcher.js'
 import type { HostedControlBootstrapAdmission } from './HostedControlBootstrap.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
+import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
+import {
+  HOSTED_APPROVAL_PROOF_DOMAIN,
+  type HostedApprovalWirePort,
+} from './HostedApprovalWire.js'
 import {
   HOSTED_LIFECYCLE_PROOF_DOMAIN,
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
@@ -39,17 +44,18 @@ describe('HostedControlRuntime', () => {
     const actions: string[] = []
     let context!: HostedControlRuntimePortFactoryContext
     let revokeCalls = 0
+    const approvals = new HostedApprovalActivatablePort()
     const admission: HostedControlBootstrapAdmission = {
       config: {
         socketPath, claudeRoot,
         deploymentId: 'deployment_test', bootId: 'boot_test', restoreGeneration: 0,
-        workspaceId: 'workspace_test', teamId: `team_${'a'.repeat(32)}`, legacyKey: 'legacy',
+        workspaceId: `workspace_${'1'.repeat(32)}`, teamId: `team_${'a'.repeat(32)}`, legacyKey: 'legacy',
         mountGeneration: 1, declaredRootHash: 'b'.repeat(64),
         ownerAuthority: 'owner-authority_runtime-test', ownerGeneration: 1,
         ownerSessionId: `owner-session_${'c'.repeat(32)}`,
       },
       bootstrapBinding: {
-        deploymentId: 'deployment_test', bootId: 'boot_test', workspaceId: 'workspace_test',
+        deploymentId: 'deployment_test', bootId: 'boot_test', workspaceId: `workspace_${'1'.repeat(32)}`,
         mountGeneration: 1, bootstrapDigest: 'd'.repeat(64),
         ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
         proofKeyId: createHash('sha256').update(activationSecret).digest('hex'),
@@ -66,16 +72,21 @@ describe('HostedControlRuntime', () => {
       return {
         lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
         messages: { dispatch: async () => ({}) },
+        approvals,
         activationSessionFactory: (connection: HostedApprovalActivationConnection) => ({
           activate: async () => {
             await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
             const token = connection.prepareEffectToken()
             if (!token?.consume()) throw new Error('activation token stale')
+            const guard = approvals.beginRecovery()
+            guard.install(runtimeApprovalDelegate())
             return '{"kind":"ready"}\n'
           },
           revoke: async () => {
+            const revocation = approvals.revoke()
             revokeCalls += 1
             actions.push('approval-revoked')
+            await revocation
           },
         }),
         close: async () => {
@@ -103,9 +114,15 @@ describe('HostedControlRuntime', () => {
       admission.bootstrapBinding,
     )
     expect(await context.isCurrentAuthority({ actorId: 'with-readiness', ...context.authority })).toBe(true)
+    expect(JSON.parse(await exchange(socketPath, approvalAckLine(
+      activationSecret, runtime.server!.ownerBinding!, context.authority,
+    ))).payload.status).toBe('acknowledged')
     activation.socket.write('x')
     await waitForRuntime(() => revokeCalls === 1)
     expect(await context.isCurrentAuthority({ actorId: 'after-activation-loss', ...context.authority })).toBe(true)
+    expect(JSON.parse(await exchange(socketPath, approvalAckLine(
+      activationSecret, runtime.server!.ownerBinding!, context.authority,
+    ))).payload.status).toBe('unavailable')
 
     await runtime.stop()
     expect(actions).toEqual(['approval-revoked', 'server-closed', 'ports-close', 'descriptor-close'])
@@ -533,6 +550,39 @@ function signedDomainLine(
     ...unsigned,
     ownerProof: createHostedDomainProof(secret, domain, 'request', unsigned),
   })}\n`
+}
+
+function approvalAckLine(
+  secret: Uint8Array,
+  ownerBinding: HostedControlOwnerBinding,
+  authority: HostedControlRuntimePortFactoryContext['authority'],
+): string {
+  const { teamId: _teamId, ...wireAuthority } = authority
+  return signedRawDomainLine(secret, HOSTED_APPROVAL_PROOF_DOMAIN, {
+    schemaVersion: 4,
+    exchangeId: `approval-request_${'6'.repeat(32)}`,
+    operation: 'approval_ingress_ack',
+    ownerBinding,
+    authority: { actorId: 'actor_runtime-approval', ...wireAuthority },
+    payload: {
+      outboxId: `runtime_permission:effect:${'5'.repeat(64)}`,
+      generation: 1,
+      ownerId: 'owner_runtime-approval',
+      leaseToken: 'lease_runtime-approval',
+    },
+  })
+}
+
+function runtimeApprovalDelegate(): HostedApprovalWirePort {
+  return {
+    claimIngress: async () => [],
+    acknowledgeIngress: async () => ({ status: 'acknowledged' }),
+    getAdmittedIngressAuthority: async () => null,
+    resolveIngressAuthority: async () => ({ status: 'unavailable' }),
+    authorizeDecision: async () => ({ status: 'unavailable' }),
+    deliverDecision: async () => ({ status: 'unavailable' }),
+    reconcileDecision: async () => ({ status: 'unavailable' }),
+  }
 }
 
 function signedRawDomainLine(

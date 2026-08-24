@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { chmod, lstat, mkdir, mkdtemp, rm, unlink } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, rename, rm, unlink } from 'node:fs/promises'
 import { connect, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -627,6 +627,155 @@ describe('HostedControlServer', () => {
     expect(revokeCalls).toBe(1)
   })
 
+  test('clears the publication deadline for slow recovery and separately bounds recovery', async () => {
+    const slow = await activationServerFixture(false, true, {
+      readDeadlineMs: 100,
+      activationRecoveryDeadlineMs: 5_000,
+    })
+    let slowRevokes = 0
+    slow.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        await Bun.sleep(300)
+        expect(connection.prepareEffectToken()?.consume()).toBe(true)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { slowRevokes += 1 },
+    }))
+    const slowClient = await openStreamingSocket(slow.socketPath)
+    slowClient.socket.write(activationPrepare())
+    expect(await slowClient.nextLine()).toContain('owner_ready')
+    slowClient.socket.write('{"publication":"slow"}\n')
+    expect(await slowClient.nextLine()).toContain('ready')
+    expect(slowRevokes).toBe(0)
+
+    const bounded = await activationServerFixture(false, true, {
+      readDeadlineMs: 100,
+      activationRecoveryDeadlineMs: 100,
+    })
+    let boundedRevokes = 0
+    let observeBoundedRevocation!: () => void
+    const boundedRevocation = new Promise<void>(resolve => { observeBoundedRevocation = resolve })
+    let releaseBoundedRecovery!: () => void
+    const boundedRecovery = new Promise<void>(resolve => { releaseBoundedRecovery = resolve })
+    bounded.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        await boundedRecovery
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { boundedRevokes += 1; observeBoundedRevocation() },
+    }))
+    const boundedClient = await openStreamingSocket(bounded.socketPath)
+    boundedClient.socket.write(activationPrepare())
+    await boundedClient.nextLine()
+    boundedClient.socket.write('{"publication":"bounded"}\n')
+    await boundedRevocation
+    releaseBoundedRecovery()
+    await waitFor(() => boundedClient.socket.destroyed)
+    expect(await exchange(bounded.socketPath, activationPrepare())).toBe('')
+    expect(boundedRevokes).toBe(1)
+    slowClient.socket.destroy()
+  })
+
+  test('owner-ready and ready write failures destroy the retained socket and revoke once', async () => {
+    const ownerReadyFailure = await activationServerFixture(false, true, {
+      beforeActivationFrameWriteForTest: (phase, socket) => {
+        if (phase === 'owner_ready') socket.destroy(new Error('owner-ready write failure'))
+      },
+    })
+    let ownerReadyRevokes = 0
+    ownerReadyFailure.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { ownerReadyRevokes += 1 },
+    }))
+    const ownerReadyClient = await openStreamingSocket(ownerReadyFailure.socketPath)
+    ownerReadyClient.socket.write(activationPrepare())
+    await waitFor(() => ownerReadyRevokes === 1 && ownerReadyClient.socket.destroyed)
+    expect(await exchange(ownerReadyFailure.socketPath, activationPrepare())).toBe('')
+    expect(ownerReadyRevokes).toBe(1)
+
+    const readyFailure = await activationServerFixture(false, true, {
+      beforeActivationFrameWriteForTest: (phase, socket) => {
+        if (phase === 'ready') socket.destroy(new Error('ready write failure'))
+      },
+    })
+    let readyRevokes = 0
+    readyFailure.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { readyRevokes += 1 },
+    }))
+    const readyClient = await openStreamingSocket(readyFailure.socketPath)
+    readyClient.socket.write(activationPrepare())
+    await readyClient.nextLine()
+    readyClient.socket.write('{"publication":"ready-write"}\n')
+    await waitFor(() => readyRevokes === 1 && readyClient.socket.destroyed)
+    expect(await exchange(readyFailure.socketPath, activationPrepare())).toBe('')
+    expect(readyRevokes).toBe(1)
+  })
+
+  test('RST/error and parent drift destroy the exact activation socket and revoke once', async () => {
+    let retainedServerSocket!: Socket
+    const errored = await activationServerFixture(false, true, {
+      beforeActivationFrameWriteForTest: (phase, socket) => {
+        if (phase === 'ready') retainedServerSocket = socket
+      },
+    })
+    let errorRevokes = 0
+    errored.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { errorRevokes += 1 },
+    }))
+    const errorClient = await openStreamingSocket(errored.socketPath)
+    errorClient.socket.write(activationPrepare())
+    await errorClient.nextLine()
+    errorClient.socket.write('{"publication":"error"}\n')
+    await errorClient.nextLine()
+    retainedServerSocket.emit('error', Object.assign(new Error('reset'), { code: 'ECONNRESET' }))
+    await waitFor(() => errorRevokes === 1 && retainedServerSocket.destroyed && errorClient.socket.destroyed)
+    expect(await exchange(errored.socketPath, activationPrepare())).toBe('')
+    expect(errorRevokes).toBe(1)
+
+    const drifted = await activationServerFixture()
+    let driftConnection!: HostedApprovalActivationConnection
+    let releaseRecovery!: () => void
+    const recovery = new Promise<void>(resolve => { releaseRecovery = resolve })
+    let driftRevokes = 0
+    drifted.create(({ connection }) => {
+      driftConnection = connection
+      return {
+        activate: async () => {
+          await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+          await recovery
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => { driftRevokes += 1 },
+      }
+    })
+    const driftClient = await openStreamingSocket(drifted.socketPath)
+    driftClient.socket.write(activationPrepare())
+    await driftClient.nextLine()
+    driftClient.socket.write('{"publication":"parent-drift"}\n')
+    const parent = join(drifted.socketPath, '..')
+    const movedParent = join(parent, '..', 'private-moved')
+    await rename(parent, movedParent)
+    await mkdir(parent, { mode: 0o700 })
+    await waitFor(() => driftRevokes === 1 && driftClient.socket.destroyed)
+    expect(driftConnection.isCurrent()).toBe(false)
+    expect(await exchange(join(movedParent, 'control.sock'), activationPrepare())).toBe('')
+    expect(driftRevokes).toBe(1)
+    releaseRecovery()
+  })
+
   test('rejects activation pipelining, cross-connection publication and every second activation', async () => {
     const pipelined = await activationServerFixture()
     let factoryCalls = 0
@@ -738,7 +887,7 @@ describe('HostedControlServer', () => {
     })
     expect(token!.consume()).toBe(false)
     expect(token!.consume()).toBe(false)
-    await waitFor(() => revokeCalls === 1)
+    await waitFor(() => revokeCalls === 1 && activation.socket.destroyed)
     expect(connection.isCurrent()).toBe(false)
     expect(await fixture.server.hasActiveLease()).toBe(false)
     // Replacement invalidates the shared pathname identity, but activation
@@ -814,6 +963,13 @@ describe('HostedControlServer', () => {
 async function activationServerFixture(
   dispatcher = false,
   installFactory = true,
+  options: {
+    readDeadlineMs?: number
+    activationRecoveryDeadlineMs?: number
+    beforeActivationFrameWriteForTest?: (
+      phase: 'owner_ready' | 'ready', socket: Socket,
+    ) => void | Promise<void>
+  } = {},
 ): Promise<{
   socketPath: string
   server: HostedControlServer
@@ -838,6 +994,7 @@ async function activationServerFixture(
     authority: fixture.authority,
     service: { mutate: async () => ({ kind: 'unavailable' as const }) },
     dispatchCoexistingOperation: dispatcher ? async () => ({ kind: 'ok' }) : undefined,
+    ...options,
     activationSessionFactory: installFactory
       ? connection => {
         if (!factory) throw new Error('activation test factory not installed')

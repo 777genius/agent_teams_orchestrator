@@ -37,6 +37,7 @@ import {
 export const HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES = 64 * 1024
 export const HOSTED_CONTROL_MAX_LINE_BYTES = 8 * 1024 * 1024
 export const HOSTED_CONTROL_READ_DEADLINE_MS = 5_000
+export const HOSTED_CONTROL_ACTIVATION_RECOVERY_DEADLINE_MS = 30_000
 export const HOSTED_LIFECYCLE_PROOF_DOMAIN = 'agent-teams.hosted-lifecycle.owner-proof/v1'
 export const HOSTED_TEAM_MESSAGE_PROOF_DOMAIN = 'agent-teams.hosted-team-message.owner-proof/v1'
 export const HOSTED_READINESS_MAX_LINE_BYTES = 4 * 1024
@@ -56,11 +57,17 @@ export type HostedControlServerOptions = {
   authority: HostedControlStableAuthority
   service: HostedTaskMutationPort
   readDeadlineMs?: number
+  /** Recovery has a separate absolute bound after the publication read completes. */
+  activationRecoveryDeadlineMs?: number
   bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
   /** Deterministic publication-window seam for security regression tests. */
   afterSocketPublicationForTest?: () => void | Promise<void>
   /** Deterministic close-window seam for hidden-path replacement regression tests. */
   beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
+  /** Deterministic retained-write seam for activation transport regression tests. */
+  beforeActivationFrameWriteForTest?: (
+    phase: 'owner_ready' | 'ready', socket: Socket,
+  ) => void | Promise<void>
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
   /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
   activationSessionFactory?: HostedApprovalActivationSessionFactory
@@ -86,6 +93,7 @@ type ActivationCandidate = {
   rejectPublication: ((error: Error) => void) | null
   revokePromise: Promise<void> | null
   monitor: ReturnType<typeof setInterval> | null
+  recoveryDeadline: ReturnType<typeof setTimeout> | null
 }
 
 export type HostedReadinessAdmission =
@@ -266,10 +274,15 @@ export class HostedControlServer {
     let bytes = 0
     let finished = false
 
-    const failClosed = () => {
+    const failClosed = (cause: unknown = new Error('Hosted control connection failed closed')) => {
       finished = true
       chunks = []
-      socket.destroy()
+      const activation = this.#activation
+      if (activation?.socket === socket) {
+        void this.#revokeActivation(activation, asError(cause))
+      } else {
+        socket.destroy()
+      }
     }
     socket.once('timeout', failClosed)
     socket.once('error', error => {
@@ -351,6 +364,7 @@ export class HostedControlServer {
       rejectPublication: null,
       revokePromise: null,
       monitor: null,
+      recoveryDeadline: null,
     }
     this.#activation = candidate
     const connection: HostedApprovalActivationConnection = Object.freeze({
@@ -374,12 +388,13 @@ export class HostedControlServer {
         throw new Error('Hosted approval activation became stale during recovery')
       }
       candidate.phase = 'ready_writing'
+      await this.#options.beforeActivationFrameWriteForTest?.('ready', socket)
       await writeRetainedFrame(socket, ready)
       if (!this.#isActivationCurrent(candidate) || candidate.phase !== 'ready_writing') {
         throw new Error('Hosted approval activation became stale while publishing ready')
       }
       candidate.phase = 'leased'
-      socket.setTimeout(0)
+      this.#clearActivationRecoveryDeadline(candidate)
     } catch (error) {
       await this.#revokeActivation(candidate, asError(error)).catch(() => undefined)
       socket.destroy()
@@ -415,6 +430,17 @@ export class HostedControlServer {
       return
     }
     candidate.phase = 'recovering'
+    // The publication inactivity deadline must not consume a legitimate slow
+    // recovery. Recovery instead owns one absolute, fail-closed deadline that
+    // also bounds the retained ready write.
+    candidate.socket.setTimeout(0)
+    candidate.recoveryDeadline = setTimeout(() => {
+      void this.#revokeActivation(
+        candidate, new Error('Hosted approval activation recovery timed out'),
+      )
+    }, this.#options.activationRecoveryDeadlineMs ??
+      HOSTED_CONTROL_ACTIVATION_RECOVERY_DEADLINE_MS)
+    candidate.recoveryDeadline.unref?.()
     candidate.publicationChunks = []
     candidate.resolvePublication?.(frame)
     candidate.resolvePublication = null
@@ -435,7 +461,9 @@ export class HostedControlServer {
     // including owner-ready failure, recovery failure, and later revocation.
     this.#activationConsumed = true
     candidate.phase = 'owner_ready_writing'
+    candidate.socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     try {
+      await this.#options.beforeActivationFrameWriteForTest?.('owner_ready', candidate.socket)
       await writeRetainedFrame(candidate.socket, ownerReady)
     } catch (error) {
       void this.#revokeActivation(candidate, asError(error))
@@ -487,6 +515,7 @@ export class HostedControlServer {
     if (candidate.revokePromise) return candidate.revokePromise
     candidate.phase = 'revoked'
     this.#activationGeneration += 1
+    this.#clearActivationRecoveryDeadline(candidate)
     if (candidate.monitor) clearInterval(candidate.monitor)
     candidate.monitor = null
     candidate.rejectPublication?.(error)
@@ -505,7 +534,15 @@ export class HostedControlServer {
     } catch (cause) {
       candidate.revokePromise = Promise.reject(cause)
     }
+    // Always close the exact retained connection in the same synchronous
+    // revocation turn. Clearing the identity monitor can never orphan it.
+    candidate.socket.destroy()
     return candidate.revokePromise
+  }
+
+  #clearActivationRecoveryDeadline(candidate: ActivationCandidate): void {
+    if (candidate.recoveryDeadline) clearTimeout(candidate.recoveryDeadline)
+    candidate.recoveryDeadline = null
   }
 
   #admitBrokerConnection(
