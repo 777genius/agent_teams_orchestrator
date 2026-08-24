@@ -18,6 +18,7 @@ import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './Open
 import type { OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import {
+  assertOpenCodeProductionBootstrapOwnership,
   createOpenCodeLaunchPreflightResult,
   deriveOpenCodeProductionProofOwnership,
   hasExactOpenCodeClaimReconciliationAuthority,
@@ -32,6 +33,23 @@ const productionContext = () => ({
   deadlineAtMs: Date.now() + 10_000,
   signal: new AbortController().signal,
   monotonicNow: Date.now,
+})
+
+test.each([
+  ['valid exact ids', { id: 'msg-bootstrap', sessionID: 'ses_member' }, true],
+  ['valid normalized compatibility session id', { id: 'msg-bootstrap', sessionId: 'ses_member' }, true],
+  ['missing message id', { sessionID: 'ses_member' }, false],
+  ['mismatched message id', { id: 'msg-other', sessionID: 'ses_member' }, false],
+  ['missing session id', { id: 'msg-bootstrap' }, false],
+  ['mismatched session id', { id: 'msg-bootstrap', sessionID: 'ses_other' }, false],
+  ['contradictory session id aliases', { id: 'msg-bootstrap', sessionID: 'ses_member',
+    sessionId: 'ses_other' }, false],
+] as const)('production bootstrap ownership: %s', (_name, info, valid) => {
+  const verify = () => assertOpenCodeProductionBootstrapOwnership({
+    message: { info, parts: [] }, messageId: 'msg-bootstrap', sessionId: 'ses_member', phase: 'returned',
+  })
+  if (valid) expect(verify()).toMatchObject({ info })
+  else expect(verify).toThrow('returned ownership verification failed')
 })
 
 test('production preflight never authorizes reconciliation and omits continuation for completed replay', () => {
@@ -417,6 +435,20 @@ test.each([
     (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
       session: { id: proof.authoritativeSessionId, title: proof.ownershipTitle }, messageId: 'msg-substituted',
     }), 'message identity changed'],
+  ['missing message id',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: proof.authoritativeSessionId, title: proof.ownershipTitle }, messageId: undefined,
+    }), 'message identity changed'],
+  ['missing message session id',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: proof.authoritativeSessionId, title: proof.ownershipTitle },
+      messageId: proof.observationMessageId,
+    }), 'message session changed'],
+  ['mismatched message session id',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: proof.authoritativeSessionId, title: proof.ownershipTitle },
+      messageId: proof.observationMessageId,
+    }), 'message session changed'],
 ] as const)('production restart fails closed on %s', async (_name, mutate, expected) => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-reobserve-fake-'))
   try {
@@ -437,7 +469,10 @@ test.each([
     await expect(reobserveOpenCodeProductionRetainedProof({
       retainedProof: retainedProof!,
       getSession: async () => changed.session,
-      getSessionMessage: async () => ({ info: { id: changed.messageId }, parts: [] }),
+      getSessionMessage: async () => ({ info: { id: changed.messageId,
+        ...(_name === 'missing message session id' ? {}
+          : { sessionID: _name === 'mismatched message session id'
+            ? 'ses_other' : retainedProof!.authoritativeSessionId }) }, parts: [] }),
     })).rejects.toThrow(expected)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
@@ -601,7 +636,8 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     const recovered = await recoverOpenCodeCommittedMemberProjection({ claim: claim!, teamId: 'team',
       laneId: 'primary', memberName: 'alice', selectedModel: 'openrouter/model', expectedBootstrapText: text,
       getSession: async () => ({ id: sessionId, title }),
-      getSessionMessage: async () => ({ info: { id: messageID, providerID: 'openrouter', modelID: 'model' },
+      getSessionMessage: async () => ({ info: { id: messageID, sessionID: sessionId,
+        providerID: 'openrouter', modelID: 'model' },
         parts: [{ type: 'text', text }] }),
       upsert: async value => { projected.push(value) },
     })
@@ -633,6 +669,14 @@ test('committed projection recovery reports absent, mismatched and foreign remot
     ['remote_foreign', async () => ({ id: base.sessionId, title: 'foreign' }), async () => base.message],
     ['remote_mismatch', async () => ({ id: base.sessionId, title: base.title }),
       async () => ({ ...base.message, info: { ...base.message.info, modelID: 'other' } })],
+    ['remote_mismatch', async () => ({ id: base.sessionId, title: base.title }),
+      async () => ({ ...base.message, info: { ...base.message.info, id: undefined } })],
+    ['remote_mismatch', async () => ({ id: base.sessionId, title: base.title }),
+      async () => ({ ...base.message, info: { ...base.message.info, id: 'msg_other' } })],
+    ['remote_mismatch', async () => ({ id: base.sessionId, title: base.title }),
+      async () => ({ ...base.message, info: { ...base.message.info, sessionID: undefined } })],
+    ['remote_mismatch', async () => ({ id: base.sessionId, title: base.title }),
+      async () => ({ ...base.message, info: { ...base.message.info, sessionID: 'ses_other' } })],
     ['transport', async () => { throw new Error('unknown transport') }, async () => null],
   ] as const) {
     let upserts = 0
@@ -704,7 +748,8 @@ async function committedRecoveryFixture() {
     immutableDigest: 'c'.repeat(64),
     generation: 1, fence: 1, acquisitionToken: 'acquire', claimToken, memberIdentity, linkage,
     recovery: { ownershipTitle: title, sessionRecord: record } }
-  const message = { info: { id: 'msg_exact', providerID: 'openrouter', modelID: 'model' },
+  const message = { info: { id: 'msg_exact', sessionID: sessionId,
+    providerID: 'openrouter', modelID: 'model' },
     parts: [{ type: 'text' as const, text }] }
   return { sessionId, title, message, input: { claim, teamId: 'team', laneId: 'primary', memberName: 'alice',
     selectedModel: 'openrouter/model', expectedBootstrapText: text } }

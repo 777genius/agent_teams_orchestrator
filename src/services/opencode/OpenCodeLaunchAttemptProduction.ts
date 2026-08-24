@@ -74,8 +74,21 @@ import {
   type OpenCodePlanScopedProfileManagerPort,
 } from './OpenCodePlanScopedProfile.js'
 import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
+import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
+
+export function assertOpenCodeProductionBootstrapOwnership(input: Readonly<{
+  message: OpenCodeMessage | null | undefined
+  messageId: string
+  sessionId: string
+  phase: 'returned' | 'persisted'
+}>): OpenCodeMessage {
+  if (!hasExactOpenCodeMessageOwnership(input.message, input.messageId, input.sessionId)) {
+    throw new Error(`OpenCode noReply bootstrap ${input.phase} ownership verification failed`)
+  }
+  return input.message
+}
 
 export async function resolveOpenCodeProductionRetainedProofRecord(input: Readonly<{
   cached?: OpenCodeProofSessionCleanupRecord
@@ -146,8 +159,8 @@ export async function reobserveOpenCodeProductionRetainedProof(input: Readonly<{
   if (!observedMessage || info.id !== retained.observationMessageId) {
     throw new Error('OpenCode retained proof message identity changed')
   }
-  const observedSessionId = info.sessionID ?? info.sessionId
-  if (observedSessionId !== undefined && observedSessionId !== retained.authoritativeSessionId) {
+  if (!hasExactOpenCodeMessageOwnership(observedMessage, retained.observationMessageId,
+    retained.authoritativeSessionId)) {
     throw new Error('OpenCode retained proof message session changed')
   }
   return observedMessage
@@ -1045,14 +1058,18 @@ class OpenCodeProductionLaunchRuntime {
           const contextHash = createHash('sha256').update(text).digest('hex')
           const briefingHash = createHash('sha256').update(member.prompt ?? '').digest('hex')
           const messageID = `msg_000000000000${createHash('sha256').update(contextHash).digest('hex').slice(0, 14)}`
-          await runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+          const returned = await runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
             () => client.sendSessionMessage(record.opencodeSessionId, {
               messageID, agent: 'teammate-bootstrap', noReply: true,
               model: modelParts(command.selectedModel), parts: [{ type: 'text', text }],
             }))
+          assertOpenCodeProductionBootstrapOwnership({ message: returned, messageId: messageID,
+            sessionId: record.opencodeSessionId, phase: 'returned' })
           const written = await client.getSessionMessage?.(record.opencodeSessionId, messageID)
           const writtenInfo = written?.info ?? {}
-          if (!written || readOpenCodeExactMessageText(written) !== text
+          const exactWritten = assertOpenCodeProductionBootstrapOwnership({ message: written,
+            messageId: messageID, sessionId: record.opencodeSessionId, phase: 'persisted' })
+          if (readOpenCodeExactMessageText(exactWritten) !== text
             || (writtenInfo.providerID ?? writtenInfo.providerId) !== modelParts(command.selectedModel).providerID
             || (writtenInfo.modelID ?? writtenInfo.modelId) !== modelParts(command.selectedModel).modelID) {
             throw new Error('OpenCode noReply bootstrap durable verification failed')

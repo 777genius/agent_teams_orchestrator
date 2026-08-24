@@ -457,6 +457,74 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual(['member_intent', 'member_unknown'])
   })
 
+  test('publishes and immediately projects a cancelled final while cleanup is retained, then passively replays it', async () => {
+    const cancellation = new AbortController()
+    const subject = setup()
+    let proofObservationEntered!: () => void
+    const atProofObservation = new Promise<void>(resolve => { proofObservationEntered = resolve })
+    subject.ports.proof.observeRetainedProofState = async () => {
+      proofObservationEntered()
+      return new Promise<never>(() => undefined)
+    }
+    let cleanupStarted = false
+    let settleCleanup!: () => void
+    const physicalCleanup = new Promise<'complete'>(resolve => { settleCleanup = () => resolve('complete') })
+    subject.ports.ownership.cleanupOwned = async () => {
+      cleanupStarted = true
+      return physicalCleanup
+    }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => {
+      if (cleanupStarted) throw new Error('cleanup deadline expired')
+      return Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          const abort = () => reject(signal.reason)
+          if (signal.aborted) abort()
+          else signal.addEventListener('abort', abort, { once: true })
+        }),
+      ])
+    }
+
+    const running = subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000, signal: cancellation.signal,
+    })
+    await atProofObservation
+    cancellation.abort(new Error('cancelled behind retained cleanup'))
+    const cancelled = await running
+    expect(cancelled.status).toBe('cancelled')
+    expect(cancelled.cleanup).toBe('timed_out')
+    expect(cancelled.durableFinalResponse).toMatchObject({
+      launchAttempt: { outcome: 'cancelled' }, failure: { code: 'cancelled' },
+    })
+    expect(subject.persistence.json().finalResponse).toEqual(cancelled.durableFinalResponse)
+    expect(subject.calls.some(call => call.startsWith('create:'))).toBe(false)
+    expect(subject.calls).not.toContain('release')
+
+    const acquisitionsBeforeProjection = subject.persistence.acquisitions
+    expect(projectOpenCodeLaunchAttemptResponse(cancelled)).toEqual(cancelled.durableFinalResponse)
+    expect(subject.persistence.acquisitions).toBe(acquisitionsBeforeProjection)
+
+    const activeCalls = subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'mcp' || call === 'proof' || call === 'proof-observe'
+      || call.startsWith('read:') || call.startsWith('create:')).length
+    const restarted = new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
+    const replay = await restarted.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(replay.status).toBe('cancelled')
+    expect(replay.durableFinalResponse).toEqual(cancelled.durableFinalResponse)
+    expect(subject.calls.filter(call => call === 'profile' || call === 'host'
+      || call === 'mcp' || call === 'proof' || call === 'proof-observe'
+      || call.startsWith('read:') || call.startsWith('create:'))).toHaveLength(activeCalls)
+    expect(subject.calls).not.toContain('release')
+
+    settleCleanup()
+    await physicalCleanup
+    await Bun.sleep(0)
+    expect(subject.calls).toContain('release')
+  })
+
   test('does not reset the deadline and catches timeout immediately after an intent transition', async () => {
     const subject = setup({ materialize: async member => {
       subject.setNow(9_000)

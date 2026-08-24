@@ -7,6 +7,7 @@ import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './Open
 import type { OpenCodeMessage, OpenCodeSessionRecord, OpenCodeSessionSummary } from './types.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
@@ -398,7 +399,8 @@ export async function recoverOpenCodeCommittedMemberProjection(input: {
   const separator = input.selectedModel.indexOf('/')
   const providerId = input.selectedModel.slice(0, separator)
   const modelId = input.selectedModel.slice(separator + 1)
-  if (!message || info.id !== bootstrap.messageID || readMessageText(message) !== input.expectedBootstrapText
+  if (!hasExactOpenCodeMessageOwnership(message, bootstrap.messageID, record.opencodeSessionId)
+    || readMessageText(message) !== input.expectedBootstrapText
     || (info.providerID ?? info.providerId) !== providerId
     || (info.modelID ?? info.modelId) !== modelId) {
     return { status: 'unresolved', reason: 'remote_mismatch' }
