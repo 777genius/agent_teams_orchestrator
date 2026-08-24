@@ -121,7 +121,7 @@ describe('OpenCode passive SQLite transaction consistency', () => {
           import { readOpenCodePassiveSnapshot } from ${JSON.stringify(storeUrl)};
           import { resolveOpenCodeCatalogSourceArtifacts, resolveOpenCodeNativeAuthorityArtifacts } from ${JSON.stringify(artifactsUrl)};
           const root=${JSON.stringify(root)}; const scope=${JSON.stringify(scope)};
-          const entries=async()=>Promise.all((await readdir(root)).sort().map(async name=>{const item=await lstat(path.join(root,name),{bigint:true});return [name,String(item.dev),String(item.ino),String(item.size),item.mode]}));
+          const entries=async()=>Promise.all((await readdir(root)).sort().map(async name=>{const item=await lstat(path.join(root,name),{bigint:true});return [name,String(item.dev),String(item.ino),String(item.size),String(item.mode)]}));
           const artifacts=resolveOpenCodeCatalogSourceArtifacts(process.cwd());
           const productionArtifacts=resolveOpenCodeNativeAuthorityArtifacts();
           const expectedProfile=process.env.OPENCODE_WINDOWS_NATIVE_EXPECTED_PROFILE;
@@ -129,7 +129,7 @@ describe('OpenCode passive SQLite transaction consistency', () => {
           if(artifacts.profile==='missing'||expectedProfile&&artifacts.profile!==expectedProfile)throw new Error('native authority profile mismatch [redacted]');
           if(expectedArch&&process.arch!==expectedArch)throw new Error('native authority architecture mismatch [redacted]');
           if(productionArtifacts.launcherPath!==artifacts.launcherPath||productionArtifacts.workerPath!==artifacts.workerPath)throw new Error('native authority production resolution mismatch [redacted]');
-          const artifactIdentity=async()=>Promise.all([artifacts.launcherPath,artifacts.workerPath].map(async file=>{const item=await lstat(file,{bigint:true});if(!item.isFile()||item.isSymbolicLink())throw new Error('native authority identity mismatch [redacted]');return [String(item.dev),String(item.ino),String(item.size),item.mode]}));
+          const artifactIdentity=async()=>Promise.all([artifacts.launcherPath,artifacts.workerPath].map(async file=>{const item=await lstat(file,{bigint:true});if(!item.isFile()||item.isSymbolicLink())throw new Error('native authority identity mismatch [redacted]');return [String(item.dev),String(item.ino),String(item.size),String(item.mode)]}));
           const nativeBefore=JSON.stringify(await artifactIdentity());
           console.error('WINDOWS_PASSIVE_PHASE writer');
           await new OpenCodePassiveStatusSnapshotWriter({rootDirectory:root,scheduleMaintenance:()=>undefined}).write(${JSON.stringify(value)},new AbortController().signal);
