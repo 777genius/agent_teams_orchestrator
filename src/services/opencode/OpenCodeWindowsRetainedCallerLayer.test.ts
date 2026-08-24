@@ -5,20 +5,19 @@ import path from 'node:path'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 describe('OpenCode Windows retained caller layer', () => {
-  test('passive child opens, file reads, and enumeration are relative to retained handles', async () => {
-    const source = await readFile(new URL('./OpenCodeWindowsPassiveReadAuthority.ts', import.meta.url), 'utf8')
-    expect(source).toContain('NtCreateFile')
-    expect(source).toContain('attributes.writeBigUInt64LE(parent, 8)')
-    expect(source).toContain('GetVolumeInformationByHandleW')
-    expect(source).toContain('NtQueryVolumeInformationFile')
-    expect(source).toContain('rootPath.slice(0, 3)')
-    expect(source).toContain('NtQueryDirectoryFile')
-    expect(source).toContain('ReadFile(pinned.handle')
-    expect(source).not.toContain('GetDriveTypeW')
-    expect(source).not.toContain('GetVolumeInformationW')
-    expect(source).not.toContain('openAbsolute(rootPath)')
-    expect(source).not.toContain('path.win32.join')
-    expect(source).not.toContain("from 'node:fs/promises'")
+  test('production Windows passive reads use only the out-of-process retained protocol', async () => {
+    const [safe, store] = await Promise.all([
+      readFile(new URL('./OpenCodeSafePublication.ts', import.meta.url), 'utf8'),
+      readFile(new URL('./OpenCodePassiveSnapshotStore.ts', import.meta.url), 'utf8'),
+    ])
+    expect(store).toContain('OpenCodeSafePublicationDirectory.openReadOnly')
+    expect(safe).toContain('await authority.openRoot(resolved, false, false)')
+    expect(safe).toContain('namespaceList(this.#windowsKey)')
+    expect(safe).toContain("pinRegular(childName(name), denyWrites, this.#windowsKey)")
+    expect(safe).toContain("namespaceOpen(relative, 'read')")
+    expect(safe).toContain('namespaceRead(opened.token, Number(opened.size))')
+    expect(safe).not.toContain('OpenCodeWindowsPassiveReadAuthority')
+    expect(safe).not.toContain('bun:ffi')
   })
 
   test('passive retained ancestor cannot switch bytes or names after a replacement attempt', async () => {

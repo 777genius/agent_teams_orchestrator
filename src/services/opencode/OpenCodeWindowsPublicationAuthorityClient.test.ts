@@ -197,6 +197,37 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(operations).toEqual(['OPEN_ROOT', 'SYNC_ROOT']); expect(kills).toBe(0)
     client.kill(); expect(kills).toBe(1)
   })
+  test('kills a retained fake authority when NS_LIST never replies by its finite physical deadline', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    let resolveExit!: (code: number) => void
+    let exited = false; let kills = 0
+    const encoder = new TextEncoder(); const operations: string[] = []
+    const finish = (code: number) => {
+      if (exited) return
+      exited = true; try { controller.close() } catch {}; resolveExit(code)
+    }
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
+      exited: new Promise<number>(resolve => { resolveExit = resolve }),
+      unref() { throw new Error('retained authority must remain referenced') },
+      kill() { kills += 1; finish(-1) },
+      stdin: { end() {}, write(line: string) {
+        const request = JSON.parse(line); operations.push(request.op)
+        if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
+          id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
+        return line.length
+      } },
+    }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: Date.now() + 100, launch: () => child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.namespaceList('.')).rejects.toThrow('unavailable [redacted]')
+    await client.physicalSettlement
+    expect(operations).toEqual(['OPEN_ROOT', 'NS_LIST'])
+    expect(kills).toBe(1)
+  }, 3_000)
   test('cancels a caller wait without killing its pending retained physical operation', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0
     const encoder = new TextEncoder(); const abort = new AbortController()

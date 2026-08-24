@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -50,6 +50,7 @@ function snapshot(at: number, connected: boolean, version: string, generation?: 
 function deferred() { let resolve!: () => void; return { promise: new Promise<void>(done => { resolve = done }), resolve } }
 async function runBoundedBunChild(source: string, timeoutMs = 20_000) {
   const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+  const exited = child.exited.catch(() => -1)
   const stdout = new Response(child.stdout).text()
   const stderr = new Response(child.stderr).text()
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -60,15 +61,29 @@ async function runBoundedBunChild(source: string, timeoutMs = 20_000) {
     }, timeoutMs)
   })
   try {
-    const [exitCode, output, error] = await Promise.all([
-      Promise.race([child.exited, timeout]), stdout, stderr,
+    const [exitCode, output, error] = await Promise.race([
+      Promise.all([exited, stdout, stderr]), timeout,
     ])
     return { exitCode, stdout: output, stderr: error }
   } finally {
     if (timer) clearTimeout(timer)
     child.kill()
-    await child.exited
+    let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([exited, new Promise<never>((_, reject) => {
+        cleanupTimer = setTimeout(() => reject(new Error('bounded fake child cleanup exceeded 2000ms')), 2_000)
+      })])
+    } finally { if (cleanupTimer) clearTimeout(cleanupTimer) }
   }
+}
+async function removeParentOwnedTemp(root: string): Promise<void> {
+  let failure: unknown
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try { await rm(root, { recursive: true, force: true }); return }
+    catch (error) { failure = error }
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw failure
 }
 async function appendLegacy(
   root: string,
@@ -94,22 +109,27 @@ async function status(root: string, providerIds = ['deepinfra']) {
 
 describe('OpenCode passive SQLite transaction consistency', () => {
   test.skipIf(process.platform !== 'win32')(
-    'Windows production read preserves every publication entry and exact object identity', async () => {
+    'Windows parent-owned child production read exits and preserves exact publication identity', async () => {
       const root = await mkdtemp(path.join(process.cwd(), '.passive-windows-readonly-'))
-      const entries = async () => Promise.all((await readdir(root)).sort().map(async name => {
-        const value = await lstat(path.join(root, name), { bigint: true })
-        return [name, value.dev, value.ino, value.size, value.mode] as const
-      }))
       try {
-        await new OpenCodePassiveStatusSnapshotWriter({
-          rootDirectory: root, scheduleMaintenance: () => undefined,
-        })
-          .write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
-        const before = await entries()
-        const observed = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
-        expect(observed?.value.binary.value.version).toBe('1.0.0')
-        expect(await entries()).toEqual(before)
-      } finally { await rm(root, { recursive: true, force: true }) }
+        const writerUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveStatusSnapshotWriter.ts')).href
+        const storeUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveSnapshotStore.ts')).href
+        const value = snapshot(1_000, true, '1.0.0')
+        const source = `import { lstat, readdir } from 'node:fs/promises'; import path from 'node:path';
+          import { OpenCodePassiveStatusSnapshotWriter } from ${JSON.stringify(writerUrl)};
+          import { readOpenCodePassiveSnapshot } from ${JSON.stringify(storeUrl)};
+          const root=${JSON.stringify(root)}; const scope=${JSON.stringify(scope)};
+          const entries=async()=>Promise.all((await readdir(root)).sort().map(async name=>{const item=await lstat(path.join(root,name),{bigint:true});return [name,String(item.dev),String(item.ino),String(item.size),item.mode]}));
+          await new OpenCodePassiveStatusSnapshotWriter({rootDirectory:root,scheduleMaintenance:()=>undefined}).write(${JSON.stringify(value)},new AbortController().signal);
+          const before=JSON.stringify(await entries());
+          const observed=await readOpenCodePassiveSnapshot(root,scope,new AbortController().signal);
+          if(observed?.value.binary.value.version!=='1.0.0')throw new Error('snapshot sentinel mismatch');
+          if(JSON.stringify(await entries())!==before)throw new Error('publication identity changed');
+          console.log('WINDOWS_PASSIVE_READ_EXIT_SENTINEL');`
+        const child = await runBoundedBunChild(source, 18_000)
+        expect(child.exitCode, child.stderr).toBe(0)
+        expect(child.stdout.trim(), child.stderr).toBe('WINDOWS_PASSIVE_READ_EXIT_SENTINEL')
+      } finally { await removeParentOwnedTemp(root) }
     },
   )
 

@@ -147,6 +147,26 @@ describe('Windows retained publication native contract', () => {
     await expect(writeFile(database, 'mutated')).rejects.toBeDefined()
     await client.close(); await writeFile(database, 'after-close')
   })
+  windowsTest('production passive directory reads through retained native namespace without writes', async () => {
+    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-passive-native-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
+    await mkdir(root); await writeFile(database, 'stable-checkpoint')
+    const before = (await readdir(root)).sort()
+    const directory = await OpenCodeSafePublicationDirectory.openReadOnly(root, {
+      windowsAuthorityFactory: input => new OpenCodeWindowsPublicationAuthorityClient({ ...input, ...artifacts() }),
+    })
+    try {
+      expect(await directory.childNames()).toEqual(before)
+      await directory.pinRegularFile('passive-status.sqlite3', true)
+      expect(new TextDecoder().decode((await directory.readBoundedRegularBytes(
+        'passive-status.sqlite3', 64,
+      ))!)).toBe('stable-checkpoint')
+      await expect(directory.ensureRegularFile('must-not-exist')).rejects.toThrow('unavailable [redacted]')
+    } finally {
+      try { await directory.close() } finally { await directory.awaitPhysicalSettlement() }
+    }
+    expect((await readdir(root)).sort()).toEqual(before)
+  })
   windowsTest('creates and publishes a temp root through one retained relative handle', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-retained-temp-root-')); roots.push(sandbox)
     const displaced = path.join(sandbox, 'displaced')

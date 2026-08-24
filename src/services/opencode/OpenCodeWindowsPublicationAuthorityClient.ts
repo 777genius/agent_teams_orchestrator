@@ -53,7 +53,10 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     // Attach both branches immediately: a hostile/test child must not create an
     // unhandled rejection, and process exit is the definitive OS handle-release boundary.
     this.physicalSettlement = this.#child.exited.then(() => undefined, () => undefined)
-    this.#child.unref(); this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline
+    // Keep the launcher referenced while native owns retained handles. CLOSE
+    // and the kill-on-close job object, followed by exited, are the physical
+    // release boundary; an unref here can let JS disappear before that boundary.
+    this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline
     this.#settlementDeadline = defaultSettlementDeadline; this.#signal = options.signal
     options.signal?.addEventListener('abort', this.#abort, { once: true })
     this.#callerDeadline = setTimeout(() => this.#cancelCaller(), Math.max(1, options.deadline - openCodeMonotonicNow()))
@@ -289,6 +292,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (signal?.aborted) abort()
     return release
   }
+  get settlementDeadline(): number { return this.#settlementDeadline }
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise
     this.#closePromise = (async () => {

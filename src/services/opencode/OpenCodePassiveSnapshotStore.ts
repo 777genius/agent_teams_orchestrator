@@ -224,7 +224,7 @@ async function commitOpenCodePassiveSnapshot(
       try { await root.close() } finally {
         // On Windows CLOSE acknowledgement precedes process exit. Do not return
         // while the native process can still retain database/root handles.
-        await root.physicalSettlement
+        await root.awaitPhysicalSettlement()
         await options.hooks?.afterRootClosed?.()
       }
     }
@@ -285,8 +285,6 @@ export async function readOpenCodePassiveSnapshot(
       // The passive connection has no filesystem VFS at all: SQLite consumes
       // an exact, bounded, no-follow copy as a read-only in-memory database.
       database = Database.deserialize(checkpoint, { readonly: true, strict: true })
-      await root.close()
-      root = null
     } else database = openDatabase(rootDirectory, true)
     verifySchema(database)
     database.exec('BEGIN')
@@ -323,7 +321,9 @@ export async function readOpenCodePassiveSnapshot(
     try {
       database?.close(false)
     } finally {
-      await root?.close()
+      if (root) {
+        try { await root.close() } finally { await root.awaitPhysicalSettlement() }
+      }
     }
   }
 }
@@ -348,7 +348,9 @@ export async function maintainOpenCodePassiveStore(rootDirectory: string, platfo
     if (process.platform !== 'win32') throw error
   } finally {
     try { database?.close(false) } finally {
-      try { await root?.close() } finally { await root?.physicalSettlement }
+      if (root) {
+        try { await root.close() } finally { await root.awaitPhysicalSettlement() }
+      }
     }
   }
 }

@@ -73,6 +73,12 @@ jobs:
           cargo test --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
           cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
           cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+      - name: Regress first Windows passive production read in an owned child
+        timeout-minutes: 2
+        run: >-
+          bun test
+          src/services/opencode/OpenCodePassiveSnapshotConsistency.test.ts
+          --test-name-pattern "Windows parent-owned child production read"
       - name: Test publication protocol and integrations
         timeout-minutes: 15
         run: >-

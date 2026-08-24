@@ -10,6 +10,21 @@ import {
 } from './OpenCodeSafePublication.js'
 
 describe('OpenCodeSafePublication', () => {
+  test('physical settlement uses a referenced finite deadline and kills a wedged launcher', async () => {
+    let kills = 0
+    const authority = {
+      physicalSettlement: new Promise<void>(() => {}),
+      settlementDeadline: Date.now() + 30,
+      kill: () => { kills += 1 },
+      close: async () => undefined,
+    }
+    const directory = new OpenCodeSafePublicationDirectory(
+      null, 'C:\\retained', { dev: 1n, ino: 2n }, authority as never,
+    )
+    await expect(directory.awaitPhysicalSettlement()).rejects.toThrow('physical settlement timed out [redacted]')
+    expect(kills).toBe(1)
+  })
+
   test.each(['recovery-marker deletion', 'recovery parent sync'])(
     'fake Windows authority keeps the committed final after injected %s failure',
     async boundary => {
