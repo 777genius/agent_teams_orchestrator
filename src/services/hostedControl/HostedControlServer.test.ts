@@ -2,13 +2,14 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { chmod, lstat, mkdir, mkdtemp, rm, unlink } from 'node:fs/promises'
-import { connect, createServer } from 'node:net'
+import { connect, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
 import { admitHostedReadiness, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
+import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
 
 const roots: string[] = []
 const servers: HostedControlServer[] = []
@@ -588,7 +589,311 @@ describe('HostedControlServer', () => {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     })
   })
+
+  test('retains one activation connection through owner-ready, publication, recovery and ready', async () => {
+    const fixture = await activationServerFixture()
+    let connection!: HostedApprovalActivationConnection
+    let publication = ''
+    let revokeCalls = 0
+    fixture.create(({ connection: candidate }) => {
+      connection = candidate
+      return {
+        activate: async prepare => {
+          expect(prepare).toBe(activationPrepare())
+          publication = await candidate.receivePublicationAfterOwnerReady(
+            '{"kind":"owner_ready"}\n', 512 * 1024,
+          )
+          const token = candidate.prepareEffectToken()!
+          expect(token.consume()).toBe(true)
+          expect(token.consume()).toBe(false)
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => { revokeCalls += 1 },
+      }
+    })
+    const client = await openStreamingSocket(fixture.socketPath)
+    client.socket.write(activationPrepare())
+    expect(await client.nextLine()).toBe('{"kind":"owner_ready"}')
+    client.socket.write('{"publication":1}\n')
+    expect(await client.nextLine()).toBe('{"kind":"ready"}')
+    expect(publication).toBe('{"publication":1}\n')
+    expect(connection.isCurrent()).toBe(true)
+    expect(client.socket.destroyed).toBe(false)
+
+    client.socket.write('x')
+    await waitFor(() => revokeCalls === 1)
+    expect(connection.isCurrent()).toBe(false)
+    await fixture.server.stop()
+    expect(revokeCalls).toBe(1)
+  })
+
+  test('rejects activation pipelining, cross-connection publication and every second activation', async () => {
+    const pipelined = await activationServerFixture()
+    let factoryCalls = 0
+    let revokeCalls = 0
+    let releaseOwnerReady!: () => void
+    const ownerReadyGate = new Promise<void>(resolve => { releaseOwnerReady = resolve })
+    pipelined.create(({ connection }) => ({
+      activate: async () => {
+        factoryCalls += 1
+        await ownerReadyGate
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { revokeCalls += 1 },
+    }))
+    expect(await exchange(pipelined.socketPath, `${activationPrepare()}{"publication":1}\n`)).toBe('')
+    expect(factoryCalls).toBe(0)
+
+    const candidate = await openStreamingSocket(pipelined.socketPath)
+    candidate.socket.write(activationPrepare())
+    await waitFor(() => factoryCalls === 1)
+    candidate.socket.write('{"publication":1}\n')
+    await waitFor(() => revokeCalls === 1)
+    releaseOwnerReady()
+    expect(await exchange(pipelined.socketPath, activationPrepare())).toContain('owner_ready')
+    expect(factoryCalls).toBe(2)
+
+    const cross = await activationServerFixture()
+    let crossRevokes = 0
+    cross.create(({ connection }) => ({
+      activate: async () => {
+        const publication = await connection.receivePublicationAfterOwnerReady(
+          '{"kind":"owner_ready"}\n', 512 * 1024,
+        )
+        expect(publication).toBe('{"publication":2}\n')
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { crossRevokes += 1 },
+    }))
+    const retained = await openStreamingSocket(cross.socketPath)
+    retained.socket.write(activationPrepare())
+    expect(await retained.nextLine()).toContain('owner_ready')
+    expect(await exchange(cross.socketPath, activationPrepare())).toBe('')
+    expect(await exchange(cross.socketPath, '{"publication":"wrong-socket"}\n')).toBe('')
+    retained.socket.write('{"publication":2}\n')
+    expect(await retained.nextLine()).toContain('ready')
+    expect(await exchange(cross.socketPath, activationPrepare())).toBe('')
+    retained.socket.end()
+    await waitFor(() => crossRevokes === 1)
+  })
+
+  test('does not let an unauthenticated prepare consume the permanent activation slot', async () => {
+    const fixture = await activationServerFixture()
+    let attempts = 0
+    let publicationTransitions = 0
+    fixture.create(({ connection }) => ({
+      activate: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('unauthenticated')
+        publicationTransitions += 1
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => undefined,
+    }))
+    expect(await exchange(fixture.socketPath, activationPrepare())).toBe('')
+    const valid = await openStreamingSocket(fixture.socketPath)
+    valid.socket.write(activationPrepare())
+    expect(await valid.nextLine()).toContain('owner_ready')
+    valid.socket.write('{"publication":1}\n')
+    expect(await valid.nextLine()).toContain('ready')
+    expect(attempts).toBe(2)
+    expect(publicationTransitions).toBe(1)
+    valid.socket.destroy()
+  })
+
+  test('synchronously fences replacement races and keeps activation independent of readiness', async () => {
+    const fixture = await activationServerFixture(true)
+    let connection!: HostedApprovalActivationConnection
+    let token: { consume(): boolean } | null = null
+    let releaseRecovery!: () => void
+    const recoveryGate = new Promise<void>(resolve => { releaseRecovery = resolve })
+    let revokeCalls = 0
+    fixture.create(({ connection: candidate }) => {
+      connection = candidate
+      return {
+        activate: async () => {
+          await candidate.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+          token = candidate.prepareEffectToken()
+          await recoveryGate
+          if (!token!.consume()) throw new Error('stale')
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => { revokeCalls += 1 },
+      }
+    })
+    const readiness = await openReadiness(fixture.socketPath, fixture.server.ownerBinding!)
+    const activation = await openStreamingSocket(fixture.socketPath)
+    activation.socket.write(activationPrepare())
+    expect(await activation.nextLine()).toContain('owner_ready')
+    activation.socket.write('{"publication":3}\n')
+    await waitFor(() => token !== null)
+
+    await unlink(fixture.socketPath)
+    const replacement = createServer()
+    await new Promise<void>((resolve, reject) => {
+      replacement.once('error', reject)
+      replacement.listen(fixture.socketPath, resolve)
+    })
+    expect(token!.consume()).toBe(false)
+    expect(token!.consume()).toBe(false)
+    await waitFor(() => revokeCalls === 1)
+    expect(connection.isCurrent()).toBe(false)
+    expect(await fixture.server.hasActiveLease()).toBe(false)
+    // Replacement invalidates the shared pathname identity, but activation
+    // revocation itself never consumes or clears the lifecycle lease object.
+    expect(readiness.socket.destroyed).toBe(false)
+    releaseRecovery()
+    await fixture.server.stop()
+    expect(revokeCalls).toBe(1)
+    readiness.socket.destroy()
+    await unlink(fixture.socketPath)
+    await new Promise<void>((resolve, reject) => replacement.close(error => error ? reject(error) : resolve()))
+  })
+
+  test('activation lease EOF and stop revoke once while ordinary dispatch stays compatible without a factory', async () => {
+    const fixture = await activationServerFixture(true)
+    let revokeCalls = 0
+    fixture.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { revokeCalls += 1 },
+    }))
+    const readiness = await openReadiness(fixture.socketPath, fixture.server.ownerBinding!)
+    const activation = await openStreamingSocket(fixture.socketPath)
+    activation.socket.write(activationPrepare())
+    await activation.nextLine()
+    activation.socket.write('{"publication":4}\n')
+    await activation.nextLine()
+    activation.socket.end()
+    await waitFor(() => revokeCalls === 1)
+    expect(await fixture.server.hasActiveLease()).toBe(true)
+    expect(await exchange(fixture.socketPath, '{"operation":"probe"}\n')).toContain('ok')
+    await fixture.server.stop()
+    expect(revokeCalls).toBe(1)
+    readiness.socket.destroy()
+
+    const legacy = await activationServerFixture(true, false)
+    const lease = await openReadiness(legacy.socketPath, legacy.server.ownerBinding!)
+    expect(await exchange(legacy.socketPath, '{"operation":"probe"}\n')).toContain('ok')
+    lease.socket.destroy()
+  })
+
+  test('stop synchronously revokes an active activation and waits for its cleanup', async () => {
+    const fixture = await activationServerFixture()
+    let revokeCalls = 0
+    let releaseCleanup!: () => void
+    const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve })
+    fixture.create(({ connection }) => ({
+      activate: async () => {
+        await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { revokeCalls += 1; await cleanup },
+    }))
+    const activation = await openStreamingSocket(fixture.socketPath)
+    activation.socket.write(activationPrepare())
+    await activation.nextLine()
+    activation.socket.write('{"publication":5}\n')
+    await activation.nextLine()
+    let stopped = false
+    const stopping = fixture.server.stop().then(() => { stopped = true })
+    expect(revokeCalls).toBe(1)
+    await Bun.sleep(0)
+    expect(stopped).toBe(false)
+    releaseCleanup()
+    await stopping
+    expect(stopped).toBe(true)
+    expect(revokeCalls).toBe(1)
+  })
 })
+
+async function activationServerFixture(
+  dispatcher = false,
+  installFactory = true,
+): Promise<{
+  socketPath: string
+  server: HostedControlServer
+  create(factory: (input: { connection: HostedApprovalActivationConnection }) => {
+    activate(frame: string): Promise<string>
+    revoke(): Promise<void>
+  }): void
+}> {
+  const root = await mkdtemp('/tmp/hc-activation-')
+  roots.push(root)
+  const socketPath = join(root, 'private', 'control.sock')
+  const fixture = hostedControlGoldenRequestFixture()
+  const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+  let factory: ((input: { connection: HostedApprovalActivationConnection }) => {
+    activate(frame: string): Promise<string>
+    revoke(): Promise<void>
+  }) | null = null
+  const server = new HostedControlServer({
+    socketPath,
+    secret: Buffer.alloc(32, 9),
+    ownerIdentity,
+    authority: fixture.authority,
+    service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+    dispatchCoexistingOperation: dispatcher ? async () => ({ kind: 'ok' }) : undefined,
+    activationSessionFactory: installFactory
+      ? connection => {
+        if (!factory) throw new Error('activation test factory not installed')
+        return factory({ connection })
+      }
+      : undefined,
+  })
+  servers.push(server)
+  await server.start()
+  return { socketPath, server, create: value => { factory = value } }
+}
+
+function activationPrepare(): string {
+  return '{"schemaVersion":2,"operation":"approval_activation_prepare"}\n'
+}
+
+function openStreamingSocket(socketPath: string): Promise<{
+  socket: Socket
+  nextLine(): Promise<string>
+}> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(socketPath)
+    let buffered = ''
+    const waiters: Array<(line: string) => void> = []
+    socket.setEncoding('utf8')
+    socket.on('data', chunk => {
+      buffered += chunk
+      while (buffered.includes('\n') && waiters.length > 0) {
+        const newline = buffered.indexOf('\n')
+        const line = buffered.slice(0, newline)
+        buffered = buffered.slice(newline + 1)
+        waiters.shift()!(line)
+      }
+    })
+    socket.once('connect', () => resolve({
+      socket,
+      nextLine: () => new Promise<string>(lineResolve => {
+        const newline = buffered.indexOf('\n')
+        if (newline >= 0) {
+          const line = buffered.slice(0, newline)
+          buffered = buffered.slice(newline + 1)
+          lineResolve(line)
+        } else waiters.push(lineResolve)
+      }),
+    }))
+    socket.once('error', reject)
+  })
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await Bun.sleep(2)
+  }
+  throw new Error('condition was not reached')
+}
 
 function openReadiness(socketPath: string, ownerBinding: NonNullable<HostedControlServer['ownerBinding']>): Promise<{ socket: ReturnType<typeof connect>; line: string }> {
   return new Promise((resolve, reject) => {

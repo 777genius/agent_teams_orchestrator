@@ -12,7 +12,10 @@ import type {
 } from './HostedControlDispatcher.js'
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
 import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
-import { HostedControlServer } from './HostedControlServer.js'
+import {
+  HostedControlServer,
+  type HostedApprovalActivationSessionFactory,
+} from './HostedControlServer.js'
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
 import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
@@ -33,6 +36,8 @@ export type HostedControlRuntimePorts = {
   messages: HostedTeamMessagePort
   /** Deliberately optional until the external lifecycle approval owner is installed. */
   approvals?: HostedApprovalWirePort
+  /** Per-connection O2-C activation boundary; omitted for legacy composition. */
+  activationSessionFactory?: HostedApprovalActivationSessionFactory
   close(): Promise<void>
 }
 
@@ -152,15 +157,6 @@ export class HostedControlRuntime {
       }
       startupRecovery = false
       let dispatcher: HostedControlDispatcher
-      server = new HostedControlServer({
-        socketPath: config.socketPath,
-        secret,
-        ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
-        authority,
-        service: taskService,
-        bootstrapBinding: descriptorAdmission?.bootstrapBinding,
-        dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
-      })
       if (!(await validateHostedControlOwnerBinding({
         claudeRoot: config.claudeRoot,
         legacyKey: config.legacyKey,
@@ -177,6 +173,16 @@ export class HostedControlRuntime {
         isCurrentAuthority,
       }))
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
+      server = new HostedControlServer({
+        socketPath: config.socketPath,
+        secret,
+        ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
+        authority,
+        service: taskService,
+        bootstrapBinding: descriptorAdmission?.bootstrapBinding,
+        dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
+        activationSessionFactory: ports.activationSessionFactory,
+      })
       dispatcher = new HostedControlDispatcher({
         secret,
         authority,
@@ -198,7 +204,10 @@ export class HostedControlRuntime {
     } catch (error) {
       this.#acceptingEffects = false
       this.#ports = null
-      await Promise.allSettled([ports?.close(), server?.stop()])
+      // Activation invalidation and handler draining must precede composed
+      // approval/lifecycle/message port teardown.
+      await server?.stop().catch(() => undefined)
+      await ports?.close().catch(() => undefined)
       this.#rootLease = null
       try { await rootLease?.release() } finally { await this.#disposeDescriptorAuthority() }
       throw error

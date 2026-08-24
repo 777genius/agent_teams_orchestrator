@@ -1,12 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { connect, type Socket } from 'node:net'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
-import { fingerprintHostedTaskCommand, type HostedTaskMutationCommand } from './protocol.js'
+import {
+  fingerprintHostedTaskCommand,
+  type HostedControlOwnerBinding,
+  type HostedTaskMutationCommand,
+} from './protocol.js'
 import { HostedControlRuntime, type HostedControlRuntimePortFactoryContext } from './HostedControlRuntime.js'
 import { createHostedLifecycleOwnerIdentityChecksum } from './HostedControlDispatcher.js'
 import type { HostedControlBootstrapAdmission } from './HostedControlBootstrap.js'
+import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
 import {
   HOSTED_LIFECYCLE_PROOF_DOMAIN,
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
@@ -20,6 +26,92 @@ afterEach(async () => {
 })
 
 describe('HostedControlRuntime', () => {
+  test('composes activation independently and stops approval before ports and descriptor authority', async () => {
+    const root = await realpath(await mkdtemp('/tmp/hosted-control-activation-runtime-'))
+    roots.push(root)
+    const claudeRoot = join(root, 'claude')
+    const runtimeRoot = join(root, 'runtime')
+    const socketPath = join(runtimeRoot, 'control.sock')
+    const activationSecret = Buffer.alloc(32, 7)
+    await mkdir(join(claudeRoot, 'teams', 'legacy'), { recursive: true, mode: 0o700 })
+    await mkdir(join(claudeRoot, 'tasks', 'legacy'), { recursive: true, mode: 0o700 })
+    await mkdir(runtimeRoot, { recursive: true, mode: 0o700 })
+    const actions: string[] = []
+    let context!: HostedControlRuntimePortFactoryContext
+    let revokeCalls = 0
+    const admission: HostedControlBootstrapAdmission = {
+      config: {
+        socketPath, claudeRoot,
+        deploymentId: 'deployment_test', bootId: 'boot_test', restoreGeneration: 0,
+        workspaceId: 'workspace_test', teamId: `team_${'a'.repeat(32)}`, legacyKey: 'legacy',
+        mountGeneration: 1, declaredRootHash: 'b'.repeat(64),
+        ownerAuthority: 'owner-authority_runtime-test', ownerGeneration: 1,
+        ownerSessionId: `owner-session_${'c'.repeat(32)}`,
+      },
+      bootstrapBinding: {
+        deploymentId: 'deployment_test', bootId: 'boot_test', workspaceId: 'workspace_test',
+        mountGeneration: 1, bootstrapDigest: 'd'.repeat(64),
+        ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
+        proofKeyId: createHash('sha256').update(activationSecret).digest('hex'),
+      },
+      secret: activationSecret,
+      guard: {
+        lost: new Promise<void>(() => undefined),
+        assertCurrent: async () => true,
+        close: async () => { actions.push('descriptor-close') },
+      },
+    }
+    const runtime = new HostedControlRuntime(admission, candidate => {
+      context = candidate
+      return {
+        lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
+        messages: { dispatch: async () => ({}) },
+        activationSessionFactory: (connection: HostedApprovalActivationConnection) => ({
+          activate: async () => {
+            await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+            const token = connection.prepareEffectToken()
+            if (!token?.consume()) throw new Error('activation token stale')
+            return '{"kind":"ready"}\n'
+          },
+          revoke: async () => {
+            revokeCalls += 1
+            actions.push('approval-revoked')
+          },
+        }),
+        close: async () => {
+          const closed = await connectionFails(socketPath)
+          actions.push(closed ? 'server-closed' : 'server-open')
+          actions.push('ports-close')
+        },
+      }
+    })
+    runtimes.push(runtime)
+    await runtime.start()
+    expect(await context.isCurrentAuthority({ actorId: 'before-readiness', ...context.authority })).toBe(false)
+
+    const activation = await openActivationStream(socketPath)
+    activation.socket.write('{"schemaVersion":2,"operation":"approval_activation_prepare"}\n')
+    expect(await activation.nextLine()).toContain('owner_ready')
+    activation.socket.write('{"publication":1}\n')
+    expect(await activation.nextLine()).toContain('ready')
+    expect(await context.isCurrentAuthority({ actorId: 'activation-only', ...context.authority })).toBe(false)
+
+    const readiness = await openDescriptorRuntimeReadiness(
+      socketPath,
+      admission.secret,
+      runtime.server!.ownerBinding!,
+      admission.bootstrapBinding,
+    )
+    expect(await context.isCurrentAuthority({ actorId: 'with-readiness', ...context.authority })).toBe(true)
+    activation.socket.write('x')
+    await waitForRuntime(() => revokeCalls === 1)
+    expect(await context.isCurrentAuthority({ actorId: 'after-activation-loss', ...context.authority })).toBe(true)
+
+    await runtime.stop()
+    expect(actions).toEqual(['approval-revoked', 'server-closed', 'ports-close', 'descriptor-close'])
+    readiness.socket.destroy()
+  })
+
   test('descriptor loss fences admission and drains exact-run compensation before stop settles', async () => {
     const root = await realpath(await mkdtemp('/tmp/hosted-control-descriptor-loss-'))
     roots.push(root)
@@ -493,4 +585,87 @@ function exchange(socketPath: string, input: string): Promise<string> {
     socket.once('close', () => resolve(output.trim()))
     socket.once('error', reject)
   })
+}
+
+function openActivationStream(socketPath: string): Promise<{
+  socket: Socket
+  nextLine(): Promise<string>
+}> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(socketPath)
+    let buffered = ''
+    const waiters: Array<(line: string) => void> = []
+    socket.setEncoding('utf8')
+    socket.on('data', chunk => {
+      buffered += chunk
+      while (buffered.includes('\n') && waiters.length > 0) {
+        const newline = buffered.indexOf('\n')
+        const line = buffered.slice(0, newline)
+        buffered = buffered.slice(newline + 1)
+        waiters.shift()!(line)
+      }
+    })
+    socket.once('connect', () => resolve({
+      socket,
+      nextLine: () => new Promise<string>(lineResolve => {
+        const newline = buffered.indexOf('\n')
+        if (newline >= 0) {
+          const line = buffered.slice(0, newline)
+          buffered = buffered.slice(newline + 1)
+          lineResolve(line)
+        } else waiters.push(lineResolve)
+      }),
+    }))
+    socket.once('error', reject)
+  })
+}
+
+function openDescriptorRuntimeReadiness(
+  socketPath: string,
+  secret: Uint8Array,
+  ownerBinding: HostedControlOwnerBinding,
+  bootstrapBinding: HostedControlBootstrapAdmission['bootstrapBinding'],
+): Promise<{ socket: Socket; line: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(socketPath)
+    let output = ''
+    socket.setEncoding('utf8')
+    socket.once('connect', () => {
+      const unsigned = {
+        schemaVersion: 2,
+        operation: 'readiness',
+        capability: 'hosted-lifecycle-command',
+        socketIdentity: ownerBinding.socketIdentity,
+        challenge: '1'.repeat(64),
+        bootstrapBinding,
+        expectedOwnerBinding: ownerBinding,
+      }
+      const serialized = JSON.stringify(unsigned)
+      const proof = createHostedRawDomainProof(
+        secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized,
+      )
+      socket.write(`${serialized.slice(0, -1)},"controllerProof":"${proof}"}\n`)
+    })
+    socket.on('data', chunk => {
+      output += chunk
+      if (output.includes('\n')) resolve({ socket, line: output.trim() })
+    })
+    socket.once('error', reject)
+  })
+}
+
+async function connectionFails(socketPath: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = connect(socketPath)
+    socket.once('connect', () => { socket.destroy(); resolve(false) })
+    socket.once('error', () => resolve(true))
+  })
+}
+
+async function waitForRuntime(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await Bun.sleep(2)
+  }
+  throw new Error('condition was not reached')
 }
