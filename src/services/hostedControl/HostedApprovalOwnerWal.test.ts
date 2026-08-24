@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { constants, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { decodeOwnerState, HostedApprovalOwnerWal, parseOwnerStateSource, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import {
+  decodeOwnerState, HostedApprovalOwnerWal, parseOwnerStateSource, type HostedApprovalOwnerState,
+} from './HostedApprovalOwnerWal.js'
+import {
+  createRegularNodeAtDarwin, type DarwinSpawnNative,
+} from './HostedApprovalOwnerWalDarwin.internal.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
-import { ingressRecordForObservedPermission } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 
 const teamId = `team_${'1'.repeat(32)}`
 const roots: string[] = []
@@ -112,6 +117,117 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
 })
 
 describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
+  test('keeps variadic creation out of Bun FFI on every supported platform', async () => {
+    const source = await readFile(resolve(import.meta.dir, 'HostedApprovalOwnerWal.ts'), 'utf8')
+    const openatDeclaration = source.split('\n').find(line => line.trimStart().startsWith('openat:'))
+    expect(openatDeclaration?.trim()).toBe(
+      'openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },',
+    )
+    expect(source).not.toMatch(/openAt\([^;]+O_CREAT/)
+    expect(source).toContain("if (darwinSpawnLibc) return makeRegularNodeAtDarwin(parentFd, name)")
+    expect(source).toContain('posix_spawn_file_actions_addopen')
+  })
+
+  test('portable fake-native creator retries EINTR and validates retained relative creation before success', () => {
+    const calls: unknown[][] = []
+    const waits = [
+      { result: -1, status: 0, errno: 4 },
+      { result: 73, status: 0, errno: 0 },
+    ]
+    const native = fakeDarwinSpawnNative(calls, { waits })
+    let removed = 0
+    expect(createRegularNodeAtDarwin(41, 'owner.json.writer-lock', native, () => { removed += 1 })).toBe(true)
+    expect(removed).toBe(0)
+    expect(calls).toEqual([
+      ['init'],
+      ['chdir', 41],
+      ['open', 0, 'owner.json.writer-lock',
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600],
+      ['spawn', '/usr/bin/true'],
+      ['wait', 73],
+      ['wait', 73],
+      ['destroy'],
+    ])
+  })
+
+  test('portable fake-native creator rejects nonzero and signaled children without claiming creation', () => {
+    for (const [status, message] of [[127 << 8, 'exited 127'], [23 << 8, 'exited 23'], [9, 'signal 9']] as const) {
+      const calls: unknown[][] = []; let removed = 0
+      const native = fakeDarwinSpawnNative(calls, { waits: [{ result: 73, status, errno: 0 }] })
+      expect(() => createRegularNodeAtDarwin(41, 'node', native, () => { removed += 1 })).toThrow(message)
+      expect(calls.filter(call => call[0] === 'wait')).toEqual([['wait', 73]])
+      expect(calls.at(-1)).toEqual(['destroy'])
+      expect(removed).toBe(0)
+    }
+  })
+
+  test('portable fake-native creator rejects wrong-pid, wait errors, and EINTR exhaustion without claiming creation', () => {
+    for (const fixture of [
+      { waits: [{ result: 74, status: 0, errno: 0 }], message: 'creator wait failed' },
+      { waits: [{ result: -1, status: 0, errno: 10 }], message: 'creator wait failed' },
+      {
+        waits: Array.from({ length: 65 }, () => ({ result: -1, status: 0, errno: 4 })),
+        message: 'creator wait failed',
+      },
+      { waits: [{ result: 73, status: 0x10000, errno: 0 }], message: 'wait status ambiguous' },
+    ]) {
+      let removed = 0
+      const native = fakeDarwinSpawnNative([], { waits: fixture.waits })
+      expect(() => createRegularNodeAtDarwin(41, 'node', native, () => { removed += 1 }))
+        .toThrow(fixture.message)
+      expect(removed).toBe(0)
+    }
+  })
+
+  test('preserves a sentinel pre-existing lock on child-exit-127, signal, and wait failure', async () => {
+    const cases = [
+      { waits: [{ result: 73, status: 127 << 8, errno: 0 }], message: 'exited 127' },
+      { waits: [{ result: 73, status: 9, errno: 0 }], message: 'signal 9' },
+      { waits: [{ result: -1, status: 0, errno: 10 }], message: 'creator wait failed' },
+    ]
+    for (const fixture of cases) {
+      const { path } = await walPath()
+      const lockPath = `${path}.writer-lock`
+      await writeFile(lockPath, 'sentinel-pre-existing-lock', { mode: 0o600 })
+      const native = fakeDarwinSpawnNative([], { waits: fixture.waits })
+      expect(() => createRegularNodeAtDarwin(41, 'owner.json.writer-lock', native, () => unlinkSync(lockPath)))
+        .toThrow(fixture.message)
+      expect(await readFile(lockPath, 'utf8')).toBe('sentinel-pre-existing-lock')
+    }
+  })
+
+  test('portable fake-native creator preserves a pre-existing lock on action, exec, and EEXIST failures', () => {
+    const cases: Array<{ overrides: Parameters<typeof fakeDarwinSpawnNative>[1]; error?: string; result?: boolean }> = [
+      { overrides: { chdirError: 22 }, error: 'retained spawn directory unavailable' },
+      { overrides: { openError: 13 }, error: 'spawn create action unavailable' },
+      { overrides: { spawnError: 2 }, error: 'creator spawn failed' },
+      { overrides: { pid: 0 }, error: 'creator spawn failed' },
+      { overrides: { spawnError: 17 }, result: false },
+    ]
+    for (const fixture of cases) {
+      let removed = 0
+      const native = fakeDarwinSpawnNative([], fixture.overrides)
+      if (fixture.error) {
+        expect(() => createRegularNodeAtDarwin(41, 'owner.json.writer-lock', native, () => { removed += 1 }))
+          .toThrow(fixture.error)
+      } else {
+        expect(createRegularNodeAtDarwin(41, 'owner.json.writer-lock', native, () => { removed += 1 }))
+          .toBe(fixture.result!)
+      }
+      expect(removed).toBe(0)
+    }
+  })
+
+  test('portable fake-native creator treats action destruction as failure and cleans an owned node', () => {
+    let removed = 0
+    const native = fakeDarwinSpawnNative([], {
+      waits: [{ result: 73, status: 0, errno: 0 }], destroyError: 22,
+    })
+    expect(() => createRegularNodeAtDarwin(41, 'node', native, () => { removed += 1 }))
+      .toThrow('actions destroy failed')
+    expect(removed).toBe(1)
+  })
+
   test('publishes a legacy v1 migration as v2 without restoring legacy routes', async () => {
     const { path } = await walPath()
     const wal = new HostedApprovalOwnerWal(path)
@@ -139,6 +255,32 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const after = await lstat(target)
     expect(await readFile(target, 'utf8')).toBe('untouched')
     expect(after.mode).toBe(before.mode); expect(after.size).toBe(before.size)
+  })
+
+  test('creates through the retained parent fd and closes descriptors when the linked parent races', async () => {
+    if (process.platform !== 'linux') return
+    const raceCreate = async () => {
+      const { path } = await walPath(); const root = join(path, '..'); const retained = `${root}.retained`
+      roots.push(retained)
+      let observedRetainedNode = false
+      const wal = new HostedApprovalOwnerWal(path, {
+        beforeRetainedCreate: () => {
+          renameSync(root, retained)
+          mkdirSync(root, { mode: 0o700 })
+        },
+        afterRetainedCreate: name => {
+          observedRetainedNode = lstatSync(join(retained, name)).isFile()
+          expect(existsSync(join(root, name))).toBe(false)
+        },
+      })
+      await expect(wal.locked(async state => state)).rejects.toThrow('outside pinned namespace')
+      expect(observedRetainedNode).toBe(true)
+      expect(existsSync(join(retained, 'owner.json.writer-lock'))).toBe(false)
+    }
+    await raceCreate()
+    const settledFds = readdirSync('/proc/self/fd').length
+    await raceCreate()
+    expect(readdirSync('/proc/self/fd').length).toBe(settledFds)
   })
 
   test('fails closed when the fence pathname is replaced after safe open and before identity use', async () => {
@@ -422,10 +564,18 @@ await wal.locked(async state => {
 })
 
 function state(): HostedApprovalOwnerState {
-  const ingress = ingressRecordForObservedPermission({
-    route, observedAtIso: '2026-08-13T10:00:00.000Z',
-    permission: { requestId: 'permission_1', sessionId: 'session_1', tool: 'bash', title: 'Run tests', kind: 'tool', raw: { requestID: 'permission_1', sessionID: 'session_1' } },
-  })
+  const effectRef = `effect:${'c'.repeat(64)}`
+  const deliveryRef = `delivery_ref_opencode-${'c'.repeat(64)}`
+  const ingress = {
+    outboxVersion: 1 as const, outboxId: `runtime_permission:${effectRef}`,
+    commandId: 'permission_1', effectRef, deliveryRef, authority: structuredClone(route.authority),
+    payloadJson: JSON.stringify({
+      schemaVersion: 1, deliveryRef, category: 'command', summary: 'Run tests',
+      expiresAtMs: null, preview: null,
+    }),
+    observedAtIso: '2026-08-13T10:00:00.000Z', acceptedAtIso: '2026-08-13T10:00:00.000Z',
+    lease: null, acknowledgedAtIso: null,
+  }
   return {
     schemaVersion: 2 as const, revision: 1, admissionGeneration: 'approval-admission-generation_1',
     admissionDigest: 'a'.repeat(64), routes: [structuredClone(route)],
@@ -438,3 +588,39 @@ function state(): HostedApprovalOwnerState {
 function withoutRevision(value: HostedApprovalOwnerState) { const { revision: _revision, writerFence: _writerFence, ...rest } = value; return rest }
 function stateFixture() { return state() }
 async function walPath() { const root = await mkdtemp(join(tmpdir(), 'approval-owner-r3-wal-')); roots.push(root); return { path: join(root, 'owner.json') } }
+
+function fakeDarwinSpawnNative(calls: unknown[][], overrides: {
+  initError?: number
+  chdirError?: number
+  openError?: number
+  spawnError?: number
+  pid?: number
+  waits?: Array<{ result: number; status: number; errno: number }>
+  destroyError?: number
+} = {}): DarwinSpawnNative {
+  const actions = Symbol('actions')
+  const pid = overrides.pid ?? 73
+  const waits = [...(overrides.waits ?? [{ result: pid, status: 0, errno: 0 }])]
+  return {
+    initActions: () => { calls.push(['init']); return { actions, error: overrides.initError ?? 0 } },
+    addChdir: (actual, parentFd) => {
+      expect(actual).toBe(actions); calls.push(['chdir', parentFd]); return overrides.chdirError ?? 0
+    },
+    addOpen: (actual, targetFd, name, flags, mode) => {
+      expect(actual).toBe(actions); calls.push(['open', targetFd, name, flags, mode]); return overrides.openError ?? 0
+    },
+    spawn: (actual, executable) => {
+      expect(actual).toBe(actions); calls.push(['spawn', executable])
+      return { error: overrides.spawnError ?? 0, pid }
+    },
+    waitPid: actualPid => {
+      calls.push(['wait', actualPid])
+      const waited = waits.shift()
+      if (!waited) throw new Error('unexpected extra waitPid call')
+      return waited
+    },
+    destroyActions: actual => {
+      expect(actual).toBe(actions); calls.push(['destroy']); return overrides.destroyError ?? 0
+    },
+  }
+}

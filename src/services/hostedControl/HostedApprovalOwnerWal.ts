@@ -1,13 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { dlopen, FFIType, ptr } from 'bun:ffi'
+import { dlopen, FFIType, ptr, read, type Pointer } from 'bun:ffi'
 import { randomUUID } from 'node:crypto'
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readSync, writeSync } from 'node:fs'
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, readSync, writeSync } from 'node:fs'
 import { lstat, mkdir, open, type FileHandle } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute } from 'node:path'
 import { isDeepStrictEqual, TextDecoder } from 'node:util'
 
 import { decodeHostedApprovalIngressAuthority, type HostedApprovalIngressRecord } from './HostedApprovalWire.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
+import { createRegularNodeAtDarwin } from './HostedApprovalOwnerWalDarwin.internal.js'
 import { assertNoDuplicateJsonObjectKeys } from './ownerProof.js'
 
 export type HostedApprovalDeliveryState = {
@@ -49,17 +50,33 @@ const WRITER_RETRY_MS = 5
 const LOCK_EX = 2
 const LOCK_NB = 4
 const LOCK_UN = 8
-
 const AT_SYMLINK_NOFOLLOW = process.platform === 'darwin' ? 0x0020 : 0x0100
 const libcPath = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6'
 const libc = process.platform === 'win32' ? null : dlopen(libcPath, {
+  // openat(2) is variadic when O_CREAT is present. Keep this declaration to
+  // its fixed prefix and create nodes separately so Darwin arm64 never has to
+  // marshal a variadic mode argument through Bun FFI.
   openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  mknodat: { args: [FFIType.i32, FFIType.ptr, FFIType.u32, FFIType.u64], returns: FFIType.i32 },
   renameat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
   unlinkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   linkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   fstatat: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 } as const)
+const darwinSpawnLibc = process.platform === 'darwin' ? dlopen(libcPath, {
+  posix_spawn_file_actions_init: { args: [FFIType.ptr], returns: FFIType.i32 },
+  posix_spawn_file_actions_addfchdir_np: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  posix_spawn_file_actions_addopen: {
+    args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32,
+  },
+  posix_spawn_file_actions_destroy: { args: [FFIType.ptr], returns: FFIType.i32 },
+  posix_spawn: {
+    args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32,
+  },
+  waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  __error: { args: [], returns: FFIType.ptr },
+} as const) : null
 
 function cString(value: string): Buffer { return Buffer.from(`${value}\0`) }
 function openAt(parentFd: number, name: string, flags: number): number {
@@ -69,42 +86,93 @@ function openAt(parentFd: number, name: string, flags: number): number {
   return fd
 }
 
-function createPathInPinnedParent(parentFd: number, parentPath: string, childPath: string, childName: string): number {
+function makeRegularNodeAt(parentFd: number, name: string): boolean {
+  if (!libc) throw new Error('Hosted approval durable namespace requires POSIX dirfd support')
+  if (darwinSpawnLibc) return makeRegularNodeAtDarwin(parentFd, name)
+  const encoded = cString(name)
+  return libc.symbols.mknodat(parentFd, ptr(encoded), constants.S_IFREG | 0o600, 0) === 0
+}
+
+function makeRegularNodeAtDarwin(parentFd: number, name: string): boolean {
+  if (!darwinSpawnLibc || !libc) throw new Error('Hosted approval durable namespace requires Darwin spawn support')
+  const errnoPointer = darwinSpawnLibc.symbols.__error()
+  if (!errnoPointer) throw new Error('Hosted approval namespace errno unavailable')
+  return createRegularNodeAtDarwin(parentFd, name, {
+    initActions: () => {
+      const actions = Buffer.alloc(8)
+      return { actions, error: darwinSpawnLibc.symbols.posix_spawn_file_actions_init(ptr(actions)) }
+    },
+    addChdir: (actions, fd) => darwinSpawnLibc.symbols.posix_spawn_file_actions_addfchdir_np(
+      ptr(actions as Buffer), fd,
+    ),
+    addOpen: (actions, targetFd, relativeName, flags, mode) => {
+      const encoded = cString(relativeName)
+      return darwinSpawnLibc.symbols.posix_spawn_file_actions_addopen(
+        ptr(actions as Buffer), targetFd, ptr(encoded), flags, mode,
+      )
+    },
+    spawn: (actions, executablePath) => {
+      const executable = cString(executablePath)
+      const argv = Buffer.alloc(16); argv.writeBigUInt64LE(BigInt(ptr(executable)))
+      const envp = Buffer.alloc(8); const pid = Buffer.alloc(4)
+      const error = darwinSpawnLibc.symbols.posix_spawn(
+        ptr(pid), ptr(executable), ptr(actions as Buffer), 0, ptr(argv), ptr(envp),
+      )
+      return { error, pid: pid.readInt32LE() }
+    },
+    waitPid: child => {
+      const status = Buffer.alloc(4)
+      const result = darwinSpawnLibc.symbols.waitpid(child, ptr(status), 0)
+      // __error() was resolved before waitpid. Bun's direct pointer read does
+      // not make another libc call that could overwrite the thread-local errno.
+      return { result, status: status.readInt32LE(), errno: result < 0 ? read.i32(errnoPointer as Pointer) : 0 }
+    },
+    destroyActions: actions => darwinSpawnLibc.symbols.posix_spawn_file_actions_destroy(ptr(actions as Buffer)),
+  }, () => unlinkAt(parentFd, name))
+}
+
+function createPathInPinnedParent(
+  parentFd: number, parentPath: string, childName: string, beforeCreate?: () => void, afterCreate?: (name: string) => void,
+): number {
   const parent = fstatSync(parentFd); const linkedParent = lstatSync(parentPath)
   if (!safeDirectoryIdentity(parent, linkedParent)) throw new Error('Hosted approval parent namespace changed before create')
-  const fd = openSync(childPath,
-    constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+  beforeCreate?.()
+  if (!makeRegularNodeAt(parentFd, childName)) throw new Error(`Hosted approval namespace create failed: ${childName}`)
+  afterCreate?.(childName)
+  let fd = -1
   try {
-    const pinnedFd = openAt(parentFd, childName, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
-    try {
-      const created = fstatSync(fd); const pinned = fstatSync(pinnedFd); const currentParent = lstatSync(parentPath)
-      if (!safeDirectoryIdentity(parent, currentParent) || created.dev !== pinned.dev || created.ino !== pinned.ino) {
-        throw new Error('Hosted approval child created outside pinned namespace')
-      }
-    } finally { closeSync(pinnedFd) }
+    fd = openAt(parentFd, childName, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    const created = fstatSync(fd); const currentParent = lstatSync(parentPath)
+    if (!safeDirectoryIdentity(parent, currentParent) || !created.isFile() ||
+      (created.mode & 0o077) !== 0) throw new Error('Hosted approval child created outside pinned namespace')
     return fd
   } catch (error) {
-    closeSync(fd)
+    if (fd >= 0) closeSync(fd)
+    try { unlinkAt(parentFd, childName) } catch { /* best-effort cleanup in the retained namespace */ }
     throw error
   }
 }
 
-function openOrCreatePathInPinnedParent(parentFd: number, parentPath: string, childPath: string, childName: string): number {
+function openOrCreatePathInPinnedParent(
+  parentFd: number, parentPath: string, childName: string, beforeCreate?: () => void, afterCreate?: (name: string) => void,
+): number {
   const parent = fstatSync(parentFd); const linkedParent = lstatSync(parentPath)
   if (!safeDirectoryIdentity(parent, linkedParent)) throw new Error('Hosted approval parent namespace changed before open')
-  const fd = openSync(childPath,
-    constants.O_RDWR | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600)
+  beforeCreate?.()
+  const createdNode = makeRegularNodeAt(parentFd, childName)
+  if (createdNode) afterCreate?.(childName)
+  let fd = -1
   try {
-    const pinnedFd = openAt(parentFd, childName, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
-    try {
-      const opened = fstatSync(fd); const pinned = fstatSync(pinnedFd); const currentParent = lstatSync(parentPath)
-      if (!safeDirectoryIdentity(parent, currentParent) || opened.dev !== pinned.dev || opened.ino !== pinned.ino) {
-        throw new Error('Hosted approval child opened outside pinned namespace')
-      }
-    } finally { closeSync(pinnedFd) }
+    fd = openAt(parentFd, childName, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(fd); const currentParent = lstatSync(parentPath)
+    if (!safeDirectoryIdentity(parent, currentParent) || !opened.isFile() ||
+      (opened.mode & 0o077) !== 0) throw new Error('Hosted approval child opened outside pinned namespace')
     return fd
   } catch (error) {
-    closeSync(fd)
+    if (fd >= 0) closeSync(fd)
+    if (createdNode) {
+      try { unlinkAt(parentFd, childName) } catch { /* best-effort cleanup in the retained namespace */ }
+    }
     throw error
   }
 }
@@ -153,6 +221,8 @@ export class HostedApprovalOwnerWal {
     afterWalRename?: () => Promise<void>
     afterFenceTempFsync?: () => Promise<void>
     afterFenceLink?: () => Promise<void>
+    beforeRetainedCreate?: () => void
+    afterRetainedCreate?: (name: string) => void
   }) {
     if (!isAbsolute(path) || path.includes('\0')) throw new TypeError('Invalid hosted approval WAL path')
     this.fencePath = `${path}.writer-fence.sqlite`
@@ -345,7 +415,9 @@ export class HostedApprovalOwnerWal {
     try {
       const parentIdentity = await parent.stat(); const linkedParent = await lstat(directory)
       if (!safeDirectoryIdentity(parentIdentity, linkedParent)) throw new Error('Unsafe hosted approval WAL directory')
-      tempFd = createPathInPinnedParent(parent.fd, directory, join(directory, tempName), tempName)
+      tempFd = createPathInPinnedParent(
+        parent.fd, directory, tempName, this.testHooks?.beforeRetainedCreate, this.testHooks?.afterRetainedCreate,
+      )
       const encoded = Buffer.from(bytes)
       if (writeSync(tempFd, encoded, 0, encoded.length, 0) !== encoded.length) throw new Error('Hosted approval WAL short write')
       const written = fstatSync(tempFd)
@@ -430,11 +502,11 @@ export class HostedApprovalOwnerWal {
     // A dedicated flock inode is the sole interprocess exclusion primitive.
     // No other descriptor for this inode is opened or closed while the lock is
     // held, so SQLite/VFS record-lock lifetime cannot be shortened by probes.
-    const lockHandle = openOrCreatePathInPinnedParent(
-      parent.fd, directory, this.lockPath, basename(this.lockPath),
-    )
-    let handle = -1
+    let lockHandle = -1; let handle = -1
     try {
+      lockHandle = openOrCreatePathInPinnedParent(
+        parent.fd, directory, basename(this.lockPath), this.testHooks?.beforeRetainedCreate, this.testHooks?.afterRetainedCreate,
+      )
       const deadline = Date.now() + WRITER_WAIT_TIMEOUT_MS
       while (!flock(lockHandle, LOCK_EX | LOCK_NB)) {
         if (Date.now() >= deadline) throw new Error('Hosted approval writer lock timeout')
@@ -474,8 +546,10 @@ export class HostedApprovalOwnerWal {
       return { handle, lockHandle, lockIdentity: { dev: lockIdentity.dev, ino: lockIdentity.ino }, parent, identity }
     } catch (error) {
       if (handle >= 0) closeSync(handle)
-      flock(lockHandle, LOCK_UN)
-      closeSync(lockHandle)
+      if (lockHandle >= 0) {
+        flock(lockHandle, LOCK_UN)
+        closeSync(lockHandle)
+      }
       await parent.close().catch(() => undefined)
       throw error
     }
@@ -487,7 +561,9 @@ export class HostedApprovalOwnerWal {
     let tempFd = -1
     let linked = false
     try {
-      tempFd = createPathInPinnedParent(parent.fd, directory, join(directory, tempName), tempName)
+      tempFd = createPathInPinnedParent(
+        parent.fd, directory, tempName, this.testHooks?.beforeRetainedCreate, this.testHooks?.afterRetainedCreate,
+      )
       const stat = fstatSync(tempFd)
       const identity: HostedApprovalWriterFenceIdentity = {
         generation: `approval-writer-fence_${randomUUID().replaceAll('-', '')}`,
