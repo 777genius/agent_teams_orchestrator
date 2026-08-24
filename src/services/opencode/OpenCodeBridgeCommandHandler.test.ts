@@ -688,6 +688,40 @@ function buildEnvelope(command: string, body: Record<string, unknown>) {
   }
 }
 
+const strictLaunchIdentity = (value: string) =>
+  `sha256:${value.repeat(64).slice(0, 64)}` as const
+
+function buildStrictLaunchEnvelope(overrides: Record<string, unknown> = {}) {
+  return buildEnvelope('opencode.launchTeam', {
+    runId: 'run-strict-preconditions',
+    laneId: 'primary',
+    teamId: 'team-strict-preconditions',
+    projectPath: '/tmp/project',
+    selectedModel: 'openrouter/model-s3',
+    launchContractVersion: 1,
+    launchAttempt: {
+      attemptId: '018f47a2-4a13-7c2f-8d44-c0ffee123456',
+      payloadHash: 'a'.repeat(64),
+      generation: 1,
+      proofNonce: 'A'.repeat(43),
+      parent: {
+        sessionIdentity: strictLaunchIdentity('b'),
+        messageIdentity: strictLaunchIdentity('c'),
+      },
+      providerId: 'openrouter',
+      modelId: 'openrouter/model-s3',
+      requiredMcpTools: ['agent-teams.message_send'],
+      requireFreshRetainedHostProof: true,
+    },
+    members: [{
+      name: 'alice',
+      memberIdentity: strictLaunchIdentity('d'),
+      prompt: 'fake prompt',
+    }],
+    ...overrides,
+  })
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>(nextResolve => {
@@ -853,6 +887,180 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(probeOptions?.inventoryMode).toBe('full')
     })
   }
+
+  describe('strict launch state-changing preconditions', () => {
+    test('returns a retryable before-effects diagnostic for a stale capability snapshot', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        return snapshot
+      }) as typeof openCodeProvisioningProbe.probe
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope({
+          expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
+        }),
+        {
+          launchAttempt: {
+            execute: async () => {
+              launchPortCalls += 1
+              throw new Error('strict launch port must not run')
+            },
+          },
+        },
+      )
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: 'provider_error',
+          retryable: true,
+          message: expect.stringContaining('capability snapshot precondition mismatch'),
+        },
+        diagnostics: [expect.objectContaining({
+          severity: 'error',
+          message: expect.stringContaining('capability snapshot precondition mismatch'),
+        })],
+      })
+      expect(probeCalls).toBe(1)
+      expect(launchPortCalls).toBe(0)
+    })
+
+    test('accepts one bounded capability snapshot recovery command', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        return snapshot
+      }) as typeof openCodeProvisioningProbe.probe
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope({
+          expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
+          capabilitySnapshotRecoveryAttemptId: 'recovery-1',
+        }),
+        {
+          launchAttempt: {
+            execute: async () => {
+              launchPortCalls += 1
+              return {
+                snapshot: null as unknown as OpenCodeProvisioningSnapshot,
+                data: { launchAttempt: { status: 'succeeded', generation: 1 } },
+              }
+            },
+          },
+        },
+      )
+
+      expect(result.ok).toBe(true)
+      expect(probeCalls).toBe(1)
+      expect(launchPortCalls).toBe(1)
+    })
+
+    test('dispatches exactly once without a requested capability snapshot', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        throw new Error('missing capability snapshot must not trigger a probe')
+      }) as typeof openCodeProvisioningProbe.probe
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope(),
+        {
+          launchAttempt: {
+            execute: async () => {
+              launchPortCalls += 1
+              return {
+                snapshot: null as unknown as OpenCodeProvisioningSnapshot,
+                data: { launchAttempt: { status: 'succeeded', generation: 1 } },
+              }
+            },
+          },
+        },
+      )
+
+      expect(result.ok).toBe(true)
+      expect(probeCalls).toBe(0)
+      expect(launchPortCalls).toBe(1)
+    })
+
+    test('dispatches exactly once for the current capability snapshot', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        return snapshot
+      }) as typeof openCodeProvisioningProbe.probe
+      const handshake = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.handshake', {
+          requiredCommand: 'opencode.launchTeam',
+          expectedCapabilitySnapshotId: 'force-full-handshake',
+          selectedModel: 'openrouter/model-s3',
+        }),
+      )
+      expect(handshake.ok).toBe(true)
+      if (!handshake.ok) return
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope({
+          expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
+        }),
+        {
+          launchAttempt: {
+            execute: async () => {
+              launchPortCalls += 1
+              return {
+                snapshot: null as unknown as OpenCodeProvisioningSnapshot,
+                data: { launchAttempt: { status: 'succeeded', generation: 1 } },
+              }
+            },
+          },
+        },
+      )
+
+      expect(result.ok).toBe(true)
+      expect(probeCalls).toBe(2)
+      expect(launchPortCalls).toBe(1)
+    })
+
+    test('returns a retryable before-effects diagnostic for a stale manifest watermark', async () => {
+      let launchPortCalls = 0
+      let probeCalls = 0
+      openCodeProvisioningProbe.probe = (async () => {
+        probeCalls += 1
+        throw new Error('manifest-only validation must not trigger a capability probe')
+      }) as typeof openCodeProvisioningProbe.probe
+
+      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
+        buildStrictLaunchEnvelope({ manifestHighWatermark: 1 }),
+        {
+          launchAttempt: {
+            execute: async () => {
+              launchPortCalls += 1
+              throw new Error('strict launch port must not run')
+            },
+          },
+        },
+      )
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: 'provider_error',
+          retryable: true,
+          message: expect.stringContaining('runtime manifest high watermark precondition is stale'),
+        },
+        diagnostics: [expect.objectContaining({
+          severity: 'error',
+          message: expect.stringContaining('runtime manifest high watermark precondition is stale'),
+        })],
+      })
+      expect(probeCalls).toBe(0)
+      expect(launchPortCalls).toBe(0)
+    })
+  })
 
   test('executes host cleanup without provisioning a readiness host', async () => {
     let probeCalled = false
