@@ -9,7 +9,9 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import {
+  OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION,
   isOpenCodeOpaqueIdentity,
+  type OpenCodeBridgeCapabilityVersions,
 } from './OpenCodeBridgeContractV2.js'
 import type {
   OpenCodeBridgeCommandHandlerPorts,
@@ -970,6 +972,9 @@ function createBridgeServerIdentity(
   snapshot?: OpenCodeProvisioningSnapshot | null,
   overrides: { runtimeStoreManifestHighWatermark?: number | null } = {},
 ) {
+  const launchContractCapability = {
+    openCodeLaunchAttemptContract: OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION,
+  } satisfies Pick<OpenCodeBridgeCapabilityVersions, 'openCodeLaunchAttemptContract'>
   return {
     schemaVersion: BRIDGE_SCHEMA_VERSION,
     peer: 'agent_teams_orchestrator',
@@ -980,6 +985,7 @@ function createBridgeServerIdentity(
       minVersion: 1,
       currentVersion: 1,
       supportedCommands: SUPPORTED_COMMANDS,
+      ...launchContractCapability,
       opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
       opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,

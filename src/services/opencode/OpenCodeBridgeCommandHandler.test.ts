@@ -5,6 +5,10 @@ import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import {
+  decodeOpenCodeBridgeCapabilities,
+  OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION,
+} from './OpenCodeBridgeContractV2.js'
+import {
   __OPEN_CODE_LEGACY_LAUNCH_FIXTURE,
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
@@ -713,7 +717,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(failed.diagnostics[0]?.message).toBe(failed.error.message)
   })
-  test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
+  test('advertises the strict launch and task ledger contracts in the production handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
@@ -721,6 +725,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
 
     expect(result.ok).toBe(true)
+    expect(result.data.server.bridgeProtocol.openCodeLaunchAttemptContract)
+      .toBe(OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION)
+    expect(decodeOpenCodeBridgeCapabilities(result.data.server.bridgeProtocol)).toMatchObject({
+      ok: true,
+      value: { openCodeLaunchAttemptContract: OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION },
+    })
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)

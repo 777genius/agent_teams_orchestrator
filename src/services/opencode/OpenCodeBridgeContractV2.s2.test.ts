@@ -14,6 +14,7 @@ import {
   isOpenCodeLaunchAttemptId,
   isOpenCodeLaunchPayloadHash,
   isOpenCodeOpaqueIdentity,
+  OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION,
   serializeOpenCodeLaunchAttemptResponse,
   validateOpenCodeLaunchAttemptCorrelation,
 } from './OpenCodeBridgeContractV2.js'
@@ -170,6 +171,20 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
     }
     expect(decodeOpenCodeBridgeCapabilities(encodeOpenCodeBridgeCapabilities(advertised)))
       .toEqual({ ok: true, value: advertised })
+    for (const legacyOrMalformed of [
+      {},
+      { executionProof: { reusable: true } },
+      { openCodeLaunchAttemptContract: 0 },
+      { openCodeLaunchAttemptContract: 2 },
+      { openCodeLaunchAttemptContract: null },
+      { openCodeLaunchAttemptContract: '1' },
+      { openCodeLaunchAttemptContract: 1.5 },
+    ]) {
+      const decoded = decodeOpenCodeBridgeCapabilities(legacyOrMalformed)
+      expect(decoded.ok === true
+        && decoded.value.openCodeLaunchAttemptContract === OPEN_CODE_LAUNCH_ATTEMPT_CONTRACT_VERSION)
+        .toBe(false)
+    }
     expect(decodeOpenCodeBridgeCapabilities({ purposeScopedProfiles: 1.5 }))
       .toEqual({ ok: false, error: { code: 'invalid_field', field: 'purposeScopedProfiles' } })
   })
