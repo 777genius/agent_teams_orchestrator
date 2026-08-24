@@ -174,7 +174,7 @@ test.each([
     expect(retainedHandles).toBe(0)
   })
 
-test('non-catalog auth returns a settled failure and closes when commit cleanup cannot finish', async () => {
+test('non-catalog auth reports the platform settlement state and closes when commit cleanup cannot finish', async () => {
   let commits = 0; let rollbacks = 0; let closes = 0; let retainedHandles = 1
   const publication = commitOpenCodeScopedProfileAuth({
     managedAuthPath: path.join(os.tmpdir(), 'settled-retained-auth.json'),
@@ -187,9 +187,9 @@ test('non-catalog auth returns a settled failure and closes when commit cleanup 
     }),
   })
   await expect(publication).rejects.toMatchObject({
-    publicationState: 'settled_failure',
+    publicationState: process.platform === 'win32' ? 'settled_failure' : 'committed_with_cleanup_error',
     retrySafe: true,
   })
   expect({ commits, rollbacks, closes, retainedHandles })
-    .toEqual({ commits: 2, rollbacks: 1, closes: 1, retainedHandles: 0 })
+    .toEqual({ commits: 2, rollbacks: process.platform === 'win32' ? 1 : 0, closes: 1, retainedHandles: 0 })
 })

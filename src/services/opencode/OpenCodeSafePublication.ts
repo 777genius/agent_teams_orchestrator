@@ -68,6 +68,31 @@ export async function settleOpenCodeAtomicPublicationCommit(
 }
 
 /**
+ * A retained POSIX transaction has already made and synchronized the new final
+ * before commit is requested. Commit selects that final irreversibly; any
+ * later rejection is cleanup/durability-barrier failure and must never be
+ * settled by rollback after the backup may have been removed.
+ */
+export async function settleOpenCodePosixAtomicPublicationCommit(
+  transaction: OpenCodeSafePublicationTransaction,
+): Promise<void> {
+  let firstError: unknown
+  try { await transaction.commit(); return }
+  catch (error) { firstError = error }
+  try {
+    await transaction.commit()
+    throw new OpenCodeAtomicPublicationSettlementError(
+      'committed_with_cleanup_error', firstError,
+    )
+  } catch (retryError) {
+    if (retryError instanceof OpenCodeAtomicPublicationSettlementError) throw retryError
+    throw new OpenCodeAtomicPublicationSettlementError(
+      'committed_with_cleanup_error', publicationFailureCause([firstError, retryError]),
+    )
+  }
+}
+
+/**
  * Native COMMIT_ATOMIC may report a cleanup failure after its durable commit
  * point. Both the commit-cleanup retry and fallback settlement request must
  * therefore keep an already-committed final visible.
@@ -727,12 +752,15 @@ export class OpenCodeSafePublicationDirectory {
       }
       if (testHooks?.retainTransaction) {
         let settled = false
+        let commitSelected = false
         let settlement: Promise<void> | null = null
         const finish = async (rollback: boolean): Promise<void> => {
           if (settled) return
           if (settlement) return settlement
           settlement = (async () => {
-            if (rollback && temporaryIdentity) {
+            const rollbackSelected = rollback && !commitSelected
+            if (!rollbackSelected) commitSelected = true
+            if (rollbackSelected && temporaryIdentity) {
               // Capture and prove the currently named object before changing
               // its visibility. A successor or any verification failure is a
               // no-op with respect to the current auth path.

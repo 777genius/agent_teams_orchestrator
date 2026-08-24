@@ -907,8 +907,16 @@ export class OpenCodeLaunchAttempt {
     const committedIds = new Set(committed.map(item => item.memberIdentity))
     const failedIds = new Set(failed.map(item => item.memberIdentity))
     const pending = members.filter(member => !committedIds.has(member) && !failedIds.has(member))
-    const cleanupPending = members.filter(member => lease.journal.events.some(event =>
-      event.type === 'cleanup' && event.memberIdentity === member && event.outcome === 'timed_out'))
+    const cleanupPending = members.filter(member => {
+      const authoritative = lastByMember.get(member)
+      if (authoritative?.type !== 'member_failed' && authoritative?.type !== 'member_unknown') return false
+      return lease.journal.events.some(event => event.type === 'cleanup'
+        && event.memberIdentity === member
+        && event.generation === authoritative.generation
+        && event.fence === authoritative.fence
+        && event.claimToken === authoritative.claimToken
+        && event.outcome === 'timed_out')
+    })
     const eligible = status === 'partial' && aggregateFailure !== undefined
       && classifyOpenCodeLaunchFailure(aggregateFailure).retryable
       ? members.filter(member => !committedIds.has(member)) : []

@@ -4,6 +4,7 @@ import {
   OpenCodeAtomicPublicationSettlementError,
   OpenCodeSafePublicationDirectory,
   settleOpenCodeAtomicPublicationCommit,
+  settleOpenCodePosixAtomicPublicationCommit,
   type OpenCodeSafePublicationTransaction,
 } from './OpenCodeSafePublication.js'
 
@@ -39,7 +40,11 @@ async function commitAndCloseProfileAuthTransaction(
   transaction: ProfileAuthPublicationTransaction,
 ): Promise<void> {
   let settlementError: unknown
-  try { await settleOpenCodeAtomicPublicationCommit(transaction) }
+  try {
+    await (process.platform === 'win32'
+      ? settleOpenCodeAtomicPublicationCommit(transaction)
+      : settleOpenCodePosixAtomicPublicationCommit(transaction))
+  }
   catch (error) { settlementError = error }
   try { await closeProfileAuthTransaction(transaction) }
   catch (closeError) {

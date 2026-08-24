@@ -586,6 +586,52 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(2)
   })
 
+  test('derives cleanup pending from the authoritative generation and persists the committed continuation', async () => {
+    let memberTwoAttempts = 0
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative, materialize: async member => member === members[0]
+      ? { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } }
+      : ++memberTwoAttempts === 1
+        ? { outcome: 'known_failure', failure: 'pre_side_effect_transport', externalEffect: false,
+          owned: { memberIdentity: member } }
+        : { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } } })
+    let cleanupAttempts = 0
+    subject.ports.ownership.cleanupOwned = async () => ++cleanupAttempts === 1 ? 'timed_out' : 'complete'
+
+    const first = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(first.status).toBe('partial')
+    expect(first.failed.map(item => item.memberIdentity)).toEqual([members[1]])
+    expect(first.pending).toEqual([])
+    expect(first.cleanupPending).toEqual([members[1]])
+    expect(first.durableFinalResponse?.members.cleanupPending).toEqual([members[1]])
+    expect(subject.persistence.json().finalResponse.members.cleanupPending).toEqual([members[1]])
+    authoritative.set(members[0], first.committed[0]!)
+
+    const continuedRequest = request(2)
+    continuedRequest.launchAttempt.continuationToken = first.continuationToken
+    const continued = await subject.launch.run({
+      request: continuedRequest, members, continuation: true, requestedBudgetMs: 10_000,
+    })
+    expect(continued.status).toBe('succeeded')
+    expect(continued.committed.map(item => item.memberIdentity)).toEqual(members)
+    expect(continued.failed).toEqual([])
+    expect(continued.pending).toEqual([])
+    expect(continued.cleanupPending).toEqual([])
+    const encoded = projectOpenCodeLaunchAttemptResponse(continued)
+    expect(decodeOpenCodeLaunchAttemptResponse(encoded)).toMatchObject({
+      ok: true,
+      value: { kind: 'v2', response: { members: {
+        committed: [{ memberIdentity: members[0] }, { memberIdentity: members[1] }],
+        failed: [], pending: [], cleanupPending: [],
+      } } },
+    })
+    expect(subject.persistence.json().finalResponse).toEqual(encoded)
+    expect(subject.persistence.json().events.map((event: any) => [event.generation, event.type])).toEqual([
+      [1, 'member_intent'], [1, 'member_applied'], [1, 'member_intent'], [1, 'member_failed'], [1, 'cleanup'],
+      [2, 'member_reconciled_absent'], [2, 'member_intent'], [2, 'member_applied'],
+    ])
+  })
+
   test('rejects forged and stale continuation tokens before advancing the durable generation', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative, materialize: async member => member === members[0]

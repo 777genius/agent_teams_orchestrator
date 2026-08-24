@@ -6,6 +6,7 @@ import {
   commitOpenCodeWindowsAtomicPublication,
   OpenCodeAtomicPublicationSettlementError,
   OpenCodeSafePublicationDirectory,
+  settleOpenCodePosixAtomicPublicationCommit,
 } from './OpenCodeSafePublication.js'
 
 describe('OpenCodeSafePublication', () => {
@@ -104,6 +105,49 @@ describe('OpenCodeSafePublication', () => {
         || name.includes('.quarantine.'))).toEqual([])
     } finally { await directory.close(); await rm(root, { recursive: true, force: true }) }
   })
+
+  test.each([1, 2])(
+    'real retained POSIX commit keeps the final visible across %i cleanup sync failure(s)',
+    async failures => {
+      if (process.platform === 'win32') return
+      const root = await mkdtemp(path.join(process.cwd(), `.opencode-safe-posix-commit-${failures}-`))
+      const directory = await OpenCodeSafePublicationDirectory.open(root)
+      let transaction!: { commit(): Promise<void>; rollback(): Promise<void> }
+      let syncAttempts = 0
+      let closed = false
+      try {
+        await writeFile(path.join(root, 'auth.json'), 'prior')
+        await directory.writeFileAtomic('auth.json', 'committed', 0o600, undefined, {
+          beforeSettlementSync: () => {
+            syncAttempts += 1
+            if (syncAttempts <= failures) throw new Error(`injected cleanup sync failure ${syncAttempts}`)
+          },
+          retainTransaction: value => { transaction = value },
+        })
+        const settlement = settleOpenCodePosixAtomicPublicationCommit(transaction)
+        await expect(settlement).rejects.toMatchObject({
+          publicationState: 'committed_with_cleanup_error', retrySafe: true,
+        })
+        expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('committed')
+        expect(await readdir(root)).toEqual(['auth.json'])
+
+        // A fallback rollback after the irreversible commit decision is commit
+        // cleanup, never removal of the committed final. Every later request is
+        // idempotent even after the retained directory is explicitly closed.
+        await transaction.rollback()
+        await transaction.commit()
+        expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('committed')
+        expect(await readdir(root)).toEqual(['auth.json'])
+        await directory.close()
+        closed = true
+        await transaction.commit()
+        expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('committed')
+      } finally {
+        if (!closed) await directory.close()
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   test('a coordinated parent swap creates zero files in the attacker directory', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return
