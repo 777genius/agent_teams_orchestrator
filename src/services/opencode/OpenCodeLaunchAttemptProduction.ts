@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
 
-import { openCodeClientFactory } from './OpenCodeClientFactory.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
-import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
+import { openCodeClientFactory as globalThisOpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { openCodeHostManager as globalThisOpenCodeHostManager } from './OpenCodeHostManager.js'
+import { OPEN_CODE_APP_MCP_SERVER_NAME,
+  openCodeMcpManager as globalThisOpenCodeMcpManager } from './OpenCodeMcpManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { openCodeProfileManager as globalThisOpenCodeProfileManager } from './OpenCodeProfileManager.js'
+import { openCodeSessionStore as globalThisOpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
   computeOpenCodeLaunchAttemptInputDigest,
@@ -365,16 +366,28 @@ async function bounded<T>(operation: Promise<T>, deadlineAtMs: number, signal: A
   }
 }
 
-/** Concrete production adapter. Tests replace this whole narrow handler port. */
+/** Concrete production adapter. */
+export type OpenCodeProductionLaunchRuntimeTestDependencies = Readonly<{
+  clientFactory?: typeof globalThisOpenCodeClientFactory
+  hostManager?: typeof globalThisOpenCodeHostManager
+  mcpManager?: typeof globalThisOpenCodeMcpManager
+  profileManager?: typeof globalThisOpenCodeProfileManager
+  sessionStore?: typeof globalThisOpenCodeSessionStore
+  dataDirectory?: string
+}>
+
 class OpenCodeProductionLaunchRuntime {
   private readonly authorizedPlans = new WeakMap<object, OpenCodeAuthorizedScopedProfilePlan>()
   private readonly completedResults = new WeakMap<object, OpenCodeLaunchAttemptResult>()
 
+  constructor(private readonly dependencies: OpenCodeProductionLaunchRuntimeTestDependencies = {}) {}
+
   async authorize(command: Command, controls: Readonly<{
     signal: AbortSignal; deadlineAtMs: number; remainingMs(): number
   }>): Promise<Command> {
+    const profileManager = (this.dependencies.profileManager ?? globalThisOpenCodeProfileManager) as unknown as OpenCodePlanScopedProfileManagerPort
     const authorization = await authorizeOpenCodeLaunchScopedProfile(
-      openCodeProfileManager as unknown as OpenCodePlanScopedProfileManagerPort,
+      profileManager,
       {
         purpose: 'launch', providerId: command.request.launchAttempt.providerId,
         modelId: command.selectedModel, runtimeInstanceId: command.request.launchAttempt.attemptId,
@@ -415,6 +428,11 @@ class OpenCodeProductionLaunchRuntime {
 
   private async run(command: Command, skipPreflight: boolean, inspectionOnly: boolean):
   Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
+    const openCodeClientFactory = this.dependencies.clientFactory ?? globalThisOpenCodeClientFactory
+    const openCodeHostManager = this.dependencies.hostManager ?? globalThisOpenCodeHostManager
+    const openCodeMcpManager = this.dependencies.mcpManager ?? globalThisOpenCodeMcpManager
+    const openCodeProfileManager = this.dependencies.profileManager ?? globalThisOpenCodeProfileManager
+    const openCodeSessionStore = this.dependencies.sessionStore ?? globalThisOpenCodeSessionStore
     const projectIdentity = command.projectIdentity
     if (!projectIdentity) throw new Error('OpenCode canonical launch project identity is absent')
     const profiles = new Map<OpenCodeOpaqueIdentity, OpenCodeScopedPreparedProfile>()
@@ -423,7 +441,8 @@ class OpenCodeProductionLaunchRuntime {
     const memberOwnershipTitles = new Map<OpenCodeOpaqueIdentity, string>()
     const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord>()
     let currentSnapshot: OpenCodeProvisioningSnapshot | null = null
-    const launchDirectory = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'launch-attempts')
+    const launchDirectory = path.join(this.dependencies.dataDirectory ?? resolveClaudeMultimodelPaths().data,
+      'opencode', 'launch-attempts')
     const journalPath = path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.journal`)
     const attemptPersistence = new OpenCodeLaunchFileJournalPersistence(journalPath)
     const mutationLedger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'),
@@ -1187,6 +1206,13 @@ class OpenCodeProductionLaunchRuntime {
 }
 
 const productionRuntime = new OpenCodeProductionLaunchRuntime()
+
+/** Production composition with inert, caller-owned dependencies for focused regression tests. */
+export function createOpenCodeLaunchAttemptProductionTestBridge(
+  dependencies: OpenCodeProductionLaunchRuntimeTestDependencies,
+): OpenCodeLaunchAttemptBridgePort {
+  return createOpenCodeLaunchAttemptProductionBridge(new OpenCodeProductionLaunchRuntime(dependencies))
+}
 
 /** Lazy production-startup composition. Injected fake ports never enter this path. */
 export function ensureOpenCodeLaunchAttemptProductionComposition(): OpenCodeBridgeCommandHandlerPorts {

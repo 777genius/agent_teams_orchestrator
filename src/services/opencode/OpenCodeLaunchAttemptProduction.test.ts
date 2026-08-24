@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import path from 'node:path'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 
 import { createHash } from 'node:crypto'
@@ -14,16 +14,25 @@ import {
   reconcileOpenCodeOwnedMemberSession,
 } from './OpenCodeLaunchAttemptProductionSession.js'
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
+import { computeOpenCodeLaunchAttemptInputDigest, computeOpenCodeLaunchAttemptImmutableDigest } from './OpenCodeLaunchAttempt.js'
 import { OpenCodeLaunchAttemptStore, OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
-import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
-import type { OpenCodeSessionRecord } from './types.js'
+import type { OpenCodeLaunchAttemptResponse, OpenCodeLaunchMemberLinkage,
+  OpenCodeOpaqueIdentity, OpenCodeRetainedHostIdentity } from './OpenCodeBridgeContractV2.js'
+import type { OpenCodeCurrentScopedProfilePlan, OpenCodeScopedPreparedProfile,
+  OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
+import { planScopedProfile } from './OpenCodeOperationPolicy.js'
+import { computeOpenCodeLaunchCommandImmutableDigest, computeOpenCodeLaunchCommandInputDigest,
+  computeOpenCodeLaunchRequestCorrelationDigest, type OpenCodeLaunchAttemptBridgePort } from './OpenCodeLaunchAttemptBridge.js'
 import {
   assertOpenCodeProductionBootstrapOwnership,
   createOpenCodeLaunchPreflightResult,
   deriveOpenCodeProductionProofOwnership,
   hasExactOpenCodeClaimReconciliationAuthority,
   inspectOpenCodeProductionGeneration,
+  createOpenCodeLaunchAttemptProductionTestBridge,
   reobserveOpenCodeProductionRetainedProof,
   resolveOpenCodeProductionRetainedProofRecord,
   transitionOpenCodeProductionMemberClaim,
@@ -596,6 +605,115 @@ test('restart migrates the exact-head proof record and refuses reconciliation th
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('production wiring rejects a durable member intent backed only by a same-name projection', async () => {
+  const fixture = await productionRecoveryHarness()
+  try {
+    const seeded = await fixture.seedIntent()
+    await fixture.sessionStore.upsert(seeded.record)
+
+    await expect(fixture.bridge.execute(fixture.command)).rejects.toThrow('explicit reconciliation')
+    expect(fixture.memberCreates()).toBe(0)
+    expect(await fixture.sessionStore.get('team', 'primary', 'alice')).toEqual(seeded.record)
+    const journal = await fixture.inspectJournal()
+    expect(journal?.events.map(event => event.type)).not.toContain('member_reconciled_applied')
+  } finally { await fixture.dispose() }
+})
+
+test('production preflight repairs an exact committed claim after commit-before-upsert crash', async () => {
+  const fixture = await productionRecoveryHarness()
+  try {
+    const seeded = await fixture.seedIntent({ acceptedProof: true })
+    await fixture.commitClaim(seeded)
+
+    const output = await fixture.bridge.execute(fixture.command)
+    const data = output.data as { launchAttempt?: unknown; members?: unknown } | null
+
+    expect(data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'succeeded' } })
+    expect(data?.members).toMatchObject({ alice: {
+      launchState: 'created', sessionId: seeded.record.opencodeSessionId,
+    } })
+    expect(fixture.memberCreates()).toBe(0)
+    expect(await fixture.sessionStore.get('team', 'primary', 'alice')).toEqual(seeded.record)
+    expect((await fixture.inspectJournal())?.events.map(event => event.type))
+      .toContain('member_reconciled_applied')
+  } finally { await fixture.dispose() }
+})
+
+test('production callback and preflight fail closed for stale or mismatched durable authority', async () => {
+  const cases = [
+    ['pending claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      expect(await fixture.ledger.claim(fixture.target, seeded.authority, fixture.context)).toBe('claimed')
+      fixture.remote.set(fixture.sessionId, { id: fixture.sessionId, title: seeded.title })
+    }],
+    ['released claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      expect(await fixture.ledger.claim(fixture.target, seeded.authority, fixture.context)).toBe('claimed')
+      expect(await fixture.ledger.transition(fixture.target, seeded.authority, 'known_failure', undefined,
+        fixture.context)).toBe('cancelled')
+      await fixture.sessionStore.upsert(seeded.record)
+    }],
+    ...([
+      ['stale generation', { generation: 2 }],
+      ['stale fence', { fence: 2 }],
+      ['mismatched claim token', { claimToken: '' }],
+    ] as const).map(([name, authority]) => [name,
+      async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+        await fixture.commitClaim({ ...seeded, authority: { ...seeded.authority, ...authority,
+          ...('claimToken' in authority && authority.claimToken === '' ? {
+            claimToken: `${seeded.authority.acquisitionToken}.foreign`,
+          } : {}) } })
+        await fixture.sessionStore.upsert(seeded.record)
+      }] as const),
+    ['mismatched member claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>,
+      seeded: ProductionSeed) => {
+      const otherMember = `sha256:${'9'.repeat(64)}` as OpenCodeOpaqueIdentity
+      const otherTarget = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
+        projectIdentity: fixture.command.projectPath, memberIdentity: otherMember })
+      expect(await fixture.ledger.claim(otherTarget, { ...seeded.authority,
+        memberIdentity: otherMember }, fixture.context)).toBe('claimed')
+      await fixture.sessionStore.upsert(seeded.record)
+    }],
+    ['mismatched session', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      await fixture.commitClaim(seeded)
+      await fixture.sessionStore.upsert({ ...seeded.record, opencodeSessionId: 'ses_foreign' })
+    }],
+    ['mismatched message', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      await fixture.commitClaim(seeded)
+      await fixture.sessionStore.upsert({ ...seeded.record, appManagedBootstrap: {
+        ...seeded.record.appManagedBootstrap!, messageID: 'msg_foreign',
+      } })
+    }],
+    ['mismatched title', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      await fixture.commitClaim({ ...seeded, title: `${seeded.title}:foreign` })
+    }],
+    ['mismatched commit', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
+      await fixture.commitClaim({ ...seeded, linkage: { ...seeded.linkage, commitIdentity: identity } })
+      await fixture.sessionStore.upsert(seeded.record)
+    }],
+  ] as const
+  for (const [name, arrange] of cases) {
+    const fixture = await productionRecoveryHarness()
+    try {
+      const seeded = await fixture.seedIntent({ acceptedProof: true })
+      try { await arrange(fixture, seeded) }
+      catch (error) { throw new Error(`arrange failed: ${name}`, { cause: error }) }
+      let succeeded = false
+      try {
+        const output = await fixture.bridge.execute(fixture.command)
+        const data = output.data as { launchAttempt?: { launchAttempt?: { outcome?: string } } } | null
+        succeeded = data?.launchAttempt
+          ?.launchAttempt?.outcome === 'succeeded'
+      } catch {}
+      expect(succeeded, name).toBe(false)
+      expect(fixture.memberCreates(), name).toBe(0)
+      const events = (await fixture.inspectJournal())?.events.map(event => event.type)
+      expect(events, name).not.toContain('member_reconciled_applied')
+      if (['released claim', 'stale generation', 'stale fence', 'mismatched claim token'].includes(name)) {
+        expect(events, `${name} production callback`).toContain('member_reconciled_absent')
+      }
+    } finally { await fixture.dispose() }
+  }
+})
+
 test('committed mutation crash failpoints rehydrate only the exact remote projection without create', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-commit-recovery-'))
   try {
@@ -626,14 +744,16 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     await ledger.claim(target, authority, storeContext())
     const projected: OpenCodeSessionRecord[] = []
     await expect(commitOpenCodeMemberProjection({
-      commit: () => ledger.transition(target, authority, 'commit', linkage, storeContext(),
-        { ownershipTitle: title, sessionRecord: record }),
+      commit: async () => {
+        const result = await ledger.transition(target, authority, 'commit', linkage, storeContext(),
+          { ownershipTitle: title, sessionRecord: record })
+        return result === 'cancelled' ? 'fenced' : result
+      },
       upsert: async () => { projected.push(record) },
       failpoint: point => { if (point === 'after_commit') throw new Error('crash:after_commit') },
     })).rejects.toThrow('crash:after_commit')
     expect(projected).toHaveLength(0)
     const claim = await new OpenCodeLaunchMutationLedger(path.join(directory, 'claims')).read(target, storeContext())
-    let creates = 0
     const recovered = await recoverOpenCodeCommittedMemberProjection({ claim: claim!, ...authority, teamId: 'team',
       laneId: 'primary', memberName: 'alice', selectedModel: 'openrouter/model', expectedBootstrapText: text,
       getSession: async () => ({ id: sessionId, title }),
@@ -644,7 +764,6 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     })
     expect(recovered.status).toBe('recovered')
     expect(projected).toHaveLength(1)
-    expect(creates).toBe(0)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -722,6 +841,176 @@ test('committed projection recovery reports absent, mismatched and foreign remot
     expect(upserts).toBe(0)
   }
 })
+
+type ProductionSeed = { record: OpenCodeSessionRecord; linkage: OpenCodeLaunchMemberLinkage;
+  authority: OpenCodeLaunchMutationIdentity; title: string; text: string }
+
+async function productionRecoveryHarness() {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-recovery-e2e-'))
+  const projectPath = path.join(directory, 'project')
+  await mkdir(projectPath)
+  const sessionStore = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+  const attemptId = '123e4567-e89b-42d3-a456-426614174443'
+  const memberIdentity = `sha256:${'4'.repeat(64)}` as OpenCodeOpaqueIdentity
+  const hash = (character: string) => character.repeat(64)
+  const oid = (character: string) => `sha256:${character.repeat(64)}` as OpenCodeOpaqueIdentity
+  const current = (input: { purpose: 'launch'; providerId?: string | null; modelId?: string | null;
+    runtimeInstanceId: string; projectPath?: string }): OpenCodeCurrentScopedProfilePlan => ({
+    ...input, providerId: input.providerId!, modelId: input.modelId!, projectPath: input.projectPath!, evidence: {
+      canonicalProjectPathFingerprint: hash('1'), projectBehaviorFingerprint: hash('2'),
+      providerEnvironmentFingerprint: hash('3'), selectedAuthFingerprint: hash('4'),
+      binaryFingerprint: hash('5'), configFingerprint: hash('6'),
+      nativeAccountIdentityFingerprint: hash('7'), nativeAccountIdentitySource: 'managed-auth',
+      nativeTargetExecutableFingerprint: hash('8'), profileLayoutFingerprint: hash('9'),
+      automaticUserPluginFingerprint: hash('a'), plugins: [],
+    },
+  })
+  const profileManager = {
+    captureCurrentScopedProfilePlan: async (input: Parameters<typeof current>[0]) => current(input),
+    planScopedProfile,
+    prepareScopedProfile: async (input: OpenCodeCurrentScopedProfilePlan, expected: ReturnType<typeof planScopedProfile>) => ({
+      scopeSchema: 'opencode-scoped-profile-v1', purpose: expected.purpose,
+      providerId: expected.providerId, modelId: expected.modelId,
+      runtimeInstanceId: input.runtimeInstanceId, scopedPlanDigest: expected.digest,
+      plannedHostKey: expected.expectedHostKey,
+      canonicalProjectPathFingerprint: expected.canonicalProjectPathFingerprint,
+      selectedAuthBaselineFingerprint: expected.selectedAuthFingerprint,
+      binaryFingerprint: expected.binaryFingerprint,
+    } as OpenCodeScopedPreparedProfile),
+  }
+  const rawCommand: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
+    request: { launchContractVersion: 1, launchAttempt: {
+      attemptId, payloadHash: hash('a'), generation: 1, proofNonce: 'A'.repeat(22),
+      parent: { sessionIdentity: oid('b'), messageIdentity: oid('c') },
+      providerId: 'openrouter', modelId: 'openrouter/model',
+      requiredMcpTools: ['agent-teams.message_send'], requireFreshRetainedHostProof: true,
+    } },
+    members: [{ name: 'alice', memberIdentity }], runId: 'run', laneId: 'primary', teamId: 'team',
+    projectPath, selectedModel: 'openrouter/model', toolApprovalMode: 'auto', continuation: false,
+    requestedBudgetMs: 30_000, preconditions: {
+      handshakeIdentityHash: hash('1'), laneId: 'primary', expectedRunId: 'run',
+      expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: hash('2'),
+      expectedManifestHighWatermark: null, commandLeaseId: 'lease-443', idempotencyKey: attemptId,
+    },
+  }
+  rawCommand.request.launchAttempt.requestCorrelationDigest =
+    computeOpenCodeLaunchRequestCorrelationDigest(rawCommand)
+  const authorization = await authorizeOpenCodeLaunchScopedProfile(profileManager, {
+    purpose: 'launch', providerId: 'openrouter', modelId: 'openrouter/model', runtimeInstanceId: attemptId,
+    projectPath,
+  })
+  const durableCommand = { ...rawCommand, requestProjectPath: projectPath, projectIdentity: projectPath,
+    effectiveProfilePlanDigest: authorization.effectivePlanDigest }
+  const commandInputDigest = computeOpenCodeLaunchCommandInputDigest(durableCommand)
+  const inputDigest = computeOpenCodeLaunchAttemptInputDigest(rawCommand.request, [memberIdentity], 'begin',
+    rawCommand.requestedBudgetMs, rawCommand.requestedBudgetMs, commandInputDigest)
+  const immutableDigest = computeOpenCodeLaunchAttemptImmutableDigest(rawCommand.request, [memberIdentity],
+    rawCommand.requestedBudgetMs, rawCommand.requestedBudgetMs,
+    computeOpenCodeLaunchCommandImmutableDigest(durableCommand))
+  const launchDirectory = path.join(directory, 'data', 'opencode', 'launch-attempts')
+  const persistence = new OpenCodeLaunchFileJournalPersistence(path.join(launchDirectory, `${attemptId}.journal`))
+  const store = new OpenCodeLaunchAttemptStore(persistence)
+  const ledger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'),
+    filePath => persistence.createRelativePersistence(filePath))
+  const target = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
+    projectIdentity: projectPath, memberIdentity })
+  const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
+  let memberCreateCount = 0
+  const remote = new Map<string, { id: string; title: string }>()
+  const messages = new Map<string, { info: Record<string, unknown>; parts: Array<{ type: 'text'; text: string }> }>()
+  const client = {
+    getSession: async (id: string) => {
+      const value = remote.get(id)
+      if (!value) throw notFound()
+      return value
+    },
+    getSessionMessage: async (id: string, messageId: string) => messages.get(`${id}:${messageId}`) ?? null,
+    createSession: async () => { memberCreateCount += 1; throw new Error('member create must not run') },
+    deleteSession: async () => false,
+  }
+  const host = { hostKey: 'host', profileRootKey: 'profile', projectPath,
+    projectBehaviorFingerprint: hash('2'), baseUrl: 'http://fake.invalid', port: 1, pid: 443,
+    processStartedAtMs: 1, version: 'fake', state: 'healthy', profile: {} as never,
+    resolvedConfigFingerprint: null, diagnostics: [] }
+  const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: path.join(directory, 'data'),
+    profileManager: profileManager as never, sessionStore: sessionStore as never,
+    clientFactory: { create: () => client } as never,
+    hostManager: { ensureScopedHost: async () => host, releaseHost: async () => {},
+      retainHostLease: async () => {} } as never,
+    mcpManager: { ensureAppMcp: async () => { throw new Error('MCP must not run') } } as never,
+  })
+  const context = { deadlineAtMs: Date.now() + 30_000,
+    signal: new AbortController().signal, monotonicNow: Date.now }
+  const acceptedProof = (): OpenCodeLaunchAttemptResponse => {
+    const retainedHost: OpenCodeRetainedHostIdentity = { hostKeyIdentity: oid('d'), processId: 443,
+      processStartedAtMs: 1, profileScopeIdentity: oid('1') }
+    return { launchAttempt: { contractVersion: 1, attemptId, idempotencyKey: 'attemptId',
+      payloadHash: rawCommand.request.launchAttempt.payloadHash, generation: 1, inputDigest, immutableDigest,
+      outcome: 'succeeded', phase: 'complete', startedAt: 0, workDeadlineAt: 10_000,
+      absoluteDeadlineAt: 11_000, cleanupReserveMs: 1_000, elapsedMs: 1,
+      providerId: 'openrouter', modelId: 'openrouter/model', profilePurpose: 'launch_attempt',
+      projectIdentity: oid('f'), profileIdentity: oid('1'), configIdentity: oid('2'), authIdentity: oid('3'),
+      pluginPolicyIdentity: oid('4'), cacheIdentity: oid('5'), binaryIdentity: oid('6'),
+      retainedHostIdentity: retainedHost,
+      requestCorrelationDigest: rawCommand.request.launchAttempt.requestCorrelationDigest },
+    proof: { generation: 1, attemptId, parent: rawCommand.request.launchAttempt.parent,
+      providerId: 'openrouter', modelId: 'openrouter/model', retainedHostIdentity: retainedHost,
+      observedMcpTools: ['agent-teams.message_send'],
+      nonceHash: createHash('sha256').update(rawCommand.request.launchAttempt.proofNonce).digest('hex'),
+      sessionIdentity: oid('7'), promptMessageIdentity: oid('8'), assistantMessageIdentity: oid('9'),
+      verifiedAt: 1, authorizationSource: 'fresh_live_attempt', cacheUsed: false,
+      requestCorrelationDigest: rawCommand.request.launchAttempt.requestCorrelationDigest },
+    members: { committed: [], failed: [], pending: [], cleanupPending: [] } }
+  }
+  const seedIntent = async (options: { acceptedProof?: boolean } = {}): Promise<ProductionSeed> => {
+    let seeded!: ProductionSeed
+    await store.withGeneration({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
+      inputDigest, immutableDigest, generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000 },
+    'begin', async lease => {
+      if (options.acceptedProof) await lease.commitAcceptedProofResponse(acceptedProof())
+      const claimToken = await lease.claim(memberIdentity)
+      const title = `agent-teams-launch:${attemptId}:${memberIdentity}:${createHash('sha256').update(claimToken).digest('hex')}`
+      const text = ['<agent_teams_app_managed_bootstrap>', 'AGENT_TEAMS_APP_MANAGED_BOOTSTRAP_V1',
+        JSON.stringify({ teamName: 'team', memberName: 'alice', runtimeProvider: 'opencode',
+          runtimeSessionId: sessionId, runId: 'run', laneId: 'primary' }),
+        'Join OpenCode team team as alice. Wait for app MCP task delivery.',
+        '</agent_teams_app_managed_bootstrap>'].join('\n')
+      const now = new Date().toISOString()
+      const record: OpenCodeSessionRecord = { teamId: 'team', laneId: 'primary', memberName: 'alice',
+        providerId: 'opencode', selectedModel: 'openrouter/model', projectPath, profileRootKey: 'profile',
+        hostKey: 'host', resolvedBehaviorFingerprint: null, opencodeSessionId: sessionId,
+        lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
+        sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: hash('2'),
+        bootstrapMode: 'app_managed_context', bootstrapEvidenceSource: 'app_managed_bootstrap',
+        appManagedBootstrap: { schemaVersion: 1, messageID: 'msg_exact',
+          contextHash: createHash('sha256').update(text).digest('hex'),
+          briefingHash: createHash('sha256').update('').digest('hex'), injectionVerifiedAt: now,
+          model: 'openrouter/model', agent: 'teammate-bootstrap' }, staleReason: null,
+        createdAt: now, updatedAt: now }
+      const linkage = linkageForTest(memberIdentity, record)
+      seeded = { record, linkage, title, text, authority: { attemptId,
+        payloadHash: rawCommand.request.launchAttempt.payloadHash, inputDigest, immutableDigest,
+        generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
+        claimToken, memberIdentity } }
+    }, context)
+    return seeded
+  }
+  return { bridge, command: rawCommand, sessionStore, seedIntent, ledger, target, context,
+    remote, messages, sessionId, memberIdentity,
+    commitClaim: async (seeded: ProductionSeed) => {
+      expect(await ledger.claim(target, seeded.authority, context)).toBe('claimed')
+      expect(await ledger.transition(target, seeded.authority, 'commit', seeded.linkage, context,
+        { ownershipTitle: seeded.title, sessionRecord: seeded.record })).toBe('committed')
+      remote.set(sessionId, { id: sessionId, title: seeded.title })
+      messages.set(`${sessionId}:msg_exact`, { info: { id: 'msg_exact', sessionID: sessionId,
+        providerID: 'openrouter', modelID: 'model' }, parts: [{ type: 'text', text: seeded.text }] })
+    },
+    inspectJournal: () => store.inspect({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
+      inputDigest, immutableDigest }),
+    memberCreates: () => memberCreateCount,
+    dispose: () => rm(directory, { recursive: true, force: true }),
+  }
+}
 
 function notFound(): Error { return new Error('request failed (404 Not Found)') }
 function controlledProofDirectories() {
