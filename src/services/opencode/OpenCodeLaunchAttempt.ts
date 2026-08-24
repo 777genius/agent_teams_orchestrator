@@ -766,7 +766,7 @@ export class OpenCodeLaunchAttempt {
                   : 'failed'
           return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
             immutableDigest, lease.generation, status, committed, members, failure, cleanup,
-            request, acceptedProofResponse)
+            request, acceptedProofResponse, owned)
         },
         initialStoreContext,
       )
@@ -891,6 +891,7 @@ export class OpenCodeLaunchAttempt {
     cleanup: OpenCodeLaunchCleanupOutcome,
     request: OpenCodeLaunchAttemptRequest,
     acceptedProofResponse?: OpenCodeLaunchAttemptResponse,
+    currentOwned: readonly OpenCodeLaunchOwnedResources[] = [],
   ): Promise<OpenCodeLaunchAttemptResult> {
     // Preserve the actual member/contract taxonomy. A partial roster does not turn a
     // provider or policy failure into a deadline; only the deadline path authors that code.
@@ -907,15 +908,20 @@ export class OpenCodeLaunchAttempt {
     const committedIds = new Set(committed.map(item => item.memberIdentity))
     const failedIds = new Set(failed.map(item => item.memberIdentity))
     const pending = members.filter(member => !committedIds.has(member) && !failedIds.has(member))
+    const ownedUncommitted = new Set(currentOwned
+      .map(resource => resource.memberIdentity)
+      .filter(memberIdentity => !committedIds.has(memberIdentity)))
     const cleanupPending = members.filter(member => {
+      if (committedIds.has(member)) return false
       const authoritative = lastByMember.get(member)
       if (authoritative?.type !== 'member_failed' && authoritative?.type !== 'member_unknown') return false
-      return lease.journal.events.some(event => event.type === 'cleanup'
+      const latestCleanup = lease.journal.events.findLast(event => event.type === 'cleanup'
         && event.memberIdentity === member
         && event.generation === authoritative.generation
         && event.fence === authoritative.fence
-        && event.claimToken === authoritative.claimToken
-        && event.outcome === 'timed_out')
+        && event.claimToken === authoritative.claimToken)
+      if (latestCleanup?.type === 'cleanup') return latestCleanup.outcome === 'timed_out'
+      return authoritative.generation === generation && ownedUncommitted.has(member)
     })
     const eligible = status === 'partial' && aggregateFailure !== undefined
       && classifyOpenCodeLaunchFailure(aggregateFailure).retryable

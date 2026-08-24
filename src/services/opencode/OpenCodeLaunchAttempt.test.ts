@@ -852,9 +852,20 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(result.failure).toMatchObject({
       kind: 'unknown_transport_after_side_effect', retryDisposition: 'never', sideEffectsStarted: true,
     })
+    expect(result.cleanup).toBe('timed_out')
+    expect(result.pending).toEqual([members[0]])
+    expect(result.cleanupPending).toEqual([members[0]])
+    expect(result.durableFinalResponse?.members.cleanupPending).toEqual([members[0]])
+    expect(decodeOpenCodeLaunchAttemptResponse(result.durableFinalResponse)).toMatchObject({
+      ok: true,
+      value: { kind: 'v2', response: { members: {
+        committed: [], failed: [], pending: [members[0]], cleanupPending: [members[0]],
+      } } },
+    })
     expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual([
       'member_intent', 'member_unknown',
     ])
+    const publishedFinal = structuredClone(subject.persistence.json().finalResponse)
     expect(subject.calls).not.toContain('release')
     expect(subject.cleaned).toEqual([])
     expect(cleanupCalls).toBe(0)
@@ -871,6 +882,15 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     await Bun.sleep(0)
     expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
     expect(result.committed).toEqual([])
+    expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
+    callerDeadlineExpired = false
+    subject.setNow(2)
+    const replay = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(replay.cleanup).toBe('timed_out')
+    expect(replay.cleanupPending).toEqual([members[0]])
+    expect(replay.durableFinalResponse?.members.cleanupPending).toEqual([members[0]])
   })
 
   test('retains the host when deferred physical cleanup rejects and never starts cleanup twice', async () => {
@@ -907,6 +927,16 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     cancellation.abort(new Error('cancelled'))
     const result = await running
     expect(result.cleanup).toBe('timed_out')
+    expect(result.pending).toEqual([members[0]])
+    expect(result.cleanupPending).toEqual([members[0]])
+    expect(result.durableFinalResponse?.members.cleanupPending).toEqual([members[0]])
+    expect(decodeOpenCodeLaunchAttemptResponse(result.durableFinalResponse)).toMatchObject({
+      ok: true,
+      value: { kind: 'v2', response: { members: {
+        committed: [], failed: [], pending: [members[0]], cleanupPending: [members[0]],
+      } } },
+    })
+    const publishedFinal = structuredClone(subject.persistence.json().finalResponse)
     expect(cleanupCalls).toBe(0)
     expect(subject.calls).not.toContain('release')
 
@@ -921,6 +951,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     await Bun.sleep(0)
     expect(cleanupCalls).toBe(1)
     expect(subject.calls).not.toContain('release')
+    expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
+    const replay = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(replay.cleanup).toBe('timed_out')
+    expect(replay.cleanupPending).toEqual([members[0]])
+    expect(replay.durableFinalResponse?.members.cleanupPending).toEqual([members[0]])
   })
 
   test('atomically aborts the live claim so a cancelled late materializer cannot commit', async () => {
