@@ -894,7 +894,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       let probeCalls = 0
       openCodeProvisioningProbe.probe = (async () => {
         probeCalls += 1
-        return snapshot
+        throw new Error('strict launch must not trigger a capability probe')
       }) as typeof openCodeProvisioningProbe.probe
 
       const result = await executeStrictOpenCodeBridgeCommandEnvelope(
@@ -923,16 +923,16 @@ describe('OpenCodeBridgeCommandHandler', () => {
           message: expect.stringContaining('capability snapshot precondition mismatch'),
         })],
       })
-      expect(probeCalls).toBe(1)
+      expect(probeCalls).toBe(0)
       expect(launchPortCalls).toBe(0)
     })
 
-    test('accepts one bounded capability snapshot recovery command', async () => {
+    test('rejects a capability snapshot recovery marker before effects', async () => {
       let launchPortCalls = 0
       let probeCalls = 0
       openCodeProvisioningProbe.probe = (async () => {
         probeCalls += 1
-        return snapshot
+        throw new Error('strict launch must not trigger a capability probe')
       }) as typeof openCodeProvisioningProbe.probe
 
       const result = await executeStrictOpenCodeBridgeCommandEnvelope(
@@ -944,21 +944,29 @@ describe('OpenCodeBridgeCommandHandler', () => {
           launchAttempt: {
             execute: async () => {
               launchPortCalls += 1
-              return {
-                snapshot: null as unknown as OpenCodeProvisioningSnapshot,
-                data: { launchAttempt: { status: 'succeeded', generation: 1 } },
-              }
+              throw new Error('strict launch port must not run')
             },
           },
         },
       )
 
-      expect(result.ok).toBe(true)
-      expect(probeCalls).toBe(1)
-      expect(launchPortCalls).toBe(1)
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: 'provider_error',
+          retryable: true,
+          message: expect.stringContaining('capability snapshot precondition mismatch'),
+        },
+        diagnostics: [expect.objectContaining({
+          severity: 'error',
+          message: expect.stringContaining('capability snapshot precondition mismatch'),
+        })],
+      })
+      expect(probeCalls).toBe(0)
+      expect(launchPortCalls).toBe(0)
     })
 
-    test('dispatches exactly once without a requested capability snapshot', async () => {
+    test('dispatches exactly once with a null capability snapshot and current manifest', async () => {
       let launchPortCalls = 0
       let probeCalls = 0
       openCodeProvisioningProbe.probe = (async () => {
@@ -967,7 +975,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       }) as typeof openCodeProvisioningProbe.probe
 
       const result = await executeStrictOpenCodeBridgeCommandEnvelope(
-        buildStrictLaunchEnvelope(),
+        buildStrictLaunchEnvelope({
+          expectedCapabilitySnapshotId: null,
+          manifestHighWatermark: 0,
+        }),
         {
           launchAttempt: {
             execute: async () => {
@@ -983,45 +994,6 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
       expect(result.ok).toBe(true)
       expect(probeCalls).toBe(0)
-      expect(launchPortCalls).toBe(1)
-    })
-
-    test('dispatches exactly once for the current capability snapshot', async () => {
-      let launchPortCalls = 0
-      let probeCalls = 0
-      openCodeProvisioningProbe.probe = (async () => {
-        probeCalls += 1
-        return snapshot
-      }) as typeof openCodeProvisioningProbe.probe
-      const handshake = await executeStrictOpenCodeBridgeCommandEnvelope(
-        buildEnvelope('opencode.handshake', {
-          requiredCommand: 'opencode.launchTeam',
-          expectedCapabilitySnapshotId: 'force-full-handshake',
-          selectedModel: 'openrouter/model-s3',
-        }),
-      )
-      expect(handshake.ok).toBe(true)
-      if (!handshake.ok) return
-
-      const result = await executeStrictOpenCodeBridgeCommandEnvelope(
-        buildStrictLaunchEnvelope({
-          expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
-        }),
-        {
-          launchAttempt: {
-            execute: async () => {
-              launchPortCalls += 1
-              return {
-                snapshot: null as unknown as OpenCodeProvisioningSnapshot,
-                data: { launchAttempt: { status: 'succeeded', generation: 1 } },
-              }
-            },
-          },
-        },
-      )
-
-      expect(result.ok).toBe(true)
-      expect(probeCalls).toBe(2)
       expect(launchPortCalls).toBe(1)
     })
 

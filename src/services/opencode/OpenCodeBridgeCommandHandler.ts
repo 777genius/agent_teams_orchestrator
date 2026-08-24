@@ -968,13 +968,6 @@ function shouldUseLightweightLaunchHandshake(body: Record<string, unknown>): boo
   return true
 }
 
-function strictLaunchRequiresCapabilitySnapshot(body: Record<string, unknown>): boolean {
-  if (asString(body.expectedCapabilitySnapshotId)) {
-    return true
-  }
-  return asString(asRecord(body.preconditions)?.expectedCapabilitySnapshotId) !== null
-}
-
 function createBridgeServerIdentity(
   snapshot?: OpenCodeProvisioningSnapshot | null,
   overrides: { runtimeStoreManifestHighWatermark?: number | null } = {},
@@ -2851,18 +2844,9 @@ async function runLaunch(
     if (request.launchAttempt.modelId !== selectedModel) {
       throw new Error('OpenCode launch-attempt selectedModel does not match launchAttempt.modelId')
     }
-    const preconditionSnapshot = strictLaunchRequiresCapabilitySnapshot(body)
-      ? await runtimeDeadline.runPhase('host_start', context =>
-        openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd, {
-          disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
-          inventoryMode: getLaunchCriticalInventoryMode(selectedModel),
-          phaseContext: context,
-        }))
-      : null
     validateOpenCodeBridgeStateChangingPreconditions({
       body,
-      runtime: createRuntimePreconditionSnapshot(preconditionSnapshot),
-      allowCapabilitySnapshotRecovery: true,
+      runtime: createRuntimePreconditionSnapshot(null),
     })
     const members: OpenCodeLaunchBridgeMember[] = membersRaw.map((item, index) => {
       const member = asRecord(item)
