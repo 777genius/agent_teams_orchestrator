@@ -76,6 +76,27 @@ import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutation
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
+export async function resolveOpenCodeProductionRetainedProofRecord(input: Readonly<{
+  cached?: OpenCodeProofSessionCleanupRecord
+  ledger: Pick<OpenCodeProofSessionCleanupLedger, 'read'>
+  attemptId: string
+  requestGeneration: number
+  hostKeyIdentity: OpenCodeOpaqueIdentity
+  deadlineAtMs: number
+  signal: AbortSignal
+}>): Promise<OpenCodeProofSessionCleanupRecord> {
+  const retainedProof = input.cached ?? await input.ledger.read({
+    deadlineAtMs: input.deadlineAtMs, signal: input.signal,
+  })
+  if (!retainedProof || retainedProof.attemptId !== input.attemptId
+    || retainedProof.requestGeneration !== input.requestGeneration
+    || retainedProof.hostKeyIdentity !== input.hostKeyIdentity
+    || !retainedProof.observationMessageId || retainedProof.state !== 'owned') {
+    throw new Error('OpenCode retained proof is unavailable')
+  }
+  return retainedProof
+}
+
 /** Pure Desktop V1 projection used by production and fake-only contract tests. */
 export function projectOpenCodeLaunchAttemptResponse(
   result: OpenCodeLaunchAttemptResult,
@@ -330,9 +351,7 @@ class OpenCodeProductionLaunchRuntime {
     const hosts = new Map<OpenCodeOpaqueIdentity, OpenCodeHostHandle>()
     const records = new Map<OpenCodeOpaqueIdentity, OpenCodeSessionRecord>()
     const memberOwnershipTitles = new Map<OpenCodeOpaqueIdentity, string>()
-    const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord & {
-      messageId?: string
-    }>()
+    const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord>()
     let currentSnapshot: OpenCodeProvisioningSnapshot | null = null
     const launchDirectory = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'launch-attempts')
     const journalPath = path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.journal`)
@@ -630,8 +649,7 @@ class OpenCodeProductionLaunchRuntime {
                 { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
                 .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
             }
-            proofSessions.set(input.host.hostKeyIdentity, { ...persisted,
-              ...(proofSession.messageId ? { messageId: proofSession.messageId } : {}) })
+            proofSessions.set(input.host.hostKeyIdentity, persisted)
             if (persisted.state === 'foreign' || persisted.state === 'unresolved'
               || persisted.state === 'registered' || persisted.state === 'owned') {
               throw new Error('OpenCode proof session cleanup could not prove absence')
@@ -756,7 +774,9 @@ class OpenCodeProductionLaunchRuntime {
           const assistantMessageIdentity = messageIdentity(response)
           const rawMessageId = response.info?.id
           if (typeof rawMessageId !== 'string' || !rawMessageId) throw new Error('OpenCode proof message id is absent')
-          proofSessions.set(input.host.hostKeyIdentity, { ...ownedProof, messageId: rawMessageId })
+          const observableProof = await proofCleanupLedger.recordObservationMessage(
+            ownedProof, rawMessageId, { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+          proofSessions.set(input.host.hostKeyIdentity, observableProof)
           const proof: OpenCodeLaunchAttemptResponse = {
             launchAttempt: {
               contractVersion: 1, attemptId: input.request.launchAttempt.attemptId,
@@ -807,10 +827,17 @@ class OpenCodeProductionLaunchRuntime {
         const client = openCodeClientFactory.create(handle.baseUrl, {
           signal: input.signal, remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
         })
-        const retainedProof = proofSessions.get(input.host.hostKeyIdentity)
-        if (!retainedProof?.messageId || retainedProof.state !== 'owned' || !client.getSessionMessage) {
+        const retainedProof = await resolveOpenCodeProductionRetainedProofRecord({
+          cached: proofSessions.get(input.host.hostKeyIdentity), ledger: proofCleanupLedger,
+          attemptId: input.request.launchAttempt.attemptId,
+          requestGeneration: input.request.launchAttempt.generation,
+          hostKeyIdentity: input.host.hostKeyIdentity,
+          deadlineAtMs: input.deadlineAtMs, signal: input.signal,
+        })
+        if (!client.getSessionMessage) {
           throw new Error('OpenCode retained proof is unavailable')
         }
+        proofSessions.set(input.host.hostKeyIdentity, retainedProof)
         const [mcp, allTools, observedAuthFingerprint, observedBinaryFingerprint,
           observedProfileIdentity, observedPluginFingerprint, observedCacheIdentity,
           observedConfig, observedProofMessage] = await Promise.all([
@@ -822,7 +849,7 @@ class OpenCodeProductionLaunchRuntime {
           immutableTreeFingerprint(prepared.pluginNodeModulesPath),
           pathIdentity(prepared.xdgCacheHome),
           client.getConfig(),
-          client.getSessionMessage(retainedProof.authoritativeSessionId, retainedProof.messageId),
+          client.getSessionMessage(retainedProof.authoritativeSessionId, retainedProof.observationMessageId),
         ])
         if (!observedProofMessage) throw new Error('OpenCode retained proof message disappeared')
         const proofInfo = observedProofMessage.info ?? {}
@@ -1050,21 +1077,10 @@ class OpenCodeProductionLaunchRuntime {
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(command) })
+    // The core returns only after authoring its durable final. Project that immutable result
+    // immediately; reacquiring the store here can deadlock behind a retained cleanup lease and
+    // can turn a bounded partial/cancellation return into an unbounded production wait.
     const launchAttempt = projectOpenCodeLaunchAttemptResponse(result)
-    if (launchAttempt) {
-      const persistenceSignal = new AbortController().signal
-      await attemptStore.withGeneration({
-        attemptId: result.attemptId,
-        payloadHash: result.payloadHash,
-        inputDigest: result.inputDigest,
-        immutableDigest: result.immutableDigest,
-        generation: result.generation,
-      }, 'replay', lease => lease.commitFinalResponse(launchAttempt), {
-        deadlineAtMs: result.absoluteDeadlineAtMs,
-        signal: persistenceSignal,
-        monotonicNow: launchMonotonicNow,
-      })
-    }
     this.completedResults.set(command, result)
     const members = Object.fromEntries(command.members.map(member => {
       const record = records.get(member.memberIdentity)

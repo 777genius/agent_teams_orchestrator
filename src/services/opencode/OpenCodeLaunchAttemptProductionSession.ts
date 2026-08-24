@@ -30,6 +30,8 @@ export type OpenCodeProofSessionGenerationRecord = {
   authoritativeSessionId: string
   ownershipTitle: string
   state: 'registered' | 'owned' | OpenCodeOwnedSessionReconciliation
+  /** Non-secret remote handle required to re-observe the accepted proof after restart. */
+  observationMessageId?: string
   updatedAt: string
 }
 
@@ -151,6 +153,36 @@ export class OpenCodeProofSessionCleanupLedger {
     })
   }
 
+  async recordObservationMessage(
+    expected: Pick<OpenCodeProofSessionCleanupRecord,
+      'attemptId' | 'generation' | 'hostKeyIdentity' | 'authoritativeSessionId' | 'ownershipTitle'>,
+    observationMessageId: string,
+    context?: OpenCodeProofLedgerContext,
+  ): Promise<OpenCodeProofSessionCleanupRecord> {
+    if (!validObservationMessageId(observationMessageId)) {
+      throw new Error('OpenCode proof observation message identity is invalid')
+    }
+    return this.exclusive(context, async directory => {
+      const ledger = await this.readFile(directory, context?.signal)
+      const current = ledger?.active
+      if (!ledger || !current || current.state !== 'owned'
+        || ledger.attemptId !== expected.attemptId
+        || current.generation !== expected.generation
+        || current.hostKeyIdentity !== expected.hostKeyIdentity
+        || current.authoritativeSessionId !== expected.authoritativeSessionId
+        || current.ownershipTitle !== expected.ownershipTitle) {
+        throw new Error('OpenCode proof cleanup ledger ownership mismatch')
+      }
+      if (current.observationMessageId !== undefined
+        && current.observationMessageId !== observationMessageId) {
+        throw new Error('OpenCode proof observation message identity changed')
+      }
+      const active = { ...current, observationMessageId, updatedAt: new Date().toISOString() }
+      await this.write(directory, { ...ledger, active }, context?.signal, ledger)
+      return { version: 2, attemptId: ledger.attemptId, ...active }
+    })
+  }
+
   private async readFile(directory: OpenCodeProofLedgerDirectory, signal?: AbortSignal): Promise<ProofLedgerFile | null> {
     try {
       const text = await directory.readBoundedRegularFile(path.basename(this.filePath), 1_048_576, signal)
@@ -260,7 +292,13 @@ function validGeneration(value: unknown): value is OpenCodeProofSessionGeneratio
     && Number.isSafeInteger(record.requestGeneration) && Number(record.requestGeneration) > 0
     && typeof record.hostKeyIdentity === 'string' && typeof record.authoritativeSessionId === 'string'
     && typeof record.ownershipTitle === 'string' && typeof record.updatedAt === 'string'
+    && (record.observationMessageId === undefined || validObservationMessageId(record.observationMessageId))
     && ['registered', 'owned', 'absent', 'deleted', 'foreign', 'unresolved'].includes(String(record.state))
+}
+
+function validObservationMessageId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 512
+    && !/[\u0000-\u001f\u007f]/u.test(value)
 }
 
 function isLegacyProofRecord(value: unknown): value is {

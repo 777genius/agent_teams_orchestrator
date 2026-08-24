@@ -1552,9 +1552,22 @@ export class OpenCodeLaunchAttemptStore {
             const candidate = { ...journal!, acceptedProofResponse: encoded }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-            await this.persistRecoverableProjection(candidate, proofContext ?? effectiveContext)
+            let persistenceError: unknown | undefined
+            try {
+              persistenceError = await this.persistRecoverableProjection(
+                candidate, proofContext ?? effectiveContext)
+            } catch (error) {
+              active = false
+              leaseFailure = error
+              if (error instanceof OpenCodeLaunchPoisonedLeaseError) leasePoison = error
+              throw error
+            }
             journal = candidate
             Object.assign(lease.journal, candidate)
+            if (persistenceError !== undefined) {
+              leaseFailure = persistenceError
+              throw persistenceError
+            }
           }, proofContext)
         },
         commitFinalResponse: async (response, responseContext) => {
@@ -1580,9 +1593,22 @@ export class OpenCodeLaunchAttemptStore {
             const candidate = { ...journal!, finalResponse: encoded }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
-            await this.persistRecoverableProjection(candidate, responseContext ?? effectiveContext)
+            let persistenceError: unknown | undefined
+            try {
+              persistenceError = await this.persistRecoverableProjection(
+                candidate, responseContext ?? effectiveContext)
+            } catch (error) {
+              active = false
+              leaseFailure = error
+              if (error instanceof OpenCodeLaunchPoisonedLeaseError) leasePoison = error
+              throw error
+            }
             journal = candidate
             Object.assign(lease.journal, candidate)
+            if (persistenceError !== undefined) {
+              leaseFailure = persistenceError
+              throw persistenceError
+            }
           }, responseContext)
         },
         reconcile: async (event, reconcileContext) => {
@@ -1774,7 +1800,7 @@ export class OpenCodeLaunchAttemptStore {
   private async persistRecoverableProjection(
     journal: OpenCodeLaunchJournal,
     context?: OpenCodeLaunchStoreContext,
-  ): Promise<void> {
+  ): Promise<unknown | undefined> {
     const bytes = new TextEncoder().encode(JSON.stringify(journal))
     if (bytes.byteLength > OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES) {
       throw new OpenCodeLaunchJournalError('corrupt', 'journal exceeds size limit')
@@ -1790,11 +1816,25 @@ export class OpenCodeLaunchAttemptStore {
       () => { replacementSettled = true },
       () => { replacementSettled = true },
     )
-    try { await awaitWithContext(replacement, context, false) }
+    try { await awaitWithContext(replacement, context, false); return undefined }
     catch (error) {
       if (!replacementSettled) {
         throw new OpenCodeLaunchPoisonedLeaseError(error, undefined, physicalSettlement)
       }
+      // Atomic publication may be durable even when the backend subsequently reports a sync
+      // failure. Observe the commit point while this process still owns the cross-process lease.
+      // Returning the original error lets the caller preserve failure semantics, but only after
+      // it has installed this exact visible candidate as the lease-local journal. Any later
+      // retained cleanup mutation will therefore merge with, rather than erase, the projection.
+      let visible: Uint8Array | null
+      try { visible = await this.persistence.read(context) }
+      catch (observationError) {
+        // Without a trustworthy observation, no same-lease mutation may proceed. An indefinite
+        // poison is conservative: physical replacement has settled, but its durable winner is
+        // unknown and cannot safely be overwritten from stale memory.
+        throw new OpenCodeLaunchPoisonedLeaseError(error, observationError, physicalSettlement)
+      }
+      if (visible && bytesEqual(visible, bytes)) return error
       throw error
     }
   }

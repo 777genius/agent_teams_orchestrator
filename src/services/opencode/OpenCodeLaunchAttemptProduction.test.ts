@@ -21,6 +21,7 @@ import {
   createOpenCodeLaunchPreflightResult,
   hasExactOpenCodeClaimReconciliationAuthority,
   inspectOpenCodeProductionGeneration,
+  resolveOpenCodeProductionRetainedProofRecord,
   transitionOpenCodeProductionMemberClaim,
 } from './OpenCodeLaunchAttemptProduction.js'
 
@@ -334,6 +335,73 @@ test('production proof composition retires an exact crashed generation before a 
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('production proof ledger persists the attempt-bound observation handle across restart', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-observation-'))
+  try {
+    const file = path.join(directory, 'proof.json')
+    const ledger = new OpenCodeProofSessionCleanupLedger(file)
+    const registration = await ledger.reconcileAndRegister({
+      attemptId: 'attempt-a', requestGeneration: 1, hostKeyIdentity: identity,
+      ownership: generation => ({ authoritativeSessionId: `proof-${generation}`,
+        ownershipTitle: `owned-${generation}` }), reconcile: async () => 'absent',
+    })
+    const owned = await ledger.recordState(registration.record, 'owned')
+    const observed = await ledger.recordObservationMessage(owned, 'msg-proof-accepted')
+    expect(observed.observationMessageId).toBe('msg-proof-accepted')
+
+    const restarted = new OpenCodeProofSessionCleanupLedger(file)
+    expect(await restarted.read()).toMatchObject({
+      attemptId: 'attempt-a', requestGeneration: 1, hostKeyIdentity: identity,
+      authoritativeSessionId: 'proof-1', state: 'owned',
+      observationMessageId: 'msg-proof-accepted',
+    })
+    await expect(restarted.recordObservationMessage(observed, 'msg-substituted'))
+      .rejects.toThrow('identity changed')
+    expect((await restarted.read())?.observationMessageId).toBe('msg-proof-accepted')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('production restart resolves the accepted proof handle and rejects generation substitution', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-roster-restart-'))
+  try {
+    const proofFile = path.join(directory, 'proof.json')
+    const firstRun = new OpenCodeProofSessionCleanupLedger(proofFile)
+    const registration = await firstRun.reconcileAndRegister({
+      attemptId: 'attempt-a', requestGeneration: 1, hostKeyIdentity: identity,
+      ownership: generation => ({ authoritativeSessionId: `proof-${generation}`,
+        ownershipTitle: `owned-${generation}` }), reconcile: async () => 'absent',
+    })
+    const owned = await firstRun.recordState(registration.record, 'owned')
+    await firstRun.recordObservationMessage(owned, 'msg-proof-accepted')
+
+    const restarted = new OpenCodeProofSessionCleanupLedger(proofFile)
+    const resolved = await resolveOpenCodeProductionRetainedProofRecord({
+      ledger: restarted, attemptId: 'attempt-a', requestGeneration: 1,
+      hostKeyIdentity: identity, deadlineAtMs: Date.now() + 10_000,
+      signal: new AbortController().signal,
+    })
+    expect(resolved.observationMessageId).toBe('msg-proof-accepted')
+
+    await expect(resolveOpenCodeProductionRetainedProofRecord({
+      ledger: restarted, attemptId: 'attempt-a', requestGeneration: 2,
+      hostKeyIdentity: identity, deadlineAtMs: Date.now() + 10_000,
+      signal: new AbortController().signal,
+    })).rejects.toThrow('retained proof is unavailable')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('production projects the core durable result without a same-attempt reacquisition', async () => {
+  const source = await readFile(new URL('./OpenCodeLaunchAttemptProduction.ts', import.meta.url), 'utf8')
+  const coreReturn = source.indexOf('const result = await core.run(')
+  const projectionComplete = source.indexOf('this.completedResults.set(command, result)', coreReturn)
+  expect(coreReturn).toBeGreaterThan(0)
+  expect(projectionComplete).toBeGreaterThan(coreReturn)
+  const postCoreProductionPath = source.slice(coreReturn, projectionComplete)
+  expect(postCoreProductionPath).toContain('projectOpenCodeLaunchAttemptResponse(result)')
+  expect(postCoreProductionPath).not.toContain('withGeneration')
+  expect(postCoreProductionPath).not.toContain('commitFinalResponse')
 })
 
 test('proof cleanup refuses an expired immutable launch deadline before publication', async () => {

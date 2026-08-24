@@ -322,6 +322,60 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     )
   })
 
+  test.each([
+    ['cleanup before rejected final publication', 'cleanup-first'],
+    ['rejected final publication before retained cleanup', 'final-first'],
+  ] as const)('preserves a publish-then-reject immutable final across %s', async (_name, order) => {
+    const persistence = new MemoryPersistence()
+    const replace = persistence.replaceAndSync.bind(persistence)
+    let rejectPublishedFinal = true
+    persistence.replaceAndSync = async bytes => {
+      await replace(bytes)
+      const candidate = JSON.parse(new TextDecoder().decode(bytes))
+      if (candidate.finalResponse && rejectPublishedFinal) {
+        rejectPublishedFinal = false
+        throw new Error('deterministic publish-then-reject')
+      }
+    }
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const exactIdentity = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    const publishedFinal = finalResponse()
+    let releaseCleanup!: () => void
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
+    let deferredCleanup!: Promise<void>
+    const running = store.withGeneration(exactIdentity, 'begin', async lease => {
+      const claimToken = await lease.claim(member)
+      await lease.append({ type: 'member_unknown', memberIdentity: member, claimToken })
+      deferredCleanup = cleanupGate.then(() => lease.append({
+        type: 'cleanup', memberIdentity: member, outcome: 'timed_out', claimToken,
+      }))
+      lease.retainUntilPhysicalSettlement(deferredCleanup)
+      if (order === 'cleanup-first') {
+        releaseCleanup()
+        await deferredCleanup
+      }
+      await expect(lease.commitFinalResponse(publishedFinal))
+        .rejects.toThrow('deterministic publish-then-reject')
+      if (order === 'final-first') releaseCleanup()
+    })
+    await expect(running).rejects.toThrow('deterministic publish-then-reject')
+    await deferredCleanup
+
+    const durable = JSON.parse(persistence.text())
+    expect(durable.finalResponse).toEqual(publishedFinal)
+    expect(durable.events.at(-1)).toMatchObject({ type: 'cleanup', outcome: 'timed_out' })
+
+    const restarted = new OpenCodeLaunchAttemptStore(persistence)
+    expect((await restarted.inspect(exactIdentity))?.finalResponse).toEqual(publishedFinal)
+    await restarted.withGeneration(exactIdentity, 'replay', async lease => {
+      expect(lease.journal.finalResponse).toEqual(publishedFinal)
+      const changed = structuredClone(publishedFinal)
+      changed.launchAttempt.elapsedMs = 9_999
+      await expect(lease.commitFinalResponse(changed)).rejects.toThrow('final response changed')
+    })
+    expect(JSON.parse(persistence.text())).toEqual(durable)
+  })
+
   test('rejects unpaired, noncanonical, duplicate and unknown-field records', async () => {
     const badEvents = [
       [{ type: 'member_applied', sequence: 1, generation: 1, fence: 1, memberIdentity: member, linkage }],
