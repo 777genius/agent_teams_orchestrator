@@ -247,6 +247,7 @@ jobs:
 
       - name: Prove packaged Windows retained publication
         if: runner.os == 'Windows'
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $env:OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR = (Resolve-Path dist)

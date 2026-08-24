@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { createHash } from 'node:crypto'
 import { lstatSync } from 'node:fs'
-import { chmod, lstat, opendir, readFile, readdir } from 'node:fs/promises'
+import { chmod, lstat, open, opendir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import {
@@ -34,6 +34,11 @@ const HISTORY_PER_SCOPE = 2
 const LEGACY_SCAN_LIMIT = 128
 const GLOBAL_SCOPE_LIMIT = 128
 const MAX_PASSIVE_DATABASE_BYTES = 32 * 1024 * 1024
+const PASSIVE_DATABASE_JOURNAL = `${OPEN_CODE_PASSIVE_DATABASE}-journal`
+const FORBIDDEN_PASSIVE_DATABASE_SIDECARS = [
+  `${OPEN_CODE_PASSIVE_DATABASE}-wal`,
+  `${OPEN_CODE_PASSIVE_DATABASE}-shm`,
+] as const
 // Deployed v1/v2 generations were millisecond timestamps. A fixed fence makes
 // an imported or rejected legacy store subordinate without trusting its clock.
 const LEGACY_GENERATION_FENCE = 1_000_000_000_000_000
@@ -141,12 +146,11 @@ async function commitOpenCodePassiveSnapshot(
       try { await root.publishImmutableFile(OPEN_CODE_PASSIVE_DATABASE, '', 0o600) }
       catch { /* a racing owner may have published the same managed file */ }
     }
-    await root.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+    await prepareRetainedDatabaseArtifacts(root, signal, options.platform)
     await options.hooks?.afterDatabasePinned?.()
-    await assertSafeDatabaseArtifacts(options.rootDirectory, true, options.platform)
     await options.hooks?.beforeDatabaseOpen?.()
     database = openDatabase(options.rootDirectory, false)
-    await ensureDatabaseReady(database, signal)
+    await ensureDatabaseReady(database, signal, (options.platform ?? process.platform) === 'win32')
     await protectDatabaseArtifacts(options.rootDirectory, options.platform)
     await root.sync()
     await options.hooks?.afterTransactionMarker?.()
@@ -204,7 +208,7 @@ async function commitOpenCodePassiveSnapshot(
       if (signal.aborted) throw cancelled()
       await options.hooks?.beforeCommitPublished?.()
       await root.validate()
-      database.exec('COMMIT')
+      await commitTransaction(database, signal)
       await options.hooks?.afterCommitPublished?.()
       return id
     } catch (error) {
@@ -263,24 +267,21 @@ export async function readOpenCodePassiveSnapshot(
     catch { return null }
   }
   let database: Database | null = null
-  let windowsBaseline: Map<string, string> | null = null
   try {
     if (process.platform === 'win32') {
-      windowsBaseline = await directoryIdentitySnapshot(rootDirectory)
-      // Bun's SQLite VFS has no no-create/no-write contract for WAL support.
-      // A passive reader therefore refuses any sidecar-bearing store instead
-      // of allowing a nominally read-only connection to create or mutate SHM.
-      for (const suffix of ['-wal', '-shm', '-journal']) {
-        if (windowsBaseline.has(`${OPEN_CODE_PASSIVE_DATABASE}${suffix}`)) return null
-      }
+      const names = new Set(await root!.childNames())
+      // Legacy evidence would require mixing the retained database with an
+      // additional tree. Sidecars are not observed at all: the copied SQLite
+      // header below must itself attest rollback-journal format.
+      if (hasLegacyArtifactName(names)) return null
     }
     await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE, true)
-    await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform)
+    await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform, false)
     if (root) {
       const checkpoint = await root.readBoundedRegularBytes(
         OPEN_CODE_PASSIVE_DATABASE, MAX_PASSIVE_DATABASE_BYTES, signal,
       )
-      if (!checkpoint) return null
+      if (!checkpoint || !hasRollbackJournalHeader(checkpoint)) return null
       // The passive connection has no filesystem VFS at all: SQLite consumes
       // an exact, bounded, no-follow copy as a read-only in-memory database.
       database = Database.deserialize(checkpoint, { readonly: true, strict: true })
@@ -290,7 +291,9 @@ export async function readOpenCodePassiveSnapshot(
     verifySchema(database)
     database.exec('BEGIN')
     try {
-      const legacyCapturedAt = await matchingLegacyCapturedAt(database, rootDirectory, scope)
+      const legacyCapturedAt = await matchingLegacyCapturedAt(
+        database, rootDirectory, scope, process.platform === 'win32',
+      )
       if (legacyCapturedAt === null) {
         database.exec('COMMIT')
         return null
@@ -317,17 +320,11 @@ export async function readOpenCodePassiveSnapshot(
     if (process.platform === 'win32') return null
     throw error
   } finally {
-    let publicationChanged = false
     try {
       database?.close(false)
     } finally {
-      if (windowsBaseline) {
-        const after = await directoryIdentitySnapshot(rootDirectory).catch(() => null)
-        publicationChanged = !after || !sameDirectoryIdentitySnapshot(windowsBaseline, after)
-      }
       await root?.close()
     }
-    if (publicationChanged) return null
   }
 }
 
@@ -341,10 +338,12 @@ export async function maintainOpenCodePassiveStore(rootDirectory: string, platfo
   }
   let database: Database | null = null
   try {
-    await root?.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
-    await assertSafeDatabaseArtifacts(rootDirectory, true, platform)
+    if (root) await prepareRetainedDatabaseArtifacts(root, undefined, platform)
+    else await assertSafeDatabaseArtifacts(rootDirectory, true, platform)
     database = openDatabase(rootDirectory, false)
-    verifySchema(database); database.exec('PRAGMA wal_checkpoint(PASSIVE)')
+    verifySchema(database)
+    if ((platform ?? process.platform) === 'win32') database.exec('PRAGMA journal_size_limit = 0')
+    else database.exec('PRAGMA wal_checkpoint(PASSIVE)')
   } catch (error) {
     if (process.platform !== 'win32') throw error
   } finally {
@@ -397,7 +396,27 @@ function initializeSchema(database: Database): void {
   verifySchema(database)
 }
 
-async function ensureDatabaseReady(database: Database, signal: AbortSignal): Promise<void> {
+async function ensureDatabaseReady(
+  database: Database,
+  signal: AbortSignal,
+  persistentJournal: boolean,
+): Promise<void> {
+  if (persistentJournal) {
+    for (;;) {
+      if (signal.aborted) throw cancelled()
+      try {
+        const journal = database.query<{ journal_mode: string }, []>('PRAGMA journal_mode = PERSIST').get()
+        if (journal?.journal_mode.toLowerCase() !== 'persist') {
+          throw new Error('Passive snapshot store journal mode is invalid')
+        }
+        database.exec('PRAGMA synchronous = FULL')
+        break
+      } catch (error) {
+        if (!isBusy(error)) throw error
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+    }
+  }
   let incompleteSchemaObservations = 0
   for (;;) {
     if (signal.aborted) throw cancelled()
@@ -422,7 +441,7 @@ async function ensureDatabaseReady(database: Database, signal: AbortSignal): Pro
             payload TEXT NOT NULL,
             transaction_id INTEGER NOT NULL
           )`)
-          database.exec('COMMIT')
+          await commitTransaction(database, signal)
           return
         } catch (error) {
           rollback(database)
@@ -455,16 +474,22 @@ async function ensureDatabaseReady(database: Database, signal: AbortSignal): Pro
         continue
       }
       await beginTransaction(database, signal, 'EXCLUSIVE')
-      try { initializeSchema(database); database.exec('COMMIT') }
+      try { initializeSchema(database); await commitTransaction(database, signal) }
       catch (initializationError) { rollback(database); if (!isBusy(initializationError)) throw initializationError }
       continue
     }
     try {
-      database.exec('PRAGMA journal_mode = WAL')
+      const expectedJournal = persistentJournal ? 'persist' : 'wal'
+      const journal = database.query<{ journal_mode: string }, []>(
+        `PRAGMA journal_mode = ${persistentJournal ? 'PERSIST' : 'WAL'}`,
+      ).get()
+      if (journal?.journal_mode.toLowerCase() !== expectedJournal) {
+        throw new Error('Passive snapshot store journal mode is invalid')
+      }
       database.exec('PRAGMA synchronous = FULL')
       await beginImmediate(database, signal)
       database.exec('UPDATE passive_meta SET journal_ready = 1 WHERE singleton = 1')
-      database.exec('COMMIT')
+      await commitTransaction(database, signal)
     } catch (error) {
       rollback(database)
       if (!isBusy(error)) throw error
@@ -488,6 +513,17 @@ async function beginTransaction(database: Database, signal: AbortSignal, mode: '
   for (;;) {
     if (signal.aborted) throw cancelled()
     try { database.exec(`BEGIN ${mode}`); return }
+    catch (error) {
+      if (!isBusy(error)) throw error
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+  }
+}
+
+async function commitTransaction(database: Database, signal: AbortSignal): Promise<void> {
+  for (;;) {
+    if (signal.aborted) throw cancelled()
+    try { database.exec('COMMIT'); return }
     catch (error) {
       if (!isBusy(error)) throw error
       await new Promise<void>(resolve => setImmediate(resolve))
@@ -646,7 +682,9 @@ async function matchingLegacyCapturedAt(
   database: Database,
   root: string,
   scope: `sha256:${string}`,
+  retainedDatabaseOnly = false,
 ): Promise<number | undefined | null> {
+  if (retainedDatabaseOnly) return undefined
   let stored: { fingerprint: string } | null
   try {
     stored = database.query<{ fingerprint: string }, [string]>(
@@ -680,11 +718,13 @@ async function assertSafeDatabaseArtifacts(
   root: string,
   databaseRequired = false,
   platform: NodeJS.Platform = process.platform,
+  includeSidecars = true,
 ): Promise<void> {
-  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+  for (const suffix of includeSidecars ? ['', '-wal', '-shm', '-journal'] : ['']) {
     try {
       const stat = await lstat(`${openCodePassiveDatabasePath(root)}${suffix}`)
       if (!stat.isFile() || stat.isSymbolicLink()
+        || stat.nlink !== 1
         || (platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
         throw new Error('Passive snapshot database artifact is unsafe')
       }
@@ -693,19 +733,6 @@ async function assertSafeDatabaseArtifacts(
       if (databaseRequired && suffix === '') throw error
     }
   }
-}
-
-async function directoryIdentitySnapshot(root: string): Promise<Map<string, string>> {
-  const snapshot = new Map<string, string>()
-  for (const name of (await readdir(root)).sort()) {
-    const metadata = await lstat(path.join(root, name), { bigint: true })
-    snapshot.set(name, `${metadata.dev}:${metadata.ino}:${metadata.mode & 0o170000n}`)
-  }
-  return snapshot
-}
-
-function sameDirectoryIdentitySnapshot(left: Map<string, string>, right: Map<string, string>): boolean {
-  return left.size === right.size && [...left].every(([name, identity]) => right.get(name) === identity)
 }
 
 async function protectDatabaseArtifacts(
@@ -721,6 +748,46 @@ async function protectDatabaseArtifacts(
     } catch (error) { if (!isMissing(error)) throw error }
   }
   await assertSafeDatabaseArtifacts(root, true, platform)
+}
+
+async function prepareRetainedDatabaseArtifacts(
+  root: OpenCodeSafePublicationDirectory,
+  signal?: AbortSignal,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  const names = new Set(await root.childNames())
+  if (platform === 'win32' && FORBIDDEN_PASSIVE_DATABASE_SIDECARS.some(name => names.has(name))) {
+    throw new Error('Passive snapshot database artifact is unsafe')
+  }
+  await root.ensureRegularFile(PASSIVE_DATABASE_JOURNAL, 0o600, signal)
+  // Retain both objects before validation. On Windows the native handles deny
+  // replacement and hard-link creation while Bun's pathname VFS is active.
+  await root.pinRegularFile(OPEN_CODE_PASSIVE_DATABASE)
+  await root.pinRegularFile(PASSIVE_DATABASE_JOURNAL)
+  await assertSafeDatabaseArtifacts(root.descriptorPath(), true, platform)
+  if (platform === 'win32') await assertRollbackJournalHeader(root.descriptorPath())
+}
+
+async function assertRollbackJournalHeader(root: string): Promise<void> {
+  const handle = await open(openCodePassiveDatabasePath(root), 'r')
+  try {
+    const header = Buffer.alloc(20)
+    const { bytesRead } = await handle.read(header, 0, header.byteLength, 0)
+    if (bytesRead >= 20 && !hasRollbackJournalHeader(header)) {
+      throw new Error('Passive snapshot database artifact is unsafe')
+    }
+  } finally { await handle.close() }
+}
+
+function hasRollbackJournalHeader(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= 20
+    && Buffer.from(bytes.subarray(0, 16)).toString('binary') === 'SQLite format 3\0'
+    && bytes[18] === 1 && bytes[19] === 1
+}
+
+function hasLegacyArtifactName(names: ReadonlySet<string>): boolean {
+  return [OPEN_CODE_PASSIVE_TRANSACTION_MARKER, 'committed.json', 'scopes', 'snapshots', 'binary.snapshot.json']
+    .some(name => names.has(name))
 }
 
 async function readLegacySnapshot(root: string, scope: `sha256:${string}`): Promise<LegacyRead> {

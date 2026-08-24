@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -58,9 +58,23 @@ describe('OpenCode passive transaction writer boundary', () => {
         await writeFile(outside, '')
         await symlink(outside, `${openCodePassiveDatabasePath(root)}${suffix}`)
         await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-          .write(snapshot(), new AbortController().signal)).rejects.toThrow('unsafe')
+          .write(snapshot(), new AbortController().signal)).rejects.toThrow(/unsafe|unavailable/)
       } finally { await rm(root, { recursive: true, force: true }) }
     }
+  })
+
+  test.each(['', '-journal'])('rejects a pre-existing database%s hard link before SQLite opens', async suffix => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-hardlink-'))
+    const artifact = `${openCodePassiveDatabasePath(root)}${suffix}`
+    const outside = path.join(root, 'outside')
+    try {
+      await writeFile(openCodePassiveDatabasePath(root), '')
+      if (suffix) await writeFile(artifact, 'external-sentinel')
+      await link(artifact, outside)
+      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(snapshot(), new AbortController().signal)).rejects.toThrow('unsafe')
+      expect(await readFile(outside, 'utf8')).toBe(suffix ? 'external-sentinel' : '')
+    } finally { await rm(root, { recursive: true, force: true }) }
   })
 
   test('fails closed on an existing foreign schema without migrating or deleting it', async () => {

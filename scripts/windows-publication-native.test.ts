@@ -6,6 +6,8 @@ import path from 'node:path'
 import { OpenCodeWindowsPublicationAuthorityClient } from '../src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.js'
 import { resolveOpenCodeNativeAuthorityArtifacts } from '../src/services/opencode/OpenCodeNativeAuthorityArtifacts.js'
 import { OpenCodeSafePublicationDirectory } from '../src/services/opencode/OpenCodeSafePublication.js'
+import { maintainOpenCodePassiveStore } from '../src/services/opencode/OpenCodePassiveSnapshotStore.js'
+import { OpenCodePassiveStatusSnapshotWriter } from '../src/services/opencode/OpenCodePassiveStatusSnapshotWriter.js'
 import { publishOpenCodeProjectBehaviorSnapshotForTest } from '../src/services/opencode/OpenCodeProfileManager.js'
 
 const roots: string[] = []
@@ -14,16 +16,103 @@ const windowsTest = process.platform === 'win32' ? test : test.skip
 function artifacts() { const directory = process.env.OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR; return directory ? {
   launcherPath: path.join(directory, 'opencode-catalog-launcher.exe'), workerPath: path.join(directory, 'opencode-catalog-authority.exe'),
 } : {} }
+async function boundedText(stream: ReadableStream<Uint8Array>, maximumBytes: number): Promise<string> {
+  const reader = stream.getReader(); const chunks: Uint8Array[] = []; let total = 0
+  try {
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) break
+      total += next.value.byteLength
+      if (total > maximumBytes) throw new Error(`native publication helper output exceeded ${maximumBytes} bytes`)
+      chunks.push(next.value)
+    }
+  } finally { reader.releaseLock() }
+  const bytes = new Uint8Array(total); let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return new TextDecoder().decode(bytes)
+}
 async function nativeRequests(requests: object[]): Promise<Record<string, unknown>[]> {
   const explicit = artifacts(); const workerPath = 'workerPath' in explicit
     ? explicit.workerPath : resolveOpenCodeNativeAuthorityArtifacts({}).workerPath
-  const child = Bun.spawn([workerPath, '--windows-publication-authority-v1'], { stdin: 'pipe', stdout: 'pipe' })
-  child.stdin.write(requests.map(request => `${JSON.stringify(request)}\n`).join('')); child.stdin.end()
-  const output = await new Response(child.stdout).text(); await child.exited
-  return output.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const controller = new AbortController()
+  let child: ReturnType<typeof Bun.spawn> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutMs = 30_000
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(); child?.kill()
+      reject(new Error(`native publication helper exceeded ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+  try {
+    child = Bun.spawn([workerPath, '--windows-publication-authority-v1'], {
+      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', signal: controller.signal,
+    })
+    child.stdin.write(requests.map(request => `${JSON.stringify(request)}\n`).join('')); child.stdin.end()
+    const completed = Promise.all([
+      boundedText(child.stdout, 1024 * 1024), boundedText(child.stderr, 64 * 1024), child.exited,
+    ]).then(([output, error, exitCode]) => {
+      if (exitCode !== 0) throw new Error(`native publication helper exited ${exitCode}: ${error.slice(0, 4096)}`)
+      return output.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    })
+    return await Promise.race([completed, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+    controller.abort(); child?.kill()
+    if (child) {
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([child.exited, new Promise<void>(resolve => {
+          cleanupTimer = setTimeout(resolve, 2_000)
+        })])
+      } finally { if (cleanupTimer) clearTimeout(cleanupTimer) }
+    }
+  }
 }
 
 describe('Windows retained publication native contract', () => {
+  test('native request startup, stdout, stderr, exit, and cleanup are statically bounded', async () => {
+    const source = await Bun.file(new URL('./windows-publication-native.test.ts', import.meta.url)).text()
+    expect(source).toContain("const timeoutMs = 30_000")
+    expect(source).toContain('boundedText(child.stdout, 1024 * 1024)')
+    expect(source).toContain('boundedText(child.stderr, 64 * 1024)')
+    expect(source).toContain('controller.abort(); child?.kill()')
+    expect(source).toContain('cleanupTimer = setTimeout(resolve, 2_000)')
+  })
+
+  windowsTest('passive SQLite retains its DB, rollback journal, and full ancestry before pathname VFS use', async () => {
+    const makeSnapshot = () => ({ schemaVersion: 1 as const, projectScope: `sha256:${'a'.repeat(64)}` as const,
+      capturedAt: 1, binary: { value: { presence: 'present' as const, version: '1.0.0' },
+        authority: 'binary_metadata' as const, freshness: 'fresh' as const, condition: 'normal' as const,
+        observedAt: 1, validUntil: 300_001, issueCode: 'none' as const }, providers: [] })
+    for (const target of ['database', 'journal'] as const) {
+      const sandbox = await mkdtemp(path.join(os.tmpdir(), `opencode-passive-hardlink-${target}-`)); roots.push(sandbox)
+      const root = path.join(sandbox, 'parent', 'store'); await mkdir(root, { recursive: true })
+      const database = path.join(root, 'passive-status.sqlite3')
+      const journal = `${database}-journal`; const selected = target === 'database' ? database : journal
+      await writeFile(database, ''); if (target === 'journal') await writeFile(journal, 'attacker-sentinel')
+      const outside = path.join(sandbox, `${target}-outside`); await link(selected, outside)
+      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(makeSnapshot(), new AbortController().signal)).rejects.toThrow(/unsafe|unavailable/)
+      expect(await readFile(outside, 'utf8')).toBe(target === 'journal' ? 'attacker-sentinel' : '')
+    }
+
+    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-passive-vfs-race-')); roots.push(sandbox)
+    const parent = path.join(sandbox, 'parent'); const root = path.join(parent, 'store'); await mkdir(root, { recursive: true })
+    const database = path.join(root, 'passive-status.sqlite3'); const journal = `${database}-journal`
+    await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
+      afterDatabasePinned: async () => {
+        await expect(rename(parent, path.join(sandbox, 'parent-replaced'))).rejects.toBeDefined()
+        await expect(rename(database, path.join(root, 'database-replaced'))).rejects.toBeDefined()
+        await expect(rename(journal, path.join(root, 'journal-replaced'))).rejects.toBeDefined()
+        await expect(link(database, path.join(sandbox, 'late-hardlink'))).rejects.toBeDefined()
+      },
+    } }).write(makeSnapshot(), new AbortController().signal)
+    expect((await readdir(root)).sort()).toEqual(['passive-status.sqlite3', 'passive-status.sqlite3-journal'])
+    await maintainOpenCodePassiveStore(root)
+    expect((await readdir(root)).some(name => name.endsWith('-wal') || name.endsWith('-shm'))).toBe(false)
+  })
+
   windowsTest('denies root and primary database replacement until close', async () => {
     const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const displaced = path.join(sandbox, 'displaced')

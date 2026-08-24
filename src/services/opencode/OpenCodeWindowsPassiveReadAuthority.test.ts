@@ -63,15 +63,19 @@ describe('OpenCode Windows passive retained traversal contract', () => {
     expect(native.calls).toEqual([
       'absolute:C:\\', 'identity:volume', 'filesystem',
       'relative:volume:owned', 'identity:owned',
-      'relative:owned:nested', 'close:owned', 'identity:nested', 'identity:nested',
+      'relative:owned:nested', 'identity:nested', 'identity:nested',
     ])
+    for (const component of [...retained.components].reverse()) native.contract.close(component.handle)
+    native.contract.close(retained.volume)
+    expect(native.calls.slice(-3)).toEqual(['close:nested', 'close:owned', 'close:volume'])
   })
 
   test.each(['owned', 'nested'])('rejects a reparse point at %s without a pathname fallback', leaf => {
     const native = fake({ rejectIdentity: leaf })
     expect(() => testRetainWindowsPassiveRoot(native.contract, 'C:\\owned\\nested')).toThrow()
     expect(native.calls).not.toContain('absolute:C:\\owned\\nested')
-    expect(native.calls.slice(-2)).toEqual([`close:${leaf}`, 'close:volume'])
+    expect(native.calls).toContain(`close:${leaf}`)
+    expect(native.calls.at(-1)).toBe('close:volume')
   })
 
   test('rejects a cross-volume component and UNC roots', () => {

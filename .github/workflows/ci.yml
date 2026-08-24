@@ -91,12 +91,14 @@ jobs:
           src/services/opencode/OpenCodePassiveSnapshotPersistencePolicy.test.ts
           src/services/runtimeBackends/openCodePassiveStatus.test.ts
       - name: Prove native NTFS handle retention
+        timeout-minutes: 10
         run: bun test scripts/windows-publication-native.test.ts
       - name: Build and compile runtime
         run: |
           bun run build
           bun run compile
       - name: Test packaged native pair
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $env:OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR = (Resolve-Path dist)

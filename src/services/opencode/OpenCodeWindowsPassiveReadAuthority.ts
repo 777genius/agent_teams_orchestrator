@@ -137,31 +137,42 @@ function guard(options: OpenOptions): void {
     && (!Number.isFinite(options.deadline) || openCodeMonotonicNow() >= options.deadline)) throw rejected()
 }
 
-type RetainedRoot = Readonly<{ root: Handle; rootIdentity: Identity; volume: Handle; volumeIdentity: Identity }>
+type RetainedComponent = Readonly<{ handle: Handle; value: Identity }>
+type RetainedRoot = Readonly<{
+  root: Handle
+  rootIdentity: Identity
+  volume: Handle
+  volumeIdentity: Identity
+  components: readonly RetainedComponent[]
+}>
 
 /** Retain the volume first, then resolve exactly one no-follow component at a time. */
 function retainRoot(contract: PassiveNativeContract, rootPath: string, options: OpenOptions): RetainedRoot {
   guard(options)
   const volume = contract.openAbsolute(rootPath.slice(0, 3))
   let current = volume
+  const retainedComponents: RetainedComponent[] = []
   try {
     const volumeIdentity = contract.identity(volume)
     if (!volumeIdentity.directory) throw rejected()
     contract.verifyFixedNtfs(volume)
     guard(options)
-    const components = rootPath.slice(3).split('\\').filter(Boolean)
-    for (const component of components) {
+    const pathComponents = rootPath.slice(3).split('\\').filter(Boolean)
+    for (const component of pathComponents) {
       const child = contract.openRelative(current, component, true)
-      if (current !== volume) contract.close(current)
       current = child
       const value = contract.identity(current)
       if (!value.directory || value.volumeSerial !== volumeIdentity.volumeSerial) throw rejected()
+      retainedComponents.push({ handle: current, value })
       guard(options)
     }
     const rootIdentity = current === volume ? volumeIdentity : contract.identity(current)
-    return { root: current, rootIdentity, volume, volumeIdentity }
+    return { root: current, rootIdentity, volume, volumeIdentity, components: retainedComponents }
   } catch (error) {
-    if (current !== volume) contract.close(current)
+    if (current !== volume && !retainedComponents.some(component => component.handle === current)) {
+      contract.close(current)
+    }
+    for (const component of retainedComponents.reverse()) contract.close(component.handle)
     contract.close(volume)
     throw error
   }
@@ -181,15 +192,18 @@ export class OpenCodeWindowsPassiveReadAuthority {
   readonly #rootIdentity: Identity
   readonly #volume: Handle | null
   readonly #volumeIdentity: Identity
+  readonly #components: readonly RetainedComponent[]
   readonly #options: OpenOptions
   readonly #pins: Handle[] = []
   #closed = false
 
   private constructor(
-    root: Handle, rootIdentity: Identity, volumeIdentity: Identity, options: OpenOptions, volume: Handle | null = null,
+    root: Handle, rootIdentity: Identity, volumeIdentity: Identity, options: OpenOptions,
+    volume: Handle | null = null, components: readonly RetainedComponent[] = [],
   ) {
     this.#root = root; this.#rootIdentity = rootIdentity; this.#volumeIdentity = volumeIdentity
     this.#options = options; this.#volume = volume
+    this.#components = components
   }
 
   static open(rootPath: string, options: OpenOptions = {}): OpenCodeWindowsPassiveReadAuthority {
@@ -198,6 +212,7 @@ export class OpenCodeWindowsPassiveReadAuthority {
     return new OpenCodeWindowsPassiveReadAuthority(
       retained.root, retained.rootIdentity, retained.volumeIdentity, options,
       retained.volume === retained.root ? null : retained.volume,
+      retained.components,
     )
   }
 
@@ -212,6 +227,11 @@ export class OpenCodeWindowsPassiveReadAuthority {
       const volume = identity(this.#volume)
       if (!volume.directory || volume.volumeSerial !== this.#volumeIdentity.volumeSerial
         || volume.fileId !== this.#volumeIdentity.fileId) throw rejected()
+    }
+    for (const component of this.#components) {
+      const current = identity(component.handle)
+      if (!current.directory || current.volumeSerial !== component.value.volumeSerial
+        || current.fileId !== component.value.fileId) throw rejected()
     }
     const current = identity(this.#root)
     if (!current.directory || current.volumeSerial !== this.#rootIdentity.volumeSerial
@@ -296,7 +316,8 @@ export class OpenCodeWindowsPassiveReadAuthority {
     if (this.#closed) return
     this.#closed = true
     for (const handle of this.#pins.splice(0)) closeHandle(handle)
-    closeHandle(this.#root)
+    if (this.#components.length === 0) closeHandle(this.#root)
+    else for (const component of [...this.#components].reverse()) closeHandle(component.handle)
     if (this.#volume) closeHandle(this.#volume)
   }
 }
