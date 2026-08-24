@@ -418,10 +418,14 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     } })
     const first = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     expect(first.status).toBe('reconciliation_required')
+    expect(first).toMatchObject({ attemptId, payloadHash: hash, generation: 1 })
+    expect(first.continuationToken).toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]+$/)
     expect(subject.persistence.json().events.map((event: any) => event.type)).toEqual(['member_intent', 'member_unknown'])
     subject.setNow(500)
+    const continuedRequest = request(2)
+    continuedRequest.launchAttempt.continuationToken = first.continuationToken
     const continued = await subject.launch.run({
-      request: request(2), members: [members[0]], continuation: true, requestedBudgetMs: 10_000,
+      request: continuedRequest, members: [members[0]], continuation: true, requestedBudgetMs: 10_000,
     })
     expect(continued.status).toBe('reconciliation_required')
     expect(continued.failure?.kind).toBe('unknown_transport_after_side_effect')
@@ -442,6 +446,8 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
         : { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } } })
     const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
     expect(result.status).toBe('partial')
+    expect(result).toMatchObject({ attemptId, payloadHash: hash, generation: 1 })
+    expect(result.continuationToken).toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]+$/)
     expect(result.committed.map(item => item.memberIdentity)).toEqual([members[0]])
     expect(result.failure).toMatchObject({
       kind: 'deadline_after_partial', retryDisposition: 'continuation', sideEffectsStarted: true,
@@ -452,12 +458,51 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       'member_intent', 'member_applied', 'member_intent', 'member_failed', 'cleanup',
     ])
     authoritative.set(members[0], result.committed[0]!)
+    const proofCount = subject.calls.filter(call => call === 'proof').length
+    const replay = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay.status).toBe('partial')
+    expect(replay.continuationToken).toBe(result.continuationToken)
+    expect(subject.calls.filter(call => call === 'proof')).toHaveLength(proofCount)
+    const continuedRequest = request(2)
+    continuedRequest.launchAttempt.continuationToken = result.continuationToken
     const continued = await subject.launch.run({
-      request: request(2), members, continuation: true, requestedBudgetMs: 10_000,
+      request: continuedRequest, members, continuation: true, requestedBudgetMs: 10_000,
     })
     expect(continued.status).toBe('succeeded')
+    expect(continued).toMatchObject({ attemptId, payloadHash: hash, generation: 2 })
+    expect(continued.continuationToken).toBeUndefined()
     expect(continued.committed.map(item => item.memberIdentity)).toEqual(members)
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(2)
+  })
+
+  test('rejects forged and stale continuation tokens before advancing the durable generation', async () => {
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative, materialize: async member => member === members[0]
+      ? { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } }
+      : { outcome: 'known_failure', failure: 'pre_side_effect_transport', externalEffect: false,
+        owned: { memberIdentity: member } } })
+    const first = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    authoritative.set(members[0], first.committed[0]!)
+
+    const forged = request(2)
+    forged.launchAttempt.continuationToken = 'forged'
+    await expect(subject.launch.run({ request: forged, members, continuation: true,
+      requestedBudgetMs: 10_000 })).rejects.toMatchObject({ field: 'launchAttempt.continuationToken' })
+    expect(subject.persistence.json()).toMatchObject({ generation: 1, fence: 1 })
+
+    const valid = request(2)
+    valid.launchAttempt.continuationToken = first.continuationToken
+    const second = await subject.launch.run({ request: valid, members, continuation: true,
+      requestedBudgetMs: 10_000 })
+    expect(second.status).toBe('partial')
+    expect(second.continuationToken).not.toBe(first.continuationToken)
+    expect(second).toMatchObject({ attemptId, payloadHash: hash, generation: 2 })
+
+    const stale = request(3)
+    stale.launchAttempt.continuationToken = first.continuationToken
+    await expect(subject.launch.run({ request: stale, members, continuation: true,
+      requestedBudgetMs: 10_000 })).rejects.toMatchObject({ field: 'launchAttempt.continuationToken' })
+    expect(subject.persistence.json()).toMatchObject({ generation: 2, fence: 2 })
   })
 
   test('records unknown, stops, and permits reconciliation but never an absent-ledger resend', async () => {
@@ -473,7 +518,10 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(first.failure?.kind).toBe('unknown_transport_after_side_effect')
     expect(invocations).toBe(1)
     subject.setNow(500)
-    const second = await subject.launch.run({ request: request(2), members, continuation: true, requestedBudgetMs: 10_000 })
+    const continuedRequest = request(2)
+    continuedRequest.launchAttempt.continuationToken = first.continuationToken
+    const second = await subject.launch.run({ request: continuedRequest, members,
+      continuation: true, requestedBudgetMs: 10_000 })
     expect(second.status).toBe('reconciliation_required')
     expect(second.failure?.kind).toBe('unknown_transport_after_side_effect')
     expect(invocations).toBe(1)
@@ -492,11 +540,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       reconciliationIdentity = input
       return authoritative.get(input.memberIdentity) ?? null
     }
-    await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const first = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     authoritative.set(members[0], linkage(members[0]))
     const beforeCreates = subject.calls.filter(call => call.startsWith('create:')).length
+    const continuedRequest = request(2)
+    continuedRequest.launchAttempt.continuationToken = first.continuationToken
     const continued = await subject.launch.run({
-      request: request(2), members: [members[0]], continuation: true, requestedBudgetMs: 10_000,
+      request: continuedRequest, members: [members[0]], continuation: true, requestedBudgetMs: 10_000,
     })
     expect(continued.status).toBe('succeeded')
     expect(continued.committed[0]).toEqual(linkage(members[0]))
@@ -533,6 +583,8 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     const creates = subject.calls.filter(call => call.startsWith('create:')).length
     const replay = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     expect(replay.status).toBe('succeeded')
+    expect(replay).toMatchObject({ attemptId, payloadHash: hash, generation: 1 })
+    expect(replay.continuationToken).toBeUndefined()
     expect(replay.committed).toEqual(first.committed)
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(creates)
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(1)
@@ -556,14 +608,17 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     const first = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     authoritative.set(members[0], first.committed[0]!)
     const proofs = subject.calls.filter(call => call === 'proof').length
+    const driftRequest = request(2)
+    driftRequest.launchAttempt.continuationToken = 'forged-for-immutable-member-drift'
     await expect(subject.launch.run({
-      request: request(2), members, continuation: true, requestedBudgetMs: 10_000,
-    })).rejects.toMatchObject({ code: 'foreign' })
+      request: driftRequest, members, continuation: true, requestedBudgetMs: 10_000,
+    })).rejects.toMatchObject({ field: 'launchAttempt.continuationToken' })
     const changedConfig = request(2)
+    changedConfig.launchAttempt.continuationToken = 'forged-for-immutable-config-drift'
     changedConfig.launchAttempt.modelId = 'anthropic/claude-opus-4-1'
     await expect(subject.launch.run({
       request: changedConfig, members: [members[0]], continuation: true, requestedBudgetMs: 10_000,
-    })).rejects.toMatchObject({ code: 'foreign' })
+    })).rejects.toMatchObject({ field: 'launchAttempt.continuationToken' })
     expect(subject.calls.filter(call => call === 'proof')).toHaveLength(proofs)
     expect(subject.persistence.json()).toMatchObject({ generation: 1, fence: 1 })
   })

@@ -16,8 +16,39 @@ import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } fro
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+import { createOpenCodeLaunchPreflightResult } from './OpenCodeLaunchAttemptProduction.js'
 
 const identity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
+
+test('production preflight projects authoritative continuation identity and omits it for completed replay', () => {
+  const base = {
+    attemptId: '123e4567-e89b-42d3-a456-426614174000',
+    payloadHash: 'b'.repeat(64),
+    immutableDigest: 'c'.repeat(64),
+    generation: 4,
+    committed: [],
+    deadlineAtMs: 10_000,
+  }
+  const pending = [`sha256:${'d'.repeat(64)}` as OpenCodeOpaqueIdentity]
+  const reconciliation = createOpenCodeLaunchPreflightResult({
+    ...base, reconciliationRequired: true, pending,
+  })
+  expect(reconciliation).toMatchObject({
+    attemptId: base.attemptId,
+    payloadHash: base.payloadHash,
+    generation: 4,
+    status: 'reconciliation_required',
+    pending,
+  })
+  expect(reconciliation.continuationToken)
+    .toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]+$/)
+
+  const completed = createOpenCodeLaunchPreflightResult({
+    ...base, reconciliationRequired: false, pending: [],
+  })
+  expect(completed.status).toBe('succeeded')
+  expect(completed.continuationToken).toBeUndefined()
+})
 
 test('production member mutation registers deterministic ownership before an ambiguous create rejection', async () => {
   const calls: string[] = []

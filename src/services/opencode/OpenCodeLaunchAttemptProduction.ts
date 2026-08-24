@@ -11,6 +11,8 @@ import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
   computeOpenCodeLaunchAttemptImmutableDigest,
+  createOpenCodeLaunchAttemptResult,
+  validateOpenCodeLaunchContinuation,
   type OpenCodeLaunchAttemptPorts,
   type OpenCodeLaunchAttemptResult,
   type OpenCodeLaunchProfile,
@@ -64,6 +66,30 @@ import {
 import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
+
+export function createOpenCodeLaunchPreflightResult(input: {
+  attemptId: string
+  payloadHash: string
+  immutableDigest: string
+  generation: number
+  reconciliationRequired: boolean
+  committed: OpenCodeLaunchMemberLinkage[]
+  pending: OpenCodeOpaqueIdentity[]
+  deadlineAtMs: number
+}): OpenCodeLaunchAttemptResult {
+  return createOpenCodeLaunchAttemptResult({
+    attemptId: input.attemptId,
+    payloadHash: input.payloadHash,
+    immutableDigest: input.immutableDigest,
+    generation: input.generation,
+    status: input.reconciliationRequired ? 'reconciliation_required' : 'succeeded',
+    committed: input.committed,
+    pending: input.pending,
+    cleanup: 'complete',
+    absoluteDeadlineAtMs: input.deadlineAtMs,
+    workDeadlineAtMs: input.deadlineAtMs,
+  })
+}
 
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
@@ -213,6 +239,18 @@ class OpenCodeProductionLaunchRuntime {
       path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.proof-cleanup.json`),
     )
     const attemptStore = new OpenCodeLaunchAttemptStore(attemptPersistence)
+    const immutableDigest = computeOpenCodeLaunchAttemptImmutableDigest(command.request,
+      command.members.map(member => member.memberIdentity), command.requestedBudgetMs,
+      command.outerRemainingBudgetMs ?? command.requestedBudgetMs,
+      computeOpenCodeLaunchCommandImmutableDigest(command))
+    validateOpenCodeLaunchContinuation({
+      attemptId: command.request.launchAttempt.attemptId,
+      payloadHash: command.request.launchAttempt.payloadHash,
+      generation: command.request.launchAttempt.generation,
+      immutableDigest,
+      continuation: command.continuation,
+      continuationToken: command.request.launchAttempt.continuationToken,
+    })
     const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
       OpenCodeLaunchMutationLedger.targetDigest({
         teamId: command.teamId, laneId: command.laneId,
@@ -245,10 +283,7 @@ class OpenCodeProductionLaunchRuntime {
     await attemptStore.inspect({
       attemptId: command.request.launchAttempt.attemptId,
       payloadHash: command.request.launchAttempt.payloadHash,
-      immutableDigest: computeOpenCodeLaunchAttemptImmutableDigest(command.request,
-        command.members.map(member => member.memberIdentity), command.requestedBudgetMs,
-        command.outerRemainingBudgetMs ?? command.requestedBudgetMs,
-        computeOpenCodeLaunchCommandImmutableDigest(command)),
+      immutableDigest,
     }, { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal, monotonicNow: launchMonotonicNow })
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
@@ -326,13 +361,14 @@ class OpenCodeProductionLaunchRuntime {
         ? [item.linkage] : [])
       const pending = priorClaims.filter(item => item.claim?.state !== 'committed' || !item.linkage)
         .map(item => item.member.memberIdentity)
-      const result = {
+      const result = createOpenCodeLaunchPreflightResult({
+        attemptId: command.request.launchAttempt.attemptId,
+        payloadHash: command.request.launchAttempt.payloadHash,
+        immutableDigest,
         generation: command.request.launchAttempt.generation,
-        status: uncertain ? 'reconciliation_required' as const : 'succeeded' as const,
-        committed, pending, cleanup: 'complete' as const,
-        absoluteDeadlineAtMs: preflightDeadlineAtMs,
-        workDeadlineAtMs: preflightDeadlineAtMs,
-      }
+        reconciliationRequired: uncertain,
+        committed, pending, deadlineAtMs: preflightDeadlineAtMs,
+      })
       return {
         snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
           profile: null, host: null, config: null, configProviders: null, providers: null,
