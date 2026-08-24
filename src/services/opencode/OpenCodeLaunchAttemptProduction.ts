@@ -42,6 +42,7 @@ import type {
 } from './OpenCodeBridgeContractV2.js'
 import type {
   OpenCodeHostHandle,
+  OpenCodeMessage,
   OpenCodeProvisioningSnapshot,
   OpenCodeScopedPreparedProfile,
   OpenCodeSessionRecord,
@@ -95,6 +96,61 @@ export async function resolveOpenCodeProductionRetainedProofRecord(input: Readon
     throw new Error('OpenCode retained proof is unavailable')
   }
   return retainedProof
+}
+
+export function deriveOpenCodeProductionProofOwnership(input: Readonly<{
+  attemptId: string
+  requestGeneration: number
+  proofGeneration: number
+  hostKeyIdentity: OpenCodeOpaqueIdentity
+}>): Readonly<{ authoritativeSessionId: string; ownershipTitle: string }> {
+  const marker = createHash('sha256').update(JSON.stringify({
+    kind: 'launch-proof-ownership-v2',
+    attemptId: input.attemptId,
+    requestGeneration: input.requestGeneration,
+    proofGeneration: input.proofGeneration,
+    hostKeyIdentity: input.hostKeyIdentity,
+  })).digest('hex')
+  return {
+    authoritativeSessionId: `ses_${marker.slice(0, 26)}`,
+    ownershipTitle: `agent-teams-proof:${input.attemptId}:${input.proofGeneration}:${marker}`,
+  }
+}
+
+/** Re-observe the exact persisted proof owner and message before retained proof can authorize work. */
+export async function reobserveOpenCodeProductionRetainedProof(input: Readonly<{
+  retainedProof: OpenCodeProofSessionCleanupRecord
+  getSession(id: string): Promise<{ id: string; title?: string }>
+  getSessionMessage(id: string, messageId: string): Promise<OpenCodeMessage | null>
+}>): Promise<OpenCodeMessage> {
+  const retained = input.retainedProof
+  const expectedOwnership = deriveOpenCodeProductionProofOwnership({
+    attemptId: retained.attemptId,
+    requestGeneration: retained.requestGeneration,
+    proofGeneration: retained.generation,
+    hostKeyIdentity: retained.hostKeyIdentity,
+  })
+  if (retained.state !== 'owned' || !retained.observationMessageId
+    || retained.authoritativeSessionId !== expectedOwnership.authoritativeSessionId
+    || retained.ownershipTitle !== expectedOwnership.ownershipTitle) {
+    throw new Error('OpenCode retained proof ownership marker mismatched')
+  }
+  const observedSession = await input.getSession(retained.authoritativeSessionId)
+  if (observedSession.id !== retained.authoritativeSessionId
+    || observedSession.title !== retained.ownershipTitle) {
+    throw new Error('OpenCode retained proof session ownership changed')
+  }
+  const observedMessage = await input.getSessionMessage(
+    retained.authoritativeSessionId, retained.observationMessageId)
+  const info = observedMessage?.info ?? {}
+  if (!observedMessage || info.id !== retained.observationMessageId) {
+    throw new Error('OpenCode retained proof message identity changed')
+  }
+  const observedSessionId = info.sessionID ?? info.sessionId
+  if (observedSessionId !== undefined && observedSessionId !== retained.authoritativeSessionId) {
+    throw new Error('OpenCode retained proof message session changed')
+  }
+  return observedMessage
 }
 
 /** Pure Desktop V1 projection used by production and fake-only contract tests. */
@@ -677,23 +733,16 @@ class OpenCodeProductionLaunchRuntime {
         const client = openCodeClientFactory.create(handle.baseUrl, {
           signal: input.signal, remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
         })
-        const proofOwnershipToken = createHash('sha256')
-          .update(input.request.launchAttempt.proofNonce)
-          .digest('hex')
         const registration = await proofCleanupLedger.reconcileAndRegister({
           attemptId: input.request.launchAttempt.attemptId,
           requestGeneration: input.request.launchAttempt.generation,
           hostKeyIdentity: input.host.hostKeyIdentity,
-          ownership: generation => {
-            const proofDigest = createHash('sha256').update(JSON.stringify({
-              kind: 'launch-proof', attemptId: input.request.launchAttempt.attemptId,
-              payloadHash: input.request.launchAttempt.payloadHash, generation,
-            })).digest('hex')
-            return {
-              authoritativeSessionId: `ses_${proofDigest.slice(0, 26)}`,
-              ownershipTitle: `agent-teams-proof:${input.request.launchAttempt.attemptId}:${generation}:${proofDigest}:${proofOwnershipToken}`,
-            }
-          },
+          ownership: generation => deriveOpenCodeProductionProofOwnership({
+            attemptId: input.request.launchAttempt.attemptId,
+            requestGeneration: input.request.launchAttempt.generation,
+            proofGeneration: generation,
+            hostKeyIdentity: input.host.hostKeyIdentity,
+          }),
           reconcile: prior => reconcileOpenCodeOwnedMemberSession({
             authoritativeSessionId: prior.authoritativeSessionId,
             ownershipTitle: prior.ownershipTitle,
@@ -838,9 +887,14 @@ class OpenCodeProductionLaunchRuntime {
           throw new Error('OpenCode retained proof is unavailable')
         }
         proofSessions.set(input.host.hostKeyIdentity, retainedProof)
+        const observedProofMessage = await reobserveOpenCodeProductionRetainedProof({
+          retainedProof,
+          getSession: id => client.getSession(id),
+          getSessionMessage: (id, messageId) => client.getSessionMessage!(id, messageId),
+        })
         const [mcp, allTools, observedAuthFingerprint, observedBinaryFingerprint,
           observedProfileIdentity, observedPluginFingerprint, observedCacheIdentity,
-          observedConfig, observedProofMessage] = await Promise.all([
+          observedConfig] = await Promise.all([
           client.getMcp(),
           client.listExperimentalToolIds({ directory: handle.projectPath, workspace: handle.projectPath }),
           fileFingerprint(prepared.managedAuthPath),
@@ -849,9 +903,7 @@ class OpenCodeProductionLaunchRuntime {
           immutableTreeFingerprint(prepared.pluginNodeModulesPath),
           pathIdentity(prepared.xdgCacheHome),
           client.getConfig(),
-          client.getSessionMessage(retainedProof.authoritativeSessionId, retainedProof.observationMessageId),
         ])
-        if (!observedProofMessage) throw new Error('OpenCode retained proof message disappeared')
         const proofInfo = observedProofMessage.info ?? {}
         const proofProviderId = proofInfo.providerID ?? proofInfo.providerId
         const proofModelId = proofInfo.modelID ?? proofInfo.modelId

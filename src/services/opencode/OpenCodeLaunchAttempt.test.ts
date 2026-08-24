@@ -47,6 +47,7 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
   bytes: Uint8Array | null = null
   fence = 0
   writes = 0
+  acquisitions = 0
   async read() { return this.bytes?.slice() ?? null }
   async replaceAndSync(bytes: Uint8Array) { this.bytes = bytes.slice(); this.writes += 1 }
   async readFence() { return this.fence || null }
@@ -56,7 +57,10 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
   }
   async acquireExclusive(
     _context: OpenCodeLaunchStoreContext,
-  ): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>> { return async () => undefined }
+  ): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>> {
+    this.acquisitions += 1
+    return async () => undefined
+  }
   json() { return this.bytes ? JSON.parse(new TextDecoder().decode(this.bytes)) : null }
 }
 
@@ -166,9 +170,10 @@ function setup(options: {
       return result
     } },
   }
+  const store = new OpenCodeLaunchAttemptStore(persistence)
   return {
     persistence, calls, cleaned, deadlines, ports,
-    launch: new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(persistence), ports),
+    store, launch: new OpenCodeLaunchAttempt(store, ports),
     setNow(value: number) { now = value },
   }
 }
@@ -866,6 +871,14 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       'member_intent', 'member_unknown',
     ])
     const publishedFinal = structuredClone(subject.persistence.json().finalResponse)
+    expect(projectOpenCodeLaunchAttemptResponse(result)).toEqual(result.durableFinalResponse)
+    expect(subject.persistence.acquisitions).toBe(1)
+    let reacquired = false
+    const blockedReacquisition = subject.store.inspect({ attemptId, payloadHash: hash,
+      inputDigest: result.inputDigest }).then(value => { reacquired = true; return value })
+    await Bun.sleep(0)
+    expect(reacquired).toBe(false)
+    expect(subject.persistence.acquisitions).toBe(1)
     expect(subject.calls).not.toContain('release')
     expect(subject.cleaned).toEqual([])
     expect(cleanupCalls).toBe(0)
@@ -880,6 +893,8 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     finishCleanup()
     await physicalCleanup
     await Bun.sleep(0)
+    expect((await blockedReacquisition)?.finalResponse).toEqual(publishedFinal)
+    expect(subject.persistence.acquisitions).toBe(2)
     expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
     expect(result.committed).toEqual([])
     expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
@@ -895,6 +910,34 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(replay.cleanup).toBe('timed_out')
     expect(replay.cleanupPending).toEqual([members[0]])
     expect(replay.durableFinalResponse?.members.cleanupPending).toEqual([members[0]])
+  })
+
+  test('production projection returns and replays a durable partial at the exhausted work deadline', async () => {
+    const subject = setup()
+    subject.ports.sessions.createBootstrapAndCommit = async input => {
+      await input.revalidateBeforeCommit()
+      const applied = { outcome: 'applied' as const, linkage: linkage(input.memberIdentity),
+        owned: { memberIdentity: input.memberIdentity } }
+      expect(await input.commitIfClaimLive(applied.linkage)).toBe('committed')
+      subject.setNow(9_000)
+      return applied
+    }
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(result.status).toBe('partial')
+    expect(result.failure?.kind).toBe('deadline_after_partial')
+    expect(result.committed).toEqual([linkage(members[0])])
+    const writes = subject.persistence.writes
+    const acquisitions = subject.persistence.acquisitions
+    expect(projectOpenCodeLaunchAttemptResponse(result)).toEqual(result.durableFinalResponse)
+    expect(subject.persistence.writes).toBe(writes)
+    expect(subject.persistence.acquisitions).toBe(acquisitions)
+
+    subject.setNow(1)
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports,
+    ).run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay.durableFinalResponse).toEqual(result.durableFinalResponse)
+    expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(0)
   })
 
   test('retains the host when deferred physical cleanup rejects and never starts cleanup twice', async () => {

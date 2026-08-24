@@ -19,8 +19,10 @@ import type { OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import {
   createOpenCodeLaunchPreflightResult,
+  deriveOpenCodeProductionProofOwnership,
   hasExactOpenCodeClaimReconciliationAuthority,
   inspectOpenCodeProductionGeneration,
+  reobserveOpenCodeProductionRetainedProof,
   resolveOpenCodeProductionRetainedProofRecord,
   transitionOpenCodeProductionMemberClaim,
 } from './OpenCodeLaunchAttemptProduction.js'
@@ -363,15 +365,17 @@ test('production proof ledger persists the attempt-bound observation handle acro
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('production restart resolves the accepted proof handle and rejects generation substitution', async () => {
+test('production restart re-observes the exact persisted proof owner and message', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-roster-restart-'))
   try {
     const proofFile = path.join(directory, 'proof.json')
     const firstRun = new OpenCodeProofSessionCleanupLedger(proofFile)
     const registration = await firstRun.reconcileAndRegister({
       attemptId: 'attempt-a', requestGeneration: 1, hostKeyIdentity: identity,
-      ownership: generation => ({ authoritativeSessionId: `proof-${generation}`,
-        ownershipTitle: `owned-${generation}` }), reconcile: async () => 'absent',
+      ownership: generation => deriveOpenCodeProductionProofOwnership({
+        attemptId: 'attempt-a', requestGeneration: 1, proofGeneration: generation,
+        hostKeyIdentity: identity,
+      }), reconcile: async () => 'absent',
     })
     const owned = await firstRun.recordState(registration.record, 'owned')
     await firstRun.recordObservationMessage(owned, 'msg-proof-accepted')
@@ -383,6 +387,13 @@ test('production restart resolves the accepted proof handle and rejects generati
       signal: new AbortController().signal,
     })
     expect(resolved.observationMessageId).toBe('msg-proof-accepted')
+    const remoteMessage = { info: { id: 'msg-proof-accepted', sessionID: resolved.authoritativeSessionId,
+      providerID: 'anthropic', modelID: 'model' }, parts: [{ type: 'text', text: 'nonce' }] }
+    expect(await reobserveOpenCodeProductionRetainedProof({
+      retainedProof: resolved,
+      getSession: async () => ({ id: resolved.authoritativeSessionId, title: resolved.ownershipTitle }),
+      getSessionMessage: async () => remoteMessage,
+    })).toBe(remoteMessage)
 
     await expect(resolveOpenCodeProductionRetainedProofRecord({
       ledger: restarted, attemptId: 'attempt-a', requestGeneration: 2,
@@ -392,16 +403,43 @@ test('production restart resolves the accepted proof handle and rejects generati
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('production projects the core durable result without a same-attempt reacquisition', async () => {
-  const source = await readFile(new URL('./OpenCodeLaunchAttemptProduction.ts', import.meta.url), 'utf8')
-  const coreReturn = source.indexOf('const result = await core.run(')
-  const projectionComplete = source.indexOf('this.completedResults.set(command, result)', coreReturn)
-  expect(coreReturn).toBeGreaterThan(0)
-  expect(projectionComplete).toBeGreaterThan(coreReturn)
-  const postCoreProductionPath = source.slice(coreReturn, projectionComplete)
-  expect(postCoreProductionPath).toContain('projectOpenCodeLaunchAttemptResponse(result)')
-  expect(postCoreProductionPath).not.toContain('withGeneration')
-  expect(postCoreProductionPath).not.toContain('commitFinalResponse')
+test.each([
+  ['replaced or reused session',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: 'ses_replaced', title: proof.ownershipTitle }, messageId: proof.observationMessageId,
+    }), 'session ownership changed'],
+  ['wrong ownership title',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: proof.authoritativeSessionId, title: `${proof.ownershipTitle}:foreign` },
+      messageId: proof.observationMessageId,
+    }), 'session ownership changed'],
+  ['substituted message id',
+    (proof: NonNullable<Awaited<ReturnType<OpenCodeProofSessionCleanupLedger['read']>>>) => ({
+      session: { id: proof.authoritativeSessionId, title: proof.ownershipTitle }, messageId: 'msg-substituted',
+    }), 'message identity changed'],
+] as const)('production restart fails closed on %s', async (_name, mutate, expected) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-reobserve-fake-'))
+  try {
+    const file = path.join(directory, 'proof.json')
+    const firstRun = new OpenCodeProofSessionCleanupLedger(file)
+    const registration = await firstRun.reconcileAndRegister({
+      attemptId: 'attempt-a', requestGeneration: 1, hostKeyIdentity: identity,
+      ownership: generation => deriveOpenCodeProductionProofOwnership({
+        attemptId: 'attempt-a', requestGeneration: 1, proofGeneration: generation,
+        hostKeyIdentity: identity,
+      }), reconcile: async () => 'absent',
+    })
+    const owned = await firstRun.recordState(registration.record, 'owned')
+    await firstRun.recordObservationMessage(owned, 'msg-proof-accepted')
+    const retainedProof = await new OpenCodeProofSessionCleanupLedger(file).read()
+    expect(retainedProof).not.toBeNull()
+    const changed = mutate(retainedProof!)
+    await expect(reobserveOpenCodeProductionRetainedProof({
+      retainedProof: retainedProof!,
+      getSession: async () => changed.session,
+      getSessionMessage: async () => ({ info: { id: changed.messageId }, parts: [] }),
+    })).rejects.toThrow(expected)
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('proof cleanup refuses an expired immutable launch deadline before publication', async () => {

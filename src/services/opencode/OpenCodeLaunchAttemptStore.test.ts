@@ -9,6 +9,7 @@ import {
   OpenCodeLaunchAttemptStore,
   OpenCodeLaunchFileJournalPersistence,
   OpenCodeLaunchJournalError,
+  OpenCodeLaunchPoisonedLeaseError,
   type OpenCodeLaunchJournalPersistence,
   type OpenCodeLaunchJournalLease,
   type OpenCodeLaunchStoreContext,
@@ -374,6 +375,53 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       await expect(lease.commitFinalResponse(changed)).rejects.toThrow('final response changed')
     })
     expect(JSON.parse(persistence.text())).toEqual(durable)
+  })
+
+  test('poisons an unobservable publish-then-throw final and fences retained cleanup from stale overwrite', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const exactIdentity = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    await store.withGeneration(exactIdentity, 'begin', async () => undefined)
+    const replace = persistence.replaceAndSync.bind(persistence)
+    const read = persistence.read.bind(persistence)
+    let makeObservationUnobservable = false
+    persistence.replaceAndSync = async bytes => {
+      await replace(bytes)
+      const candidate = JSON.parse(new TextDecoder().decode(bytes))
+      if (candidate.finalResponse) {
+        makeObservationUnobservable = true
+        throw new Error('publish succeeded but sync result was ambiguous')
+      }
+    }
+    persistence.read = async () => {
+      if (makeObservationUnobservable) {
+        makeObservationUnobservable = false
+        throw new Error('publication winner is unobservable')
+      }
+      return read()
+    }
+    let releaseCleanup!: () => void
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
+    let retainedCleanup!: Promise<void>
+    const publishedFinal = finalResponse()
+    await expect(store.withGeneration(exactIdentity, 'begin', async lease => {
+      const claimToken = await lease.claim(member)
+      await lease.append({ type: 'member_unknown', memberIdentity: member, claimToken })
+      retainedCleanup = cleanupGate.then(() => lease.append({
+        type: 'cleanup', memberIdentity: member, outcome: 'timed_out', claimToken,
+      }))
+      lease.retainUntilPhysicalSettlement(retainedCleanup)
+      await lease.commitFinalResponse(publishedFinal)
+    })).rejects.toBeInstanceOf(OpenCodeLaunchPoisonedLeaseError)
+
+    const published = JSON.parse(persistence.text())
+    expect(published.finalResponse).toEqual(publishedFinal)
+    expect(published.events.at(-1)).toMatchObject({ type: 'member_unknown' })
+    releaseCleanup()
+    await expect(retainedCleanup).rejects.toMatchObject({ code: 'fenced' })
+    expect(JSON.parse(persistence.text())).toEqual(published)
+    expect((await new OpenCodeLaunchAttemptStore(persistence).inspect(exactIdentity))?.finalResponse)
+      .toEqual(publishedFinal)
   })
 
   test('rejects unpaired, noncanonical, duplicate and unknown-field records', async () => {
