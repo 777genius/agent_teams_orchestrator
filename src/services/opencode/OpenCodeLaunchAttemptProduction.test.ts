@@ -13,10 +13,15 @@ import {
   reconcileOpenCodeOwnedMemberSession,
 } from './OpenCodeLaunchAttemptProductionSession.js'
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
+import { OpenCodeLaunchAttemptStore, OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
-import { createOpenCodeLaunchPreflightResult } from './OpenCodeLaunchAttemptProduction.js'
+import {
+  createOpenCodeLaunchPreflightResult,
+  inspectOpenCodeProductionGeneration,
+  transitionOpenCodeProductionMemberClaim,
+} from './OpenCodeLaunchAttemptProduction.js'
 
 const identity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
 
@@ -48,6 +53,116 @@ test('production preflight never authorizes reconciliation and omits continuatio
   expect(completed.status).toBe('succeeded')
   expect(completed.continuationToken).toBeUndefined()
 })
+
+test('production inspection accepts only exact current replay or exact next-generation capability', () => {
+  const initial = { generation: 1, inputDigest: 'a'.repeat(64), consumedContinuationToken: undefined,
+    continuation: { issuedGeneration: 1, token: 'token-one', eligibleMemberIdentities: [identity] } }
+  expect(inspectOpenCodeProductionGeneration(initial, {
+    generation: 1, inputDigest: initial.inputDigest, continuation: false,
+  })).toBe('replay')
+  expect(inspectOpenCodeProductionGeneration(initial, {
+    generation: 2, inputDigest: 'b'.repeat(64), continuation: true, continuationToken: 'token-one',
+  })).toBe('continue')
+  for (const changed of [
+    { generation: 2, inputDigest: initial.inputDigest, continuation: false },
+    { generation: 1, inputDigest: 'b'.repeat(64), continuation: false },
+    { generation: 1, inputDigest: initial.inputDigest, continuation: true, continuationToken: 'token-one' },
+    { generation: 2, inputDigest: 'b'.repeat(64), continuation: true, continuationToken: 'changed' },
+    { generation: 3, inputDigest: 'b'.repeat(64), continuation: true, continuationToken: 'token-one' },
+  ]) expect(() => inspectOpenCodeProductionGeneration(initial, changed)).toThrow()
+
+  const continued = { generation: 2, inputDigest: 'b'.repeat(64), continuation: undefined,
+    consumedContinuationToken: 'token-one' }
+  expect(inspectOpenCodeProductionGeneration(continued, {
+    generation: 2, inputDigest: continued.inputDigest, continuation: true, continuationToken: 'token-one',
+  })).toBe('replay')
+  expect(() => inspectOpenCodeProductionGeneration(continued, {
+    generation: 2, inputDigest: continued.inputDigest, continuation: true, continuationToken: 'changed',
+  })).toThrow()
+})
+
+test('production authority continues member 1 committed/member 2 proven failure only in generation 2', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-continuation-'))
+  try {
+    const attemptId = '123e4567-e89b-42d3-a456-426614174000'
+    const payloadHash = 'b'.repeat(64)
+    const immutableDigest = 'c'.repeat(64)
+    const firstDigest = 'd'.repeat(64)
+    const secondDigest = 'e'.repeat(64)
+    const secondMember = `sha256:${'5'.repeat(64)}` as OpenCodeOpaqueIdentity
+    const store = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(
+      path.join(directory, 'attempt.journal')))
+    const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
+    const targetOne = OpenCodeLaunchMutationLedger.targetDigest({
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: identity,
+    })
+    const targetTwo = OpenCodeLaunchMutationLedger.targetDigest({
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: secondMember,
+    })
+    const makeIdentity = (lease: { generation: number; fence: number; acquisitionToken: string },
+      claimToken: string, memberIdentity: OpenCodeOpaqueIdentity, inputDigest: string): OpenCodeLaunchMutationIdentity => ({
+      attemptId, payloadHash, immutableDigest, inputDigest, memberIdentity, claimToken,
+      generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
+    })
+    const deadline = context()
+    let continuationToken = ''
+    await store.withGeneration({ attemptId, payloadHash, immutableDigest, inputDigest: firstDigest,
+      generation: 1 }, 'begin', async lease => {
+      const firstClaim = await lease.claim(identity)
+      const firstAuthority = makeIdentity(lease, firstClaim, identity, firstDigest)
+      expect(await ledger.claim(targetOne, firstAuthority, deadline)).toBe('claimed')
+      expect(await transitionOpenCodeProductionMemberClaim(ledger, targetOne,
+        { ...firstAuthority, transition: 'commit', linkage, recovery }, deadline)).toBe('committed')
+      await lease.append({ type: 'member_applied', memberIdentity: identity, linkage, claimToken: firstClaim })
+
+      const secondClaim = await lease.claim(secondMember)
+      const secondAuthority = makeIdentity(lease, secondClaim, secondMember, firstDigest)
+      expect(await ledger.claim(targetTwo, secondAuthority, deadline)).toBe('claimed')
+      expect(await transitionOpenCodeProductionMemberClaim(ledger, targetTwo,
+        { ...secondAuthority, transition: 'cancel', provenNoExternalEffect: true }, deadline)).toBe('cancelled')
+      await lease.append({ type: 'member_failed', memberIdentity: secondMember,
+        failure: 'pre_side_effect_transport', externalEffect: false, claimToken: secondClaim })
+      continuationToken = await lease.issueContinuation([secondMember])
+    }, deadline)
+
+    await store.withGeneration({ attemptId, payloadHash, immutableDigest, inputDigest: secondDigest,
+      generation: 2, continuationToken }, 'continue', async lease => {
+      expect((await ledger.read(targetOne, deadline))?.state).toBe('committed')
+      const secondClaim = await lease.claim(secondMember)
+      const secondAuthority = makeIdentity(lease, secondClaim, secondMember, secondDigest)
+      expect(await ledger.claim(targetTwo, secondAuthority, deadline)).toBe('claimed')
+    }, deadline)
+    expect(await store.inspect({ attemptId, payloadHash, immutableDigest, inputDigest: secondDigest }))
+      .toMatchObject({ generation: 2, authorizedMemberIdentities: [secondMember] })
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('production maps unknown transport to permanent unknown and never to reclaimable known failure', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-unknown-'))
+  try {
+    const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
+    const owner = identityForProductionClaim(identity, 1, 'claim-one')
+    expect(await ledger.claim(target, owner, context())).toBe('claimed')
+    expect(await transitionOpenCodeProductionMemberClaim(ledger, target,
+      { ...owner, transition: 'cancel' }, context())).toBe('cancelled')
+    expect((await ledger.read(target, context()))?.state).toBe('unknown')
+    const next = identityForProductionClaim(identity, 2, 'claim-two')
+    expect(await ledger.claim(target, next, context())).toBe('unknown')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+function identityForProductionClaim(
+  memberIdentity: OpenCodeOpaqueIdentity,
+  generation: number,
+  claimToken: string,
+): OpenCodeLaunchMutationIdentity {
+  return {
+    attemptId: '123e4567-e89b-42d3-a456-426614174000', payloadHash: 'b'.repeat(64),
+    inputDigest: generation === 1 ? 'c'.repeat(64) : 'd'.repeat(64), immutableDigest: 'e'.repeat(64),
+    generation, fence: generation, acquisitionToken: `acquisition-${generation}`,
+    claimToken, memberIdentity,
+  }
+}
 
 test('production member mutation registers deterministic ownership before an ambiguous create rejection', async () => {
   const calls: string[] = []

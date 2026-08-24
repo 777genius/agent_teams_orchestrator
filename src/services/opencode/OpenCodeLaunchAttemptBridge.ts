@@ -6,6 +6,7 @@ import type {
 } from './OpenCodeBridgeContractV2.js'
 import {
   OpenCodeLaunchAttempt,
+  validateOpenCodeLaunchContinuation,
   type OpenCodeLaunchAttemptPorts,
   type OpenCodeLaunchAttemptInput,
   type OpenCodeLaunchAttemptResult,
@@ -163,6 +164,14 @@ export class OpenCodeLaunchAttemptBridge implements OpenCodeLaunchAttemptBridgeP
     input: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0],
   ): ReturnType<OpenCodeLaunchAttemptBridgePort['execute']> {
     const attempt = input.request.launchAttempt
+    validateOpenCodeLaunchContinuation({
+      attemptId: attempt.attemptId,
+      payloadHash: attempt.payloadHash,
+      generation: attempt.generation,
+      immutableDigest: computeOpenCodeLaunchCommandImmutableDigest(input),
+      continuation: input.continuation,
+      continuationToken: attempt.continuationToken,
+    })
     const inputDigest = computeOpenCodeLaunchCommandInputDigest(input)
     // This read is intentionally before construction of any profile/host/session side effect.
     const prior = await this.dependencies.commandLedger.read({

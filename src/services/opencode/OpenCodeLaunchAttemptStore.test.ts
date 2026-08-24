@@ -27,6 +27,13 @@ const linkage: OpenCodeLaunchMemberLinkage = {
 }
 const leasePath = (filePath: string) => deriveOpenCodeLaunchNamespacePaths(filePath, posix).lock
 
+async function issueContinuation(
+  store: OpenCodeLaunchAttemptStore,
+  currentIdentity: typeof identity & { inputDigest?: string; immutableDigest?: string; generation?: number },
+): Promise<string> {
+  return store.withGeneration(currentIdentity, 'replay', lease => lease.issueContinuation([member]))
+}
+
 class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
   bytes: Uint8Array | null = null
   fence = 0
@@ -177,22 +184,59 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const store = new OpenCodeLaunchAttemptStore(persistence)
     const order: string[] = []
     let release!: () => void
+    let authorize!: (token: string) => void
     const gate = new Promise<void>(resolve => { release = resolve })
+    const authorization = new Promise<string>(resolve => { authorize = resolve })
     const first = store.withGeneration(identity, 'begin', async lease => {
       order.push(`begin:${lease.generation}:${lease.fence}`)
+      authorize(await lease.issueContinuation([member]))
       await gate
       await lease.append({ type: 'member_intent', memberIdentity: member })
       order.push('begin:end')
     })
-    const second = store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64) }, 'continue', async lease => {
+    const second = authorization.then(continuationToken => store.withGeneration({ ...identity,
+      inputDigest: 'b'.repeat(64), generation: 2, continuationToken }, 'continue', async lease => {
       order.push(`continue:${lease.generation}:${lease.fence}`)
-    })
+    }))
     while (order.length === 0) await Promise.resolve()
     expect(order).toEqual(['begin:1:1'])
     release()
     await Promise.all([first, second])
     expect(order).toEqual(['begin:1:1', 'begin:end', 'continue:2:2'])
     expect((await store.inspect({ ...identity, inputDigest: 'b'.repeat(64) }))?.generation).toBe(2)
+  })
+
+  test('issues a journal-random capability bound to the exact ordered set and consumes it only once for generation two', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const secondMember = oid('5')
+    await store.withGeneration({ ...identity, inputDigest: '1'.repeat(64), immutableDigest: '2'.repeat(64) },
+      'begin', async lease => {
+        const token = await lease.issueContinuation([member, secondMember])
+        expect(token).toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]{43}$/)
+        expect(await lease.issueContinuation([member, secondMember])).toBe(token)
+        await expect(lease.issueContinuation([secondMember, member])).rejects.toMatchObject({ code: 'fenced' })
+      })
+    const issued = (await store.inspect(identity))!.continuation!
+    expect(issued.eligibleMemberIdentities).toEqual([member, secondMember])
+    await expect(store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken: 'opencode-launch-continuation-v1.forged' }, 'continue', async () => undefined))
+      .rejects.toMatchObject({ code: 'fenced' })
+
+    await store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken: issued.token }, 'continue', async lease => {
+      expect(lease.continuationEligibleMemberIdentities).toEqual([member, secondMember])
+    })
+    await expect(store.withGeneration({ ...identity, inputDigest: '4'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken: issued.token }, 'continue', async () => undefined))
+      .rejects.toMatchObject({ code: 'foreign' })
+    await expect(store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken: 'opencode-launch-continuation-v1.changed' }, 'continue', async () => undefined))
+      .rejects.toMatchObject({ code: 'fenced' })
+    await store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken: issued.token }, 'continue', async lease => {
+      expect(await lease.issueContinuation([secondMember])).not.toBe(issued.token)
+    })
   })
 
   test('durably binds profile/config/auth/binary/plugin/cache identities across continuation', async () => {
@@ -204,7 +248,10 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     }
     await store.withGeneration({ ...identity, inputDigest: '1'.repeat(64), immutableDigest: '2'.repeat(64) },
       'begin', lease => lease.bindProfile(binding))
-    await expect(store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64), generation: 2 },
+    const continuationToken = await issueContinuation(store,
+      { ...identity, inputDigest: '1'.repeat(64), immutableDigest: '2'.repeat(64), generation: 1 })
+    await expect(store.withGeneration({ ...identity, inputDigest: '3'.repeat(64), immutableDigest: '2'.repeat(64),
+      generation: 2, continuationToken },
       'continue', lease => lease.bindProfile({ ...binding, authIdentity: oid('0') })))
       .rejects.toMatchObject({ code: 'foreign' })
     expect((await store.inspect(identity))?.profileBinding).toEqual(binding)
@@ -215,7 +262,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const store = new OpenCodeLaunchAttemptStore(persistence)
     let stale!: OpenCodeLaunchJournalLease
     await store.withGeneration(identity, 'begin', async lease => { stale = lease })
-    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64) }, 'continue', async () => undefined)
+    const continuationToken = await issueContinuation(store, identity)
+    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', async () => undefined)
     await expect(stale.append({ type: 'member_intent', memberIdentity: member })).rejects.toMatchObject({
       code: 'fenced',
     })
@@ -297,6 +346,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     await store.withGeneration(identity, 'begin', async () => undefined)
+    const continuationToken = await issueContinuation(store, identity)
     let releasePhysical!: () => void
     let physicalEntered!: () => void
     const entered = new Promise<void>(resolve => { physicalEntered = resolve })
@@ -311,7 +361,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const first = store.withGeneration(identity, 'begin', lease =>
       lease.append({ type: 'member_intent', memberIdentity: member }))
     await entered
-    const second = store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2 }, 'continue', async () => {
+    const second = store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', async () => {
       generationTwoEntered = true
     })
     await Promise.resolve()
@@ -358,13 +409,15 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     await store.withGeneration(identity, 'begin', async () => undefined)
+    const continuationToken = await issueContinuation(store, identity)
     const compare = persistence.compareAndSwapFence.bind(persistence)
     let ambiguous = true
     persistence.compareAndSwapFence = async (expected, next) => {
       await compare(expected, next)
       if (ambiguous) { ambiguous = false; throw new Error('fence fsync ambiguity') }
     }
-    await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2 },
+    await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken },
       'continue', async () => undefined)).rejects.toThrow('fence fsync ambiguity')
     expect(persistence.fence).toBe(3)
     expect(JSON.parse(persistence.text())).toMatchObject({ generation: 1, fence: 1 })
@@ -424,7 +477,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const store = new OpenCodeLaunchAttemptStore(persistence)
     let claimToken = ''
     await store.withGeneration(identity, 'begin', async lease => { claimToken = await lease.claim(member) })
-    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2 }, 'continue', lease =>
+    const continuationToken = await issueContinuation(store, identity)
+    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', lease =>
       lease.reconcile({ type: 'member_reconciled_applied', memberIdentity: member, linkage, claimToken }))
     expect((await store.inspect({ ...identity, inputDigest: 'b'.repeat(64) }))?.events.at(-1)?.type)
       .toBe('member_reconciled_applied')
@@ -528,6 +583,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     try {
       const running = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
         .withGeneration(liveIdentity, 'begin', async lease => {
+          await lease.issueContinuation([member])
           entered(); await gate
           await lease.revalidate(member, 'not-a-claim', context)
         }, context)
@@ -540,7 +596,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
 
       await rm(parent, { recursive: true }); await rename(displaced, parent)
       const restarted = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
-      await restarted.withGeneration({ ...liveIdentity, inputDigest: 'b'.repeat(64) }, 'continue', async lease => {
+      const continuationToken = (await restarted.inspect(liveIdentity, context))!.continuation!.token
+      await restarted.withGeneration({ ...liveIdentity, inputDigest: 'b'.repeat(64), generation: 2,
+        continuationToken }, 'continue', async lease => {
         expect(lease).toMatchObject({ generation: 2, fence: 2 })
       }, context)
       expect(await restarted.inspect({ ...identity, inputDigest: 'b'.repeat(64) }, context))
@@ -1122,7 +1180,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     await store.withGeneration({ ...identity, startedAtMs: 0, totalBudgetMs: 10 }, 'begin', async () => undefined)
-    await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2 }, 'continue', async () => undefined, {
+    const continuationToken = await issueContinuation(store, identity)
+    await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', async () => undefined, {
       deadlineAtMs: 110, monotonicNow: () => 10, signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: 'fenced' })
     expect(JSON.parse(persistence.text()).generation).toBe(1)
@@ -1160,8 +1220,11 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       await lease.reconcile({ type: 'member_reconciled_applied', memberIdentity: member, linkage, claimToken: firstToken })
       await expect(lease.append({ type: 'cleanup', memberIdentity: member, outcome: 'complete', claimToken: firstToken }))
         .rejects.toMatchObject({ code: 'corrupt' })
+      await lease.issueContinuation([member])
     })
-    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2 }, 'continue', async lease => {
+    const continuationToken = (await store.inspect(identity))!.continuation!.token
+    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', async lease => {
       await expect(lease.append({ type: 'cleanup', memberIdentity: member, outcome: 'complete', claimToken: firstToken }))
         .rejects.toMatchObject({ code: 'fenced' })
       const secondToken = await lease.claim(oid('5'))
@@ -1241,7 +1304,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       catch { await writeFile(${JSON.stringify(rejected)}, 'rejected'); }
     `
     const secondCode = `${common}
-      await store.withGeneration({...identity,inputDigest:${JSON.stringify('b'.repeat(64))},generation:2}, 'continue', async lease => {
+      const token = await store.withGeneration(identity, 'replay', lease => lease.issueContinuation([${JSON.stringify(member)}]), context);
+      await store.withGeneration({...identity,inputDigest:${JSON.stringify('b'.repeat(64))},generation:2,continuationToken:token}, 'continue', async lease => {
         await lease.append({type:'member_intent',memberIdentity:${JSON.stringify(oid('8'))}});
       }, context);
     `

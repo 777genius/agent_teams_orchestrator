@@ -30,7 +30,9 @@ const request: OpenCodeLaunchAttemptRequest = {
   },
 }
 const result: OpenCodeLaunchAttemptResult = {
+  attemptId: request.launchAttempt.attemptId, payloadHash: request.launchAttempt.payloadHash,
   generation: 1,
+  inputDigest: 'b'.repeat(64), immutableDigest: 'c'.repeat(64),
   status: 'succeeded',
   committed: [{
     memberIdentity: opaque('d'),
@@ -38,7 +40,9 @@ const result: OpenCodeLaunchAttemptResult = {
     bootstrapMessageIdentity: opaque('f'),
     commitIdentity: opaque('1'),
   }],
+  failed: [],
   pending: [],
+  cleanupPending: [],
   cleanup: 'complete',
   absoluteDeadlineAtMs: 43_000,
   workDeadlineAtMs: 38_000,
@@ -177,6 +181,26 @@ describe('OpenCodeLaunchAttemptBridge', () => {
       effectiveProfilePlanDigest: '2'.repeat(64) }
     expect(computeOpenCodeLaunchCommandImmutableDigest(plannedContinuation))
       .not.toBe(computeOpenCodeLaunchCommandImmutableDigest(plannedFirst))
+  })
+
+  test('rejects tokenless continuation and initial token before ledger or effects', async () => {
+    let calls = 0
+    const bridge = new OpenCodeLaunchAttemptBridge({
+      commandLedger: { read: async () => { calls += 1; return { status: 'absent' } } },
+      attempt: { run: async () => { calls += 1; return result } },
+      projection: { fromDurableResult: async () => { calls += 1; return { snapshot, data: null } } },
+    })
+    const tokenless = command(); tokenless.request = structuredClone(tokenless.request)
+    tokenless.request.launchAttempt.generation = 2; tokenless.continuation = true
+    await expect(bridge.execute(tokenless)).rejects.toMatchObject({
+      field: 'launchAttempt.continuationToken',
+    })
+    const initialToken = command(); initialToken.request = structuredClone(initialToken.request)
+    initialToken.request.launchAttempt.continuationToken = 'forged'
+    await expect(bridge.execute(initialToken)).rejects.toMatchObject({
+      field: 'launchAttempt.continuationToken',
+    })
+    expect(calls).toBe(0)
   })
 
   for (const status of ['unknown', 'completed'] as const) {

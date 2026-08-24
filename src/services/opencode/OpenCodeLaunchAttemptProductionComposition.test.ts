@@ -15,10 +15,14 @@ import type { OpenCodeProvisioningSnapshot } from './types.js'
 const identity = (character: string) => `sha256:${character.repeat(64)}` as const
 const snapshot = { detected: false } as OpenCodeProvisioningSnapshot
 const result: OpenCodeLaunchAttemptResult = {
+  attemptId: '018f47a2-4a13-7c2f-8d44-c0ffee123456', payloadHash: 'a'.repeat(64),
   generation: 1,
+  inputDigest: 'b'.repeat(64), immutableDigest: 'c'.repeat(64),
   status: 'succeeded',
   committed: [],
+  failed: [],
   pending: [],
+  cleanupPending: [],
   cleanup: 'complete',
   absoluteDeadlineAtMs: 10_000,
   workDeadlineAtMs: 9_000,
@@ -82,6 +86,34 @@ describe('OpenCode production launch composition', () => {
 
     await expect(bridge.execute(command())).rejects.toThrow('immutable plan mismatch')
     expect(calls).toEqual(['plan', 'command-ledger'])
+  })
+
+  test('completed and unknown replay compare the exact generation input key', async () => {
+    for (const status of ['succeeded', 'reconciliation_required'] as const) {
+      let durableKey: { attemptId: string; payloadHash: string; generation: number; inputDigest: string } | undefined
+      let effects = 0
+      const output = { snapshot, data: { launchAttempt: { outcome: status } } }
+      const bridge = createOpenCodeLaunchAttemptProductionBridge({
+        authorize: async value => value,
+        inspect: async (_value, key) => {
+          durableKey ??= { ...key }
+          if (JSON.stringify(key) !== JSON.stringify(durableKey)) throw new Error('exact replay mismatch')
+          return output
+        },
+        executeAfterPreflight: async () => { effects += 1; return { output, result } },
+      })
+      await bridge.execute(command())
+      const changedGeneration = command()
+      changedGeneration.request.launchAttempt.generation = 2
+      changedGeneration.request.launchAttempt.continuationToken = 'changed-token'
+      changedGeneration.continuation = true
+      await expect(bridge.execute(changedGeneration)).rejects.toThrow('exact replay mismatch')
+      const changedMode = command(); changedMode.continuation = true
+      await expect(bridge.execute(changedMode)).rejects.toThrow()
+      const changedToken = command(); changedToken.request.launchAttempt.continuationToken = 'changed-token'
+      await expect(bridge.execute(changedToken)).rejects.toThrow()
+      expect(effects).toBe(0)
+    }
   })
 
   test('absent ledger is the only path to the accepted core and durable projection', async () => {

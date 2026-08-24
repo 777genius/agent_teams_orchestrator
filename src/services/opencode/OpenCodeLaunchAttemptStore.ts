@@ -14,6 +14,9 @@ import {
   isOpenCodeLaunchAttemptId,
   isOpenCodeLaunchPayloadHash,
   isOpenCodeOpaqueIdentity,
+  decodeOpenCodeLaunchAttemptResponse,
+  encodeOpenCodeLaunchAttemptResponse,
+  type OpenCodeLaunchAttemptResponse,
   type OpenCodeLaunchMemberLinkage,
   type OpenCodeOpaqueIdentity,
 } from './OpenCodeBridgeContractV2.js'
@@ -82,6 +85,10 @@ export type OpenCodeLaunchJournal = {
   }
   /** Exact ordered member set authorized when the current continuation was consumed. */
   authorizedMemberIdentities?: OpenCodeOpaqueIdentity[]
+  /** Capability consumed to enter this generation; retained for exact same-generation replay. */
+  consumedContinuationToken?: string
+  /** Redacted, decoder-validated authoritative Desktop V1 projection for this generation. */
+  finalResponse?: OpenCodeLaunchAttemptResponse
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -1284,6 +1291,7 @@ export type OpenCodeLaunchJournalLease = {
     eligibleMemberIdentities: readonly OpenCodeOpaqueIdentity[],
     context?: OpenCodeLaunchStoreContext,
   ): Promise<string>
+  commitFinalResponse(response: OpenCodeLaunchAttemptResponse, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Re-reads both durable authorities immediately before an irreversible external commit. */
@@ -1365,6 +1373,10 @@ export class OpenCodeLaunchAttemptStore {
           if (identity.inputDigest !== undefined && identity.inputDigest !== journal.inputDigest) {
             throw new OpenCodeLaunchJournalError('foreign', 'continuation input digest mismatch')
           }
+          if (!journal.consumedContinuationToken
+            || identity.continuationToken !== journal.consumedContinuationToken) {
+            throw new OpenCodeLaunchJournalError('fenced', 'consumed continuation capability mismatch')
+          }
         } else {
           if (identity.generation !== undefined && identity.generation !== journal.generation + 1) {
             throw new OpenCodeLaunchJournalError('fenced', 'continuation generation is not next')
@@ -1380,7 +1392,9 @@ export class OpenCodeLaunchAttemptStore {
           const candidate = { ...journal, inputDigest: identity.inputDigest,
             generation: journal.generation + 1, fence: journal.fence + 1,
             continuation: undefined,
-            authorizedMemberIdentities: consumedContinuationMembers }
+            authorizedMemberIdentities: consumedContinuationMembers,
+            consumedContinuationToken: identity.continuationToken,
+            finalResponse: undefined }
           assertSafePositive(candidate.generation, 'generation')
           assertSafePositive(candidate.fence, 'fence')
           await this.persist(candidate, effectiveContext)
@@ -1410,7 +1424,8 @@ export class OpenCodeLaunchAttemptStore {
             return
           }
           const candidate = { ...journal!, profileBinding: structuredClone(binding) }
-          validateJournal(candidate, identity)
+          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
           await this.persist(candidate, bindingContext ?? effectiveContext)
           journal = candidate
           Object.assign(lease.journal, candidate)
@@ -1454,11 +1469,37 @@ export class OpenCodeLaunchAttemptStore {
             eligibleMemberIdentities: [...eligibleMemberIdentities],
           }
           const candidate = { ...journal!, continuation }
-          validateJournal(candidate, identity)
+          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
           await this.persist(candidate, issueContext ?? effectiveContext)
           journal = candidate
           Object.assign(lease.journal, candidate)
           return continuation.token
+        },
+        commitFinalResponse: async (response, responseContext) => {
+          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
+            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+          }
+          const encoded = encodeOpenCodeLaunchAttemptResponse(response)
+          if (encoded.launchAttempt.attemptId !== journal!.attemptId
+            || encoded.launchAttempt.payloadHash !== journal!.payloadHash
+            || encoded.launchAttempt.generation !== generation
+            || encoded.launchAttempt.inputDigest !== journal!.inputDigest
+            || encoded.launchAttempt.immutableDigest !== journal!.immutableDigest) {
+            throw new OpenCodeLaunchJournalError('foreign', 'final response identity mismatch')
+          }
+          if (journal!.finalResponse) {
+            if (JSON.stringify(journal!.finalResponse) !== JSON.stringify(encoded)) {
+              throw new OpenCodeLaunchJournalError('fenced', 'final response changed')
+            }
+            return
+          }
+          const candidate = { ...journal!, finalResponse: encoded }
+          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+          await this.persist(candidate, responseContext ?? effectiveContext)
+          journal = candidate
+          Object.assign(lease.journal, candidate)
         },
         reconcile: async (event, reconcileContext) => {
           if (!event.claimToken) {
@@ -1497,7 +1538,8 @@ export class OpenCodeLaunchAttemptStore {
           } as OpenCodeLaunchJournalEvent
           validateEvent(next)
           const candidate = { ...journal!, events: [...journal!.events, next] }
-          validateJournal(candidate, identity)
+          validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+            inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
           try { await this.persist(candidate, appendContext ?? effectiveContext) }
           catch (error) {
             active = false
@@ -1720,6 +1762,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     'startedAtMs', 'totalBudgetMs', 'generation', 'fence', 'events'] as const
   const allowedJournalKeys = new Set<string>([
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
+    'consumedContinuationToken', 'finalResponse',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -1760,6 +1803,25 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
       || new Set(source.authorizedMemberIdentities).size !== source.authorizedMemberIdentities.length
       || !source.authorizedMemberIdentities.every(isOpenCodeOpaqueIdentity))) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid authorized member partition')
+  }
+  if (source.consumedContinuationToken !== undefined
+    && (typeof source.consumedContinuationToken !== 'string'
+      || source.consumedContinuationToken.length === 0
+      || source.consumedContinuationToken.length > 256
+      || source.generation <= 1
+      || source.authorizedMemberIdentities === undefined)) {
+    throw new OpenCodeLaunchJournalError('corrupt', 'invalid consumed continuation capability')
+  }
+  if (source.finalResponse !== undefined) {
+    const decoded = decodeOpenCodeLaunchAttemptResponse(source.finalResponse)
+    if (!decoded.ok || decoded.value.kind !== 'v2'
+      || decoded.value.response.launchAttempt.attemptId !== source.attemptId
+      || decoded.value.response.launchAttempt.payloadHash !== source.payloadHash
+      || decoded.value.response.launchAttempt.generation !== source.generation
+      || decoded.value.response.launchAttempt.inputDigest !== source.inputDigest
+      || decoded.value.response.launchAttempt.immutableDigest !== source.immutableDigest) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid final response projection')
+    }
   }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid journal event count')

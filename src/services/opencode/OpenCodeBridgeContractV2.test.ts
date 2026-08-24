@@ -41,8 +41,6 @@ function request(): OpenCodeLaunchAttemptRequest {
       attemptId,
       payloadHash,
       generation: 7,
-      inputDigest: 'd'.repeat(64),
-      immutableDigest: 'e'.repeat(64),
       proofNonce: nonce,
       parent: { sessionIdentity: identity('1'), messageIdentity: identity('2') },
       providerId: 'xai',
@@ -62,6 +60,8 @@ function response(): OpenCodeLaunchAttemptResponse {
       idempotencyKey: 'attemptId',
       payloadHash,
       generation: 7,
+      inputDigest: 'd'.repeat(64),
+      immutableDigest: 'e'.repeat(64),
       outcome: 'partial',
       phase: 'cleanup',
       startedAt: 1_776_600_000_000,
@@ -230,6 +230,21 @@ describe('OpenCodeBridgeContractV2 negotiation and request', () => {
     expect(decodeOpenCodeLaunchAttemptRequestJson(JSON.stringify(request()))).toMatchObject({
       ok: true,
       value: { kind: 'v2' },
+    })
+  })
+
+  test('requires strictly positive request, response, and proof generations', () => {
+    const invalidRequest = request(); invalidRequest.launchAttempt.generation = 0
+    expect(decodeOpenCodeLaunchAttemptRequest(invalidRequest)).toMatchObject({
+      ok: false, error: { field: 'launchAttempt.generation' },
+    })
+    const invalidResponse = response(); invalidResponse.launchAttempt.generation = 0
+    expect(decodeOpenCodeLaunchAttemptResponse(invalidResponse)).toMatchObject({
+      ok: false, error: { field: 'launchAttempt.generation' },
+    })
+    const invalidProof = response(); invalidProof.proof!.generation = 0
+    expect(decodeOpenCodeLaunchAttemptResponse(invalidProof)).toMatchObject({
+      ok: false, error: { field: 'proof.generation' },
     })
   })
 })

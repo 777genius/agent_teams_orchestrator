@@ -108,4 +108,21 @@ describe('OpenCodeLaunchMutationLedger', () => {
       expect(await ledger.claim(target, identity('123e4567-e89b-42d3-a456-426614174002', 'claim-b'), context())).toBe('unknown')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+
+  test('known no-effect failure is reclaimable only by exact immutable authority at the next generation', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-claim-known-'))
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(join(root, 'claims'))
+      const first = identity('123e4567-e89b-42d3-a456-426614174001', 'claim-a')
+      expect(await ledger.claim(target, first, context())).toBe('claimed')
+      expect(await ledger.transition(target, first, 'known_failure', undefined, context())).toBe('cancelled')
+      const next = { ...identity(first.attemptId, 'claim-b'), inputDigest: 'd'.repeat(64),
+        generation: 2, fence: 2 }
+      expect(await ledger.claim(target, { ...next, generation: 3, fence: 3 }, context()))
+        .toBe('reconciliation_required')
+      expect(await ledger.claim(target, { ...next, immutableDigest: 'e'.repeat(64) }, context()))
+        .toBe('reconciliation_required')
+      expect(await ledger.claim(target, next, context())).toBe('claimed')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
 })

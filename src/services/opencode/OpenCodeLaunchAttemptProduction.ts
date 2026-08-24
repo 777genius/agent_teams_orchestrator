@@ -29,6 +29,7 @@ import {
 import {
   OpenCodeLaunchAttemptStore,
   OpenCodeLaunchFileJournalPersistence,
+  type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
 import type {
   OpenCodeLaunchFailureDetails,
@@ -45,7 +46,10 @@ import type {
   OpenCodeSessionRecord,
 } from './types.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
-import { OpenCodeLaunchMutationLedger } from './OpenCodeLaunchMutationLedger.js'
+import {
+  OpenCodeLaunchMutationLedger,
+  type OpenCodeLaunchMutationIdentity,
+} from './OpenCodeLaunchMutationLedger.js'
 import {
   hydrateOpenCodeRecoveredSessionLease,
   OpenCodeLaunchRetainedHostLeases,
@@ -153,6 +157,57 @@ export function createOpenCodeLaunchPreflightResult(input: {
     absoluteDeadlineAtMs: input.deadlineAtMs,
     workDeadlineAtMs: input.deadlineAtMs,
   })
+}
+
+/** Exact production mapping from core cancellation evidence to the global mutation authority. */
+export function transitionOpenCodeProductionMemberClaim(
+  ledger: OpenCodeLaunchMutationLedger,
+  targetDigest: string,
+  input: OpenCodeLaunchMutationIdentity & (
+    | { transition: 'cancel'; provenNoExternalEffect?: true }
+    | { transition: 'commit'; linkage: OpenCodeLaunchMemberLinkage; recovery?: Parameters<OpenCodeLaunchMutationLedger['transition']>[5] }
+  ),
+  context: OpenCodeLaunchStoreContext,
+): ReturnType<OpenCodeLaunchMutationLedger['transition']> {
+  return ledger.transition(targetDigest, input,
+    input.transition === 'commit' ? 'commit'
+      : input.provenNoExternalEffect ? 'known_failure' : 'unknown',
+    input.transition === 'commit' ? input.linkage : undefined,
+    context,
+    input.transition === 'commit' ? input.recovery : undefined)
+}
+
+export function inspectOpenCodeProductionGeneration(
+  journal: Pick<NonNullable<Awaited<ReturnType<OpenCodeLaunchAttemptStore['inspect']>>>,
+    'generation' | 'inputDigest' | 'continuation' | 'consumedContinuationToken'>,
+  request: Readonly<{
+    generation: number
+    inputDigest: string
+    continuation: boolean
+    continuationToken?: string
+  }>,
+): 'replay' | 'continue' {
+  if (request.generation === journal.generation) {
+    if (request.inputDigest !== journal.inputDigest) {
+      throw new Error('OpenCode durable command ledger generation input mismatch')
+    }
+    if (journal.generation === 1) {
+      if (request.continuation || request.continuationToken !== undefined) {
+        throw new Error('OpenCode durable command ledger continuation mode mismatch')
+      }
+    } else if (!journal.consumedContinuationToken
+      || !request.continuation
+      || request.continuationToken !== journal.consumedContinuationToken) {
+      throw new Error('OpenCode durable command ledger consumed continuation mismatch')
+    }
+    return 'replay'
+  }
+  if (request.generation === journal.generation + 1
+    && request.continuation
+    && journal.continuation
+    && journal.continuation.issuedGeneration === journal.generation
+    && request.continuationToken === journal.continuation.token) return 'continue'
+  throw new Error('OpenCode durable command ledger generation mismatch')
 }
 
 function opaque(value: unknown): OpenCodeOpaqueIdentity {
@@ -365,20 +420,14 @@ class OpenCodeProductionLaunchRuntime {
       payloadHash: command.request.launchAttempt.payloadHash,
       immutableDigest,
     }, { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal, monotonicNow: launchMonotonicNow })
+    let exactCurrentGeneration = false
     if (journal) {
-      const requestedGeneration = command.request.launchAttempt.generation
-      if (requestedGeneration === journal.generation) {
-        if (journal.inputDigest !== inputDigest) {
-          throw new Error('OpenCode durable command ledger generation input mismatch')
-        }
-      } else if (requestedGeneration === journal.generation + 1 && command.continuation) {
-        if (!journal.continuation
-          || journal.continuation.token !== command.request.launchAttempt.continuationToken) {
-          throw new Error('OpenCode durable command ledger continuation capability mismatch')
-        }
-      } else {
-        throw new Error('OpenCode durable command ledger generation mismatch')
-      }
+      exactCurrentGeneration = inspectOpenCodeProductionGeneration(journal, {
+        generation: command.request.launchAttempt.generation,
+        inputDigest,
+        continuation: command.continuation,
+        continuationToken: command.request.launchAttempt.continuationToken,
+      }) === 'replay'
     }
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
@@ -451,20 +500,28 @@ class OpenCodeProductionLaunchRuntime {
       || item.reconciliationError !== null)
     const completed = priorClaims.length > 0 && priorClaims.every(item => item.claim?.state === 'committed'
       && item.linkage !== null)
-    if (uncertain || completed) {
+    if (journal?.finalResponse && exactCurrentGeneration) {
+      const final = journal.finalResponse
+      const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
+      const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
       return {
         snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
           profile: null, host: null, config: null, configProviders: null, providers: null,
           providerAuth: null, agents: [], mcp: null, appMcp: null,
-          probeError: uncertain ? 'launch mutation requires reconciliation' : null, diagnostics: [] },
+          probeError: final.launchAttempt.outcome === 'reconciliation_required'
+            ? 'launch mutation requires reconciliation' : null, diagnostics: [] },
         data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
           members: Object.fromEntries(priorClaims.map(item => [item.member.name, {
             ...(item.record ? { sessionId: item.record.opencodeSessionId } : {}),
-            launchState: item.claim?.state === 'committed' && item.linkage ? 'created' : 'pending',
+            launchState: committedIds.has(item.member.memberIdentity) ? 'created'
+              : failedIds.has(item.member.memberIdentity) ? 'failed' : 'pending',
             evidence: [], diagnostics: item.reconciliationError
               ? [`committed projection reconciliation unresolved: ${item.reconciliationError}`] : [],
-          }])) },
+          }])), launchAttempt: final },
       }
+    }
+    if (uncertain || completed) {
+      throw new Error('OpenCode authoritative launch-attempt projection is absent')
     }
     if (inspectionOnly) return null
     }
@@ -686,7 +743,8 @@ class OpenCodeProductionLaunchRuntime {
             launchAttempt: {
               contractVersion: 1, attemptId: input.request.launchAttempt.attemptId,
               idempotencyKey: 'attemptId', payloadHash: input.request.launchAttempt.payloadHash,
-              generation: input.request.launchAttempt.generation, outcome: 'succeeded', phase: 'complete',
+              generation: input.request.launchAttempt.generation, inputDigest, immutableDigest,
+              outcome: 'succeeded', phase: 'complete',
               startedAt: verifiedAt - 1, workDeadlineAt: verifiedAt + 1,
               absoluteDeadlineAt: verifiedAt + 2, cleanupReserveMs: 1, elapsedMs: 1,
               providerId: input.request.launchAttempt.providerId, modelId: input.request.launchAttempt.modelId,
@@ -818,12 +876,8 @@ class OpenCodeProductionLaunchRuntime {
         transitionMemberClaim: async input => {
           const target = targetByMember.get(input.memberIdentity)
           if (!target) return 'fenced'
-          return mutationLedger.transition(target, input,
-            input.transition === 'commit' ? 'commit'
-              : input.knownNoEffect ? 'known_failure' : 'unknown',
-            input.transition === 'commit' ? input.linkage : undefined,
-            { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow },
-            input.transition === 'commit' ? input.recovery : undefined)
+          return transitionOpenCodeProductionMemberClaim(mutationLedger, target, input,
+            { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow })
         },
         createBootstrapAndCommit: async input => {
           const member = memberByIdentity.get(input.memberIdentity)
@@ -978,8 +1032,22 @@ class OpenCodeProductionLaunchRuntime {
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(command) })
-    this.completedResults.set(command, result)
     const launchAttempt = projectOpenCodeLaunchAttemptResponse(result)
+    if (launchAttempt) {
+      const persistenceSignal = new AbortController().signal
+      await attemptStore.withGeneration({
+        attemptId: result.attemptId,
+        payloadHash: result.payloadHash,
+        inputDigest: result.inputDigest,
+        immutableDigest: result.immutableDigest,
+        generation: result.generation,
+      }, 'replay', lease => lease.commitFinalResponse(launchAttempt), {
+        deadlineAtMs: result.absoluteDeadlineAtMs,
+        signal: persistenceSignal,
+        monotonicNow: launchMonotonicNow,
+      })
+    }
+    this.completedResults.set(command, result)
     const members = Object.fromEntries(command.members.map(member => {
       const record = records.get(member.memberIdentity)
       const committed = result.committed.some(link => link.memberIdentity === member.memberIdentity)
