@@ -644,6 +644,9 @@ test('production callback and preflight fail closed for stale or mismatched dura
     ['pending claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
       expect(await fixture.ledger.claim(fixture.target, seeded.authority, fixture.context)).toBe('claimed')
       fixture.remote.set(fixture.sessionId, { id: fixture.sessionId, title: seeded.title })
+      await fixture.sessionStore.upsert(seeded.record)
+      expect(await fixture.ledger.read(fixture.target, fixture.context)).toMatchObject({ state: 'claimed' })
+      expect(await fixture.readSessionProjection()).toEqual(seeded.record)
     }],
     ['released claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
       expect(await fixture.ledger.claim(fixture.target, seeded.authority, fixture.context)).toBe('claimed')
@@ -683,7 +686,14 @@ test('production callback and preflight fail closed for stale or mismatched dura
       } })
     }],
     ['mismatched title', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
-      await fixture.commitClaim({ ...seeded, title: `${seeded.title}:foreign` })
+      const mismatchedTitle = `${seeded.title}:foreign`
+      await fixture.commitClaim({ ...seeded, title: mismatchedTitle })
+      await fixture.sessionStore.upsert(seeded.record)
+      expect(await fixture.ledger.read(fixture.target, fixture.context)).toMatchObject({
+        state: 'committed', linkage: seeded.linkage,
+        recovery: { ownershipTitle: mismatchedTitle, sessionRecord: seeded.record },
+      })
+      expect(await fixture.readSessionProjection()).toEqual(seeded.record)
     }],
     ['mismatched commit', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
       await fixture.commitClaim({ ...seeded, linkage: { ...seeded.linkage, commitIdentity: identity } })
@@ -704,6 +714,7 @@ test('production callback and preflight fail closed for stale or mismatched dura
       expect(data?.launchAttempt?.members, name).toMatchObject({
         committed: [], failed: [], pending: [fixture.memberIdentity],
       })
+      expect(output.snapshot.probeError, name).toBe('launch attempt did not acquire a host')
       const expectedSessionReads = name === 'mismatched member claim' ? 1 : 2
       expect(fixture.sessionReads(), `${name} preflight and readMemberLinkage`)
         .toBe(expectedSessionReads)
@@ -714,7 +725,7 @@ test('production callback and preflight fail closed for stale or mismatched dura
       expect(events, `${name} exact recovery journal`).toEqual(['member_intent', 'member_applied'])
     } finally { await fixture.dispose() }
   }
-})
+}, 15_000)
 
 test('committed mutation crash failpoints rehydrate only the exact remote projection without create', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-commit-recovery-'))
@@ -1022,6 +1033,7 @@ async function productionRecoveryHarness() {
     },
     inspectJournal: () => store.inspect({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
       inputDigest, immutableDigest }),
+    readSessionProjection: () => originalSessionGet('team', 'primary', 'alice'),
     memberCreates: () => memberCreateCount,
     sessionReads: () => sessionReadCount,
     mcpChecks: () => mcpCheckCount,
