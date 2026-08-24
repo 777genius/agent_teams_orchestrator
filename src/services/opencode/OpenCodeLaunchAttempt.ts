@@ -1183,7 +1183,8 @@ export function validateOpenCodeLaunchResponseRoster(
     }
   }
   const uncommitted = new Set([...failed, ...pending])
-  if (response.members.cleanupPending.some(identity => !uncommitted.has(identity))) {
+  if (new Set(response.members.cleanupPending).size !== response.members.cleanupPending.length
+    || response.members.cleanupPending.some(identity => !uncommitted.has(identity))) {
     throw new OpenCodeLaunchAttemptError('members.cleanupPending')
   }
   if (response.proof && (response.proof.parent.sessionIdentity !== parent.sessionIdentity

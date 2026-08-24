@@ -1,9 +1,13 @@
 import path from 'node:path'
 
 import {
+  OpenCodeAtomicPublicationSettlementError,
   OpenCodeSafePublicationDirectory,
+  settleOpenCodeAtomicPublicationCommit,
   type OpenCodeSafePublicationTransaction,
 } from './OpenCodeSafePublication.js'
+
+export { OpenCodeAtomicPublicationSettlementError }
 
 type PublishAuth = (
   directoryPath: string,
@@ -11,10 +15,15 @@ type PublishAuth = (
   bytes: Uint8Array,
   signal?: AbortSignal,
   deadlineAtMs?: number,
-) => Promise<OpenCodeSafePublicationTransaction | null | void>
+) => Promise<ProfileAuthPublicationTransaction | null | void>
+
+type ProfileAuthPublicationTransaction = OpenCodeSafePublicationTransaction & Readonly<{
+  /** Closes the exact directory/authority which owns commit and rollback. */
+  close?(): Promise<void>
+}>
 
 type ProfileAuthTransactionRecord = Readonly<{
-  transaction: OpenCodeSafePublicationTransaction
+  transaction: ProfileAuthPublicationTransaction
   profile: object
   signal?: AbortSignal
 }>
@@ -22,13 +31,43 @@ const profileAuthTransactions = new WeakMap<object, ProfileAuthTransactionRecord
 const signalAuthTransactions = new WeakMap<AbortSignal, ProfileAuthTransactionRecord>()
 const settlementReaper = new Set<ProfileAuthTransactionRecord>()
 
+async function closeProfileAuthTransaction(transaction: ProfileAuthPublicationTransaction): Promise<void> {
+  await transaction.close?.()
+}
+
+async function commitAndCloseProfileAuthTransaction(
+  transaction: ProfileAuthPublicationTransaction,
+): Promise<void> {
+  let settlementError: unknown
+  try { await settleOpenCodeAtomicPublicationCommit(transaction) }
+  catch (error) { settlementError = error }
+  try { await closeProfileAuthTransaction(transaction) }
+  catch (closeError) {
+    const state = settlementError instanceof OpenCodeAtomicPublicationSettlementError
+      ? settlementError.publicationState
+      : 'committed_with_cleanup_error'
+    settlementError = new OpenCodeAtomicPublicationSettlementError(
+      state,
+      settlementError === undefined
+        ? closeError
+        : new AggregateError([settlementError, closeError], 'OpenCode scoped auth close failure'),
+    )
+  }
+  if (settlementError !== undefined) throw settlementError
+}
+
+async function rollbackProfileAuthTransaction(transaction: ProfileAuthPublicationTransaction): Promise<void> {
+  await transaction.rollback()
+  await closeProfileAuthTransaction(transaction)
+}
+
 function reapRollback(record: ProfileAuthTransactionRecord): void {
   if (settlementReaper.has(record)) return
   settlementReaper.add(record)
   let attempts = 0
   const retry = (): void => {
     attempts += 1
-    void record.transaction.rollback().then(() => {
+    void rollbackProfileAuthTransaction(record.transaction).then(() => {
       settlementReaper.delete(record)
       profileAuthTransactions.delete(record.profile)
       if (record.signal) signalAuthTransactions.delete(record.signal)
@@ -72,32 +111,29 @@ const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal, 
     throw new Error('OpenCode scoped profile auth transaction unavailable')
   }
   return Object.freeze({
-    commit: async () => {
-      await transaction!.commit()
-      await directory.close()
-    },
-    rollback: async () => {
-      // The retained directory is part of the retryable transaction. Releasing
-      // it after a failed rollback would let the root or backup object be
-      // replaced before the exact same settlement is retried.
-      await transaction!.rollback()
-      await directory.close()
-    },
+    commit: () => transaction!.commit(),
+    // The retained directory is part of the retryable transaction. Releasing
+    // it after a failed rollback would let the root or backup object be
+    // replaced before the exact same settlement is retried.
+    rollback: () => transaction!.rollback(),
+    close: () => directory.close(),
   })
 }
 
 export async function finalizeOpenCodeScopedProfileAuth(preparedProfile: object): Promise<void> {
   const record = profileAuthTransactions.get(preparedProfile)
   if (!record) return
-  await record.transaction.commit()
-  profileAuthTransactions.delete(preparedProfile)
-  if (record.signal) signalAuthTransactions.delete(record.signal)
+  try { await commitAndCloseProfileAuthTransaction(record.transaction) }
+  finally {
+    profileAuthTransactions.delete(preparedProfile)
+    if (record.signal) signalAuthTransactions.delete(record.signal)
+  }
 }
 
 export async function rollbackOpenCodeScopedProfileAuth(preparedProfile: object): Promise<void> {
   const record = profileAuthTransactions.get(preparedProfile)
   if (!record) return
-  try { await record.transaction.rollback() } catch (error) { reapRollback(record); throw error }
+  try { await rollbackProfileAuthTransaction(record.transaction) } catch (error) { reapRollback(record); throw error }
   profileAuthTransactions.delete(preparedProfile)
   if (record.signal) signalAuthTransactions.delete(record.signal)
 }
@@ -105,7 +141,7 @@ export async function rollbackOpenCodeScopedProfileAuth(preparedProfile: object)
 export async function rollbackOpenCodeScopedProfileAuthSignal(signal: AbortSignal): Promise<void> {
   const record = signalAuthTransactions.get(signal)
   if (!record) return
-  try { await record.transaction.rollback() } catch (error) { reapRollback(record); throw error }
+  try { await rollbackProfileAuthTransaction(record.transaction) } catch (error) { reapRollback(record); throw error }
   signalAuthTransactions.delete(signal)
   profileAuthTransactions.delete(record.profile)
 }
@@ -139,7 +175,7 @@ export async function commitOpenCodeScopedProfileAuth<T>(input: Readonly<{
         ...(input.abortSignal ? { signal: input.abortSignal } : {}) })
       profileAuthTransactions.set(input.preparedProfile, record)
       if (input.abortSignal) signalAuthTransactions.set(input.abortSignal, record)
-    } else await transaction.commit()
+    } else await commitAndCloseProfileAuthTransaction(transaction)
   }
   // Deliberately no post-write abort check or fallible identity/path phase.
   return input.preparedProfile

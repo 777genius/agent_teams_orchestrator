@@ -118,7 +118,7 @@ function response(): OpenCodeLaunchAttemptResponse {
         },
       }],
       pending: [identity('e')],
-      cleanupPending: [identity('c')],
+      cleanupPending: [identity('d')],
       continuationToken: 'opaque-continuation-value',
     },
   }
@@ -543,6 +543,30 @@ describe('OpenCodeBridgeContractV2 noReply member linkage', () => {
       ok: false,
       error: { field: 'members.cleanupPending' },
     })
+  })
+
+  test('accepts cleanup only for failed or pending roster members', () => {
+    const committed = response().members.committed[0]!.memberIdentity
+    const failed = response().members.failed[0]!.memberIdentity
+    const pending = response().members.pending[0]!
+    const unrelated = identity('0')
+    for (const cleanupPending of [[committed], [unrelated], [failed, failed], [failed, pending, failed]]) {
+      const candidate = response()
+      candidate.members.cleanupPending = cleanupPending
+      expect(decodeOpenCodeLaunchAttemptResponse(candidate)).toEqual({
+        ok: false,
+        error: { code: 'invalid_field', field: 'members.cleanupPending' },
+      })
+      expect(() => encodeOpenCodeLaunchAttemptResponse(candidate))
+        .toThrow('Invalid OpenCode launch response: members.cleanupPending')
+    }
+    for (const cleanupPending of [[failed], [pending], [failed, pending], []]) {
+      const candidate = response()
+      candidate.members.cleanupPending = cleanupPending
+      expect(decodeOpenCodeLaunchAttemptResponse(candidate)).toMatchObject({ ok: true })
+      expect(encodeOpenCodeLaunchAttemptResponse(candidate).members.cleanupPending)
+        .toEqual(cleanupPending)
+    }
   })
 })
 

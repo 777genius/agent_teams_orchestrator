@@ -671,8 +671,15 @@ function decodeMembers(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeLaunc
   if (pendingSource.some(identity => correlatedIdentities.has(identity))) return invalid('members.pending')
   const resultIds = [...committed.map(item => item.memberIdentity), ...failed.map(item => item.memberIdentity), ...pendingSource]
   if (new Set(resultIds).size !== resultIds.length) return invalid('members')
-  const resultMemberIdentities = new Set(resultIds)
-  if (cleanupPendingSource.some(identity => correlatedIdentities.has(identity) && !resultMemberIdentities.has(identity))) {
+  // Cleanup is a secondary state of an uncommitted roster member, never an
+  // independent identity partition. In particular, committed linkage fields
+  // and well-formed identities invented outside the roster cannot authorize
+  // cleanup work.
+  const cleanupEligibleIdentities = new Set<OpenCodeOpaqueIdentity>([
+    ...failed.map(item => item.memberIdentity),
+    ...pendingSource,
+  ])
+  if (cleanupPendingSource.some(identity => !cleanupEligibleIdentities.has(identity))) {
     return invalid('members.cleanupPending')
   }
   return { ok: true, value: {

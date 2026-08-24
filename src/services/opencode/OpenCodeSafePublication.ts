@@ -16,19 +16,69 @@ export type OpenCodeSafePublicationTransaction = Readonly<{
   rollback(): Promise<void>
 }>
 
+export type OpenCodeAtomicPublicationFailureState =
+  | 'committed_with_cleanup_error'
+  | 'settled_failure'
+
+/** Retry/read-safe result after a fallible commit has been explicitly settled. */
+export class OpenCodeAtomicPublicationSettlementError extends Error {
+  readonly retrySafe = true
+
+  constructor(
+    readonly publicationState: OpenCodeAtomicPublicationFailureState,
+    cause: unknown,
+  ) {
+    super(`OpenCode atomic publication ${publicationState.replaceAll('_', ' ')}`, { cause })
+    this.name = 'OpenCodeAtomicPublicationSettlementError'
+  }
+}
+
+function publicationFailureCause(errors: readonly unknown[]): unknown {
+  return errors.length === 1
+    ? errors[0]
+    : new AggregateError(errors, 'OpenCode atomic publication settlement failures')
+}
+
+/**
+ * A commit rejection can occur beyond native's irreversible durability point.
+ * Retry commit cleanup on the same authority first; only then use rollback as
+ * an idempotent settlement request (native preserves an already-committed
+ * publication). The resulting state is explicit and safe for caller retry.
+ */
+export async function settleOpenCodeAtomicPublicationCommit(
+  transaction: OpenCodeSafePublicationTransaction,
+): Promise<void> {
+  let firstError: unknown
+  try { await transaction.commit(); return }
+  catch (error) { firstError = error }
+  try {
+    await transaction.commit()
+    throw new OpenCodeAtomicPublicationSettlementError(
+      'committed_with_cleanup_error', firstError,
+    )
+  } catch (retryError) {
+    if (retryError instanceof OpenCodeAtomicPublicationSettlementError) throw retryError
+    const errors = [firstError, retryError]
+    try { await transaction.rollback() }
+    catch (rollbackError) { errors.push(rollbackError) }
+    throw new OpenCodeAtomicPublicationSettlementError(
+      'settled_failure', publicationFailureCause(errors),
+    )
+  }
+}
+
 /**
  * Native COMMIT_ATOMIC may report a cleanup failure after its durable commit
- * point. The paired rollback request is therefore a settlement retry; native
- * authority must keep the committed final visible in that state.
+ * point. Both the commit-cleanup retry and fallback settlement request must
+ * therefore keep an already-committed final visible.
  */
 export async function commitOpenCodeWindowsAtomicPublication(
   authority: Pick<OpenCodeWindowsPublicationAuthorityClient, 'commitAtomic' | 'rollbackAtomic'>,
 ): Promise<void> {
-  try { await authority.commitAtomic() }
-  catch (error) {
-    await authority.rollbackAtomic().catch(() => undefined)
-    throw error
-  }
+  await settleOpenCodeAtomicPublicationCommit({
+    commit: () => authority.commitAtomic(),
+    rollback: () => authority.rollbackAtomic(),
+  })
 }
 
 export type OpenCodeSafePublicationOpenOptions = Readonly<{

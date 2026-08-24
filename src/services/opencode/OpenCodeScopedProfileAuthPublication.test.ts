@@ -6,6 +6,7 @@ import path from 'node:path'
 import {
   commitOpenCodeScopedProfileAuth,
   finalizeOpenCodeScopedProfileAuth,
+  OpenCodeAtomicPublicationSettlementError,
   rollbackOpenCodeScopedProfileAuth,
   rollbackOpenCodeScopedProfileAuthSignal,
 } from './OpenCodeScopedProfileAuthPublication.js'
@@ -132,4 +133,63 @@ test('failed rollback remains unsettled and retryable', async () => {
     .rejects.toThrow('injected durable rollback failure')
   await rollbackOpenCodeScopedProfileAuth(preparedProfile)
   expect(attempts).toBe(2)
+})
+
+test.each([
+  ['launch', 'recovery-marker deletion'],
+  ['launch', 'recovery parent sync'],
+  ['execution-probe', 'recovery-marker deletion'],
+  ['execution-probe', 'recovery parent sync'],
+] as const)('non-catalog %s auth closes exact retained authority after injected %s failure',
+  async (purpose, boundary) => {
+    let commitAttempts = 0; let rollbackAttempts = 0
+    let closeInvocations = 0; let retainedHandles = 1
+    const close = async () => {
+      closeInvocations += 1
+      if (retainedHandles > 0) retainedHandles -= 1
+    }
+    const publication = commitOpenCodeScopedProfileAuth({
+      managedAuthPath: path.join(os.tmpdir(), `${purpose}-retained-auth.json`),
+      managedAuthBytes: Buffer.from('{}'),
+      preparedProfile: { purpose },
+      publish: async () => ({
+        commit: async () => {
+          commitAttempts += 1
+          if (commitAttempts === 1) throw new Error(`injected ${boundary} failure`)
+        },
+        rollback: async () => { rollbackAttempts += 1 },
+        close,
+      }),
+    })
+    await expect(publication).rejects.toBeInstanceOf(OpenCodeAtomicPublicationSettlementError)
+    await expect(publication).rejects.toMatchObject({
+      publicationState: 'committed_with_cleanup_error',
+      retrySafe: true,
+    })
+    expect(commitAttempts).toBe(2)
+    expect(rollbackAttempts).toBe(0)
+    expect(retainedHandles).toBe(0)
+    await close()
+    expect(closeInvocations).toBe(2)
+    expect(retainedHandles).toBe(0)
+  })
+
+test('non-catalog auth returns a settled failure and closes when commit cleanup cannot finish', async () => {
+  let commits = 0; let rollbacks = 0; let closes = 0; let retainedHandles = 1
+  const publication = commitOpenCodeScopedProfileAuth({
+    managedAuthPath: path.join(os.tmpdir(), 'settled-retained-auth.json'),
+    managedAuthBytes: Buffer.from('{}'),
+    preparedProfile: { purpose: 'launch' },
+    publish: async () => ({
+      commit: async () => { commits += 1; throw new Error('commit cleanup unavailable') },
+      rollback: async () => { rollbacks += 1 },
+      close: async () => { closes += 1; retainedHandles = 0 },
+    }),
+  })
+  await expect(publication).rejects.toMatchObject({
+    publicationState: 'settled_failure',
+    retrySafe: true,
+  })
+  expect({ commits, rollbacks, closes, retainedHandles })
+    .toEqual({ commits: 2, rollbacks: 1, closes: 1, retainedHandles: 0 })
 })

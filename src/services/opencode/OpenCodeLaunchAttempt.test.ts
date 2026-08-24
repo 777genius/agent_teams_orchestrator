@@ -226,6 +226,14 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     ['committed cleanup identity', (value: OpenCodeLaunchAttemptResponse) => {
       value.members.cleanupPending.push(value.members.committed[0]!.memberIdentity)
     }],
+    ['unrelated cleanup identity', (value: OpenCodeLaunchAttemptResponse) => {
+      value.members.cleanupPending.push(oid('f'))
+    }],
+    ['duplicate cleanup identity', (value: OpenCodeLaunchAttemptResponse) => {
+      const identity = value.members.committed.pop()!.memberIdentity
+      value.members.pending.push(identity)
+      value.members.cleanupPending.push(identity, identity)
+    }],
     ['wrong parent linkage', (value: OpenCodeLaunchAttemptResponse) => {
       value.proof!.parent.messageIdentity = oid('f')
     }],
@@ -235,6 +243,33 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     const response = structuredClone(result.durableFinalResponse!)
     mutate(response)
     expect(() => validateOpenCodeLaunchResponseRoster(response, members, request().launchAttempt.parent)).toThrow()
+  })
+
+  test('accepts cleanup correlation for failed or pending roster identities only', async () => {
+    const subject = setup()
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+    const pendingResponse = structuredClone(result.durableFinalResponse!)
+    const pendingIdentity = pendingResponse.members.committed.pop()!.memberIdentity
+    pendingResponse.members.pending.push(pendingIdentity)
+    pendingResponse.members.cleanupPending = [pendingIdentity]
+    expect(() => validateOpenCodeLaunchResponseRoster(
+      pendingResponse, members, request().launchAttempt.parent,
+    )).not.toThrow()
+
+    const failedResponse = structuredClone(result.durableFinalResponse!)
+    const failedIdentity = failedResponse.members.committed.pop()!.memberIdentity
+    failedResponse.members.failed.push({
+      memberIdentity: failedIdentity,
+      failure: {
+        code: 'deadline_after_partial', origin: 'deadline', retryDisposition: 'continuation',
+        retryable: true, phase: 'member_materialize', sideEffectsStarted: true,
+        exhaustionScope: 'member',
+      },
+    })
+    failedResponse.members.cleanupPending = [failedIdentity]
+    expect(() => validateOpenCodeLaunchResponseRoster(
+      failedResponse, members, request().launchAttempt.parent,
+    )).not.toThrow()
   })
 
   test('uses capped phase deadlines and one absolute deadline with positive cleanup reserve', async () => {

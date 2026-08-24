@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import {
   commitOpenCodeWindowsAtomicPublication,
+  OpenCodeAtomicPublicationSettlementError,
   OpenCodeSafePublicationDirectory,
 } from './OpenCodeSafePublication.js'
 
@@ -13,23 +14,42 @@ describe('OpenCodeSafePublication', () => {
     async boundary => {
       let final: 'prior' | 'committed' | null = 'prior'
       let committed = false
+      let commitAttempts = 0
       const calls: string[] = []
       const authority = {
         commitAtomic: async () => {
           calls.push(`commit:${boundary}`)
           final = 'committed'; committed = true
-          throw new Error(`injected ${boundary} failure`)
+          commitAttempts += 1
+          if (commitAttempts === 1) throw new Error(`injected ${boundary} failure`)
         },
         rollbackAtomic: async () => {
           calls.push('rollback')
           if (!committed) final = 'prior'
         },
       }
-      await expect(commitOpenCodeWindowsAtomicPublication(authority)).rejects.toThrow(`injected ${boundary}`)
-      expect(calls).toEqual([`commit:${boundary}`, 'rollback'])
-      expect(final).toBe('committed')
+      const rejected = commitOpenCodeWindowsAtomicPublication(authority)
+      await expect(rejected).rejects.toBeInstanceOf(OpenCodeAtomicPublicationSettlementError)
+      await expect(rejected).rejects.toMatchObject({
+        publicationState: 'committed_with_cleanup_error',
+        retrySafe: true,
+      })
+      expect(calls).toEqual([`commit:${boundary}`, `commit:${boundary}`])
+      expect(String(final)).toBe('committed')
     },
   )
+
+  test('automatic Windows settlement falls back without rolling back a committed publication', async () => {
+    let final = 'prior'; const calls: string[] = []
+    const authority = {
+      commitAtomic: async () => { final = 'committed'; calls.push('commit'); throw new Error('cleanup') },
+      rollbackAtomic: async () => { calls.push('settle') },
+    }
+    const rejected = commitOpenCodeWindowsAtomicPublication(authority)
+    await expect(rejected).rejects.toMatchObject({ publicationState: 'settled_failure', retrySafe: true })
+    expect(calls).toEqual(['commit', 'commit', 'settle'])
+    expect(final).toBe('committed')
+  })
 
   test('retained transaction synchronizes each visibility and settlement boundary', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-sync-protocol-'))
