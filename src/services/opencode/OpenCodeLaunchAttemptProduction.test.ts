@@ -693,23 +693,25 @@ test('production callback and preflight fail closed for stale or mismatched dura
   for (const [name, arrange] of cases) {
     const fixture = await productionRecoveryHarness()
     try {
-      const seeded = await fixture.seedIntent({ acceptedProof: true })
+      const seeded = await fixture.seedIntent({ acceptedProof: true, applied: true })
       try { await arrange(fixture, seeded) }
       catch (error) { throw new Error(`arrange failed: ${name}`, { cause: error }) }
-      let succeeded = false
-      try {
-        const output = await fixture.bridge.execute(fixture.command)
-        const data = output.data as { launchAttempt?: { launchAttempt?: { outcome?: string } } } | null
-        succeeded = data?.launchAttempt
-          ?.launchAttempt?.outcome === 'succeeded'
-      } catch {}
-      expect(succeeded, name).toBe(false)
+      const output = await fixture.bridge.execute(fixture.command)
+      const data = output.data as { launchAttempt?: OpenCodeLaunchAttemptResponse } | null
+      expect(data?.launchAttempt?.launchAttempt, name).toMatchObject({
+        outcome: 'reconciliation_required', phase: 'complete',
+      })
+      expect(data?.launchAttempt?.members, name).toMatchObject({
+        committed: [], failed: [], pending: [fixture.memberIdentity],
+      })
+      const expectedSessionReads = name === 'mismatched member claim' ? 1 : 2
+      expect(fixture.sessionReads(), `${name} preflight and readMemberLinkage`)
+        .toBe(expectedSessionReads)
+      expect(fixture.mcpChecks(), `${name} stops at recovery boundary`).toBe(0)
       expect(fixture.memberCreates(), name).toBe(0)
       const events = (await fixture.inspectJournal())?.events.map(event => event.type)
       expect(events, name).not.toContain('member_reconciled_applied')
-      if (['released claim', 'stale generation', 'stale fence', 'mismatched claim token'].includes(name)) {
-        expect(events, `${name} production callback`).toContain('member_reconciled_absent')
-      }
+      expect(events, `${name} exact recovery journal`).toEqual(['member_intent', 'member_applied'])
     } finally { await fixture.dispose() }
   }
 })
@@ -850,6 +852,12 @@ async function productionRecoveryHarness() {
   const projectPath = path.join(directory, 'project')
   await mkdir(projectPath)
   const sessionStore = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+  let sessionReadCount = 0
+  const originalSessionGet = sessionStore.get.bind(sessionStore)
+  sessionStore.get = async (...input: Parameters<OpenCodeSessionStore['get']>) => {
+    sessionReadCount += 1
+    return originalSessionGet(...input)
+  }
   const attemptId = '123e4567-e89b-42d3-a456-426614174443'
   const memberIdentity = `sha256:${'4'.repeat(64)}` as OpenCodeOpaqueIdentity
   const hash = (character: string) => character.repeat(64)
@@ -916,6 +924,7 @@ async function productionRecoveryHarness() {
     projectIdentity: projectPath, memberIdentity })
   const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
   let memberCreateCount = 0
+  let mcpCheckCount = 0
   const remote = new Map<string, { id: string; title: string }>()
   const messages = new Map<string, { info: Record<string, unknown>; parts: Array<{ type: 'text'; text: string }> }>()
   const client = {
@@ -937,7 +946,10 @@ async function productionRecoveryHarness() {
     clientFactory: { create: () => client } as never,
     hostManager: { ensureScopedHost: async () => host, releaseHost: async () => {},
       retainHostLease: async () => {} } as never,
-    mcpManager: { ensureAppMcp: async () => { throw new Error('MCP must not run') } } as never,
+    mcpManager: { ensureAppMcp: async () => {
+      mcpCheckCount += 1
+      throw new Error('MCP must not run before recovery settles')
+    } } as never,
   })
   const context = { deadlineAtMs: Date.now() + 30_000,
     signal: new AbortController().signal, monotonicNow: Date.now }
@@ -962,7 +974,7 @@ async function productionRecoveryHarness() {
       requestCorrelationDigest: rawCommand.request.launchAttempt.requestCorrelationDigest },
     members: { committed: [], failed: [], pending: [], cleanupPending: [] } }
   }
-  const seedIntent = async (options: { acceptedProof?: boolean } = {}): Promise<ProductionSeed> => {
+  const seedIntent = async (options: { acceptedProof?: boolean; applied?: boolean } = {}): Promise<ProductionSeed> => {
     let seeded!: ProductionSeed
     await store.withGeneration({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
       inputDigest, immutableDigest, generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000 },
@@ -992,6 +1004,9 @@ async function productionRecoveryHarness() {
         payloadHash: rawCommand.request.launchAttempt.payloadHash, inputDigest, immutableDigest,
         generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
         claimToken, memberIdentity } }
+      if (options.applied) {
+        await lease.append({ type: 'member_applied', memberIdentity, linkage, claimToken })
+      }
     }, context)
     return seeded
   }
@@ -1008,6 +1023,8 @@ async function productionRecoveryHarness() {
     inspectJournal: () => store.inspect({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
       inputDigest, immutableDigest }),
     memberCreates: () => memberCreateCount,
+    sessionReads: () => sessionReadCount,
+    mcpChecks: () => mcpCheckCount,
     dispose: () => rm(directory, { recursive: true, force: true }),
   }
 }
