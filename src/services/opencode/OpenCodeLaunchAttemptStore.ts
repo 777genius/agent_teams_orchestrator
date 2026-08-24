@@ -1,7 +1,7 @@
 import { constants } from 'node:fs'
 import { chmod, lstat, mkdir, open, realpath, rename, rmdir, stat, unlink } from 'node:fs/promises'
 import path, { basename, dirname, join, parse, resolve } from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { dlopen, FFIType, ptr, read } from 'bun:ffi'
 import type { PlatformPath } from 'node:path'
 import {
@@ -74,6 +74,14 @@ export type OpenCodeLaunchJournal = {
   fence: number
   /** First successfully prepared profile; immutable across every continuation. */
   profileBinding?: OpenCodeLaunchProfileBinding
+  /** Random orchestrator capability for exactly the next generation. */
+  continuation?: {
+    issuedGeneration: number
+    token: string
+    eligibleMemberIdentities: OpenCodeOpaqueIdentity[]
+  }
+  /** Exact ordered member set authorized when the current continuation was consumed. */
+  authorizedMemberIdentities?: OpenCodeOpaqueIdentity[]
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -95,6 +103,7 @@ export type OpenCodeLaunchJournalIdentity = {
   totalBudgetMs?: number
   /** Optional atomic expectation; not serialized as a second identity. */
   generation?: number
+  continuationToken?: string
 }
 
 type WithoutJournalCoordination<T> = T extends unknown
@@ -1267,9 +1276,14 @@ export type OpenCodeLaunchJournalLease = {
   readonly generation: number
   readonly fence: number
   readonly acquisitionToken: string
+  readonly continuationEligibleMemberIdentities: readonly OpenCodeOpaqueIdentity[]
   bindProfile(binding: OpenCodeLaunchProfileBinding, context?: OpenCodeLaunchStoreContext): Promise<void>
   claim(memberIdentity: OpenCodeOpaqueIdentity, context?: OpenCodeLaunchStoreContext): Promise<string>
   append(event: OpenCodeLaunchJournalAppendEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
+  issueContinuation(
+    eligibleMemberIdentities: readonly OpenCodeOpaqueIdentity[],
+    context?: OpenCodeLaunchStoreContext,
+  ): Promise<string>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Re-reads both durable authorities immediately before an irreversible external commit. */
@@ -1317,6 +1331,7 @@ export class OpenCodeLaunchAttemptStore {
         ...(mode === 'continue' ? { inputDigest: undefined } : {}),
       }
       let journal = await this.load(loadIdentity, context)
+      let consumedContinuationMembers: OpenCodeOpaqueIdentity[] = []
       let effectiveContext = context
       if (journal && context) {
         const persistedDeadlineAtMs = safeAdd(journal.startedAtMs, journal.totalBudgetMs, 'absoluteDeadlineAtMs')
@@ -1357,8 +1372,15 @@ export class OpenCodeLaunchAttemptStore {
           if (identity.inputDigest === undefined) {
             throw new OpenCodeLaunchJournalError('foreign', 'continuation input digest is required')
           }
+          if (!journal.continuation || journal.continuation.issuedGeneration !== journal.generation
+            || identity.continuationToken !== journal.continuation.token) {
+            throw new OpenCodeLaunchJournalError('fenced', 'continuation capability mismatch')
+          }
+          consumedContinuationMembers = [...journal.continuation.eligibleMemberIdentities]
           const candidate = { ...journal, inputDigest: identity.inputDigest,
-            generation: journal.generation + 1, fence: journal.fence + 1 }
+            generation: journal.generation + 1, fence: journal.fence + 1,
+            continuation: undefined,
+            authorizedMemberIdentities: consumedContinuationMembers }
           assertSafePositive(candidate.generation, 'generation')
           assertSafePositive(candidate.fence, 'fence')
           await this.persist(candidate, effectiveContext)
@@ -1367,6 +1389,10 @@ export class OpenCodeLaunchAttemptStore {
       }
       const generation = journal.generation
       const fence = journal.fence
+      const continuationEligibleMemberIdentities = mode === 'continue'
+        ? [...(consumedContinuationMembers.length > 0
+          ? consumedContinuationMembers : journal.authorizedMemberIdentities ?? [])]
+        : []
       let active = true
       let leasePoison: OpenCodeLaunchPoisonedLeaseError | undefined
       const lease: OpenCodeLaunchJournalLease = {
@@ -1374,6 +1400,7 @@ export class OpenCodeLaunchAttemptStore {
         generation,
         fence,
         acquisitionToken,
+        continuationEligibleMemberIdentities,
         bindProfile: async (binding, bindingContext) => {
           validateProfileBinding(binding)
           if (journal!.profileBinding) {
@@ -1403,6 +1430,35 @@ export class OpenCodeLaunchAttemptStore {
             throw new OpenCodeLaunchJournalError('fenced', 'normal transition requires this acquisition claimant token')
           }
           await appendEvent(normalEvent, appendContext)
+        },
+        issueContinuation: async (eligibleMemberIdentities, issueContext) => {
+          if (!active || journal!.generation !== generation || journal!.fence !== fence) {
+            throw new OpenCodeLaunchJournalError('fenced', 'stale generation writer')
+          }
+          if (eligibleMemberIdentities.length === 0
+            || new Set(eligibleMemberIdentities).size !== eligibleMemberIdentities.length
+            || !eligibleMemberIdentities.every(isOpenCodeOpaqueIdentity)) {
+            throw new OpenCodeLaunchJournalError('foreign', 'invalid continuation member partition')
+          }
+          if (journal!.continuation) {
+            if (journal!.continuation.issuedGeneration !== generation
+              || JSON.stringify(journal!.continuation.eligibleMemberIdentities)
+                !== JSON.stringify(eligibleMemberIdentities)) {
+              throw new OpenCodeLaunchJournalError('fenced', 'continuation partition changed')
+            }
+            return journal!.continuation.token
+          }
+          const continuation = {
+            issuedGeneration: generation,
+            token: `opencode-launch-continuation-v1.${randomBytes(32).toString('base64url')}`,
+            eligibleMemberIdentities: [...eligibleMemberIdentities],
+          }
+          const candidate = { ...journal!, continuation }
+          validateJournal(candidate, identity)
+          await this.persist(candidate, issueContext ?? effectiveContext)
+          journal = candidate
+          Object.assign(lease.journal, candidate)
+          return continuation.token
         },
         reconcile: async (event, reconcileContext) => {
           if (!event.claimToken) {
@@ -1648,6 +1704,10 @@ function validateIdentity(identity: OpenCodeLaunchJournalIdentity): void {
     throw new OpenCodeLaunchJournalError('foreign', 'noncanonical attempt identity')
   }
   if (identity.generation !== undefined) assertSafePositive(identity.generation, 'generation')
+  if (identity.continuationToken !== undefined
+    && (typeof identity.continuationToken !== 'string' || identity.continuationToken.length > 256)) {
+    throw new OpenCodeLaunchJournalError('foreign', 'noncanonical continuation capability')
+  }
 }
 
 function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity): OpenCodeLaunchJournal {
@@ -1658,7 +1718,11 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
   }
   const journalKeys = ['version', 'attemptId', 'payloadHash', 'inputDigest', 'immutableDigest',
     'startedAtMs', 'totalBudgetMs', 'generation', 'fence', 'events'] as const
-  if (!(strictKeys(source, journalKeys) || strictKeys(source, [...journalKeys, 'profileBinding']))
+  const allowedJournalKeys = new Set<string>([
+    ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
+  ])
+  if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
+    || Object.keys(source).some(key => !allowedJournalKeys.has(key))
     || !isOpenCodeLaunchPayloadHash(source.inputDigest) || !isOpenCodeLaunchPayloadHash(source.immutableDigest)) {
     throw new OpenCodeLaunchJournalError('corrupt', 'journal contains unknown fields')
   }
@@ -1677,6 +1741,26 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
   assertSafePositive(source.fence, 'fence')
   if (source.generation !== source.fence) throw new OpenCodeLaunchJournalError('corrupt', 'generation must equal fence')
   if (source.profileBinding !== undefined) validateProfileBinding(source.profileBinding)
+  if (source.continuation !== undefined) {
+    const continuation = record(source.continuation)
+    if (!continuation || !strictKeys(continuation,
+      ['issuedGeneration', 'token', 'eligibleMemberIdentities'])
+      || continuation.issuedGeneration !== source.generation
+      || typeof continuation.token !== 'string' || continuation.token.length > 256
+      || !Array.isArray(continuation.eligibleMemberIdentities)
+      || continuation.eligibleMemberIdentities.length === 0
+      || new Set(continuation.eligibleMemberIdentities).size !== continuation.eligibleMemberIdentities.length
+      || !continuation.eligibleMemberIdentities.every(isOpenCodeOpaqueIdentity)) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid continuation capability')
+    }
+  }
+  if (source.authorizedMemberIdentities !== undefined
+    && (!Array.isArray(source.authorizedMemberIdentities)
+      || source.authorizedMemberIdentities.length === 0
+      || new Set(source.authorizedMemberIdentities).size !== source.authorizedMemberIdentities.length
+      || !source.authorizedMemberIdentities.every(isOpenCodeOpaqueIdentity))) {
+    throw new OpenCodeLaunchJournalError('corrupt', 'invalid authorized member partition')
+  }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid journal event count')
   }

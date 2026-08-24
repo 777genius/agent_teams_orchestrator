@@ -13,6 +13,7 @@ const target = OpenCodeLaunchMutationLedger.targetDigest({
 })
 const identity = (attemptId: string, claimToken: string): OpenCodeLaunchMutationIdentity => ({
   attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
+  immutableDigest: 'c'.repeat(64),
   generation: 1, fence: 1, acquisitionToken: `acquisition-${claimToken}`,
   claimToken, memberIdentity,
 })

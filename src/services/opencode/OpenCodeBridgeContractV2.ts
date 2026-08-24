@@ -64,7 +64,8 @@ export type DecodedOpenCodeLaunchAttemptRequest =
   | { kind: 'legacy' }
   | { kind: 'v2'; request: OpenCodeLaunchAttemptRequest }
 
-export type OpenCodeLaunchAttemptOutcome = 'succeeded' | 'partial' | 'failed' | 'cancelled'
+export type OpenCodeLaunchAttemptOutcome =
+  | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'reconciliation_required'
 export type { OpenCodeLaunchFailureKind, OpenCodeLaunchRetryDisposition }
 export type OpenCodeLaunchAttemptPhase =
   | 'profile_prepare' | 'retained_host_start' | 'provider_live_validate'
@@ -92,6 +93,10 @@ export type OpenCodeLaunchAttemptDetails = {
   idempotencyKey: 'attemptId'
   payloadHash: string
   generation: number
+  /** Orchestrator-authored digest for this exact generation/mode/token. */
+  inputDigest: string
+  /** Orchestrator-authored stable digest for the immutable ordered launch plan. */
+  immutableDigest: string
   outcome: OpenCodeLaunchAttemptOutcome
   phase: OpenCodeLaunchAttemptPhase
   startedAt: number
@@ -164,7 +169,9 @@ const opaqueIdentityPattern = /^sha256:[0-9a-f]{64}$/
 const purposePattern = /^[a-z][a-z0-9_-]{0,63}$/
 const toolPattern = /^[a-z][a-z0-9_.:-]{0,127}$/
 const sensitiveWireTextPattern = /(?:https?:\/\/|wss?:\/\/|@|bearer|secret|credential|authorization|password|api[_-]?key|access[_-]?token|refresh[_-]?token)/i
-const outcomes: readonly OpenCodeLaunchAttemptOutcome[] = ['succeeded', 'partial', 'failed', 'cancelled']
+const outcomes: readonly OpenCodeLaunchAttemptOutcome[] = [
+  'succeeded', 'partial', 'failed', 'cancelled', 'reconciliation_required',
+]
 const phases: readonly OpenCodeLaunchAttemptPhase[] = [
   'profile_prepare', 'retained_host_start', 'provider_live_validate', 'retained_host_mcp_proof',
   'execution_submit', 'execution_poll', 'member_materialize', 'result_commit', 'cleanup', 'complete',
@@ -213,6 +220,9 @@ function member<T extends string>(values: readonly T[], value: unknown): value i
 }
 function safeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0
+}
+function positiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0
 }
 function opaqueToken(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 4096
@@ -377,7 +387,7 @@ export function decodeOpenCodeLaunchAttemptRequest(
       return invalid('launchAttempt.attemptId')
     }
     if (!isOpenCodeLaunchPayloadHash(attempt.payloadHash)) return invalid('launchAttempt.payloadHash')
-    if (!safeInteger(attempt.generation)) return invalid('launchAttempt.generation')
+    if (!positiveInteger(attempt.generation)) return invalid('launchAttempt.generation')
     if (!isOpenCodeLaunchProofNonce(attempt.proofNonce)) return invalid('launchAttempt.proofNonce')
     const parent = decodeParent(attempt.parent, 'launchAttempt.parent')
     if (isDecodeFailure(parent)) return parent
@@ -474,7 +484,9 @@ function decodeLaunchAttempt(value: unknown): OpenCodeBridgeDecodeResult<OpenCod
   if (!isOpenCodeLaunchAttemptId(source.attemptId)) return invalid('launchAttempt.attemptId')
   if (source.idempotencyKey !== 'attemptId') return invalid('launchAttempt.idempotencyKey')
   if (!isOpenCodeLaunchPayloadHash(source.payloadHash)) return invalid('launchAttempt.payloadHash')
-  if (!safeInteger(source.generation)) return invalid('launchAttempt.generation')
+  if (!positiveInteger(source.generation)) return invalid('launchAttempt.generation')
+  if (!isOpenCodeLaunchPayloadHash(source.inputDigest)) return invalid('launchAttempt.inputDigest')
+  if (!isOpenCodeLaunchPayloadHash(source.immutableDigest)) return invalid('launchAttempt.immutableDigest')
   if (!member(outcomes, source.outcome)) return invalid('launchAttempt.outcome')
   if (!member(phases, source.phase)) return invalid('launchAttempt.phase')
   const startedAt = source.startedAt
@@ -533,6 +545,8 @@ function decodeLaunchAttempt(value: unknown): OpenCodeBridgeDecodeResult<OpenCod
     idempotencyKey: 'attemptId',
     payloadHash: source.payloadHash,
     generation: source.generation,
+    inputDigest: source.inputDigest,
+    immutableDigest: source.immutableDigest,
     outcome: source.outcome,
     phase: source.phase,
     startedAt,
@@ -558,7 +572,7 @@ function decodeLaunchAttempt(value: unknown): OpenCodeBridgeDecodeResult<OpenCod
 function decodeProof(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeRetainedHostProof> {
   const source = record(value)
   if (!source) return invalid('proof')
-  if (!safeInteger(source.generation)) return invalid('proof.generation')
+  if (!positiveInteger(source.generation)) return invalid('proof.generation')
   if (!isOpenCodeLaunchAttemptId(source.attemptId)) return invalid('proof.attemptId')
   const parent = decodeParent(source.parent, 'proof.parent')
   if (isDecodeFailure(parent)) return parent
@@ -706,8 +720,11 @@ function decodeResponse(value: unknown): OpenCodeBridgeDecodeResult<OpenCodeLaun
       || (members.value.failed.length === 0 && members.value.pending.length === 0)
       || members.value.continuationToken === undefined)) return invalid('members.continuationToken')
   if (outcome === 'failed' && (failure === undefined || members.value.committed.length > 0)) return invalid('failure')
-  if ((members.value.pending.length > 0 || hasContinuationFailure(failure, members.value))
-    && members.value.continuationToken === undefined) return invalid('members.continuationToken')
+  if (outcome === 'reconciliation_required'
+    && (failure === undefined || failure.code !== 'unknown_transport_after_side_effect'
+      || members.value.continuationToken !== undefined)) return invalid('members.continuationToken')
+  if (members.value.continuationToken !== undefined
+    && outcome !== 'partial') return invalid('members.continuationToken')
   return { ok: true, value: {
     launchAttempt: launchAttempt.value,
     ...(proof === undefined ? {} : { proof }),

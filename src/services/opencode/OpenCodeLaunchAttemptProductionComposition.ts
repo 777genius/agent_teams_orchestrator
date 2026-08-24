@@ -19,7 +19,9 @@ export type OpenCodeLaunchAttemptProductionRuntime = {
     remainingMs(): number
   }>): Promise<Command>
   /** Durable, read-only gate. Null is the only result that authorizes effects. */
-  inspect(command: Command): Promise<Output | null>
+  inspect(command: Command, identity: Readonly<{
+    attemptId: string; payloadHash: string; generation: number; inputDigest: string
+  }>): Promise<Output | null>
   executeAfterPreflight(command: Command): Promise<{
     output: Output
     result: OpenCodeLaunchAttemptResult
@@ -53,10 +55,10 @@ export function createOpenCodeLaunchAttemptProductionBridge(
     constructor() {
       super({
         commandLedger: {
-          read: async () => {
+          read: async identity => {
             const active = context.getStore()
             if (!active) throw new Error('OpenCode production launch command context is absent')
-            const output = await runtime.inspect(active.command)
+            const output = await runtime.inspect(active.command, identity)
             if (!output) return { status: 'absent' }
             const status = readStatus(output) === 'reconciliation_required'
               ? 'unknown' as const
@@ -155,5 +157,6 @@ function readStatus(output: Output): string | undefined {
   if (!output.data || typeof output.data !== 'object') return undefined
   const attempt = (output.data as { launchAttempt?: unknown }).launchAttempt
   if (!attempt || typeof attempt !== 'object') return undefined
-  return (attempt as { status?: unknown }).status as string | undefined
+  const value = attempt as { outcome?: unknown; status?: unknown }
+  return (value.outcome ?? value.status) as string | undefined
 }

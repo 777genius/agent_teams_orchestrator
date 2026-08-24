@@ -41,6 +41,8 @@ function request(): OpenCodeLaunchAttemptRequest {
       attemptId,
       payloadHash,
       generation: 7,
+      inputDigest: 'd'.repeat(64),
+      immutableDigest: 'e'.repeat(64),
       proofNonce: nonce,
       parent: { sessionIdentity: identity('1'), messageIdentity: identity('2') },
       providerId: 'xai',

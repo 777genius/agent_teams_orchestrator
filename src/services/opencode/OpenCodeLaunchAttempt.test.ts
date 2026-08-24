@@ -61,6 +61,7 @@ function proofResponse(generation: number, nonceHash = hash, verifiedAt = 1): Op
   return {
     launchAttempt: {
       contractVersion: 1, attemptId, idempotencyKey: 'attemptId', payloadHash: hash, generation,
+      inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64),
       outcome: 'succeeded', phase: 'complete', startedAt: 0, absoluteDeadlineAt: 10_000,
       workDeadlineAt: 9_000, cleanupReserveMs: 1_000, elapsedMs: 1,
       providerId: 'anthropic', modelId: 'anthropic/claude-sonnet-4-5', profilePurpose: 'launch_attempt',

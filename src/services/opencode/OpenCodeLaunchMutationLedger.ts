@@ -24,6 +24,7 @@ export type OpenCodeLaunchMutationIdentity = {
   attemptId: string
   payloadHash: string
   inputDigest: string
+  immutableDigest: string
   generation: number
   fence: number
   acquisitionToken: string
@@ -35,7 +36,7 @@ export type OpenCodeLaunchMutationClaimRecord = OpenCodeLaunchMutationIdentity &
   version: 1
   targetDigest: string
   idempotencyIdentity: string
-  state: 'claimed' | 'unknown' | 'committed'
+  state: 'claimed' | 'known_failure' | 'unknown' | 'committed'
   linkage?: OpenCodeLaunchMemberLinkage
   recovery?: OpenCodeLaunchMemberRecovery
 }
@@ -80,6 +81,17 @@ export class OpenCodeLaunchMutationLedger {
       const current = await this.readUnlocked(persistence, targetDigest, context)
       if (current) {
         if (current.state === 'committed') return 'already_committed'
+        if (current.state === 'known_failure') {
+          if (sameImmutableAuthority(current, identity)
+            && identity.generation === current.generation + 1
+            && identity.fence === current.fence + 1) {
+            const reclaimed: ClaimRecord = { ...current, ...identity, state: 'claimed' }
+            validateClaimRecord(reclaimed)
+            await persistence.replaceAndSync(new TextEncoder().encode(JSON.stringify(reclaimed)), context)
+            return 'claimed'
+          }
+          return 'reconciliation_required'
+        }
         // A live or crashed authority is never stolen. The exact same caller may
         // resume only through reconciliation, not by issuing create again.
         return current.state === 'unknown' ? 'unknown' : 'reconciliation_required'
@@ -97,7 +109,7 @@ export class OpenCodeLaunchMutationLedger {
   async transition(
     targetDigest: string,
     identity: OpenCodeLaunchMutationIdentity,
-    transition: 'unknown' | 'commit',
+    transition: 'known_failure' | 'unknown' | 'commit',
     linkage: OpenCodeLaunchMemberLinkage | undefined,
     context: OpenCodeLaunchStoreContext,
     recovery?: OpenCodeLaunchMemberRecovery,
@@ -112,7 +124,7 @@ export class OpenCodeLaunchMutationLedger {
       if (transition === 'commit' && !recovery) throw new TypeError('launch mutation recovery metadata is required')
       const next: ClaimRecord = transition === 'commit'
         ? { ...current, state: 'committed', linkage, recovery }
-        : { ...current, state: 'unknown' }
+        : { ...current, state: transition }
       validateClaimRecord(next)
       await persistence.replaceAndSync(new TextEncoder().encode(JSON.stringify(next)), context)
       return transition === 'commit' ? 'committed' : 'cancelled'
@@ -150,12 +162,13 @@ function validateClaimRecord(value: unknown): asserts value is ClaimRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw corrupt()
   const record = value as Record<string, unknown>
   const allowed = new Set(['version', 'targetDigest', 'idempotencyIdentity', 'state', 'attemptId', 'payloadHash',
-    'inputDigest', 'generation', 'fence', 'acquisitionToken', 'claimToken', 'memberIdentity', 'linkage', 'recovery'])
+    'inputDigest', 'immutableDigest', 'generation', 'fence', 'acquisitionToken', 'claimToken', 'memberIdentity', 'linkage', 'recovery'])
   if (Object.keys(record).some(key => !allowed.has(key)) || record.version !== 1
     || !DIGEST.test(String(record.targetDigest)) || !TOKEN.test(String(record.idempotencyIdentity))
-    || !['claimed', 'unknown', 'committed'].includes(String(record.state))
+    || !['claimed', 'known_failure', 'unknown', 'committed'].includes(String(record.state))
     || !isOpenCodeLaunchAttemptId(record.attemptId) || !isOpenCodeLaunchPayloadHash(record.payloadHash)
-    || !DIGEST.test(String(record.inputDigest)) || typeof record.generation !== 'number'
+    || !DIGEST.test(String(record.inputDigest)) || !DIGEST.test(String(record.immutableDigest))
+    || typeof record.generation !== 'number'
     || !Number.isSafeInteger(record.generation) || typeof record.fence !== 'number'
     || !Number.isSafeInteger(record.fence) || !TOKEN.test(String(record.acquisitionToken))
     || !TOKEN.test(String(record.claimToken)) || !isOpenCodeOpaqueIdentity(record.memberIdentity)) throw corrupt()
@@ -184,6 +197,11 @@ function sameAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity)
     && left.inputDigest === right.inputDigest && left.generation === right.generation
     && left.fence === right.fence && left.acquisitionToken === right.acquisitionToken
     && left.claimToken === right.claimToken && left.memberIdentity === right.memberIdentity
+}
+
+function sameImmutableAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity): boolean {
+  return left.attemptId === right.attemptId && left.payloadHash === right.payloadHash
+    && left.immutableDigest === right.immutableDigest && left.memberIdentity === right.memberIdentity
 }
 
 function sameLinkageShape(value: unknown, memberIdentity: string): value is OpenCodeLaunchMemberLinkage {

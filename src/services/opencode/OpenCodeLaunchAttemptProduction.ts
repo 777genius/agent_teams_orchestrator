@@ -10,6 +10,7 @@ import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
+  computeOpenCodeLaunchAttemptInputDigest,
   computeOpenCodeLaunchAttemptImmutableDigest,
   createOpenCodeLaunchAttemptResult,
   validateOpenCodeLaunchContinuation,
@@ -30,11 +31,13 @@ import {
   OpenCodeLaunchFileJournalPersistence,
 } from './OpenCodeLaunchAttemptStore.js'
 import type {
+  OpenCodeLaunchFailureDetails,
   OpenCodeLaunchAttemptResponse,
   OpenCodeLaunchMemberLinkage,
   OpenCodeOpaqueIdentity,
   OpenCodeRetainedHostIdentity,
 } from './OpenCodeBridgeContractV2.js'
+import { encodeOpenCodeLaunchAttemptResponse } from './OpenCodeBridgeContractV2.js'
 import type {
   OpenCodeHostHandle,
   OpenCodeProvisioningSnapshot,
@@ -67,6 +70,64 @@ import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutation
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
+function wireFailure(
+  failure: NonNullable<OpenCodeLaunchAttemptResult['failure']>,
+): OpenCodeLaunchFailureDetails {
+  const code = failure.kind
+  return {
+    code,
+    origin: code.startsWith('deadline_') || code.includes('budget_exhausted') ? 'deadline'
+      : code === 'contract_violation' || code === 'unknown_transport_after_side_effect' ? 'session'
+        : 'provider',
+    retryDisposition: failure.retryDisposition,
+    retryable: failure.retryable,
+    phase: 'member_materialize',
+    sideEffectsStarted: failure.sideEffectsStarted,
+  }
+}
+
+/** Pure Desktop V1 projection used by production and fake-only contract tests. */
+export function projectOpenCodeLaunchAttemptResponse(
+  result: OpenCodeLaunchAttemptResult,
+): OpenCodeLaunchAttemptResponse | undefined {
+  const accepted = result.acceptedProofResponse
+  if (!accepted) return undefined
+  const cleanupReserveMs = result.absoluteDeadlineAtMs - result.workDeadlineAtMs
+  if (cleanupReserveMs <= 0) return undefined
+  const outcome = result.status
+  const failure = result.failure ? wireFailure(result.failure) : undefined
+  const response: OpenCodeLaunchAttemptResponse = {
+    launchAttempt: {
+      ...accepted.launchAttempt,
+      attemptId: result.attemptId,
+      payloadHash: result.payloadHash,
+      generation: result.generation,
+      inputDigest: result.inputDigest,
+      immutableDigest: result.immutableDigest,
+      outcome,
+      phase: 'complete',
+      startedAt: result.absoluteDeadlineAtMs - (result.absoluteDeadlineAtMs
+        - accepted.launchAttempt.startedAt),
+      workDeadlineAt: result.workDeadlineAtMs,
+      absoluteDeadlineAt: result.absoluteDeadlineAtMs,
+      cleanupReserveMs,
+      elapsedMs: Math.max(0, Math.min(result.absoluteDeadlineAtMs,
+        accepted.proof?.verifiedAt ?? result.absoluteDeadlineAtMs) - accepted.launchAttempt.startedAt),
+    },
+    ...(accepted.proof === undefined ? {} : { proof: { ...accepted.proof, generation: result.generation } }),
+    members: {
+      committed: result.committed,
+      failed: result.failed.map(item => ({ memberIdentity: item.memberIdentity,
+        failure: wireFailure(item.failure) })),
+      pending: result.pending,
+      cleanupPending: result.cleanupPending,
+      ...(result.continuationToken === undefined ? {} : { continuationToken: result.continuationToken }),
+    },
+    ...(failure === undefined ? {} : { failure }),
+  }
+  return encodeOpenCodeLaunchAttemptResponse(response)
+}
+
 export function createOpenCodeLaunchPreflightResult(input: {
   attemptId: string
   payloadHash: string
@@ -81,10 +142,13 @@ export function createOpenCodeLaunchPreflightResult(input: {
     attemptId: input.attemptId,
     payloadHash: input.payloadHash,
     immutableDigest: input.immutableDigest,
+    inputDigest: input.payloadHash,
     generation: input.generation,
     status: input.reconciliationRequired ? 'reconciliation_required' : 'succeeded',
     committed: input.committed,
+    failed: [],
     pending: input.pending,
+    cleanupPending: [],
     cleanup: 'complete',
     absoluteDeadlineAtMs: input.deadlineAtMs,
     workDeadlineAtMs: input.deadlineAtMs,
@@ -186,6 +250,7 @@ async function bounded<T>(operation: Promise<T>, deadlineAtMs: number, signal: A
 /** Concrete production adapter. Tests replace this whole narrow handler port. */
 class OpenCodeProductionLaunchRuntime {
   private readonly authorizedPlans = new WeakMap<object, OpenCodeAuthorizedScopedProfilePlan>()
+  private readonly completedResults = new WeakMap<object, OpenCodeLaunchAttemptResult>()
 
   async authorize(command: Command, controls: Readonly<{
     signal: AbortSignal; deadlineAtMs: number; remainingMs(): number
@@ -203,7 +268,15 @@ class OpenCodeProductionLaunchRuntime {
     return authorized
   }
 
-  async inspect(command: Command): Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
+  async inspect(command: Command, identity: Readonly<{
+    attemptId: string; payloadHash: string; generation: number; inputDigest: string
+  }>): Promise<Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>> | null> {
+    if (identity.attemptId !== command.request.launchAttempt.attemptId
+      || identity.payloadHash !== command.request.launchAttempt.payloadHash
+      || identity.generation !== command.request.launchAttempt.generation
+      || identity.inputDigest !== computeOpenCodeLaunchCommandInputDigest(command)) {
+      throw new Error('OpenCode durable command ledger inspection identity mismatch')
+    }
     return this.run(command, false, true)
   }
 
@@ -213,7 +286,7 @@ class OpenCodeProductionLaunchRuntime {
   }> {
     const output = await this.run(command, true, false)
     if (!output) throw new Error('OpenCode production launch result projection is absent')
-    const result = (output.data as { launchAttempt?: OpenCodeLaunchAttemptResult }).launchAttempt
+    const result = this.completedResults.get(command)
     if (!result) throw new Error('OpenCode production launch result projection is absent')
     return { output, result }
   }
@@ -239,9 +312,16 @@ class OpenCodeProductionLaunchRuntime {
       path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.proof-cleanup.json`),
     )
     const attemptStore = new OpenCodeLaunchAttemptStore(attemptPersistence)
+    const requestedBudgetMs = command.deadlineAtMs === undefined
+      ? command.outerRemainingBudgetMs ?? command.requestedBudgetMs : command.requestedBudgetMs
+    const effectiveBudgetMs = Math.min(requestedBudgetMs, 300_000)
+    const commandInputDigest = computeOpenCodeLaunchCommandInputDigest(command)
+    const inputDigest = computeOpenCodeLaunchAttemptInputDigest(command.request,
+      command.members.map(member => member.memberIdentity), command.continuation ? 'continue' : 'begin',
+      requestedBudgetMs, effectiveBudgetMs, commandInputDigest)
     const immutableDigest = computeOpenCodeLaunchAttemptImmutableDigest(command.request,
-      command.members.map(member => member.memberIdentity), command.requestedBudgetMs,
-      command.outerRemainingBudgetMs ?? command.requestedBudgetMs,
+      command.members.map(member => member.memberIdentity), requestedBudgetMs,
+      effectiveBudgetMs,
       computeOpenCodeLaunchCommandImmutableDigest(command))
     validateOpenCodeLaunchContinuation({
       attemptId: command.request.launchAttempt.attemptId,
@@ -280,11 +360,26 @@ class OpenCodeProductionLaunchRuntime {
     const preflightDeadlineAtMs = command.deadlineAtMs ?? (launchMonotonicNow()
       + (command.outerRemainingBudgetMs ?? command.requestedBudgetMs))
     const preflightSignal = command.signal ?? new AbortController().signal
-    await attemptStore.inspect({
+    const journal = await attemptStore.inspect({
       attemptId: command.request.launchAttempt.attemptId,
       payloadHash: command.request.launchAttempt.payloadHash,
       immutableDigest,
     }, { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal, monotonicNow: launchMonotonicNow })
+    if (journal) {
+      const requestedGeneration = command.request.launchAttempt.generation
+      if (requestedGeneration === journal.generation) {
+        if (journal.inputDigest !== inputDigest) {
+          throw new Error('OpenCode durable command ledger generation input mismatch')
+        }
+      } else if (requestedGeneration === journal.generation + 1 && command.continuation) {
+        if (!journal.continuation
+          || journal.continuation.token !== command.request.launchAttempt.continuationToken) {
+          throw new Error('OpenCode durable command ledger continuation capability mismatch')
+        }
+      } else {
+        throw new Error('OpenCode durable command ledger generation mismatch')
+      }
+    }
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
       recoveryHost ??= (async () => {
@@ -357,18 +452,6 @@ class OpenCodeProductionLaunchRuntime {
     const completed = priorClaims.length > 0 && priorClaims.every(item => item.claim?.state === 'committed'
       && item.linkage !== null)
     if (uncertain || completed) {
-      const committed = priorClaims.flatMap(item => item.claim?.state === 'committed' && item.linkage
-        ? [item.linkage] : [])
-      const pending = priorClaims.filter(item => item.claim?.state !== 'committed' || !item.linkage)
-        .map(item => item.member.memberIdentity)
-      const result = createOpenCodeLaunchPreflightResult({
-        attemptId: command.request.launchAttempt.attemptId,
-        payloadHash: command.request.launchAttempt.payloadHash,
-        immutableDigest,
-        generation: command.request.launchAttempt.generation,
-        reconciliationRequired: uncertain,
-        committed, pending, deadlineAtMs: preflightDeadlineAtMs,
-      })
       return {
         snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
           profile: null, host: null, config: null, configProviders: null, providers: null,
@@ -376,11 +459,11 @@ class OpenCodeProductionLaunchRuntime {
           probeError: uncertain ? 'launch mutation requires reconciliation' : null, diagnostics: [] },
         data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
           members: Object.fromEntries(priorClaims.map(item => [item.member.name, {
-            sessionId: item.record?.opencodeSessionId ?? `pending:${item.member.memberIdentity}`,
-            launchState: item.claim?.state === 'committed' && item.linkage ? 'created' : 'failed',
+            ...(item.record ? { sessionId: item.record.opencodeSessionId } : {}),
+            launchState: item.claim?.state === 'committed' && item.linkage ? 'created' : 'pending',
             evidence: [], diagnostics: item.reconciliationError
               ? [`committed projection reconciliation unresolved: ${item.reconciliationError}`] : [],
-          }])), launchAttempt: result },
+          }])) },
       }
     }
     if (inspectionOnly) return null
@@ -736,7 +819,8 @@ class OpenCodeProductionLaunchRuntime {
           const target = targetByMember.get(input.memberIdentity)
           if (!target) return 'fenced'
           return mutationLedger.transition(target, input,
-            input.transition === 'commit' ? 'commit' : 'unknown',
+            input.transition === 'commit' ? 'commit'
+              : input.knownNoEffect ? 'known_failure' : 'unknown',
             input.transition === 'commit' ? input.linkage : undefined,
             { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow },
             input.transition === 'commit' ? input.recovery : undefined)
@@ -894,18 +978,21 @@ class OpenCodeProductionLaunchRuntime {
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(command) })
+    this.completedResults.set(command, result)
+    const launchAttempt = projectOpenCodeLaunchAttemptResponse(result)
     const members = Object.fromEntries(command.members.map(member => {
       const record = records.get(member.memberIdentity)
       const committed = result.committed.some(link => link.memberIdentity === member.memberIdentity)
-      return [member.name, { sessionId: record?.opencodeSessionId ?? `pending:${member.memberIdentity}`,
-        launchState: committed ? 'created' : 'failed', evidence: [], diagnostics: [] }]
+      const failed = result.failed.some(item => item.memberIdentity === member.memberIdentity)
+      return [member.name, { ...(record ? { sessionId: record.opencodeSessionId } : {}),
+        launchState: committed ? 'created' : failed ? 'failed' : 'pending', evidence: [], diagnostics: [] }]
     }))
     return { snapshot: currentSnapshot ?? {
       detected: false, hostHealthy: false, projectPath: command.projectPath, profile: null, host: null,
       config: null, configProviders: null, providers: null, providerAuth: null, agents: [], mcp: null,
       appMcp: null, probeError: 'launch attempt did not acquire a host', diagnostics: [],
     }, data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
-      members, launchAttempt: result } }
+      members, ...(launchAttempt === undefined ? {} : { launchAttempt }) } }
   }
 }
 

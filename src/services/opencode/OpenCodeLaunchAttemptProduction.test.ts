@@ -20,7 +20,7 @@ import { createOpenCodeLaunchPreflightResult } from './OpenCodeLaunchAttemptProd
 
 const identity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
 
-test('production preflight projects authoritative continuation identity and omits it for completed replay', () => {
+test('production preflight never authorizes reconciliation and omits continuation for completed replay', () => {
   const base = {
     attemptId: '123e4567-e89b-42d3-a456-426614174000',
     payloadHash: 'b'.repeat(64),
@@ -40,8 +40,7 @@ test('production preflight projects authoritative continuation identity and omit
     status: 'reconciliation_required',
     pending,
   })
-  expect(reconciliation.continuationToken)
-    .toMatch(/^opencode-launch-continuation-v1\.[A-Za-z0-9_-]+$/)
+  expect(reconciliation.continuationToken).toBeUndefined()
 
   const completed = createOpenCodeLaunchPreflightResult({
     ...base, reconciliationRequired: false, pending: [],
@@ -283,6 +282,7 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
       projectIdentity: '/fake/project', memberIdentity })
     const authority: OpenCodeLaunchMutationIdentity = { attemptId: '123e4567-e89b-42d3-a456-426614174001',
       payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64), generation: 1, fence: 1,
+      immutableDigest: 'c'.repeat(64),
       acquisitionToken: 'acquire', claimToken: 'claim', memberIdentity }
     const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
     const title = `agent-teams-launch:${authority.attemptId}:${memberIdentity}:${createHash('sha256').update('claim').digest('hex')}`
@@ -414,6 +414,7 @@ async function committedRecoveryFixture() {
   const linkage = linkageForTest(memberIdentity, record)
   const claim = { version: 1 as const, targetDigest: 'd'.repeat(64), idempotencyIdentity: sessionId,
     state: 'committed' as const, attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
+    immutableDigest: 'c'.repeat(64),
     generation: 1, fence: 1, acquisitionToken: 'acquire', claimToken, memberIdentity, linkage,
     recovery: { ownershipTitle: title, sessionRecord: record } }
   const message = { info: { id: 'msg_exact', providerID: 'openrouter', modelID: 'model' },

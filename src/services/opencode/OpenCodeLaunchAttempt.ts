@@ -6,6 +6,7 @@ import {
   isOpenCodeOpaqueIdentity,
   validateOpenCodeLaunchAttemptCorrelation,
   type OpenCodeLaunchAttemptRequest,
+  type OpenCodeLaunchAttemptResponse,
   type OpenCodeLaunchMemberLinkage,
   type OpenCodeOpaqueIdentity,
   type OpenCodeRetainedHostIdentity,
@@ -18,6 +19,7 @@ import {
 } from './OpenCodeLaunchAttemptPolicy.js'
 import {
   OpenCodeLaunchAttemptStore,
+  OpenCodeLaunchJournalError,
   OpenCodeLaunchPoisonedLeaseError,
   type OpenCodeLaunchJournalEvent,
   type OpenCodeLaunchJournalReconciliationEvent,
@@ -125,21 +127,21 @@ export type OpenCodeLaunchAttemptPorts = {
   sessions: {
     /** Authoritative durable read; null means the session ledger proves absence. */
     readMemberLinkage(input: {
-      attemptId: string; payloadHash: string; inputDigest: string; generation: number; fence: number
+      attemptId: string; payloadHash: string; inputDigest: string; immutableDigest: string; generation: number; fence: number
       claimToken: string; currentGeneration: number; currentFence: number
       memberIdentity: OpenCodeOpaqueIdentity; deadlineAtMs: number; signal: AbortSignal
     }): Promise<OpenCodeLaunchMemberLinkage | null>
     claimMemberMutation(input: {
-      attemptId: string; payloadHash: string; inputDigest: string; generation: number; fence: number
+      attemptId: string; payloadHash: string; inputDigest: string; immutableDigest: string; generation: number; fence: number
       acquisitionToken: string; claimToken: string
       memberIdentity: OpenCodeOpaqueIdentity; deadlineAtMs: number; signal: AbortSignal
     }): Promise<'claimed' | 'already_committed' | 'unknown' | 'reconciliation_required'>
     /** The single durable CAS for cancellation and commit of an exact live claim. */
     transitionMemberClaim(input: {
-      attemptId: string; payloadHash: string; inputDigest: string; generation: number; fence: number
+      attemptId: string; payloadHash: string; inputDigest: string; immutableDigest: string; generation: number; fence: number
       acquisitionToken: string; claimToken: string
       memberIdentity: OpenCodeOpaqueIdentity; deadlineAtMs: number; signal: AbortSignal
-    } & ({ transition: 'cancel' } | { transition: 'commit'; linkage: OpenCodeLaunchMemberLinkage;
+    } & ({ transition: 'cancel'; knownNoEffect?: true } | { transition: 'commit'; linkage: OpenCodeLaunchMemberLinkage;
       recovery?: OpenCodeLaunchMemberRecovery })):
       Promise<'cancelled' | 'committed' | 'fenced' | 'unknown'>
     /** Includes session create, noReply bootstrap, and truthful durable linkage commit. */
@@ -202,10 +204,15 @@ export type OpenCodeLaunchAttemptResult = {
   attemptId: string
   payloadHash: string
   generation: number
+  inputDigest: string
+  immutableDigest: string
   status: 'succeeded' | 'partial' | 'failed' | 'reconciliation_required' | 'cancelled'
   committed: OpenCodeLaunchMemberLinkage[]
+  failed: Array<{ memberIdentity: OpenCodeOpaqueIdentity; failure: ReturnType<typeof classifyOpenCodeLaunchFailure> }>
   pending: OpenCodeOpaqueIdentity[]
+  cleanupPending: OpenCodeOpaqueIdentity[]
   continuationToken?: string
+  acceptedProofResponse?: OpenCodeLaunchAttemptResponse
   failure?: ReturnType<typeof classifyOpenCodeLaunchFailure>
   cleanup: OpenCodeLaunchCleanupOutcome
   absoluteDeadlineAtMs: number
@@ -274,7 +281,7 @@ export class OpenCodeLaunchAttempt {
       return await this.store.withGeneration(
         {
           attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
-          generation: attempt.generation,
+          generation: attempt.generation, continuationToken: attempt.continuationToken,
           ...(input.continuation ? {} : {
             startedAtMs: initialPolicy.startedAtMs,
             totalBudgetMs: initialPolicy.totalBudgetMs,
@@ -283,6 +290,9 @@ export class OpenCodeLaunchAttempt {
         input.continuation ? 'continue' : 'begin',
         async lease => {
           if (lease.generation !== attempt.generation) throw new OpenCodeLaunchAttemptError('generation')
+          if (input.continuation && lease.continuationEligibleMemberIdentities.length === 0) {
+            throw new OpenCodeLaunchAttemptError('launchAttempt.continuationToken')
+          }
           let firstClockRead = true
           const policy = new OpenCodeLaunchAttemptPolicy({
             requestedBudgetMs: lease.journal.totalBudgetMs,
@@ -295,29 +305,30 @@ export class OpenCodeLaunchAttempt {
           })
           const committed: OpenCodeLaunchMemberLinkage[] = []
           const pending: OpenCodeOpaqueIdentity[] = []
+          let acceptedProofResponse: OpenCodeLaunchAttemptResponse | undefined
           const recovery = await this.reconcile(
             lease.journal.events, members, committed, lease.generation,
-            { attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, currentFence: lease.fence },
+            { attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, immutableDigest,
+              currentFence: lease.fence },
             lease.reconcile,
             policy.workDeadlineAtMs, controller.signal,
           )
           if (recovery === 'required') {
-            return this.result(policy, attempt.attemptId, attempt.payloadHash, immutableDigest,
-              lease.generation, 'reconciliation_required', committed,
-              members.filter(member => !committed.some(link => link.memberIdentity === member)),
-              'unknown_transport_after_side_effect', 'complete')
+            return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
+              immutableDigest, lease.generation, 'reconciliation_required', committed,
+              members, 'unknown_transport_after_side_effect', 'complete', acceptedProofResponse)
           }
           if (recovery) {
             const recoveryStatus = recovery === 'unknown_transport_after_side_effect'
               ? 'reconciliation_required' : committed.length ? 'partial' : 'failed'
-            return this.result(policy, attempt.attemptId, attempt.payloadHash, immutableDigest,
-              lease.generation, recoveryStatus, committed,
-              members.filter(member => !committed.some(link => link.memberIdentity === member)),
-              recovery, 'complete')
+            return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
+              immutableDigest, lease.generation, recoveryStatus, committed,
+              members, recovery, 'complete', acceptedProofResponse)
           }
           if (committed.length === members.length) {
-            return this.result(policy, attempt.attemptId, attempt.payloadHash, immutableDigest,
-              lease.generation, 'succeeded', committed, [], undefined, 'complete')
+            return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
+              immutableDigest, lease.generation, 'succeeded', committed, members,
+              undefined, 'complete', acceptedProofResponse)
           }
 
           const owned: OpenCodeLaunchOwnedResources[] = []
@@ -414,6 +425,7 @@ export class OpenCodeLaunchAttempt {
               || proofResponse.proof.observedMcpTools.some((tool, index) => tool !== attempt.requiredMcpTools[index])) {
               throw new OpenCodeLaunchAttemptError('proof.profile')
             }
+            acceptedProofResponse = proofResponse
 
             const memberPhaseStartedAt = this.ports.clock.monotonicNow()
             for (const memberIdentity of members) {
@@ -455,7 +467,7 @@ export class OpenCodeLaunchAttempt {
               ambiguousMember = memberIdentity
               const claimOperation = runOpenCodeMutationWithFreshProof(revalidateMember,
                 () => this.ports.sessions.claimMemberMutation({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
                   claimToken, memberIdentity,
                   deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
@@ -466,7 +478,7 @@ export class OpenCodeLaunchAttempt {
               if (claim !== 'claimed') {
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
                   claimToken, memberIdentity, transition: 'cancel', deadlineAtMs: policy.absoluteDeadlineAtMs,
                   signal: abortSignal,
@@ -480,7 +492,7 @@ export class OpenCodeLaunchAttempt {
               let claimCommitStarted = false
               const materializeOperation = Promise.resolve().then(() =>
                 this.ports.sessions.createBootstrapAndCommit({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   memberIdentity, host: host!, generation: lease.generation, fence: lease.fence,
                   acquisitionToken: lease.acquisitionToken, claimToken,
                   deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
@@ -494,7 +506,7 @@ export class OpenCodeLaunchAttempt {
                     if (this.ports.clock.monotonicNow() >= budget.memberDeadlineAtMs) throw new DeadlineError()
                     const transition = await runOpenCodeMutationWithFreshProof(revalidateMember,
                       () => this.ports.sessions.transitionMemberClaim({
-                        attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                        attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                         generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
                         claimToken, memberIdentity, linkage, recovery, transition: 'commit',
                         deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
@@ -518,7 +530,7 @@ export class OpenCodeLaunchAttempt {
                 if (materialized.owned) registerOwned(materialized.owned, memberIdentity)
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
                   claimToken, memberIdentity, transition: 'cancel', deadlineAtMs: policy.absoluteDeadlineAtMs,
                   signal: abortSignal,
@@ -534,9 +546,10 @@ export class OpenCodeLaunchAttempt {
                 if (materialized.owned) registerOwned(materialized.owned, memberIdentity)
                 const abortSignal = new AbortController().signal
                 const abortResult = await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
-                  claimToken, memberIdentity, transition: 'cancel', deadlineAtMs: policy.absoluteDeadlineAtMs,
+                  claimToken, memberIdentity, transition: 'cancel', knownNoEffect: true,
+                  deadlineAtMs: policy.absoluteDeadlineAtMs,
                   signal: abortSignal,
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 if (abortResult !== 'cancelled' && abortResult !== 'fenced') {
@@ -575,7 +588,7 @@ export class OpenCodeLaunchAttempt {
               if (ambiguousClaimToken) {
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
-                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
+                  attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
                   generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
                   claimToken: ambiguousClaimToken, memberIdentity: ambiguousMember, transition: 'cancel',
                   deadlineAtMs: policy.absoluteDeadlineAtMs, signal: abortSignal,
@@ -705,12 +718,17 @@ export class OpenCodeLaunchAttempt {
               : committed.length ? 'partial'
                 : failure === 'cancelled' ? 'cancelled'
                   : 'failed'
-          const unresolved = members.filter(member => !committed.some(link => link.memberIdentity === member))
-          return this.result(policy, attempt.attemptId, attempt.payloadHash, immutableDigest,
-            lease.generation, status, committed, [...pending, ...unresolved], failure, cleanup)
+          return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
+            immutableDigest, lease.generation, status, committed, members, failure, cleanup,
+            acceptedProofResponse)
         },
         initialStoreContext,
       )
+    } catch (error) {
+      if (input.continuation && error instanceof OpenCodeLaunchJournalError) {
+        throw new OpenCodeLaunchAttemptError('launchAttempt.continuationToken')
+      }
+      throw error
     } finally {
       input.signal?.removeEventListener('abort', cancel)
     }
@@ -721,7 +739,7 @@ export class OpenCodeLaunchAttempt {
     members: readonly OpenCodeOpaqueIdentity[],
     committed: OpenCodeLaunchMemberLinkage[],
     currentGeneration: number,
-    coordination: { attemptId: string; payloadHash: string; currentFence: number },
+    coordination: { attemptId: string; payloadHash: string; immutableDigest: string; currentFence: number },
     append: (event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext) => Promise<void>,
     deadlineAtMs: number,
     signal: AbortSignal,
@@ -812,24 +830,48 @@ export class OpenCodeLaunchAttempt {
     }
   }
 
-  private result(
+  private async result(
+    lease: import('./OpenCodeLaunchAttemptStore.js').OpenCodeLaunchJournalLease,
     policy: OpenCodeLaunchAttemptPolicy,
     attemptId: string,
     payloadHash: string,
+    inputDigest: string,
     immutableDigest: string,
     generation: number,
     status: OpenCodeLaunchAttemptResult['status'],
     committed: OpenCodeLaunchMemberLinkage[],
-    pending: OpenCodeOpaqueIdentity[],
+    members: readonly OpenCodeOpaqueIdentity[],
     failure: OpenCodeLaunchFailureKind | undefined,
     cleanup: OpenCodeLaunchCleanupOutcome,
-  ): OpenCodeLaunchAttemptResult {
+    acceptedProofResponse?: OpenCodeLaunchAttemptResponse,
+  ): Promise<OpenCodeLaunchAttemptResult> {
     const aggregateFailure = committed.length > 0 && failure !== undefined
       && failure !== 'unknown_transport_after_side_effect'
       ? 'deadline_after_partial' : failure
+    const lastByMember = new Map<OpenCodeOpaqueIdentity, OpenCodeLaunchJournalEvent>()
+    for (const event of lease.journal.events) {
+      if (event.type !== 'cleanup') lastByMember.set(event.memberIdentity, event)
+    }
+    const failed = members.flatMap(memberIdentity => {
+      const event = lastByMember.get(memberIdentity)
+      return event?.type === 'member_failed'
+        ? [{ memberIdentity, failure: classifyOpenCodeLaunchFailure(event.failure) }] : []
+    })
+    const committedIds = new Set(committed.map(item => item.memberIdentity))
+    const failedIds = new Set(failed.map(item => item.memberIdentity))
+    const pending = members.filter(member => !committedIds.has(member) && !failedIds.has(member))
+    const cleanupPending = members.filter(member => lease.journal.events.some(event =>
+      event.type === 'cleanup' && event.memberIdentity === member && event.outcome === 'timed_out'))
+    const eligible = status === 'partial' && aggregateFailure !== undefined
+      && classifyOpenCodeLaunchFailure(aggregateFailure).retryable
+      ? members.filter(member => !committedIds.has(member)) : []
+    const continuationToken = eligible.length > 0
+      ? await lease.issueContinuation(eligible) : undefined
     return createOpenCodeLaunchAttemptResult({
-      attemptId, payloadHash, immutableDigest,
-      generation, status, committed, pending,
+      attemptId, payloadHash, inputDigest, immutableDigest,
+      generation, status, committed, failed, pending, cleanupPending,
+      ...(continuationToken === undefined ? {} : { continuationToken }),
+      ...(acceptedProofResponse === undefined ? {} : { acceptedProofResponse }),
       ...(aggregateFailure === undefined ? {} : { failure: classifyOpenCodeLaunchFailure(aggregateFailure) }),
       cleanup,
       absoluteDeadlineAtMs: policy.absoluteDeadlineAtMs,
@@ -844,19 +886,6 @@ export type OpenCodeLaunchContinuationIdentity = {
   immutableDigest: string
 }
 
-/** Opaque correlation capability for the generation that just completed. */
-export function computeOpenCodeLaunchContinuationToken(
-  input: OpenCodeLaunchContinuationIdentity & { completedGeneration: number },
-): string {
-  return `opencode-launch-continuation-v1.${createHash('sha256').update(JSON.stringify({
-    domain: 'opencode-launch-continuation-v1',
-    attemptId: input.attemptId,
-    payloadHash: input.payloadHash,
-    completedGeneration: input.completedGeneration,
-    immutableDigest: input.immutableDigest,
-  })).digest('base64url')}`
-}
-
 export function validateOpenCodeLaunchContinuation(
   input: OpenCodeLaunchContinuationIdentity & {
     generation: number
@@ -864,39 +893,37 @@ export function validateOpenCodeLaunchContinuation(
     continuationToken?: string
   },
 ): void {
-  if (!input.continuation) return
+  if (!input.continuation) {
+    if (input.generation !== 1) throw new OpenCodeLaunchAttemptError('generation')
+    if (input.continuationToken !== undefined) {
+      throw new OpenCodeLaunchAttemptError('launchAttempt.continuationToken')
+    }
+    return
+  }
   if (input.generation <= 1) throw new OpenCodeLaunchAttemptError('generation')
-  const expected = computeOpenCodeLaunchContinuationToken({
-    attemptId: input.attemptId,
-    payloadHash: input.payloadHash,
-    immutableDigest: input.immutableDigest,
-    completedGeneration: input.generation - 1,
-  })
-  if (input.continuationToken !== expected) {
+  if (!input.continuationToken) {
     throw new OpenCodeLaunchAttemptError('launchAttempt.continuationToken')
   }
 }
 
 export function createOpenCodeLaunchAttemptResult(
   input: OpenCodeLaunchContinuationIdentity & Omit<OpenCodeLaunchAttemptResult,
-    'attemptId' | 'payloadHash' | 'continuationToken'>,
+    'attemptId' | 'payloadHash'>,
 ): OpenCodeLaunchAttemptResult {
   const pending = [...new Set(input.pending)]
-  const canContinue = pending.length > 0
-    && (input.status === 'partial' || input.status === 'reconciliation_required')
   return {
     attemptId: input.attemptId,
     payloadHash: input.payloadHash,
     generation: input.generation,
+    inputDigest: input.inputDigest,
+    immutableDigest: input.immutableDigest,
     status: input.status,
     committed: [...input.committed],
+    failed: [...input.failed],
     pending,
-    ...(canContinue ? { continuationToken: computeOpenCodeLaunchContinuationToken({
-      attemptId: input.attemptId,
-      payloadHash: input.payloadHash,
-      immutableDigest: input.immutableDigest,
-      completedGeneration: input.generation,
-    }) } : {}),
+    cleanupPending: [...input.cleanupPending],
+    ...(input.continuationToken === undefined ? {} : { continuationToken: input.continuationToken }),
+    ...(input.acceptedProofResponse === undefined ? {} : { acceptedProofResponse: input.acceptedProofResponse }),
     ...(input.failure === undefined ? {} : { failure: input.failure }),
     cleanup: input.cleanup,
     absoluteDeadlineAtMs: input.absoluteDeadlineAtMs,
