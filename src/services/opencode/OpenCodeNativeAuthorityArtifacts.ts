@@ -57,7 +57,7 @@ export function verifyOpenCodeNativeAuthorityArtifacts(artifacts: OpenCodeNative
 
 export type OpenCodeNativeAuthorityChild = Readonly<{
   pid: number
-  stdin: { write(value: string): number; end(): void }
+  stdin: { write(value: string): number; flush(): number | Promise<number>; end(): void }
   stdout: ReadableStream<Uint8Array>
   exited: Promise<number>
   kill(signal?: NodeJS.Signals | number): void

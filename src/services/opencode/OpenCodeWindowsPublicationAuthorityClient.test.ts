@@ -9,7 +9,7 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
   const encoder = new TextEncoder(); const stdout = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
   const child = { pid: 123, stdout, exited: new Promise<number>(resolve => { resolveExit = resolve }), unref() {},
     kill() { kills += 1; if (exitOnKill) exit(-1) },
-    stdin: { end() { closes += 1 }, write(line: string) {
+    stdin: { end() { closes += 1 }, flush() { return 0 }, write(line: string) {
       const request = JSON.parse(line); requests.push(request); operations.push(request.op); const value = request.op === 'OPEN_ROOT'
         ? { volumeSerial: '1', fileId: '2', createdPaths: [] }
         : request.op === 'PIN_REGULAR' || request.op === 'PIN_REGULAR_READONLY'
@@ -52,6 +52,26 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
 }
 
 describe('OpenCodeWindowsPublicationAuthorityClient', () => {
+  test('flushes each buffered Bun stdin request before waiting for its reply', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>; let buffered = ''
+    const encoder = new TextEncoder(); const operations: string[] = []
+    const child = { pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
+      exited: new Promise<number>(() => {}), unref() {}, kill() { try { controller.close() } catch {} },
+      stdin: { end() {}, write(line: string) { buffered = line; return line.length }, async flush() {
+        await Promise.resolve()
+        const request = JSON.parse(buffered); operations.push(request.op)
+        controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1, id: request.id, ok: true,
+          value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
+        return buffered.length
+      } } }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
+      launch: () => child })
+    await expect(client.openRoot('C:\\safe', false, false)).resolves.toMatchObject({ fileId: '2' })
+    expect(operations).toEqual(['OPEN_ROOT'])
+    client.kill()
+  })
+
   test('cancels caller waits but preserves retained cleanup authority after owner loss', async () => {
     const process = fake(); const abort = new AbortController()
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
@@ -150,7 +170,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     const writes: Record<string, unknown>[] = []; const encoder = new TextEncoder()
     const child = { pid: 123, stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
       exited: new Promise<number>(() => {}), unref() {}, kill() { kills += 1; try { controller.close() } catch {} },
-      stdin: { end() {}, write(line: string) { writes.push(JSON.parse(line)); return line.length } } }
+      stdin: { end() {}, flush() { return 0 }, write(line: string) { writes.push(JSON.parse(line)); return line.length } } }
     const reply = (request: Record<string, unknown>, value: unknown) => controller.enqueue(encoder.encode(
       `${JSON.stringify({ version: 1, id: request.id, ok: true, value })}\n`))
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
@@ -169,7 +189,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     const encoder = new TextEncoder(); let writes = 0
     const child = { pid: 123, stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
       exited: new Promise<number>(() => {}), unref() {}, kill() { kills += 1; try { controller.close() } catch {} },
-      stdin: { end() {}, write(line: string) { const request = JSON.parse(line); writes += 1
+      stdin: { end() {}, flush() { return 0 }, write(line: string) { const request = JSON.parse(line); writes += 1
         if (writes === 1) controller.enqueue(encoder.encode(
           `${JSON.stringify({ version: 1, id: request.id, ok: true,
             value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`
@@ -186,7 +206,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     const encoder = new TextEncoder(); const operations: string[] = []
     const child = { pid: 123, stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
       exited: new Promise<number>(() => {}), unref() {}, kill() { kills += 1 },
-      stdin: { end() {}, write(line: string) { const request = JSON.parse(line); operations.push(request.op)
+      stdin: { end() {}, flush() { return 0 }, write(line: string) { const request = JSON.parse(line); operations.push(request.op)
         if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
           id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
         return line.length } } }
@@ -212,7 +232,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       exited: new Promise<number>(resolve => { resolveExit = resolve }),
       unref() { throw new Error('retained authority must remain referenced') },
       kill() { kills += 1; finish(-1) },
-      stdin: { end() {}, write(line: string) {
+      stdin: { end() {}, flush() { return 0 }, write(line: string) {
         const request = JSON.parse(line); operations.push(request.op)
         if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
           id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
@@ -233,7 +253,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     const encoder = new TextEncoder(); const abort = new AbortController()
     const child = { pid: 123, stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
       exited: new Promise<number>(() => {}), unref() {}, kill() { kills += 1 },
-      stdin: { end() {}, write(line: string) { const request = JSON.parse(line)
+      stdin: { end() {}, flush() { return 0 }, write(line: string) { const request = JSON.parse(line)
         if (request.op === 'OPEN_ROOT') controller.enqueue(encoder.encode(`${JSON.stringify({ version: 1,
           id: request.id, ok: true, value: { volumeSerial: '1', fileId: '2', createdPaths: [] } })}\n`))
         return line.length } } }
@@ -263,7 +283,7 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
       exited: new Promise<number>(resolve => { resolveExit = resolve }),
       unref() {},
       kill() { kills += 1; exit(-1) },
-      stdin: { end() { closes += 1 }, write(line: string) {
+      stdin: { end() { closes += 1 }, flush() { return 0 }, write(line: string) {
         const request = JSON.parse(line) as Record<string, unknown>; requests.push(request)
         if (request.op === 'OPEN_ROOT') {
           reply(request, { volumeSerial: '1', fileId: '2', createdPaths: [] })

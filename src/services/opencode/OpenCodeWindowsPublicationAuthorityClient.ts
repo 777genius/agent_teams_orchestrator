@@ -345,6 +345,11 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       this.#child.stdin.write(encoded)
+      // Bun.spawn exposes piped stdin as a buffered FileSink. A request keeps
+      // stdin open for subsequent commands, so write() alone is not a delivery
+      // boundary on Windows; end() happened only during failure cleanup, too
+      // late to establish the request/reply protocol boundary.
+      await this.#child.stdin.flush()
       const physical = Promise.race([this.#readLine(), this.#child.exited.then(() => { throw unavailable() })])
       const line = await Promise.race([physical,
         new Promise<never>((_, reject) => { timer = setTimeout(() => { this.kill(); reject(unavailable()) }, remaining); timer.unref?.() })])
