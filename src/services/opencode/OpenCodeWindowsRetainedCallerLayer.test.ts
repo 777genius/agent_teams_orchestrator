@@ -92,6 +92,9 @@ describe('OpenCode Windows retained caller layer', () => {
         operations.push(`lock:${key}`)
         return async () => { operations.push(`unlock:${key}`) }
       },
+      pinRegular: async (name: string, denyWrites: boolean) => {
+        operations.push(`pin:${name}:${denyWrites}`)
+      },
       namespaceRename: async (from: string, to: string) => { operations.push(`rename:${from}:${to}`) },
       namespaceSyncDirectory: async (key: string) => { operations.push(`sync:${key}`) },
       close: async () => { operations.push('close') },
@@ -101,6 +104,8 @@ describe('OpenCode Windows retained caller layer', () => {
     )
     expect(await directory.childNames()).toEqual(['owned'])
     expect(await directory.regularFileModifiedAt('owned')).toBe(123)
+    await directory.pinRegularFile('writer.sqlite3')
+    await directory.pinRegularFile('reader.sqlite3', true)
     await directory.publishImmutableFile('bridge.exe', 'complete', 0o500)
     await directory.retireChildDirectory('old', '.retired')
     const release = await directory.acquireRetainedLock('profile.lock', {
@@ -109,7 +114,9 @@ describe('OpenCode Windows retained caller layer', () => {
     await release()
     await directory.close()
     expect(operations).toEqual([
-      'list:.', 'validate', 'modified:owned:file', 'validate', 'immutable:bridge.exe:complete', 'sync:.',
+      'list:.', 'validate', 'modified:owned:file',
+      'pin:writer.sqlite3:false', 'pin:reader.sqlite3:true', 'validate',
+      'immutable:bridge.exe:complete', 'sync:.',
       'rename:old:.retired', 'remove-tree:.retired', 'sync:.',
       'lock:profile.lock', 'unlock:profile.lock', 'close',
     ])

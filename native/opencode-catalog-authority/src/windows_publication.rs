@@ -1231,7 +1231,7 @@ impl RetainedWindowsRoot {
         &mut self,
         parent_key: &str,
         name: &str,
-        _deny_writes: bool,
+        deny_writes: bool,
     ) -> Result<Value, &'static str> {
         if !valid_leaf(name) || (parent_key != "." && !valid_materialization_key(parent_key)) {
             return Err("LEAF_REJECTED");
@@ -1239,11 +1239,15 @@ impl RetainedWindowsRoot {
         self.validate()?;
         let (parent, identity) = self.retained_directory(parent_key)?;
         validate_retained_directory(parent, identity)?;
-        // The retained relative open is no-follow and denies write/delete
-        // sharing. The legacy PIN_REGULAR spelling remains wire-compatible;
-        // all consumers now receive the stronger content-stable lease.
-        let file = crate::windows_identity::open_relative_file(parent, Path::new(name))
-            .map_err(|_| "FILE_REJECTED")?;
+        // Writers retain object identity without delete sharing while allowing
+        // SQLite's own read-write handle. Passive readers additionally deny
+        // writes so their copied checkpoint is content-stable.
+        let file = if deny_writes {
+            crate::windows_identity::open_relative_file(parent, Path::new(name))
+        } else {
+            crate::windows_identity::pin_relative_writable_file(parent, Path::new(name))
+        }
+        .map_err(|_| "FILE_REJECTED")?;
         let metadata = file.metadata().map_err(|_| "FILE_REJECTED")?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("FILE_REJECTED");

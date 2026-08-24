@@ -137,4 +137,38 @@ describe('OpenCode passive transaction writer boundary', () => {
       expect(order).toEqual(['PIN', 'OPEN', 'DB_CLOSE', 'ROOT_CLOSE'])
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+
+  test.each(['error', 'cancel', 'close-error'] as const)(
+    'releases the retained root on %s after ownership begins', async mode => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `passive-sqlite-${mode}-`))
+      const order: string[] = []
+      const abort = new AbortController()
+      try {
+        const writer = new OpenCodePassiveStatusSnapshotWriter({
+          rootDirectory: root,
+          scheduleMaintenance: () => undefined,
+          safeStorageHooks: {
+            afterDatabasePinned: () => {
+              order.push('PIN')
+              if (mode === 'error') throw new Error('injected open failure')
+            },
+            afterGenerationDirectoryCreated: () => {
+              if (mode === 'cancel') abort.abort(new Error('injected cancellation'))
+            },
+            afterDatabaseClosed: () => {
+              order.push('DB_CLOSE')
+              if (mode === 'close-error') throw new Error('injected close failure')
+            },
+            afterRootClosed: () => { order.push('ROOT_CLOSE') },
+          },
+        })
+        await expect(writer.write(snapshot(), abort.signal)).rejects.toThrow(
+          mode === 'cancel' ? 'cancelled' : 'injected',
+        )
+        expect(order).toEqual(mode === 'error'
+          ? ['PIN', 'ROOT_CLOSE']
+          : ['PIN', 'DB_CLOSE', 'ROOT_CLOSE'])
+      } finally { await rm(root, { recursive: true, force: true }) }
+    },
+  )
 })

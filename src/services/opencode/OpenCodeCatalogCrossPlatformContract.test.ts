@@ -11,7 +11,9 @@ describe('native catalog cross-platform source contract', () => {
       resolveOpenCodeCatalogSourceArtifacts(root, platform, candidate => files.includes(candidate))
     const release = resolveOpenCodeCatalogSourceArtifacts(root, 'linux', () => true)
     expect(release.profile).toBe('release')
-    expect(release.launcherPath).toContain('/target/release/opencode-catalog-launcher')
+    expect(release.launcherPath).toBe(path.join(
+      root, 'native/opencode-catalog-launcher/target/release/opencode-catalog-launcher',
+    ))
 
     const debugFiles = [
       path.join(root, 'native/opencode-catalog-launcher/target/debug/opencode-catalog-launcher'),
@@ -19,7 +21,9 @@ describe('native catalog cross-platform source contract', () => {
     ]
     const debug = resolved('linux', debugFiles)
     expect(debug.profile).toBe('debug')
-    expect(debug.workerPath).toContain('/target/debug/opencode-catalog-authority')
+    expect(debug.workerPath).toBe(path.join(
+      root, 'native/opencode-catalog-authority/target/debug/opencode-catalog-authority',
+    ))
     const missing = resolved('win32', [])
     expect(missing.profile).toBe('missing')
     expect(missing.launcherPath).toEndWith('opencode-catalog-launcher.exe')
@@ -94,6 +98,7 @@ describe('native catalog cross-platform source contract', () => {
 
   test('Windows authority rejects reparse components and unverifiable non-local filesystems', async () => {
     const source = await readFile('native/opencode-catalog-authority/src/main.rs', 'utf8')
+    const publication = await readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8')
     const vfs = await readFile('native/opencode-catalog-authority/src/windows_vfs.rs', 'utf8')
     const identity = await readFile('native/opencode-catalog-authority/src/windows_identity.rs', 'utf8')
     expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
@@ -105,6 +110,8 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('windows_vfs::name()')
     expect(source).toContain('windows_vfs::release()')
     expect(source.match(/windows_vfs::release\(\)/g)?.length).toBe(1)
+    expect(publication).toContain('if deny_writes')
+    expect(publication).toContain('pin_relative_writable_file')
     expect(identity).toContain('root_directory: parent.as_raw_handle()')
     expect(identity).toContain('FILE_OPEN_IF makes creation/open one indivisible')
     expect(identity).toContain('0x0010_0000')
@@ -146,7 +153,7 @@ describe('native catalog cross-platform source contract', () => {
     const authority = await readFile('native/opencode-catalog-authority/src/main.rs', 'utf8')
     expect(launcherToml).toContain('version = "=0.61.2"')
     for (const lock of [launcherLock, authorityLock]) {
-      expect(lock).toMatch(/name = "windows-sys"\nversion = "0\.61\.2"/)
+      expect(lock).toMatch(/name = "windows-sys"\r?\nversion = "0\.61\.2"/)
     }
     for (const feature of ['Win32_Foundation', 'Win32_Security', 'Win32_Storage_FileSystem',
       'Win32_System_JobObjects', 'Win32_System_Threading']) expect(launcherToml).toContain(feature)

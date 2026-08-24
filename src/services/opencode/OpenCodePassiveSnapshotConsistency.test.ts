@@ -48,6 +48,28 @@ function snapshot(at: number, connected: boolean, version: string, generation?: 
 }
 
 function deferred() { let resolve!: () => void; return { promise: new Promise<void>(done => { resolve = done }), resolve } }
+async function runBoundedBunChild(source: string, timeoutMs = 20_000) {
+  const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+  const stdout = new Response(child.stdout).text()
+  const stderr = new Response(child.stderr).text()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`bounded fake child exceeded ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+  try {
+    const [exitCode, output, error] = await Promise.all([
+      Promise.race([child.exited, timeout]), stdout, stderr,
+    ])
+    return { exitCode, stdout: output, stderr: error }
+  } finally {
+    if (timer) clearTimeout(timer)
+    child.kill()
+    await child.exited
+  }
+}
 async function appendLegacy(
   root: string,
   value: OpenCodeRedactedSnapshotV1,
@@ -79,7 +101,9 @@ describe('OpenCode passive SQLite transaction consistency', () => {
         return [name, value.dev, value.ino, value.size, value.mode] as const
       }))
       try {
-        await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        await new OpenCodePassiveStatusSnapshotWriter({
+          rootDirectory: root, scheduleMaintenance: () => undefined,
+        })
           .write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
         const before = await entries()
         const observed = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
@@ -99,12 +123,11 @@ describe('OpenCode passive SQLite transaction consistency', () => {
           const observation={value:'configured',authority:'config_metadata',freshness:'fresh',condition:'normal',observedAt:1000,validUntil:301000,issueCode:'none'};
           const id=await mutateOpenCodePassiveSnapshot({rootDirectory:${JSON.stringify(root)}},{projectScope:${JSON.stringify(scope)},capturedAt:1000,providers:[{providerId:${JSON.stringify(providerId)},configured:observation}]},new AbortController().signal);
           console.log(id);`
-        return Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+        return runBoundedBunChild(source)
       })
-      const exits = await Promise.all(children.map(child => child.exited))
-      const errors = await Promise.all(children.map(async child => new Response(child.stderr).text()))
-      expect(exits.every(code => code === 0), errors.filter(Boolean).join('\n')).toBe(true)
-      const ids = await Promise.all(children.map(async child => Number((await new Response(child.stdout).text()).trim())))
+      const results = await Promise.all(children)
+      expect(results.every(child => child.exitCode === 0), results.map(child => child.stderr).filter(Boolean).join('\n')).toBe(true)
+      const ids = results.map(child => Number(child.stdout.trim()))
       expect(new Set(ids).size).toBe(32)
       expect(ids.every(Number.isSafeInteger)).toBe(true)
       const selected = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
@@ -124,8 +147,8 @@ describe('OpenCode passive SQLite transaction consistency', () => {
       const source = `import { mutateOpenCodePassiveSnapshot } from ${JSON.stringify(moduleUrl)};
         const o={value:'configured',authority:'config_metadata',freshness:'fresh',condition:'normal',observedAt:1,validUntil:300001,issueCode:'none'};
         await mutateOpenCodePassiveSnapshot({rootDirectory:${JSON.stringify(root)},hooks:{afterGenerationDirectoryCreated(){process.exit(77)}}},{projectScope:${JSON.stringify(scope)},capturedAt:1,providers:[{providerId:'deepinfra',configured:o}]},new AbortController().signal);`
-      const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'ignore', stderr: 'pipe' })
-      expect(await child.exited).toBe(77)
+      const child = await runBoundedBunChild(source)
+      expect(child.exitCode, child.stderr).toBe(77)
       await new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 2_000,
         canonicalizePath: async () => canonical, publicationDeadlineMs: 5_000 }).publishProviderUpdate({ projectPath: canonical,
           providerId: 'deepinfra', connected: false })

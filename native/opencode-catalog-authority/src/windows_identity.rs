@@ -293,6 +293,13 @@ pub(super) fn open_relative_file(parent: &File, component: &Path) -> Result<File
     open_relative_file_with_disposition(parent, component, 1, true)?.ok_or(())
 }
 
+/// Retains an existing file's identity while permitting the database owner to
+/// keep writing it. Delete sharing remains denied, so the pathname cannot be
+/// replaced before the retained authority closes.
+pub(super) fn pin_relative_writable_file(parent: &File, component: &Path) -> Result<File, ()> {
+    open_relative_file_with_sharing(parent, component, 0x1 | 0x2)?.ok_or(())
+}
+
 pub(super) fn open_relative_file_optional(
     parent: &File,
     component: &Path,
@@ -378,6 +385,60 @@ fn open_relative_file_with_disposition(
     {
         unsafe {
             drop(File::from_raw_handle(handle));
+        }
+        return Err(());
+    }
+    Ok(Some(unsafe { File::from_raw_handle(handle) }))
+}
+
+fn open_relative_file_with_sharing(
+    parent: &File,
+    component: &Path,
+    sharing: u32,
+) -> Result<Option<File>, ()> {
+    let mut name = component.as_os_str().encode_wide().collect::<Vec<_>>();
+    if name.is_empty()
+        || name.iter().any(|value| *value == 0)
+        || name.len() > (u16::MAX as usize / 2)
+    {
+        return Err(());
+    }
+    let mut unicode = UnicodeString {
+        length: (name.len() * 2) as u16,
+        maximum_length: (name.len() * 2) as u16,
+        buffer: name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: parent.as_raw_handle(),
+        object_name: &mut unicode,
+        attributes: 0x40,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            0x0010_0000 | 0x0000_0080 | 0x0000_0001,
+            &mut attributes,
+            &mut status,
+            std::ptr::null_mut(),
+            0,
+            sharing,
+            1, // FILE_OPEN
+            0x40 | 0x20 | 0x0020_0000,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result < 0 || handle.is_null() || status.information != 1 {
+        if !handle.is_null() {
+            unsafe { drop(File::from_raw_handle(handle)) };
         }
         return Err(());
     }
@@ -657,6 +718,26 @@ mod tests {
         delete_on_close(&temporary).unwrap();
         drop(temporary);
         drop(prior);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_pin_allows_database_writes_but_denies_replacement() {
+        let root = fixture("writable-pin");
+        let parent = directory(&root);
+        std::fs::write(root.join("passive.sqlite3"), b"before").unwrap();
+        let retained = pin_relative_writable_file(&parent, Path::new("passive.sqlite3")).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0x1 | 0x2 | 0x4)
+            .open(root.join("passive.sqlite3"))
+            .unwrap();
+        writer.write_all(b"after").unwrap();
+        writer.sync_all().unwrap();
+        assert!(std::fs::rename(root.join("passive.sqlite3"), root.join("replaced")).is_err());
+        drop(writer);
+        drop(retained);
         drop(parent);
         std::fs::remove_dir_all(root).unwrap();
     }

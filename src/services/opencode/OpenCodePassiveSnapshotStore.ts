@@ -212,8 +212,18 @@ async function commitOpenCodePassiveSnapshot(
       throw error
     }
   } finally {
-    if (database) { database.close(false); await options.hooks?.afterDatabaseClosed?.() }
-    await root.close(); await options.hooks?.afterRootClosed?.()
+    try {
+      if (database) {
+        try { database.close(false) } finally { await options.hooks?.afterDatabaseClosed?.() }
+      }
+    } finally {
+      try { await root.close() } finally {
+        // On Windows CLOSE acknowledgement precedes process exit. Do not return
+        // while the native process can still retain database/root handles.
+        await root.physicalSettlement
+        await options.hooks?.afterRootClosed?.()
+      }
+    }
   }
 }
 
@@ -307,13 +317,16 @@ export async function readOpenCodePassiveSnapshot(
     if (process.platform === 'win32') return null
     throw error
   } finally {
-    database?.close(false)
     let publicationChanged = false
-    if (windowsBaseline) {
-      const after = await directoryIdentitySnapshot(rootDirectory).catch(() => null)
-      publicationChanged = !after || !sameDirectoryIdentitySnapshot(windowsBaseline, after)
+    try {
+      database?.close(false)
+    } finally {
+      if (windowsBaseline) {
+        const after = await directoryIdentitySnapshot(rootDirectory).catch(() => null)
+        publicationChanged = !after || !sameDirectoryIdentitySnapshot(windowsBaseline, after)
+      }
+      await root?.close()
     }
-    await root?.close()
     if (publicationChanged) return null
   }
 }
@@ -334,7 +347,11 @@ export async function maintainOpenCodePassiveStore(rootDirectory: string, platfo
     verifySchema(database); database.exec('PRAGMA wal_checkpoint(PASSIVE)')
   } catch (error) {
     if (process.platform !== 'win32') throw error
-  } finally { database?.close(false); await root?.close() }
+  } finally {
+    try { database?.close(false) } finally {
+      try { await root?.close() } finally { await root?.physicalSettlement }
+    }
+  }
 }
 
 function openDatabase(rootDirectory: string, readonly: boolean): Database {

@@ -74,6 +74,7 @@ jobs:
           cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
           cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
       - name: Test publication protocol and integrations
+        timeout-minutes: 15
         run: >-
           bun test
           src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
