@@ -40,6 +40,21 @@ export type HostedControlBootstrapBinding = {
   proofKeyId: string
 }
 
+export type HostedApprovalActivationV2BootstrapExpectation = {
+  approvalGeneration: number
+  admissionOwnerGeneration: number
+  approvalDigest: `sha256:${string}`
+  admissionDocumentDigest: `sha256:${string}`
+  ownerArtifactDigest: `sha256:${string}`
+  wireCapabilityDigest: `sha256:${string}`
+  signedManifest: {
+    format: 'agent-teams.hosted-lifecycle-owner-admission/v4'
+    manifestDigest: `sha256:${string}`
+    releasePinDigest: `sha256:${string}`
+    launcherKeyId: string
+  }
+}
+
 export type HostedControlBootstrapHeader = {
   format: typeof HOSTED_CONTROL_BOOTSTRAP_FORMAT
   restoreGeneration: number
@@ -51,6 +66,7 @@ export type HostedControlBootstrapHeader = {
   claudeRoot: string
   socketPath: string
   legacyKey: string
+  approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
   bootstrapBinding: HostedControlBootstrapBinding
   leaseEvidence: HostedControlLeaseEvidence
 }
@@ -64,6 +80,7 @@ export type HostedControlDescriptorGuard = {
 export type HostedControlBootstrapAdmission = {
   config: Omit<HostedControlRuntimeConfig, 'secretFile'>
   bootstrapBinding: HostedControlBootstrapBinding
+  approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
   secret: Buffer
   guard: HostedControlDescriptorGuard
 }
@@ -71,11 +88,19 @@ export type HostedControlBootstrapAdmission = {
 const HEADER_KEYS = [
   'format', 'restoreGeneration', 'teamId', 'declaredRootHash', 'ownerAuthority',
   'ownerGeneration', 'ownerSessionId', 'claudeRoot', 'socketPath', 'legacyKey',
-  'bootstrapBinding', 'leaseEvidence',
+  'approvalActivationV2', 'bootstrapBinding', 'leaseEvidence',
 ] as const
 const BINDING_KEYS = [
   'deploymentId', 'bootId', 'workspaceId', 'mountGeneration', 'bootstrapDigest',
   'ownerArtifactDigest', 'proofKeyId',
+] as const
+const ACTIVATION_KEYS = [
+  'approvalGeneration', 'admissionOwnerGeneration', 'approvalDigest',
+  'admissionDocumentDigest', 'ownerArtifactDigest', 'wireCapabilityDigest',
+  'signedManifest',
+] as const
+const SIGNED_MANIFEST_KEYS = [
+  'format', 'manifestDigest', 'releasePinDigest', 'launcherKeyId',
 ] as const
 const EVIDENCE_KEYS = [
   'device', 'inode', 'uid', 'gid', 'mode', 'launcherLeaseId',
@@ -128,7 +153,9 @@ export async function readHostedControlBootstrap(options: {
       frame.fill(0)
     }
     await validateLeaseEvidence(launcherLeaseFd, descriptorStats[0], header.leaseEvidence)
-    validateBootstrapBinding(header.bootstrapBinding, header.leaseEvidence, secret)
+    validateBootstrapBinding(
+      header.bootstrapBinding, header.approvalActivationV2, header.leaseEvidence, secret,
+    )
     ensureBeforeDeadline(deadlineAt)
     const guard = createDescriptorGuard(launcherLeaseFd, livenessFd, header.leaseEvidence)
     const config: Omit<HostedControlRuntimeConfig, 'secretFile'> = {
@@ -146,7 +173,13 @@ export async function readHostedControlBootstrap(options: {
       ownerGeneration: header.ownerGeneration,
       ownerSessionId: header.ownerSessionId,
     }
-    const result = { config, bootstrapBinding: header.bootstrapBinding, secret, guard }
+    const result = {
+      config,
+      bootstrapBinding: header.bootstrapBinding,
+      approvalActivationV2: header.approvalActivationV2,
+      secret,
+      guard,
+    }
     admitted = true
     return result
   } catch {
@@ -170,6 +203,8 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
   const raw = exactRecord(unknown, HEADER_KEYS)
   if (JSON.stringify(raw) !== text) fail()
   const binding = exactRecord(raw.bootstrapBinding, BINDING_KEYS)
+  const activation = exactRecord(raw.approvalActivationV2, ACTIVATION_KEYS)
+  const signedManifest = exactRecord(activation.signedManifest, SIGNED_MANIFEST_KEYS)
   const evidence = exactRecord(raw.leaseEvidence, EVIDENCE_KEYS)
   const header: HostedControlBootstrapHeader = {
     format: exactString(raw.format, /^agent-teams\.hosted-control\.bootstrap\/v1$/) as typeof HOSTED_CONTROL_BOOTSTRAP_FORMAT,
@@ -182,6 +217,20 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
     claudeRoot: absoluteCanonicalPath(raw.claudeRoot),
     socketPath: absoluteCanonicalPath(raw.socketPath, 103),
     legacyKey: exactString(raw.legacyKey, /^[A-Za-z0-9_-]{1,128}$/),
+    approvalActivationV2: {
+      approvalGeneration: integer(activation.approvalGeneration, 1),
+      admissionOwnerGeneration: integer(activation.admissionOwnerGeneration, 1),
+      approvalDigest: exactString(activation.approvalDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+      admissionDocumentDigest: exactString(activation.admissionDocumentDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+      ownerArtifactDigest: exactString(activation.ownerArtifactDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+      wireCapabilityDigest: exactString(activation.wireCapabilityDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+      signedManifest: {
+        format: exactString(signedManifest.format, /^agent-teams\.hosted-lifecycle-owner-admission\/v4$/) as 'agent-teams.hosted-lifecycle-owner-admission/v4',
+        manifestDigest: exactString(signedManifest.manifestDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+        releasePinDigest: exactString(signedManifest.releasePinDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+        launcherKeyId: exactString(signedManifest.launcherKeyId, /^[0-9a-f]{64}$/),
+      },
+    },
     bootstrapBinding: {
       deploymentId: exactString(binding.deploymentId, ID),
       bootId: exactString(binding.bootId, ID),
@@ -206,11 +255,13 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
 
 function validateBootstrapBinding(
   binding: HostedControlBootstrapBinding,
+  activation: HostedApprovalActivationV2BootstrapExpectation,
   evidence: HostedControlLeaseEvidence,
   secret: Buffer,
 ): void {
   if (binding.ownerArtifactDigest !== `sha256:${evidence.launcherArtifactDigest}` ||
-    binding.proofKeyId !== createHash('sha256').update(secret).digest('hex')) fail()
+    binding.proofKeyId !== createHash('sha256').update(secret).digest('hex') ||
+    activation.ownerArtifactDigest !== binding.ownerArtifactDigest) fail()
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/

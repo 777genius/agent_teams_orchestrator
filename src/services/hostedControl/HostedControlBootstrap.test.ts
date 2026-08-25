@@ -108,6 +108,13 @@ describe('hosted control inherited-descriptor bootstrap', () => {
       (header: HostedControlBootstrapHeader) => ({ ...header, bootstrapBinding: {
         ...header.bootstrapBinding, proofKeyId: '0'.repeat(64),
       } }),
+      (header: HostedControlBootstrapHeader) => ({
+        ...header,
+        approvalActivationV2: {
+          ...header.approvalActivationV2,
+          ownerArtifactDigest: `sha256:${'0'.repeat(64)}`,
+        },
+      }),
     ]) {
       const fixture = await launchFixture(10_000)
       fixture.bootstrap.end(frame(mutate(fixture.header), fixture.secret))
@@ -152,6 +159,20 @@ function makeHeader(stat: Stats, digest: string): HostedControlBootstrapHeader {
     ownerAuthority: 'owner-authority_bootstrap-test', ownerGeneration: 4,
     ownerSessionId: 'owner-session_bootstrap-test', claudeRoot: '/sandbox/claude',
     socketPath: '/sandbox/control.sock', legacyKey: 'legacy',
+    approvalActivationV2: {
+      approvalGeneration: 7,
+      admissionOwnerGeneration: 11,
+      approvalDigest: `sha256:${'d'.repeat(64)}`,
+      admissionDocumentDigest: `sha256:${'e'.repeat(64)}`,
+      ownerArtifactDigest: `sha256:${digest}`,
+      wireCapabilityDigest: `sha256:${'f'.repeat(64)}`,
+      signedManifest: {
+        format: 'agent-teams.hosted-lifecycle-owner-admission/v4',
+        manifestDigest: `sha256:${'1'.repeat(64)}`,
+        releasePinDigest: `sha256:${'2'.repeat(64)}`,
+        launcherKeyId: '3'.repeat(64),
+      },
+    },
     bootstrapBinding: {
       deploymentId: 'deployment-test', bootId: 'boot-test', workspaceId: 'workspace-test',
       mountGeneration: 3, bootstrapDigest: 'c'.repeat(64),

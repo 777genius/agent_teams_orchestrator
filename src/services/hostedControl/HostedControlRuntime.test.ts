@@ -60,6 +60,7 @@ describe('HostedControlRuntime', () => {
         ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
         proofKeyId: createHash('sha256').update(activationSecret).digest('hex'),
       },
+      approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
       secret: activationSecret,
       guard: {
         lost: new Promise<void>(() => undefined),
@@ -98,6 +99,12 @@ describe('HostedControlRuntime', () => {
     })
     runtimes.push(runtime)
     await runtime.start()
+    expect(context.activationV2?.expectation).toEqual({
+      authority: context.authority,
+      socketPath,
+      ...admission.approvalActivationV2,
+    })
+    expect(context.activationV2?.proofKey).toBe(activationSecret)
     expect(await context.isCurrentAuthority({ actorId: 'before-readiness', ...context.authority })).toBe(false)
 
     const activation = await openActivationStream(socketPath)
@@ -160,6 +167,7 @@ describe('HostedControlRuntime', () => {
         ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
         proofKeyId: 'f'.repeat(64),
       },
+      approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
       secret: Buffer.alloc(32, 0xa5),
       guard: {
         lost,
@@ -172,6 +180,7 @@ describe('HostedControlRuntime', () => {
       return {
         lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
         messages: { dispatch: async () => ({}) },
+        revoke: async () => { actions.push('approval-fenced') },
         close: async () => {
           actions.push('exact-run-stop')
           compensationStarted()
@@ -185,6 +194,7 @@ describe('HostedControlRuntime', () => {
 
     loseAuthority()
     await enteredCompensation
+    expect(actions).toEqual(['approval-fenced', 'exact-run-stop'])
     expect(runtime.server).toBeNull()
     expect(await portContext.isCurrentAuthority({
       actorId: 'after-descriptor-loss', ...portContext.authority,
@@ -193,11 +203,11 @@ describe('HostedControlRuntime', () => {
     const stopping = runtime.stop().then(() => { stopped = true })
     await Bun.sleep(0)
     expect(stopped).toBe(false)
-    expect(actions).toEqual(['exact-run-stop'])
+    expect(actions).toEqual(['approval-fenced', 'exact-run-stop'])
 
     releaseCompensation()
     await stopping
-    expect(actions).toEqual(['exact-run-stop', 'drained'])
+    expect(actions).toEqual(['approval-fenced', 'exact-run-stop', 'drained'])
   })
 
   test('retains descriptor authority through runtime lifetime and zeroes the admitted key on stop', async () => {
@@ -227,6 +237,7 @@ describe('HostedControlRuntime', () => {
         ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
         proofKeyId: 'f'.repeat(64),
       },
+      approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
       secret,
       guard: {
         lost: new Promise<void>(() => undefined),
@@ -718,4 +729,21 @@ async function waitForRuntime(predicate: () => boolean): Promise<void> {
     await Bun.sleep(2)
   }
   throw new Error('condition was not reached')
+}
+
+function activationBootstrapExpectation(ownerArtifactDigest: `sha256:${string}`) {
+  return {
+    approvalGeneration: 7,
+    admissionOwnerGeneration: 11,
+    approvalDigest: `sha256:${'1'.repeat(64)}` as const,
+    admissionDocumentDigest: `sha256:${'2'.repeat(64)}` as const,
+    ownerArtifactDigest,
+    wireCapabilityDigest: `sha256:${'3'.repeat(64)}` as const,
+    signedManifest: {
+      format: 'agent-teams.hosted-lifecycle-owner-admission/v4' as const,
+      manifestDigest: `sha256:${'4'.repeat(64)}` as const,
+      releasePinDigest: `sha256:${'5'.repeat(64)}` as const,
+      launcherKeyId: '6'.repeat(64),
+    },
+  }
 }
