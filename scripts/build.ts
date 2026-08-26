@@ -708,11 +708,25 @@ function repositoryRelativePath(path: string, root = repositoryRoot): string {
   return relation.split(sep).join('/')
 }
 
-function readStableBytes(path: string, label: string, allowRootOwner = false): {
+function readStableBytes(
+  path: string,
+  label: string,
+  allowRootOwner = false,
+  trustRoot?: string,
+): {
   bytes: Buffer
   stat: BigIntStats
 } {
   const absolutePath = resolve(path)
+  if (trustRoot !== undefined) {
+    const absoluteRoot = realpathSync(resolve(trustRoot))
+    const realPath = realpathSync(absolutePath)
+    const relation = relative(absoluteRoot, realPath)
+    if (relation === '' || relation === '..' || relation.startsWith(`..${sep}`) ||
+      isAbsolute(relation)) {
+      throw new Error(`Hosted actual-owner ${label} escaped its trust root`)
+    }
+  }
   const linked = lstatSync(absolutePath, { bigint: true })
   const currentUid = process.getuid?.()
   const ownerTrusted = currentUid === undefined || linked.uid === BigInt(currentUid) ||
@@ -741,7 +755,7 @@ function readStableBytes(path: string, label: string, allowRootOwner = false): {
 function sourceInputIdentity(path: string, root = repositoryRoot): SourceInputIdentity {
   const relativePath = repositoryRelativePath(path, root)
   const snapshot = readStableBytes(
-    resolve(root, relativePath), `source input: ${relativePath}`,
+    resolve(root, relativePath), `source input: ${relativePath}`, false, root,
   )
   if (snapshot.bytes.byteLength === 0) {
     throw new Error(`Hosted actual-owner source input is empty: ${relativePath}`)
@@ -1052,7 +1066,9 @@ if (committedSourcePrint) {
     mkdirSync(staging, { mode: 0o700 })
     const root = materializeCommittedBuildRoot(staging)
     const relativePath = repositoryRelativePath(requested, root)
-    const snapshot = readStableBytes(join(root, relativePath), 'committed source test')
+    const snapshot = readStableBytes(
+      join(root, relativePath), 'committed source test', false, root,
+    )
     const sha256 = createHash('sha256').update(snapshot.bytes).digest('hex')
     console.log(committedSourcePrint.startsWith('--test-print-committed-source-identity=')
       ? JSON.stringify({

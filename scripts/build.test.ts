@@ -305,6 +305,43 @@ int main(void) {
       entry.startsWith('.committed-source-test-'))).toEqual([])
   })
 
+  test('fails closed beneath an intermediate symlink in the dependency snapshot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-owner-dependency-traversal-'))
+    fixtureRoots.push(root)
+    await mkdir(join(root, 'scripts'), { recursive: true })
+    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await writeFile(join(root, 'package.json'), JSON.stringify({
+      name: 'dependency-traversal-fixture', version: '1.0.0',
+    }))
+    const outside = join(root, 'outside-dependency')
+    const outsideFile = join(outside, 'payload.mjs')
+    const outsideBytes = Buffer.from('export const escaped = true\n')
+    await mkdir(outside)
+    await writeFile(outsideFile, outsideBytes)
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await symlink(outside, join(root, 'node_modules', 'linked-dependency'), 'dir')
+    for (const command of [
+      ['init', '-q'], ['config', 'user.email', 'test@example.invalid'],
+      ['config', 'user.name', 'test'], ['add', 'scripts/build.ts', 'package.json'],
+      ['commit', '-qm', 'fixture'],
+    ]) {
+      expect(spawnSync('/usr/bin/git', command, { cwd: root }).status).toBe(0)
+    }
+
+    const result = spawnSync(process.execPath, [
+      'run', join(root, 'scripts', 'build.ts'),
+      '--test-print-committed-source-identity=' +
+        'node_modules/linked-dependency/payload.mjs',
+    ], { cwd: root, encoding: 'utf8' })
+
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain(sha256(outsideBytes))
+    expect(result.stderr).toContain('escaped its trust root')
+    expect(await readFile(outsideFile)).toEqual(outsideBytes)
+    expect((await readdir(root)).filter(entry =>
+      entry.startsWith('.committed-source-test-'))).toEqual([])
+  })
+
   test('converges identical publishers and truthfully installs a later distinct generation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-publication-winner-'))
     fixtureRoots.push(root)
