@@ -134,7 +134,7 @@ describe('release build feature plan', () => {
     expect(source).not.toMatch(/['"`]--metafile['"`]\s*,/)
   })
 
-  test('publishes an ordinary CLI bundle without entering the Linux owner boundary', async () => {
+  test('publishes a portable CLI bundle without deleting a preinstalled owner pair', async () => {
     const root = await mkdtemp(join(tmpdir(), 'portable-cli-publication-'))
     fixtureRoots.push(root)
     await mkdir(join(root, 'scripts'), { recursive: true })
@@ -144,8 +144,16 @@ describe('release build feature plan', () => {
     }))
     const staging = join(root, 'staging')
     const finalOut = join(root, 'dist', 'local-cli-dev')
+    const finalWrapper = join(root, 'bin', 'hosted-actual-owner-acceptance')
+    const wrapperBytes = Buffer.from('\x7fELF:preinstalled-wrapper')
+    const ownerBytes = Buffer.from(`\x7fELF:preinstalled-owner:${sha256(wrapperBytes)}`)
+    const ownerName = `hostedActualOwnerLauncher-${sha256(ownerBytes)}`
     await mkdir(staging)
+    await mkdir(finalOut, { recursive: true })
+    await mkdir(dirname(finalWrapper), { recursive: true })
     await writeFile(join(staging, 'cli.js'), 'portable-cli-bundle\n')
+    await writeFile(join(finalOut, ownerName), ownerBytes, { mode: 0o555 })
+    await writeFile(finalWrapper, wrapperBytes, { mode: 0o555 })
 
     const result = spawnSync(process.execPath, [
       'run', join(root, 'scripts', 'build.ts'),
@@ -158,6 +166,10 @@ describe('release build feature plan', () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
     expect(result.signal).toBeNull()
     expect(await readFile(join(finalOut, 'cli.js'), 'utf8')).toBe('portable-cli-bundle\n')
+    expect(await readFile(join(finalOut, ownerName))).toEqual(ownerBytes)
+    expect(await readFile(finalWrapper)).toEqual(wrapperBytes)
+    expect((await lstat(join(finalOut, ownerName))).mode & 0o777).toBe(0o555)
+    expect((await lstat(finalWrapper)).mode & 0o777).toBe(0o555)
   })
 
   test('uses Bun-supported negative compile autoload flags for the generated wrapper', async () => {

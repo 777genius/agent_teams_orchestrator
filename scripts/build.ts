@@ -1617,11 +1617,13 @@ function publishBuildGeneration(
       renameSync(wrapperStaging, wrapperFinal)
       chmodSync(wrapperFinal, 0o555)
     }
-    const publishedOwners = readdirSync(finalOutdir).filter(entry =>
-      /^hostedActualOwnerLauncher-[0-9a-f]{64}$/.test(entry),
-    )
-    for (const entry of publishedOwners) {
-      if (entry !== candidateOwnerName) unlinkSync(join(finalOutdir, entry))
+    if (candidateDigest) {
+      const publishedOwners = readdirSync(finalOutdir).filter(entry =>
+        /^hostedActualOwnerLauncher-[0-9a-f]{64}$/.test(entry),
+      )
+      for (const entry of publishedOwners) {
+        if (entry !== candidateOwnerName) unlinkSync(join(finalOutdir, entry))
+      }
     }
     rmdirSync(stagingOutdir)
     if (!candidateOwnerName || !wrapperFinal) return null
