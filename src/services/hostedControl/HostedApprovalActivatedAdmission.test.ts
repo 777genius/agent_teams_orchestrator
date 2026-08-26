@@ -167,6 +167,47 @@ describe('C1 verified activated-admission adapter', () => {
     }
   })
 
+  test('rename-away then restore permanently seals the activation epoch', async () => {
+    let delegatedEffects = 0
+    const harness = await createHarness({
+      delegate: wire({
+        deliverDecision: async () => {
+          delegatedEffects += 1
+          return { status: 'delivered' }
+        },
+      }),
+    })
+    const token = await harness.admission.prepareEffectToken()
+    const away = `${harness.path}.away`
+
+    await rename(harness.path, away)
+    await rename(away, harness.path)
+
+    expect(await harness.admission.isCurrent()).toBe(false)
+    expect(harness.port.lifecycle).toMatchObject({ status: 'revoked', sealed: true })
+    expect(harness.guard.isCurrent()).toBe(false)
+    expect(token?.consume()).toBe(false)
+    expect(await harness.port.deliverDecision({} as never)).toEqual({ status: 'unavailable' })
+    expect(delegatedEffects).toBe(0)
+  })
+
+  test('mutate bytes then restore permanently seals the activation epoch', async () => {
+    const harness = await createHarness()
+    const token = await harness.admission.prepareEffectToken()
+    const original = Buffer.from(harness.activation.canonicalAdmissionDocument)
+    const changed = Buffer.from(original)
+    changed[1] = changed[1] === 0x61 ? 0x62 : 0x61
+
+    await writeFile(harness.path, changed, { mode: 0o600 })
+    await writeFile(harness.path, original, { mode: 0o600 })
+
+    expect(await harness.admission.isCurrent()).toBe(false)
+    expect(harness.port.lifecycle).toMatchObject({ status: 'revoked', sealed: true })
+    expect(harness.guard.isCurrent()).toBe(false)
+    expect(token?.consume()).toBe(false)
+    expect(await harness.admission.prepareEffectToken()).toBeNull()
+  })
+
   test('fails closed when the retained socket cannot prepare or consume its exact token', async () => {
     const prepareFailure = await createHarness()
     prepareFailure.socket.allowPrepare = false

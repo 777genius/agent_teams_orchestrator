@@ -47,9 +47,11 @@ export type HostedApprovalActivatedAdmissionOptions = {
 }
 
 type RawAdmissionIdentity = Readonly<{
-  dev: number | bigint
-  ino: number | bigint
-  size: number
+  dev: bigint
+  ino: bigint
+  size: bigint
+  ctimeNs: bigint
+  mtimeNs: bigint
   bytes: Buffer
 }>
 
@@ -79,15 +81,21 @@ export function loadHostedApprovalActivatedAdmission(
   const digest = bareGlobalDigest(activation, canonicalBytes)
   const epoch = activationGuard.epoch
 
-  const synchronouslyCurrent = (): boolean => {
+  const rawArtifactCurrent = (): boolean => {
+    let current = false
     try {
-      return activationGuard.epoch === epoch &&
-        activationGuard.isCurrent() &&
-        activationSocket.isCurrent() &&
-        rawAdmissionCurrent(rawAdmissionPath, identity)
-    } catch {
-      return false
-    }
+      current = rawAdmissionCurrent(rawAdmissionPath, identity)
+    } catch {}
+    if (!current) activationGuard.seal()
+    return current
+  }
+
+  const synchronouslyCurrent = (): boolean => {
+    const rawCurrent = rawArtifactCurrent()
+    try {
+      return rawCurrent && activationGuard.epoch === epoch &&
+        activationGuard.isCurrent() && activationSocket.isCurrent()
+    } catch { return false }
   }
 
   return Object.freeze({
@@ -110,8 +118,7 @@ export function loadHostedApprovalActivatedAdmission(
       synchronouslyCurrent,
       activationGuard,
       activationSocket,
-      rawAdmissionPath,
-      identity,
+      rawArtifactCurrent,
     )),
   })
 }
@@ -190,18 +197,19 @@ function loadExactPrivateAdmission(path: string, expected: Buffer): RawAdmission
   let fd = -1
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    const opened = fstatSync(fd)
-    const linked = lstatSync(path)
-    if (!safePrivateIdentity(opened, linked) || opened.size !== expected.byteLength) {
+    const opened = fstatSync(fd, { bigint: true })
+    const linked = lstatSync(path, { bigint: true })
+    if (!safePrivateIdentity(opened, linked) || opened.size !== BigInt(expected.byteLength)) {
       throw new Error('Hosted approval raw admission is not an exact private file')
     }
-    const bytes = readExact(fd, opened.size)
-    const after = fstatSync(fd)
-    const current = lstatSync(path)
+    const bytes = readExact(fd, Number(opened.size))
+    const after = fstatSync(fd, { bigint: true })
+    const current = lstatSync(path, { bigint: true })
     if (
       !safePrivateIdentity(after, current) ||
       after.dev !== opened.dev || after.ino !== opened.ino ||
-      after.size !== opened.size || !bytes.equals(expected)
+      after.size !== opened.size || after.ctimeNs !== opened.ctimeNs ||
+      after.mtimeNs !== opened.mtimeNs || !bytes.equals(expected)
     ) {
       throw new Error('Hosted approval raw admission bytes do not match verified activation')
     }
@@ -209,6 +217,8 @@ function loadExactPrivateAdmission(path: string, expected: Buffer): RawAdmission
       dev: opened.dev,
       ino: opened.ino,
       size: opened.size,
+      ctimeNs: opened.ctimeNs,
+      mtimeNs: opened.mtimeNs,
       bytes: Buffer.from(bytes),
     })
   } catch (error) {
@@ -223,19 +233,21 @@ function rawAdmissionCurrent(path: string, expected: RawAdmissionIdentity): bool
   let fd = -1
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    const opened = fstatSync(fd)
-    const linked = lstatSync(path)
+    const opened = fstatSync(fd, { bigint: true })
+    const linked = lstatSync(path, { bigint: true })
     if (
       !safePrivateIdentity(opened, linked) ||
       opened.dev !== expected.dev || opened.ino !== expected.ino ||
-      opened.size !== expected.size
+      opened.size !== expected.size || opened.ctimeNs !== expected.ctimeNs ||
+      opened.mtimeNs !== expected.mtimeNs
     ) return false
-    const bytes = readExact(fd, opened.size)
-    const after = fstatSync(fd)
-    const current = lstatSync(path)
+    const bytes = readExact(fd, Number(opened.size))
+    const after = fstatSync(fd, { bigint: true })
+    const current = lstatSync(path, { bigint: true })
     return safePrivateIdentity(after, current) &&
       after.dev === expected.dev && after.ino === expected.ino &&
-      after.size === expected.size && bytes.equals(expected.bytes)
+      after.size === expected.size && after.ctimeNs === expected.ctimeNs &&
+      after.mtimeNs === expected.mtimeNs && bytes.equals(expected.bytes)
   } catch {
     return false
   } finally {
@@ -247,8 +259,7 @@ function prepareCombinedEffectToken(
   synchronouslyCurrent: () => boolean,
   activationGuard: HostedApprovalActivationGuard,
   activationSocket: HostedApprovalRetainedActivationSocket,
-  rawAdmissionPath: string,
-  identity: RawAdmissionIdentity,
+  rawArtifactCurrent: () => boolean,
 ): { consume(): boolean } | null {
   if (!synchronouslyCurrent()) return null
   const activationToken = activationGuard.prepareEffectToken()
@@ -266,7 +277,7 @@ function prepareCombinedEffectToken(
       consumed = true
       // Evaluate every constituent fence even after one fails so no prepared
       // single-use capability remains live after this combined attempt.
-      const rawCurrent = rawAdmissionCurrent(rawAdmissionPath, identity)
+      const rawCurrent = rawArtifactCurrent()
       const socketCurrent = consumePreparedToken(socketToken)
       const epochCurrent = consumePreparedToken(activationToken)
       return rawCurrent && socketCurrent && epochCurrent
@@ -294,15 +305,15 @@ function readExact(fd: number, size: number): Buffer {
 
 function safePrivateIdentity(
   opened: {
-    dev: number | bigint
-    ino: number | bigint
-    mode: number
-    uid: number
+    dev: bigint
+    ino: bigint
+    mode: bigint
+    uid: bigint
     isFile(): boolean
   },
   linked: {
-    dev: number | bigint
-    ino: number | bigint
+    dev: bigint
+    ino: bigint
     isFile(): boolean
     isSymbolicLink(): boolean
   },
@@ -310,6 +321,6 @@ function safePrivateIdentity(
   const ownerUid = process.geteuid?.() ?? process.getuid?.()
   return opened.isFile() && linked.isFile() && !linked.isSymbolicLink() &&
     opened.dev === linked.dev && opened.ino === linked.ino &&
-    (opened.mode & 0o7777) === 0o600 &&
-    (ownerUid === undefined || opened.uid === ownerUid)
+    (opened.mode & 0o7777n) === 0o600n &&
+    (ownerUid === undefined || opened.uid === BigInt(ownerUid))
 }

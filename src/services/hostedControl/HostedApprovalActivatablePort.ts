@@ -15,6 +15,8 @@ export type HostedApprovalActivationGuard = {
   readonly epoch: number
   /** True only while this exact activation attempt remains recovering or active. */
   isCurrent(): boolean
+  /** Permanently seals this exact attempt at a synchronous revocation boundary. */
+  seal(): void
   /** Available only after the delegate has been installed. */
   prepareEffectToken(): HostedApprovalActivationEffectToken | null
   /** The delegate reference is installed synchronously at this call boundary. */
@@ -66,6 +68,7 @@ export class HostedApprovalActivatablePort implements HostedApprovalWirePort {
     return Object.freeze({
       epoch,
       isCurrent: () => this.#isCurrentAttempt(epoch, attempt),
+      seal: () => this.#seal(epoch, attempt),
       prepareEffectToken: () => this.#prepareEffectToken(epoch, attempt),
       install: (delegate: HostedApprovalWirePort) => this.#install(epoch, attempt, delegate),
     })
@@ -146,6 +149,14 @@ export class HostedApprovalActivatablePort implements HostedApprovalWirePort {
     const lifecycle = this.#lifecycle
     return (lifecycle.status === 'recovering' || lifecycle.status === 'active') &&
       lifecycle.epoch === epoch && lifecycle.attempt === attempt
+  }
+
+  #seal(epoch: number, attempt: symbol): void {
+    if (!this.#isCurrentAttempt(epoch, attempt)) return
+    // Artifact observers cannot await cleanup. Clearing the delegate and
+    // advancing the epoch here is the complete synchronous authorization
+    // boundary; session shutdown remains responsible for resource cleanup.
+    this.#lifecycle = { status: 'revoked', epoch: epoch + 1, sealed: true }
   }
 
   #prepareEffectToken(
