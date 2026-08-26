@@ -253,6 +253,68 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
+  test('replacement owner adopts a persisted running tuple and shutdown stops that exact run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-restart-shutdown-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    const crashedOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await crashedOwner.inspect(plan)
+    const launching = await crashedOwner.launch({
+      plan,
+      commandId: 'command-before-crash',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const persisted = await waitForPhase(crashedOwner, 'running')
+    expect(persisted.runId).toBe(launching.runId)
+
+    // Do not close or shut down the first instance: abandoning it models a
+    // process crash while the provider run and durable running tuple survive.
+    const replacementOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
+      phase: 'running',
+      runId: persisted.runId,
+    })
+    await replacementOwner.shutdown()
+
+    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+    expect(lane.stoppedApprovalModes).toEqual(['manual'])
+    await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
+      phase: 'idle',
+      runId: null,
+    })
+  })
+
+  test('replacement owner cleans the exact persisted tuple when running adoption fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-restart-failed-adoption-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    const crashedOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await crashedOwner.inspect(plan)
+    await crashedOwner.launch({
+      plan,
+      commandId: 'command-before-failed-adoption',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const persisted = await waitForPhase(crashedOwner, 'running')
+    lane.inspectResult = { phase: 'failed', recoverable: true }
+
+    const replacementOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    await expect(replacementOwner.inspect(plan)).rejects.toThrow(
+      'Unable to adopt recovered team lifecycle run',
+    )
+    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+
+    lane.inspectResult = null
+    await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
+      phase: 'idle',
+      runId: null,
+    })
+  })
+
   test('keeps an in-process launch authoritative until its effect job commits', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-inflight-'))
     roots.push(root)

@@ -86,9 +86,13 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         // Stop completion is only authoritative while its local job is still owned.
         state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
       } else if (state.phase === 'running' && state.runId) {
-        const observations = await this.#inspectLanes(plan, state.runId)
-        if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
-          state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
+        if (!this.#ownedRuns.has(state.runId)) {
+          state = await this.#adoptRecoveredRunning(plan, state)
+        } else {
+          const observations = await this.#inspectLanes(plan, state.runId)
+          if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
+            state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
+          }
         }
       }
       return snapshot(this.providerId, state)
@@ -261,6 +265,49 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     const next = launchCompletion(observations)
     if (next.phase === 'launching') return state
     return this.#write({ ...state, phase: next.phase, recoverable: next.recoverable }, plan)
+  }
+
+  async #adoptRecoveredRunning(
+    plan: TeamLifecycleLaunchPlan,
+    state: DurableState & { runId: string },
+  ): Promise<DurableState> {
+    let observations: TeamLifecycleLaneObservation[]
+    try {
+      observations = await this.#inspectLanes(plan, state.runId)
+    } catch (error) {
+      await this.#failRecoveredRunning(plan, state, error)
+    }
+    if (observations!.every(observation => observation.phase === 'running')) {
+      // Reading the exact durable plan/run tuple under the replacement runtime's
+      // exclusive authority is its adoption boundary. From this point shutdown
+      // must compensate the recovered external run just like a local launch.
+      this.#ownedRuns.add(state.runId)
+      return state
+    }
+    await this.#failRecoveredRunning(
+      plan,
+      state,
+      new Error('Recovered team lifecycle lanes do not confirm the exact running tuple'),
+    )
+  }
+
+  async #failRecoveredRunning(
+    plan: TeamLifecycleLaunchPlan,
+    state: DurableState & { runId: string },
+    cause: unknown,
+  ): Promise<never> {
+    let stopped = false
+    try {
+      stopped = (await this.#applyLanesForTeardown(plan, state.runId))
+        .every(observation => observation.phase === 'idle')
+    } catch {}
+    await this.#write({
+      ...state,
+      phase: stopped ? 'idle' : 'failed',
+      runId: stopped ? null : state.runId,
+      recoverable: !stopped,
+    }, plan)
+    throw new Error('Unable to adopt recovered team lifecycle run', { cause })
   }
 
   #trackJob(runId: string, operation: Promise<void>): void {
