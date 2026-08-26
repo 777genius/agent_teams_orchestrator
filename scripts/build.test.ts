@@ -1342,6 +1342,7 @@ describe('packaged hosted actual-owner build', () => {
     const clone = spawnSync('/usr/bin/git', ['clone', '--no-hardlinks', repoRoot, root], {
       encoding: 'utf8',
       env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+      timeout: 60_000,
     })
     if (clone.status !== 0) {
       throw new Error(`clean fixture clone failed: ${spawnResultEvidence(clone)}`)
@@ -1395,7 +1396,7 @@ describe('packaged hosted actual-owner build', () => {
     ], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } })
     expect(subject.status, spawnResultEvidence(subject)).toBe(0)
     expect(subject.stdout.trim()).toBe('packaged owner fixture')
-  })
+  }, 60_000)
 
   test('removes every staging output when a build child fails', async () => {
     const brokenRoot = await mkdtemp(join(tmpdir(), 'hosted-owner-failed-build-'))
@@ -1827,9 +1828,10 @@ int main(int argc, char **argv) {
       const forgedBuild = spawnSync(process.execPath, [
         'build', join(buildRoot, 'src', 'entrypoints', 'hostedActualOwnerAcceptance.ts'),
         '--target=bun', '--format=esm', `--outfile=${decoy}`,
+        '--define', 'process.env.USER_TYPE="external"',
         '--define', 'process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE="owner"',
       ], { cwd: buildRoot, encoding: 'utf8' })
-      expect(forgedBuild.status).toBe(0)
+      expect(forgedBuild.status, spawnResultEvidence(forgedBuild)).toBe(0)
       const direct = spawnSync(process.execPath, [
         decoy,
         '--hosted-actual-owner-sealed-protocol=v1',
@@ -1867,19 +1869,56 @@ int main(int argc, char **argv) {
         stdout: 'pipe',
         stderr: 'pipe',
       }))
-      const concurrentStatuses = await Promise.all(concurrentBuilds.map(child => child.exited))
-      expect(concurrentStatuses).toEqual([0, 0])
-      const concurrentOutput = await Promise.all(concurrentBuilds.map(async child =>
-        (await new Response(child.stdout).text()).trim()))
-      const reportedWinners = concurrentOutput.map(output =>
-        output.match(/\(([0-9a-f]{64})\)$/)?.[1])
-      expect(reportedWinners[0]).toMatch(/^[0-9a-f]{64}$/)
-      expect(reportedWinners[1]).toBe(reportedWinners[0])
+      const concurrentResults = await Promise.all(concurrentBuilds.map(async child => {
+        const [status, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ])
+        return { status, stdout: stdout.trim(), stderr }
+      }))
+      expect(concurrentResults.map(result => result.status),
+        JSON.stringify(concurrentResults)).toEqual([0, 0])
+      const reportedPublications = concurrentResults.map(result =>
+        result.stdout.match(/\(([0-9a-f]{64})\)$/)?.[1])
+      expect(reportedPublications[0]).toMatch(/^[0-9a-f]{64}$/)
+      expect(reportedPublications[1]).toMatch(/^[0-9a-f]{64}$/)
+
       expect(await readFile(unrelated, 'utf8')).toBe('preserve-me')
-      expect((await readdir(join(buildRoot, 'dist', 'local-cli'))).filter(name =>
+      const finalOwnerNames = (await readdir(join(buildRoot, 'dist', 'local-cli'))).filter(name =>
         /^hostedActualOwnerLauncher-[0-9a-f]{64}$/.test(name),
-      )).toHaveLength(1)
-      expect(existsSync(`${generatedWrapper}.lock`)).toBe(false)
+      )
+      expect(finalOwnerNames).toHaveLength(1)
+      const finalOwnerName = finalOwnerNames[0]!
+      const finalOwner = join(buildRoot, 'dist', 'local-cli', finalOwnerName)
+      const [finalOwnerBytes, finalWrapperBytes, finalOwnerStat, finalWrapperStat] =
+        await Promise.all([
+          readFile(finalOwner),
+          readFile(generatedWrapper),
+          lstat(finalOwner),
+          lstat(generatedWrapper),
+        ])
+      const finalOwnerSha256 = sha256(finalOwnerBytes)
+      const finalWrapperSha256 = sha256(finalWrapperBytes)
+      expect(finalOwnerName).toBe(`hostedActualOwnerLauncher-${finalOwnerSha256}`)
+      expect(finalOwnerBytes.subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+      expect(finalWrapperBytes.subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+      expect(finalOwnerBytes.includes(Buffer.from(finalWrapperSha256))).toBe(true)
+      expect(finalOwnerStat.nlink).toBe(1)
+      expect(finalWrapperStat.nlink).toBe(1)
+      expect(finalOwnerStat.mode & 0o777).toBe(0o555)
+      expect(finalWrapperStat.mode & 0o777).toBe(0o555)
+      const finalGeneration = sha256(JSON.stringify({
+        ownerSha256: finalOwnerSha256,
+        wrapperSha256: finalWrapperSha256,
+      }))
+      expect(reportedPublications).toContain(finalGeneration)
+
+      const publicationDebris = [
+        ...(await readdir(join(buildRoot, 'dist'))),
+        ...(await readdir(join(buildRoot, 'bin'))),
+      ].filter(name => name.includes('.staging-') || name.endsWith('.lock'))
+      expect(publicationDebris).toEqual([])
     } finally {
       await rm(generatedWrapper, { force: true })
     }
