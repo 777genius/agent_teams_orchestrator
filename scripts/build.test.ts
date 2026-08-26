@@ -129,9 +129,9 @@ describe('release build feature plan', () => {
     expect(source).toContain(
       "readStableBytes(metafilePath, 'build metafile').bytes.toString('utf8')",
     )
-    expect(source.match(/'--metafile'/g)).toHaveLength(1)
-    expect(source).toContain("        '--metafile',\n        hostedActualOwnerMetafile,")
-    expect(source).not.toContain('--metafile=')
+    expect(source.match(/`--metafile=\$\{hostedActualOwnerMetafile\}`/g)).toHaveLength(1)
+    expect(source).toContain('        `--metafile=${hostedActualOwnerMetafile}`,')
+    expect(source).not.toMatch(/['"`]--metafile['"`]\s*,/)
   })
 
   test('publishes an ordinary CLI bundle without entering the Linux owner boundary', async () => {
