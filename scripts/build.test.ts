@@ -18,6 +18,11 @@ import {
 } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import {
+  validateAcceptanceEvidence,
+  type ActualOwnerAcceptanceEvidence,
+} from './e2e/hosted-actual-owner/evidence.js'
+import { assertActualOwnerProcessAnchorCurrent } from './e2e/hosted-actual-owner/process-anchor.js'
 
 const repoRoot = resolve(import.meta.dir, '..')
 const buildScript = resolve(repoRoot, 'scripts/build.ts')
@@ -1516,6 +1521,7 @@ describe('packaged hosted actual-owner build', () => {
       const preloadMarker = join(sandbox, 'preload-executed')
       const preload = join(sandbox, 'preload.js')
       await writeFile(preload, `await Bun.write(${JSON.stringify(preloadMarker)}, 'forged')\n`)
+      const evidenceFile = join(sandbox, 'evidence.json')
       const ownerEnvironment = {
         PATH: '/nonexistent',
         BUN_INSPECT_PRELOAD: preload,
@@ -1532,7 +1538,7 @@ describe('packaged hosted actual-owner build', () => {
         HOSTED_ACTUAL_OWNER_E2E_PRODUCT_ROOT: productRoot,
         HOSTED_ACTUAL_OWNER_E2E_PRODUCT_PUBLICATION_TIMEOUT_MS: '5000',
         HOSTED_ACTUAL_OWNER_E2E_CONTROL_SOCKET: join(sandbox, 'control.sock'),
-        HOSTED_ACTUAL_OWNER_E2E_EVIDENCE_FILE: join(sandbox, 'evidence.json'),
+        HOSTED_ACTUAL_OWNER_E2E_EVIDENCE_FILE: evidenceFile,
         HOSTED_ACTUAL_OWNER_E2E_MARKER: join(
           sandbox, '.agent-teams-actual-owner-e2e-owner.json',
         ),
@@ -1648,27 +1654,119 @@ int main(int argc, char **argv) {
 
       const mutationMarker = join(sandbox, 'mutated-owner-executed')
       const ownerBackup = `${ownerArtifact}.verified-original`
+      const originalOwnerBytes = await readFile(ownerArtifact)
+      const originalOwnerSha256 = `sha256:${sha256(originalOwnerBytes)}` as const
+      const staleEvidence = JSON.parse(await readFile(evidenceFile, 'utf8'))
+      const trustedOwnerArtifact = staleEvidence.ownerArtifact
+      expect(trustedOwnerArtifact).toEqual({
+        kind: 'sealed-build',
+        executable: ownerArtifact,
+        sha256: originalOwnerSha256,
+        buildClosureSha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      })
+      const runtimeManifest = JSON.parse(manifestBytes.toString('utf8'))
+      await rm(evidenceFile, { force: true })
       const sealedRun = Bun.spawn({
         cmd: [generatedWrapper, '--runtime-manifest', matchingManifest],
         cwd: buildRoot,
         env: ownerEnvironment,
         stdout: 'pipe',
         stderr: 'pipe',
+        detached: true,
       })
-      let sealedPid = 0
-      const childDeadline = Date.now() + 3000
-      while (Date.now() < childDeadline && sealedPid === 0) {
-        try {
-          const children = (await readFile(
-            `/proc/${sealedRun.pid}/task/${sealedRun.pid}/children`, 'utf8',
-          )).trim().split(/\s+/).filter(Boolean)
-          sealedPid = Number(children[0] ?? 0)
-        } catch {}
-        if (sealedPid === 0) await Bun.sleep(1)
-      }
-      expect(sealedPid).toBeGreaterThan(1)
-      await rename(ownerArtifact, ownerBackup)
+      const sealedExit = sealedRun.exited
+      const sealedStdout = new Response(sealedRun.stdout).text()
+      const sealedStderr = new Response(sealedRun.stderr).text()
+      let sealedExited = false
+      void sealedExit.then(() => { sealedExited = true })
+      let ownerMoved = false
       try {
+        const failIfExited = async (phase: string, code: number): Promise<never> => {
+          throw new Error(
+            `sealed owner exited during ${phase} with status ${code}: ${await sealedStderr}`,
+          )
+        }
+        const waitForPoll = async (phase: string, milliseconds: number): Promise<void> => {
+          const outcome = await Promise.race([
+            Bun.sleep(milliseconds).then(() => null),
+            sealedExit,
+          ])
+          if (outcome !== null) await failIfExited(phase, outcome)
+        }
+        const wrapperChildren = async (): Promise<number[]> => {
+          const contents = await readFile(
+            `/proc/${sealedRun.pid}/task/${sealedRun.pid}/children`, 'utf8',
+          ).catch(() => '')
+          return contents.trim().split(/\s+/).filter(Boolean).map(Number)
+        }
+
+        let sealedPid = 0
+        let childObservation: number[] = []
+        const childDeadline = Date.now() + 3000
+        while (Date.now() < childDeadline && sealedPid === 0) {
+          childObservation = await wrapperChildren()
+          if (childObservation.length === 1 && childObservation[0]! > 1) {
+            sealedPid = childObservation[0]!
+            break
+          }
+          await waitForPoll('child discovery', 1)
+        }
+        expect(sealedPid,
+          `sealed child was not discovered; wrapper children: ${JSON.stringify(childObservation)}`,
+        ).toBeGreaterThan(1)
+
+        let startingEvidence: ActualOwnerAcceptanceEvidence | null = null
+        let evidenceObservation = 'evidence file was not created'
+        const evidenceDeadline = Date.now() + 5000
+        while (Date.now() < evidenceDeadline && startingEvidence === null) {
+          try {
+            const candidate = validateAcceptanceEvidence(
+              JSON.parse(await readFile(evidenceFile, 'utf8')),
+              { trustedOwnerArtifact },
+            )
+            expect(candidate).toMatchObject({
+              schemaVersion: 1,
+              purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-acceptance/v1',
+              status: 'starting',
+              failure: null,
+              runId: runtimeManifest.runId,
+              markerPath: ownerEnvironment.HOSTED_ACTUAL_OWNER_E2E_MARKER,
+              refs: {
+                orchestrator: orchestratorRef,
+                openCode: 'b'.repeat(40),
+                product: productRef,
+              },
+              ownerArtifact: trustedOwnerArtifact,
+              owner: { pid: sealedPid, processAnchor: { pid: sealedPid } },
+            })
+            expect(candidate.ownerArtifact.sha256).toBe(originalOwnerSha256)
+            expect(candidate.owner.processAnchor.executableSha256).toBe(originalOwnerSha256)
+            expect(candidate.owner.processAnchor.startTimeTicks).toMatch(/^[1-9][0-9]*$/)
+            expect(candidate.owner.processAnchor.bootId)
+              .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+            expect(candidate.owner.processAnchor.pidNamespace).toMatch(/^pid:\[[1-9][0-9]*\]$/)
+            assertActualOwnerProcessAnchorCurrent(candidate.owner.processAnchor)
+            startingEvidence = candidate
+            evidenceObservation = JSON.stringify({
+              status: candidate.status,
+              runId: candidate.runId,
+              ownerPid: candidate.owner.pid,
+              anchorPid: candidate.owner.processAnchor.pid,
+            })
+          } catch (error) {
+            evidenceObservation = error instanceof Error ? error.message : String(error)
+          }
+          if (startingEvidence === null) await waitForPoll('starting-evidence synchronization', 5)
+        }
+        expect(startingEvidence,
+          `fresh sealed-run starting evidence was not observed for pid ${sealedPid}: ${evidenceObservation}`,
+        ).not.toBeNull()
+        expect(await wrapperChildren(),
+          `wrapper child changed before launcher mutation (expected only ${sealedPid})`,
+        ).toEqual([sealedPid])
+
+        await rename(ownerArtifact, ownerBackup)
+        ownerMoved = true
         await writeFile(ownerArtifact, `#!/bin/sh\ntouch ${mutationMarker}\nexit 97\n`, {
           mode: 0o755,
         })
@@ -1685,14 +1783,42 @@ int main(int argc, char **argv) {
         expect(sealedEnvironment.some(entry =>
           /^(?:BUN_|NODE_|LD_|DYLD_|GLIBC_TUNABLES=|GIT_|ARBITRARY_CONFIG=)/.test(entry),
         )).toBe(false)
-        expect(await sealedRun.exited).toBe(1)
-        const sealedStderr = await new Response(sealedRun.stderr).text()
-        expect(sealedStderr).toContain('product_publication_timeout')
-        expect(sealedStderr).not.toContain('launcher_hash_mismatch')
+        const exitDeadline = Date.now() + 8000
+        while (!sealedExited && Date.now() < exitDeadline) await Bun.sleep(5)
+        expect(sealedExited,
+          `sealed owner did not exit after launcher mutation; stderr pending for pid ${sealedPid}`,
+        ).toBe(true)
+        expect(await sealedExit).toBe(1)
+        const stderr = await sealedStderr
+        expect(stderr).toContain('product_publication_timeout')
+        expect(stderr).not.toContain('hosted_actual_owner_launch_launcher_replaced')
+        expect(stderr).not.toContain('launcher_hash_mismatch')
         expect(existsSync(mutationMarker)).toBe(false)
       } finally {
-        await rm(ownerArtifact, { force: true })
-        await rename(ownerBackup, ownerArtifact)
+        if (ownerMoved) {
+          await rm(ownerArtifact, { force: true })
+          await rename(ownerBackup, ownerArtifact)
+        }
+        if (!sealedExited) {
+          try {
+            process.kill(-sealedRun.pid, 'SIGTERM')
+          } catch {
+            sealedRun.kill('SIGTERM')
+          }
+          await Promise.race([sealedExit, Bun.sleep(1000)])
+        }
+        if (!sealedExited) {
+          try {
+            process.kill(-sealedRun.pid, 'SIGKILL')
+          } catch {
+            sealedRun.kill('SIGKILL')
+          }
+          await Promise.race([sealedExit, Bun.sleep(1000)])
+        }
+        await Promise.all([
+          Promise.race([sealedStdout, Bun.sleep(1000)]),
+          Promise.race([sealedStderr, Bun.sleep(1000)]),
+        ])
       }
 
       const decoyRoot = await mkdtemp(join(tmpdir(), 'hosted-owner-generic-bun-'))
