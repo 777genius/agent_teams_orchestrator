@@ -1826,7 +1826,7 @@ int main(int argc, char **argv) {
       const decoy = join(decoyRoot, 'owner-decoy.js')
       const forgedBuild = spawnSync(process.execPath, [
         'build', join(buildRoot, 'src', 'entrypoints', 'hostedActualOwnerAcceptance.ts'),
-        '--target=bun', '--format=esm', '--external=*', `--outfile=${decoy}`,
+        '--target=bun', '--format=esm', `--outfile=${decoy}`,
         '--define', 'process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE="owner"',
       ], { cwd: buildRoot, encoding: 'utf8' })
       expect(forgedBuild.status).toBe(0)
@@ -1841,6 +1841,7 @@ int main(int argc, char **argv) {
       expect(direct.stderr).toContain(
         'hosted_actual_owner_launch_standalone_owner_identity_invalid',
       )
+      expect(direct.stderr).not.toContain('Cannot find module')
       const directSource = spawnSync(process.execPath, [
         join(buildRoot, 'src', 'entrypoints', 'hostedActualOwnerAcceptance.ts'),
         '--hosted-actual-owner-sealed-protocol=v1',
