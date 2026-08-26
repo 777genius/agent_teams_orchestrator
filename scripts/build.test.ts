@@ -976,7 +976,7 @@ afterAll(async () => {
   for (const root of fixtureRoots.splice(0)) {
     await rm(root, { recursive: true, force: true })
   }
-})
+}, 300_000)
 
 describe.skip('superseded synthetic hosted actual-owner launcher boundary', () => {
   test('fails closed on malformed input before consulting its execution closure', () => {
@@ -1452,6 +1452,21 @@ describe('packaged hosted actual-owner build', () => {
 
   test('builds and runs the real sealed owner with no sidecar or generic loader', async () => {
     const buildRoot = await cleanPackagedBuildFixture()
+    const productRoot = await cleanPackagedBuildFixture(false)
+    const productHead = spawnSync('/usr/bin/git', [
+      '-C', productRoot, 'rev-parse', 'HEAD',
+    ], {
+      encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+    })
+    expect(productHead.status, spawnResultEvidence(productHead)).toBe(0)
+    const productRef = productHead.stdout.trim()
+    const productStatus = spawnSync('/usr/bin/git', [
+      '-C', productRoot, 'status', '--porcelain=v1', '--untracked-files=all',
+    ], {
+      encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+    })
+    expect(productStatus.status, spawnResultEvidence(productStatus)).toBe(0)
+    expect(productStatus.stdout).toBe('')
     const fixtureBuildScript = join(buildRoot, 'scripts', 'build.ts')
     const generatedWrapper = join(buildRoot, 'bin', 'hosted-actual-owner-acceptance')
     const build = spawnSync(process.execPath, ['run', './scripts/build.ts'], {
@@ -1485,14 +1500,18 @@ describe('packaged hosted actual-owner build', () => {
         buildRoot, 'dist', 'local-cli', 'hostedActualOwnerAcceptance.js',
       ))).toBe(false)
 
-      const head = spawnSync('/usr/bin/git', ['-C', buildRoot, 'rev-parse', 'HEAD'], {
+      const orchestratorHead = spawnSync('/usr/bin/git', [
+        '-C', buildRoot, 'rev-parse', 'HEAD',
+      ], {
         encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
-      }).stdout.trim()
+      })
+      expect(orchestratorHead.status, spawnResultEvidence(orchestratorHead)).toBe(0)
+      const orchestratorRef = orchestratorHead.stdout.trim()
       const openCodeSha256 = sha256(await readFile(process.execPath))
       const { manifestPath: matchingManifest, sandbox } = await writeRuntimeManifest({
-        orchestratorRef: head,
+        orchestratorRef,
         openCodeExecutableSha256: openCodeSha256,
-        productRef: head,
+        productRef,
       })
       const preloadMarker = join(sandbox, 'preload-executed')
       const preload = join(sandbox, 'preload.js')
@@ -1510,7 +1529,7 @@ describe('packaged hosted actual-owner build', () => {
         HOSTED_ACTUAL_OWNER_E2E_HOSTED_CONTROL_CONFIG: join(sandbox, 'hosted-control.json'),
         HOSTED_ACTUAL_OWNER_E2E_OPENCODE_EXECUTABLE: process.execPath,
         HOSTED_ACTUAL_OWNER_E2E_OPENCODE_SHA256: openCodeSha256,
-        HOSTED_ACTUAL_OWNER_E2E_PRODUCT_ROOT: buildRoot,
+        HOSTED_ACTUAL_OWNER_E2E_PRODUCT_ROOT: productRoot,
         HOSTED_ACTUAL_OWNER_E2E_PRODUCT_PUBLICATION_TIMEOUT_MS: '5000',
         HOSTED_ACTUAL_OWNER_E2E_CONTROL_SOCKET: join(sandbox, 'control.sock'),
         HOSTED_ACTUAL_OWNER_E2E_EVIDENCE_FILE: join(sandbox, 'evidence.json'),
@@ -1568,6 +1587,18 @@ int main(int argc, char **argv) {
       expect(admitted.stderr).not.toContain('orchestrator_ref_mismatch')
       expect(existsSync(preloadMarker)).toBe(false)
 
+      const productDirtyMarker = join(productRoot, 'dirty-product-fixture')
+      await writeFile(productDirtyMarker, 'dirty')
+      try {
+        const dirtyProduct = spawnSync(generatedWrapper, [
+          '--runtime-manifest', matchingManifest,
+        ], { cwd: buildRoot, encoding: 'utf8', env: ownerEnvironment })
+        expect(dirtyProduct.status).toBe(1)
+        expect(dirtyProduct.stderr).toContain('hosted_actual_owner_product_dirty')
+      } finally {
+        await rm(productDirtyMarker, { force: true })
+      }
+
       const genericSource = join(sandbox, 'generic-wrapper.c')
       const genericWrapper = join(sandbox, 'generic-wrapper')
       const genericPrint = spawnSync(process.execPath, [
@@ -1599,7 +1630,7 @@ int main(int argc, char **argv) {
 
       const manifestBytes = await readFile(matchingManifest)
       const forgedManifest = JSON.parse(manifestBytes.toString('utf8'))
-      forgedManifest.refs.orchestrator = head === 'f'.repeat(40)
+      forgedManifest.refs.orchestrator = orchestratorRef === 'f'.repeat(40)
         ? 'e'.repeat(40)
         : 'f'.repeat(40)
       await writeFile(matchingManifest, `${JSON.stringify(forgedManifest)}\n`, { mode: 0o600 })
