@@ -353,6 +353,53 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     expect(await replacement.read()).toMatchObject({ deliveries: [{ phase: 'started', result: null, effectRef: ingress.effectRef }] })
   })
 
+  test('compacts terminal delivery history while retaining every active or ambiguous effect', async () => {
+    const { path } = await walPath(); const wal = new HostedApprovalOwnerWal(path)
+    const base = state(); const active = structuredClone(base.ingress[0]!)
+    active.effectRef = `effect:${'e'.repeat(64)}`; active.outboxId = `runtime_permission:${active.effectRef}`
+    active.deliveryRef = 'delivery_ref_active'
+    active.payloadJson = JSON.stringify({
+      schemaVersion: 1, deliveryRef: active.deliveryRef, category: 'command', summary: 'Run tests',
+      expiresAtMs: null, preview: null,
+    })
+    const terminalIngress = Array.from({ length: 2_050 }, (_, index) => {
+      const suffix = index.toString(36); const digest = index.toString(16).padStart(64, '0')
+      const record = structuredClone(base.ingress[0]!)
+      record.effectRef = `effect:${digest}`; record.outboxId = `runtime_permission:${record.effectRef}`
+      record.deliveryRef = `delivery_ref_terminal_${suffix}`
+      record.commandId = `permission_terminal_${suffix}`
+      record.payloadJson = JSON.stringify({
+        schemaVersion: 1, deliveryRef: record.deliveryRef, category: 'command', summary: 'Run tests',
+        expiresAtMs: null, preview: null,
+      })
+      record.lease = {
+        generation: 1, ownerId: 'owner_terminal', leaseToken: `lease_${suffix}`,
+        claimedAtIso: '2026-08-13T10:00:01.000Z', leaseExpiresAtIso: '2026-08-13T10:00:03.000Z',
+      }
+      record.acknowledgedAtIso = '2026-08-13T10:00:02.000Z'
+      return record
+    })
+    const deliveries: HostedApprovalOwnerState['deliveries'] = terminalIngress.map((record, index) => ({
+      providerDeliveryId: `delivery_${index.toString(36)}`,
+      reconciliationRef: `approval-reconciliation_${index.toString(36)}`,
+      deliveryRef: record.deliveryRef, payloadFingerprint: index.toString(16).padStart(64, '0'),
+      outboxId: record.outboxId, effectRef: record.effectRef,
+      phase: 'completed', result: 'delivered',
+    }))
+    deliveries.push({
+      providerDeliveryId: 'delivery_active', reconciliationRef: 'approval-reconciliation_active',
+      deliveryRef: active.deliveryRef, payloadFingerprint: 'f'.repeat(64), outboxId: active.outboxId,
+      effectRef: active.effectRef, phase: 'started' as const, result: null,
+    })
+    const published = await wal.locked(current => wal.publish(current, {
+      ...withoutRevision(base), ingress: [...terminalIngress, active], deliveries,
+    }))
+    expect(published.deliveries).toHaveLength(2_049)
+    expect(published.deliveries[0]?.outboxId).toBe(terminalIngress[2]!.outboxId)
+    expect(published.deliveries.at(-1)).toMatchObject({ outboxId: active.outboxId, phase: 'started' })
+    expect(published.ingress.some(record => record.outboxId === active.outboxId)).toBe(true)
+  })
+
   test('serializes concurrent processes and crash handover without a stale-time reclaim window', async () => {
     const { path } = await walPath()
     const root = join(path, '..'); const start = join(root, 'start'); const entered = join(root, 'entered')

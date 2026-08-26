@@ -10,6 +10,7 @@ import { decodeHostedApprovalIngressAuthority, type HostedApprovalIngressRecord 
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import { createRegularNodeAtDarwin } from './HostedApprovalOwnerWalDarwin.internal.js'
 import { assertNoDuplicateJsonObjectKeys } from './ownerProof.js'
+import { containsHostPath } from './hostPathSafety.js'
 
 export type HostedApprovalDeliveryState = {
   providerDeliveryId: string
@@ -44,7 +45,8 @@ export type HostedApprovalWriterFenceIdentity = {
 }
 
 const MAX_BYTES = 32 * 1024 * 1024
-const HOST_PATH = /(?:^|[\s"'`(])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|var|tmp|etc|private|mnt|Volumes|opt)\/)/
+const RETENTION_TARGET_BYTES = 24 * 1024 * 1024
+const TERMINAL_RETENTION_RECORDS = 2_048
 const WRITER_WAIT_TIMEOUT_MS = 30_000
 const WRITER_RETRY_MS = 5
 const LOCK_EX = 2
@@ -319,7 +321,11 @@ export class HostedApprovalOwnerWal {
     if (!(await this.ownsCurrentFence())) throw new Error('Hosted approval writer fence changed')
     const current = await this.read()
     if (!isDeepStrictEqual(current, previous)) throw new Error('Hosted approval WAL compare-and-swap conflict')
-    const state = decodeOwnerState({ ...next, writerFence: this.#activeFenceIdentity, revision: (previous?.revision ?? 0) + 1 })
+    const state = compactOwnerState(decodeOwnerState({
+      ...next,
+      writerFence: this.#activeFenceIdentity,
+      revision: (previous?.revision ?? 0) + 1,
+    }))
     const bytes = `${JSON.stringify(state)}\n`
     if (Buffer.byteLength(bytes) > MAX_BYTES) throw new Error('Hosted approval WAL exceeds limit')
     await this.#publishExact(bytes)
@@ -593,6 +599,45 @@ export class HostedApprovalOwnerWal {
   }
 }
 
+function compactOwnerState(state: HostedApprovalOwnerState): HostedApprovalOwnerState {
+  const terminalDeliveryIds = new Set(state.deliveries
+    .filter(delivery => delivery.phase !== 'started')
+    .slice(-TERMINAL_RETENTION_RECORDS)
+    .map(delivery => delivery.outboxId))
+  const activeDeliveryIds = new Set(state.deliveries
+    .filter(delivery => delivery.phase === 'started')
+    .map(delivery => delivery.outboxId))
+  const acknowledgedIds = new Set(state.ingress
+    .filter(record => record.acknowledgedAtIso !== null)
+    .slice(-TERMINAL_RETENTION_RECORDS)
+    .map(record => record.outboxId))
+  const retainedOutbox = new Set([...terminalDeliveryIds, ...activeDeliveryIds, ...acknowledgedIds])
+  let compacted: HostedApprovalOwnerState = {
+    ...state,
+    ingress: state.ingress.filter(record =>
+      record.acknowledgedAtIso === null || retainedOutbox.has(record.outboxId)),
+    retiredIngress: state.retiredIngress.filter(record => retainedOutbox.has(record.outboxId)),
+    deliveries: state.deliveries.filter(delivery =>
+      delivery.phase === 'started' || terminalDeliveryIds.has(delivery.outboxId)),
+  }
+  // Active/ambiguous records are never discarded. If they alone exceed the
+  // recovery budget, the caller receives deterministic backpressure instead of
+  // growing until the 32 MiB hard failure.
+  if (Buffer.byteLength(JSON.stringify(compacted)) > RETENTION_TARGET_BYTES) {
+    const activeOnly = {
+      ...compacted,
+      ingress: compacted.ingress.filter(record => record.acknowledgedAtIso === null || activeDeliveryIds.has(record.outboxId)),
+      retiredIngress: compacted.retiredIngress.filter(record => activeDeliveryIds.has(record.outboxId)),
+      deliveries: compacted.deliveries.filter(delivery => delivery.phase === 'started'),
+    }
+    if (Buffer.byteLength(JSON.stringify(activeOnly)) > RETENTION_TARGET_BYTES) {
+      throw new Error('Hosted approval owner active state exceeds retention budget')
+    }
+    compacted = activeOnly
+  }
+  return compacted
+}
+
 function readFenceIdentity(fd: number): HostedApprovalWriterFenceIdentity {
   const stat = fstatSync(fd)
   if (!stat.isFile() || stat.size < 2 || stat.size > 4096 || (stat.mode & 0o077) !== 0) {
@@ -791,7 +836,7 @@ function decodeWalIngress(value: unknown, routes: ReadonlyMap<string, HostedAppr
   exact(payload, ['schemaVersion', 'deliveryRef', 'category', 'summary', 'expiresAtMs', 'preview'], 'WAL ingress payload')
   if (payload.schemaVersion !== 1 || payload.deliveryRef !== record.deliveryRef ||
     !['file_change', 'command', 'network', 'other'].includes(String(payload.category)) || typeof payload.summary !== 'string' ||
-    Buffer.byteLength(payload.summary) > 2048 || payload.summary.includes('\n') || HOST_PATH.test(payload.summary) ||
+    Buffer.byteLength(payload.summary) > 2048 || payload.summary.includes('\n') || containsHostPath(payload.summary) ||
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(payload.summary) || payload.preview !== null ||
     !(payload.expiresAtMs === null || Number.isSafeInteger(payload.expiresAtMs) && (payload.expiresAtMs as number) >= 0)) throw new Error('Invalid hosted approval WAL ingress payload')
   const lease = record.lease === null ? null : decodeLease(record.lease)

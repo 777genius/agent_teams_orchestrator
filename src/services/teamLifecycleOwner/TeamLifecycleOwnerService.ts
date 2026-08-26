@@ -88,21 +88,23 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
         return { kind: 'unavailable' }
       }
       if (this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+      const effectGuard = async (): Promise<boolean> =>
+        await admission.isCurrent() && (!this.options.effectGuard || await this.options.effectGuard())
       let rawAfter: TeamLifecycleOwnerState
       const effectInput: TeamLifecycleOwnerEffectInput = {
         plan: admission.plan,
         commandId: input.commandId,
         runId: input.runId,
         expectedProviderGeneration: rawBefore.providerGeneration,
-        effectGuard: this.options.effectGuard,
+        effectGuard,
       }
       try {
-        if (this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+        if (!(await effectGuard())) return { kind: 'unavailable' }
         rawAfter = await this.options.execution[input.action](effectInput)
       } catch {
         return { kind: 'unavailable' }
       }
-      if (!this.#validSnapshot(rawAfter) || this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+      if (!this.#validSnapshot(rawAfter) || !(await effectGuard())) return { kind: 'unavailable' }
       const after = bindPlanGeneration(rawAfter, admission.planGeneration)
       if (!this.#validTransition(before, after, input.action, input.runId) ||
         !(await this.#capabilityCurrent(admission.plan, after))) return { kind: 'unavailable' }
@@ -110,7 +112,7 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       if (!rawConfirmed || !this.#validSnapshot(rawConfirmed)) return { kind: 'unavailable' }
       const confirmed = bindPlanGeneration(rawConfirmed, admission.planGeneration)
       if (!this.#validConfirmation(after, confirmed, input.action, input.runId) ||
-        !(await this.#capabilityCurrent(admission.plan, confirmed)) || !(await admission.isCurrent())) {
+        !(await this.#capabilityCurrent(admission.plan, confirmed)) || !(await effectGuard())) {
         return { kind: 'unavailable' }
       }
       return { kind: 'applied', snapshot: confirmed }

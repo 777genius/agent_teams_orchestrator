@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto'
-import { constants, link, lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { closeSync, constants as syncConstants, fstatSync, fsyncSync, readFileSync, writeSync } from 'node:fs'
+import { constants, lstat, mkdir, open, readdir, realpath } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import { TaskMutationLockUnavailableError, withTaskMutationCoordination } from '../../utils/taskMutationCoordinator.js'
 import { fingerprintHostedTaskCommand } from './protocol.js'
 import type { HostedControlAuthority, HostedControlStableAuthority, HostedTaskMutationCommand, HostedTaskMutationCommittedResult, HostedTaskMutationReceipt, HostedTaskMutationRequest, HostedTaskMutationTerminalResult } from './protocol.js'
-import { fsyncDirectoryPath, fsyncFileAndParent, HOSTED_MUTATION_RETRY_AFTER_MS, HostedTaskMutationWal, type HostedMutationFileImage, type HostedMutationIntent, type HostedMutationWrite } from './HostedTaskMutationWal.js'
+import { HOSTED_MUTATION_RETRY_AFTER_MS, HostedTaskMutationWal, type HostedMutationFileImage, type HostedMutationIntent, type HostedMutationWrite } from './HostedTaskMutationWal.js'
+import { PinnedPosixDirectory } from './PinnedPosixDirectory.internal.js'
 
 type BoardState = { sourceGeneration: string; revision: string; directories: { team: [number, number]; tasks: [number, number] }; taskMembership: string[]; rosterGuard: string; roster: Array<[string, string | null]>; allTaskTexts: Map<string, string>; tasks: Map<string, { rawId: string; publicId: string; path: string; text: string; value: Record<string, unknown> }>; kanbanPath: string; kanbanText: string | null; kanban: Record<string, unknown>; ledgerPath: string; ledgerText: string | null; ledger: MutationLedger }
 type SourceState = Pick<BoardState, 'sourceGeneration' | 'directories'>
@@ -106,7 +108,7 @@ export class HostedTaskMutationService {
     for (const write of intent.writes) {
       if (!(await this.#validateIntentGuards(intent))) return false
       const current = await this.#readTarget(write.target)
-      if (sameImage(current, write.after)) { await this.#finishPublishedTarget(write.target); continue }
+      if (sameImage(current, write.after)) { await this.#finishPublishedTarget(intent, write.target); continue }
       if (!matchesPreimage(current, write.before)) return false
       await this.#publishTarget(intent, write)
     }
@@ -310,7 +312,7 @@ export class HostedTaskMutationService {
     for (const write of intent.writes) {
       if (!(await this.#validateIntentGuards(intent))) throw new Error('Hosted board guard changed')
       const current = await this.#readTarget(write.target)
-      if (sameImage(current, write.after)) { await this.#finishPublishedTarget(write.target); continue }
+      if (sameImage(current, write.after)) { await this.#finishPublishedTarget(intent, write.target); continue }
       if (!matchesPreimage(current, write.before)) throw new Error('Hosted target preimage substituted')
       if (write.target === 'kanban') await this.#runCrashHook('before_kanban_write')
       await this.#publishTarget(intent, write)
@@ -319,7 +321,17 @@ export class HostedTaskMutationService {
     }
   }
   async #runCrashHook(stage: CrashStage): Promise<void> { try { await this.options.crashHook?.(stage) } catch { throw new ControlledHostedMutationCrash(stage) } }
-  async #finishPublishedTarget(target: string): Promise<void> { await fsyncFileAndParent(this.#targetPath(target)) }
+  async #finishPublishedTarget(intent: HostedMutationIntent, target: string): Promise<void> {
+    const { directory, name } = await this.#openPinnedTarget(intent, target)
+    let fd = -1
+    try {
+      directory.assertLinked()
+      fd = directory.openChild(name, syncConstants.O_RDONLY)
+      fsyncSync(fd)
+      await directory.sync()
+      directory.assertLinked()
+    } finally { if (fd >= 0) closeSync(fd); await directory.close() }
+  }
   #targetPath(target: string): string {
     if (target === 'kanban') return join(this.options.claudeRoot, 'teams', this.options.legacyKey, 'kanban-state.json')
     if (target === 'ledger') return join(this.options.claudeRoot, 'teams', this.options.legacyKey, 'hosted-task-board-mutation-ledger.v2.json')
@@ -328,57 +340,101 @@ export class HostedTaskMutationService {
   }
   async #readTarget(target: string): Promise<HostedMutationFileImage> { return readPathImage(this.#targetPath(target)) }
   async #publishTarget(intent: HostedMutationIntent, write: HostedMutationWrite): Promise<void> {
-    const path = this.#targetPath(write.target); const parent = dirname(path); const suffix = sha(`${intent.walId}\0${write.target}`).slice(0, 24)
-    const staged = join(parent, `.hosted-stage-${suffix}`); const detached = join(parent, `.hosted-detach-${suffix}`)
+    const { directory, name: targetName } = await this.#openPinnedTarget(intent, write.target)
+    const suffix = sha(`${intent.walId}\0${write.target}`).slice(0, 24)
+    const staged = `.hosted-stage-${suffix}`; const detached = `.hosted-detach-${suffix}`
     const text = Buffer.from(write.after.contentBase64!, 'base64').toString('utf8'); if (sha(text) !== write.after.sha256) throw new Error('Hosted WAL image hash mismatch')
-    const existingStage = await readPathImage(staged)
-    if (existingStage.existed && !sameImage(existingStage, write.after)) throw new Error('Hosted stage path substituted')
-    if (!existingStage.existed) { const handle = await open(staged, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600); try { await handle.writeFile(text); await handle.sync() } finally { await handle.close() } }
-    if (write.before.existed) {
-      if ((await readPathImage(detached)).existed) throw new Error('Hosted detach path already exists')
-      await link(path, detached)
-      if (!matchesPreimage(await readPathImage(detached), write.before)) throw new Error('Hosted detached preimage mismatch')
-      const [currentStat, detachedStat] = await Promise.all([lstat(path), lstat(detached)])
-      if (currentStat.dev !== detachedStat.dev || currentStat.ino !== detachedStat.ino) throw new Error('Hosted target changed before detach')
-      await unlink(path)
-      if (write.target.startsWith('task:')) await this.#runCrashHook('after_task_detach')
-    }
-    try { await link(staged, path) } catch (error) {
-      if (write.before.existed && (error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('Hosted target substituted during publication')
-      throw error
-    }
-    await fsyncDirectoryPath(parent)
-    if (!sameImage(await this.#readTarget(write.target), write.after)) throw new Error('Hosted target publication mismatch')
-    await Promise.all([unlink(staged).catch(() => {}), unlink(detached).catch(() => {})]); await fsyncDirectoryPath(parent)
+    try {
+      directory.assertLinked()
+      const existingStage = readPinnedImage(directory, staged)
+      if (existingStage.existed && !sameImage(existingStage, write.after)) throw new Error('Hosted stage path substituted')
+      if (!existingStage.existed) writePinnedImage(directory, staged, Buffer.from(text))
+      if (write.before.existed) {
+        if (readPinnedImage(directory, detached).existed) throw new Error('Hosted detach path already exists')
+        directory.link(targetName, detached)
+        if (!matchesPreimage(readPinnedImage(directory, detached), write.before)) throw new Error('Hosted detached preimage mismatch')
+        const current = readPinnedImage(directory, targetName); const detachedImage = readPinnedImage(directory, detached)
+        if (current.stat?.device !== detachedImage.stat?.device || current.stat?.inode !== detachedImage.stat?.inode) throw new Error('Hosted target changed before detach')
+        directory.unlink(targetName)
+        if (write.target.startsWith('task:')) await this.#runCrashHook('after_task_detach')
+      }
+      directory.link(staged, targetName)
+      await directory.sync(); directory.assertLinked()
+      if (!sameImage(readPinnedImage(directory, targetName), write.after)) throw new Error('Hosted target publication mismatch')
+      directory.unlinkIfExists(staged); directory.unlinkIfExists(detached); await directory.sync(); directory.assertLinked()
+    } finally { await directory.close() }
   }
 
   async #resumeDetachedPublications(intent: HostedMutationIntent): Promise<boolean> {
     for (const write of intent.writes) {
-      const path = this.#targetPath(write.target); const parent = dirname(path); const suffix = sha(`${intent.walId}\0${write.target}`).slice(0, 24)
-      const staged = join(parent, `.hosted-stage-${suffix}`); const detached = join(parent, `.hosted-detach-${suffix}`)
-      const detachedImage = await readPathImage(detached)
-      if (!detachedImage.existed) continue
-      if (!matchesPreimage(detachedImage, write.before)) return false
-      const current = await this.#readTarget(write.target)
-      if (matchesPreimage(current, write.before)) {
-        const [currentStat, detachedStat] = await Promise.all([lstat(path), lstat(detached)])
-        if (currentStat.dev !== detachedStat.dev || currentStat.ino !== detachedStat.ino) return false
-        await unlink(path)
-      } else if (current.existed && !sameImage(current, write.after)) return false
-      if (!(await this.#readTarget(write.target)).existed) {
-        let stagedImage = await readPathImage(staged)
-        if (!sameImage(stagedImage, write.after)) {
-          if (stagedImage.existed) return false
-          const text = Buffer.from(write.after.contentBase64!, 'base64').toString('utf8'); const handle = await open(staged, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-          try { await handle.writeFile(text); await handle.sync() } finally { await handle.close() }; stagedImage = await readPathImage(staged)
-        }
-        if (!sameImage(stagedImage, write.after)) return false
-        try { await link(staged, path) } catch { return false }
-      } else if (!sameImage(await this.#readTarget(write.target), write.after)) return false
-      await fsyncDirectoryPath(parent); await Promise.all([unlink(staged).catch(() => {}), unlink(detached).catch(() => {})]); await fsyncDirectoryPath(parent)
+      const { directory, name: targetName } = await this.#openPinnedTarget(intent, write.target)
+      const suffix = sha(`${intent.walId}\0${write.target}`).slice(0, 24)
+      const staged = `.hosted-stage-${suffix}`; const detached = `.hosted-detach-${suffix}`
+      try {
+        directory.assertLinked()
+        const detachedImage = readPinnedImage(directory, detached)
+        if (!detachedImage.existed) continue
+        if (!matchesPreimage(detachedImage, write.before)) return false
+        const current = readPinnedImage(directory, targetName)
+        if (matchesPreimage(current, write.before)) {
+          if (current.stat?.device !== detachedImage.stat?.device || current.stat?.inode !== detachedImage.stat?.inode) return false
+          directory.unlink(targetName)
+        } else if (current.existed && !sameImage(current, write.after)) return false
+        if (!readPinnedImage(directory, targetName).existed) {
+          let stagedImage = readPinnedImage(directory, staged)
+          if (!sameImage(stagedImage, write.after)) {
+            if (stagedImage.existed) return false
+            writePinnedImage(directory, staged, Buffer.from(write.after.contentBase64!, 'base64'))
+            stagedImage = readPinnedImage(directory, staged)
+          }
+          if (!sameImage(stagedImage, write.after)) return false
+          directory.link(staged, targetName)
+        } else if (!sameImage(readPinnedImage(directory, targetName), write.after)) return false
+        await directory.sync(); directory.assertLinked()
+        directory.unlinkIfExists(staged); directory.unlinkIfExists(detached); await directory.sync(); directory.assertLinked()
+      } finally { await directory.close() }
     }
     return true
   }
+
+  async #openPinnedTarget(intent: HostedMutationIntent, target: string): Promise<{ directory: PinnedPosixDirectory; name: string }> {
+    const task = target.startsWith('task:')
+    const path = task
+      ? join(this.options.claudeRoot, 'tasks', this.options.legacyKey)
+      : join(this.options.claudeRoot, 'teams', this.options.legacyKey)
+    const name = task ? target.slice(5) : target === 'kanban' ? 'kanban-state.json' : 'hosted-task-board-mutation-ledger.v2.json'
+    const directory = await PinnedPosixDirectory.open(path)
+    const expected = task ? intent.directories.tasks : intent.directories.team
+    if (String(directory.identity.dev) !== String(expected[0]) || String(directory.identity.ino) !== String(expected[1])) {
+      await directory.close(); throw new Error('Hosted mutation target directory generation changed')
+    }
+    return { directory, name }
+  }
+}
+
+function readPinnedImage(directory: PinnedPosixDirectory, name: string): HostedMutationFileImage {
+  if (!directory.exists(name)) return missingImage()
+  let fd = -1
+  try {
+    fd = directory.openChild(name, syncConstants.O_RDONLY)
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || (stat.mode & 0o022) !== 0 || stat.size > 1024 * 1024) throw new Error('Unsafe hosted pinned target')
+    const content = readFileSync(fd)
+    return image(content.toString('utf8'), { device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs })
+  } finally { if (fd >= 0) closeSync(fd) }
+}
+
+function writePinnedImage(directory: PinnedPosixDirectory, name: string, bytes: Buffer): void {
+  const fd = directory.createExclusive(name)
+  try {
+    let offset = 0
+    while (offset < bytes.length) {
+      const written = writeSync(fd, bytes, offset, bytes.length - offset, offset)
+      if (written <= 0) throw new Error('Hosted pinned target short write')
+      offset += written
+    }
+    fsyncSync(fd)
+  } finally { closeSync(fd) }
 }
 
 function sha(value: string): string { return createHash('sha256').update(value).digest('hex') }

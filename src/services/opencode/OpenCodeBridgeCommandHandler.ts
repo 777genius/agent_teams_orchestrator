@@ -187,6 +187,7 @@ type TeamWarning = {
 
 type LaunchMemberDraft = {
   sessionId: string
+  effectiveModel: string
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
   pendingPermissionRequestIds?: string[]
   pendingPermissions?: OpenCodeNormalizedPermission[]
@@ -2085,7 +2086,7 @@ function buildTeamLaunchData(params: {
             ? { pendingPermissions: member.pendingPermissions }
             : {}),
           ...(member.diagnostics.length ? { diagnostics: [...member.diagnostics] } : {}),
-          model: params.selectedModel,
+          model: member.effectiveModel,
           ...(typeof member.runtimePid === 'number' && member.runtimePid > 0
             ? { runtimePid: member.runtimePid }
             : {}),
@@ -2901,6 +2902,8 @@ async function runLaunchWithProvisioningSnapshot(
     const prompt = asString(member?.prompt)
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
     const memberVariant = asString(member?.effort) ?? selectedVariant ?? undefined
+    const effectiveModel = memberModels.get(name) ?? apiSelectedModel
+    const reportedModel = asString(member?.model) ?? selectedModel
     let record: OpenCodeSessionRecord | null = null
     const memberTiming = memberTimings.get(name) ?? {}
     memberTimings.set(name, memberTiming)
@@ -2910,7 +2913,7 @@ async function runLaunchWithProvisioningSnapshot(
         teamId,
         laneId,
         memberName: name,
-        selectedModel: memberModels.get(name) ?? apiSelectedModel,
+        selectedModel: effectiveModel,
         selectedVariant: memberVariant,
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
@@ -2952,7 +2955,7 @@ async function runLaunchWithProvisioningSnapshot(
           teamId,
           laneId,
           memberName: name,
-          selectedModel: memberModels.get(name) ?? apiSelectedModel,
+          selectedModel: effectiveModel,
           selectedVariant: memberVariant,
           title: `${teamId} - ${name}`,
           projectPath: snapshot.projectPath,
@@ -3031,7 +3034,7 @@ async function runLaunchWithProvisioningSnapshot(
         contextHash: injected.contextHash,
         briefingHash: injected.briefingHash,
         injectionVerifiedAt: injected.injectionVerifiedAt,
-        model: apiSelectedModel,
+        model: effectiveModel,
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
       }
       record = {
@@ -3055,7 +3058,7 @@ async function runLaunchWithProvisioningSnapshot(
         briefingHash: injected.briefingHash,
         injectionVerifiedAt: injected.injectionVerifiedAt,
         candidateAt,
-        model: apiSelectedModel,
+        model: effectiveModel,
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
       }
       const memberDiagnostics = [
@@ -3065,6 +3068,7 @@ async function runLaunchWithProvisioningSnapshot(
       ]
       members[name] = {
         sessionId: record.opencodeSessionId,
+        effectiveModel: reportedModel,
         launchState: 'created',
         bootstrapEvidenceSource: 'app_managed_bootstrap',
         bootstrapMode: 'app_managed_context',
@@ -3089,6 +3093,7 @@ async function runLaunchWithProvisioningSnapshot(
         : []
       members[name] = {
         sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
+        effectiveModel: reportedModel,
         launchState: 'failed',
         ...(typeof record?.runtimePid === 'number' && record.runtimePid > 0
           ? { runtimePid: record.runtimePid }
@@ -3148,11 +3153,29 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   const diagnostics: TeamDiagnostic[] = []
   let selectedModel = 'unknown/unknown'
 
+  const lifecycleRecords = lifecycleOwner
+    ? (await openCodeSessionStore.list()).filter(record => record.teamId === teamId && record.laneId === laneId)
+    : null
+  const expectedNames = expectedMembers
+    .map(item => asString(asRecord(item)?.name))
+    .filter((name): name is string => name !== null)
+  if (lifecycleOwner) {
+    const actualNames = lifecycleRecords!.map(record => record.memberName).sort()
+    if (actualNames.length !== expectedNames.length ||
+      actualNames.some((name, index) => name !== [...expectedNames].sort()[index]) ||
+      lifecycleRecords!.some(record => record.runId !== runId)) {
+      throw new Error('Stored OpenCode lifecycle session set does not exactly match the admitted run/member set')
+    }
+  }
+  const lifecycleRecordsByMember = new Map(lifecycleRecords?.map(record => [record.memberName, record]) ?? [])
+
   for (const item of expectedMembers) {
     const member = asRecord(item)
     const name = asString(member?.name)
     if (!name) continue
-    const record = await openCodeSessionStore.get(teamId, laneId, name)
+    const record = lifecycleOwner
+      ? lifecycleRecordsByMember.get(name) ?? null
+      : await openCodeSessionStore.get(teamId, laneId, name)
     if (!record) {
       diagnostics.push(teamDiagnostic('member_session_missing', `No stored OpenCode session for ${teamId}/${name}`, 'warning'))
       continue
@@ -3161,7 +3184,8 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
       throw new Error(`Stored OpenCode session for ${teamId}/${laneId}/${name} belongs to stale run ${record.runId}`)
     }
     selectedModel = record.selectedModel
-    const expectedModel = asString(member?.model)
+    const expectedModel = asString(member?.model) ?? (lifecycleOwner ? asString(body.selectedModel) : null)
+    let effectiveModel = expectedModel ?? record.selectedModel
     if (expectedModel) {
       let expectedSelectedModel: string
       try {
@@ -3171,6 +3195,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
         const reason = error instanceof Error ? error.message : String(error)
         members[name] = {
           sessionId: record.opencodeSessionId,
+          effectiveModel,
           launchState: 'failed',
           ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
             ? { runtimePid: record.runtimePid }
@@ -3187,6 +3212,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
         const reason = `Stored OpenCode session model "${record.selectedModel}" does not match expected model "${expectedSelectedModel}".`
         members[name] = {
           sessionId: record.opencodeSessionId,
+          effectiveModel,
           launchState: 'failed',
           ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
             ? { runtimePid: record.runtimePid }
@@ -3200,6 +3226,15 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
         continue
       }
     }
+    if (lifecycleOwner) {
+      const expectedProjectPath = asString(body.projectPath)
+      const expectedMode = asString(body.toolApprovalMode)
+      const expectedVariant = asString(member?.variant) ?? asString(body.selectedVariant) ?? undefined
+      if (!expectedProjectPath || record.projectPath !== expectedProjectPath || snapshot.projectPath !== expectedProjectPath ||
+        record.toolApprovalMode !== expectedMode || record.selectedVariant !== expectedVariant) {
+        throw new Error(`Stored OpenCode session binding for ${teamId}/${laneId}/${name} does not match the admitted workspace/policy/model variant`)
+      }
+    }
     try {
       const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
       const bootstrapFailure = summarizeBootstrapMcpFailure(record, reconciled.summary)
@@ -3209,6 +3244,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
       ]
       members[name] = {
         sessionId: record.opencodeSessionId,
+        effectiveModel,
         launchState: bridgeStateFromSummary(record, reconciled.summary),
         bootstrapEvidenceSource: resolvedOpenCodeBootstrapEvidenceSource(record),
         bootstrapMode: resolvedOpenCodeBootstrapMode(record),
@@ -3232,6 +3268,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
       const reason = error instanceof Error ? error.message : String(error)
       members[name] = {
         sessionId: record.opencodeSessionId,
+        effectiveModel,
         launchState: 'failed',
         ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
           ? { runtimePid: record.runtimePid }
@@ -3293,7 +3330,20 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   const diagnostics: TeamDiagnostic[] = []
   const recordsByMember = new Map(records.map(record => [record.memberName, record]))
-  const membersToStop = lifecycleOwner ? expectedMembers : records.map(record => record.memberName)
+  const admittedNames = new Set(expectedMembers)
+  const membersToStop = records.map(record => record.memberName)
+  if (lifecycleOwner) {
+    for (const memberName of expectedMembers) {
+      if (!recordsByMember.has(memberName)) membersToStop.push(memberName)
+    }
+    for (const memberName of membersToStop) {
+      if (!admittedNames.has(memberName)) diagnostics.push(teamDiagnostic(
+        'extra_same_run_session_stopped',
+        `Stopping unadmitted stored session ${teamId}/${laneId}/${memberName} because it is proven to belong to the exact run ${runId}`,
+        'warning',
+      ))
+    }
+  }
   for (const memberName of membersToStop) {
     const record = recordsByMember.get(memberName)
     if (!record) {

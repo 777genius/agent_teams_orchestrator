@@ -673,7 +673,17 @@ export class AcceptanceRuntime {
     if (request.schemaVersion !== 1 || Object.keys(request).some(key => !['schemaVersion', 'operation'].includes(key))) {
       throw new Error('hosted_actual_owner_control_invalid')
     }
-    if (request.operation === 'readiness' || request.operation === 'evidence') {
+    if (request.operation === 'readiness') {
+      // Startup already produced a fully validated evidence image. Readiness is
+      // a bounded liveness/control handshake: revalidate the publication and
+      // retained owner lease, but do not repeat provider executable hashing and
+      // evidence regeneration on the socket's 5s response path.
+      if (!this.readinessLease || this.readinessLease.destroyed || this.evidence.status !== 'ready') {
+        throw new Error('hosted_actual_owner_readiness_lease_lost')
+      }
+      return this.evidence
+    }
+    if (request.operation === 'evidence') {
       await this.refreshEvidence('ready'); return this.evidence
     }
     if (request.operation === 'poll_ingress') {

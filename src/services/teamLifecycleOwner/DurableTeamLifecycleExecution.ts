@@ -48,6 +48,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   readonly #jobs = new Map<string, Promise<void>>()
   readonly #ownedRuns = new Map<string, TeamLifecycleLaunchPlan>()
   readonly #ownerIncarnation = `owner_${randomUUID().replaceAll('-', '')}`
+  readonly #initializationMarkerPath: string
   #acceptingEffects = true
   #closePromise: Promise<void> | null = null
   #shutdownPromise: Promise<void> | null = null
@@ -61,6 +62,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     if (!isAbsolute(statePath) || statePath.includes('\0')) {
       throw new TypeError('Team lifecycle state path must be absolute')
     }
+    this.#initializationMarkerPath = `${statePath}.initialized`
     const entries = adapters.map(adapter => [adapter.kind, adapter] as const)
     if (new Set(entries.map(([kind]) => kind)).size !== entries.length) {
       throw new TypeError('Duplicate team lifecycle lane adapter')
@@ -119,7 +121,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
           throw error
         })
-        if (stateExists) throw new Error('Team lifecycle durable state has no admitted startup plan')
+        const markerExists = await lstat(this.#initializationMarkerPath).then(() => true).catch(error => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          throw error
+        })
+        if (stateExists || markerExists) throw new Error('Team lifecycle durable state has no admitted startup plan')
         return
       }
 
@@ -243,7 +249,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     for (const [ownedRunId, plan] of [...this.#ownedRuns]) {
       await this.#serialized(async () => {
         const current = await this.#read(plan)
-        if (current.phase !== 'running' || current.runId !== ownedRunId ||
+        if (current.phase === 'idle' || current.runId !== ownedRunId ||
           current.ownerIncarnation !== this.#ownerIncarnation) {
           this.#ownedRuns.delete(ownedRunId)
           return
@@ -277,7 +283,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (current.ownerIncarnation !== this.#ownerIncarnation) return
       if (current.runId === runId && current.phase === 'running') return
       if (current.runId !== runId || current.phase !== 'launching') {
-        await this.#applyLanes(plan, runId, 'stop', effectGuard).catch(() => [])
+        await this.#applyLanesForTeardown(plan, runId).catch(() => [])
         return
       }
       const next = launchCompletion(observations)
@@ -507,7 +513,24 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     })
-    if (!handle) return initialState(plan)
+    if (!handle) {
+      const marker = await open(
+        this.#initializationMarkerPath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+      ).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      })
+      if (!marker) return initialState(plan)
+      try {
+        const stat = await marker.stat()
+        if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size < 2 || stat.size > 1024 ||
+          (process.getuid?.() !== undefined && stat.uid !== process.getuid())) {
+          throw new Error('Unsafe team lifecycle initialization marker')
+        }
+      } finally { await marker.close() }
+      throw new Error('Team lifecycle durable state disappeared after initialization')
+    }
     try {
       const [stat, current] = await Promise.all([handle.stat(), lstat(this.statePath)])
       if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
@@ -539,7 +562,20 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     }
     await writeFileAtomic(this.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 })
     await fsyncFileAndParent(this.statePath)
+    await this.#writeInitializationMarker()
     return state
+  }
+
+  async #writeInitializationMarker(): Promise<void> {
+    const marker = `${JSON.stringify({ schemaVersion: 1, initialized: true })}\n`
+    const exists = await lstat(this.#initializationMarkerPath).then(() => true).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    })
+    if (!exists) {
+      await writeFileAtomic(this.#initializationMarkerPath, marker, { mode: 0o600 })
+      await fsyncFileAndParent(this.#initializationMarkerPath)
+    }
   }
 
   async #serialized<T>(operation: () => Promise<T>): Promise<T> {

@@ -139,6 +139,7 @@ import {
   finalizeTeamMemberSpawnClaim,
   recordArmedTeamMemberSpawnRuntime,
   readTeamFileAsync,
+  removeTeammateFromTeamFileIfIdentityMatches,
   releaseTeamMemberSpawnClaim,
   sanitizeAgentName,
   sanitizeName,
@@ -3209,6 +3210,48 @@ async function handleSpawnNativeProcess(
               : 'process exited',
       })
       finishRuntimeLogStreams([stdoutLog, stderrLog])
+      // Root exit is only a notification. Query the exact detached PGID or
+      // named Windows Job before clearing durable ownership; descendants may
+      // otherwise survive while the stale roster permanently blocks respawn.
+      void (async () => {
+        const treeEmpty = await killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }).catch(() => false)
+        if (!treeEmpty) return
+        const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+          agentId: teammateId,
+          paneId: processPaneId,
+          processStartedAtMs,
+          processOsIdentity,
+          processOwnerToken,
+          processRunId,
+        }).catch(() => false)
+        if (!removed) return
+        setAppState(prev => {
+          const teammates = prev.teamContext?.teammates
+          const owned = teammates?.[teammateId]
+          const exactOwned = owned?.tmuxPaneId === processPaneId &&
+            owned.processStartedAtMs === processStartedAtMs &&
+            owned.processOsIdentity === processOsIdentity &&
+            owned.processOwnerToken === processOwnerToken &&
+            owned.processRunId === processRunId
+          const tasks = Object.fromEntries(Object.entries(prev.tasks).filter(([, task]) =>
+            !isInProcessTeammateTask(task) || task.identity.agentId !== teammateId ||
+            task.externalRuntime?.paneId !== processPaneId ||
+            task.externalRuntime.processStartedAtMs !== processStartedAtMs ||
+            task.externalRuntime.processOsIdentity !== processOsIdentity ||
+            task.externalRuntime.processOwnerToken !== processOwnerToken ||
+            task.externalRuntime.processRunId !== processRunId))
+          if (!prev.teamContext || !teammates || !exactOwned) return { ...prev, tasks }
+          const { [teammateId]: _retired, ...remaining } = teammates
+          return { ...prev, tasks, teamContext: { ...prev.teamContext, teammates: remaining } }
+        })
+      })()
     })
     child.once('error', error => {
       void writeParentOwnedTeammateRuntimeEvent({

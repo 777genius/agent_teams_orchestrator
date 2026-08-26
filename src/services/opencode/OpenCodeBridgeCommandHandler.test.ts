@@ -5614,6 +5614,23 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('lifecycle-owner reconcile rejects extra same-lane sessions outside the admitted member set', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({ laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-reconcile' }),
+      buildRecord({ laneId: 'opencode-lane', memberName: 'rogue', runId: 'run-owned-reconcile' }),
+    ]) as typeof openCodeSessionStore.list
+    const result = await createOwnedOpenCodeLifecycleCommandExecutor()(buildEnvelope('opencode.reconcileTeam', {
+      runId: 'run-owned-reconcile', laneId: 'opencode-lane', teamId: 'team-a',
+      projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free',
+      selectedVariant: null, toolApprovalMode: 'manual',
+      expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free', variant: null }],
+    }))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('does not exactly match the admitted run/member set')
+  })
+
   test('rejects reconcile before probing runtime when duplicate expected member names are provided', async () => {
     let probeCalls = 0
     const getCalls: string[] = []
@@ -6055,6 +6072,30 @@ describe('OpenCodeBridgeCommandHandler', () => {
       stopped: false,
       diagnostics: ['Admitted OpenCode session record is missing'],
     })
+  })
+
+  test('lifecycle-owner stop also retires unadmitted sessions proven to belong to the exact run', async () => {
+    const aborted: string[] = []; const released: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({ laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-extra' }),
+      buildRecord({ laneId: 'opencode-lane', memberName: 'rogue', runId: 'run-owned-extra' }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.abort = (async record => { aborted.push(record.memberName); return true }) as typeof openCodeSessionBridge.abort
+    openCodeSessionBridge.releaseSession = (async record => { released.push(record.memberName) }) as typeof openCodeSessionBridge.releaseSession
+    openCodeHostManager.reconcilePersistentHosts = (async () => ({
+      cleaned: 0, remaining: 0, hosts: [], diagnostics: [],
+    })) as typeof openCodeHostManager.reconcilePersistentHosts
+
+    const result = await createOwnedOpenCodeLifecycleCommandExecutor()(buildEnvelope('opencode.stopTeam', {
+      runId: 'run-owned-extra', laneId: 'opencode-lane', teamId: 'team-a',
+      expectedMembers: [{ name: 'alice' }],
+    }))
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(aborted.sort()).toEqual(['alice', 'rogue'])
+    expect(released.sort()).toEqual(['alice', 'rogue'])
+    expect(result.data.diagnostics).toContainEqual(expect.objectContaining({ code: 'extra_same_run_session_stopped' }))
   })
 
   test('keeps stop failures isolated to the addressed mixed OpenCode secondary lane', async () => {

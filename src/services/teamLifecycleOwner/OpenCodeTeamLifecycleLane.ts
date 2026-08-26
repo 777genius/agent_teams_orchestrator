@@ -60,9 +60,14 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         runId: input.runId,
         laneId: input.lane.laneId,
         teamId: input.planTeamId,
+        projectPath: input.workspaceRoot,
+        selectedModel: input.lane.selectedModel,
+        selectedVariant: input.lane.effort ?? null,
+        toolApprovalMode: input.toolApprovalMode,
         expectedMembers: input.lane.members.map(member => ({
           name: member.name,
-          ...(member.model ? { model: member.model } : {}),
+          model: member.model ?? input.lane.selectedModel,
+          variant: member.effort ?? input.lane.effort ?? null,
         })),
       })
       return launchObservation(data)
@@ -142,7 +147,15 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       runId: input.runId,
       laneId: input.lane.laneId,
       teamId: input.planTeamId,
-      expectedMembers: input.lane.members.map(member => ({ name: member.name })),
+      projectPath: input.workspaceRoot,
+      selectedModel: input.lane.selectedModel,
+      selectedVariant: input.lane.effort ?? null,
+      toolApprovalMode: input.toolApprovalMode,
+      expectedMembers: input.lane.members.map(member => ({
+        name: member.name,
+        model: member.model ?? input.lane.selectedModel,
+        variant: member.effort ?? input.lane.effort ?? null,
+      })),
     })
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     return idle()

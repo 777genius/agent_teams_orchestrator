@@ -121,6 +121,34 @@ describe('TeamLifecycleOwnerService', () => {
     expect(execution.calls).toHaveLength(1)
   })
 
+  test('passes the live plan admission guard through to the deferred effect boundary', async () => {
+    let checks = 0; let crossedEffectBoundary = false
+    const store: TeamLifecycleLaunchPlanStore = {
+      load: async () => ({
+        plan, planGeneration: `plan-generation_${'a'.repeat(64)}`,
+        isCurrent: async () => ++checks < 3,
+      }),
+    }
+    const execution = new FakeExecution()
+    const originalLaunch = execution.launch.bind(execution)
+    execution.launch = async input => {
+      crossedEffectBoundary = await input.effectGuard?.() ?? true
+      if (!crossedEffectBoundary) throw new Error('admission revoked')
+      return originalLaunch(input)
+    }
+    const service = new TeamLifecycleOwnerService({ planStore: store, execution })
+    const inspected = await service.inspect(scope)
+    if (inspected.kind !== 'owned') throw new Error('expected owner')
+    checks = 0
+    const result = await service.execute({
+      scope, action: 'launch', commandId: 'command_revoked_effect', runId: null,
+      expectedProviderGeneration: inspected.snapshot.providerGeneration,
+    })
+    expect(result).toEqual({ kind: 'unavailable' })
+    expect(crossedEffectBoundary).toBe(false)
+    expect(execution.calls).toEqual([])
+  })
+
   test('fails closed when the owner does not confirm the post-effect snapshot', async () => {
     const execution = new FakeExecution()
     execution.confirm = false

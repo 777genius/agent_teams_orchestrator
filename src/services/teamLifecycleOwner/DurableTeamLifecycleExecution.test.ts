@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -178,6 +178,21 @@ describe('DurableTeamLifecycleExecution', () => {
       'Unable to adopt recovered team lifecycle run',
     )
     await expect(restarted.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
+  })
+
+  test('fails closed when durable state disappears after the namespace was initialized', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-state-deletion-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const execution = new DurableTeamLifecycleExecution(statePath, [new FakeLane()])
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan, commandId: 'command-state-deletion', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForPhase(execution, 'running')
+    await unlink(statePath)
+    await expect(execution.inspect(plan)).rejects.toThrow('disappeared after initialization')
   })
 
   test('close rejects new effects and drains a pending launch before returning', async () => {

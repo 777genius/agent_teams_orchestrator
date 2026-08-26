@@ -273,6 +273,7 @@ describe('HostedApprovalOwnerService R2', () => {
     const root = join(fx.store.wal.path, '..')
     const effects = join(root, 'provider-effects')
     const entered = join(root, 'provider-effect-durable')
+    const childReady = join(root, 'service-child-ready')
     const outcome = join(root, 'replacement-outcome.json')
     const input = join(root, 'service-crash-input.json')
     const processScript = join(root, 'service-crash-owner.ts')
@@ -283,6 +284,7 @@ describe('HostedApprovalOwnerService R2', () => {
       admittedAuthority: record!.authority,
       effects,
       entered,
+      childReady,
       outcome,
     }))
 
@@ -293,13 +295,16 @@ describe('HostedApprovalOwnerService R2', () => {
     await writeFile(processScript, `
 import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs'
 import { appendFile, readFile, writeFile } from 'node:fs/promises'
-import { HostedApprovalOwnerService } from ${JSON.stringify(serviceUrl)}
-import { HostedApprovalOwnerStore } from ${JSON.stringify(storeUrl)}
-import { HostedApprovalOwnerWal } from ${JSON.stringify(walUrl)}
-import { fingerprintHostedApprovalDelivery } from ${JSON.stringify(wireUrl)}
-
 const mode = process.argv[2]
 const fixture = JSON.parse(await readFile(process.argv[3], 'utf8'))
+// Signal process/control readiness before Bun performs cold source-module
+// compilation. The parent then observes a distinct durable effect boundary.
+await writeFile(fixture.childReady, 'ready')
+const [{ HostedApprovalOwnerService }, { HostedApprovalOwnerStore },
+  { HostedApprovalOwnerWal }, { fingerprintHostedApprovalDelivery }] = await Promise.all([
+  import(${JSON.stringify(serviceUrl)}), import(${JSON.stringify(storeUrl)}),
+  import(${JSON.stringify(walUrl)}), import(${JSON.stringify(wireUrl)}),
+])
 const admission = {
   schemaVersion: 1,
   admissionGeneration: 'approval-admission-generation_test',
@@ -369,9 +374,14 @@ if (mode === 'replacement') {
       stderr: 'pipe',
     })
     try {
-      const deadline = Date.now() + 5_000
+      const readyDeadline = Date.now() + 5_000
+      while (!await Bun.file(childReady).exists()) {
+        if (crashed.exitCode !== null || Date.now() >= readyDeadline) throw new Error('Effect owner control process did not become ready')
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      const effectDeadline = Date.now() + 7_500
       while (!await Bun.file(entered).exists()) {
-        if (crashed.exitCode !== null || Date.now() >= deadline) {
+        if (crashed.exitCode !== null || Date.now() >= effectDeadline) {
           throw new Error('Effect owner did not reach its durable provider boundary')
         }
         await new Promise(resolve => setTimeout(resolve, 5))

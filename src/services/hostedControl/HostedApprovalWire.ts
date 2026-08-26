@@ -10,6 +10,7 @@ import {
   type HostedControlOwnerBinding,
   type HostedControlStableAuthority,
 } from './protocol.js'
+import { containsHostPath } from './hostPathSafety.js'
 
 export const HOSTED_APPROVAL_PROOF_DOMAIN =
   'agent-teams.hosted-runtime-approval.owner-proof/v1'
@@ -28,9 +29,6 @@ export const HOSTED_APPROVAL_MAX_PAYLOAD_JSON_BYTES = 136 * 1024
 export const HOSTED_APPROVAL_MAX_RECORD_BYTES = 272 * 1024
 export const HOSTED_APPROVAL_MAX_PREVIEW_CONTENT_BYTES = 64 * 1024
 export const HOSTED_APPROVAL_MAX_SUMMARY_BYTES = 2 * 1024
-
-const HOST_PATH =
-  /(?:^|[\s"'`(])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|var|tmp|etc|private|mnt|Volumes|opt)\/)/
 
 const OPERATIONS = [
   'approval_ingress_claim',
@@ -784,7 +782,7 @@ function boundedRedactedText(
   allowNewlines = false,
 ): string {
   if (typeof value !== 'string' || (!allowEmpty && value.length === 0) ||
-    Buffer.byteLength(value, 'utf8') > maxBytes || HOST_PATH.test(value)) {
+    Buffer.byteLength(value, 'utf8') > maxBytes || containsHostPath(value)) {
     throw new Error(`Invalid ${field}`)
   }
   for (let index = 0; index < value.length; index += 1) {

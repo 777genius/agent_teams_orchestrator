@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, lstat, mkdir, open, rename, rm } from 'node:fs/promises'
+import { closeSync, fstatSync, fsyncSync, ftruncateSync, readFileSync, writeSync } from 'node:fs'
+import { constants, lstat, mkdir, open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import * as lockfile from '../../utils/lockfile.js'
+import { closePinnedFd, flockPinned, PinnedPosixDirectory } from './PinnedPosixDirectory.internal.js'
 
 const MAX_WAL_BYTES = 8 * 1024 * 1024
 const DEFAULT_COMPLETED_RETENTION = 2_048
-const LOCK_OPTIONS = { realpath: false, retries: { retries: 10, minTimeout: 5, maxTimeout: 100 } } as const
+const LOCK_EX = 2
+const LOCK_NB = 4
+const LOCK_UN = 8
 
 type HostedLifecycleWalAppendHandle = {
   stat(): Promise<{ isFile(): boolean; mode: number; size: number; dev: number | bigint; ino: number | bigint; uid: number }>
@@ -116,9 +119,14 @@ export class HostedLifecycleAuthorityWal {
   readonly lockPath: string
   readonly #openAppend: NonNullable<HostedLifecycleAuthorityWalOptions['openAppend']>
   readonly #openDirectory: NonNullable<HostedLifecycleAuthorityWalOptions['openDirectory']>
+  readonly #customOpenAppend: boolean
+  readonly #customOpenDirectory: boolean
   readonly #compactionThresholdBytes: number
   readonly #completedRetentionEntries: number
   #lockHeld = false
+  #activeParent: PinnedPosixDirectory | null = null
+  #activeLockFd: number | null = null
+  #activeLockIdentity: { dev: number | bigint; ino: number | bigint } | null = null
   constructor(
     private readonly directory: string,
     private readonly teamId: string,
@@ -129,6 +137,8 @@ export class HostedLifecycleAuthorityWal {
     this.lockPath = join(directory, 'hosted-lifecycle-authority.lock')
     this.#openAppend = options.openAppend ?? (async (path, flags, mode) => open(path, flags, mode))
     this.#openDirectory = options.openDirectory ?? (async (path, flags) => open(path, flags))
+    this.#customOpenAppend = options.openAppend !== undefined
+    this.#customOpenDirectory = options.openDirectory !== undefined
     this.#compactionThresholdBytes = options.compactionThresholdBytes ?? MAX_WAL_BYTES
     this.#completedRetentionEntries = options.completedRetentionEntries ?? DEFAULT_COMPLETED_RETENTION
     if (!Number.isSafeInteger(this.#compactionThresholdBytes) || this.#compactionThresholdBytes < 1_024 ||
@@ -138,25 +148,77 @@ export class HostedLifecycleAuthorityWal {
 
   async withLock<T>(operation: () => Promise<T>): Promise<T | undefined> {
     await this.#prepareDirectory()
-    let release: (() => Promise<void>) | undefined
-    try { release = await lockfile.lock(this.lockPath, LOCK_OPTIONS) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ELOCKED') return undefined
-      throw error
-    }
+    const parent = await PinnedPosixDirectory.open(this.directory)
+    const lockName = 'hosted-lifecycle-authority.lock'
+    let lockFd = -1
     try {
+      try {
+        lockFd = parent.exists(lockName)
+          ? parent.openChild(lockName, constants.O_RDWR)
+          : parent.createExclusive(lockName)
+      } catch (error) {
+        if (!parent.exists(lockName)) throw error
+        lockFd = parent.openChild(lockName, constants.O_RDWR)
+      }
+      for (let attempt = 0; !flockPinned(lockFd, LOCK_EX | LOCK_NB); attempt += 1) {
+        if (attempt >= 10) return undefined
+        await new Promise(resolve => setTimeout(resolve, Math.min(100, 5 * 2 ** attempt)))
+      }
+      this.#activeParent = parent
+      this.#activeLockFd = lockFd
+      const lockStat = fstatSync(lockFd)
+      this.#activeLockIdentity = { dev: lockStat.dev, ino: lockStat.ino }
+      await this.#assertPinnedCriticalSection()
+      fsyncSync(lockFd); await parent.sync(); await this.#assertPinnedCriticalSection()
       // O_APPEND would otherwise place the next valid record after a corrupt
       // suffix forever. Repair only while the cross-process writer lock is held.
       await this.#repairTornTail()
       this.#lockHeld = true
-      return await operation()
+      const result = await operation()
+      await this.#assertPinnedCriticalSection()
+      return result
     } finally {
       this.#lockHeld = false
-      await release()
+      this.#activeParent = null
+      this.#activeLockFd = null
+      this.#activeLockIdentity = null
+      if (lockFd >= 0) { flockPinned(lockFd, LOCK_UN); closePinnedFd(lockFd) }
+      await parent.close()
     }
+  }
+
+  async #assertPinnedCriticalSection(): Promise<void> {
+    const parent = this.#activeParent; const lockFd = this.#activeLockFd; const identity = this.#activeLockIdentity
+    if (!parent || lockFd === null || !identity) throw new Error('Hosted lifecycle WAL pinned authority unavailable')
+    parent.assertLinked()
+    const opened = fstatSync(lockFd)
+    const linkedFd = parent.openChild('hosted-lifecycle-authority.lock', constants.O_RDONLY)
+    try {
+      const linked = fstatSync(linkedFd)
+      if (!opened.isFile() || (opened.mode & 0o077) !== 0 || opened.dev !== identity.dev || opened.ino !== identity.ino ||
+        linked.dev !== identity.dev || linked.ino !== identity.ino ||
+        (process.getuid?.() !== undefined && opened.uid !== process.getuid())) {
+        throw new Error('Hosted lifecycle WAL lock identity changed')
+      }
+    } finally { closeSync(linkedFd) }
   }
 
   async load(): Promise<HostedLifecycleWalState> {
     const state: HostedLifecycleWalState = { grants: new Map(), commands: new Map(), released: new Set() }
+    if (this.#activeParent) {
+      await this.#assertPinnedCriticalSection()
+      const name = 'hosted-lifecycle-authority.wal.v1.jsonl'
+      if (!this.#activeParent.exists(name)) return state
+      const fd = this.#activeParent.openChild(name, constants.O_RDONLY)
+      try {
+        const stat = fstatSync(fd)
+        if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > MAX_WAL_BYTES ||
+          (process.getuid?.() !== undefined && stat.uid !== process.getuid())) throw new Error('Unsafe hosted lifecycle WAL')
+        this.#decodeWalText(readFileSync(fd).toString('utf8'), state)
+        await this.#assertPinnedCriticalSection()
+        return state
+      } finally { closeSync(fd) }
+    }
     const handle = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
@@ -170,34 +232,29 @@ export class HostedLifecycleAuthorityWal {
       }
       const text = await handle.readFile('utf8')
       if (Buffer.byteLength(text) > MAX_WAL_BYTES) throw new Error('Hosted lifecycle WAL exceeds 8MiB')
-      const lines = text.split('\n')
-      // A record is durable only when its terminating newline is present. This
-      // also avoids inventing a valid-looking record whose newline write tore.
-      lines.pop()
-      for (const line of lines) {
-        if (!line) continue
-        const record = decodeRecord(JSON.parse(line), this.teamId)
-        if (record.kind === 'snapshot') {
-          if (state.grants.size || state.commands.size || state.released.size) {
-            throw new Error('Invalid hosted lifecycle WAL snapshot ordering')
-          }
-          restoreSnapshot(state, record)
-        } else {
-          applyEntry(state, record)
-        }
-      }
+      this.#decodeWalText(text, state)
       return state
     } finally { await handle.close() }
   }
 
+  #decodeWalText(text: string, state: HostedLifecycleWalState): void {
+    if (Buffer.byteLength(text) > MAX_WAL_BYTES) throw new Error('Hosted lifecycle WAL exceeds 8MiB')
+    const lines = text.split('\n'); lines.pop()
+    for (const line of lines) {
+      if (!line) continue
+      const record = decodeRecord(JSON.parse(line), this.teamId)
+      if (record.kind === 'snapshot') {
+        if (state.grants.size || state.commands.size || state.released.size) throw new Error('Invalid hosted lifecycle WAL snapshot ordering')
+        restoreSnapshot(state, record)
+      } else applyEntry(state, record)
+    }
+  }
+
   async append(entry: HostedLifecycleWalEntry): Promise<void> {
     if (!this.#lockHeld) throw new Error('Hosted lifecycle WAL append requires writer lock')
+    await this.#assertPinnedCriticalSection()
     const line = Buffer.from(`${JSON.stringify(entry)}\n`)
-    const handle = await this.#openAppend(
-      this.path,
-      constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
+    const handle = await this.#openAppendPinned()
     let originalSize = 0
     let closed = false
     try {
@@ -231,6 +288,28 @@ export class HostedLifecycleAuthorityWal {
     } finally { if (!closed) await handle.close() }
   }
 
+  async #openAppendPinned(): Promise<HostedLifecycleWalAppendHandle> {
+    const parent = this.#activeParent
+    if (!parent || this.#customOpenAppend) {
+      return this.#openAppend(this.path, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600)
+    }
+    const walName = 'hosted-lifecycle-authority.wal.v1.jsonl'
+    let fd: number
+    if (parent.exists(walName)) fd = parent.openChild(walName, constants.O_APPEND | constants.O_WRONLY)
+    else {
+      fd = parent.createExclusive(walName)
+      closeSync(fd)
+      fd = parent.openChild(walName, constants.O_APPEND | constants.O_WRONLY)
+    }
+    return {
+      stat: async () => fstatSync(fd),
+      write: async (buffer, offset, length) => ({ bytesWritten: writeSync(fd, buffer, offset, length) }),
+      truncate: async length => { ftruncateSync(fd, length) },
+      sync: async () => { fsyncSync(fd) },
+      close: async () => { closeSync(fd) },
+    }
+  }
+
   async #compactAndAppend(entry: HostedLifecycleWalEntry): Promise<void> {
     const state = await this.load()
     applyEntry(state, entry)
@@ -239,22 +318,18 @@ export class HostedLifecycleAuthorityWal {
     if (Buffer.byteLength(serialized) > MAX_WAL_BYTES) {
       throw new Error('Hosted lifecycle WAL active state exceeds 8MiB')
     }
-    const tempPath = `${this.path}.snapshot-${process.pid}-${randomUUID()}`
+    const parent = this.#activeParent
+    if (!parent) throw new Error('Hosted lifecycle WAL compaction requires pinned parent')
+    const tempName = `hosted-lifecycle-authority.wal.v1.jsonl.snapshot-${process.pid}-${randomUUID()}`
     try {
-      const handle = await open(
-        tempPath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
-        0o600,
-      )
-      let replacementIdentity: Awaited<ReturnType<typeof handle.stat>>
+      const fd = parent.createExclusive(tempName)
+      let replacementIdentity: ReturnType<typeof fstatSync>
       try {
-        await handle.writeFile(serialized, 'utf8')
-        await handle.sync()
-        replacementIdentity = await handle.stat()
-      } finally {
-        await handle.close()
-      }
-      await rename(tempPath, this.path)
+        const bytes = Buffer.from(serialized); if (writeSync(fd, bytes, 0, bytes.length, 0) !== bytes.length) throw new Error('Hosted lifecycle WAL compact short write')
+        fsyncSync(fd)
+        replacementIdentity = fstatSync(fd)
+      } finally { closeSync(fd) }
+      parent.rename(tempName, 'hosted-lifecycle-authority.wal.v1.jsonl')
       // The replacement inode, not merely whatever currently occupies the
       // pathname, must remain installed across the directory durability
       // boundary. This closes rename/substitution races during rotation.
@@ -262,12 +337,15 @@ export class HostedLifecycleAuthorityWal {
       await this.#syncDirectory()
       await this.#assertCurrentWalHandle(replacementIdentity)
     } finally {
-      await rm(tempPath, { force: true }).catch(() => undefined)
+      if (parent.exists(tempName)) parent.unlinkIfExists(tempName)
     }
   }
 
   async #assertCurrentWalHandle(stat: Awaited<ReturnType<HostedLifecycleWalAppendHandle['stat']>>): Promise<void> {
-    const current = await lstat(this.path)
+    const pinned = this.#activeParent
+    const current = pinned
+      ? (() => { const fd = pinned.openChild('hosted-lifecycle-authority.wal.v1.jsonl', constants.O_RDONLY); try { return fstatSync(fd) } finally { closeSync(fd) } })()
+      : await lstat(this.path)
     const uid = process.getuid?.()
     if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
       stat.ino !== current.ino || stat.uid !== current.uid || stat.mode !== current.mode || (stat.mode & 0o077) !== 0 ||
@@ -277,6 +355,12 @@ export class HostedLifecycleAuthorityWal {
   }
 
   async #syncDirectory(): Promise<void> {
+    if (this.#activeParent && !this.#customOpenDirectory) {
+      await this.#assertPinnedCriticalSection()
+      await this.#activeParent.sync()
+      await this.#assertPinnedCriticalSection()
+      return
+    }
     const handle = await this.#openDirectory(
       this.directory,
       constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0),
@@ -311,6 +395,22 @@ export class HostedLifecycleAuthorityWal {
   }
 
   async #repairTornTail(): Promise<void> {
+    if (this.#activeParent) {
+      await this.#assertPinnedCriticalSection()
+      const name = 'hosted-lifecycle-authority.wal.v1.jsonl'
+      if (!this.#activeParent.exists(name)) return
+      const fd = this.#activeParent.openChild(name, constants.O_RDWR)
+      try {
+        const stat = fstatSync(fd)
+        if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > MAX_WAL_BYTES ||
+          (process.getuid?.() !== undefined && stat.uid !== process.getuid())) throw new Error('Unsafe hosted lifecycle WAL')
+        const bytes = readFileSync(fd)
+        if (bytes.length === 0 || bytes.at(-1) === 0x0a) return
+        ftruncateSync(fd, bytes.lastIndexOf(0x0a) + 1); fsyncSync(fd)
+        await this.#syncDirectory()
+      } finally { closeSync(fd) }
+      return
+    }
     const handle = await open(
       this.path,
       constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
@@ -344,14 +444,20 @@ function compactSnapshot(
   const allCompleted = [...state.commands.values()]
     .filter((command): command is Extract<HostedLifecycleWalEntry, { kind: 'completed' }> =>
       command.kind === 'completed')
+  // Completion is the durable effect boundary. If the owner crashes before it
+  // appends the advisory release record, compaction must still retire that
+  // grant so it cannot reappear as active authority after restart.
+  const effectivelyReleased = new Set([
+    ...state.released,
+    ...allCompleted.map(command => command.authorization.grantId),
+  ])
   const retainedCompletedKeys = new Set([
     ...allCompleted.slice(-completedLimit),
-    ...allCompleted.filter(command => !state.released.has(command.authorization.grantId)),
   ].map(command => walCommandKey(command.command, command.authorization)))
   const completed = allCompleted.filter(command =>
     retainedCompletedKeys.has(walCommandKey(command.command, command.authorization)))
   const retainedGrantIds = new Set<string>([
-    ...[...state.grants.keys()].filter(grantId => !state.released.has(grantId)),
+    ...[...state.grants.keys()].filter(grantId => !effectivelyReleased.has(grantId)),
     ...ambiguous.map(command => command.authorization.grantId),
     ...completed.map(command => command.authorization.grantId),
   ])
@@ -364,7 +470,7 @@ function compactSnapshot(
       ...ambiguous,
       ...completed.flatMap(command => [startedFromCompleted(command), command]),
     ],
-    released: [...state.released].filter(grantId => retainedGrantIds.has(grantId)),
+    released: [...effectivelyReleased].filter(grantId => retainedGrantIds.has(grantId)),
   }
 }
 
@@ -412,10 +518,14 @@ function applyEntry(state: HostedLifecycleWalState, entry: HostedLifecycleWalEnt
     return
   }
   if (entry.kind === 'released') {
-    if (!state.grants.has(entry.grantId) || state.released.has(entry.grantId)) {
+    if (!state.grants.has(entry.grantId)) {
       throw new Error('Invalid hosted lifecycle WAL release ordering')
     }
     const grant = state.grants.get(entry.grantId)!
+    if (state.released.has(entry.grantId)) {
+      if (state.commands.get(walCommandKey(grant.command, grant.authorization))?.kind === 'completed') return
+      throw new Error('Invalid hosted lifecycle WAL release ordering')
+    }
     if (state.commands.get(walCommandKey(grant.command, grant.authorization))?.kind === 'started') {
       throw new Error('Invalid hosted lifecycle WAL ambiguous release')
     }
