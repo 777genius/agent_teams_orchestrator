@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import type { Stats } from 'node:fs'
+import { lstatSync, type Stats } from 'node:fs'
 import { constants, chmod, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { connect, createServer, type Server, type Socket } from 'node:net'
 import { basename, dirname, join } from 'node:path'
@@ -15,6 +15,12 @@ import {
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
+import {
+  HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
+  HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES,
+  type HostedApprovalActivationConnection,
+  type HostedApprovalActivationTransportSession,
+} from './HostedApprovalActivationSession.js'
 import {
   decodeHostedTaskMutationRequest,
   decodeHostedTaskMutationTerminalResult,
@@ -31,6 +37,7 @@ import {
 export const HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES = 64 * 1024
 export const HOSTED_CONTROL_MAX_LINE_BYTES = 8 * 1024 * 1024
 export const HOSTED_CONTROL_READ_DEADLINE_MS = 5_000
+export const HOSTED_CONTROL_ACTIVATION_RECOVERY_DEADLINE_MS = 30_000
 export const HOSTED_LIFECYCLE_PROOF_DOMAIN = 'agent-teams.hosted-lifecycle.owner-proof/v1'
 export const HOSTED_TEAM_MESSAGE_PROOF_DOMAIN = 'agent-teams.hosted-team-message.owner-proof/v1'
 export const HOSTED_READINESS_MAX_LINE_BYTES = 4 * 1024
@@ -39,6 +46,10 @@ export type HostedTaskMutationPort = {
   mutate(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult>
 }
 
+export type HostedApprovalActivationSessionFactory = (
+  connection: HostedApprovalActivationConnection,
+) => HostedApprovalActivationTransportSession
+
 export type HostedControlServerOptions = {
   socketPath: string
   secret: Uint8Array
@@ -46,12 +57,43 @@ export type HostedControlServerOptions = {
   authority: HostedControlStableAuthority
   service: HostedTaskMutationPort
   readDeadlineMs?: number
+  /** Recovery has a separate absolute bound after the publication read completes. */
+  activationRecoveryDeadlineMs?: number
   bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
   /** Deterministic publication-window seam for security regression tests. */
   afterSocketPublicationForTest?: () => void | Promise<void>
   /** Deterministic close-window seam for hidden-path replacement regression tests. */
   beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
+  /** Deterministic retained-write seam for activation transport regression tests. */
+  beforeActivationFrameWriteForTest?: (
+    phase: 'owner_ready' | 'ready', socket: Socket,
+  ) => void | Promise<void>
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
+  /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
+  activationSessionFactory?: HostedApprovalActivationSessionFactory
+}
+
+type ActivationPhase =
+  | 'preparing'
+  | 'owner_ready_writing'
+  | 'awaiting_publication'
+  | 'recovering'
+  | 'ready_writing'
+  | 'leased'
+  | 'revoked'
+
+type ActivationCandidate = {
+  readonly socket: Socket
+  readonly generation: number
+  phase: ActivationPhase
+  session: HostedApprovalActivationTransportSession | null
+  publicationChunks: Buffer[]
+  publicationBytes: number
+  resolvePublication: ((frame: string) => void) | null
+  rejectPublication: ((error: Error) => void) | null
+  revokePromise: Promise<void> | null
+  monitor: ReturnType<typeof setInterval> | null
+  recoveryDeadline: ReturnType<typeof setTimeout> | null
 }
 
 export type HostedReadinessAdmission =
@@ -70,6 +112,9 @@ export class HostedControlServer {
   #listenPath: string | null = null
   #leaseSocket: Socket | null = null
   #leaseConsumed = false
+  #activationConsumed = false
+  #activationGeneration = 0
+  #activation: ActivationCandidate | null = null
   readonly #mutationLease = new AsyncLocalStorage<Socket>()
   readonly #handlers = new Set<Promise<void>>()
   #stopping = false
@@ -177,6 +222,11 @@ export class HostedControlServer {
 
   async #stop(): Promise<void> {
     this.#stopping = true
+    // The approval delegate is synchronously fenced before any listener,
+    // handler, lifecycle port, root lease, or descriptor cleanup can begin.
+    const activationRevocation = this.#activation
+      ? this.#revokeActivation(this.#activation, new Error('Hosted control server stopped'))
+      : Promise.resolve()
     const server = this.#server
     const broker = this.#broker
     const parentIdentity = this.#socketParentIdentity
@@ -200,6 +250,7 @@ export class HostedControlServer {
       )
     }
     await Promise.allSettled([...this.#handlers])
+    await activationRevocation.catch(() => undefined)
     if (this.#ownsSocket) {
       this.#ownsSocket = false
       const [socketStat, parentStat] = await Promise.all([
@@ -223,17 +274,41 @@ export class HostedControlServer {
     let bytes = 0
     let finished = false
 
-    const failClosed = () => {
+    const failClosed = (cause: unknown = new Error('Hosted control connection failed closed')) => {
       finished = true
       chunks = []
-      socket.destroy()
+      const activation = this.#activation
+      if (activation?.socket === socket) {
+        void this.#revokeActivation(activation, asError(cause))
+      } else {
+        socket.destroy()
+      }
     }
     socket.once('timeout', failClosed)
-    socket.once('error', () => {
+    socket.once('error', error => {
       finished = true
       chunks = []
+      const activation = this.#activation
+      if (activation?.socket === socket) void this.#revokeActivation(activation, error)
+    })
+    socket.once('end', () => {
+      const activation = this.#activation
+      if (activation?.socket === socket) {
+        void this.#revokeActivation(activation, new Error('Hosted approval activation lease ended'))
+      }
+    })
+    socket.once('close', () => {
+      const activation = this.#activation
+      if (activation?.socket === socket) {
+        void this.#revokeActivation(activation, new Error('Hosted approval activation lease closed'))
+      }
     })
     socket.on('data', chunk => {
+      const activation = this.#activation
+      if (activation?.socket === socket) {
+        this.#handleActivationData(activation, chunk)
+        return
+      }
       if (finished) {
         socket.destroy()
         return
@@ -256,12 +331,218 @@ export class HostedControlServer {
       if (this.#stopping) { failClosed(); return }
       let line: string
       try { line = decodeUtf8(input.subarray(0, newline)) } catch { failClosed(); return }
+      if (this.#options.activationSessionFactory && isActivationPrepare(line)) {
+        const handler = this.#beginActivation(socket, `${line}\n`).catch(failClosed)
+        this.#handlers.add(handler)
+        void handler.finally(() => this.#handlers.delete(handler))
+        return
+      }
       const handler = this.#processLine(socket, line)
         .catch(failClosed)
       this.#handlers.add(handler)
       void handler.finally(() => this.#handlers.delete(handler))
     })
     if (initialData.byteLength > 0) socket.emit('data', initialData)
+  }
+
+  async #beginActivation(socket: Socket, prepareFrame: string): Promise<void> {
+    if (this.#activationConsumed || this.#activation || this.#stopping ||
+      Buffer.byteLength(prepareFrame, 'utf8') > HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES) {
+      socket.destroy()
+      return
+    }
+    const ownerBinding = this.#ownerBinding
+    if (!ownerBinding || !this.#isCurrentSocketIdentitySync()) { socket.destroy(); return }
+    const candidate: ActivationCandidate = {
+      socket,
+      generation: ++this.#activationGeneration,
+      phase: 'preparing',
+      session: null,
+      publicationChunks: [],
+      publicationBytes: 0,
+      resolvePublication: null,
+      rejectPublication: null,
+      revokePromise: null,
+      monitor: null,
+      recoveryDeadline: null,
+    }
+    this.#activation = candidate
+    const connection: HostedApprovalActivationConnection = Object.freeze({
+      ownerBinding,
+      socketPath: this.#options.socketPath,
+      isCurrent: () => this.#isActivationCurrent(candidate),
+      prepareEffectToken: () => this.#prepareActivationEffectToken(candidate),
+      receivePublicationAfterOwnerReady: (ownerReady, maximumBytes) =>
+        this.#receivePublicationAfterOwnerReady(candidate, ownerReady, maximumBytes),
+    })
+    try {
+      candidate.session = this.#options.activationSessionFactory!(connection)
+      candidate.monitor = setInterval(() => {
+        if (!this.#isActivationCurrent(candidate)) {
+          void this.#revokeActivation(candidate, new Error('Hosted approval activation socket identity changed'))
+        }
+      }, 10)
+      candidate.monitor.unref?.()
+      const ready = await candidate.session.activate(prepareFrame)
+      if (!this.#isActivationCurrent(candidate) || candidate.phase !== 'recovering') {
+        throw new Error('Hosted approval activation became stale during recovery')
+      }
+      candidate.phase = 'ready_writing'
+      await this.#options.beforeActivationFrameWriteForTest?.('ready', socket)
+      await writeRetainedFrame(socket, ready)
+      if (!this.#isActivationCurrent(candidate) || candidate.phase !== 'ready_writing') {
+        throw new Error('Hosted approval activation became stale while publishing ready')
+      }
+      candidate.phase = 'leased'
+      this.#clearActivationRecoveryDeadline(candidate)
+    } catch (error) {
+      await this.#revokeActivation(candidate, asError(error)).catch(() => undefined)
+      socket.destroy()
+      throw error
+    }
+  }
+
+  #handleActivationData(candidate: ActivationCandidate, chunk: Buffer): void {
+    if (candidate.phase !== 'awaiting_publication') {
+      void this.#revokeActivation(candidate, new Error('Unexpected hosted approval activation bytes'))
+      candidate.socket.destroy()
+      return
+    }
+    candidate.publicationBytes += chunk.byteLength
+    if (candidate.publicationBytes > HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES) {
+      void this.#revokeActivation(candidate, new Error('Hosted approval activation publication exceeds limit'))
+      candidate.socket.destroy()
+      return
+    }
+    candidate.publicationChunks.push(chunk)
+    const input = Buffer.concat(candidate.publicationChunks)
+    const newline = input.indexOf(0x0a)
+    if (newline < 0) return
+    if (newline !== input.byteLength - 1 || input.indexOf(0x0a, newline + 1) >= 0) {
+      void this.#revokeActivation(candidate, new Error('Hosted approval activation publication was pipelined'))
+      candidate.socket.destroy()
+      return
+    }
+    let frame: string
+    try { frame = `${decodeUtf8(input.subarray(0, newline))}\n` } catch (error) {
+      void this.#revokeActivation(candidate, asError(error))
+      candidate.socket.destroy()
+      return
+    }
+    candidate.phase = 'recovering'
+    // The publication inactivity deadline must not consume a legitimate slow
+    // recovery. Recovery instead owns one absolute, fail-closed deadline that
+    // also bounds the retained ready write.
+    candidate.socket.setTimeout(0)
+    candidate.recoveryDeadline = setTimeout(() => {
+      void this.#revokeActivation(
+        candidate, new Error('Hosted approval activation recovery timed out'),
+      )
+    }, this.#options.activationRecoveryDeadlineMs ??
+      HOSTED_CONTROL_ACTIVATION_RECOVERY_DEADLINE_MS)
+    candidate.recoveryDeadline.unref?.()
+    candidate.publicationChunks = []
+    candidate.resolvePublication?.(frame)
+    candidate.resolvePublication = null
+    candidate.rejectPublication = null
+  }
+
+  async #receivePublicationAfterOwnerReady(
+    candidate: ActivationCandidate,
+    ownerReady: string,
+    maximumBytes: number,
+  ): Promise<string> {
+    if (maximumBytes !== HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES ||
+      candidate.phase !== 'preparing' || !this.#isActivationCurrent(candidate)) {
+      throw new Error('Hosted approval activation publication transition is stale')
+    }
+    // O2-C reaches this transition only after authenticating the prepare.
+    // From this point the process-generation activation slot is permanent,
+    // including owner-ready failure, recovery failure, and later revocation.
+    this.#activationConsumed = true
+    candidate.phase = 'owner_ready_writing'
+    candidate.socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
+    try {
+      await this.#options.beforeActivationFrameWriteForTest?.('owner_ready', candidate.socket)
+      await writeRetainedFrame(candidate.socket, ownerReady)
+    } catch (error) {
+      void this.#revokeActivation(candidate, asError(error))
+      throw error
+    }
+    if (candidate.phase !== 'owner_ready_writing' || !this.#isActivationCurrent(candidate)) {
+      throw new Error('Hosted approval activation owner-ready write became stale')
+    }
+    candidate.phase = 'awaiting_publication'
+    candidate.socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
+    return new Promise<string>((resolve, reject) => {
+      candidate.resolvePublication = resolve
+      candidate.rejectPublication = reject
+    })
+  }
+
+  #prepareActivationEffectToken(candidate: ActivationCandidate): { consume(): boolean } | null {
+    if (!this.#isActivationCurrent(candidate)) return null
+    const generation = candidate.generation
+    const socket = candidate.socket
+    const ownerBinding = this.#ownerBinding
+    const parentIdentity = this.#socketParentIdentity
+    let consumed = false
+    return Object.freeze({
+      consume: (): boolean => {
+        if (consumed) return false
+        consumed = true
+        const current = !!ownerBinding && !!parentIdentity &&
+          this.#activation === candidate && this.#activationGeneration === generation &&
+          candidate.socket === socket && !socket.destroyed &&
+          isSocketIdentityCurrentSync(
+            this.#options.socketPath, ownerBinding, parentIdentity,
+          )
+        if (!current) void this.#revokeActivation(
+          candidate, new Error('Hosted approval activation effect token is stale'),
+        )
+        return current
+      },
+    })
+  }
+
+  #isActivationCurrent(candidate: ActivationCandidate): boolean {
+    return this.#activation === candidate && this.#activationGeneration === candidate.generation &&
+      candidate.phase !== 'revoked' && !this.#stopping && !candidate.socket.destroyed &&
+      this.#isCurrentSocketIdentitySync()
+  }
+
+  #revokeActivation(candidate: ActivationCandidate, error: Error): Promise<void> {
+    if (candidate.revokePromise) return candidate.revokePromise
+    candidate.phase = 'revoked'
+    this.#activationGeneration += 1
+    this.#clearActivationRecoveryDeadline(candidate)
+    if (candidate.monitor) clearInterval(candidate.monitor)
+    candidate.monitor = null
+    candidate.rejectPublication?.(error)
+    candidate.resolvePublication = null
+    candidate.rejectPublication = null
+    if (!this.#activationConsumed && this.#activation === candidate) {
+      this.#activation = null
+    }
+    // Invocation, and therefore O2-C's synchronous O2-A linearization point,
+    // happens before this method exposes the cleanup promise.
+    candidate.revokePromise = Promise.resolve()
+    try {
+      candidate.revokePromise = candidate.session
+        ? Promise.resolve(candidate.session.revoke())
+        : Promise.resolve()
+    } catch (cause) {
+      candidate.revokePromise = Promise.reject(cause)
+    }
+    // Always close the exact retained connection in the same synchronous
+    // revocation turn. Clearing the identity monitor can never orphan it.
+    candidate.socket.destroy()
+    return candidate.revokePromise
+  }
+
+  #clearActivationRecoveryDeadline(candidate: ActivationCandidate): void {
+    if (candidate.recoveryDeadline) clearTimeout(candidate.recoveryDeadline)
+    candidate.recoveryDeadline = null
   }
 
   #admitBrokerConnection(
@@ -393,6 +674,59 @@ export class HostedControlServer {
     const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath).catch(() => null), lstat(dirname(this.#options.socketPath)).catch(() => null)])
     return !!socketStat?.isSocket() && (socketStat.mode & 0o077) === 0 && (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) && !!parentStat?.isDirectory() && !parentStat.isSymbolicLink() && String(socketStat.dev) === ownerBinding.socketIdentity.device && String(socketStat.ino) === ownerBinding.socketIdentity.inode && socketStat.uid === ownerBinding.socketIdentity.uid && socketStat.gid === ownerBinding.socketIdentity.gid && (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode && parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
   }
+
+  #isCurrentSocketIdentitySync(): boolean {
+    const ownerBinding = this.#ownerBinding
+    const parentIdentity = this.#socketParentIdentity
+    return !!ownerBinding && !!parentIdentity && isSocketIdentityCurrentSync(
+      this.#options.socketPath, ownerBinding, parentIdentity,
+    )
+  }
+}
+
+function isActivationPrepare(line: string): boolean {
+  try {
+    const value = JSON.parse(line) as Record<string, unknown>
+    return !!value && typeof value === 'object' && !Array.isArray(value) &&
+      value.operation === 'approval_activation_prepare'
+  } catch {
+    return false
+  }
+}
+
+function isSocketIdentityCurrentSync(
+  socketPath: string,
+  ownerBinding: HostedControlOwnerBinding,
+  parentIdentity: { device: number; inode: number },
+): boolean {
+  try {
+    const socketStat = lstatSync(socketPath)
+    const parentStat = lstatSync(dirname(socketPath))
+    return socketStat.isSocket() && (socketStat.mode & 0o077) === 0 &&
+      (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) &&
+      parentStat.isDirectory() && !parentStat.isSymbolicLink() &&
+      String(socketStat.dev) === ownerBinding.socketIdentity.device &&
+      String(socketStat.ino) === ownerBinding.socketIdentity.inode &&
+      socketStat.uid === ownerBinding.socketIdentity.uid &&
+      socketStat.gid === ownerBinding.socketIdentity.gid &&
+      (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode &&
+      parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
+  } catch {
+    return false
+  }
+}
+
+function writeRetainedFrame(socket: Socket, frame: string): Promise<void> {
+  if (!frame.endsWith('\n') || frame.slice(0, -1).includes('\n')) {
+    return Promise.reject(new Error('Hosted approval activation response is not one frame'))
+  }
+  return new Promise<void>((resolve, reject) => {
+    socket.write(frame, error => error ? reject(error) : resolve())
+  })
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
 }
 
 function isApprovalOperation(value: unknown): boolean {

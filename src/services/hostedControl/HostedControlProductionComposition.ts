@@ -17,8 +17,12 @@ import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.j
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
-import { PrivateFileHostedApprovalRuntimeAdmissionStore } from './HostedApprovalRuntimeAdmission.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
+import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
+import {
+  HostedApprovalActivationSession,
+  type HostedApprovalActivationConnection,
+} from './HostedApprovalActivationSession.js'
 
 export const HOSTED_LIFECYCLE_PLAN_FILE = 'hosted-lifecycle-plan.v1.json'
 export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
@@ -75,39 +79,59 @@ export function createHostedControlProductionPortFactory(
       messageDelivery,
       lifecycleEffects: lifecycle.authority,
     })
-    // Approval capability is installed only after a separate trusted
-    // provisioning owner atomically publishes its private authority. This
-    // composition never manufactures it from launch-plan strings. Until that
-    // producer lands, absence is capability-false; a present malformed file is
-    // still a startup failure.
-    let approvals: HostedApprovalOwnerService | undefined
-    try {
-      const approvalAdmission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(
-        join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE),
-      ).load(context.authority)
-      // Loading still validates a published admission. Keep the production
-      // port absent until the exact authenticated v2 server artifact passes
-      // the no-fake sandbox E2E and its cross-repo contract is verified.
-      if (OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED) {
-        approvals = new HostedApprovalOwnerService({
-          store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
-            join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
-          )),
-          admission: approvalAdmission,
-          runtime: new OpenCodeHostedApprovalRuntimeAdapter(),
-          isCurrentOuterAuthority: () => context.isCurrentAuthority({
-            actorId: 'hosted-approval-owner', ...context.authority,
-          }),
+    const activation = context.activationV2
+    const approvals = activation ? new HostedApprovalActivatablePort() : undefined
+    const rawAdmissionPath = join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE)
+    const activationSessionFactory = activation && approvals
+      ? (connection: HostedApprovalActivationConnection) =>
+        HostedApprovalActivationSession.production({
+          proofKey: activation.proofKey,
+          authority: {
+            snapshot: () => ({
+              ...activation.expectation,
+              ownerBinding: connection.ownerBinding,
+            }),
+            assertBootstrapCurrent: activation.assertBootstrapCurrent,
+            assertRootCurrent: activation.assertRootCurrent,
+          },
+          connection,
+          rawAdmissionPath,
+          port: approvals,
+          recover: async approvalAdmission => {
+            if (!OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED) {
+              throw new Error('hosted_approval_runtime_production_gate_closed')
+            }
+            const owner = new HostedApprovalOwnerService({
+              store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
+                join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
+              )),
+              admission: approvalAdmission,
+              runtime: new OpenCodeHostedApprovalRuntimeAdapter(),
+              isCurrentOuterAuthority: () => context.isCurrentAuthority({
+                actorId: 'hosted-approval-owner', ...context.authority,
+              }),
+            })
+            // Recovery is deliberately complete before the session installs
+            // the owner behind the stable activatable port.
+            await owner.recoverStateOnly()
+            return owner
+          },
         })
-        await approvals.recoverStateOnly()
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      : undefined
+    let revocation: Promise<void> | null = null
+    const revoke = (): Promise<void> => {
+      if (!revocation) revocation = approvals?.revoke() ?? Promise.resolve()
+      return revocation
     }
     return {
       ...services,
       ...(approvals ? { approvals } : {}),
+      ...(activationSessionFactory ? { activationSessionFactory } : {}),
+      revoke,
       close: async () => {
+        // Calling revoke fences the delegate synchronously; all awaited work is
+        // cleanup and therefore precedes lifecycle/authority resource release.
+        await revoke().catch(() => undefined)
         await Promise.all([messageDelivery.close(), execution.shutdown()])
       },
     }

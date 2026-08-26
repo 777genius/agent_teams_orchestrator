@@ -12,7 +12,11 @@ import type {
 } from './HostedControlDispatcher.js'
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
 import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
-import { HostedControlServer } from './HostedControlServer.js'
+import type { HostedApprovalActivationExpectation } from './HostedApprovalRuntimeActivation.js'
+import {
+  HostedControlServer,
+  type HostedApprovalActivationSessionFactory,
+} from './HostedControlServer.js'
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
 import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
@@ -31,16 +35,33 @@ import {
 export type HostedControlRuntimePorts = {
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
-  /** Deliberately optional until the external lifecycle approval owner is installed. */
+  /**
+   * Deliberately optional until the external lifecycle approval owner is installed.
+   * When activation is composed, this is the stable activation-managed port: it
+   * must fail closed before activation and synchronously after session revocation.
+   */
   approvals?: HostedApprovalWirePort
+  /** Per-connection O2-C activation boundary; omitted for legacy composition. */
+  activationSessionFactory?: HostedApprovalActivationSessionFactory
+  /** Synchronously fences the stable approval port; returned work is cleanup only. */
+  revoke?(): Promise<void>
   close(): Promise<void>
 }
+
+export type HostedControlApprovalActivationV2Context = Readonly<{
+  proofKey: Uint8Array
+  expectation: Readonly<Omit<HostedApprovalActivationExpectation, 'ownerBinding'>>
+  assertBootstrapCurrent(): boolean | Promise<boolean>
+  assertRootCurrent(): boolean | Promise<boolean>
+}>
 
 export type HostedControlRuntimePortFactoryContext = {
   authority: Readonly<HostedControlStableAuthority>
   readonly legacyKey: string
   /** Canonical owner-validated root for all private hosted durable state. */
   teamRoot: string
+  /** Present only for the authenticated inherited-descriptor activation-v2 bootstrap. */
+  activationV2?: HostedControlApprovalActivationV2Context
   isCurrentAuthority(authority: HostedControlAuthority | HostedLifecycleAuthority): Promise<boolean>
 }
 
@@ -59,6 +80,7 @@ export class HostedControlRuntime {
   #descriptorGuard: HostedControlDescriptorGuard | null = null
   #descriptorAuthorityLost = false
   #secret: Buffer | null = null
+  #portsRevocation: Promise<void> | null = null
 
   constructor(
     private readonly source: string | HostedControlBootstrapAdmission,
@@ -72,6 +94,7 @@ export class HostedControlRuntime {
   async start(): Promise<void> {
     if (this.#startRequested || this.#server) throw new Error('Hosted control runtime is already started')
     this.#startRequested = true
+    this.#portsRevocation = null
     const startup = { cancelled: false }
     this.#startup = startup
     return this.#enqueue(async () => {
@@ -136,6 +159,14 @@ export class HostedControlRuntime {
       const isCurrentAuthority = async (
         candidate: HostedControlAuthority | HostedLifecycleAuthority,
       ): Promise<boolean> => authorityMatches(candidate, authority) && await validateOwner()
+      const assertRootCurrent = async (): Promise<boolean> => {
+        if (!this.#acceptingEffects) return false
+        return validateHostedControlOwnerBinding({
+          claudeRoot: config.claudeRoot,
+          legacyKey: config.legacyKey,
+          expectedRootIdentity: ownerScope.rootIdentity,
+        })
+      }
       const taskService = new HostedTaskMutationService({
         claudeRoot: config.claudeRoot,
         legacyKey: config.legacyKey,
@@ -152,15 +183,6 @@ export class HostedControlRuntime {
       }
       startupRecovery = false
       let dispatcher: HostedControlDispatcher
-      server = new HostedControlServer({
-        socketPath: config.socketPath,
-        secret,
-        ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
-        authority,
-        service: taskService,
-        bootstrapBinding: descriptorAdmission?.bootstrapBinding,
-        dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
-      })
       if (!(await validateHostedControlOwnerBinding({
         claudeRoot: config.claudeRoot,
         legacyKey: config.legacyKey,
@@ -174,9 +196,36 @@ export class HostedControlRuntime {
         authority,
         legacyKey: config.legacyKey,
         teamRoot: ownerScope.canonicalTeamRoot,
+        ...(descriptorAdmission ? {
+          activationV2: Object.freeze({
+            proofKey: secret,
+            expectation: Object.freeze({
+              authority,
+              socketPath: config.socketPath,
+              ...descriptorAdmission.approvalActivationV2,
+              signedManifest: Object.freeze({
+                ...descriptorAdmission.approvalActivationV2.signedManifest,
+              }),
+            }),
+            assertBootstrapCurrent: () =>
+              this.#descriptorGuard === descriptorAdmission.guard &&
+              descriptorAdmission.guard.assertCurrent(),
+            assertRootCurrent,
+          }),
+        } : {}),
         isCurrentAuthority,
       }))
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
+      server = new HostedControlServer({
+        socketPath: config.socketPath,
+        secret,
+        ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
+        authority,
+        service: taskService,
+        bootstrapBinding: descriptorAdmission?.bootstrapBinding,
+        dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
+        activationSessionFactory: ports.activationSessionFactory,
+      })
       dispatcher = new HostedControlDispatcher({
         secret,
         authority,
@@ -198,7 +247,13 @@ export class HostedControlRuntime {
     } catch (error) {
       this.#acceptingEffects = false
       this.#ports = null
-      await Promise.allSettled([ports?.close(), server?.stop()])
+      let revocation: Promise<void> = Promise.resolve()
+      try { revocation = ports?.revoke?.() ?? revocation } catch { /* cleanup remains mandatory */ }
+      // Activation invalidation and handler draining must precede composed
+      // approval/lifecycle/message port teardown.
+      await server?.stop().catch(() => undefined)
+      await revocation.catch(() => undefined)
+      await ports?.close().catch(() => undefined)
       this.#rootLease = null
       try { await rootLease?.release() } finally { await this.#disposeDescriptorAuthority() }
       throw error
@@ -208,6 +263,8 @@ export class HostedControlRuntime {
   async stop(): Promise<void> {
     if (this.#startup) this.#startup.cancelled = true
     this.#acceptingEffects = false
+    // Invocation is the synchronous fencing boundary. Awaiting is cleanup.
+    const revocation = this.#revokePorts()
     return this.#enqueue(async () => {
       const server = this.#server
       const ports = this.#ports
@@ -217,7 +274,10 @@ export class HostedControlRuntime {
       try {
         await server?.stop()
       } finally {
-        try { await ports?.close() } finally {
+        try {
+          await revocation.catch(() => undefined)
+          await ports?.close()
+        } finally {
           const rootLease = this.#rootLease
           this.#rootLease = null
           try { await rootLease?.release() } finally { await this.#disposeDescriptorAuthority() }
@@ -241,6 +301,8 @@ export class HostedControlRuntime {
       this.#descriptorAuthorityLost = true
       this.#acceptingEffects = false
       if (this.#startup) this.#startup.cancelled = true
+      // Do not defer approval fencing behind the queued async stop.
+      void this.#revokePorts().catch(() => undefined)
       void this.stop().catch(() => undefined)
     }
     void guard.lost.then(lost, lost)
@@ -253,6 +315,16 @@ export class HostedControlRuntime {
     this.#secret = null
     secret?.fill(0)
     await guard?.close()
+  }
+
+  #revokePorts(): Promise<void> {
+    if (this.#portsRevocation) return this.#portsRevocation
+    try {
+      this.#portsRevocation = this.#ports?.revoke?.() ?? Promise.resolve()
+    } catch (error) {
+      this.#portsRevocation = Promise.reject(error)
+    }
+    return this.#portsRevocation
   }
 }
 
