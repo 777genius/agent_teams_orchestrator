@@ -99,6 +99,63 @@ describe('release build feature plan', () => {
     expect(plan.hostedActualOwnerWrapper).toBe('./bin/hosted-actual-owner-acceptance')
   })
 
+  test('keeps ordinary development builds portable and platform-honest', () => {
+    const plan = readBuildPlan(['--dev'])
+
+    if (process.platform === 'linux' && process.arch === 'x64') {
+      expect(plan.hostedActualOwnerArtifact)
+        .toBe('./dist/local-cli-dev/hostedActualOwnerLauncher-<sha256>')
+      expect(plan.hostedActualOwnerWrapper).toBe('./bin/hosted-actual-owner-acceptance')
+    } else {
+      expect(plan.hostedActualOwnerArtifact).toBeNull()
+      expect(plan.hostedActualOwnerWrapper).toBeNull()
+      const hosted = spawnSync(process.execPath, [
+        'run', buildScript, '--dev', '--feature=HOSTED_CONTROL', '--print-build-plan',
+      ], { cwd: repoRoot, encoding: 'utf8' })
+      expect(hosted.status).not.toBe(0)
+      expect(hosted.stderr).toContain(
+        'Hosted actual-owner production build requires Linux x64 glibc',
+      )
+    }
+  })
+
+  test('uses a fresh absolute metafile for each committed-root owner build', async () => {
+    const source = await readFile(buildScript, 'utf8')
+    expect(source).toContain(
+      "resolve(stagingOutdir, 'hostedActualOwnerAcceptance.meta.json')",
+    )
+    expect(source.match(/runBuildWithFreshMetafile\(/g)).toHaveLength(3)
+    expect(source).toContain(
+      "readStableBytes(metafilePath, 'build metafile').bytes.toString('utf8')",
+    )
+  })
+
+  test('publishes an ordinary CLI bundle without entering the Linux owner boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'portable-cli-publication-'))
+    fixtureRoots.push(root)
+    await mkdir(join(root, 'scripts'), { recursive: true })
+    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await writeFile(join(root, 'package.json'), JSON.stringify({
+      name: 'portable-cli-publication-fixture', version: '1.0.0',
+    }))
+    const staging = join(root, 'staging')
+    const finalOut = join(root, 'dist', 'local-cli-dev')
+    await mkdir(staging)
+    await writeFile(join(staging, 'cli.js'), 'portable-cli-bundle\n')
+
+    const result = spawnSync(process.execPath, [
+      'run', join(root, 'scripts', 'build.ts'),
+      `--test-publish-generation=${staging}|${finalOut}`,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, HOSTED_ACTUAL_OWNER_BUILD_TEST_HOOK: '1' },
+    })
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
+    expect(result.signal).toBeNull()
+    expect(await readFile(join(finalOut, 'cli.js'), 'utf8')).toBe('portable-cli-bundle\n')
+  })
+
   test('uses Bun-supported negative compile autoload flags for the generated wrapper', async () => {
     const source = await readFile(buildScript, 'utf8')
     expect(source).toContain("'--no-compile-autoload-dotenv'")
@@ -1113,7 +1170,17 @@ async function writeRuntimeManifest(input: {
 }
 
 describe('packaged hosted actual-owner build', () => {
-  async function cleanPackagedBuildFixture(): Promise<string> {
+  function spawnResultEvidence(result: ReturnType<typeof spawnSync>): string {
+    return JSON.stringify({
+      status: result.status,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      error: result.error?.message,
+    })
+  }
+
+  async function cleanPackagedBuildFixture(copyDependencies = true): Promise<string> {
     const fixtureParent = await mkdtemp(join(tmpdir(), 'hosted-owner-clean-build-'))
     fixtureRoots.push(fixtureParent)
     const root = join(fixtureParent, 'repository')
@@ -1121,7 +1188,9 @@ describe('packaged hosted actual-owner build', () => {
       encoding: 'utf8',
       env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
     })
-    if (clone.status !== 0) throw new Error(`clean fixture clone failed:\n${clone.stderr}`)
+    if (clone.status !== 0) {
+      throw new Error(`clean fixture clone failed: ${spawnResultEvidence(clone)}`)
+    }
     const ownedProductionPaths = [
       'scripts/build.ts',
       'scripts/e2e/hosted-actual-owner/contracts.ts',
@@ -1135,21 +1204,42 @@ describe('packaged hosted actual-owner build', () => {
       await cp(join(repoRoot, path), join(root, path))
     }
     const dependencies = join(repoRoot, 'node_modules')
-    if (existsSync(dependencies)) {
+    if (copyDependencies && existsSync(dependencies)) {
       await cp(dependencies, join(root, 'node_modules'), { recursive: true })
     }
     const commit = spawnSync('/usr/bin/git', [
       '-C', root, '-c', 'user.name=Hosted Owner Test',
       '-c', 'user.email=hosted-owner-test.invalid', 'add', '--', ...ownedProductionPaths,
     ], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } })
-    if (commit.status !== 0) throw new Error(`clean fixture add failed:\n${commit.stderr}`)
+    if (commit.status !== 0) {
+      throw new Error(`clean fixture add failed: ${spawnResultEvidence(commit)}`)
+    }
     const committed = spawnSync('/usr/bin/git', [
       '-C', root, '-c', 'user.name=Hosted Owner Test',
-      '-c', 'user.email=hosted-owner-test.invalid', 'commit', '-m', 'packaged owner fixture',
+      '-c', 'user.email=hosted-owner-test.invalid', 'commit', '--allow-empty',
+      '-m', 'packaged owner fixture',
     ], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } })
-    if (committed.status !== 0) throw new Error(`clean fixture commit failed:\n${committed.stderr}`)
+    if (committed.status !== 0) {
+      throw new Error(`clean fixture commit failed: ${spawnResultEvidence(committed)}`)
+    }
     return root
   }
+
+  test('creates a genuinely clean commit when fixture inputs already match HEAD', async () => {
+    const root = await cleanPackagedBuildFixture(false)
+    const status = spawnSync('/usr/bin/git', [
+      '-C', root, 'status', '--porcelain=v1', '--untracked-files=all',
+    ], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } })
+    expect(status.status, spawnResultEvidence(status)).toBe(0)
+    expect(status.signal).toBeNull()
+    expect(status.stdout).toBe('')
+    expect(status.stderr).toBe('')
+    const subject = spawnSync('/usr/bin/git', [
+      '-C', root, 'show', '-s', '--format=%s', 'HEAD',
+    ], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } })
+    expect(subject.status, spawnResultEvidence(subject)).toBe(0)
+    expect(subject.stdout.trim()).toBe('packaged owner fixture')
+  })
 
   test('removes every staging output when a build child fails', async () => {
     const brokenRoot = await mkdtemp(join(tmpdir(), 'hosted-owner-failed-build-'))

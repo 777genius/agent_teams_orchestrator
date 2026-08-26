@@ -758,7 +758,9 @@ function readHostedActualOwnerSourceInputs(
   metafilePath: string,
   root = repositoryRoot,
 ): readonly SourceInputIdentity[] {
-  const decoded: unknown = JSON.parse(readFileSync(metafilePath, 'utf8'))
+  const decoded: unknown = JSON.parse(
+    readStableBytes(metafilePath, 'build metafile').bytes.toString('utf8'),
+  )
   if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
     throw new Error('Hosted actual-owner build metafile is invalid')
   }
@@ -1064,16 +1066,19 @@ if (publicationTest) {
     throw new Error('Hosted actual-owner publication test hook is disabled')
   }
   const paths = publicationTest.slice(publicationTest.indexOf('=') + 1).split('|')
-  if (paths.length !== 4 || paths.some(path => {
+  if ((paths.length !== 2 && paths.length !== 4) || paths.some(path => {
     const relation = relative(repositoryRoot, resolve(path))
     return relation === '' || relation === '..' || relation.startsWith(`..${sep}`) ||
       isAbsolute(relation)
   })) {
     throw new Error('Hosted actual-owner publication test path escaped repository')
   }
-  publishBuildGeneration(paths[0]!, paths[1]!, paths[2]!, paths[3]!, digest => {
-    writeSync(process.stdout.fd, `${digest}\n`)
-  })
+  const publishesOwner = paths.length === 4
+  publishBuildGeneration(
+    paths[0]!, paths[1]!, publishesOwner ? paths[2]! : null,
+    publishesOwner ? paths[3]! : null,
+    publishesOwner ? digest => writeSync(process.stdout.fd, `${digest}\n`) : undefined,
+  )
   process.exit(0)
 }
 
@@ -1286,6 +1291,17 @@ function runBuild(cmd: string[], cwd = repositoryRoot): void {
 
   if (proc.exitCode !== 0) {
     throw new Error(`Build child failed with exit code ${proc.exitCode ?? 1}: ${cmd.slice(1, 4).join(' ')}`)
+  }
+}
+
+function runBuildWithFreshMetafile(cmd: string[], cwd: string, metafilePath: string): void {
+  if (!isAbsolute(metafilePath)) {
+    throw new Error('Hosted actual-owner build metafile path is not absolute')
+  }
+  unlinkIfPresent(metafilePath)
+  runBuild(cmd, cwd)
+  if (!existsSync(metafilePath)) {
+    throw new Error('Hosted actual-owner build did not produce its metafile')
   }
 }
 
@@ -1537,8 +1553,11 @@ function publishBuildGeneration(
   wrapperFinal: string | null,
   reportInstalled?: (digest: string) => void,
 ): string | null {
+  if ((wrapperStaging === null) !== (wrapperFinal === null)) {
+    throw new Error('Hosted actual-owner publication paths are incomplete')
+  }
   mkdirSync(finalOutdir, { recursive: true })
-  const published = withPublicationLock(() => {
+  const install = (): string | null => {
     const stagedEntries = readdirSync(stagingOutdir).sort()
     const candidateOwnerName = stagedEntries.find(entry =>
       /^hostedActualOwnerLauncher-[0-9a-f]{64}$/.test(entry),
@@ -1594,7 +1613,10 @@ function publishBuildGeneration(
     // validated pair remains installed until this callback has completed.
     reportInstalled?.(installedDigest)
     return installedDigest
-  })
+  }
+  // Ordinary CLI bundles are portable. Only the paired Linux x64 actual-owner
+  // artifacts cross the platform-specific, serialized publication boundary.
+  const published = wrapperStaging === null ? install() : withPublicationLock(install)
   return published
 }
 
@@ -1629,7 +1651,7 @@ if (compile) {
   const hostedActualOwnerWrapperStaging =
     `${hostedActualOwnerOutfile}.staging-${process.pid}-${Date.now()}`
   let hostedActualOwnerLauncherStaging =
-    `${stagingOutdir}/${hostedActualOwnerLauncherBasename}`
+    resolve(stagingOutdir, hostedActualOwnerLauncherBasename)
   const hostedActualOwnerNativeSource =
     `${stagingOutdir}/.${hostedActualOwnerLauncherBasename}.c`
   const hostedActualOwnerNativeDependencies =
@@ -1637,7 +1659,7 @@ if (compile) {
   const hostedActualOwnerNativeLinkMap =
     `${stagingOutdir}/.${hostedActualOwnerLauncherBasename}.map`
   const hostedActualOwnerMetafile =
-    `${stagingOutdir}/hostedActualOwnerAcceptance.meta.json`
+    resolve(stagingOutdir, 'hostedActualOwnerAcceptance.meta.json')
   try {
     if (existsSync(stagingOutdir)) removeEmptyBuildDirectory(stagingOutdir)
     unlinkIfPresent(hostedActualOwnerWrapperStaging)
@@ -1699,7 +1721,7 @@ if (compile) {
         `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify('{}')}`,
       ], false)
 
-      runBuild(ownerBuild, committedBuildRoot)
+      runBuildWithFreshMetafile(ownerBuild, committedBuildRoot, hostedActualOwnerMetafile)
       const sourceInputs = readHostedActualOwnerSourceInputs(
         hostedActualOwnerMetafile, committedBuildRoot,
       )
@@ -1761,7 +1783,9 @@ if (compile) {
           : argument === `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify('{}')}`
             ? `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify(descriptorJson)}`
             : argument)
-      runBuild(finalOwnerBuild, committedBuildRoot)
+      runBuildWithFreshMetafile(
+        finalOwnerBuild, committedBuildRoot, hostedActualOwnerMetafile,
+      )
       chmodSync(hostedActualOwnerLauncherStaging, 0o555)
       const finalSourceInputs = readHostedActualOwnerSourceInputs(
         hostedActualOwnerMetafile, committedBuildRoot,
