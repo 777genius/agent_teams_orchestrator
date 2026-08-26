@@ -2864,6 +2864,25 @@ async function runLaunchWithProvisioningSnapshot(
     parseOpenCodeExecutionProof(body.executionProof),
     runtimeDeadline,
   )
+  const memberModels = new Map<string, string>()
+  for (const item of membersRaw) {
+    const member = asRecord(item)
+    const name = asString(member?.name)
+    if (!name) continue
+    const apiMemberModel = resolveOpenCodeProviderScopedModel(
+      asString(member?.model) ?? selectedModel,
+      snapshot,
+    )
+    if (apiMemberModel !== apiSelectedModel) {
+      await assertOpenCodeSelectedModelLaunchAccess(
+        apiMemberModel,
+        snapshot,
+        parseOpenCodeExecutionProof(body.executionProof),
+        runtimeDeadline,
+      )
+    }
+    memberModels.set(name, apiMemberModel)
+  }
   await assertOpenCodeLaunchMcpReady(snapshot, runtimeDeadline)
   runtimeDeadline.throwIfExpired('post_probe_refresh')
   // From this point the command starts creating durable sessions. Keep the
@@ -2891,7 +2910,7 @@ async function runLaunchWithProvisioningSnapshot(
         teamId,
         laneId,
         memberName: name,
-        selectedModel: apiSelectedModel,
+        selectedModel: memberModels.get(name) ?? apiSelectedModel,
         selectedVariant: memberVariant,
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
@@ -2933,7 +2952,7 @@ async function runLaunchWithProvisioningSnapshot(
           teamId,
           laneId,
           memberName: name,
-          selectedModel: apiSelectedModel,
+          selectedModel: memberModels.get(name) ?? apiSelectedModel,
           selectedVariant: memberVariant,
           title: `${teamId} - ${name}`,
           projectPath: snapshot.projectPath,
@@ -3249,6 +3268,16 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   if (!runId || !laneId || !teamId) {
     throw new Error('opencode.stopTeam requires runId, laneId and teamId/teamName')
   }
+  const expectedMembers = lifecycleOwner
+    ? (Array.isArray(body.expectedMembers) ? body.expectedMembers : [])
+      .map(item => asString(asRecord(item)?.name))
+      .filter((name): name is string => name !== null)
+    : []
+  if (lifecycleOwner && (expectedMembers.length === 0 ||
+    expectedMembers.length !== (body.expectedMembers as unknown[] | undefined)?.length ||
+    new Set(expectedMembers.map(name => name.toLowerCase())).size !== expectedMembers.length)) {
+    throw new Error('opencode.stopTeam lifecycle owner requires a unique admitted member set')
+  }
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
@@ -3263,7 +3292,22 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   }
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   const diagnostics: TeamDiagnostic[] = []
-  for (const record of records) {
+  const recordsByMember = new Map(records.map(record => [record.memberName, record]))
+  const membersToStop = lifecycleOwner ? expectedMembers : records.map(record => record.memberName)
+  for (const memberName of membersToStop) {
+    const record = recordsByMember.get(memberName)
+    if (!record) {
+      members[memberName] = {
+        stopped: false,
+        diagnostics: ['Admitted OpenCode session record is missing'],
+      }
+      diagnostics.push(teamDiagnostic(
+        'member_session_missing_during_stop',
+        `No stored OpenCode session for admitted member ${teamId}/${memberName}`,
+        'error',
+      ))
+      continue
+    }
     let stopped = false
     const memberDiagnostics: string[] = []
     try {
@@ -3321,7 +3365,9 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
     snapshot,
     data: {
       runId,
-      stopped: Object.values(members).every(member => member.stopped),
+      stopped: Object.keys(members).length > 0 &&
+        membersToStop.length === Object.keys(members).length &&
+        Object.values(members).every(member => member.stopped),
       members,
       warnings: [],
       diagnostics,

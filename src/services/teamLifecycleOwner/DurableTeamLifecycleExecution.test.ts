@@ -174,9 +174,10 @@ describe('DurableTeamLifecycleExecution', () => {
     await firstProcess.close()
 
     const restarted = new DurableTeamLifecycleExecution(statePath, [lane])
-    await expect(restarted.inspect(plan)).resolves.toMatchObject({
-      phase: 'failed', runId: launching.runId, recoverable: true,
-    })
+    await expect(restarted.recoverAtStartup(plan, () => true)).rejects.toThrow(
+      'Unable to adopt recovered team lifecycle run',
+    )
+    await expect(restarted.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
   test('close rejects new effects and drains a pending launch before returning', async () => {
@@ -272,6 +273,7 @@ describe('DurableTeamLifecycleExecution', () => {
     // Do not close or shut down the first instance: abandoning it models a
     // process crash while the provider run and durable running tuple survive.
     const replacementOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    await replacementOwner.recoverAtStartup(plan, () => true)
     await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
       phase: 'running',
       runId: persisted.runId,
@@ -284,6 +286,64 @@ describe('DurableTeamLifecycleExecution', () => {
       phase: 'idle',
       runId: null,
     })
+  })
+
+  test('atomically transfers a running tuple so stale generation shutdown cannot stop it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-transfer-fence-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    const oldGeneration = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await oldGeneration.inspect(plan)
+    await oldGeneration.launch({
+      plan, commandId: 'command-old-generation', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const running = await waitForPhase(oldGeneration, 'running')
+
+    const newGeneration = new DurableTeamLifecycleExecution(statePath, [lane])
+    await newGeneration.recoverAtStartup(plan, () => true)
+    await expect(newGeneration.inspect(plan)).resolves.toMatchObject({
+      phase: 'running', runId: running.runId,
+    })
+    await expect(oldGeneration.inspect(plan)).rejects.toThrow('another incarnation')
+    await oldGeneration.shutdown()
+    expect(lane.stoppedRunIds).toEqual([])
+
+    await newGeneration.shutdown()
+    expect(lane.stoppedRunIds).toEqual([running.runId])
+  })
+
+  test('shutdown compensates only the exact owned tuple after admitted plan rotation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-plan-rotation-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idleA = await execution.inspect(plan)
+    await execution.launch({
+      plan, commandId: 'command-plan-a-launch', runId: null,
+      expectedProviderGeneration: idleA.providerGeneration,
+    })
+    const runningA = await waitForPhase(execution, 'running')
+    await execution.stop({
+      plan, commandId: 'command-plan-a-stop', runId: runningA.runId,
+      expectedProviderGeneration: runningA.providerGeneration,
+    })
+    await waitForPhase(execution, 'idle')
+
+    const planB: TeamLifecycleLaunchPlan = {
+      ...plan,
+      lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/replacement-model' }],
+    }
+    const idleB = await execution.inspect(planB)
+    await execution.launch({
+      plan: planB, commandId: 'command-plan-b-launch', runId: null,
+      expectedProviderGeneration: idleB.providerGeneration,
+    })
+    const runningB = await waitForPhase(execution, 'running', planB)
+    await execution.shutdown()
+
+    expect(lane.stoppedRunIds).toEqual([runningA.runId, runningB.runId])
   })
 
   test('replacement owner cleans the exact persisted tuple when running adoption fails', async () => {
@@ -303,7 +363,7 @@ describe('DurableTeamLifecycleExecution', () => {
     lane.inspectResult = { phase: 'failed', recoverable: true }
 
     const replacementOwner = new DurableTeamLifecycleExecution(statePath, [lane])
-    await expect(replacementOwner.inspect(plan)).rejects.toThrow(
+    await expect(replacementOwner.recoverAtStartup(plan, () => true)).rejects.toThrow(
       'Unable to adopt recovered team lifecycle run',
     )
     expect(lane.stoppedRunIds).toEqual([persisted.runId])
@@ -450,6 +510,38 @@ describe('DurableTeamLifecycleExecution', () => {
       'Team lifecycle durable approval mode changed',
     )
   })
+
+  test('rejects recovery cross-binding across every effect-bearing admitted plan field', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-plan-binding-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const execution = new DurableTeamLifecycleExecution(statePath, [new FakeLane()])
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan, commandId: 'command-plan-binding', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForPhase(execution, 'running')
+
+    const changedPlans: TeamLifecycleLaunchPlan[] = [
+      { ...plan, workspaceRoot: '/sandbox/other-project' },
+      { ...plan, toolApprovalMode: 'auto' },
+      { ...plan, lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/other-default' }] },
+      {
+        ...plan,
+        lanes: [{
+          ...plan.lanes[0]!,
+          members: [{ ...plan.lanes[0]!.members[0]!, model: 'provider/member-override' }],
+        }],
+      },
+    ]
+    for (const changed of changedPlans) {
+      const replacement = new DurableTeamLifecycleExecution(statePath, [new FakeLane()])
+      await expect(replacement.recoverAtStartup(changed, () => true)).rejects.toThrow(
+        /Active team lifecycle plan changed|durable approval mode changed/,
+      )
+    }
+  })
 })
 
 describe('OpenCodeTeamLifecycleLane', () => {
@@ -546,9 +638,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
 async function waitForPhase(
   execution: DurableTeamLifecycleExecution,
   phase: 'idle' | 'running' | 'failed',
+  admittedPlan: TeamLifecycleLaunchPlan = plan,
 ) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const state = await execution.inspect(plan)
+    const state = await execution.inspect(admittedPlan)
     if (state.phase === phase) return state
     await Bun.sleep(5)
   }

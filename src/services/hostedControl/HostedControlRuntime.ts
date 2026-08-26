@@ -181,7 +181,6 @@ export class HostedControlRuntime {
       if (!(await taskService.recover())) {
         throw new Error('Hosted control WAL recovery did not establish a safe state')
       }
-      startupRecovery = false
       let dispatcher: HostedControlDispatcher
       if (!(await validateHostedControlOwnerBinding({
         claudeRoot: config.claudeRoot,
@@ -215,6 +214,11 @@ export class HostedControlRuntime {
         } : {}),
         isCurrentAuthority,
       }))
+      // Port composition performs lifecycle recovery before the socket exists.
+      // Keep the exclusive root/descriptor authority usable for that exact
+      // pre-publication interval, then require the live server lease for every
+      // subsequent effect.
+      startupRecovery = false
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       server = new HostedControlServer({
         socketPath: config.socketPath,

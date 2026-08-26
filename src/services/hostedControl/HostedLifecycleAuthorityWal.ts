@@ -1,10 +1,11 @@
-import { createHash } from 'node:crypto'
-import { constants, lstat, mkdir, open } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants, lstat, mkdir, open, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import * as lockfile from '../../utils/lockfile.js'
 
 const MAX_WAL_BYTES = 8 * 1024 * 1024
+const DEFAULT_COMPLETED_RETENTION = 2_048
 const LOCK_OPTIONS = { realpath: false, retries: { retries: 10, minTimeout: 5, maxTimeout: 100 } } as const
 
 type HostedLifecycleWalAppendHandle = {
@@ -23,6 +24,9 @@ type HostedLifecycleWalDirectoryHandle = {
 export type HostedLifecycleAuthorityWalOptions = {
   openAppend?: (path: string, flags: number, mode: number) => Promise<HostedLifecycleWalAppendHandle>
   openDirectory?: (path: string, flags: number) => Promise<HostedLifecycleWalDirectoryHandle>
+  /** Test seam; production always uses the 8 MiB hard ceiling. */
+  compactionThresholdBytes?: number
+  completedRetentionEntries?: number
 }
 
 export type HostedLifecycleDurableAuthorization = {
@@ -66,6 +70,15 @@ export type HostedLifecycleWalEntry =
   | { schemaVersion: 1; kind: 'completed'; fingerprint: string; command: HostedLifecycleDurableCommand; durableCommand: HostedLifecycleWireDurableCommand; authorization: HostedLifecycleDurableAuthorization; result: HostedLifecyclePublicResult }
   | { schemaVersion: 1; kind: 'released'; grantId: string }
 
+type HostedLifecycleWalSnapshot = {
+  schemaVersion: 1
+  kind: 'snapshot'
+  retention: { policy: 'latest-completed-v1'; completedLimit: number }
+  grants: Extract<HostedLifecycleWalEntry, { kind: 'grant' }>[]
+  commands: Extract<HostedLifecycleWalEntry, { kind: 'started' | 'completed' }>[]
+  released: string[]
+}
+
 export type HostedLifecycleWalState = {
   grants: Map<string, Extract<HostedLifecycleWalEntry, { kind: 'grant' }>>
   commands: Map<string, Extract<HostedLifecycleWalEntry, { kind: 'started' | 'completed' }>>
@@ -103,6 +116,8 @@ export class HostedLifecycleAuthorityWal {
   readonly lockPath: string
   readonly #openAppend: NonNullable<HostedLifecycleAuthorityWalOptions['openAppend']>
   readonly #openDirectory: NonNullable<HostedLifecycleAuthorityWalOptions['openDirectory']>
+  readonly #compactionThresholdBytes: number
+  readonly #completedRetentionEntries: number
   #lockHeld = false
   constructor(
     private readonly directory: string,
@@ -114,6 +129,11 @@ export class HostedLifecycleAuthorityWal {
     this.lockPath = join(directory, 'hosted-lifecycle-authority.lock')
     this.#openAppend = options.openAppend ?? (async (path, flags, mode) => open(path, flags, mode))
     this.#openDirectory = options.openDirectory ?? (async (path, flags) => open(path, flags))
+    this.#compactionThresholdBytes = options.compactionThresholdBytes ?? MAX_WAL_BYTES
+    this.#completedRetentionEntries = options.completedRetentionEntries ?? DEFAULT_COMPLETED_RETENTION
+    if (!Number.isSafeInteger(this.#compactionThresholdBytes) || this.#compactionThresholdBytes < 1_024 ||
+      this.#compactionThresholdBytes > MAX_WAL_BYTES || !Number.isSafeInteger(this.#completedRetentionEntries) ||
+      this.#completedRetentionEntries < 1) throw new TypeError('Invalid hosted lifecycle WAL compaction policy')
   }
 
   async withLock<T>(operation: () => Promise<T>): Promise<T | undefined> {
@@ -156,8 +176,15 @@ export class HostedLifecycleAuthorityWal {
       lines.pop()
       for (const line of lines) {
         if (!line) continue
-        const entry = decodeEntry(JSON.parse(line), this.teamId)
-        applyEntry(state, entry)
+        const record = decodeRecord(JSON.parse(line), this.teamId)
+        if (record.kind === 'snapshot') {
+          if (state.grants.size || state.commands.size || state.released.size) {
+            throw new Error('Invalid hosted lifecycle WAL snapshot ordering')
+          }
+          restoreSnapshot(state, record)
+        } else {
+          applyEntry(state, record)
+        }
       }
       return state
     } finally { await handle.close() }
@@ -172,12 +199,16 @@ export class HostedLifecycleAuthorityWal {
       0o600,
     )
     let originalSize = 0
+    let closed = false
     try {
       const stat = await handle.stat()
       originalSize = stat.size
       await this.#assertCurrentWalHandle(stat)
-      if (stat.size + line.byteLength > MAX_WAL_BYTES) {
-        throw new Error('Unsafe or oversized hosted lifecycle WAL')
+      if (stat.size + line.byteLength > this.#compactionThresholdBytes) {
+        await handle.close()
+        closed = true
+        await this.#compactAndAppend(entry)
+        return
       }
       try {
         let offset = 0
@@ -197,7 +228,42 @@ export class HostedLifecycleAuthorityWal {
         try { await handle.truncate(originalSize); await handle.sync() } catch {}
         throw error
       }
-    } finally { await handle.close() }
+    } finally { if (!closed) await handle.close() }
+  }
+
+  async #compactAndAppend(entry: HostedLifecycleWalEntry): Promise<void> {
+    const state = await this.load()
+    applyEntry(state, entry)
+    const snapshot = compactSnapshot(state, this.#completedRetentionEntries)
+    const serialized = `${JSON.stringify(snapshot)}\n`
+    if (Buffer.byteLength(serialized) > MAX_WAL_BYTES) {
+      throw new Error('Hosted lifecycle WAL active state exceeds 8MiB')
+    }
+    const tempPath = `${this.path}.snapshot-${process.pid}-${randomUUID()}`
+    try {
+      const handle = await open(
+        tempPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      )
+      let replacementIdentity: Awaited<ReturnType<typeof handle.stat>>
+      try {
+        await handle.writeFile(serialized, 'utf8')
+        await handle.sync()
+        replacementIdentity = await handle.stat()
+      } finally {
+        await handle.close()
+      }
+      await rename(tempPath, this.path)
+      // The replacement inode, not merely whatever currently occupies the
+      // pathname, must remain installed across the directory durability
+      // boundary. This closes rename/substitution races during rotation.
+      await this.#assertCurrentWalHandle(replacementIdentity)
+      await this.#syncDirectory()
+      await this.#assertCurrentWalHandle(replacementIdentity)
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => undefined)
+    }
   }
 
   async #assertCurrentWalHandle(stat: Awaited<ReturnType<HostedLifecycleWalAppendHandle['stat']>>): Promise<void> {
@@ -270,6 +336,72 @@ export class HostedLifecycleAuthorityWal {
   }
 }
 
+function compactSnapshot(
+  state: HostedLifecycleWalState,
+  completedLimit: number,
+): HostedLifecycleWalSnapshot {
+  const ambiguous = [...state.commands.values()].filter(command => command.kind === 'started')
+  const allCompleted = [...state.commands.values()]
+    .filter((command): command is Extract<HostedLifecycleWalEntry, { kind: 'completed' }> =>
+      command.kind === 'completed')
+  const retainedCompletedKeys = new Set([
+    ...allCompleted.slice(-completedLimit),
+    ...allCompleted.filter(command => !state.released.has(command.authorization.grantId)),
+  ].map(command => walCommandKey(command.command, command.authorization)))
+  const completed = allCompleted.filter(command =>
+    retainedCompletedKeys.has(walCommandKey(command.command, command.authorization)))
+  const retainedGrantIds = new Set<string>([
+    ...[...state.grants.keys()].filter(grantId => !state.released.has(grantId)),
+    ...ambiguous.map(command => command.authorization.grantId),
+    ...completed.map(command => command.authorization.grantId),
+  ])
+  return {
+    schemaVersion: 1,
+    kind: 'snapshot',
+    retention: { policy: 'latest-completed-v1', completedLimit },
+    grants: [...state.grants.values()].filter(grant => retainedGrantIds.has(grant.authorization.grantId)),
+    commands: [
+      ...ambiguous,
+      ...completed.flatMap(command => [startedFromCompleted(command), command]),
+    ],
+    released: [...state.released].filter(grantId => retainedGrantIds.has(grantId)),
+  }
+}
+
+function restoreSnapshot(state: HostedLifecycleWalState, snapshot: HostedLifecycleWalSnapshot): void {
+  for (const grant of snapshot.grants) {
+    if (state.grants.has(grant.authorization.grantId) || [...state.grants.values()].some(existing =>
+      walCommandKey(existing.command, existing.authorization) === walCommandKey(grant.command, grant.authorization))) {
+      throw new Error('Invalid duplicate hosted lifecycle WAL snapshot grant')
+    }
+    state.grants.set(grant.authorization.grantId, grant)
+  }
+  for (const command of snapshot.commands) {
+    applyEntry(state, command)
+  }
+  for (const grantId of snapshot.released) {
+    const grant = state.grants.get(grantId)
+    if (!grant || state.released.has(grantId) ||
+      state.commands.get(walCommandKey(grant.command, grant.authorization))?.kind === 'started') {
+      throw new Error('Invalid hosted lifecycle WAL snapshot release')
+    }
+    state.released.add(grantId)
+  }
+}
+
+function startedFromCompleted(
+  command: Extract<HostedLifecycleWalEntry, { kind: 'completed' }>,
+): Extract<HostedLifecycleWalEntry, { kind: 'started' }> {
+  return {
+    schemaVersion: 1,
+    kind: 'started',
+    fingerprint: command.fingerprint,
+    command: command.command,
+    durableCommand: command.durableCommand,
+    authorization: command.authorization,
+  }
+}
+
 function applyEntry(state: HostedLifecycleWalState, entry: HostedLifecycleWalEntry): void {
   if (entry.kind === 'grant') {
     if (state.grants.has(entry.authorization.grantId) || [...state.grants.values()].some(existing =>
@@ -319,6 +451,34 @@ function walCommandKey(
   authorization: HostedLifecycleDurableAuthorization,
 ): string {
   return `${authorization.deploymentId}\0${authorization.actorId}\0${command.action}\0${command.idempotencyKey}`
+}
+
+function decodeRecord(value: unknown, teamId: string): HostedLifecycleWalEntry | HostedLifecycleWalSnapshot {
+  const raw = object(value, 'entry')
+  if (raw.kind !== 'snapshot') return decodeEntry(value, teamId)
+  exact(raw, ['schemaVersion', 'kind', 'retention', 'grants', 'commands', 'released'], 'snapshot')
+  const retention = object(raw.retention, 'snapshot retention')
+  exact(retention, ['policy', 'completedLimit'], 'snapshot retention')
+  if (raw.schemaVersion !== 1 || retention.policy !== 'latest-completed-v1' ||
+    !Number.isSafeInteger(retention.completedLimit) || (retention.completedLimit as number) < 1 ||
+    !Array.isArray(raw.grants) || !Array.isArray(raw.commands) || !Array.isArray(raw.released)) {
+    throw new Error('Invalid hosted lifecycle WAL snapshot')
+  }
+  const grants = raw.grants.map(entry => decodeEntry(entry, teamId))
+  const commands = raw.commands.map(entry => decodeEntry(entry, teamId))
+  if (grants.some(entry => entry.kind !== 'grant') ||
+    commands.some(entry => entry.kind !== 'started' && entry.kind !== 'completed') ||
+    raw.released.some(grantId => typeof grantId !== 'string')) {
+    throw new Error('Invalid hosted lifecycle WAL snapshot records')
+  }
+  return {
+    schemaVersion: 1,
+    kind: 'snapshot',
+    retention: retention as HostedLifecycleWalSnapshot['retention'],
+    grants: grants as HostedLifecycleWalSnapshot['grants'],
+    commands: commands as HostedLifecycleWalSnapshot['commands'],
+    released: raw.released as string[],
+  }
 }
 
 function decodeEntry(value: unknown, teamId: string): HostedLifecycleWalEntry {

@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import {
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
+  createOwnedOpenCodeLifecycleCommandExecutor,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
@@ -2238,6 +2239,44 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ).toBe(123)
     expect(Object.keys((result.data as { members: Record<string, unknown> }).members)).toEqual([
       'alice',
+    ])
+  })
+
+  test('launches each admitted member with its individually authorized model override', async () => {
+    const selectedModels: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      selectedModels.push(input.selectedModel)
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-member-models',
+        laneId: 'opencode-lane',
+        teamId: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          { name: 'alice', prompt: 'Use the lane default.' },
+          { name: 'bob', prompt: 'Use the override.', model: 'openrouter/ling-2.6-flash-free' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(selectedModels).toEqual([
+      'openrouter/minimax-m2.5-free',
+      'openrouter/ling-2.6-flash-free',
     ])
   })
 
@@ -5988,6 +6027,34 @@ describe('OpenCodeBridgeCommandHandler', () => {
         },
       ])
     }
+  })
+
+  test('lifecycle-owner stop fails closed when an admitted member record is missing', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({ laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-stop' }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.abort = (async () => true) as typeof openCodeSessionBridge.abort
+    openCodeSessionBridge.releaseSession = (async () => {}) as typeof openCodeSessionBridge.releaseSession
+    openCodeHostManager.reconcilePersistentHosts = (async () => ({
+      cleaned: 0, remaining: 0, hosts: [], diagnostics: [],
+    })) as typeof openCodeHostManager.reconcilePersistentHosts
+
+    const executeOwned = createOwnedOpenCodeLifecycleCommandExecutor()
+    const result = await executeOwned(buildEnvelope('opencode.stopTeam', {
+      runId: 'run-owned-stop',
+      laneId: 'opencode-lane',
+      teamId: 'team-a',
+      expectedMembers: [{ name: 'alice' }, { name: 'bob' }],
+    }))
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.data.stopped).toBe(false)
+    expect(result.data.members.bob).toEqual({
+      stopped: false,
+      diagnostics: ['Admitted OpenCode session record is missing'],
+    })
   })
 
   test('keeps stop failures isolated to the addressed mixed OpenCode secondary lane', async () => {

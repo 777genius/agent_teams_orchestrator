@@ -81,6 +81,20 @@ const started: HostedLifecycleWalEntry = {
   schemaVersion: 1, kind: 'started', fingerprint: durableCommand.commandFingerprint.digest,
   command, durableCommand, authorization: grant.authorization,
 }
+const completed: HostedLifecycleWalEntry = {
+  ...started,
+  kind: 'completed',
+  result: {
+    schemaVersion: 1,
+    kind: 'accepted',
+    action: command.action,
+    commandId: command.commandId,
+    workspaceId: command.workspaceId,
+    teamId,
+    runId: 'run_compaction01',
+    resourceRevision: command.expectedRevision,
+  },
+}
 
 describe('HostedLifecycleAuthorityWal append durability', () => {
   test('rolls back an incomplete append so authorization and release are never claimed from a truncated record', async () => {
@@ -207,6 +221,29 @@ describe('HostedLifecycleAuthorityWal append durability', () => {
     })
     await expect(wal.withLock(() => wal.append(grant))).rejects.toThrow()
     expect((await lstat(wal.path)).nlink).toBe(2)
+  })
+
+  test('rotates atomically at the size boundary and retains terminal idempotency across restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-compaction-')); roots.push(root)
+    const wal = new HostedLifecycleAuthorityWal(root, teamId, {
+      compactionThresholdBytes: 1_024,
+      completedRetentionEntries: 4,
+    })
+    await wal.withLock(async () => {
+      await wal.append(grant)
+      await wal.append(started)
+      await wal.append(completed)
+      await wal.append({ schemaVersion: 1, kind: 'released', grantId: grant.authorization.grantId })
+    })
+
+    const record = JSON.parse((await readFile(wal.path, 'utf8')).trim()) as Record<string, unknown>
+    expect(record.kind).toBe('snapshot')
+    expect(record.retention).toEqual({ policy: 'latest-completed-v1', completedLimit: 4 })
+
+    const recovered = await new HostedLifecycleAuthorityWal(root, teamId).load()
+    expect(recovered.grants.has(grant.authorization.grantId)).toBe(true)
+    expect(recovered.released.has(grant.authorization.grantId)).toBe(true)
+    expect([...recovered.commands.values()]).toEqual([completed])
   })
 })
 

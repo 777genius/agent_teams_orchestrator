@@ -260,7 +260,7 @@ describe('HostedControlRuntime', () => {
     expect(secret.every(byte => byte === 0)).toBe(true)
   })
 
-  test('cancels and disposes startup when stop arrives while port composition is deferred', async () => {
+  test('keeps pre-publication authority current during real port composition and cancels deferred startup', async () => {
     const root = await realpath(await mkdtemp('/tmp/hosted-control-start-race-'))
     roots.push(root)
     const claudeRoot = join(root, 'claude')
@@ -285,7 +285,12 @@ describe('HostedControlRuntime', () => {
     let releaseFactory!: () => void
     const factoryGate = new Promise<void>(resolve => { releaseFactory = resolve })
     let closeCalls = 0
-    const runtime = new HostedControlRuntime(configPath, async () => {
+    let prePublicationCurrent = false
+    const runtime = new HostedControlRuntime(configPath, async context => {
+      prePublicationCurrent = await context.isCurrentAuthority({
+        actorId: 'startup-recovery',
+        ...context.authority,
+      })
       enterFactory()
       await factoryGate
       return {
@@ -298,6 +303,7 @@ describe('HostedControlRuntime', () => {
     const starting = runtime.start()
     void starting.catch(() => undefined)
     await factoryEntered
+    expect(prePublicationCurrent).toBe(true)
     const stopping = runtime.stop()
     expect(runtime.server).toBeNull()
     releaseFactory()

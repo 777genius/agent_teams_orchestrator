@@ -142,6 +142,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       runId: input.runId,
       laneId: input.lane.laneId,
       teamId: input.planTeamId,
+      expectedMembers: input.lane.members.map(member => ({ name: member.name })),
     })
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     return idle()
