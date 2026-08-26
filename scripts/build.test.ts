@@ -13,6 +13,7 @@ import {
   readdir,
   rename,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -128,6 +129,9 @@ describe('release build feature plan', () => {
     expect(source).toContain(
       "readStableBytes(metafilePath, 'build metafile').bytes.toString('utf8')",
     )
+    expect(source.match(/'--metafile'/g)).toHaveLength(1)
+    expect(source).toContain("        '--metafile',\n        hostedActualOwnerMetafile,")
+    expect(source).not.toContain('--metafile=')
   })
 
   test('publishes an ordinary CLI bundle without entering the Linux owner boundary', async () => {
@@ -250,6 +254,55 @@ int main(void) {
     if (result.status !== 0) throw new Error(result.stderr)
     expect(result.stdout.trim()).toBe(sha256(committed))
     expect(result.stdout.trim()).not.toBe(sha256(Buffer.from('race-forged-bytes\n')))
+  })
+
+  test('seals copied writable dependencies without mutating or escaping the installed tree', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-owner-dependency-snapshot-'))
+    fixtureRoots.push(root)
+    await mkdir(join(root, 'scripts'), { recursive: true })
+    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await writeFile(join(root, 'package.json'), JSON.stringify({
+      name: 'dependency-snapshot-fixture', version: '1.0.0',
+    }))
+    const dependency = join(
+      root, 'node_modules', '@anthropic-ai', 'sdk', '_vendor',
+      'partial-json-parser', 'parser.mjs',
+    )
+    const dependencyBytes = Buffer.from('export const parser = "cached dependency"\n')
+    await mkdir(dirname(dependency), { recursive: true })
+    await writeFile(dependency, dependencyBytes)
+    await chmod(dependency, 0o664)
+    const outside = join(root, 'outside-dependency.mjs')
+    const outsideBytes = Buffer.from('must remain outside the snapshot\n')
+    await writeFile(outside, outsideBytes)
+    await chmod(outside, 0o664)
+    await symlink(outside, join(root, 'node_modules', 'dependency-escape.mjs'))
+    for (const command of [
+      ['init', '-q'], ['config', 'user.email', 'test@example.invalid'],
+      ['config', 'user.name', 'test'], ['add', 'scripts/build.ts', 'package.json'],
+      ['commit', '-qm', 'fixture'],
+    ]) {
+      expect(spawnSync('/usr/bin/git', command, { cwd: root }).status).toBe(0)
+    }
+
+    const result = spawnSync(process.execPath, [
+      'run', join(root, 'scripts', 'build.ts'),
+      '--test-print-committed-source-identity=' +
+        'node_modules/@anthropic-ai/sdk/_vendor/partial-json-parser/parser.mjs',
+    ], { cwd: root, encoding: 'utf8' })
+
+    expect(result.status, result.stderr).toBe(0)
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      sha256: sha256(dependencyBytes),
+      mode: '600',
+    })
+    expect(await readFile(dependency)).toEqual(dependencyBytes)
+    expect((await lstat(dependency)).mode & 0o777).toBe(0o664)
+    expect(await readFile(outside)).toEqual(outsideBytes)
+    expect((await lstat(outside)).mode & 0o777).toBe(0o664)
+    expect(await readlink(join(root, 'node_modules', 'dependency-escape.mjs'))).toBe(outside)
+    expect((await readdir(root)).filter(entry =>
+      entry.startsWith('.committed-source-test-'))).toEqual([])
   })
 
   test('converges identical publishers and truthfully installs a later distinct generation', async () => {

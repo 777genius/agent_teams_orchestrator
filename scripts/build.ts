@@ -1043,7 +1043,8 @@ if (nativeWrapperPrint) {
 }
 
 const committedSourcePrint = args.find(arg =>
-  arg.startsWith('--test-print-committed-source-sha256='))
+  arg.startsWith('--test-print-committed-source-sha256=') ||
+  arg.startsWith('--test-print-committed-source-identity='))
 if (committedSourcePrint) {
   const requested = committedSourcePrint.slice(committedSourcePrint.indexOf('=') + 1)
   const staging = join(repositoryRoot, `.committed-source-test-${process.pid}`)
@@ -1051,9 +1052,14 @@ if (committedSourcePrint) {
     mkdirSync(staging, { mode: 0o700 })
     const root = materializeCommittedBuildRoot(staging)
     const relativePath = repositoryRelativePath(requested, root)
-    console.log(createHash('sha256').update(
-      readStableBytes(join(root, relativePath), 'committed source test').bytes,
-    ).digest('hex'))
+    const snapshot = readStableBytes(join(root, relativePath), 'committed source test')
+    const sha256 = createHash('sha256').update(snapshot.bytes).digest('hex')
+    console.log(committedSourcePrint.startsWith('--test-print-committed-source-identity=')
+      ? JSON.stringify({
+          sha256,
+          mode: (snapshot.stat.mode & 0o777n).toString(8).padStart(3, '0'),
+        })
+      : sha256)
   } finally {
     if (existsSync(staging)) removeEmptyBuildDirectory(staging)
   }
@@ -1484,7 +1490,6 @@ function materializeCommittedBuildRoot(stagingOutdir: string): string {
       else if (linked.isFile()) chmodSync(path, linked.mode & 0o111 ? 0o700 : 0o600)
     }
   }
-  sealTree(root)
   const installedDependencies = join(repositoryRoot, 'node_modules')
   if (existsSync(installedDependencies)) {
     cpSync(installedDependencies, join(root, 'node_modules'), {
@@ -1493,6 +1498,7 @@ function materializeCommittedBuildRoot(stagingOutdir: string): string {
       preserveTimestamps: true,
     })
   }
+  sealTree(root)
   return root
 }
 
@@ -1707,7 +1713,8 @@ if (compile) {
         'esm',
         '--outfile',
         hostedActualOwnerLauncherStaging,
-        `--metafile=${hostedActualOwnerMetafile}`,
+        '--metafile',
+        hostedActualOwnerMetafile,
         '--minify',
         '--packages',
         'bundle',
