@@ -1,0 +1,1 @@
+Temporary CI evaluation marker for PR #46.\n\nDo not merge this file or PR #46.\n\nCode commit under evaluation: d64e0da9b82a622e703ab914462e7a912191eb4b\nReviewed patch sha256: 22820d97e16ca9a3b959dea6edd363da58186ed842df106d2bb289bc7bcf6196\nFinal integration target: PR #44 through exact commit transfer after green CI and xhigh review.\n
