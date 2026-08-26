@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
-import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import { DurableTeamLifecycleExecution } from '../teamLifecycleOwner/DurableTeamLifecycleExecution.js'
+import {
+  OpenCodeTeamLifecycleLane,
+  type TeamLifecycleLaneEffectPort,
+  type TeamLifecycleLaneObservation,
+} from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import {
   createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
@@ -118,6 +124,67 @@ describe('createHostedControlProductionPorts', () => {
     const createPorts = createHostedControlProductionPortFactory(() => new OpenCodeTeamLifecycleLane())
     const ports = await createPorts(context(teamRoot))
     expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
+  })
+
+  test('adopts a durable running plan before publishing ports and immediate close stops the exact run', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-startup-running-')
+    const admittedPlan = await writePlan(teamRoot, 'opencode')
+    const lane = new ProductionRecoveryLane()
+    const crashedExecution = new DurableTeamLifecycleExecution(
+      join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
+      [lane],
+    )
+    const idle = await crashedExecution.inspect(admittedPlan)
+    const launching = await crashedExecution.launch({
+      plan: admittedPlan,
+      commandId: 'command-before-production-restart',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForDurablePhase(teamRoot, 'running')
+
+    const createPorts = createHostedControlProductionPortFactory(() => lane)
+    const ports = await createPorts(context(teamRoot))
+    await ports.close()
+
+    expect(lane.inspectedRunIds).toEqual([launching.runId])
+    expect(lane.stoppedRunIds).toEqual([launching.runId])
+    expect(await durableState(teamRoot)).toMatchObject({
+      phase: 'idle',
+      runId: null,
+      recoverable: false,
+    })
+  })
+
+  test('fails startup closed and tears down the exact run when durable running adoption is partial', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-startup-partial-')
+    const admittedPlan = await writePlan(teamRoot, 'opencode')
+    const lane = new ProductionRecoveryLane()
+    const crashedExecution = new DurableTeamLifecycleExecution(
+      join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
+      [lane],
+    )
+    const idle = await crashedExecution.inspect(admittedPlan)
+    const launching = await crashedExecution.launch({
+      plan: admittedPlan,
+      commandId: 'command-before-partial-recovery',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForDurablePhase(teamRoot, 'running')
+    lane.inspectResult = { phase: 'failed', recoverable: true }
+
+    const createPorts = createHostedControlProductionPortFactory(() => lane)
+    await expect(createPorts(context(teamRoot))).rejects.toThrow(
+      'Unable to adopt recovered team lifecycle run',
+    )
+    expect(lane.inspectedRunIds).toEqual([launching.runId])
+    expect(lane.stoppedRunIds).toEqual([launching.runId])
+    expect(await durableState(teamRoot)).toMatchObject({
+      phase: 'idle',
+      runId: null,
+      recoverable: false,
+    })
   })
 
   test('composes one stable fail-closed port and exact activation-v2 session from authenticated context', async () => {
@@ -274,7 +341,10 @@ function controlStateInput() {
   }
 }
 
-async function writePlan(teamRoot: string, kind: 'opencode' | 'native'): Promise<void> {
+async function writePlan(
+  teamRoot: string,
+  kind: 'opencode' | 'native',
+): Promise<TeamLifecycleLaunchPlan> {
   await mkdir(teamRoot, { recursive: true, mode: 0o700 })
   const lane =
     kind === 'opencode'
@@ -291,18 +361,61 @@ async function writePlan(teamRoot: string, kind: 'opencode' | 'native'): Promise
           provider: 'codex',
           members: [{ name: 'worker', prompt: 'Work only in the admitted sandbox.' }],
         }
+  const plan: TeamLifecycleLaunchPlan = {
+    schemaVersion: 2,
+    workspaceId: stableAuthority.workspaceId,
+    teamId,
+    workspaceRoot: join(teamRoot, 'sandbox-workspace'),
+    toolApprovalMode: 'manual',
+    lanes: [lane],
+  }
   const path = join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE)
   await writeFile(
     path,
-    JSON.stringify({
-      schemaVersion: 2,
-      workspaceId: stableAuthority.workspaceId,
-      teamId,
-      workspaceRoot: join(teamRoot, 'sandbox-workspace'),
-      toolApprovalMode: 'manual',
-      lanes: [lane],
-    }),
+    JSON.stringify(plan),
     { mode: 0o600 },
   )
   await chmod(path, 0o600)
+  return plan
+}
+
+class ProductionRecoveryLane implements TeamLifecycleLaneEffectPort {
+  readonly kind = 'opencode' as const
+  inspectedRunIds: string[] = []
+  stoppedRunIds: string[] = []
+  inspectResult: TeamLifecycleLaneObservation = { phase: 'running', recoverable: false }
+
+  supports(): boolean { return true }
+  async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
+    if (input.runId) this.inspectedRunIds.push(input.runId)
+    return input.runId ? this.inspectResult : { phase: 'idle', recoverable: false }
+  }
+  async launch(): Promise<TeamLifecycleLaneObservation> {
+    return { phase: 'running', recoverable: false }
+  }
+  async cancel(): Promise<TeamLifecycleLaneObservation> {
+    return { phase: 'idle', recoverable: false }
+  }
+  async stop(input: { runId: string }): Promise<TeamLifecycleLaneObservation> {
+    this.stoppedRunIds.push(input.runId)
+    return { phase: 'idle', recoverable: false }
+  }
+  async recover(): Promise<TeamLifecycleLaneObservation> {
+    return { phase: 'idle', recoverable: false }
+  }
+}
+
+async function durableState(teamRoot: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(
+    join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
+    'utf8',
+  )) as Record<string, unknown>
+}
+
+async function waitForDurablePhase(teamRoot: string, phase: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await durableState(teamRoot)).phase === phase) return
+    await Bun.sleep(5)
+  }
+  throw new Error(`Timed out waiting for durable phase ${phase}`)
 }

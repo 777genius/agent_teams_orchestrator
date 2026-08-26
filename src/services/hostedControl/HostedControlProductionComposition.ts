@@ -6,7 +6,10 @@ import {
   type TeamLifecycleLaneEffectPort,
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { createTeamLifecycleAuthorityComposition } from '../teamLifecycleOwner/TeamLifecycleAuthorityComposition.js'
-import { PrivateFileTeamLifecycleLaunchPlanStore } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
+import {
+  PrivateFileTeamLifecycleLaunchPlanStore,
+  type TeamLifecycleLaunchPlanAdmission,
+} from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { createHostedControlEffectServices } from './HostedControlEffectServices.js'
 import type {
   HostedControlRuntimePortFactory,
@@ -47,6 +50,19 @@ export function createHostedControlProductionPortFactory(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
       [createOpenCodeLane()],
     )
+    const planStore = new PrivateFileTeamLifecycleLaunchPlanStore(
+      join(context.teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
+    )
+    const lifecycleEffectGuard = () => context.isCurrentAuthority({
+      actorId: 'hosted-lifecycle-owner', ...context.authority,
+    })
+    const admission = await loadStartupAdmission(planStore, {
+      workspaceId: context.authority.workspaceId,
+      teamId: context.authority.teamId,
+    })
+    const startupGuard = async () => (await lifecycleEffectGuard()) &&
+      (admission === null || await admission.isCurrent())
+
     const lifecycle = createTeamLifecycleAuthorityComposition({
       workspaceId: context.authority.workspaceId,
       teamId: context.authority.teamId,
@@ -57,11 +73,9 @@ export function createHostedControlProductionPortFactory(
         context.teamRoot,
         context.authority.teamId,
       ),
-      planStore: new PrivateFileTeamLifecycleLaunchPlanStore(
-        join(context.teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
-      ),
+      planStore,
       execution,
-      effectGuard: () => context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }),
+      effectGuard: lifecycleEffectGuard,
     })
 
     const authorityGuard = { isCurrent: context.isCurrentAuthority }
@@ -123,6 +137,18 @@ export function createHostedControlProductionPortFactory(
       if (!revocation) revocation = approvals?.revoke() ?? Promise.resolve()
       return revocation
     }
+    try {
+      // This is the final fallible startup step: no lifecycle/message/approval
+      // port can escape until every durable run is adopted by this execution.
+      await execution.recoverAtStartup(admission?.plan ?? null, startupGuard)
+    } catch (error) {
+      await revoke().catch(() => undefined)
+      await Promise.all([
+        messageDelivery.close().catch(() => undefined),
+        execution.shutdown().catch(() => undefined),
+      ])
+      throw error
+    }
     return {
       ...services,
       ...(approvals ? { approvals } : {}),
@@ -139,3 +165,15 @@ export function createHostedControlProductionPortFactory(
 }
 
 export const createHostedControlProductionPorts = createHostedControlProductionPortFactory()
+
+async function loadStartupAdmission(
+  store: PrivateFileTeamLifecycleLaunchPlanStore,
+  scope: { workspaceId: string; teamId: string },
+): Promise<TeamLifecycleLaunchPlanAdmission | null> {
+  try {
+    return await store.load(scope)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}

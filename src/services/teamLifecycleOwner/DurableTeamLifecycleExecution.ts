@@ -99,6 +99,48 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     })
   }
 
+  /**
+   * Establishes ownership of any durable provider run before production ports
+   * become reachable. A missing plan is safe only when no execution state has
+   * ever been published; active or ambiguous crash state is either adopted or
+   * synchronously driven through exact teardown before startup fails closed.
+   */
+  recoverAtStartup(
+    plan: TeamLifecycleLaunchPlan | null,
+    effectGuard: EffectGuard,
+  ): Promise<void> {
+    return this.#serialized(async () => {
+      this.#assertAcceptingEffects()
+      if (!plan) {
+        const stateExists = await lstat(this.statePath).then(() => true).catch(error => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          throw error
+        })
+        if (stateExists) throw new Error('Team lifecycle durable state has no admitted startup plan')
+        return
+      }
+
+      this.#rememberPlan(plan)
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority is not current')
+      const state = await this.#read(plan)
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      if (state.phase === 'idle') return
+
+      if (state.phase === 'running' && state.runId) {
+        await this.#adoptRecoveredRunning(plan, state, effectGuard)
+        return
+      }
+
+      if (!state.runId) throw new Error('Team lifecycle startup state is ambiguous')
+      await this.#failRecoveredState(
+        plan,
+        state,
+        new Error(`Team lifecycle startup found interrupted ${state.phase} state`),
+        effectGuard,
+      )
+    })
+  }
+
   launch(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
     this.#rememberPlan(input.plan)
     return this.#serialized(async () => {
@@ -270,12 +312,15 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   async #adoptRecoveredRunning(
     plan: TeamLifecycleLaunchPlan,
     state: DurableState & { runId: string },
+    effectGuard?: EffectGuard,
   ): Promise<DurableState> {
     let observations: TeamLifecycleLaneObservation[]
     try {
-      observations = await this.#inspectLanes(plan, state.runId)
+      observations = effectGuard
+        ? await this.#inspectLanesGuarded(plan, state.runId, effectGuard)
+        : await this.#inspectLanes(plan, state.runId)
     } catch (error) {
-      await this.#failRecoveredRunning(plan, state, error)
+      await this.#failRecoveredState(plan, state, error, effectGuard)
     }
     if (observations!.every(observation => observation.phase === 'running')) {
       // Reading the exact durable plan/run tuple under the replacement runtime's
@@ -284,21 +329,25 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       this.#ownedRuns.add(state.runId)
       return state
     }
-    await this.#failRecoveredRunning(
+    await this.#failRecoveredState(
       plan,
       state,
       new Error('Recovered team lifecycle lanes do not confirm the exact running tuple'),
+      effectGuard,
     )
   }
 
-  async #failRecoveredRunning(
+  async #failRecoveredState(
     plan: TeamLifecycleLaunchPlan,
     state: DurableState & { runId: string },
     cause: unknown,
+    effectGuard?: EffectGuard,
   ): Promise<never> {
     let stopped = false
     try {
-      stopped = (await this.#applyLanesForTeardown(plan, state.runId))
+      stopped = (await (effectGuard
+        ? this.#applyLanesForRecoveryTeardown(plan, state.runId, effectGuard)
+        : this.#applyLanesForTeardown(plan, state.runId)))
         .every(observation => observation.phase === 'idle')
     } catch {}
     await this.#write({
@@ -327,6 +376,26 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         lane,
         runId,
       })
+    }))
+  }
+
+  #inspectLanesGuarded(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+    effectGuard: EffectGuard,
+  ): Promise<TeamLifecycleLaneObservation[]> {
+    return Promise.all(plan.lanes.map(async lane => {
+      const adapter = this.#adapter(lane.kind)
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      const observation = await adapter.inspect({
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        runId,
+      })
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      return observation
     }))
   }
 
@@ -376,6 +445,23 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       lane,
       runId,
     })))
+  }
+
+  #applyLanesForRecoveryTeardown(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+    effectGuard: EffectGuard,
+  ): Promise<TeamLifecycleLaneObservation[]> {
+    return Promise.all(plan.lanes.map(async lane => {
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed before teardown')
+      return this.#adapter(lane.kind).stop({
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        runId,
+      })
+    }))
   }
 
   #rememberPlan(plan: TeamLifecycleLaunchPlan): void {
