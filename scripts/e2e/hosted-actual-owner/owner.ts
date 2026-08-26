@@ -1,13 +1,20 @@
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
+import { constants, readFileSync, realpathSync } from 'node:fs'
 import { chmod, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { HostedApprovalOwnerService } from '../../../src/services/hostedControl/HostedApprovalOwnerService.js'
-import { HostedApprovalOwnerStore } from '../../../src/services/hostedControl/HostedApprovalOwnerStore.js'
-import { HostedApprovalOwnerWal } from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
+import {
+  HostedApprovalOwnerStore,
+  withoutRevision,
+} from '../../../src/services/hostedControl/HostedApprovalOwnerStore.js'
+import {
+  HostedApprovalOwnerWal,
+  parseOwnerStateSource,
+  type HostedApprovalOwnerState,
+} from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
 import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRuntimeAdmission } from '../../../src/services/hostedControl/HostedApprovalRuntimeAdmission.js'
 import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
@@ -15,14 +22,26 @@ import { HostedControlRuntime } from '../../../src/services/hostedControl/Hosted
 import { OpenCodeHostedApprovalRuntimeAdapter } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
 import { prepareOpenCodeArtifactDigestToken } from '../../../src/services/opencode/OpenCodeArtifactDigest.js'
 import {
-  assertMarkerOwnedSandbox, loadAcceptanceConfig, HOSTED_APPROVAL_ADMISSION_FILE,
-  isWithin, type ActualOwnerAcceptanceConfig,
+  appendPrivateTimeline, assertMarkerOwnedSandbox, loadAcceptanceConfig,
+  assertProductionOwnerTrust, HOSTED_APPROVAL_ADMISSION_FILE, isWithin,
+  type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
-import { buildAcceptanceEvidence, type ActualOwnerAcceptanceEvidence } from './evidence.js'
 import {
-  assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
+  buildAcceptanceEvidence,
+  validateAcceptanceEvidence,
+  type ActualOwnerAcceptanceEvidence,
+  type ActualOwnerWalSource,
+} from './evidence.js'
+import {
+  assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, EvidenceRefreshFence,
+  readAnchoredFile,
   type SecureFileIdentity,
 } from './secure-files.js'
+import {
+  captureCurrentActualOwnerProcessAnchor,
+  type ActualOwnerProcessAnchor,
+} from './process-anchor.js'
+import type { ActualOwnerOrchestratorAuthority } from './contracts.js'
 
 const MAX_CONTROL_BYTES = 16 * 1024
 
@@ -78,10 +97,13 @@ class AcceptanceRuntime {
   } | null = null
   private stopping = false
   private evidence: ActualOwnerAcceptanceEvidence
+  private readonly processAnchor: ActualOwnerProcessAnchor
+  private readonly evidenceRefreshFence = new EvidenceRefreshFence()
   private sequence = 0
 
-  constructor(readonly config: ActualOwnerAcceptanceConfig) {
-    this.evidence = buildAcceptanceEvidence({ config, status: 'starting' })
+  constructor(readonly config: ActualOwnerAcceptanceConfig, processAnchor: ActualOwnerProcessAnchor) {
+    this.processAnchor = processAnchor
+    this.evidence = buildAcceptanceEvidence({ config, processAnchor, status: 'starting' })
   }
 
   async start(): Promise<void> {
@@ -95,11 +117,7 @@ class AcceptanceRuntime {
       throw new Error('hosted_actual_owner_composition_incomplete')
     }
     await this.startControl()
-    this.evidence = buildAcceptanceEvidence({
-      config: this.config, status: 'ready', admission: this.admission,
-      ownerSocket: await this.ownerSocket(), state: await this.store.read(), publication: this.publication,
-    })
-    await this.writeEvidence()
+    await this.refreshEvidence('ready')
     process.stdout.write(`${JSON.stringify({
       schemaVersion: 1,
       purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-readiness/v1',
@@ -152,6 +170,10 @@ class AcceptanceRuntime {
 
   private async ports(context: HostedControlRuntimePortFactoryContext) {
     await this.assertPublicationCurrent()
+    assertProductionOwnerTrust(
+      this.config.ownerArtifact,
+      context.activationV2?.expectation.ownerArtifactDigest,
+    )
     const expectedAdmission = join(context.teamRoot, HOSTED_APPROVAL_ADMISSION_FILE)
     if (expectedAdmission !== this.config.admissionFile || !isWithin(this.config.sandboxRoot, context.teamRoot) ||
       this.config.walFile !== join(context.teamRoot, 'hosted-approval-owner.v1.json')) {
@@ -178,6 +200,12 @@ class AcceptanceRuntime {
       }),
     })
     await service.recoverStateOnly()
+    await this.assertPublicationCurrent()
+    await store.wal.locked(async state => {
+      if (!state) throw new Error('hosted_actual_owner_wal_recovery_missing')
+      return store.wal.publish(state, withoutRevision(state))
+    })
+    await this.assertPublicationCurrent()
     this.store = store; this.service = service; this.admission = admission
     const approvals = new EvidenceApprovalPort(service, (event, approvalId) => this.record(event, approvalId))
     return {
@@ -200,29 +228,86 @@ class AcceptanceRuntime {
   }
 
   private async record(event: string, approvalId: string | null): Promise<void> {
-    const handle = await open(this.config.runtime.capture.ownerWalTimelinePath, 'a', 0o600)
-    try {
-      await handle.writeFile(`${JSON.stringify({
+    await appendPrivateTimeline(
+      this.config.runtime.capture.ownerWalTimelinePath,
+      this.config.sandboxRoot,
+      `${JSON.stringify({
         schemaVersion: 1, runId: this.config.runtime.runId, sequence: ++this.sequence,
         at: new Date().toISOString(), event, approvalId,
         generation: this.admission?.admissionGeneration ?? null,
-      })}\n`)
-      await handle.sync()
-    } finally { await handle.close() }
+      })}\n`,
+    )
     await this.refreshEvidence('ready')
   }
 
   private async refreshEvidence(status: 'ready' | 'stopping'): Promise<void> {
-    this.evidence = buildAcceptanceEvidence({
-      config: this.config, status, admission: this.admission,
-      ownerSocket: this.evidence.owner.ownerSocket ?? await this.ownerSocket(),
-      state: await this.store?.read() ?? null, publication: this.publication,
-    })
-    await this.writeEvidence()
+    return this.evidenceRefreshFence.run(generation =>
+      this.refreshEvidenceGeneration(status, generation))
   }
 
-  private async writeEvidence(): Promise<void> {
-    await atomicPrivateJson(this.config.evidenceFile, this.config.sandboxRoot, this.evidence)
+  private async refreshEvidenceGeneration(
+    status: 'ready' | 'stopping',
+    generation: number,
+  ): Promise<void> {
+    this.evidenceRefreshFence.assertActive(generation)
+    await this.assertPublicationCurrent()
+    const wal = await this.readWalSource()
+    await this.assertPublicationCurrent()
+    const evidence = buildAcceptanceEvidence({
+      config: this.config, processAnchor: this.processAnchor, status, admission: this.admission,
+      ownerSocket: this.evidence.owner.ownerSocket ?? await this.ownerSocket(),
+      state: wal.state, walSource: wal.source, publication: this.publication,
+    })
+    await this.assertPublicationCurrent()
+    await this.writeEvidence(evidence, generation)
+    await this.assertPublicationCurrent()
+    this.evidenceRefreshFence.assertActive(generation)
+    this.evidence = evidence
+  }
+
+  private async readWalSource(): Promise<{
+    state: HostedApprovalOwnerState
+    source: ActualOwnerWalSource
+  }> {
+    const snapshot = await readAnchoredFile(this.config.walFile, this.config.sandboxRoot, {
+      minimumBytes: 2,
+      maximumBytes: 32 * 1024 * 1024,
+      mode: 0o600,
+    })
+    const state = parseOwnerStateSource(snapshot.bytes)
+    if (state.revision < 1) throw new Error('hosted_actual_owner_wal_revision_invalid')
+    return {
+      state,
+      source: Object.freeze({
+        identity: snapshot.identity,
+        sha256: createHash('sha256').update(snapshot.bytes).digest('hex'),
+        observedAtUnixMs: Date.now(),
+      }),
+    }
+  }
+
+  private async writeEvidence(
+    evidence: ActualOwnerAcceptanceEvidence = this.evidence,
+    generation?: number,
+  ): Promise<void> {
+    const assertGeneration = () => {
+      if (generation !== undefined) this.evidenceRefreshFence.assertActive(generation)
+    }
+    const validateEvidence = () => this.config.ownerArtifact.kind === 'sealed-build'
+      ? validateAcceptanceEvidence(evidence, {
+          trustedOwnerArtifact: this.config.ownerArtifact,
+        })
+      : evidence
+    assertGeneration()
+    const validated = validateEvidence()
+    await atomicPrivateJson(
+      this.config.evidenceFile,
+      this.config.sandboxRoot,
+      validated,
+      () => { assertGeneration(); validateEvidence() },
+      () => { assertGeneration(); validateEvidence() },
+    )
+    assertGeneration()
   }
 
   private async startControl(): Promise<void> {
@@ -348,10 +433,13 @@ class AcceptanceRuntime {
   }
 }
 
-export async function runActualOwnerAcceptance(args: readonly string[]): Promise<void> {
-  const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
-  const config = await loadAcceptanceConfig({ args, repositoryRoot })
-  const acceptance = new AcceptanceRuntime(config)
+export async function runActualOwnerAcceptance(
+  args: readonly string[],
+  authority: ActualOwnerOrchestratorAuthority,
+): Promise<void> {
+  const processAnchor = await captureCurrentActualOwnerProcessAnchor()
+  const config = await loadAcceptanceConfig({ args, authority })
+  const acceptance = new AcceptanceRuntime(config, processAnchor)
   const stop = () => void acceptance.stop().then(() => process.exit(0), error => {
     process.stderr.write(`${error instanceof Error ? error.message : 'hosted_actual_owner_cleanup_failed'}\n`)
     process.exit(1)
@@ -360,13 +448,25 @@ export async function runActualOwnerAcceptance(args: readonly string[]): Promise
   try { await acceptance.start() } catch (error) {
     const failure = error instanceof Error ? error.message : 'hosted_actual_owner_start_failed'
     await atomicPrivateJson(config.evidenceFile, config.sandboxRoot,
-      buildAcceptanceEvidence({ config, status: 'failed', failure })).catch(() => undefined)
+      buildAcceptanceEvidence({ config, processAnchor, status: 'failed', failure })).catch(() => undefined)
     await acceptance.stop().catch(() => undefined)
     throw error
   }
   await new Promise<void>(() => undefined)
 }
 
-if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
-  await runActualOwnerAcceptance(process.argv.slice(2))
+if (import.meta.main) {
+  const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+  const executable = realpathSync(process.execPath)
+  const sourceBytes = readFileSync(fileURLToPath(import.meta.url))
+  await runActualOwnerAcceptance(process.argv.slice(2), {
+    kind: 'source',
+    repositoryRoot,
+    ownerArtifact: {
+      kind: 'source-smoke',
+      executable,
+      sha256: `sha256:${createHash('sha256').update(readFileSync(executable)).digest('hex')}`,
+      buildClosureSha256: `sha256:${createHash('sha256').update(sourceBytes).digest('hex')}`,
+    },
+  })
 }

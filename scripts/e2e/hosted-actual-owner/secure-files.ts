@@ -34,7 +34,65 @@ function same(left: BigIntStats, right: BigIntStats): boolean {
 
 function stable(left: BigIntStats, right: BigIntStats): boolean {
   return same(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs && left.mode === right.mode && left.nlink === right.nlink
+    left.ctimeNs === right.ctimeNs && left.mode === right.mode && left.nlink === right.nlink &&
+    left.uid === right.uid && left.gid === right.gid
+}
+
+function atomicallyPublished(left: BigIntStats, right: BigIntStats): boolean {
+  return same(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs &&
+    left.mode === right.mode && left.nlink === right.nlink && left.uid === right.uid &&
+    left.gid === right.gid
+}
+
+export class EvidenceRefreshFence {
+  private tail: Promise<void> = Promise.resolve()
+  private nextGeneration = 0
+  private activeGeneration: number | null = null
+
+  run<T>(operation: (generation: number) => Promise<T>): Promise<T> {
+    const generation = ++this.nextGeneration
+    const scheduled: Promise<T> = this.tail.then(() => {
+      if (this.activeGeneration !== null) {
+        throw new Error('hosted_actual_owner_evidence_refresh_overlap')
+      }
+      this.activeGeneration = generation
+      return Promise.resolve().then(() => operation(generation)).finally(() => {
+        this.activeGeneration = null
+      })
+    })
+    this.tail = scheduled.then(() => undefined, () => undefined)
+    return scheduled
+  }
+
+  assertActive(generation: number): void {
+    if (this.activeGeneration !== generation) {
+      throw new Error('hosted_actual_owner_evidence_refresh_generation_stale')
+    }
+  }
+}
+
+async function assertExactContent(
+  handle: FileHandle,
+  expectedStat: BigIntStats,
+  expectedBytes: Buffer,
+): Promise<BigIntStats> {
+  const before = await handle.stat({ bigint: true })
+  if (!stable(expectedStat, before) || before.size !== BigInt(expectedBytes.byteLength)) {
+    throw new Error('hosted_actual_owner_evidence_content_drift')
+  }
+  const observed = Buffer.alloc(expectedBytes.byteLength)
+  let offset = 0
+  while (offset < observed.byteLength) {
+    const { bytesRead } = await handle.read(observed, offset, observed.byteLength - offset, offset)
+    if (bytesRead === 0) break
+    offset += bytesRead
+  }
+  const after = await handle.stat({ bigint: true })
+  if (offset !== observed.byteLength || !observed.equals(expectedBytes) ||
+    !stable(before, after)) {
+    throw new Error('hosted_actual_owner_evidence_content_drift')
+  }
+  return after
 }
 
 function identity(stat: BigIntStats): SecureFileIdentity {
@@ -146,17 +204,25 @@ export async function atomicPrivateJson(
   trustedRoot: string,
   value: unknown,
   beforeRename?: (temporaryPath: string) => void | Promise<void>,
+  afterRename?: () => void | Promise<void>,
 ): Promise<SecureFileIdentity> {
   const parentPath = dirname(path)
   const parent = await anchoredDirectory(parentPath, trustedRoot)
   const temporaryName = `.${basename(path)}.tmp-${process.pid}-${randomUUID()}`
   const temporaryPath = `${parent.anchoredPath}/${temporaryName}`
   let temporaryExists = true
+  let published = false
+  let handle: FileHandle | null = null
+  const serialized = Buffer.from(`${JSON.stringify(value)}\n`)
   try {
-    const handle = await open(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, 0o600)
+    handle = await open(
+      temporaryPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NOFOLLOW,
+      0o600,
+    )
     let written: BigIntStats
     try {
-      await handle.writeFile(`${JSON.stringify(value)}\n`)
+      await handle.writeFile(serialized)
       await handle.sync()
       written = await handle.stat({ bigint: true })
       if (!written.isFile() || written.nlink !== 1n || Number(written.mode & 0o777n) !== 0o600) {
@@ -164,23 +230,55 @@ export async function atomicPrivateJson(
       }
       await beforeRename?.(temporaryPath)
       const linked = await lstat(temporaryPath, { bigint: true })
-      if (!same(written, linked) || linked.isSymbolicLink()) {
+      if (!stable(written, linked) || linked.isSymbolicLink()) {
         throw new Error('hosted_actual_owner_evidence_temp_substituted')
       }
-    } finally { await handle.close() }
+      await assertExactContent(handle, written, serialized)
+    } catch (error) {
+      await handle.close()
+      handle = null
+      throw error
+    }
     await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
     await rename(temporaryPath, `${parent.anchoredPath}/${basename(path)}`)
     temporaryExists = false
-    const published = await lstat(`${parent.anchoredPath}/${basename(path)}`, { bigint: true })
-    if (!same(written!, published) || published.isSymbolicLink()) {
+    published = true
+    const publishedStat = await lstat(`${parent.anchoredPath}/${basename(path)}`, { bigint: true })
+    if (!atomicallyPublished(written!, publishedStat) || publishedStat.isSymbolicLink()) {
       throw new Error('hosted_actual_owner_evidence_publish_substituted')
     }
+    await assertExactContent(handle, publishedStat, serialized)
     await parent.handle.sync()
     await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
     const final = await lstat(path, { bigint: true })
-    if (!same(written!, final)) throw new Error('hosted_actual_owner_evidence_membership_unproved')
-    return identity(final)
+    if (!stable(publishedStat, final)) throw new Error('hosted_actual_owner_evidence_membership_unproved')
+    await afterRename?.()
+    await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
+    const postValidated = await lstat(path, { bigint: true })
+    if (!stable(publishedStat, postValidated) || postValidated.isSymbolicLink()) {
+      throw new Error('hosted_actual_owner_evidence_post_validation_membership_unproved')
+    }
+    await assertExactContent(handle, publishedStat, serialized)
+    await handle.sync()
+    const contentValidated = await assertExactContent(handle, publishedStat, serialized)
+    await handle.close()
+    handle = null
+    return identity(contentValidated)
+  } catch (error) {
+    if (published && handle) {
+      try {
+        // Invalidate the exact inode we published through its still-open descriptor. Path-based
+        // unlink would be unsafe here: rename-away or RENAME_EXCHANGE may have installed an
+        // unrelated file at the evidence pathname after the last membership check.
+        await handle.truncate(0)
+        await handle.sync()
+      } catch {
+        throw new Error('hosted_actual_owner_evidence_invalidation_failed', { cause: error })
+      }
+    }
+    throw error
   } finally {
+    await handle?.close().catch(() => undefined)
     if (temporaryExists) await unlink(temporaryPath).catch(() => undefined)
     await parent.handle.close()
   }
