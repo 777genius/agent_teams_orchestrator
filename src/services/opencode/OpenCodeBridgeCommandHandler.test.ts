@@ -4383,6 +4383,103 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(released).toEqual(['session-late'])
   }, 2_000)
 
+  test('does not start another provider mutation after the deadline expires during MCP retry backoff', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot: buildReadinessSnapshot(), release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionBridge.ensureSession = (async input => buildRecord({
+      laneId: input.laneId,
+      memberName: input.memberName,
+      selectedModel: input.selectedModel,
+    })) as typeof openCodeSessionBridge.ensureSession
+    let readinessMutations = 0
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      readinessMutations += 1
+      return {
+        ok: false,
+        connected: false,
+        attached: false,
+        runtimePid: record.runtimePid,
+        reason: 'retry',
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-hosted-mcp-backoff-timeout',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'minimax-m2.5-free',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    envelope.timeoutMs = 100
+
+    const result = await createOwnedOpenCodeLifecycleCommandExecutor()(envelope, {
+      effectGuard: () => true,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('timeout')
+    expect(readinessMutations).toBe(1)
+    await Bun.sleep(300)
+    expect(readinessMutations).toBe(1)
+  }, 2_000)
+
+  test('holds a hosted deadline open until a late environment refresh is synchronously compensated', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot: buildReadinessSnapshot(), release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob', memberName: 'bob', opencodeSessionId: 'session-late-refresh',
+    })
+    openCodeSessionBridge.ensureSession = (async () => record) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    let refreshEntered!: () => void
+    let releaseRefresh!: () => void
+    const entered = new Promise<void>(resolve => { refreshEntered = resolve })
+    const refreshGate = new Promise<void>(resolve => { releaseRefresh = resolve })
+    openCodeSessionBridge.refreshSessionEnvironment = (async current => {
+      refreshEntered()
+      await refreshGate
+      return current
+    }) as typeof openCodeSessionBridge.refreshSessionEnvironment
+    const released: string[] = []
+    openCodeSessionBridge.releaseSession = (async current => {
+      released.push(current.opencodeSessionId)
+    }) as typeof openCodeSessionBridge.releaseSession
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-hosted-late-refresh',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'minimax-m2.5-free',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    envelope.timeoutMs = 100
+    let settled = false
+    const executing = createOwnedOpenCodeLifecycleCommandExecutor()(envelope, {
+      effectGuard: () => true,
+    }).then(result => {
+      settled = true
+      return result
+    })
+    await entered
+    await Bun.sleep(150)
+    expect(settled).toBe(false)
+    expect(released).toEqual([])
+
+    releaseRefresh()
+    const result = await executing
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('timeout')
+    expect(released).toEqual(['session-late-refresh'])
+    await Bun.sleep(25)
+    expect(released).toEqual(['session-late-refresh'])
+  }, 2_000)
+
   test('allows launch for built-in free OpenCode models without connected providers', async () => {
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({

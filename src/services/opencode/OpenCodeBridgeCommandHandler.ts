@@ -2774,6 +2774,11 @@ async function runBoundedLaunchMutation<T>(
   synchronizeLateCompletion = false,
 ): Promise<T> {
   await assertLifecycleEffectCurrent(effectGuard)
+  // A previous provider attempt may have consumed the remaining command
+  // budget while the retry loop was backing off. Check the deadline before
+  // constructing the next provider promise: runPhase() cannot prevent an
+  // operation that was already invoked from mutating the provider.
+  runtimeDeadline.throwIfExpired('provider_mutation')
   const pending = operation()
   try {
     return await runtimeDeadline.runPhase('provider_mutation', () => pending)
@@ -3082,9 +3087,15 @@ async function runLaunchWithProvisioningSnapshot(
       }), () => cleanupFailedLaunchSession(record!), effectGuard, synchronizeLateCompletion)
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
       try {
-        await assertLifecycleEffectCurrent(effectGuard)
-        record = await openCodeSessionBridge.refreshSessionEnvironment(record)
+        record = await runBoundedLaunchMutation(
+          runtimeDeadline,
+          () => openCodeSessionBridge.refreshSessionEnvironment(record!),
+          refreshed => cleanupFailedLaunchSession(refreshed),
+          effectGuard,
+          synchronizeLateCompletion,
+        )
       } catch (error) {
+        if (runtimeDeadline.signal.aborted) throw error
         diagnostics.push(teamDiagnostic(
           'opencode_launch_session_environment_refresh_failed',
           `${name}: ${error instanceof Error ? error.message : String(error)}`,
