@@ -31,13 +31,21 @@ const plan: TeamLifecycleLaunchPlan = {
   }],
 }
 
+const TEST_RECOVERY_BINDING = `session-set_${'a'.repeat(64)}`
+
+function running(
+  recoveryBinding = TEST_RECOVERY_BINDING,
+): TeamLifecycleLaneObservation {
+  return { phase: 'running', recoverable: false, recoveryBinding }
+}
+
 class FakeLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const
   launched: Array<{ runId: string; teamId: string; toolApprovalMode: 'manual' | 'auto' }> = []
   stoppedRunIds: string[] = []
   stoppedApprovalModes: Array<'manual' | 'auto'> = []
   actions: string[] = []
-  launchResult: TeamLifecycleLaneObservation = { phase: 'running', recoverable: false }
+  launchResult: TeamLifecycleLaneObservation = running()
   inspectResult: TeamLifecycleLaneObservation | null = null
 
   supports(_action: HostedLifecycleAction): boolean { return true }
@@ -124,7 +132,7 @@ describe('DurableTeamLifecycleExecution', () => {
     roots.push(root)
     const lane = new FakeLane()
     lane.launchResult = { phase: 'launching', recoverable: false }
-    lane.inspectResult = { phase: 'running', recoverable: false }
+    lane.inspectResult = running()
     const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
     const idle = await execution.inspect(plan)
 
@@ -205,7 +213,7 @@ describe('DurableTeamLifecycleExecution', () => {
         this.actions.push('launch')
         this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
         await launchGate
-        return { phase: 'running', recoverable: false }
+        return running()
       }
     }
     const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [new PendingLane()])
@@ -225,13 +233,17 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'running' })
   })
 
-  test('bounds a hung provider launch so lifecycle close cannot wait indefinitely', async () => {
+  test('bounds a cooperative hung provider launch so lifecycle close cannot wait indefinitely', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-close-deadline-'))
     roots.push(root)
     class HungLane extends FakeLane {
-      override async launch(): Promise<TeamLifecycleLaneObservation> {
+      override async launch(input: { signal?: AbortSignal }): Promise<TeamLifecycleLaneObservation> {
         this.actions.push('launch')
-        return new Promise(() => {})
+        return new Promise((_, reject) => {
+          const abort = () => reject(input.signal?.reason)
+          if (input.signal?.aborted) abort()
+          else input.signal?.addEventListener('abort', abort, { once: true })
+        })
       }
     }
     const lane = new HungLane()
@@ -249,6 +261,49 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(Date.now() - startedAt).toBeLessThan(500)
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'failed', recoverable: true })
   })
+
+  test('does not close across a timed-out late launch until exact compensation confirms', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-late-launch-fence-'))
+    roots.push(root)
+    let releaseLaunch!: () => void
+    const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve })
+    let stopConfirmed = false
+    class GatedLateLane extends FakeLane {
+      override async launch(): Promise<TeamLifecycleLaneObservation> {
+        this.actions.push('launch')
+        await launchGate
+        return running()
+      }
+      override async stop(): Promise<TeamLifecycleLaneObservation> {
+        this.actions.push('stop')
+        stopConfirmed = true
+        return { phase: 'idle', recoverable: false }
+      }
+    }
+    const lane = new GatedLateLane()
+    const execution = new DurableTeamLifecycleExecution(
+      join(root, 'state.json'), [lane], 'team-lifecycle-owner',
+      { effectTimeoutMs: 25, compensationTimeoutMs: 250 },
+    )
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan, commandId: 'command-late-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    let closed = false
+    const closing = execution.close().then(() => { closed = true })
+    await Bun.sleep(75)
+    expect(closed).toBe(false)
+    expect(stopConfirmed).toBe(false)
+
+    releaseLaunch()
+    await closing
+    expect(stopConfirmed).toBe(true)
+    expect(lane.actions).toEqual(['launch', 'stop'])
+    await Bun.sleep(25)
+    expect(lane.actions).toEqual(['launch', 'stop'])
+    await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'failed', recoverable: true })
+  }, 2_000)
 
   test('shutdown compensates the exact running run and cannot settle before stop confirms', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-running-close-'))
@@ -326,6 +381,28 @@ describe('DurableTeamLifecycleExecution', () => {
       phase: 'idle',
       runId: null,
     })
+  })
+
+  test('rejects recovery when the provider substitutes the exact launched member session set', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-session-binding-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    const crashedOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await crashedOwner.inspect(plan)
+    await crashedOwner.launch({
+      plan, commandId: 'command-session-binding', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const persisted = await waitForPhase(crashedOwner, 'running')
+    lane.inspectResult = running(`session-set_${'b'.repeat(64)}`)
+
+    const replacement = new DurableTeamLifecycleExecution(statePath, [lane])
+    await expect(replacement.recoverAtStartup(plan, () => true)).rejects.toThrow(
+      'Unable to adopt recovered team lifecycle run',
+    )
+    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+    await expect(replacement.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
   test('atomically transfers a running tuple so stale generation shutdown cannot stop it', async () => {
@@ -430,7 +507,7 @@ describe('DurableTeamLifecycleExecution', () => {
         this.actions.push('launch')
         this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
         await launchGate
-        return { phase: 'running', recoverable: false }
+        return running()
       }
     }
     const lane = new InFlightLane()
@@ -492,7 +569,7 @@ describe('DurableTeamLifecycleExecution', () => {
           toolApprovalMode: input.toolApprovalMode,
         })
         await launchGate
-        return { phase: 'running', recoverable: false }
+        return running()
       }
     }
     const lane = new BlockedLaunchLane()
@@ -595,7 +672,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
         ok: true,
         data: command === 'opencode.stopTeam'
           ? { stopped: true }
-          : { teamLaunchState: command === 'opencode.launchTeam' ? 'permission_blocked' : 'ready' },
+          : {
+              teamLaunchState: command === 'opencode.launchTeam' ? 'permission_blocked' : 'ready',
+              members: { worker: { sessionId: 'session-worker' } },
+            },
       }
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
@@ -607,8 +687,14 @@ describe('OpenCodeTeamLifecycleLane', () => {
       lane: admittedLane,
       runId: 'run_test1234',
     }
-    await expect(lane.launch(input)).resolves.toEqual({ phase: 'launching', recoverable: false })
-    await expect(lane.inspect(input)).resolves.toEqual({ phase: 'running', recoverable: false })
+    await expect(lane.launch(input)).resolves.toMatchObject({
+      phase: 'launching', recoverable: false,
+      recoveryBinding: expect.stringMatching(/^session-set_[0-9a-f]{64}$/),
+    })
+    await expect(lane.inspect(input)).resolves.toMatchObject({
+      phase: 'running', recoverable: false,
+      recoveryBinding: expect.stringMatching(/^session-set_[0-9a-f]{64}$/),
+    })
     await expect(lane.stop(input)).resolves.toEqual({ phase: 'idle', recoverable: false })
     expect(calls.map(call => call.command)).toEqual([
       'opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam',
@@ -631,7 +717,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
         ok: true,
         data: command === 'opencode.stopTeam'
           ? { stopped: true }
-          : { teamLaunchState: 'ready' },
+          : { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
       }
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 300_000, () => true)
@@ -650,11 +736,55 @@ describe('OpenCodeTeamLifecycleLane', () => {
     expect(calls).toEqual(['opencode.launchTeam'])
 
     releaseLaunch()
-    await expect(Promise.all([launch, stop])).resolves.toEqual([
-      { phase: 'running', recoverable: false },
-      { phase: 'idle', recoverable: false },
-    ])
+    const [launched, stopped] = await Promise.all([launch, stop])
+    expect(launched).toMatchObject({
+      phase: 'running', recoverable: false,
+      recoveryBinding: expect.stringMatching(/^session-set_[0-9a-f]{64}$/),
+    })
+    expect(stopped).toEqual({ phase: 'idle', recoverable: false })
     expect(calls).toEqual(['opencode.launchTeam', 'opencode.stopTeam'])
+  })
+
+  test('rejects substituted, omitted, and duplicate provider session identities', async () => {
+    let teamLaunchState = 'launching'
+    let members: Record<string, { sessionId: string }> = {
+      worker: { sessionId: 'session-worker' },
+      reviewer: { sessionId: 'session-reviewer' },
+    }
+    const execute = (async () => ({
+      ok: true,
+      data: { teamLaunchState, members },
+    })) as never
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
+    const admittedLane = {
+      ...plan.lanes[0]!,
+      members: [
+        ...plan.lanes[0]!.members,
+        { name: 'reviewer', prompt: 'Review the fixture.' },
+      ],
+    }
+    const input = {
+      planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode, lane: admittedLane, runId: 'run_binding',
+    }
+    const launched = await lane.launch(input)
+    expect(launched.phase).toBe('launching')
+    expect(launched.recoveryBinding).toMatch(/^session-set_[0-9a-f]{64}$/)
+
+    members = {
+      worker: { sessionId: 'session-substituted' },
+      reviewer: { sessionId: 'session-reviewer' },
+    }
+    await expect(lane.inspect({ ...input, recoveryBinding: launched.recoveryBinding }))
+      .rejects.toThrow('does not match the durable launch binding')
+    teamLaunchState = 'ready'
+    members = { worker: { sessionId: 'session-worker' } }
+    await expect(lane.inspect(input)).rejects.toThrow('changed the exact admitted member set')
+    members = {
+      worker: { sessionId: 'session-duplicate' },
+      reviewer: { sessionId: 'session-duplicate' },
+    }
+    await expect(lane.inspect(input)).rejects.toThrow('missing or duplicate session id')
   })
 
   test('revalidates a queued request inside the lane before provider mutation', async () => {
@@ -669,7 +799,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
         markFirstStarted()
         await firstGate
       }
-      return { ok: true, data: { teamLaunchState: 'ready' } }
+      return {
+        ok: true,
+        data: { teamLaunchState: 'ready', members: { worker: { sessionId: `session-${calls.length}` } } },
+      }
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     let current = true
@@ -689,7 +822,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
     )
     current = false
     releaseFirst()
-    await expect(first).resolves.toEqual({ phase: 'running', recoverable: false })
+    await expect(first).resolves.toMatchObject({
+      phase: 'running', recoverable: false,
+      recoveryBinding: expect.stringMatching(/^session-set_[0-9a-f]{64}$/),
+    })
     expect(await queuedOutcome).toBeInstanceOf(Error)
     expect((await queuedOutcome as Error).message).toContain('authority changed before provider effect')
     expect(calls).toHaveLength(1)
@@ -699,7 +835,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
     let launchBody: Record<string, unknown> | null = null
     const execute = (async (input: unknown) => {
       launchBody = (input as { body: Record<string, unknown> }).body
-      return { ok: true, data: { teamLaunchState: 'ready' } }
+      return {
+        ok: true,
+        data: { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
+      }
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     await lane.launch({

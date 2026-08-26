@@ -964,7 +964,9 @@ describe('supervised process teammate backend e2e', () => {
     } catch (error) {
       firstFailure = error as Error
     }
-    expect(firstFailure?.message).toMatch(/teammate process exited before runtime_ready|Failed to capture immutable process identity/)
+    expect(firstFailure?.message).toMatch(
+      /exited immediately with code 42|teammate process exited before runtime_ready|Failed to capture immutable process identity/,
+    )
     await waitForCondition(async () =>
       !(await readTeamFileAsync(fixture.teamName))?.members.some(member => member.name === 'alice') &&
       fixture.context.getAppState().teamContext?.teammates[`alice@${fixture.teamName}`] === undefined,
@@ -1011,6 +1013,36 @@ describe('supervised process teammate backend e2e', () => {
     await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
+
+  it('retires a pre-finalization /bin/true process group claim and permits respawn', async () => {
+    if (process.platform !== 'linux') return
+    const fixture = await createFixture({ trusted: true, mode: 'success' })
+    const fixtureCommand = process.env[TEAMMATE_COMMAND_ENV_VAR]!
+    process.env[TEAMMATE_COMMAND_ENV_VAR] = '/bin/true'
+    await expect(__handleSpawnNativeProcessForTests(
+      {
+        name: 'alice', prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName, cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )).rejects.toThrow()
+    await waitForCondition(async () =>
+      !(await readTeamFileAsync(fixture.teamName))?.members.some(member => member.name === 'alice') &&
+      fixture.context.getAppState().teamContext?.teammates[`alice@${fixture.teamName}`] === undefined,
+    5_000)
+
+    process.env[TEAMMATE_COMMAND_ENV_VAR] = fixtureCommand
+    const respawned = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice', prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName, cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+    expect(respawned.data.backend_type).toBe('process')
+    expect(respawned.data.runtime_pid).toBeNumber()
+    runtimePids.push(respawned.data.runtime_pid!)
+  }, 15_000)
 
   it('fails before spawn when workspace trust is missing', async () => {
     const fixture = await createFixture({ trusted: false })

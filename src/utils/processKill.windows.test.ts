@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import {
   buildExactProcessTreeSpawn,
+  confirmNaturalProcessTreeExit,
   isProcessAlive,
   terminateExpectedProcessTreeStable,
 } from './processKill.js'
@@ -47,6 +48,21 @@ async function withPhaseTimeout<T>(
 }
 
 describe('Windows Job process containment', () => {
+  it('proves a naturally completed supervisor Job empty after its named handle disappears', async () => {
+    if (process.platform !== 'win32') return
+    const launch = buildExactProcessTreeSpawn(process.execPath, ['-e', 'process.exit(0)'], {
+      stdio: 'ignore',
+    }, 'win32')
+    const supervisor = spawn(launch.command, launch.args, launch.options)
+    await withPhaseTimeout(new Promise<void>((resolve, reject) => {
+      supervisor.once('error', reject)
+      supervisor.once('close', () => resolve())
+    }), WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS, 'natural Windows Job supervisor exit')
+    await expect(confirmNaturalProcessTreeExit(
+      supervisor.pid!, launch.osIdentity, 'win32',
+    )).resolves.toBe(true)
+  }, WINDOWS_JOB_TEST_TIMEOUT_MS)
+
   it('launches inside the Job and proves it empty after exact termination', async () => {
     if (process.platform !== 'win32') return
     // This intentionally exercises the native PowerShell/Win32 path and runs

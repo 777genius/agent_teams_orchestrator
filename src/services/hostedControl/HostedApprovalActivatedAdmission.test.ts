@@ -181,6 +181,9 @@ describe('C1 verified activated-admission adapter', () => {
     const away = `${harness.path}.away`
 
     await rename(harness.path, away)
+    // Some hosted filesystems coalesce back-to-back inode timestamp updates.
+    // Keep the transient drift observable without weakening the restore case.
+    await Bun.sleep(5)
     await rename(away, harness.path)
 
     expect(await harness.admission.isCurrent()).toBe(false)
@@ -199,6 +202,7 @@ describe('C1 verified activated-admission adapter', () => {
     changed[1] = changed[1] === 0x61 ? 0x62 : 0x61
 
     await writeFile(harness.path, changed, { mode: 0o600 })
+    await Bun.sleep(5)
     await writeFile(harness.path, original, { mode: 0o600 })
 
     expect(await harness.admission.isCurrent()).toBe(false)

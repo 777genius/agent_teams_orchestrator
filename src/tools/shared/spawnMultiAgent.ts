@@ -2851,10 +2851,12 @@ async function handleSpawnNativeProcess(
       : undefined
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
+  let naturalClose: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null
   let runtimePid: number | undefined
   let processPaneId: string | undefined
   let processStartedAtMs: number | null = null
   let processOsIdentity: string | null = null
+  let deterministicProcessOsIdentity: string | null = null
   let settleNaturalExitIdentity!: () => void
   let naturalExitIdentitySettled = false
   const naturalExitIdentityReady = new Promise<void>(resolve => { settleNaturalExitIdentity = resolve })
@@ -3060,14 +3062,12 @@ async function handleSpawnNativeProcess(
       detail: code !== null ? `process exited with code ${code}` : signal ? `process exited from signal ${signal}` : 'process exited',
     })
     finishRuntimeLogStreams([stdoutLog, stderrLog])
-    const treeEmpty = runtimePid && process.platform !== 'win32'
-      ? await confirmNaturalProcessTreeExit(runtimePid, processOsIdentity).catch(() => false)
-      : await killProcessBackendRuntime(processPaneId, {
-          expectedAgentId: teammateId, teamName,
-          expectedStartedAtMs: processStartedAtMs,
-          expectedOwnerToken: processOwnerToken, expectedRunId: processRunId,
-          expectedOsIdentity: processOsIdentity,
-        }).catch(() => false)
+    const treeEmpty = runtimePid
+      ? await confirmNaturalProcessTreeExit(
+          runtimePid,
+          processOsIdentity ?? deterministicProcessOsIdentity,
+        ).catch(() => false)
+      : false
     if (!treeEmpty) return
     const exactProcessIdentity = {
       agentId: teammateId, paneId: processPaneId,
@@ -3164,13 +3164,16 @@ async function handleSpawnNativeProcess(
     }
 
     runtimePid = child.pid
+    deterministicProcessOsIdentity = exactSpawn.osIdentity === 'unix-pgid:pending'
+      ? `unix-pgid:${runtimePid}`
+      : exactSpawn.osIdentity
     // Drain output before asynchronous identity capture. A short-lived child
     // can exit during that probe, and its failure evidence must not be lost.
     child.stdout?.pipe(stdoutLog)
     child.stderr?.pipe(stderrLog)
     // Subscribe before the first asynchronous identity probe. Very short-lived
     // children can otherwise emit close before cleanup has a listener.
-    const naturalClose = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+    naturalClose = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
       child!.once('close', (code, signal) => resolve({ code, signal }))
     })
     void naturalClose.then(async ({ code, signal }) => {
@@ -3722,11 +3725,20 @@ async function handleSpawnNativeProcess(
         }),
       )
     } else if (!cleanupState.attempted && child) {
-      // Without an OS-stable start identity even ChildProcess.kill() is only
-      // PID signaling and can hit a reused process. Observe exit, never signal.
-      // Root exit also cannot prove that no descendant escaped on Unix, nor
-      // that a named Windows Job has no active child. Preserve recovery state.
-      terminated = false
+      // A child can exit before immutable PID identity publication. The spawn
+      // boundary still gives Unix a deterministic PGID and Windows a unique
+      // named Job. Only after the exact ChildProcess close and a kernel-level
+      // empty-boundary proof may the pre-finalized claim be retired.
+      const rootExited = runtimePid !== undefined && !isProcessAlive(runtimePid)
+      if (rootExited && naturalClose && deterministicProcessOsIdentity) {
+        await naturalClose
+        terminated = await confirmNaturalProcessTreeExit(
+          runtimePid,
+          deterministicProcessOsIdentity,
+        ).catch(() => false)
+      } else {
+        terminated = false
+      }
     }
     if (terminated) {
       await removeOwnedRecoveryReservation().catch(() => undefined)

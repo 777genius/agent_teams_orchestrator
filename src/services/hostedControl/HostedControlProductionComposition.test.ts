@@ -383,7 +383,9 @@ class ProductionRecoveryLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const
   inspectedRunIds: string[] = []
   stoppedRunIds: string[] = []
-  inspectResult: TeamLifecycleLaneObservation = { phase: 'running', recoverable: false }
+  inspectResult: TeamLifecycleLaneObservation = {
+    phase: 'running', recoverable: false, recoveryBinding: `session-set_${'a'.repeat(64)}`,
+  }
 
   supports(): boolean { return true }
   async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
@@ -391,7 +393,7 @@ class ProductionRecoveryLane implements TeamLifecycleLaneEffectPort {
     return input.runId ? this.inspectResult : { phase: 'idle', recoverable: false }
   }
   async launch(): Promise<TeamLifecycleLaneObservation> {
-    return { phase: 'running', recoverable: false }
+    return { phase: 'running', recoverable: false, recoveryBinding: `session-set_${'a'.repeat(64)}` }
   }
   async cancel(): Promise<TeamLifecycleLaneObservation> {
     return { phase: 'idle', recoverable: false }

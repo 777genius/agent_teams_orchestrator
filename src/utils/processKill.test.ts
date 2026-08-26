@@ -9,6 +9,7 @@ import {
   buildExactProcessTreeSpawn,
   buildWindowsTaskkillInvocation,
   captureProcessTreeIdentity,
+  confirmNaturalProcessTreeExit,
   getProcessTreeContainmentCapability,
   isProcessAlive,
   killProcessTreeAndWait,
@@ -54,6 +55,22 @@ describe('processKill', () => {
     expect(first.args.join(' ')).toContain('Diagnostics.ProcessStartInfo')
     expect(first.args.join(' ')).not.toContain('& $p.command')
     expect(getProcessTreeContainmentCapability(first.osIdentity, 'win32')).toBe('exact')
+  })
+
+  it('distinguishes completed Windows Job supervisor exit from unverifiable containment', async () => {
+    const query = async (state: 'absent' | 'empty' | 'active' | 'unverifiable') =>
+      confirmNaturalProcessTreeExit(42, 'win32-job:exact-a', 'win32', {
+        isProcessAlive: () => false,
+        queryWindowsJobAfterSupervisorExit: async () => state,
+      })
+    await expect(query('absent')).resolves.toBe(true)
+    await expect(query('empty')).resolves.toBe(true)
+    await expect(query('active')).resolves.toBe(false)
+    await expect(query('unverifiable')).resolves.toBe(false)
+    await expect(confirmNaturalProcessTreeExit(42, 'win32-job:exact-a', 'win32', {
+      isProcessAlive: () => true,
+      queryWindowsJobAfterSupervisorExit: async () => 'absent',
+    })).resolves.toBe(false)
   })
 
   it('preserves Windows native argv through ProcessStartInfo command-line quoting', () => {

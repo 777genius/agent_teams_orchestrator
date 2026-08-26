@@ -64,6 +64,14 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     expect(() => decodeOwnerState(payload)).toThrow('ingress payload')
     const encodedHostPath = state(); const encodedBody = JSON.parse(encodedHostPath.ingress[0]!.payloadJson); encodedBody.summary = 'inspect %252e%252e%255cprivate%255ckey'; encodedHostPath.ingress[0]!.payloadJson = JSON.stringify(encodedBody)
     expect(() => decodeOwnerState(encodedHostPath)).toThrow('ingress payload')
+    for (const summary of [
+      'prefix% %2e%2e%2fprivate%2fkey',
+      'inspect %25252e%25252e%25252fprivate%25252fkey',
+      'inspect %255c%255c%253f%255cC%253a%255cprivate%255ckey',
+    ]) {
+      const hostile = state(); const hostileBody = JSON.parse(hostile.ingress[0]!.payloadJson); hostileBody.summary = summary; hostile.ingress[0]!.payloadJson = JSON.stringify(hostileBody)
+      expect(() => decodeOwnerState(hostile)).toThrow('ingress payload')
+    }
     const acknowledgement = state(); acknowledgement.ingress[0]!.acknowledgedAtIso = '2026-08-13T09:59:00.000Z'; acknowledgement.ingress[0]!.lease = { generation: 1, ownerId: 'owner_1', leaseToken: 'lease_1', claimedAtIso: '2026-08-13T10:00:01.000Z', leaseExpiresAtIso: '2026-08-13T10:00:02.000Z' }
     expect(() => decodeOwnerState(acknowledgement)).toThrow('acknowledgement')
     const delivery = state(); delivery.deliveries = [{ providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`, deliveryRef: 'delivery_ref_wrong', payloadFingerprint: 'f'.repeat(64), outboxId: delivery.ingress[0]!.outboxId, effectRef: delivery.ingress[0]!.effectRef, phase: 'started', result: null }]
@@ -422,14 +430,14 @@ import { HostedApprovalOwnerWal } from ${JSON.stringify(moduleUrl)}
 const wal = new HostedApprovalOwnerWal(process.argv[2])
 await wal.locked(async state => state)
 `)
-    const first = Bun.spawn({ cmd: [process.execPath, firstScript, path, entered, start], stdout: 'ignore', stderr: 'pipe' })
+    const first = Bun.spawn({ cmd: [process.execPath, firstScript, path, entered, start], stdout: 'ignore', stderr: 'ignore' })
     while (await Bun.file(entered).exists() === false) await new Promise(resolve => setTimeout(resolve, 5))
-    const second = Bun.spawn({ cmd: [process.execPath, secondScript, path], stdout: 'ignore', stderr: 'pipe' })
+    const second = Bun.spawn({ cmd: [process.execPath, secondScript, path], stdout: 'ignore', stderr: 'ignore' })
     await new Promise(resolve => setTimeout(resolve, 25))
     expect(second.exitCode).toBeNull()
     first.kill('SIGKILL')
-    expect(await first.exited).not.toBe(0)
     expect(await second.exited).toBe(0)
+    expect(first.exitCode).not.toBe(0)
   }, 15_000)
 
   test('keeps a cross-process contender excluded after ownsCurrentFence and effect-token consume', async () => {

@@ -2430,6 +2430,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
     expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.model).toBe('openrouter/moonshotai/kimi-k2')
     expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
@@ -2481,6 +2482,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
     expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.model).toBe('openrouter/moonshotai/kimi-k2')
     expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
@@ -4290,6 +4292,97 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.error.details).toMatchObject({ phase: 'provider_mutation', commandBudgetMs: 500 })
   })
 
+  test('revalidates lifecycle authority after an adversarial probe pause before any provider mutation', async () => {
+    let releaseProbe!: () => void
+    let probeEntered!: () => void
+    const probeGate = new Promise<void>(resolve => { releaseProbe = resolve })
+    const entered = new Promise<void>(resolve => { probeEntered = resolve })
+    openCodeProvisioningProbe.probeRetainingHost = (async () => {
+      probeEntered()
+      await probeGate
+      return { snapshot: buildReadinessSnapshot(), release: async () => {} }
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    let ensureSessionCalls = 0
+    openCodeSessionBridge.ensureSession = (async () => {
+      ensureSessionCalls += 1
+      return buildRecord()
+    }) as typeof openCodeSessionBridge.ensureSession
+    let current = true
+    const executing = createOwnedOpenCodeLifecycleCommandExecutor()(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-rotated-during-probe',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+      { effectGuard: () => current },
+    )
+    await entered
+    current = false
+    releaseProbe()
+
+    const result = await executing
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('holds a hosted deadline open until a late ensureSession is synchronously compensated', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot: buildReadinessSnapshot(), release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    let releaseEnsure!: () => void
+    let ensureEntered!: () => void
+    const ensureGate = new Promise<void>(resolve => { releaseEnsure = resolve })
+    const entered = new Promise<void>(resolve => { ensureEntered = resolve })
+    const lateRecord = buildRecord({
+      laneId: 'secondary:opencode:bob', memberName: 'bob', opencodeSessionId: 'session-late',
+    })
+    openCodeSessionBridge.ensureSession = (async () => {
+      ensureEntered()
+      await ensureGate
+      return lateRecord
+    }) as typeof openCodeSessionBridge.ensureSession
+    const released: string[] = []
+    openCodeSessionBridge.releaseSession = (async record => {
+      released.push(record.opencodeSessionId)
+    }) as typeof openCodeSessionBridge.releaseSession
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-hosted-late-ensure',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'minimax-m2.5-free',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    envelope.timeoutMs = 100
+    let settled = false
+    const executing = createOwnedOpenCodeLifecycleCommandExecutor()(envelope, {
+      effectGuard: () => true,
+    }).then(result => {
+      settled = true
+      return result
+    })
+    await entered
+    await Bun.sleep(150)
+    expect(settled).toBe(false)
+    expect(released).toEqual([])
+
+    releaseEnsure()
+    const result = await executing
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('timeout')
+    expect(released).toEqual(['session-late'])
+    await Bun.sleep(25)
+    expect(released).toEqual(['session-late'])
+  }, 2_000)
+
   test('allows launch for built-in free OpenCode models without connected providers', async () => {
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({
@@ -4333,7 +4426,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureSessionCalls).toBe(1)
     expect(result.data.teamLaunchState).toBe('launching')
-    expect(result.data.members.bob?.model).toBe('big-pickle')
+    expect(result.data.members.bob?.model).toBe('opencode/big-pickle')
     expect(result.data.members.bob?.launchState).toBe('created')
   })
 

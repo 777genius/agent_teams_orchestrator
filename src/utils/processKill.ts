@@ -378,13 +378,55 @@ export async function confirmNaturalProcessTreeExit(
   pid: number,
   expectedOsIdentity: string | null | undefined,
   platform: NodeJS.Platform = process.platform,
+  dependencies: {
+    isProcessAlive?: (pid: number) => boolean
+    listLinuxProcessGroupMembers?: (pgid: number) => Promise<number[] | null>
+    queryWindowsJobAfterSupervisorExit?: (
+      expectedOsIdentity: string,
+    ) => Promise<'absent' | 'empty' | 'active' | 'unverifiable'>
+  } = {},
 ): Promise<boolean> {
-  if (platform !== 'linux' || expectedOsIdentity !== `unix-pgid:${pid}` || isProcessAlive(pid)) return false
-  const first = await listLinuxProcessGroupMembers(pid)
+  const processAlive = dependencies.isProcessAlive ?? isProcessAlive
+  if (platform === 'win32') {
+    if (!expectedOsIdentity?.startsWith('win32-job:') || processAlive(pid)) return false
+    const query = dependencies.queryWindowsJobAfterSupervisorExit ?? queryWindowsJobAfterSupervisorExit
+    const state = await query(expectedOsIdentity)
+    // This helper is only called after the exact supervisor ChildProcess has
+    // emitted close. A missing KILL_ON_JOB_CLOSE Job then proves its final
+    // handle closed and every contained child was terminated; an extant Job
+    // is safe only when the kernel reports zero active processes.
+    return state === 'absent' || state === 'empty'
+  }
+  if (platform !== 'linux' || expectedOsIdentity !== `unix-pgid:${pid}` || processAlive(pid)) return false
+  const listMembers = dependencies.listLinuxProcessGroupMembers ?? listLinuxProcessGroupMembers
+  const first = await listMembers(pid)
   if (!first || first.length > 0) return false
   await new Promise<void>(resolve => setImmediate(resolve))
-  const second = await listLinuxProcessGroupMembers(pid)
-  return second !== null && second.length === 0 && !isProcessAlive(pid)
+  const second = await listMembers(pid)
+  return second !== null && second.length === 0 && !processAlive(pid)
+}
+
+async function queryWindowsJobAfterSupervisorExit(
+  expectedOsIdentity: string,
+): Promise<'absent' | 'empty' | 'active' | 'unverifiable'> {
+  const jobName = expectedOsIdentity.slice('win32-job:'.length)
+  if (!/^[a-zA-Z0-9._-]{1,128}$/.test(jobName)) return 'unverifiable'
+  const script = [
+    '$ErrorActionPreference="Stop"',
+    'Add-Type -TypeDefinition @"\nusing System; using System.Runtime.InteropServices; public static class JN { [StructLayout(LayoutKind.Sequential)] public struct A { public long TotalUserTime,TotalKernelTime,ThisPeriodTotalUserTime,ThisPeriodTotalKernelTime; public uint TotalPageFaultCount,TotalProcesses,ActiveProcesses,TotalTerminatedProcesses; } [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr OpenJobObject(uint a,bool i,string n); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr h,int c,ref A i,uint l,IntPtr r); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); }\n"@',
+    `$h=[JN]::OpenJobObject(0x0004,$false,'${jobName}')`,
+    'if($h -eq [IntPtr]::Zero){if([Runtime.InteropServices.Marshal]::GetLastWin32Error() -eq 2){exit 10};exit 13}',
+    'try {$a=New-Object JN+A;if(-not [JN]::QueryInformationJobObject($h,1,[ref]$a,[Runtime.InteropServices.Marshal]::SizeOf($a),[IntPtr]::Zero)){exit 13};if($a.ActiveProcesses -eq 0){exit 11};exit 12} finally {[void][JN]::CloseHandle($h)}',
+  ].join(';')
+  return new Promise(resolve => {
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    ], { stdio: 'ignore', windowsHide: true })
+    child.once('error', () => resolve('unverifiable'))
+    child.once('close', code => resolve(
+      code === 10 ? 'absent' : code === 11 ? 'empty' : code === 12 ? 'active' : 'unverifiable',
+    ))
+  })
 }
 
 async function terminateWindowsJobStable(

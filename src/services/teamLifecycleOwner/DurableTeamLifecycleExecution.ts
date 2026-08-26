@@ -19,7 +19,7 @@ import type {
 } from './OpenCodeTeamLifecycleLane.js'
 
 type DurableState = {
-  schemaVersion: 3
+  schemaVersion: 4
   revision: number
   planFingerprint: string
   toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
@@ -27,6 +27,7 @@ type DurableState = {
   runId: string | null
   recoverable: boolean
   ownerIncarnation: string | null
+  recoveryBindings: Record<string, string>
 }
 
 type LaneInput = TeamLifecycleLaneInput & { runId: string }
@@ -94,7 +95,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         if (state.ownerIncarnation !== this.#ownerIncarnation) {
           throw new Error('Team lifecycle run is owned by another incarnation')
         } else {
-          const observations = await this.#inspectLanes(plan, state.runId)
+          const observations = await this.#inspectLanes(plan, state.runId, state.recoveryBindings)
           if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
             state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
           }
@@ -160,6 +161,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       const launching = await this.#write({
         ...before, phase: 'launching', runId, recoverable: false,
         ownerIncarnation: this.#ownerIncarnation,
+        recoveryBindings: {},
       }, input.plan)
       this.#ownedRuns.set(runId, input.plan)
       this.#trackJob(runId, this.#completeLaunch(input.plan, runId, input.effectGuard ?? EFFECT_ALLOWED))
@@ -214,6 +216,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       }
       const idleState = await this.#write({
         ...before, phase: 'idle', runId: null, recoverable: false, ownerIncarnation: null,
+        recoveryBindings: {},
       }, input.plan)
       this.#ownedRuns.delete(before.runId)
       return snapshot(this.providerId, idleState)
@@ -265,6 +268,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
           runId: stopped ? null : current.runId,
           recoverable: !stopped,
           ownerIncarnation: stopped ? null : this.#ownerIncarnation,
+          recoveryBindings: stopped ? {} : current.recoveryBindings,
         }, plan)
         if (stopped) this.#ownedRuns.delete(current.runId)
       })
@@ -287,11 +291,22 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         return
       }
       const next = launchCompletion(observations)
-      if (next.phase === 'launching') return
+      if (next.phase === 'launching') {
+        if (observationsHaveRecoveryBindings(plan, observations)) {
+          await this.#write({
+            ...current,
+            recoveryBindings: launchRecoveryBindings(plan, observations),
+          }, plan)
+        }
+        return
+      }
       await this.#write({
         ...current,
         phase: next.phase,
         recoverable: next.recoverable,
+        recoveryBindings: next.phase === 'running'
+          ? launchRecoveryBindings(plan, observations)
+          : {},
       }, plan)
     })
   }
@@ -312,6 +327,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         runId: stopped ? null : runId,
         recoverable: !stopped,
         ownerIncarnation: stopped ? null : this.#ownerIncarnation,
+        recoveryBindings: stopped ? {} : current.recoveryBindings,
       }, plan)
       if (stopped) this.#ownedRuns.delete(runId)
     })
@@ -320,13 +336,22 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   async #reconcileLaunching(plan: TeamLifecycleLaunchPlan, state: DurableState): Promise<DurableState> {
     let observations: TeamLifecycleLaneObservation[]
     try {
-      observations = await this.#inspectLanes(plan, state.runId!)
+      observations = await this.#inspectLanes(plan, state.runId!, state.recoveryBindings)
     } catch {
       observations = [{ phase: 'failed', recoverable: true }]
     }
     const next = launchCompletion(observations)
-    if (next.phase === 'launching') return state
-    return this.#write({ ...state, phase: next.phase, recoverable: next.recoverable }, plan)
+    if (next.phase === 'launching') {
+      return observationsHaveRecoveryBindings(plan, observations)
+        ? this.#write({ ...state, recoveryBindings: launchRecoveryBindings(plan, observations) }, plan)
+        : state
+    }
+    return this.#write({
+      ...state,
+      phase: next.phase,
+      recoverable: next.recoverable,
+      recoveryBindings: next.phase === 'running' ? launchRecoveryBindings(plan, observations) : {},
+    }, plan)
   }
 
   async #adoptRecoveredRunning(
@@ -334,11 +359,19 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     state: DurableState & { runId: string },
     effectGuard?: EffectGuard,
   ): Promise<DurableState> {
+    if (!hasExactRecoveryBindings(plan, state.recoveryBindings)) {
+      await this.#failRecoveredState(
+        plan,
+        state,
+        new Error('Recovered team lifecycle run has no exact durable provider session binding'),
+        effectGuard,
+      )
+    }
     let observations: TeamLifecycleLaneObservation[]
     try {
       observations = effectGuard
-        ? await this.#inspectLanesGuarded(plan, state.runId, effectGuard)
-        : await this.#inspectLanes(plan, state.runId)
+        ? await this.#inspectLanesGuarded(plan, state.runId, state.recoveryBindings, effectGuard)
+        : await this.#inspectLanes(plan, state.runId, state.recoveryBindings)
     } catch (error) {
       await this.#failRecoveredState(plan, state, error, effectGuard)
     }
@@ -380,6 +413,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       runId: stopped ? null : state.runId,
       recoverable: !stopped,
       ownerIncarnation: stopped ? null : this.#ownerIncarnation,
+      recoveryBindings: stopped ? {} : state.recoveryBindings,
     }, plan)
     throw new Error('Unable to adopt recovered team lifecycle run', { cause })
   }
@@ -391,34 +425,46 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     this.#jobs.set(runId, job)
   }
 
-  #inspectLanes(plan: TeamLifecycleLaunchPlan, runId: string): Promise<TeamLifecycleLaneObservation[]> {
-    return Promise.all(plan.lanes.map(lane => {
-      const adapter = this.#adapter(lane.kind)
-      return adapter.inspect({
-        planTeamId: plan.teamId,
-        workspaceRoot: plan.workspaceRoot,
-        toolApprovalMode: plan.toolApprovalMode,
-        lane,
-        runId,
-      })
-    }))
-  }
-
-  #inspectLanesGuarded(
+  #inspectLanes(
     plan: TeamLifecycleLaunchPlan,
     runId: string,
-    effectGuard: EffectGuard,
+    recoveryBindings: Record<string, string> = {},
   ): Promise<TeamLifecycleLaneObservation[]> {
     return Promise.all(plan.lanes.map(async lane => {
       const adapter = this.#adapter(lane.kind)
-      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      const expectedBinding = recoveryBindings[lane.laneId]
       const observation = await adapter.inspect({
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
         lane,
         runId,
+        recoveryBinding: expectedBinding,
       })
+      assertRecoveryBinding(lane.laneId, expectedBinding, observation)
+      return observation
+    }))
+  }
+
+  #inspectLanesGuarded(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+    recoveryBindings: Record<string, string>,
+    effectGuard: EffectGuard,
+  ): Promise<TeamLifecycleLaneObservation[]> {
+    return Promise.all(plan.lanes.map(async lane => {
+      const adapter = this.#adapter(lane.kind)
+      if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      const expectedBinding = recoveryBindings[lane.laneId]
+      const observation = await adapter.inspect({
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        runId,
+        recoveryBinding: expectedBinding,
+      })
+      assertRecoveryBinding(lane.laneId, expectedBinding, observation)
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
       return observation
     }))
@@ -510,12 +556,38 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     timer.unref?.()
     try {
       const operation = adapter[action]({ ...input, signal: controller.signal })
-      return await Promise.race([
-        operation,
-        new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => {
-          reject(controller.signal.reason)
-        }, { once: true })),
-      ])
+      try {
+        return await Promise.race([
+          operation,
+          new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => {
+            reject(controller.signal.reason)
+          }, { once: true })),
+        ])
+      } catch (error) {
+        if (!controller.signal.aborted) throw error
+        // A cooperative adapter may need its provider gate to release before
+        // acknowledging cancellation. Keep the owning job live until that
+        // happens, and compensate a late successful launch synchronously. This
+        // is the fence that makes close() a true no-late-provider-effects
+        // boundary instead of a timer race.
+        let late: TeamLifecycleLaneObservation
+        try {
+          late = await operation
+        } catch {
+          throw error
+        }
+        if (action === 'launch' && late.phase !== 'idle') {
+          const stopped = await adapter.stop({
+            ...input,
+            signal: undefined,
+            effectGuard: () => this.#ownedRuns.get(input.runId) !== undefined,
+          })
+          if (stopped.phase !== 'idle') {
+            throw new Error('Timed-out team lifecycle launch compensation was not confirmed', { cause: error })
+          }
+        }
+        throw error
+      }
     } finally {
       clearTimeout(timer)
     }
@@ -587,7 +659,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   async #write(input: DurableState, plan: TeamLifecycleLaunchPlan): Promise<DurableState> {
     const state: DurableState = {
       ...input,
-      schemaVersion: 3,
+      schemaVersion: 4,
       toolApprovalMode: plan.toolApprovalMode,
       revision: input.revision + 1,
       planFingerprint: planFingerprint(plan),
@@ -631,7 +703,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
 function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     revision: 0,
     planFingerprint: planFingerprint(plan),
     toolApprovalMode: plan.toolApprovalMode,
@@ -639,13 +711,15 @@ function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
     runId: null,
     recoverable: false,
     ownerIncarnation: null,
+    recoveryBindings: {},
   }
 }
 
 function launchCompletion(
   observations: readonly TeamLifecycleLaneObservation[],
 ): TeamLifecycleLaneObservation {
-  if (observations.every(observation => observation.phase === 'running')) {
+  if (observations.every(observation => observation.phase === 'running' &&
+    validRecoveryBinding(observation.recoveryBinding))) {
     return { phase: 'running', recoverable: false }
   }
   if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
@@ -679,20 +753,68 @@ function positiveTimeout(value: number, label: string): number {
   return Math.ceil(value)
 }
 
+function launchRecoveryBindings(
+  plan: TeamLifecycleLaunchPlan,
+  observations: readonly TeamLifecycleLaneObservation[],
+): Record<string, string> {
+  if (observations.length !== plan.lanes.length) throw new Error('Lifecycle lane observation count changed')
+  return Object.fromEntries(plan.lanes.map((lane, index) => {
+    const binding = observations[index]?.recoveryBinding
+    if (!validRecoveryBinding(binding)) {
+      throw new Error(`Lifecycle lane ${lane.laneId} omitted its exact recovery binding`)
+    }
+    return [lane.laneId, binding]
+  }))
+}
+
+function observationsHaveRecoveryBindings(
+  plan: TeamLifecycleLaunchPlan,
+  observations: readonly TeamLifecycleLaneObservation[],
+): boolean {
+  return observations.length === plan.lanes.length && observations.every(
+    observation => validRecoveryBinding(observation.recoveryBinding),
+  )
+}
+
+function validRecoveryBinding(value: unknown): value is string {
+  return typeof value === 'string' && /^session-set_[0-9a-f]{64}$/.test(value)
+}
+
+function hasExactRecoveryBindings(
+  plan: TeamLifecycleLaunchPlan,
+  bindings: Record<string, string>,
+): boolean {
+  const actual = Object.keys(bindings).sort()
+  const expected = plan.lanes.map(lane => lane.laneId).sort()
+  return actual.length === expected.length && actual.every((laneId, index) => laneId === expected[index])
+}
+
+function assertRecoveryBinding(
+  laneId: string,
+  expected: string | undefined,
+  observation: TeamLifecycleLaneObservation,
+): void {
+  if (expected && observation.recoveryBinding !== expected) {
+    throw new Error(`Lifecycle lane ${laneId} provider session set changed from its durable binding`)
+  }
+}
+
 function decodeState(value: unknown): DurableState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid team lifecycle state')
   const record = value as Record<string, unknown>
-  const legacy = record.schemaVersion === 2
+  const legacyOwner = record.schemaVersion === 2
+  const legacyBindings = record.schemaVersion === 2 || record.schemaVersion === 3
   const keys = ['schemaVersion', 'revision', 'planFingerprint', 'toolApprovalMode', 'phase', 'runId', 'recoverable',
-    ...(legacy ? [] : ['ownerIncarnation'])]
+    ...(legacyOwner ? [] : ['ownerIncarnation']), ...(legacyBindings ? [] : ['recoveryBindings'])]
   if (Object.keys(record).length !== keys.length || Object.keys(record).some(key => !keys.includes(key)) ||
-    ![2, 3].includes(record.schemaVersion as number) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
+    ![2, 3, 4].includes(record.schemaVersion as number) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
     typeof record.planFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.planFingerprint) ||
     !['idle', 'launching', 'running', 'stopping', 'failed'].includes(String(record.phase)) ||
     !(record.runId === null || typeof record.runId === 'string' && /^run_[A-Za-z0-9][A-Za-z0-9._-]{0,250}$/.test(record.runId)) ||
     !['manual', 'auto'].includes(String(record.toolApprovalMode)) ||
-    typeof record.recoverable !== 'boolean' || (!legacy && !(record.ownerIncarnation === null ||
-      typeof record.ownerIncarnation === 'string' && /^owner_[0-9a-f]{32}$/.test(record.ownerIncarnation)))) {
+    typeof record.recoverable !== 'boolean' || (!legacyOwner && !(record.ownerIncarnation === null ||
+      typeof record.ownerIncarnation === 'string' && /^owner_[0-9a-f]{32}$/.test(record.ownerIncarnation))) ||
+    (!legacyBindings && !validRecoveryBindings(record.recoveryBindings))) {
     throw new Error('Invalid team lifecycle state')
   }
   if (record.phase === 'idle' ? record.runId !== null : record.runId === null) {
@@ -700,7 +822,16 @@ function decodeState(value: unknown): DurableState {
   }
   return {
     ...record,
-    schemaVersion: 3,
-    ownerIncarnation: legacy ? null : record.ownerIncarnation,
+    schemaVersion: 4,
+    ownerIncarnation: legacyOwner ? null : record.ownerIncarnation,
+    recoveryBindings: legacyBindings ? {} : record.recoveryBindings,
   } as DurableState
+}
+
+function validRecoveryBindings(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const entries = Object.entries(value as Record<string, unknown>)
+  return entries.length <= 64 && entries.every(([laneId, binding]) =>
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(laneId) &&
+    typeof binding === 'string' && /^session-set_[0-9a-f]{64}$/.test(binding))
 }

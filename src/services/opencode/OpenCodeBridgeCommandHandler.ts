@@ -780,7 +780,12 @@ function delayMs(ms: number): Promise<void> {
 // gated by committed desktop-side evidence, not by this readiness check alone.
 async function waitForLaunchSessionAppMcpReady(
   record: OpenCodeSessionRecord,
-  options: { attachIfMissing?: boolean } = {},
+  options: {
+    attachIfMissing?: boolean
+    effectGuard?: () => boolean | Promise<boolean>
+    runtimeDeadline: OpenCodeRuntimeDeadline
+    synchronizeLateCompletion: boolean
+  },
 ): Promise<Awaited<ReturnType<typeof openCodeSessionBridge.ensureSessionAppMcpReady>>> {
   const delays = [0, 250, 750, 1_500]
   const attachIfMissing = options.attachIfMissing ?? true
@@ -789,14 +794,35 @@ async function waitForLaunchSessionAppMcpReady(
     if (delay > 0) {
       await delayMs(delay)
     }
-    latest = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
-      attachIfMissing: attachIfMissing && (index === 0 || latest?.connected !== true),
-    })
+    latest = await runBoundedLaunchMutation(
+      options.runtimeDeadline,
+      () => openCodeSessionBridge.ensureSessionAppMcpReady(record, {
+        attachIfMissing: attachIfMissing && (index === 0 || latest?.connected !== true),
+      }),
+      () => cleanupFailedLaunchSession(record),
+      options.effectGuard,
+      options.synchronizeLateCompletion,
+    )
     if (latest.ok) {
       return latest
     }
   }
-  return latest ?? openCodeSessionBridge.ensureSessionAppMcpReady(record, { attachIfMissing })
+  if (latest) return latest
+  return runBoundedLaunchMutation(
+    options.runtimeDeadline,
+    () => openCodeSessionBridge.ensureSessionAppMcpReady(record, { attachIfMissing }),
+    () => cleanupFailedLaunchSession(record),
+    options.effectGuard,
+    options.synchronizeLateCompletion,
+  )
+}
+
+async function assertLifecycleEffectCurrent(
+  effectGuard?: () => boolean | Promise<boolean>,
+): Promise<void> {
+  if (effectGuard && !(await effectGuard())) {
+    throw new Error('OpenCode lifecycle plan authority changed before provider mutation')
+  }
 }
 
 function normalizeStable(value: unknown): unknown {
@@ -2744,17 +2770,26 @@ async function runBoundedLaunchMutation<T>(
   runtimeDeadline: OpenCodeRuntimeDeadline,
   operation: () => Promise<T>,
   compensate: (value: T) => Promise<unknown>,
+  effectGuard?: () => boolean | Promise<boolean>,
+  synchronizeLateCompletion = false,
 ): Promise<T> {
+  await assertLifecycleEffectCurrent(effectGuard)
   const pending = operation()
   try {
     return await runtimeDeadline.runPhase('provider_mutation', () => pending)
   } catch (error) {
     if (runtimeDeadline.signal.aborted) {
-      // The provider promise may settle after the deadline race. Chain exact
-      // compensation to that settlement, while bounding how long lifecycle
-      // close waits for it in this process.
-      const compensation = pending.then(value => compensate(value)).catch(() => undefined)
-      void withTimeout(compensation, 5_000).catch(() => undefined)
+      if (synchronizeLateCompletion) {
+        // Do not let the owner command settle while a timed-out provider promise
+        // can still publish an effect. Await its terminal result and synchronously
+        // compensate the exact value before lifecycle close may drain this job.
+        try {
+          await compensate(await pending)
+        } catch {}
+      } else {
+        const lateCompensation = pending.then(value => compensate(value)).catch(() => undefined)
+        void withTimeout(lateCompensation, 5_000).catch(() => undefined)
+      }
     }
     throw error
   }
@@ -2796,6 +2831,8 @@ async function markStaleAndReleaseSession(
 async function runLaunch(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
+  effectGuard?: () => boolean | Promise<boolean>,
+  synchronizeLateCompletion = false,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -2814,11 +2851,13 @@ async function runLaunch(
   let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
   try {
     retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
-      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
-        asString(body.projectPath) ?? envelope.cwd,
-        { toolApprovalMode, phaseContext: context },
-      )
-      return pendingProbe
+      return assertLifecycleEffectCurrent(effectGuard).then(() => {
+        pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+          asString(body.projectPath) ?? envelope.cwd,
+          { toolApprovalMode, phaseContext: context },
+        )
+        return pendingProbe
+      })
     })
   } catch (error) {
     if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
@@ -2837,6 +2876,8 @@ async function runLaunch(
       retainedProbe.snapshot,
       runtimeDeadline,
       { provisioningProbeMs },
+      effectGuard,
+      synchronizeLateCompletion,
     )
   } finally {
     await retainedProbe.release().catch(() => undefined)
@@ -2848,6 +2889,8 @@ async function runLaunchWithProvisioningSnapshot(
   snapshot: OpenCodeProvisioningSnapshot,
   runtimeDeadline: OpenCodeRuntimeDeadline,
   timings: { provisioningProbeMs?: number } = {},
+  effectGuard?: () => boolean | Promise<boolean>,
+  synchronizeLateCompletion = false,
 ) {
   const launchStartedAt = Date.now()
   const body = envelope.body
@@ -2920,7 +2963,6 @@ async function runLaunchWithProvisioningSnapshot(
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
     const memberVariant = asString(member?.effort) ?? selectedVariant ?? undefined
     const effectiveModel = memberModels.get(name) ?? apiSelectedModel
-    const reportedModel = asString(member?.model) ?? selectedModel
     let record: OpenCodeSessionRecord | null = null
     const memberTiming = memberTimings.get(name) ?? {}
     memberTimings.set(name, memberTiming)
@@ -2938,9 +2980,11 @@ async function runLaunchWithProvisioningSnapshot(
         runId,
         fresh: true,
         toolApprovalMode,
-      }), created => cleanupFailedLaunchSession(created))
+      }), created => cleanupFailedLaunchSession(created), effectGuard, synchronizeLateCompletion)
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
-      let mcpReady = await waitForLaunchSessionAppMcpReady(record)
+      let mcpReady = await waitForLaunchSessionAppMcpReady(record, {
+        effectGuard, runtimeDeadline, synchronizeLateCompletion,
+      })
       if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
         record = { ...record, runtimePid: mcpReady.runtimePid }
       }
@@ -2980,13 +3024,15 @@ async function runLaunchWithProvisioningSnapshot(
           runId,
           fresh: true,
           toolApprovalMode,
-        }), created => cleanupFailedLaunchSession(created))
+        }), created => cleanupFailedLaunchSession(created), effectGuard, synchronizeLateCompletion)
         diagnostics.push(teamDiagnostic(
           'opencode_launch_session_recreated_after_mcp_attach',
           `Recreated OpenCode session for ${name} after Agent Teams MCP attach so launch bootstrap sees the newly attached tools.`,
           'info',
         ))
-        mcpReady = await waitForLaunchSessionAppMcpReady(record, { attachIfMissing: false })
+        mcpReady = await waitForLaunchSessionAppMcpReady(record, {
+          attachIfMissing: false, effectGuard, runtimeDeadline, synchronizeLateCompletion,
+        })
         if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
           record = { ...record, runtimePid: mcpReady.runtimePid }
         }
@@ -3033,9 +3079,10 @@ async function runLaunchWithProvisioningSnapshot(
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
         contextHash,
         briefingHash,
-      }), () => cleanupFailedLaunchSession(record!))
+      }), () => cleanupFailedLaunchSession(record!), effectGuard, synchronizeLateCompletion)
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
       try {
+        await assertLifecycleEffectCurrent(effectGuard)
         record = await openCodeSessionBridge.refreshSessionEnvironment(record)
       } catch (error) {
         diagnostics.push(teamDiagnostic(
@@ -3085,7 +3132,7 @@ async function runLaunchWithProvisioningSnapshot(
       ]
       members[name] = {
         sessionId: record.opencodeSessionId,
-        effectiveModel: reportedModel,
+        effectiveModel,
         launchState: 'created',
         bootstrapEvidenceSource: 'app_managed_bootstrap',
         bootstrapMode: 'app_managed_context',
@@ -3118,7 +3165,7 @@ async function runLaunchWithProvisioningSnapshot(
         : []
       members[name] = {
         sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
-        effectiveModel: reportedModel,
+        effectiveModel,
         launchState: 'failed',
         ...(typeof record?.runtimePid === 'number' && record.runtimePid > 0
           ? { runtimePid: record.runtimePid }
@@ -3159,7 +3206,11 @@ async function runLaunchWithProvisioningSnapshot(
   }
 }
 
-async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
+async function runReconcile(
+  envelope: BridgeEnvelope,
+  lifecycleOwner: boolean,
+  effectGuard?: () => boolean | Promise<boolean>,
+) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -3169,6 +3220,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   }
   const expectedMembers = Array.isArray(body.expectedMembers) ? body.expectedMembers : []
   assertUniqueOpenCodeMemberNames(expectedMembers, 'opencode.reconcileTeam expectedMembers')
+  if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
@@ -3261,6 +3313,7 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
       }
     }
     try {
+      if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
       const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
       const bootstrapFailure = summarizeBootstrapMcpFailure(record, reconciled.summary)
       const memberDiagnostics = [
@@ -3322,7 +3375,11 @@ async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   }
 }
 
-async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
+async function runStop(
+  envelope: BridgeEnvelope,
+  lifecycleOwner: boolean,
+  effectGuard?: () => boolean | Promise<boolean>,
+) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -3340,6 +3397,7 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
     new Set(expectedMembers.map(name => name.toLowerCase())).size !== expectedMembers.length)) {
     throw new Error('opencode.stopTeam lifecycle owner requires a unique admitted member set')
   }
+  if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
@@ -3386,7 +3444,9 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
     let stopped = false
     const memberDiagnostics: string[] = []
     try {
+      if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
       stopped = await openCodeSessionBridge.abort(record)
+      if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
       await openCodeSessionBridge.releaseSession(record)
     } catch (error) {
       memberDiagnostics.push(error instanceof Error ? error.message : String(error))
@@ -3405,6 +3465,7 @@ async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   )
   for (const projectPath of cleanupProjectPaths) {
     try {
+      if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
       const cleanup = await openCodeHostManager.reconcilePersistentHosts({
         mode: 'stale',
         reason: 'stopTeam',
@@ -4510,6 +4571,7 @@ async function handleEnvelope(
   envelope: BridgeEnvelope,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
   lifecycleOwner = false,
+  effectGuard?: () => boolean | Promise<boolean>,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -4551,11 +4613,11 @@ async function handleEnvelope(
       if (!runtimeDeadline) {
         throw new Error('OpenCode launch preflight deadline was not initialized')
       }
-      return runLaunch(envelope, runtimeDeadline)
+      return runLaunch(envelope, runtimeDeadline, effectGuard, lifecycleOwner)
     case 'opencode.reconcileTeam':
-      return runReconcile(envelope, lifecycleOwner)
+      return runReconcile(envelope, lifecycleOwner, effectGuard)
     case 'opencode.stopTeam':
-      return runStop(envelope, lifecycleOwner)
+      return runStop(envelope, lifecycleOwner, effectGuard)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery':
@@ -4613,7 +4675,10 @@ const HOSTED_LIFECYCLE_OWNER_CAPABILITY = Symbol('hosted-lifecycle-owner')
  */
 export function createOwnedOpenCodeLifecycleCommandExecutor() {
   const capability = HOSTED_LIFECYCLE_OWNER_CAPABILITY
-  return async (input: unknown, options: { signal?: AbortSignal } = {}) => {
+  return async (input: unknown, options: {
+    signal?: AbortSignal
+    effectGuard?: () => boolean | Promise<boolean>
+  } = {}) => {
     if (capability !== HOSTED_LIFECYCLE_OWNER_CAPABILITY) {
       throw new Error('OpenCode lifecycle owner capability is invalid')
     }
@@ -4625,6 +4690,7 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
       envelope,
       HOSTED_LIFECYCLE_OWNER_CAPABILITY,
       options.signal,
+      options.effectGuard,
     )
   }
 }
@@ -4633,6 +4699,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
   input: unknown,
   ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
   externalSignal?: AbortSignal,
+  effectGuard?: () => boolean | Promise<boolean>,
 ) {
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
@@ -4671,8 +4738,15 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
       envelope,
       runtimeDeadline,
       ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+      effectGuard,
     )
-    const result = await raceOpenCodeAbortSignal(operation, externalSignal)
+    // The hosted owner must not return while an aborted provider operation can
+    // still settle and mutate state. Its guarded launch path synchronously
+    // accounts and compensates late completion; public callers retain the
+    // ordinary responsive abort race.
+    const result = ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY
+      ? await operation
+      : await raceOpenCodeAbortSignal(operation, externalSignal)
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
     }

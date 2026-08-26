@@ -22,25 +22,42 @@ const HOST_PATHS = [
 ].map(source => new RegExp(source, 'u'))
 
 export function containsHostPath(value: string): boolean {
-  return normalizedCandidates(value).some(candidate =>
+  const normalized = normalizedCandidates(value)
+  return normalized.exhausted || normalized.candidates.some(candidate =>
     HOST_PATHS.some(pattern => pattern.test(withoutWebUrls(candidate))),
   )
 }
 
-function normalizedCandidates(value: string): string[] {
+const MAX_NORMALIZED_CANDIDATES = 256
+const MAX_NORMALIZATION_WORK = 2 * 1024 * 1024
+const MAX_NORMALIZED_LENGTH = 256 * 1024
+const ENCODED_RUN = /(?:%[0-9A-Fa-f]{2})+/gu
+
+function normalizedCandidates(value: string): { candidates: string[]; exhausted: boolean } {
   const candidates = new Set<string>()
   let current = normalizePathText(value)
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    candidates.add(current)
-    try {
-      const decoded = decodeURIComponent(current)
-      if (decoded === current) break
-      current = normalizePathText(decoded)
-    } catch {
-      break
+  let work = 0
+  for (let attempt = 0; attempt < MAX_NORMALIZED_CANDIDATES; attempt += 1) {
+    work += current.length
+    if (current.length > MAX_NORMALIZED_LENGTH || work > MAX_NORMALIZATION_WORK) {
+      return { candidates: [...candidates], exhausted: true }
     }
+    candidates.add(current)
+    // Decode valid runs independently. A malformed escape elsewhere must not
+    // suppress a later encoded traversal, while each replacement remains a
+    // strict contraction. Repeating to stability covers arbitrary encoding
+    // depth; explicit work/candidate caps fail closed instead of becoming a
+    // CPU or allocation oracle.
+    let decoded: string
+    try {
+      decoded = current.replace(ENCODED_RUN, run => decodeURIComponent(run))
+    } catch {
+      return { candidates: [...candidates], exhausted: true }
+    }
+    if (decoded === current) return { candidates: [...candidates], exhausted: false }
+    current = normalizePathText(decoded)
   }
-  return [...candidates]
+  return { candidates: [...candidates], exhausted: true }
 }
 
 function normalizePathText(value: string): string {

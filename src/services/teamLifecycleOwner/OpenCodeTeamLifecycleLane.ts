@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
 import type { TeamLifecycleLaunchLane } from './TeamLifecycleLaunchPlan.js'
@@ -8,6 +8,8 @@ export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
 export type TeamLifecycleLaneObservation = {
   phase: TeamLifecycleLanePhase
   recoverable: boolean
+  /** Digest of the exact provider session set, persisted before recovery adoption. */
+  recoveryBinding?: string
 }
 
 export interface TeamLifecycleLaneEffectPort {
@@ -28,6 +30,7 @@ export type TeamLifecycleLaneInput = {
   /** Checked inside the lane queue immediately before a provider mutation. */
   effectGuard?: () => boolean | Promise<boolean>
   signal?: AbortSignal
+  recoveryBinding?: string
 }
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
@@ -66,8 +69,8 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
           model: member.model ?? input.lane.selectedModel,
           variant: member.effort ?? input.lane.effort ?? null,
         })),
-      })
-      return launchObservation(data)
+      }, input.signal, input.effectGuard)
+      return launchObservation(data, input.lane.members.map(member => member.name), input.recoveryBinding)
     })
   }
 
@@ -91,8 +94,8 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
           ...(member.model ? { model: member.model } : {}),
           ...(member.effort ? { effort: member.effort } : {}),
         })),
-      }, input.signal)
-      return launchObservation(data)
+      }, input.signal, input.effectGuard)
+      return launchObservation(data, input.lane.members.map(member => member.name))
     })
   }
 
@@ -125,7 +128,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         model: member.model ?? input.lane.selectedModel,
         variant: member.effort ?? input.lane.effort ?? null,
       })),
-    }, input.signal)
+    }, input.signal, input.effectGuard)
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     return idle()
   }
@@ -135,6 +138,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     cwd: string,
     body: Record<string, unknown>,
     signal?: AbortSignal,
+    effectGuard?: () => boolean | Promise<boolean>,
   ): Promise<Record<string, unknown>> {
     if (!this.hasLiveCapability()) throw new Error('OpenCode lifecycle owner capability is unavailable')
     const response: unknown = await this.executeBridge({
@@ -145,7 +149,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       startedAt: new Date().toISOString(),
       timeoutMs: this.timeoutMs,
       body,
-    }, { signal })
+    }, { signal, effectGuard })
     const record = asRecord(response)
     if (record.ok !== true) {
       const error = asRecord(record.error)
@@ -180,14 +184,52 @@ async function assertEffectGuard(input: TeamLifecycleLaneInput): Promise<void> {
   }
 }
 
-function launchObservation(data: Record<string, unknown>): TeamLifecycleLaneObservation {
+function launchObservation(
+  data: Record<string, unknown>,
+  expectedMemberNames: readonly string[],
+  expectedRecoveryBinding?: string,
+): TeamLifecycleLaneObservation {
   switch (data.teamLaunchState) {
-    case 'ready': return { phase: 'running', recoverable: false }
+    case 'ready': {
+      const recoveryBinding = exactSessionSetBinding(data, expectedMemberNames)
+      if (expectedRecoveryBinding && recoveryBinding !== expectedRecoveryBinding) {
+        throw new Error('OpenCode lifecycle session set does not match the durable launch binding')
+      }
+      return { phase: 'running', recoverable: false, recoveryBinding }
+    }
     case 'launching':
-    case 'permission_blocked': return { phase: 'launching', recoverable: false }
+    case 'permission_blocked': {
+      const recoveryBinding = exactSessionSetBinding(data, expectedMemberNames)
+      if (expectedRecoveryBinding && recoveryBinding !== expectedRecoveryBinding) {
+        throw new Error('OpenCode lifecycle session set does not match the durable launch binding')
+      }
+      return { phase: 'launching', recoverable: false, recoveryBinding }
+    }
     case 'failed': return { phase: 'failed', recoverable: true }
     default: throw new Error('OpenCode bridge returned an invalid team launch state')
   }
+}
+
+function exactSessionSetBinding(
+  data: Record<string, unknown>,
+  expectedMemberNames: readonly string[],
+): string {
+  const members = asRecord(data.members)
+  const tuples = Object.entries(members).map(([memberName, raw]) => {
+    const sessionId = asRecord(raw).sessionId
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throw new Error('OpenCode lifecycle response omitted an exact member session id')
+    }
+    return { memberName, opencodeSessionId: sessionId }
+  }).sort((left, right) => left.memberName.localeCompare(right.memberName))
+  const expected = [...expectedMemberNames].sort((left, right) => left.localeCompare(right))
+  if (tuples.length !== expected.length || tuples.some((tuple, index) => tuple.memberName !== expected[index])) {
+    throw new Error('OpenCode lifecycle response changed the exact admitted member set')
+  }
+  if (tuples.length === 0 || new Set(tuples.map(tuple => tuple.opencodeSessionId)).size !== tuples.length) {
+    throw new Error('OpenCode lifecycle response contains a missing or duplicate session id')
+  }
+  return `session-set_${createHash('sha256').update(JSON.stringify(tuples)).digest('hex')}`
 }
 
 function idle(): TeamLifecycleLaneObservation {

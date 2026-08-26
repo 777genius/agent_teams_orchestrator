@@ -418,6 +418,9 @@ describe('HostedApprovalWireDispatcher', () => {
       ingressRecord('😀'.repeat(16_385), 'summary'),
       ingressRecord('safe', 'open /Users/alice/private.txt'),
       ingressRecord('safe', 'open %252e%252e%255cprivate%255ckey.txt'),
+      ingressRecord('safe', 'prefix% %2e%2e%2fprivate%2fkey'),
+      ingressRecord('safe', 'open %25252e%25252e%25252fprivate%25252fkey'),
+      ingressRecord('safe', 'open %255c%255c%253f%255cC%253a%255cprivate%255ckey'),
       ingressRecord('safe', 'inspect cwd:workspace/private/key.txt'),
       ingressRecord('safe', 'line one\nline two'),
     ]) {
