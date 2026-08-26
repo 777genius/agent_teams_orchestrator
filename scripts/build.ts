@@ -37,6 +37,7 @@ const hostedActualOwnerRequiredInputs = [
   'tsconfig.json',
   'scripts/build.ts',
   'src/entrypoints/hostedActualOwnerAcceptance.ts',
+  'src/entrypoints/hostedActualOwnerGeneratedIdentity.ts',
   'scripts/e2e/hosted-actual-owner/contracts.ts',
   'scripts/e2e/hosted-actual-owner/evidence.ts',
   'scripts/e2e/hosted-actual-owner/owner.ts',
@@ -45,6 +46,8 @@ const hostedActualOwnerRequiredInputs = [
 ] as const
 const hostedActualOwnerWrapperRelativePath = 'bin/hosted-actual-owner-acceptance'
 const hostedActualOwnerLauncherBasename = 'hostedActualOwnerLauncher'
+const hostedActualOwnerGeneratedIdentityPath =
+  'src/entrypoints/hostedActualOwnerGeneratedIdentity.ts'
 const hostedActualOwnerLaunchPurpose =
   'agent-teams.hosted-actual-owner-acceptance.launch-descriptor/v1'
 const hostedActualOwnerBuildRecipePurpose =
@@ -771,6 +774,10 @@ function sourceInputIdentity(path: string, root = repositoryRoot): SourceInputId
 function readHostedActualOwnerSourceInputs(
   metafilePath: string,
   root = repositoryRoot,
+  generatedIdentity?: Readonly<{
+    committed: SourceInputIdentity
+    exact: SourceInputIdentity
+  }>,
 ): readonly SourceInputIdentity[] {
   const decoded: unknown = JSON.parse(
     readStableBytes(metafilePath, 'build metafile').bytes.toString('utf8'),
@@ -782,9 +789,24 @@ function readHostedActualOwnerSourceInputs(
   if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) {
     throw new Error('Hosted actual-owner build metafile inputs are invalid')
   }
+  const metafilePaths = new Set(
+    Object.keys(inputs).map(inputPath => repositoryRelativePath(inputPath, root)),
+  )
+  if (!metafilePaths.has(hostedActualOwnerGeneratedIdentityPath)) {
+    throw new Error('Hosted actual-owner build omitted its generated identity input')
+  }
   const paths = new Set<string>(hostedActualOwnerRequiredInputs)
-  for (const inputPath of Object.keys(inputs)) paths.add(repositoryRelativePath(inputPath, root))
-  const sourceInputs = [...paths].sort().map(path => sourceInputIdentity(path, root))
+  for (const inputPath of metafilePaths) paths.add(inputPath)
+  const sourceInputs = [...paths].sort().map(path => {
+    if (generatedIdentity && path === hostedActualOwnerGeneratedIdentityPath) {
+      const actual = sourceInputIdentity(path, root)
+      if (JSON.stringify(actual) !== JSON.stringify(generatedIdentity.exact)) {
+        throw new Error('Hosted actual-owner generated identity changed during build')
+      }
+      return generatedIdentity.committed
+    }
+    return sourceInputIdentity(path, root)
+  })
   for (const required of hostedActualOwnerRequiredInputs) {
     if (!sourceInputs.some(input => input.path === required)) {
       throw new Error(`Hosted actual-owner closure omitted required source: ${required}`)
@@ -796,9 +818,12 @@ function readHostedActualOwnerSourceInputs(
 function assertSourceInputsUnchanged(
   expected: readonly SourceInputIdentity[],
   root = repositoryRoot,
+  except: readonly string[] = [],
 ): void {
-  const current = expected.map(input => sourceInputIdentity(input.path, root))
-  if (JSON.stringify(current) !== JSON.stringify(expected)) {
+  const excluded = new Set(except)
+  const checkedExpected = expected.filter(input => !excluded.has(input.path))
+  const current = checkedExpected.map(input => sourceInputIdentity(input.path, root))
+  if (JSON.stringify(current) !== JSON.stringify(checkedExpected)) {
     throw new Error('Hosted actual-owner source inputs changed during build')
   }
 }
@@ -1229,9 +1254,6 @@ function hostedActualOwnerBuildRecipe(
     defines: {
       common: commonDefines,
       owner: [
-        ['process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256',
-          '<derived-build-closure-sha256>'],
-        ['process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR', '<signed-build-descriptor>'],
         ['process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE', JSON.stringify('owner')],
       ],
     },
@@ -1247,6 +1269,12 @@ function hostedActualOwnerBuildRecipe(
       packages: 'bundle',
       conditions: ['bun'],
       ownerEntrypoint: 'src/entrypoints/hostedActualOwnerAcceptance.ts',
+      ownerGeneratedIdentity: {
+        path: hostedActualOwnerGeneratedIdentityPath,
+        format: 'deterministic-typescript-module',
+        embeddedFields: ['buildClosureSha256', 'descriptorJson'],
+        runtimeSidecar: false,
+      },
       ownerCompile: true,
       ownerAutoloadDotenv: false,
       ownerAutoloadBunfig: false,
@@ -1282,6 +1310,18 @@ function hostedActualOwnerBuildClosureSha256(
     buildRecipe,
     sourceAuthority: authority,
   })).digest('hex')
+}
+
+function hostedActualOwnerGeneratedIdentitySource(
+  buildClosureSha256: string,
+  descriptorJson: string,
+): string {
+  if (!/^[0-9a-f]{64}$/.test(buildClosureSha256)) {
+    throw new Error('Hosted actual-owner generated build closure is invalid')
+  }
+  return `// Deterministic authenticated build input; bundled into the standalone owner.\n` +
+    `export const HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256 = ${JSON.stringify(buildClosureSha256)}\n` +
+    `export const HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR = ${JSON.stringify(descriptorJson)}\n`
 }
 
 function extendBuildArgs(cmd: string[], includeExternals = true): string[] {
@@ -1739,10 +1779,6 @@ if (compile) {
         'bun',
         '--define',
         `process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE=${JSON.stringify('owner')}`,
-        '--define',
-        `process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256=${JSON.stringify('0'.repeat(64))}`,
-        '--define',
-        `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify('{}')}`,
       ], false)
 
       runBuildWithFreshMetafile(ownerBuild, committedBuildRoot, hostedActualOwnerMetafile)
@@ -1801,18 +1837,50 @@ if (compile) {
         sourceInputs,
       })
       const descriptorJson = JSON.stringify(launchDescriptor)
-      const finalOwnerBuild = ownerBuild.map(argument =>
-        argument === `process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256=${JSON.stringify('0'.repeat(64))}`
-          ? `process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256=${JSON.stringify(buildClosureSha256)}`
-          : argument === `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify('{}')}`
-            ? `process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify(descriptorJson)}`
-            : argument)
+      const committedGeneratedIdentity = sourceInputs.find(
+        input => input.path === hostedActualOwnerGeneratedIdentityPath,
+      )
+      if (!committedGeneratedIdentity) {
+        throw new Error('Hosted actual-owner committed generated identity sentinel is missing')
+      }
+      const generatedIdentityAbsolutePath = resolve(
+        committedBuildRoot, hostedActualOwnerGeneratedIdentityPath,
+      )
+      const generatedIdentityBytes = Buffer.from(hostedActualOwnerGeneratedIdentitySource(
+        buildClosureSha256, descriptorJson,
+      ))
+      writeFileSync(generatedIdentityAbsolutePath, generatedIdentityBytes, { mode: 0o600 })
+      const generatedIdentity = sourceInputIdentity(
+        hostedActualOwnerGeneratedIdentityPath, committedBuildRoot,
+      )
+      if (process.env.HOSTED_ACTUAL_OWNER_BUILD_TEST_HOOK === '1' &&
+        process.env.HOSTED_ACTUAL_OWNER_GENERATED_IDENTITY_TEST_FAULT ===
+          'replace-before-final-build') {
+        writeFileSync(generatedIdentityAbsolutePath, `${generatedIdentityBytes}tampered\n`, {
+          mode: 0o600,
+        })
+      }
+      assertSourceInputsUnchanged(
+        sourceInputs, committedBuildRoot, [hostedActualOwnerGeneratedIdentityPath],
+      )
+      if (JSON.stringify(sourceInputIdentity(
+        hostedActualOwnerGeneratedIdentityPath, committedBuildRoot,
+      )) !== JSON.stringify(generatedIdentity)) {
+        throw new Error('Hosted actual-owner generated identity changed before final build')
+      }
+      // The sentinel build exists only to discover the committed source closure.
+      // Removing it makes final-build success, rather than overwrite behavior, the
+      // only way a publishable owner artifact can remain in staging.
+      unlinkIfPresent(hostedActualOwnerLauncherStaging)
       runBuildWithFreshMetafile(
-        finalOwnerBuild, committedBuildRoot, hostedActualOwnerMetafile,
+        ownerBuild, committedBuildRoot, hostedActualOwnerMetafile,
       )
       chmodSync(hostedActualOwnerLauncherStaging, 0o555)
       const finalSourceInputs = readHostedActualOwnerSourceInputs(
-        hostedActualOwnerMetafile, committedBuildRoot,
+        hostedActualOwnerMetafile, committedBuildRoot, {
+          committed: committedGeneratedIdentity,
+          exact: generatedIdentity,
+        },
       )
       if (JSON.stringify(finalSourceInputs) !== JSON.stringify(sourceInputs)) {
         throw new Error('Hosted actual-owner committed source closure changed during build')
@@ -1838,7 +1906,9 @@ if (compile) {
       unlinkIfPresent(hostedActualOwnerNativeSource)
       unlinkIfPresent(hostedActualOwnerNativeDependencies)
       unlinkIfPresent(hostedActualOwnerNativeLinkMap)
-      assertSourceInputsUnchanged(sourceInputs, committedBuildRoot)
+      assertSourceInputsUnchanged(
+        sourceInputs, committedBuildRoot, [hostedActualOwnerGeneratedIdentityPath],
+      )
       const finalBunIdentity = fixedArtifactIdentity(
         trustedBunSnapshot, 'Bun executable snapshot after build',
       )

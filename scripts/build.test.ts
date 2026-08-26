@@ -180,6 +180,54 @@ describe('release build feature plan', () => {
     expect(source).not.toContain('--compile-autoload-bunfig=false')
   })
 
+  test('carries the large owner identity through a deterministic build input, not argv', async () => {
+    const [source, ownerSource] = await Promise.all([
+      readFile(buildScript, 'utf8'),
+      readFile(join(repoRoot, 'src', 'entrypoints', 'hostedActualOwnerAcceptance.ts'), 'utf8'),
+    ])
+    expect(source).toContain('hostedActualOwnerGeneratedIdentitySource(')
+    expect(source).toContain("format: 'deterministic-typescript-module'")
+    expect(source).not.toContain(
+      '`process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR=${JSON.stringify(descriptorJson)}`',
+    )
+    expect(source).not.toContain(
+      '`process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256=${JSON.stringify(buildClosureSha256)}`',
+    )
+    expect(source).toContain('unlinkIfPresent(hostedActualOwnerLauncherStaging)')
+    expect(ownerSource).toContain("from './hostedActualOwnerGeneratedIdentity'")
+    expect(ownerSource).not.toContain(
+      'process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR',
+    )
+  })
+
+  test('Bun embeds a generated identity larger than Linux MAX_ARG_STRLEN', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-owner-large-generated-input-'))
+    fixtureRoots.push(root)
+    const generated = join(root, 'hostedActualOwnerGeneratedIdentity.ts')
+    const entrypoint = join(root, 'owner.ts')
+    const owner = join(root, 'owner')
+    const descriptor = 'd'.repeat(512 * 1024)
+    await writeFile(generated,
+      `export const HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR = ${JSON.stringify(descriptor)}\n`)
+    await writeFile(entrypoint, `
+import { HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR } from './hostedActualOwnerGeneratedIdentity'
+if (HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR.length !== ${descriptor.length}) process.exit(91)
+process.stdout.write(String(HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR.length))
+`)
+    const argv = [
+      'build', entrypoint, '--compile', '--target=bun', `--outfile=${owner}`,
+      '--no-compile-autoload-dotenv', '--no-compile-autoload-bunfig',
+    ]
+    expect(Math.max(...argv.map(argument => Buffer.byteLength(argument)))).toBeLessThan(4096)
+    const build = spawnSync(process.execPath, argv, { cwd: root, encoding: 'utf8' })
+    expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0)
+    await rm(generated)
+    await rm(entrypoint)
+    const run = spawnSync(owner, [], { cwd: root, encoding: 'utf8' })
+    expect(run.status, run.stderr).toBe(0)
+    expect(run.stdout).toBe(String(descriptor.length))
+  }, 30_000)
+
   test('closes an adversarial inherited descriptor before the owner exec boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-fd-boundary-'))
     fixtureRoots.push(root)
@@ -1301,6 +1349,7 @@ describe('packaged hosted actual-owner build', () => {
       'scripts/e2e/hosted-actual-owner/process-anchor.ts',
       'scripts/e2e/hosted-actual-owner/secure-files.ts',
       'src/entrypoints/hostedActualOwnerAcceptance.ts',
+      'src/entrypoints/hostedActualOwnerGeneratedIdentity.ts',
     ]
     for (const path of ownedProductionPaths) {
       await cp(join(repoRoot, path), join(root, path))
@@ -1367,6 +1416,39 @@ describe('packaged hosted actual-owner build', () => {
     expect(distEntries.some(entry => entry.includes('.staging-'))).toBe(false)
     expect(binEntries.some(entry => entry.includes('.staging-'))).toBe(false)
   })
+
+  test('fails closed on generated identity tampering and removes every temporary input', async () => {
+    const root = await cleanPackagedBuildFixture()
+    const committedSentinel = await readFile(join(
+      root, 'src', 'entrypoints', 'hostedActualOwnerGeneratedIdentity.ts',
+    ))
+    const build = spawnSync(process.execPath, ['run', './scripts/build.ts'], {
+      cwd: root,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      env: {
+        ...process.env,
+        HOSTED_ACTUAL_OWNER_BUILD_TEST_HOOK: '1',
+        HOSTED_ACTUAL_OWNER_GENERATED_IDENTITY_TEST_FAULT: 'replace-before-final-build',
+      },
+    })
+    expect(build.status).not.toBe(0)
+    expect(build.stderr).toContain(
+      'Hosted actual-owner generated identity changed before final build',
+    )
+    expect(await readFile(join(
+      root, 'src', 'entrypoints', 'hostedActualOwnerGeneratedIdentity.ts',
+    ))).toEqual(committedSentinel)
+    const distEntries = existsSync(join(root, 'dist'))
+      ? await readdir(join(root, 'dist'))
+      : []
+    const binEntries = existsSync(join(root, 'bin'))
+      ? await readdir(join(root, 'bin'))
+      : []
+    expect(distEntries.some(entry => entry.includes('.staging-'))).toBe(false)
+    expect(binEntries.some(entry => entry.includes('.staging-'))).toBe(false)
+    expect(existsSync(join(root, 'bin', 'hosted-actual-owner-acceptance'))).toBe(false)
+  }, 240_000)
 
   test('builds and runs the real sealed owner with no sidecar or generic loader', async () => {
     const buildRoot = await cleanPackagedBuildFixture()

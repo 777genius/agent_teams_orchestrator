@@ -12,10 +12,14 @@ import {
 } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import { isAbsolute, posix, resolve } from 'node:path'
+import {
+  HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256,
+  HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR,
+} from './hostedActualOwnerGeneratedIdentity'
 
 const ENTRY_MODE = process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE
-const COMPILED_BUILD_CLOSURE_SHA256 = process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256
-const COMPILED_BUILD_DESCRIPTOR = process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR
+const COMPILED_BUILD_CLOSURE_SHA256 = HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256
+const COMPILED_BUILD_DESCRIPTOR = HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR
 const LAUNCH_DESCRIPTOR_PURPOSE =
   'agent-teams.hosted-actual-owner-acceptance.launch-descriptor/v1'
 const BUILD_RECIPE_PURPOSE =
@@ -232,6 +236,7 @@ function buildRecipe(value: unknown): BuildRecipeIdentity {
   )
   const bundler = exactObject(Reflect.get(recipe, 'bundler'), [
     'minify', 'packages', 'conditions', 'ownerEntrypoint', 'ownerExternal',
+    'ownerGeneratedIdentity',
     'ownerCompile', 'ownerAutoloadDotenv', 'ownerAutoloadBunfig', 'ownerExecArgv',
     'sealedOwnerArgv', 'ownerRelativePath', 'nativeWrapperCompiler',
     'nativeWrapperCompilerArgs', 'nativeWrapperStatic', 'nativeWrapperBuildInputsSha256',
@@ -246,6 +251,11 @@ function buildRecipe(value: unknown): BuildRecipeIdentity {
       : []),
   ].sort()
   const ownerDefines = defineEntries(Reflect.get(defines, 'owner'))
+  const ownerGeneratedIdentity = exactObject(
+    Reflect.get(bundler, 'ownerGeneratedIdentity'),
+    ['path', 'format', 'embeddedFields', 'runtimeSidecar'],
+    'build_recipe',
+  )
   if (!Array.isArray(invocation) || invocation.length < 3 ||
     invocation.some(part => typeof part !== 'string') ||
     invocation[0] !== 'bun' || invocation[1] !== 'run' || invocation[2] !== 'scripts/build.ts' ||
@@ -263,6 +273,13 @@ function buildRecipe(value: unknown): BuildRecipeIdentity {
     JSON.stringify(Reflect.get(bundler, 'conditions')) !== JSON.stringify(['bun']) ||
     Reflect.get(bundler, 'ownerEntrypoint') !==
       'src/entrypoints/hostedActualOwnerAcceptance.ts' ||
+    Reflect.get(ownerGeneratedIdentity, 'path') !==
+      'src/entrypoints/hostedActualOwnerGeneratedIdentity.ts' ||
+    Reflect.get(ownerGeneratedIdentity, 'format') !==
+      'deterministic-typescript-module' ||
+    JSON.stringify(Reflect.get(ownerGeneratedIdentity, 'embeddedFields')) !==
+      JSON.stringify(['buildClosureSha256', 'descriptorJson']) ||
+    Reflect.get(ownerGeneratedIdentity, 'runtimeSidecar') !== false ||
     JSON.stringify(Reflect.get(bundler, 'ownerExternal')) !== JSON.stringify([]) ||
     Reflect.get(bundler, 'ownerCompile') !== true ||
     Reflect.get(bundler, 'ownerAutoloadDotenv') !== false ||
@@ -287,9 +304,6 @@ function buildRecipe(value: unknown): BuildRecipeIdentity {
     JSON.stringify(commonDefines.map(([key]) => key)) !==
       JSON.stringify(expectedCommonDefineKeys) ||
     JSON.stringify(ownerDefines) !== JSON.stringify([
-      ['process.env.HOSTED_ACTUAL_OWNER_BUILD_CLOSURE_SHA256',
-        '<derived-build-closure-sha256>'],
-      ['process.env.HOSTED_ACTUAL_OWNER_BUILD_DESCRIPTOR', '<signed-build-descriptor>'],
       ['process.env.HOSTED_ACTUAL_OWNER_ENTRY_MODE', JSON.stringify('owner')],
     ]) ||
     JSON.stringify(environment) !== JSON.stringify([
