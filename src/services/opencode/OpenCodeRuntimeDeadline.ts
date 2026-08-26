@@ -4,6 +4,7 @@ export const OPEN_CODE_READINESS_PHASES = [
   'execution_submit',
   'execution_poll',
   'post_probe_refresh',
+  'provider_mutation',
 ] as const
 
 export type OpenCodeReadinessPhase = typeof OPEN_CODE_READINESS_PHASES[number]
@@ -199,6 +200,10 @@ export class OpenCodeRuntimeDeadline {
     }
     this.disposed = true
     this.clearTimer(this.timer)
+  }
+
+  abort(reason: unknown = new Error('OpenCode operation aborted')): void {
+    if (!this.controller.signal.aborted) this.controller.abort(reason)
   }
 
   private abortForDeadline(): void {

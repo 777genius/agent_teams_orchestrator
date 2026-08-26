@@ -225,6 +225,31 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'running' })
   })
 
+  test('bounds a hung provider launch so lifecycle close cannot wait indefinitely', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-close-deadline-'))
+    roots.push(root)
+    class HungLane extends FakeLane {
+      override async launch(): Promise<TeamLifecycleLaneObservation> {
+        this.actions.push('launch')
+        return new Promise(() => {})
+      }
+    }
+    const lane = new HungLane()
+    const execution = new DurableTeamLifecycleExecution(
+      join(root, 'state.json'), [lane], 'team-lifecycle-owner',
+      { effectTimeoutMs: 25, compensationTimeoutMs: 25 },
+    )
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan, commandId: 'command-hung-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const startedAt = Date.now()
+    await execution.close()
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'failed', recoverable: true })
+  })
+
   test('shutdown compensates the exact running run and cannot settle before stop confirms', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-running-close-'))
     roots.push(root)
@@ -630,6 +655,44 @@ describe('OpenCodeTeamLifecycleLane', () => {
       { phase: 'idle', recoverable: false },
     ])
     expect(calls).toEqual(['opencode.launchTeam', 'opencode.stopTeam'])
+  })
+
+  test('revalidates a queued request inside the lane before provider mutation', async () => {
+    let releaseFirst!: () => void
+    let markFirstStarted!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
+    const calls: string[] = []
+    const execute = (async (input: unknown) => {
+      calls.push(String((input as Record<string, unknown>).requestId))
+      if (calls.length === 1) {
+        markFirstStarted()
+        await firstGate
+      }
+      return { ok: true, data: { teamLaunchState: 'ready' } }
+    }) as never
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
+    let current = true
+    const first = lane.launch({
+      planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_first',
+    })
+    await firstStarted
+    const queued = lane.launch({
+      planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_queued',
+      effectGuard: () => current,
+    })
+    const queuedOutcome = queued.then(
+      () => null,
+      error => error,
+    )
+    current = false
+    releaseFirst()
+    await expect(first).resolves.toEqual({ phase: 'running', recoverable: false })
+    expect(await queuedOutcome).toBeInstanceOf(Error)
+    expect((await queuedOutcome as Error).message).toContain('authority changed before provider effect')
+    expect(calls).toHaveLength(1)
   })
 
   test('maps an admitted auto plan to explicit automatic wire semantics', async () => {

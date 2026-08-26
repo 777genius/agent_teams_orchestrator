@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 
 import type { TeamFile } from './teamHelpers.js'
-import { __setTeamFileLockExchangeTestHook, __setTeamFileLockPlatformForTests, __setWindowsTeamLockBeforeMutexApiAwaitTestHook, __setWindowsTeamLockMutexApiForTests, armTeamMemberSpawnClaim, claimTeamMemberForSpawn, getTeamDir, readTeamFileAsync, recordArmedTeamMemberSpawnRuntime, upsertTeamMember, withTeamFileLock, writeTeamFileAsync } from './teamHelpers.js'
+import { __setTeamFileLockExchangeTestHook, __setTeamFileLockPlatformForTests, __setWindowsTeamLockBeforeMutexApiAwaitTestHook, __setWindowsTeamLockMutexApiForTests, armTeamMemberSpawnClaim, claimTeamMemberForSpawn, finalizeTeamMemberSpawnClaim, getTeamDir, readTeamFileAsync, recordArmedTeamMemberSpawnRuntime, removeTeammateFromTeamFileIfIdentityMatches, upsertTeamMember, withTeamFileLock, writeTeamFileAsync } from './teamHelpers.js'
 import { mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -114,6 +114,47 @@ describe('teamHelpers bootstrapExpectedAfter', () => {
         tmuxPaneId: '%42', backendType: 'tmux', spawnClaimToken: 'claim-a',
         spawnClaimRuntimeMayExist: true,
       })
+    } finally {
+      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfig
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retires only the exact pre-finalized or finalized process spawn claim and permits respawn', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'team-helpers-process-exit-claim-'))
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = root
+    const processIdentity = {
+      agentId: 'alice@atlas-hq', paneId: 'process:4242', processStartedAtMs: 10,
+      processOsIdentity: 'unix-pgid:4242:start-a', processOwnerToken: 'owner-a', processRunId: 'process-run-a',
+    }
+    const reservation = {
+      ...processIdentity, name: 'alice', joinedAt: 1, tmuxPaneId: processIdentity.paneId,
+      cwd: '/tmp/project', subscriptions: [], backendType: 'process' as const,
+      spawnClaimToken: 'claim-a', spawnClaimRunId: 'claim-run-a',
+    }
+    try {
+      await mkdir(getTeamDir('atlas-hq'), { recursive: true })
+      await writeTeamFileAsync('atlas-hq', { ...createTeamFile(), members: [reservation] })
+      expect(await removeTeammateFromTeamFileIfIdentityMatches('atlas-hq', {
+        ...processIdentity, spawnClaimToken: 'claim-a', spawnClaimRunId: 'stale-run',
+      })).toBe(false)
+      expect(await removeTeammateFromTeamFileIfIdentityMatches('atlas-hq', {
+        ...processIdentity, spawnClaimToken: 'claim-a', spawnClaimRunId: 'claim-run-a',
+      })).toBe(true)
+
+      await writeTeamFileAsync('atlas-hq', { ...createTeamFile(), members: [reservation] })
+      expect(await finalizeTeamMemberSpawnClaim('atlas-hq', reservation.agentId, 'claim-a', 'claim-run-a')).toBe(true)
+      expect(await removeTeammateFromTeamFileIfIdentityMatches('atlas-hq', {
+        ...processIdentity, spawnClaimToken: undefined, spawnClaimRunId: 'claim-run-a',
+      })).toBe(true)
+      expect(await claimTeamMemberForSpawn('atlas-hq', {
+        ...reservation, tmuxPaneId: 'spawn:pending:claim-b', spawnClaimToken: 'claim-b', spawnClaimRunId: 'claim-run-b',
+      })).toBe(true)
+      expect(await removeTeammateFromTeamFileIfIdentityMatches('atlas-hq', {
+        ...processIdentity, spawnClaimToken: undefined, spawnClaimRunId: 'claim-run-a',
+      })).toBe(false)
     } finally {
       if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
       else process.env.CLAUDE_CONFIG_DIR = previousConfig

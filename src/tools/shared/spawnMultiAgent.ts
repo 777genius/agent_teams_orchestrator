@@ -47,6 +47,7 @@ import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import {
   buildExactProcessTreeSpawn,
   captureProcessTreeIdentity,
+  confirmNaturalProcessTreeExit,
   isProcessAlive,
   readProcessStartTimeMs,
 } from '../../utils/processKill.js'
@@ -2854,6 +2855,22 @@ async function handleSpawnNativeProcess(
   let processPaneId: string | undefined
   let processStartedAtMs: number | null = null
   let processOsIdentity: string | null = null
+  let settleNaturalExitIdentity!: () => void
+  let naturalExitIdentitySettled = false
+  const naturalExitIdentityReady = new Promise<void>(resolve => { settleNaturalExitIdentity = resolve })
+  const markNaturalExitIdentityReady = () => {
+    if (naturalExitIdentitySettled) return
+    naturalExitIdentitySettled = true
+    settleNaturalExitIdentity()
+  }
+  let settleNaturalExitState!: () => void
+  let naturalExitStateSettled = false
+  const naturalExitStateReady = new Promise<void>(resolve => { settleNaturalExitState = resolve })
+  const markNaturalExitStateReady = () => {
+    if (naturalExitStateSettled) return
+    naturalExitStateSettled = true
+    settleNaturalExitState()
+  }
   const cleanupState = { attempted: false, confirmed: false }
   let stdoutLog: WriteStream | undefined
   let stderrLog: WriteStream | undefined
@@ -2881,6 +2898,13 @@ async function handleSpawnNativeProcess(
       isBootstrapInstructionText: isBootstrapMailboxInstructionText,
     },
   )
+
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process reservation.`)
+  }
 
   let reservationOwned = false
   const reservationResult = await updateTeamFileAsync(teamName, teamFile => {
@@ -2987,6 +3011,8 @@ async function handleSpawnNativeProcess(
           spawnedAt: Date.now(),
           processOwnerToken,
           processRunId,
+          spawnClaimToken: input.spawnClaimToken,
+          spawnClaimRunId: bootstrapRunId,
         },
       },
     },
@@ -3026,6 +3052,68 @@ async function handleSpawnNativeProcess(
     })
   }
 
+  const handleNaturalProcessClose = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
+    void writeParentOwnedTeammateRuntimeEvent({
+      type: 'exited', eventsPath: runtimePaths.eventsPath, pid: runtimePid,
+      teamName, agentName: sanitizedName, agentId: teammateId,
+      runId: getSessionId(), bootstrapRunId, source: 'spawnMultiAgent.process',
+      detail: code !== null ? `process exited with code ${code}` : signal ? `process exited from signal ${signal}` : 'process exited',
+    })
+    finishRuntimeLogStreams([stdoutLog, stderrLog])
+    const treeEmpty = runtimePid && process.platform !== 'win32'
+      ? await confirmNaturalProcessTreeExit(runtimePid, processOsIdentity).catch(() => false)
+      : await killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId, teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken, expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }).catch(() => false)
+    if (!treeEmpty) return
+    const exactProcessIdentity = {
+      agentId: teammateId, paneId: processPaneId,
+      processStartedAtMs: processStartedAtMs ?? undefined,
+      processOsIdentity, processOwnerToken, processRunId,
+      spawnClaimRunId: bootstrapRunId,
+    }
+    const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+      ...exactProcessIdentity, spawnClaimToken: input.spawnClaimToken,
+    }).catch(() => false) || await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+      ...exactProcessIdentity, spawnClaimToken: undefined,
+    }).catch(() => false)
+    if (!removed) return
+    setAppState(prev => {
+      const teammates = prev.teamContext?.teammates
+      const owned = teammates?.[teammateId]
+      const exactClaim = owned?.processOwnerToken === processOwnerToken &&
+        owned.processRunId === processRunId && owned.spawnClaimRunId === bootstrapRunId
+      const exactFinalized = exactClaim && owned.tmuxPaneId === processPaneId &&
+        owned.processStartedAtMs === (processStartedAtMs ?? undefined) &&
+        owned.processOsIdentity === processOsIdentity &&
+        (owned.spawnClaimToken === input.spawnClaimToken || owned.spawnClaimToken === undefined)
+      const exactPreFinalized = exactClaim && owned.tmuxPaneId === pendingPaneId &&
+        owned.processStartedAtMs === undefined && owned.processOsIdentity === undefined &&
+        owned.spawnClaimToken === input.spawnClaimToken
+      const exactOwned = exactFinalized || exactPreFinalized
+      const recovery = prev.teammateTerminationRecovery[sanitizedName]
+      const exactRecovery = recovery?.processOwnerToken === processOwnerToken &&
+        recovery.processRunId === processRunId &&
+        (recovery.paneId === processPaneId || recovery.paneId === pendingPaneId)
+      const teammateTerminationRecovery = exactRecovery
+        ? Object.fromEntries(Object.entries(prev.teammateTerminationRecovery).filter(([name]) => name !== sanitizedName))
+        : prev.teammateTerminationRecovery
+      const tasks = Object.fromEntries(Object.entries(prev.tasks).filter(([, task]) =>
+        !isInProcessTeammateTask(task) || task.identity.agentId !== teammateId ||
+        task.externalRuntime?.paneId !== processPaneId ||
+        task.externalRuntime.processStartedAtMs !== processStartedAtMs ||
+        task.externalRuntime.processOsIdentity !== processOsIdentity ||
+        task.externalRuntime.processOwnerToken !== processOwnerToken ||
+        task.externalRuntime.processRunId !== processRunId))
+      if (!prev.teamContext || !teammates || !exactOwned) return { ...prev, tasks, teammateTerminationRecovery }
+      const { [teammateId]: _retired, ...remaining } = teammates
+      return { ...prev, tasks, teammateTerminationRecovery, teamContext: { ...prev.teamContext, teammates: remaining } }
+    })
+  }
+
   try {
     stdoutLog = createWriteStream(runtimePaths.stdoutPath, {
       flags: 'a',
@@ -3047,13 +3135,6 @@ async function handleSpawnNativeProcess(
         { level: 'warn' },
       )
     })
-
-    if (
-      !input.spawnClaimToken ||
-      !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
-    ) {
-      throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process launch.`)
-    }
 
     const exactSpawn = buildExactProcessTreeSpawn(command, argv, {
       cwd: workingDir,
@@ -3083,6 +3164,20 @@ async function handleSpawnNativeProcess(
     }
 
     runtimePid = child.pid
+    // Drain output before asynchronous identity capture. A short-lived child
+    // can exit during that probe, and its failure evidence must not be lost.
+    child.stdout?.pipe(stdoutLog)
+    child.stderr?.pipe(stderrLog)
+    // Subscribe before the first asynchronous identity probe. Very short-lived
+    // children can otherwise emit close before cleanup has a listener.
+    const naturalClose = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child!.once('close', (code, signal) => resolve({ code, signal }))
+    })
+    void naturalClose.then(async ({ code, signal }) => {
+      await naturalExitIdentityReady
+      await naturalExitStateReady
+      await handleNaturalProcessClose(code, signal)
+    })
     processOsIdentity = exactSpawn.osIdentity === 'unix-pgid:pending'
       ? await captureProcessTreeIdentity(runtimePid)
       : exactSpawn.osIdentity
@@ -3092,6 +3187,7 @@ async function handleSpawnNativeProcess(
     processIdentity.osIdentity = processOsIdentity
     processPaneId = buildProcessBackendPaneId(runtimePid)
     processIdentity.paneId = processPaneId
+    markNaturalExitIdentityReady()
     let pidPublishOwned = false
     const pidPublishResult = await updateTeamFileAsync(teamName, teamFile => {
       const owned = teamFile.members.find(member => member.agentId === teammateId)
@@ -3186,73 +3282,9 @@ async function handleSpawnNativeProcess(
         { level: 'warn' },
       )
     })
-    child.stdout?.pipe(stdoutLog)
-    child.stderr?.pipe(stderrLog)
     ;(child.stdin as { unref?: () => void } | null)?.unref?.()
     ;(child.stdout as { unref?: () => void } | null)?.unref?.()
     ;(child.stderr as { unref?: () => void } | null)?.unref?.()
-    child.once('close', (code, signal) => {
-      void writeParentOwnedTeammateRuntimeEvent({
-        type: 'exited',
-        eventsPath: runtimePaths.eventsPath,
-        pid: runtimePid,
-        teamName,
-        agentName: sanitizedName,
-        agentId: teammateId,
-        runId: getSessionId(),
-        bootstrapRunId,
-        source: 'spawnMultiAgent.process',
-        detail:
-          code !== null
-            ? `process exited with code ${code}`
-            : signal
-              ? `process exited from signal ${signal}`
-              : 'process exited',
-      })
-      finishRuntimeLogStreams([stdoutLog, stderrLog])
-      // Root exit is only a notification. Query the exact detached PGID or
-      // named Windows Job before clearing durable ownership; descendants may
-      // otherwise survive while the stale roster permanently blocks respawn.
-      void (async () => {
-        const treeEmpty = await killProcessBackendRuntime(processPaneId, {
-          expectedAgentId: teammateId,
-          teamName,
-          expectedStartedAtMs: processStartedAtMs,
-          expectedOwnerToken: processOwnerToken,
-          expectedRunId: processRunId,
-          expectedOsIdentity: processOsIdentity,
-        }).catch(() => false)
-        if (!treeEmpty) return
-        const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
-          agentId: teammateId,
-          paneId: processPaneId,
-          processStartedAtMs,
-          processOsIdentity,
-          processOwnerToken,
-          processRunId,
-        }).catch(() => false)
-        if (!removed) return
-        setAppState(prev => {
-          const teammates = prev.teamContext?.teammates
-          const owned = teammates?.[teammateId]
-          const exactOwned = owned?.tmuxPaneId === processPaneId &&
-            owned.processStartedAtMs === processStartedAtMs &&
-            owned.processOsIdentity === processOsIdentity &&
-            owned.processOwnerToken === processOwnerToken &&
-            owned.processRunId === processRunId
-          const tasks = Object.fromEntries(Object.entries(prev.tasks).filter(([, task]) =>
-            !isInProcessTeammateTask(task) || task.identity.agentId !== teammateId ||
-            task.externalRuntime?.paneId !== processPaneId ||
-            task.externalRuntime.processStartedAtMs !== processStartedAtMs ||
-            task.externalRuntime.processOsIdentity !== processOsIdentity ||
-            task.externalRuntime.processOwnerToken !== processOwnerToken ||
-            task.externalRuntime.processRunId !== processRunId))
-          if (!prev.teamContext || !teammates || !exactOwned) return { ...prev, tasks }
-          const { [teammateId]: _retired, ...remaining } = teammates
-          return { ...prev, tasks, teamContext: { ...prev.teamContext, teammates: remaining } }
-        })
-      })()
-    })
     child.once('error', error => {
       void writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
@@ -3616,12 +3648,15 @@ async function handleSpawnNativeProcess(
             processOsIdentity,
             processOwnerToken,
             processRunId,
+            spawnClaimToken: input.spawnClaimToken,
+            spawnClaimRunId: bootstrapRunId,
           },
         },
       },
     }))
 
     child.unref()
+    markNaturalExitStateReady()
     logForDebugging(
       `[handleSpawnNativeProcess] Spawned teammate ${teammateId} as pid ${runtimePid}`,
     )
@@ -3659,6 +3694,20 @@ async function handleSpawnNativeProcess(
       },
     }
   } catch (error) {
+    markNaturalExitIdentityReady()
+    const failureAlreadyRecorded = await readTeammateRuntimeEvents(runtimePaths.eventsPath)
+      .then(events => events.some(event =>
+        event.type === 'failed' && event.bootstrapRunId === bootstrapRunId,
+      ))
+      .catch(() => false)
+    if (!failureAlreadyRecorded) {
+      await writeParentOwnedTeammateRuntimeEvent({
+        type: 'failed', eventsPath: runtimePaths.eventsPath, pid: runtimePid,
+        teamName, agentName: sanitizedName, agentId: teammateId,
+        runId: getSessionId(), bootstrapRunId, source: 'spawnMultiAgent.process',
+        detail: errorMessage(error),
+      }).catch(() => undefined)
+    }
     let terminated = child === null || cleanupState.confirmed
     if (!cleanupState.attempted && child && runtimePid && processPaneId && processStartedAtMs !== null) {
       terminated = await attemptProcessCleanupOnce(
@@ -3725,6 +3774,7 @@ async function handleSpawnNativeProcess(
         { level: 'warn' },
       )
     }
+    markNaturalExitStateReady()
     finishRuntimeLogStreams([stdoutLog, stderrLog])
     throw error
   } finally {

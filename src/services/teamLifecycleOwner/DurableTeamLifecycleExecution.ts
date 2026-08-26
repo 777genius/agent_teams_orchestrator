@@ -14,6 +14,7 @@ import type {
 } from './TeamLifecycleOwnerService.js'
 import type {
   TeamLifecycleLaneEffectPort,
+  TeamLifecycleLaneInput,
   TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
 
@@ -28,13 +29,7 @@ type DurableState = {
   ownerIncarnation: string | null
 }
 
-type LaneInput = {
-  planTeamId: string
-  workspaceRoot: string
-  toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
-  lane: TeamLifecycleLaunchPlan['lanes'][number]
-  runId: string
-}
+type LaneInput = TeamLifecycleLaneInput & { runId: string }
 
 type EffectGuard = NonNullable<TeamLifecycleOwnerEffectInput['effectGuard']>
 const EFFECT_ALLOWED: EffectGuard = () => true
@@ -49,6 +44,8 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   readonly #ownedRuns = new Map<string, TeamLifecycleLaunchPlan>()
   readonly #ownerIncarnation = `owner_${randomUUID().replaceAll('-', '')}`
   readonly #initializationMarkerPath: string
+  readonly #effectTimeoutMs: number
+  readonly #compensationTimeoutMs: number
   #acceptingEffects = true
   #closePromise: Promise<void> | null = null
   #shutdownPromise: Promise<void> | null = null
@@ -58,11 +55,14 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     private readonly statePath: string,
     adapters: readonly TeamLifecycleLaneEffectPort[],
     private readonly providerId = 'team-lifecycle-owner',
+    timeouts: { effectTimeoutMs?: number; compensationTimeoutMs?: number } = {},
   ) {
     if (!isAbsolute(statePath) || statePath.includes('\0')) {
       throw new TypeError('Team lifecycle state path must be absolute')
     }
     this.#initializationMarkerPath = `${statePath}.initialized`
+    this.#effectTimeoutMs = positiveTimeout(timeouts.effectTimeoutMs ?? 300_000, 'effect')
+    this.#compensationTimeoutMs = positiveTimeout(timeouts.compensationTimeoutMs ?? 10_000, 'compensation')
     const entries = adapters.map(adapter => [adapter.kind, adapter] as const)
     if (new Set(entries.map(([kind]) => kind)).size !== entries.length) {
       throw new TypeError('Duplicate team lifecycle lane adapter')
@@ -438,17 +438,21 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         toolApprovalMode: plan.toolApprovalMode,
         lane,
         runId,
+        effectGuard,
       }
       // No asynchronous boundary may exist between the authority comparison and
       // invoking the provider adapter: a queued launch can outlive its request.
       if (!(await effectGuard())) throw new Error('Team lifecycle effect authority changed')
-      const observation = await adapter[action](laneInput)
+      const observation = await this.#invokeAdapter(adapter, action, laneInput, this.#effectTimeoutMs)
       if (!(await effectGuard())) {
         // A successful launch is already an external effect. Losing authority
         // while it awaited must synchronously compensate that exact run before
         // the job can settle or close() can declare the owner drained.
         if (action === 'launch') {
-          const stopped = await adapter.stop(laneInput)
+          const stopped = await this.#invokeAdapter(adapter, 'stop', {
+            ...laneInput,
+            effectGuard: () => this.#ownedRuns.get(runId) === plan,
+          }, this.#compensationTimeoutMs)
           if (stopped.phase !== 'idle') {
             throw new Error('Team lifecycle effect authority changed and exact launch compensation was not confirmed')
           }
@@ -463,13 +467,17 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     plan: TeamLifecycleLaunchPlan,
     runId: string,
   ): Promise<TeamLifecycleLaneObservation[]> {
-    return Promise.all(plan.lanes.map(lane => this.#adapter(lane.kind).stop({
-      planTeamId: plan.teamId,
-      workspaceRoot: plan.workspaceRoot,
-      toolApprovalMode: plan.toolApprovalMode,
-      lane,
-      runId,
-    })))
+    return Promise.all(plan.lanes.map(lane => {
+      const adapter = this.#adapter(lane.kind)
+      return this.#invokeAdapter(adapter, 'stop', {
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        runId,
+        effectGuard: () => this.#ownedRuns.get(runId) === plan,
+      }, this.#compensationTimeoutMs)
+    }))
   }
 
   #applyLanesForRecoveryTeardown(
@@ -479,14 +487,38 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   ): Promise<TeamLifecycleLaneObservation[]> {
     return Promise.all(plan.lanes.map(async lane => {
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed before teardown')
-      return this.#adapter(lane.kind).stop({
+      const adapter = this.#adapter(lane.kind)
+      return this.#invokeAdapter(adapter, 'stop', {
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
         lane,
         runId,
-      })
+        effectGuard,
+      }, this.#compensationTimeoutMs)
     }))
+  }
+
+  async #invokeAdapter(
+    adapter: TeamLifecycleLaneEffectPort,
+    action: 'launch' | 'cancel' | 'stop' | 'recover',
+    input: LaneInput,
+    timeoutMs: number,
+  ): Promise<TeamLifecycleLaneObservation> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error(`Team lifecycle ${action} deadline exceeded`)), timeoutMs)
+    timer.unref?.()
+    try {
+      const operation = adapter[action]({ ...input, signal: controller.signal })
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => {
+          reject(controller.signal.reason)
+        }, { once: true })),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   #adapter(kind: TeamLifecycleLaunchPlan['lanes'][number]['kind']): TeamLifecycleLaneEffectPort {
@@ -640,6 +672,11 @@ function generation(state: DurableState): string {
 
 function planFingerprint(plan: TeamLifecycleLaunchPlan): string {
   return createHash('sha256').update(JSON.stringify(plan)).digest('hex')
+}
+
+function positiveTimeout(value: number, label: string): number {
+  if (!Number.isFinite(value) || value <= 0) throw new TypeError(`Invalid team lifecycle ${label} timeout`)
+  return Math.ceil(value)
 }
 
 function decodeState(value: unknown): DurableState {

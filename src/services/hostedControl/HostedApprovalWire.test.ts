@@ -417,6 +417,8 @@ describe('HostedApprovalWireDispatcher', () => {
     for (const record of [
       ingressRecord('😀'.repeat(16_385), 'summary'),
       ingressRecord('safe', 'open /Users/alice/private.txt'),
+      ingressRecord('safe', 'open %252e%252e%255cprivate%255ckey.txt'),
+      ingressRecord('safe', 'inspect cwd:workspace/private/key.txt'),
       ingressRecord('safe', 'line one\nline two'),
     ]) {
       await expect(dispatch(dispatcher({

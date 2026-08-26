@@ -25,6 +25,9 @@ export type TeamLifecycleLaneInput = {
   workspaceRoot: string
   toolApprovalMode: 'manual' | 'auto'
   lane: TeamLifecycleLaunchLane
+  /** Checked inside the lane queue immediately before a provider mutation. */
+  effectGuard?: () => boolean | Promise<boolean>
+  signal?: AbortSignal
 }
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
@@ -47,13 +50,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
 
   supports(): boolean { return this.hasLiveCapability() }
 
-  async inspect(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string | null
-  }): Promise<TeamLifecycleLaneObservation> {
+  async inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode' || !input.runId) return idle()
     return this.#serialized(input, async () => {
       const data = await this.#execute('opencode.reconcileTeam', input.workspaceRoot, {
@@ -74,16 +71,11 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     })
   }
 
-  async launch(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string
-  }): Promise<TeamLifecycleLaneObservation> {
+  async launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
     const lane = input.lane
     return this.#serialized(input, async () => {
+      await assertEffectGuard(input)
       const data = await this.#execute('opencode.launchTeam', input.workspaceRoot, {
         runId: input.runId,
         laneId: lane.laneId,
@@ -99,50 +91,27 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
           ...(member.model ? { model: member.model } : {}),
           ...(member.effort ? { effort: member.effort } : {}),
         })),
-      })
+      }, input.signal)
       return launchObservation(data)
     })
   }
 
-  cancel(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string
-  }): Promise<TeamLifecycleLaneObservation> {
+  cancel(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     return this.#serialized(input, () => this.#stop(input))
   }
 
-  stop(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string
-  }): Promise<TeamLifecycleLaneObservation> {
+  stop(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     return this.#serialized(input, () => this.#stop(input))
   }
 
-  async recover(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string
-  }): Promise<TeamLifecycleLaneObservation> {
+  async recover(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     // Recovery is a confirmed cleanup to idle. A new launch requires a fresh command/revision.
     return this.#serialized(input, () => this.#stop(input))
   }
 
-  async #stop(input: {
-    planTeamId: string
-    workspaceRoot: string
-    toolApprovalMode: 'manual' | 'auto'
-    lane: TeamLifecycleLaunchLane
-    runId: string
-  }): Promise<TeamLifecycleLaneObservation> {
+  async #stop(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
+    await assertEffectGuard(input)
     const data = await this.#execute('opencode.stopTeam', input.workspaceRoot, {
       runId: input.runId,
       laneId: input.lane.laneId,
@@ -156,7 +125,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         model: member.model ?? input.lane.selectedModel,
         variant: member.effort ?? input.lane.effort ?? null,
       })),
-    })
+    }, input.signal)
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     return idle()
   }
@@ -165,6 +134,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     command: 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam',
     cwd: string,
     body: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     if (!this.hasLiveCapability()) throw new Error('OpenCode lifecycle owner capability is unavailable')
     const response: unknown = await this.executeBridge({
@@ -175,7 +145,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       startedAt: new Date().toISOString(),
       timeoutMs: this.timeoutMs,
       body,
-    })
+    }, { signal })
     const record = asRecord(response)
     if (record.ok !== true) {
       const error = asRecord(record.error)
@@ -201,6 +171,12 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       release()
       if (this.#queues.get(key) === tail) this.#queues.delete(key)
     }
+  }
+}
+
+async function assertEffectGuard(input: TeamLifecycleLaneInput): Promise<void> {
+  if (input.effectGuard && !(await input.effectGuard())) {
+    throw new Error('Team lifecycle lane authority changed before provider effect')
   }
 }
 

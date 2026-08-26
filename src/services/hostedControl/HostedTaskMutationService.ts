@@ -13,7 +13,7 @@ type SourceState = Pick<BoardState, 'sourceGeneration' | 'directories'>
 type MutationLedger = { schemaVersion: 2; entries: Record<string, LedgerEntry> }
 type LedgerEntry = { fingerprint: string; commandId: string; sourceGeneration: string; expectedRevision: string; receipt: HostedTaskMutationReceipt; committedAtMs: number }
 type PlanResult = { writes: HostedMutationWrite[]; result: HostedTaskMutationCommittedResult } | { terminal: HostedTaskMutationTerminalResult }
-type CrashStage = 'after_task_detach' | 'after_task_write' | 'before_kanban_write' | 'before_terminal'
+type CrashStage = 'after_task_stage' | 'after_task_detach' | 'after_task_write' | 'before_kanban_write' | 'before_terminal'
 class ControlledHostedMutationCrash extends Error {}
 const TASK_STATUSES = ['pending', 'in_progress', 'completed'] as const
 const COLUMNS = ['todo', 'in_progress', 'review', 'approved', 'done'] as const
@@ -349,12 +349,19 @@ export class HostedTaskMutationService {
       const existingStage = readPinnedImage(directory, staged)
       if (existingStage.existed && !sameImage(existingStage, write.after)) throw new Error('Hosted stage path substituted')
       if (!existingStage.existed) writePinnedImage(directory, staged, Buffer.from(text))
+      // The deterministic stage is a recovery anchor. Publish its directory
+      // entry before any preimage can be unlinked, otherwise a power loss may
+      // retain neither the target nor a discoverable postimage.
+      await directory.sync(); directory.assertLinked()
+      if (write.target.startsWith('task:')) await this.#runCrashHook('after_task_stage')
       if (write.before.existed) {
         if (readPinnedImage(directory, detached).existed) throw new Error('Hosted detach path already exists')
         directory.link(targetName, detached)
         if (!matchesPreimage(readPinnedImage(directory, detached), write.before)) throw new Error('Hosted detached preimage mismatch')
         const current = readPinnedImage(directory, targetName); const detachedImage = readPinnedImage(directory, detached)
         if (current.stat?.device !== detachedImage.stat?.device || current.stat?.inode !== detachedImage.stat?.inode) throw new Error('Hosted target changed before detach')
+        // Make the hard-link recovery anchor durable before destructive unlink.
+        await directory.sync(); directory.assertLinked()
         directory.unlink(targetName)
         if (write.target.startsWith('task:')) await this.#runCrashHook('after_task_detach')
       }
@@ -373,7 +380,37 @@ export class HostedTaskMutationService {
       try {
         directory.assertLinked()
         const detachedImage = readPinnedImage(directory, detached)
-        if (!detachedImage.existed) continue
+        if (!detachedImage.existed) {
+          const stagedImage = readPinnedImage(directory, staged)
+          if (!stagedImage.existed) continue
+          const current = readPinnedImage(directory, targetName)
+          // A crash may leave the deterministic stage after its file fsync but
+          // before the detached anchor. Trust neither its pathname nor inode:
+          // only an exact WAL postimage beside the exact target preimage is
+          // repairable, and recreate it under the active writer fence.
+          if (!sameImage(stagedImage, write.after) || !matchesPreimage(current, write.before)) return false
+          directory.unlink(staged)
+          await directory.sync(); directory.assertLinked()
+          writePinnedImage(directory, staged, Buffer.from(write.after.contentBase64!, 'base64'))
+          await directory.sync(); directory.assertLinked()
+          if (!sameImage(readPinnedImage(directory, staged), write.after)) return false
+          if (write.before.existed) {
+            directory.link(targetName, detached)
+            const repairedDetached = readPinnedImage(directory, detached)
+            const repairedTarget = readPinnedImage(directory, targetName)
+            if (!matchesPreimage(repairedDetached, write.before)
+              || repairedTarget.stat?.device !== repairedDetached.stat?.device
+              || repairedTarget.stat?.inode !== repairedDetached.stat?.inode) return false
+            await directory.sync(); directory.assertLinked()
+            directory.unlink(targetName)
+          }
+          directory.link(staged, targetName)
+          await directory.sync(); directory.assertLinked()
+          if (!sameImage(readPinnedImage(directory, targetName), write.after)) return false
+          directory.unlinkIfExists(staged); directory.unlinkIfExists(detached)
+          await directory.sync(); directory.assertLinked()
+          continue
+        }
         if (!matchesPreimage(detachedImage, write.before)) return false
         const current = readPinnedImage(directory, targetName)
         if (matchesPreimage(current, write.before)) {

@@ -15,6 +15,17 @@ describe('host path redaction boundary', () => {
     '~operator/.ssh/config',
     '../outside/.env',
     'safe/../../outside',
+    'workspace/private/secrets.json',
+    'workspace\\private\\secrets.json',
+    'cwd:/srv/private/project',
+    'cwd:workspace/private/file.txt',
+    'file:../private/file.txt',
+    '\\Device\\HarddiskVolume1\\private\\key',
+    '\\??\\C:\\private\\key',
+    '%2e%2e%2fprivate%2fkey',
+    '%252e%252e%255cprivate%255ckey',
+    'workspace%EF%BC%8Fprivate%EF%BC%8Fkey',
+    'workspace\uff0fprivate\uff0fkey',
   ])('detects %s', value => expect(containsHostPath(value)).toBe(true))
 
   test.each([

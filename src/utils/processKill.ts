@@ -368,6 +368,25 @@ async function listLinuxProcessGroupMembers(pgid: number): Promise<number[] | nu
   }
 }
 
+/**
+ * Proves exhaustion after the exact ChildProcess object reports natural exit.
+ * This is deliberately narrower than generic PID cleanup: an empty captured
+ * Linux PGID means no descendant can later reappear, while any member or
+ * unreadable process table remains ambiguous and fails closed.
+ */
+export async function confirmNaturalProcessTreeExit(
+  pid: number,
+  expectedOsIdentity: string | null | undefined,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  if (platform !== 'linux' || expectedOsIdentity !== `unix-pgid:${pid}` || isProcessAlive(pid)) return false
+  const first = await listLinuxProcessGroupMembers(pid)
+  if (!first || first.length > 0) return false
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const second = await listLinuxProcessGroupMembers(pid)
+  return second !== null && second.length === 0 && !isProcessAlive(pid)
+}
+
 async function terminateWindowsJobStable(
   expectedOsIdentity: string | undefined,
   options: ExactProcessTreeTerminationOptions,

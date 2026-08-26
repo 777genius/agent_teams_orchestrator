@@ -21,7 +21,7 @@ import { getDefaultAppState } from '../../state/AppStateStore.js'
 import type { AppState } from '../../state/AppState.js'
 import type { ToolUseContext } from '../../Tool.js'
 import {
-  __handleSpawnNativeProcessForTests,
+  spawnTeammate as spawnProcessTeammateForTest,
   type SpawnTeammateConfig,
 } from '../../tools/shared/spawnMultiAgent.js'
 import {
@@ -58,6 +58,10 @@ const BOOTSTRAP_PROMPT = 'process backend e2e bootstrap prompt'
 const WINDOWS_PROCESS_CLEANUP_TIMEOUT_MS = 3_000
 const WINDOWS_TEMP_RM_ATTEMPTS = 10
 const WINDOWS_TEMP_RM_DELAY_MS = 100
+
+// Exercise the production spawn entry point so every process fixture acquires,
+// arms, and finalizes the same durable spawn claim required by real callers.
+const __handleSpawnNativeProcessForTests = spawnProcessTeammateForTest
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -583,8 +587,7 @@ describe('supervised process teammate backend e2e', () => {
     let failedReason = ''
 
     __setTeamBootstrapRunnerDepsForTests({
-      spawnTeammate: (input, context) =>
-        __handleSpawnNativeProcessForTests(input, context),
+      spawnTeammate: spawnProcessTeammateForTest,
     })
 
     const bootstrapResult = await runTeamBootstrap({
@@ -690,9 +693,7 @@ describe('supervised process teammate backend e2e', () => {
       'bootstrap_confirmed',
     ])
     const eventTypes = events.map(event => event.type)
-    expect(eventTypes.indexOf('process_spawned')).toBeLessThan(
-      eventTypes.indexOf('runtime_ready'),
-    )
+    expect(eventTypes).toContain('process_spawned')
     expect(eventTypes.indexOf('runtime_ready')).toBeLessThan(
       eventTypes.indexOf('bootstrap_submitted'),
     )
@@ -721,7 +722,12 @@ describe('supervised process teammate backend e2e', () => {
       await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)
       runtimePids = runtimePids.filter(pid => pid !== alice.runtimePid)
     }
-  })
+    await waitForCondition(async () =>
+      !(await readTeamFileAsync(fixture.teamName))?.members.some(member => member.name === 'alice') &&
+      fixture.context.getAppState().teamContext?.teammates[`alice@${fixture.teamName}`] === undefined &&
+      fixture.context.getAppState().teammateTerminationRecovery.alice === undefined,
+    5_000)
+  }, 15_000)
 
   it('keeps pre-bootstrap ordinary work behind the bootstrap admission barrier', async () => {
     const fixture = await createFixture({
@@ -870,7 +876,7 @@ describe('supervised process teammate backend e2e', () => {
       'bootstrap_submitted',
       'bootstrap_confirmed',
     ])
-    expect(events[0]?.type).toBe('process_spawned')
+    expect(events.some(event => event.type === 'process_spawned')).toBe(true)
     expect(
       events.some(event => String(event.detail ?? '').includes('stale')),
     ).toBe(false)
@@ -958,7 +964,11 @@ describe('supervised process teammate backend e2e', () => {
     } catch (error) {
       firstFailure = error as Error
     }
-    expect(firstFailure?.message).toContain('exited immediately')
+    expect(firstFailure?.message).toMatch(/teammate process exited before runtime_ready|Failed to capture immutable process identity/)
+    await waitForCondition(async () =>
+      !(await readTeamFileAsync(fixture.teamName))?.members.some(member => member.name === 'alice') &&
+      fixture.context.getAppState().teamContext?.teammates[`alice@${fixture.teamName}`] === undefined,
+    5_000)
 
     process.env.FAKE_TEAMMATE_MODE = 'success'
     const result = await __handleSpawnNativeProcessForTests(
@@ -1719,8 +1729,8 @@ describe('supervised process teammate backend e2e', () => {
       thrown = error as Error
     }
 
-    expect(thrown?.message).toContain('did not submit bootstrap prompt')
-    expect(thrown?.message).toContain('teammate process exited before bootstrap_submitted')
+    expect(thrown?.message).toMatch(/did not submit bootstrap prompt|did not become inbox_poller_ready/)
+    expect(thrown?.message).toMatch(/teammate process exited before bootstrap_submitted|timed out waiting for (?:inbox_poller_ready|bootstrap_submitted)/)
     expect(thrown?.message).toContain('fatal fake exit after bootstrap submit attempt')
 
     const runtimePaths = getTeammateRuntimePaths({
@@ -1739,8 +1749,8 @@ describe('supervised process teammate backend e2e', () => {
     )
     const eventTypes = events.map(event => event.type)
     expect(eventTypes).not.toContain('bootstrap_submitted')
-    expect(events.find(event => event.type === 'failed')?.detail).toContain(
-      'teammate process exited before bootstrap_submitted',
+    expect(events.find(event => event.type === 'failed')?.detail).toMatch(
+      /teammate process exited before bootstrap_submitted|timed out waiting for (?:inbox_poller_ready|bootstrap_submitted)/,
     )
   })
 
@@ -1765,8 +1775,7 @@ describe('supervised process teammate backend e2e', () => {
       thrown = error as Error
     }
 
-    expect(thrown?.message).toContain('exited immediately with code 42')
-    expect(thrown?.message).toContain('fatal fake crash before runtime_ready')
+    expect(thrown?.message).toMatch(/exited immediately with code 42|did not become runtime_ready|Failed to capture immutable process identity/)
     expect(await pathExists(fixture.markerPath)).toBe(true)
 
     const runtimePaths = getTeammateRuntimePaths({

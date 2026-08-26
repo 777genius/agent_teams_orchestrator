@@ -4261,6 +4261,35 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   })
 
+  test('keeps the command deadline active across a hung ensureSession mutation', async () => {
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    let ensureSessionCalls = 0
+    openCodeSessionBridge.ensureSession = (async () => {
+      ensureSessionCalls += 1
+      return new Promise(() => {})
+    }) as typeof openCodeSessionBridge.ensureSession
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-ensure-session-timeout',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'minimax-m2.5-free',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    envelope.timeoutMs = 500
+    const startedAt = Date.now()
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+
+    expect(Date.now() - startedAt).toBeLessThan(1_500)
+    expect(ensureSessionCalls).toBe(1)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('timeout')
+    expect(result.error.details).toMatchObject({ phase: 'provider_mutation', commandBudgetMs: 500 })
+  })
+
   test('allows launch for built-in free OpenCode models without connected providers', async () => {
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({

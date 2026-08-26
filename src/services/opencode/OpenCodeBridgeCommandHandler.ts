@@ -2740,6 +2740,26 @@ async function cleanupFailedLaunchSession(
   return diagnostics
 }
 
+async function runBoundedLaunchMutation<T>(
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+  operation: () => Promise<T>,
+  compensate: (value: T) => Promise<unknown>,
+): Promise<T> {
+  const pending = operation()
+  try {
+    return await runtimeDeadline.runPhase('provider_mutation', () => pending)
+  } catch (error) {
+    if (runtimeDeadline.signal.aborted) {
+      // The provider promise may settle after the deadline race. Chain exact
+      // compensation to that settlement, while bounding how long lifecycle
+      // close waits for it in this process.
+      const compensation = pending.then(value => compensate(value)).catch(() => undefined)
+      void withTimeout(compensation, 5_000).catch(() => undefined)
+    }
+    throw error
+  }
+}
+
 async function markStaleAndReleaseSession(
   record: OpenCodeSessionRecord,
   staleReason: string,
@@ -2886,9 +2906,6 @@ async function runLaunchWithProvisioningSnapshot(
   }
   await assertOpenCodeLaunchMcpReady(snapshot, runtimeDeadline)
   runtimeDeadline.throwIfExpired('post_probe_refresh')
-  // From this point the command starts creating durable sessions. Keep the
-  // pre-launch deadline from turning a completed state change into a timeout.
-  runtimeDeadline.dispose()
   const members: Record<string, LaunchMemberDraft> = {}
   const memberTimings = new Map<string, {
     ensureSessionMs?: number
@@ -2909,7 +2926,7 @@ async function runLaunchWithProvisioningSnapshot(
     memberTimings.set(name, memberTiming)
     try {
       const ensureStartedAt = Date.now()
-      record = await openCodeSessionBridge.ensureSession({
+      record = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.ensureSession({
         teamId,
         laneId,
         memberName: name,
@@ -2921,7 +2938,7 @@ async function runLaunchWithProvisioningSnapshot(
         runId,
         fresh: true,
         toolApprovalMode,
-      })
+      }), created => cleanupFailedLaunchSession(created))
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
       let mcpReady = await waitForLaunchSessionAppMcpReady(record)
       if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
@@ -2951,7 +2968,7 @@ async function runLaunchWithProvisioningSnapshot(
             'warning',
           ))
         })
-        record = await openCodeSessionBridge.ensureSession({
+        record = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.ensureSession({
           teamId,
           laneId,
           memberName: name,
@@ -2963,7 +2980,7 @@ async function runLaunchWithProvisioningSnapshot(
           runId,
           fresh: true,
           toolApprovalMode,
-        })
+        }), created => cleanupFailedLaunchSession(created))
         diagnostics.push(teamDiagnostic(
           'opencode_launch_session_recreated_after_mcp_attach',
           `Recreated OpenCode session for ${name} after Agent Teams MCP attach so launch bootstrap sees the newly attached tools.`,
@@ -3010,13 +3027,13 @@ async function runLaunchWithProvisioningSnapshot(
         contextHash,
       })
       const injectionStartedAt = Date.now()
-      const injected = await openCodeSessionBridge.injectAppManagedBootstrapContext(record, {
+      const injected = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.injectAppManagedBootstrapContext(record!, {
         messageID,
         text: contextText,
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
         contextHash,
         briefingHash,
-      })
+      }), () => cleanupFailedLaunchSession(record!))
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
       try {
         record = await openCodeSessionBridge.refreshSessionEnvironment(record)
@@ -3087,9 +3104,17 @@ async function runLaunchWithProvisioningSnapshot(
         'info',
       ))
     } catch (error) {
+      // A command-wide provider deadline is lifecycle authority, not a
+      // per-member launch failure. Preserve it to the wire boundary so a hung
+      // mutation cannot be converted into a successful launch response.
+      if (isOpenCodeRuntimeDeadlineError(error)) throw error
       const reason = error instanceof Error ? error.message : String(error)
       const cleanupDiagnostics = record
-        ? await cleanupFailedLaunchSession(record)
+        ? await withTimeout(cleanupFailedLaunchSession(record), 5_000).catch(cleanupError => [teamDiagnostic(
+            'opencode_launch_compensation_timeout',
+            `${name}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+            'warning',
+          )])
         : []
       members[name] = {
         sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
@@ -4588,7 +4613,7 @@ const HOSTED_LIFECYCLE_OWNER_CAPABILITY = Symbol('hosted-lifecycle-owner')
  */
 export function createOwnedOpenCodeLifecycleCommandExecutor() {
   const capability = HOSTED_LIFECYCLE_OWNER_CAPABILITY
-  return async (input: unknown) => {
+  return async (input: unknown, options: { signal?: AbortSignal } = {}) => {
     if (capability !== HOSTED_LIFECYCLE_OWNER_CAPABILITY) {
       throw new Error('OpenCode lifecycle owner capability is invalid')
     }
@@ -4599,6 +4624,7 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
     return executeOpenCodeBridgeCommandEnvelopeInternal(
       envelope,
       HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+      options.signal,
     )
   }
 }
@@ -4606,6 +4632,7 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
 async function executeOpenCodeBridgeCommandEnvelopeInternal(
   input: unknown,
   ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+  externalSignal?: AbortSignal,
 ) {
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
@@ -4636,12 +4663,16 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
   )
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
+  const abortForExternalSignal = () => runtimeDeadline?.abort(externalSignal?.reason)
+  if (externalSignal?.aborted) abortForExternalSignal()
+  else externalSignal?.addEventListener('abort', abortForExternalSignal, { once: true })
   try {
-    const result = await handleEnvelope(
+    const operation = handleEnvelope(
       envelope,
       runtimeDeadline,
       ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
     )
+    const result = await raceOpenCodeAbortSignal(operation, externalSignal)
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
     }
@@ -4658,6 +4689,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
       deadlineError?.toDetails(),
     )
   } finally {
+    externalSignal?.removeEventListener('abort', abortForExternalSignal)
     runtimeDeadline?.dispose()
   }
 }

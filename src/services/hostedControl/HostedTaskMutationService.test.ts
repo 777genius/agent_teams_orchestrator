@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAgentStatuses, getTask, listTasks } from '../../utils/tasks.js'
@@ -57,7 +57,7 @@ describe('HostedTaskMutationService', () => {
     const authority = { actorId: 'actor', deploymentId: 'deployment', bootId: 'boot', restoreGeneration: 1, workspaceId: 'workspace', mountBinding: { mountGeneration: 1, declaredRootHash: 'b'.repeat(64) }, teamId }
     const wal = new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId)
     let crashed = false
-    const makeService = (crashStage?: 'after_task_detach' | 'after_task_write' | 'before_terminal') => new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal, crashHook: crashStage ? stage => { if (stage === crashStage && !crashed) { crashed = true; throw new Error('controlled crash') } } : undefined })
+    const makeService = (crashStage?: 'after_task_stage' | 'after_task_detach' | 'after_task_write' | 'before_terminal') => new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal, crashHook: crashStage ? stage => { if (stage === crashStage && !crashed) { crashed = true; throw new Error('controlled crash') } } : undefined })
     let command: HostedTaskMutationCommand = { schemaVersion: 1, kind: 'create_task', commandId: 'command_recovery', idempotencyKey: 'idem:recovery', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Recover me', description: null, status: 'pending', ownerId: null, column: 'todo', order: 0 }
     const request = (): HostedTaskMutationRequest => ({ schemaVersion: 2, exchangeId: `task-request_${'5'.repeat(32)}`, operation: 'task_mutate', ownerBinding: { ownerAuthority: 'owner_authority1', ownerGeneration: 1, ownerSessionId: `owner_session_${'6'.repeat(32)}`, socketIdentity: socketIdentity() }, authority, payload: { command, payloadFingerprint: fingerprintHostedTaskCommand(command) }, ownerProof: '0'.repeat(64) })
     const generationResult = await makeService().mutate(request()); expect(generationResult.kind).toBe('stale_generation')
@@ -94,6 +94,14 @@ describe('HostedTaskMutationService', () => {
     expect(await makeService().recover()).toBe(true)
     expect((await makeService().mutate(request())).kind).toBe('idempotent_replay')
 
+    crashed = false
+    command = { ...command, commandId: 'command_partial_stage', idempotencyKey: 'idem:partial-stage', expectedRevision: 'revision_stale', subject: 'Recovered deterministic stage' }
+    const stageRevision = await makeService().mutate(request()); if (stageRevision.kind !== 'stale_revision') throw new Error('expected stage revision')
+    command = { ...command, expectedRevision: stageRevision.currentRevision }
+    expect((await makeService('after_task_stage').mutate(request())).kind).toBe('unavailable')
+    expect(await makeService().recover()).toBe(true)
+    expect((await makeService().mutate(request())).kind).toBe('idempotent_replay')
+
     command = { ...command, commandId: 'command_missing', idempotencyKey: 'idem:missing', taskId: `task_${'f'.repeat(32)}`, expectedRevision: 'revision_stale' }
     const missingRevision = await makeService().mutate(request()); if (missingRevision.kind !== 'stale_revision') throw new Error('expected missing revision')
     command = { ...command, expectedRevision: missingRevision.currentRevision }
@@ -115,6 +123,31 @@ describe('HostedTaskMutationService', () => {
     expect((await service(true).mutate(request())).kind).toBe('unavailable')
     await writeFile(join(root, 'teams', 'legacy', 'kanban-state.json'), '{"substituted":true}')
     expect(await service().recover()).toBe(false)
+  })
+
+  test('rejects a hostile deterministic stage while preserving the exact target preimage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-stage-substitution-')); roots.push(root)
+    const tasksDir = join(root, 'tasks', 'legacy')
+    await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(tasksDir, { recursive: true })
+    await writeFile(join(tasksDir, 'existing.json'), `${JSON.stringify({ id: 'existing', subject: 'Before', status: 'pending', blocks: [], blockedBy: [] }, null, 2)}\n`)
+    const teamId = `team_${'d'.repeat(32)}`; const authority = authorityFor(teamId); const wal = new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId)
+    let cut = false
+    const crashing = new HostedTaskMutationService({
+      claudeRoot: root, legacyKey: 'legacy', authority, wal,
+      crashHook: stage => { if (stage === 'after_task_stage' && !cut) { cut = true; throw new Error('cut') } },
+    })
+    const prepared = await runCommand(crashing, authority, {
+      schemaVersion: 1, kind: 'update_details', commandId: 'command_stage_substitution',
+      idempotencyKey: 'stage-substitution', teamId, expectedSourceGeneration: 'generation_stale',
+      expectedRevision: 'revision_stale', taskId: publicId(teamId, 'existing'), subject: 'After',
+    })
+    expect(prepared.result.kind).toBe('unavailable')
+    const stageName = (await readdir(tasksDir)).find(name => name.startsWith('.hosted-stage-'))
+    expect(stageName).toBeDefined()
+    await writeFile(join(tasksDir, stageName!), 'hostile-stage')
+    const recovery = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal })
+    expect(await recovery.recover()).toBe(false)
+    expect(JSON.parse(await readFile(join(tasksDir, 'existing.json'), 'utf8')).subject).toBe('Before')
   })
 
   test('preserves kanban metadata and placement for task-only mutations and applies description tombstones canonically', async () => {

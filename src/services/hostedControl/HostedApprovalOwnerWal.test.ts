@@ -62,6 +62,8 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     expect(() => decodeOwnerState(authority)).toThrow('ingress binding')
     const payload = state(); const body = JSON.parse(payload.ingress[0]!.payloadJson); body.deliveryRef = 'delivery_ref_substituted'; payload.ingress[0]!.payloadJson = JSON.stringify(body)
     expect(() => decodeOwnerState(payload)).toThrow('ingress payload')
+    const encodedHostPath = state(); const encodedBody = JSON.parse(encodedHostPath.ingress[0]!.payloadJson); encodedBody.summary = 'inspect %252e%252e%255cprivate%255ckey'; encodedHostPath.ingress[0]!.payloadJson = JSON.stringify(encodedBody)
+    expect(() => decodeOwnerState(encodedHostPath)).toThrow('ingress payload')
     const acknowledgement = state(); acknowledgement.ingress[0]!.acknowledgedAtIso = '2026-08-13T09:59:00.000Z'; acknowledgement.ingress[0]!.lease = { generation: 1, ownerId: 'owner_1', leaseToken: 'lease_1', claimedAtIso: '2026-08-13T10:00:01.000Z', leaseExpiresAtIso: '2026-08-13T10:00:02.000Z' }
     expect(() => decodeOwnerState(acknowledgement)).toThrow('acknowledgement')
     const delivery = state(); delivery.deliveries = [{ providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`, deliveryRef: 'delivery_ref_wrong', payloadFingerprint: 'f'.repeat(64), outboxId: delivery.ingress[0]!.outboxId, effectRef: delivery.ingress[0]!.effectRef, phase: 'started', result: null }]
