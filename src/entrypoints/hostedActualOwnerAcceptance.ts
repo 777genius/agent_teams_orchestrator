@@ -381,7 +381,12 @@ function parseLaunchDescriptor(text: string | undefined): LaunchDescriptor {
   const wrapperInput = exactObject(Reflect.get(input, 'wrapper'), [
     'relativePath', 'size', 'mode', 'sha256', 'role',
   ], 'wrapper_identity')
-  const wrapperArtifact = portableArtifact(wrapperInput, 'wrapper_identity')
+  const wrapperArtifact = portableArtifact({
+    relativePath: Reflect.get(wrapperInput, 'relativePath'),
+    size: Reflect.get(wrapperInput, 'size'),
+    mode: Reflect.get(wrapperInput, 'mode'),
+    sha256: Reflect.get(wrapperInput, 'sha256'),
+  }, 'wrapper_identity')
   const wrapper = Object.freeze({
     ...wrapperArtifact,
     role: Reflect.get(wrapperInput, 'role'),
