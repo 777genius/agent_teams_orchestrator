@@ -122,21 +122,19 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
-  test('freshly rejects effect-edge PID/start and resolved-config drift', async () => {
+  test('rejects effect authority from a custom process factory without executable artifact proof', async () => {
     const spawned = createMockChildProcess(4242)
     let alive = true
-    let startedAtMs = 1000
-    let configAgent = 'teammate'
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43140,
       spawnHostProcess: () => spawned.child,
       isProcessAlive: () => alive,
       killProcess: () => { alive = false },
-      readProcessStartTimeMs: async () => startedAtMs,
+      readProcessStartTimeMs: async () => 1000,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
-        if (url.endsWith('/config')) return { status: 200, data: { default_agent: configAgent } }
+        if (url.endsWith('/config')) return { status: 200, data: { default_agent: 'teammate' } }
         if (url.endsWith('/config/providers')) return { status: 200, data: { providers: [] } }
         if (url.endsWith('/agent')) return { status: 200, data: [] }
         if (url.endsWith('/mcp')) return { status: 200, data: {} }
@@ -150,15 +148,15 @@ describe('OpenCodeHostManager', () => {
       processStartedAtMs: host.processStartedAtMs ?? null,
       resolvedConfigFingerprint: host.resolvedConfigFingerprint,
     }
-    expect(await manager.verifyEffectHost(proof)).toBe(true)
-    startedAtMs = 2000
-    expect(await manager.verifyEffectHost(proof)).toBe(false)
-    startedAtMs = 1000; configAgent = 'replacement'
+    // A custom process factory cannot prove which executable its synthetic PID
+    // runs, so it must never mint effect authority even when the remaining
+    // process and resolved-config fields match.
+    expect(host.openCodeArtifactDigest).toBeNull()
     expect(await manager.verifyEffectHost(proof)).toBe(false)
     await manager.disposeHost(host.hostKey)
   })
 
-  test('one-use host effect token rejects in-process host replacement before POST', async () => {
+  test('does not mint a one-use host effect token for a custom process factory', async () => {
     const spawned = createMockChildProcess(321)
     let alive = true
     const manager = new OpenCodeHostManager({
@@ -185,9 +183,8 @@ describe('OpenCodeHostManager', () => {
       hostKey: first.hostKey, pid: first.pid, processStartedAtMs: first.processStartedAtMs,
       resolvedConfigFingerprint: first.resolvedConfigFingerprint,
     })
-    expect(token).not.toBeNull()
+    expect(token).toBeNull()
     await manager.disposeHost(first.hostKey)
-    expect(token!.consume()).toBe(false)
   })
 
   test('starts a fresh persistent host when managed OpenCode auth changes', async () => {
