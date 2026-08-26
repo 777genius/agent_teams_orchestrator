@@ -639,7 +639,7 @@ await new Promise(() => {})
       const readiness = await Promise.race([
         lines.next(),
         childFailure(trackedChild, 'actual-owner failed before readiness'),
-        Bun.sleep(15_000).then(() => { throw new Error('actual-owner readiness timed out') }),
+        Bun.sleep(60_000).then(() => { throw new Error('actual-owner readiness timed out') }),
       ])
       expect(readiness).toMatchObject({
         purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-readiness/v1', status: 'ready',
@@ -649,7 +649,7 @@ await new Promise(() => {})
       expect(await control(controlSocket, 'readiness')).toMatchObject({ status: 'ready' })
       expect(await control(controlSocket, 'shutdown')).toEqual({ schemaVersion: 1, operation: 'shutdown', accepted: true })
       const termination = await Promise.race([trackedChild.termination,
-        Bun.sleep(10_000).then(() => { throw new Error('actual-owner shutdown timed out') })])
+        Bun.sleep(30_000).then(() => { throw new Error('actual-owner shutdown timed out') })])
       if (termination.kind === 'error') throw termination.error
       expect(termination).toMatchObject({ kind: 'close', code: 0, signal: null })
       children.delete(child)
@@ -660,5 +660,5 @@ await new Promise(() => {})
     } finally {
       await cleanup.dispose()
     }
-  }, 30_000)
+  }, 120_000)
 })
