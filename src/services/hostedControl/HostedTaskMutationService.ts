@@ -10,7 +10,7 @@ import { PinnedPosixDirectory } from './PinnedPosixDirectory.internal.js'
 
 type BoardState = { sourceGeneration: string; revision: string; directories: { team: [number, number]; tasks: [number, number] }; taskMembership: string[]; rosterGuard: string; roster: Array<[string, string | null]>; allTaskTexts: Map<string, string>; tasks: Map<string, { rawId: string; publicId: string; path: string; text: string; value: Record<string, unknown> }>; kanbanPath: string; kanbanText: string | null; kanban: Record<string, unknown>; ledgerPath: string; ledgerText: string | null; ledger: MutationLedger }
 type SourceState = Pick<BoardState, 'sourceGeneration' | 'directories'>
-type MutationLedger = { schemaVersion: 2; entries: Record<string, LedgerEntry> }
+type MutationLedger = { schemaVersion: 3; epoch: number; entries: Record<string, LedgerEntry> }
 type LedgerEntry = { fingerprint: string; commandId: string; sourceGeneration: string; expectedRevision: string; receipt: HostedTaskMutationReceipt; committedAtMs: number }
 type PlanResult = { writes: HostedMutationWrite[]; result: HostedTaskMutationCommittedResult } | { terminal: HostedTaskMutationTerminalResult }
 type CrashStage = 'after_task_stage' | 'after_task_detach' | 'after_task_write' | 'before_kanban_write' | 'before_terminal'
@@ -78,7 +78,13 @@ export class HostedTaskMutationService {
         if (durableEntry.fingerprint !== request.payload.payloadFingerprint) return { kind: 'conflict', reason: 'idempotency_mismatch', currentSourceGeneration: state.sourceGeneration }
         return { kind: 'idempotent_replay', currentSourceGeneration: state.sourceGeneration, payloadFingerprint: durableEntry.fingerprint, receipt: { ...durableEntry.receipt, outcome: 'idempotent_replay' } }
       }
-      state.revision = await this.#revision(state.sourceGeneration, state.allTaskTexts, state.kanbanText, state.roster)
+      state.revision = await this.#revision(
+        state.sourceGeneration,
+        state.allTaskTexts,
+        state.kanbanText,
+        state.roster,
+        state.ledger.epoch,
+      )
       if (command.expectedRevision !== state.revision) return { kind: 'stale_revision', currentSourceGeneration: state.sourceGeneration, currentRevision: state.revision }
 
       const planned = await this.#plan(state, command, request.payload.payloadFingerprint)
@@ -180,9 +186,17 @@ export class HostedTaskMutationService {
     }
 
     const kanbanAfter = kanbanChanged ? JSON.stringify(kanban, null, 2) : state.kanbanText
-    const revision = await this.#revision(state.sourceGeneration, taskTexts, kanbanAfter, state.roster)
-    const receipt: HostedTaskMutationReceipt = { schemaVersion: 1, outcome: 'committed', commandId: command.commandId, teamId: command.teamId, sourceGeneration: state.sourceGeneration, revision, affectedTaskIds: [...new Set(affected)].sort() }
     const ledger = compactLedger(state.ledger, state.sourceGeneration)
+    if (ledger.epoch >= Number.MAX_SAFE_INTEGER) throw new Error('Hosted mutation ledger epoch exhausted')
+    ledger.epoch += 1
+    const revision = await this.#revision(
+      state.sourceGeneration,
+      taskTexts,
+      kanbanAfter,
+      state.roster,
+      ledger.epoch,
+    )
+    const receipt: HostedTaskMutationReceipt = { schemaVersion: 1, outcome: 'committed', commandId: command.commandId, teamId: command.teamId, sourceGeneration: state.sourceGeneration, revision, affectedTaskIds: [...new Set(affected)].sort() }
     const currentLedgerKey = ledgerKey(command)
     ledger.entries[currentLedgerKey] = { fingerprint, commandId: command.commandId, sourceGeneration: state.sourceGeneration, expectedRevision: command.expectedRevision, receipt, committedAtMs: this.#now() }
     const ledgerAfter = serializeLedgerBounded(ledger, currentLedgerKey)
@@ -240,9 +254,15 @@ export class HostedTaskMutationService {
     return { sourceGeneration, revision: '', directories: source.directories, taskMembership, rosterGuard, roster, allTaskTexts, tasks, kanbanPath, kanbanText, kanban, ledgerPath, ledgerText, ledger }
   }
 
-  async #revision(sourceGeneration: string, tasks: Map<string, string>, kanbanText: string | null, roster: Array<[string, string | null]>): Promise<string> {
+  async #revision(
+    sourceGeneration: string,
+    tasks: Map<string, string>,
+    kanbanText: string | null,
+    roster: Array<[string, string | null]>,
+    ledgerEpoch: number,
+  ): Promise<string> {
     const taskFiles = [...tasks.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, text]) => [name, sha(text)])
-    return `revision_${sha(JSON.stringify({ domain: 'hosted-task-board-revision/v3', sourceGeneration, taskFiles, kanban: kanbanText === null ? null : sha(kanbanText), roster }))}`
+    return `revision_${sha(JSON.stringify({ domain: 'hosted-task-board-revision/v4', sourceGeneration, taskFiles, kanban: kanbanText === null ? null : sha(kanbanText), roster, ledgerEpoch }))}`
   }
 
   async #activeMembers(): Promise<Map<string, string>> {
@@ -496,9 +516,14 @@ function sameRecoveryAuthority(a: HostedControlAuthority, b: HostedControlStable
 function stateConflict(state: BoardState): HostedTaskMutationTerminalResult { return { kind: 'conflict', reason: 'state_conflict', currentSourceGeneration: state.sourceGeneration, currentRevision: state.revision } }
 function ledgerKey(command: HostedTaskMutationCommand): string { return sha(JSON.stringify({ domain: 'hosted-task-board-idempotency-ledger/v3', teamId: command.teamId, sourceGeneration: command.expectedSourceGeneration, idempotencyKey: command.idempotencyKey })) }
 function parseLedger(text: string | null, teamId: string): MutationLedger {
-  if (!text) return { schemaVersion: 2, entries: {} }
+  if (!text) return { schemaVersion: 3, epoch: 0, entries: {} }
   const value = parseRecord(text, 'hosted mutation ledger')
-  if (!hasExactKeys(value, ['schemaVersion', 'entries']) || value.schemaVersion !== 2 || !isRecord(value.entries)) throw new Error('Invalid hosted mutation ledger')
+  const legacy = value.schemaVersion === 2 && hasExactKeys(value, ['schemaVersion', 'entries'])
+  const current = value.schemaVersion === 3 && hasExactKeys(value, ['schemaVersion', 'epoch', 'entries'])
+  if ((!legacy && !current) || !isRecord(value.entries) ||
+    (current && (!Number.isSafeInteger(value.epoch) || (value.epoch as number) < 0))) {
+    throw new Error('Invalid hosted mutation ledger')
+  }
   const entries: Record<string, LedgerEntry> = {}
   for (const [key, raw] of Object.entries(value.entries)) {
     if (!/^[0-9a-f]{64}$/.test(key) || !isRecord(raw) || !hasExactKeys(raw, ['fingerprint', 'commandId', 'sourceGeneration', 'expectedRevision', 'receipt', 'committedAtMs'])) throw new Error('Invalid hosted mutation ledger entry')
@@ -507,7 +532,7 @@ function parseLedger(text: string | null, teamId: string): MutationLedger {
     if (receipt.commandId !== raw.commandId || receipt.sourceGeneration !== raw.sourceGeneration || receipt.teamId !== teamId) throw new Error('Invalid hosted mutation ledger binding')
     entries[key] = { fingerprint: raw.fingerprint, commandId: raw.commandId, sourceGeneration: raw.sourceGeneration, expectedRevision: raw.expectedRevision, receipt, committedAtMs: raw.committedAtMs } as LedgerEntry
   }
-  return { schemaVersion: 2, entries }
+  return { schemaVersion: 3, epoch: current ? value.epoch as number : 0, entries }
 }
 function compactLedger(ledger: MutationLedger, sourceGeneration: string): MutationLedger {
   const retained = Object.entries(ledger.entries)
@@ -515,12 +540,12 @@ function compactLedger(ledger: MutationLedger, sourceGeneration: string): Mutati
     .sort(([keyA, a], [keyB, b]) => a.committedAtMs - b.committedAtMs || keyA.localeCompare(keyB))
     .slice(-255)
     .sort(([a], [b]) => a.localeCompare(b))
-  return { schemaVersion: 2, entries: Object.fromEntries(retained) }
+  return { schemaVersion: 3, epoch: ledger.epoch, entries: Object.fromEntries(retained) }
 }
 function serializeLedgerBounded(ledger: MutationLedger, currentKey: string): string {
   const entries = new Map(Object.entries(ledger.entries))
   while (true) {
-    const ordered = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b)); const text = JSON.stringify({ schemaVersion: 2, entries: Object.fromEntries(ordered) }, null, 2)
+    const ordered = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b)); const text = JSON.stringify({ schemaVersion: 3, epoch: ledger.epoch, entries: Object.fromEntries(ordered) }, null, 2)
     if (Buffer.byteLength(text) <= 512 * 1024) return text
     const removable = [...entries.entries()].filter(([key]) => key !== currentKey).sort(([keyA, a], [keyB, b]) => a.committedAtMs - b.committedAtMs || keyA.localeCompare(keyB))[0]
     if (!removable) throw new Error('Hosted mutation ledger entry exceeds 512KiB')

@@ -2,9 +2,8 @@ import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync, type Stats } from 'node:fs'
 import { constants, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { decodeHostedControlAuthority, decodeHostedTaskMutationCommand, fingerprintHostedTaskCommand } from './protocol.js'
 import type { HostedControlAuthority, HostedTaskMutationCommand, HostedTaskMutationCommittedResult, HostedTaskMutationReceipt } from './protocol.js'
 
@@ -62,6 +61,7 @@ export type HostedTaskMutationWalOptions = {
   processIdentity?: { processInstanceId: string; processStartIdentity: string }
   isProcessIdentityAlive?: (pid: number, processStartIdentity: string) => boolean
   getProcessStartIdentity?: (pid: number) => string | null
+  durabilityHook?: (stage: 'temp_written' | 'temp_synced' | 'renamed' | 'parent_synced') => void | Promise<void>
 }
 
 export class HostedTaskMutationWal {
@@ -72,6 +72,7 @@ export class HostedTaskMutationWal {
   readonly #processInstanceId: string
   readonly #processStartIdentity: string
   readonly #isProcessIdentityAlive: (pid: number, processStartIdentity: string) => boolean
+  readonly #durabilityHook?: HostedTaskMutationWalOptions['durabilityHook']
   constructor(private readonly directory: string, private readonly teamId: string, options: string | HostedTaskMutationWalOptions = {}) {
     const identity = typeof options === 'string'
       ? { processInstanceId: options, processStartIdentity: defaultProcessStartIdentity() }
@@ -84,6 +85,7 @@ export class HostedTaskMutationWal {
         const current = (options.getProcessStartIdentity ?? readProcessStartIdentity)(pid)
         return current !== null && current === recorded
       })
+    this.#durabilityHook = typeof options === 'string' ? undefined : options.durabilityHook
     this.#path = join(directory, 'hosted-task-board-mutation.wal.v1.json')
     this.#fencePath = join(directory, 'hosted-task-board-mutation.fence.v1.json')
   }
@@ -198,7 +200,44 @@ export class HostedTaskMutationWal {
     const text = JSON.stringify(state); if (Buffer.byteLength(text) > MAX_WAL_BYTES) throw new Error('Hosted WAL exceeds 8MiB')
     if (!(await this.ownsActiveFence())) throw new Error('Hosted WAL write requires active fence')
     await assertPrivateDirectory(this.directory)
-    await writeFileAtomic(this.#path, text, { mode: 0o600 }); await fsyncFileAndParent(this.#path)
+    await this.#writeFileDurably(text)
+  }
+  async #writeFileDurably(text: string): Promise<void> {
+    const parentPath = dirname(this.#path)
+    const parent = await open(parentPath, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
+    const temporary = join(parentPath, `.${basename(this.#path)}.tmp.${process.pid}.${randomUUID()}`)
+    let temporaryHandle: Awaited<ReturnType<typeof open>> | null = null
+    let renamed = false
+    try {
+      const parentIdentity = await parent.stat()
+      const currentParent = await lstat(parentPath)
+      if (!parentIdentity.isDirectory() || !currentParent.isDirectory() || currentParent.isSymbolicLink() ||
+        currentParent.dev !== parentIdentity.dev || currentParent.ino !== parentIdentity.ino) {
+        throw new Error('Hosted WAL parent was substituted')
+      }
+      temporaryHandle = await open(
+        temporary,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      )
+      await temporaryHandle.writeFile(text)
+      await this.#durabilityHook?.('temp_written')
+      await temporaryHandle.sync()
+      await this.#durabilityHook?.('temp_synced')
+      await temporaryHandle.close()
+      temporaryHandle = null
+      await rename(temporary, this.#path)
+      renamed = true
+      await this.#durabilityHook?.('renamed')
+      await parent.sync()
+      await this.#durabilityHook?.('parent_synced')
+    } catch (error) {
+      await temporaryHandle?.close().catch(() => undefined)
+      if (!renamed) await unlink(temporary).catch(() => undefined)
+      throw error
+    } finally {
+      await parent.close()
+    }
   }
   async #read(): Promise<State | null> {
     const handle = await open(this.#path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }); if (!handle) return null

@@ -318,6 +318,84 @@ describe('HostedTaskMutationService', () => {
     expect(await service.recover()).toBe(false)
   })
 
+  test('keeps an evicted replay stale after 255 later ledger entries, semantic cycling, and restart recovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-ledger-epoch-')); roots.push(root)
+    const teamDirectory = join(root, 'teams', 'legacy')
+    const tasksDirectory = join(root, 'tasks', 'legacy')
+    await mkdir(teamDirectory, { recursive: true }); await mkdir(tasksDirectory, { recursive: true })
+    const teamId = `team_${'e'.repeat(32)}`
+    const authority = authorityFor(teamId)
+    const taskPath = join(tasksDirectory, 'existing.json')
+    await writeFile(taskPath, `${JSON.stringify({ id: 'existing', subject: 'A', status: 'pending', blocks: [], blockedBy: [] }, null, 2)}\n`)
+    const wal = new HostedTaskMutationWal(teamDirectory, teamId)
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal })
+    const first = await runCommand(service, authority, {
+      schemaVersion: 1, kind: 'update_details', commandId: 'command_epoch_first',
+      idempotencyKey: 'epoch-first', teamId, expectedSourceGeneration: 'generation_stale',
+      expectedRevision: 'revision_stale', taskId: publicId(teamId, 'existing'), subject: 'B',
+    })
+    expect(first.result.kind).toBe('committed')
+    if (first.result.kind !== 'committed') return
+    const firstRequest = requestFor(authority, first.command)
+
+    const ledgerPath = join(teamDirectory, 'hosted-task-board-mutation-ledger.v2.json')
+    const ledger = JSON.parse(await readFile(ledgerPath, 'utf8')) as {
+      schemaVersion: number
+      epoch: number
+      entries: Record<string, Record<string, unknown>>
+    }
+    const firstEntry = Object.values(ledger.entries)[0]!
+    for (let index = 0; index < 255; index += 1) {
+      const commandId = `command_epoch_seed_${index}`
+      const key = createHash('sha256').update(`epoch-seed-${index}`).digest('hex')
+      ledger.entries[key] = {
+        ...structuredClone(firstEntry),
+        commandId,
+        committedAtMs: (firstEntry.committedAtMs as number) + index + 1,
+        receipt: {
+          ...(structuredClone(firstEntry.receipt) as Record<string, unknown>),
+          commandId,
+          affectedTaskIds: [],
+        },
+      }
+    }
+    ledger.schemaVersion = 3
+    ledger.epoch = 256
+    await writeFile(ledgerPath, JSON.stringify(ledger, null, 2), { mode: 0o600 })
+
+    const away = await runCommand(service, authority, {
+      ...first.command,
+      commandId: 'command_epoch_away', idempotencyKey: 'epoch-away',
+      expectedRevision: 'revision_stale', subject: 'C',
+    })
+    expect(away.result.kind).toBe('committed')
+    let cut = false
+    const crashing = new HostedTaskMutationService({
+      claudeRoot: root, legacyKey: 'legacy', authority, wal,
+      crashHook: stage => {
+        if (stage === 'before_terminal' && !cut) { cut = true; throw new Error('cut') }
+      },
+    })
+    const back = await runCommand(crashing, authority, {
+      ...first.command,
+      commandId: 'command_epoch_back', idempotencyKey: 'epoch-back',
+      expectedRevision: 'revision_stale', subject: 'A',
+    })
+    expect(back.result.kind).toBe('unavailable')
+
+    const restarted = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal })
+    expect(await restarted.recover()).toBe(true)
+    expect(JSON.parse(await readFile(taskPath, 'utf8')).subject).toBe('A')
+    const replayOne = await restarted.mutate(firstRequest)
+    const replayTwo = await restarted.mutate(firstRequest)
+    expect(replayOne.kind).toBe('stale_revision')
+    expect(replayTwo.kind).toBe('stale_revision')
+    expect(JSON.parse(await readFile(taskPath, 'utf8')).subject).toBe('A')
+    const compacted = JSON.parse(await readFile(ledgerPath, 'utf8')) as { epoch: number; entries: Record<string, unknown> }
+    expect(compacted.epoch).toBe(258)
+    expect(Object.keys(compacted.entries)).toHaveLength(256)
+  }, 20_000)
+
   test('recovers prepared writes under a fresh boot but rejects stable authority drift', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-service-fresh-boot-')); roots.push(root)
     await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })

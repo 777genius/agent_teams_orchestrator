@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fingerprintHostedTaskCommand } from './protocol.js'
@@ -46,6 +46,39 @@ describe('HostedTaskMutationWal', () => {
     invalidLayout.intent.writes.push(structuredClone(invalidLayout.intent.writes[0]))
     await writeFile(wal.path, JSON.stringify(invalidLayout), { mode: 0o600 })
     await expect(new HostedTaskMutationWal(root, scope.teamId).lookup(scope)).rejects.toThrow('write layout')
+  })
+
+  test('orders WAL durability before publication and leaves crash-recoverable states at each fault boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-wal-durability-order-')); roots.push(root)
+    const teamId = `team_${'7'.repeat(32)}`
+    const scope = { teamId, sourceGeneration: 'generation_order', idempotencyKey: 'order' }
+    const receipt = { schemaVersion: 1 as const, outcome: 'committed' as const, commandId: 'command_order', teamId, sourceGeneration: scope.sourceGeneration, revision: 'revision_next', affectedTaskIds: [] }
+    const authority = { actorId: 'actor', deploymentId: 'deployment', bootId: 'boot', restoreGeneration: 1, workspaceId: 'workspace', mountBinding: { mountGeneration: 1, declaredRootHash: 'b'.repeat(64) }, teamId }
+    const command = { schemaVersion: 1 as const, kind: 'create_task' as const, commandId: 'command_order', idempotencyKey: scope.idempotencyKey, teamId, expectedSourceGeneration: scope.sourceGeneration, expectedRevision: 'revision_before', subject: 'Subject', description: null, status: 'pending' as const, ownerId: null, column: 'todo' as const, order: 0 }
+    const fingerprint = fingerprintHostedTaskCommand(command)
+    const result = { kind: 'committed' as const, currentSourceGeneration: scope.sourceGeneration, payloadFingerprint: fingerprint, receipt }
+    const ledgerText = '{"schemaVersion":3,"epoch":1,"entries":{}}'
+    const ledgerImage = { existed: true, sha256: createHash('sha256').update(ledgerText).digest('hex'), contentBase64: Buffer.from(ledgerText).toString('base64') }
+    const input = { scope, commandId: command.commandId, payloadFingerprint: fingerprint, expectedRevision: command.expectedRevision, committedResult: result, writes: [{ target: 'ledger' as const, before: { existed: false, sha256: null, contentBase64: null }, after: ledgerImage }], directories: { team: [1, 2] as [number, number], tasks: [1, 3] as [number, number] }, taskMembership: [], rosterGuard: 'a'.repeat(64), authority, command, canonicalScope: { claudeRoot: root, teamDirectory: root, tasksDirectory: root } }
+
+    const stages: string[] = []
+    const ordered = new HostedTaskMutationWal(root, teamId, { durabilityHook: stage => { stages.push(stage) } })
+    await ordered.withFence(async () => { await ordered.appendIntent(input) })
+    expect(stages).toEqual(['temp_written', 'temp_synced', 'renamed', 'parent_synced'])
+
+    await rm(ordered.path)
+    const beforeRename = new HostedTaskMutationWal(root, teamId, {
+      durabilityHook: stage => { if (stage === 'temp_synced') throw new Error('power cut before rename') },
+    })
+    await expect(beforeRename.withFence(async () => beforeRename.appendIntent(input))).rejects.toThrow('power cut before rename')
+    expect(await new HostedTaskMutationWal(root, teamId).lookup(scope)).toEqual({ kind: 'none' })
+    expect((await readdir(root)).some(name => name.includes('.tmp.'))).toBe(false)
+
+    const afterRename = new HostedTaskMutationWal(root, teamId, {
+      durabilityHook: stage => { if (stage === 'renamed') throw new Error('power cut after rename') },
+    })
+    await expect(afterRename.withFence(async () => afterRename.appendIntent(input))).rejects.toThrow('power cut after rename')
+    expect((await new HostedTaskMutationWal(root, teamId).lookup(scope)).kind).toBe('ambiguous')
   })
 
   test('never takes an expired fence from a live PID, even for another process instance', async () => {

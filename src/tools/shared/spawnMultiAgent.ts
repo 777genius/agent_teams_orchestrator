@@ -3160,7 +3160,21 @@ async function handleSpawnNativeProcess(
     child = spawn(exactSpawn.command, exactSpawn.args, exactSpawn.options)
 
     if (!child.pid) {
-      throw new Error(`Failed to spawn teammate process for ${teammateId}: missing pid`)
+      // Node reports an exec failure asynchronously: spawn() still returns a
+      // ChildProcess, but it has no pid and emits error followed by close. Do
+      // not preserve a process:pending blocker until that no-process boundary
+      // is proven and the armed durable claim can be retired safely.
+      let spawnError: Error | null = null
+      await new Promise<void>(resolve => {
+        child!.once('error', error => { spawnError = error })
+        child!.once('close', () => resolve())
+      })
+      child = null
+      throw new Error(
+        `Failed to spawn teammate process for ${teammateId}: missing pid${
+          spawnError ? ` (${spawnError.message})` : ''
+        }`,
+      )
     }
 
     runtimePid = child.pid

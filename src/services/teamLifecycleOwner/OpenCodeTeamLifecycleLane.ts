@@ -56,6 +56,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   async inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode' || !input.runId) return idle()
     return this.#serialized(input, async () => {
+      await assertEffectGuard(input)
       const data = await this.#execute('opencode.reconcileTeam', input.workspaceRoot, {
         runId: input.runId,
         laneId: input.lane.laneId,

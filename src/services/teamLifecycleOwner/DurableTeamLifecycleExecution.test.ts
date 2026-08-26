@@ -831,6 +831,62 @@ describe('OpenCodeTeamLifecycleLane', () => {
     expect(calls).toHaveLength(1)
   })
 
+  test('revalidates startup recovery inspection after its lane queue waits', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-queued-recovery-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    let releaseFirst!: () => void
+    let markFirstStarted!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
+    const calls: string[] = []
+    let blockNext = false
+    const execute = (async (input: unknown) => {
+      calls.push(String((input as Record<string, unknown>).command))
+      if (blockNext) {
+        blockNext = false
+        markFirstStarted()
+        await firstGate
+      }
+      return {
+        ok: true,
+        data: { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
+      }
+    }) as never
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
+    const crashedOwner = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await crashedOwner.inspect(plan)
+    await crashedOwner.launch({
+      plan, commandId: 'command-before-queued-recovery', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForPhase(crashedOwner, 'running')
+
+    blockNext = true
+    const first = lane.launch({
+      planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_queue_blocker',
+    })
+    await firstStarted
+    const callsBeforeRecovery = [...calls]
+    let current = true
+    let guardChecks = 0
+    let markInspectQueued!: () => void
+    const inspectQueued = new Promise<void>(resolve => { markInspectQueued = resolve })
+    const replacement = new DurableTeamLifecycleExecution(statePath, [lane])
+    const queuedRecovery = replacement.recoverAtStartup(plan, () => {
+      guardChecks += 1
+      if (guardChecks === 3) markInspectQueued()
+      return current
+    })
+    await inspectQueued
+    current = false
+    releaseFirst()
+    await expect(first).resolves.toMatchObject({ phase: 'running' })
+    await expect(queuedRecovery).rejects.toThrow('Unable to adopt recovered team lifecycle run')
+    expect(calls).toEqual(callsBeforeRecovery)
+  })
+
   test('maps an admitted auto plan to explicit automatic wire semantics', async () => {
     let launchBody: Record<string, unknown> | null = null
     const execute = (async (input: unknown) => {

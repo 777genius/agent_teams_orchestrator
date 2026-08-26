@@ -1044,6 +1044,35 @@ describe('supervised process teammate backend e2e', () => {
     runtimePids.push(respawned.data.runtime_pid!)
   }, 15_000)
 
+  it('retires an armed process claim when the executable does not exist and permits retry', async () => {
+    if (process.platform !== 'linux') return
+    const fixture = await createFixture({ trusted: true, mode: 'success' })
+    const fixtureCommand = process.env[TEAMMATE_COMMAND_ENV_VAR]!
+    process.env[TEAMMATE_COMMAND_ENV_VAR] = '/definitely/missing/claude-teammate-command'
+    await expect(__handleSpawnNativeProcessForTests(
+      {
+        name: 'alice', prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName, cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )).rejects.toThrow(/missing pid.*ENOENT/)
+    await waitForCondition(async () =>
+      !(await readTeamFileAsync(fixture.teamName))?.members.some(member => member.name === 'alice') &&
+      fixture.context.getAppState().teamContext?.teammates[`alice@${fixture.teamName}`] === undefined,
+    5_000)
+
+    process.env[TEAMMATE_COMMAND_ENV_VAR] = fixtureCommand
+    const respawned = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice', prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName, cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+    expect(respawned.data.runtime_pid).toBeNumber()
+    runtimePids.push(respawned.data.runtime_pid!)
+  }, 15_000)
+
   it('fails before spawn when workspace trust is missing', async () => {
     const fixture = await createFixture({ trusted: false })
 

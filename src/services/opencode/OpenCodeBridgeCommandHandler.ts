@@ -3221,6 +3221,7 @@ async function runReconcile(
   envelope: BridgeEnvelope,
   lifecycleOwner: boolean,
   effectGuard?: () => boolean | Promise<boolean>,
+  runtimeDeadline?: OpenCodeRuntimeDeadline,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -3232,7 +3233,9 @@ async function runReconcile(
   const expectedMembers = Array.isArray(body.expectedMembers) ? body.expectedMembers : []
   assertUniqueOpenCodeMemberNames(expectedMembers, 'opencode.reconcileTeam expectedMembers')
   if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+  const snapshot = runtimeDeadline
+    ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeProvisioningProbe.probe(envelope.cwd))
+    : await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
@@ -3242,7 +3245,8 @@ async function runReconcile(
   let selectedModel = 'unknown/unknown'
 
   const lifecycleRecords = lifecycleOwner
-    ? (await openCodeSessionStore.list()).filter(record => record.teamId === teamId && record.laneId === laneId)
+    ? (await runtimeDeadline!.runPhase('provider_mutation', () => openCodeSessionStore.list()))
+      .filter(record => record.teamId === teamId && record.laneId === laneId)
     : null
   const expectedNames = expectedMembers
     .map(item => asString(asRecord(item)?.name))
@@ -3325,7 +3329,12 @@ async function runReconcile(
     }
     try {
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-      const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+      const reconciled = runtimeDeadline
+        ? await runtimeDeadline.runPhase(
+            'provider_mutation',
+            () => openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
+          )
+        : await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
       const bootstrapFailure = summarizeBootstrapMcpFailure(record, reconciled.summary)
       const memberDiagnostics = [
         ...reconciled.summary.diagnostics,
@@ -3354,6 +3363,7 @@ async function runReconcile(
         diagnostics: memberDiagnostics,
       }
     } catch (error) {
+      if (isOpenCodeRuntimeDeadlineError(error) || runtimeDeadline?.signal.aborted) throw error
       const reason = error instanceof Error ? error.message : String(error)
       members[name] = {
         sessionId: record.opencodeSessionId,
@@ -3390,6 +3400,7 @@ async function runStop(
   envelope: BridgeEnvelope,
   lifecycleOwner: boolean,
   effectGuard?: () => boolean | Promise<boolean>,
+  runtimeDeadline?: OpenCodeRuntimeDeadline,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -3409,12 +3420,16 @@ async function runStop(
     throw new Error('opencode.stopTeam lifecycle owner requires a unique admitted member set')
   }
   if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+  const snapshot = runtimeDeadline
+    ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeProvisioningProbe.probe(envelope.cwd))
+    : await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
-  const records = (await openCodeSessionStore.list()).filter(
+  const records = (await (runtimeDeadline
+    ? runtimeDeadline.runPhase('provider_mutation', () => openCodeSessionStore.list())
+    : openCodeSessionStore.list())).filter(
     record => record.teamId === teamId && record.laneId === laneId,
   )
   const staleRun = lifecycleOwner ? records.find(record => record.runId !== runId) : undefined
@@ -3454,13 +3469,28 @@ async function runStop(
     }
     let stopped = false
     const memberDiagnostics: string[] = []
+    let operationError: unknown = null
     try {
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-      stopped = await openCodeSessionBridge.abort(record)
+      stopped = runtimeDeadline
+        ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeSessionBridge.abort(record))
+        : await openCodeSessionBridge.abort(record)
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-      await openCodeSessionBridge.releaseSession(record)
     } catch (error) {
+      operationError = error
       memberDiagnostics.push(error instanceof Error ? error.message : String(error))
+    } finally {
+      // A provider abort may ignore cancellation forever. Root lease release is
+      // independent teardown and must still run so owner shutdown cannot retain
+      // the host solely because the abort RPC failed to acknowledge.
+      if (!operationError || lifecycleOwner) {
+        await openCodeSessionBridge.releaseSession(record).catch(error => {
+          memberDiagnostics.push(error instanceof Error ? error.message : String(error))
+        })
+      }
+    }
+    if (operationError && (isOpenCodeRuntimeDeadlineError(operationError) || runtimeDeadline?.signal.aborted)) {
+      throw operationError
     }
     members[record.memberName] = {
       sessionId: record.opencodeSessionId,
@@ -3477,7 +3507,7 @@ async function runStop(
   for (const projectPath of cleanupProjectPaths) {
     try {
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-      const cleanup = await openCodeHostManager.reconcilePersistentHosts({
+      const cleanupHosts = () => openCodeHostManager.reconcilePersistentHosts({
         mode: 'stale',
         reason: 'stopTeam',
         projectPath,
@@ -3485,6 +3515,9 @@ async function runStop(
         leaseStaleAgeMs: null,
         preflightLeaseStaleAgeMs: null,
       })
+      const cleanup = runtimeDeadline
+        ? await runtimeDeadline.runPhase('provider_mutation', cleanupHosts)
+        : await cleanupHosts()
       if (cleanup.cleaned > 0) {
         diagnostics.push({
           code: 'opencode_host_cleanup',
@@ -3500,6 +3533,7 @@ async function runStop(
         })
       }
     } catch (error) {
+      if (isOpenCodeRuntimeDeadlineError(error) || runtimeDeadline?.signal.aborted) throw error
       diagnostics.push({
         code: 'opencode_host_cleanup_failed',
         severity: 'warning',
@@ -4626,9 +4660,15 @@ async function handleEnvelope(
       }
       return runLaunch(envelope, runtimeDeadline, effectGuard, lifecycleOwner)
     case 'opencode.reconcileTeam':
-      return runReconcile(envelope, lifecycleOwner, effectGuard)
+      if (lifecycleOwner && !runtimeDeadline) {
+        throw new Error('OpenCode reconcile deadline was not initialized')
+      }
+      return runReconcile(envelope, lifecycleOwner, effectGuard, runtimeDeadline)
     case 'opencode.stopTeam':
-      return runStop(envelope, lifecycleOwner, effectGuard)
+      if (lifecycleOwner && !runtimeDeadline) {
+        throw new Error('OpenCode stop deadline was not initialized')
+      }
+      return runStop(envelope, lifecycleOwner, effectGuard, runtimeDeadline)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery':
@@ -4735,9 +4775,12 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
     )
   }
 
+  const lifecycleOwner = ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY
   const runtimeDeadline = (
     envelope.command === 'opencode.readiness'
     || envelope.command === 'opencode.launchTeam'
+    || (lifecycleOwner && envelope.command === 'opencode.reconcileTeam')
+    || (lifecycleOwner && envelope.command === 'opencode.stopTeam')
   )
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
@@ -4745,17 +4788,24 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
   if (externalSignal?.aborted) abortForExternalSignal()
   else externalSignal?.addEventListener('abort', abortForExternalSignal, { once: true })
   try {
+    const fencedEffectGuard = lifecycleOwner
+      ? async () => {
+          runtimeDeadline?.throwIfExpired('provider_mutation')
+          if (externalSignal?.aborted) throwOpenCodeAbortReason(externalSignal)
+          return effectGuard ? effectGuard() : true
+        }
+      : effectGuard
     const operation = handleEnvelope(
       envelope,
       runtimeDeadline,
-      ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
-      effectGuard,
+      lifecycleOwner,
+      fencedEffectGuard,
     )
     // The hosted owner must not return while an aborted provider operation can
     // still settle and mutate state. Its guarded launch path synchronously
     // accounts and compensates late completion; public callers retain the
     // ordinary responsive abort race.
-    const result = ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY
+    const result = lifecycleOwner
       ? await operation
       : await raceOpenCodeAbortSignal(operation, externalSignal)
     if (envelope.command === 'opencode.readiness') {

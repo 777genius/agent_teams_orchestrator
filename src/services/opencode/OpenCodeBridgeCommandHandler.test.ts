@@ -5850,6 +5850,45 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.error.message).toContain('does not exactly match the admitted run/member set')
   })
 
+  test('bounds lifecycle-owner reconcile on external cancellation without later member effects', async () => {
+    const reconcile = createDeferred<Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>>()
+    let reconcileCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-hung-reconcile',
+        toolApprovalMode: 'manual',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.reconcileSession = (() => {
+      reconcileCalls += 1
+      return reconcile.promise
+    }) as typeof openCodeSessionBridge.reconcileSession
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const pending = createOwnedOpenCodeLifecycleCommandExecutor()(buildEnvelope('opencode.reconcileTeam', {
+      runId: 'run-owned-hung-reconcile', laneId: 'opencode-lane', teamId: 'team-a',
+      projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free',
+      selectedVariant: null, toolApprovalMode: 'manual',
+      expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free', variant: null }],
+    }), { signal: controller.signal })
+    setTimeout(() => controller.abort(new Error('reconcile authority expired')), 25).unref?.()
+    const result = await pending
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(result.ok).toBe(false)
+    expect(reconcileCalls).toBe(1)
+
+    reconcile.resolve({
+      record: buildRecord({
+        laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-hung-reconcile',
+        toolApprovalMode: 'manual',
+      }),
+      summary: buildReconcileSummary({ sessionId: 'session-alice' }),
+    })
+    await Bun.sleep(25)
+    expect(reconcileCalls).toBe(1)
+  })
+
   test('rejects reconcile before probing runtime when duplicate expected member names are provided', async () => {
     let probeCalls = 0
     const getCalls: string[] = []
@@ -6291,6 +6330,40 @@ describe('OpenCodeBridgeCommandHandler', () => {
       stopped: false,
       diagnostics: ['Admitted OpenCode session record is missing'],
     })
+  })
+
+  test('bounds lifecycle-owner stop when provider abort never settles and still releases the root lease', async () => {
+    const abort = createDeferred<boolean>()
+    const released: string[] = []
+    let cleanupCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({ laneId: 'opencode-lane', memberName: 'alice', runId: 'run-owned-hung-stop' }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.abort = (() => abort.promise) as typeof openCodeSessionBridge.abort
+    openCodeSessionBridge.releaseSession = (async record => { released.push(record.memberName) }) as typeof openCodeSessionBridge.releaseSession
+    openCodeHostManager.reconcilePersistentHosts = (async () => {
+      cleanupCalls += 1
+      return { cleaned: 0, remaining: 0, hosts: [], diagnostics: [] }
+    }) as typeof openCodeHostManager.reconcilePersistentHosts
+
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const stopping = createOwnedOpenCodeLifecycleCommandExecutor()(buildEnvelope('opencode.stopTeam', {
+        runId: 'run-owned-hung-stop', laneId: 'opencode-lane', teamId: 'team-a',
+        expectedMembers: [{ name: 'alice' }],
+      }), { signal: controller.signal })
+    setTimeout(() => controller.abort(new Error('compensation deadline exceeded')), 25).unref?.()
+    const result = await stopping
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(result.ok).toBe(false)
+    expect(released).toEqual(['alice'])
+    expect(cleanupCalls).toBe(0)
+
+    abort.resolve(true)
+    await Bun.sleep(25)
+    expect(released).toEqual(['alice'])
+    expect(cleanupCalls).toBe(0)
   })
 
   test('lifecycle-owner stop also retires unadmitted sessions proven to belong to the exact run', async () => {

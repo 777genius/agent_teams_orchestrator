@@ -463,6 +463,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         lane,
         runId,
         recoveryBinding: expectedBinding,
+        effectGuard,
       })
       assertRecoveryBinding(lane.laneId, expectedBinding, observation)
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
