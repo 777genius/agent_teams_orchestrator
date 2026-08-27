@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -454,6 +454,103 @@ describe('OpenCode production launch composition', () => {
         .trim().split('\n')
       expect(allPidLines).toHaveLength(4)
       for (const line of allPidLines) expect(isProcessAlive(Number(line.split(':')[1]))).toBe(false)
+
+      // A deterministic unhealthy response exercises failed-health rollback
+      // through the same production composition. Exact native containment is
+      // strongly reaped, so the bound acquisition obligation may be cleared.
+      await writeFile(path.join(data, 'static-host-fixture.mode'), 'unhealthy\n')
+      const unhealthyValue = structuredClone(value)
+      unhealthyValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee666666'
+      unhealthyValue.request.launchAttempt.payloadHash = '6'.repeat(64)
+      unhealthyValue.request.launchAttempt.proofNonce = 'AwMDAwMDAwMDAwMDAwMDAw'
+      unhealthyValue.request.launchAttempt.parent = {
+        sessionIdentity: identity('3'), messageIdentity: identity('4'),
+      }
+      unhealthyValue.members = [{ name: 'unhealthy', memberIdentity: identity('6') }]
+      unhealthyValue.preconditions.idempotencyKey = unhealthyValue.request.launchAttempt.attemptId
+      unhealthyValue.preconditions.commandLeaseId = 'lease-unhealthy'
+      unhealthyValue.request.launchAttempt.requestCorrelationDigest =
+        computeOpenCodeLaunchRequestCorrelationDigest(unhealthyValue)
+      const unhealthy = await createBridge().execute(unhealthyValue)
+      expect(unhealthy.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      const unhealthyLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+        'launch-attempts', `${unhealthyValue.request.launchAttempt.attemptId}.host-release.json`))
+      expect(await unhealthyLedger.read({ attemptId: unhealthyValue.request.launchAttempt.attemptId,
+        payloadHash: unhealthyValue.request.launchAttempt.payloadHash, generation: 1 })).toBeNull()
+      const unhealthyPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+        .trim().split('\n').slice(4)
+      expect(unhealthyPidLines).toHaveLength(2)
+      for (const line of unhealthyPidLines) expect(isProcessAlive(Number(line.split(':')[1]))).toBe(false)
+
+      if (process.platform === 'linux') {
+      // Fail before health after the native leader has exited while its
+      // TERM-resistant grandchild remains in the owned containment unit. The
+      // actual production acquisition must turn the prepublished obligation
+      // into an immutable pending receipt, and a fresh runtime may project
+      // only the durable incomplete terminal until exact native proof exists.
+      await writeFile(path.join(data, 'static-host-fixture.mode'), 'leader-exit\n')
+      const failedValue = structuredClone(value)
+      failedValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee777777'
+      failedValue.request.launchAttempt.payloadHash = '7'.repeat(64)
+      failedValue.request.launchAttempt.proofNonce = 'AgICAgICAgICAgICAgICAg'
+      failedValue.request.launchAttempt.parent = {
+        sessionIdentity: identity('5'), messageIdentity: identity('6'),
+      }
+      failedValue.members = [{ name: 'failed-startup', memberIdentity: identity('7') }]
+      failedValue.preconditions.idempotencyKey = failedValue.request.launchAttempt.attemptId
+      failedValue.preconditions.commandLeaseId = 'lease-failed-startup'
+      failedValue.requestedBudgetMs = 10_000
+      failedValue.outerRemainingBudgetMs = 10_000
+      failedValue.request.launchAttempt.requestCorrelationDigest =
+        computeOpenCodeLaunchRequestCorrelationDigest(failedValue)
+      const failed = await createBridge().execute(failedValue)
+      expect(failed.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      const failedLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+        'launch-attempts', `${failedValue.request.launchAttempt.attemptId}.host-release.json`))
+      let failedReceipt = null
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        failedReceipt = await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
+          payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }).catch(() => null)
+        if (failedReceipt) break
+        await Bun.sleep(20)
+      }
+      expect(failedReceipt)
+        .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
+      const blockedReplay = await createBridge().execute(failedValue)
+      expect(blockedReplay.data?.launchAttempt).toEqual(failed.data?.launchAttempt)
+      const failedPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+        .trim().split('\n').slice(6)
+      expect(failedPidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
+      const failedGrandchild = Number(failedPidLines.find(line => line.startsWith('grandchild:'))!
+        .split(':')[1])
+      expect(isProcessAlive(failedGrandchild)).toBe(true)
+      process.kill(failedGrandchild, 'SIGKILL')
+      for (let attempt = 0; attempt < 100 && isProcessAlive(failedGrandchild); attempt += 1) {
+        await Bun.sleep(10)
+      }
+      await createBridge().execute(failedValue)
+      expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
+        payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
+        .toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
+      } else {
+        // The production bridge above proved the complete acquisition and
+        // native launcher chain. Now keep one real launcher/job receipt pending
+        // across a HostManager restart: without the owning handle, Windows
+        // must fail closed and issue no PID-only tree mutation.
+        await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
+        const prepared = await profileManager.prepareScopedProfile(
+          current, profileManager.planScopedProfile(current),
+        )
+        const owningManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+        const reference = await owningManager.ensureScopedHostReference({
+          preparedProfile: prepared, expectedHostKey: prepared.plannedHostKey,
+        })
+        const restartReceipt = owningManager.hostReleaseReceipt(reference)
+        const restartedManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+        await expect(restartedManager.reconcileHostReleaseReceipt(restartReceipt))
+          .rejects.toThrow('cleanup remains incomplete')
+        await owningManager.releaseHostReference(reference)
+      }
     } finally {
       restoreEnvironment()
       await rm(root, { recursive: true, force: true })

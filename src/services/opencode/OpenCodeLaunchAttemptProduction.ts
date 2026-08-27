@@ -1120,11 +1120,44 @@ class OpenCodeProductionLaunchRuntime {
               expectedHostKey: prepared.plannedHostKey,
               healthTimeoutMs: Math.max(1, input.deadlineAtMs - launchMonotonicNow()), abortSignal: input.signal })
           } catch (error) {
-            if (error instanceof OpenCodeOperationHostAcquisitionCleanupError
-              || (error && typeof error === 'object'
-                && (error as { cleanupIncomplete?: unknown }).cleanupIncomplete === true)) throw error
-            await hostReleaseLedger.clearObligation(obligation,
-              { deadlineAtMs: productionDeadlineAtMs, signal: input.signal })
+            if (error instanceof OpenCodeOperationHostAcquisitionCleanupError) throw error
+            if (error && typeof error === 'object'
+              && (error as { cleanupIncomplete?: unknown }).cleanupIncomplete === true) {
+              const startup = (error as { startupCleanupReceipt?: {
+                hostKey: string
+                receipt: OpenCodeLaunchHostReleaseRecord['receipt']
+              } }).startupCleanupReceipt
+              if (startup) {
+                const reserveController = new AbortController()
+                const reserveDeadlineAtMs = launchMonotonicNow() + 10_000
+                await hostReleaseLedger.record({
+                  schemaVersion: 3,
+                  obligationId: obligation.obligationId,
+                  attemptId: obligation.attemptId,
+                  payloadHash: obligation.payloadHash,
+                  generation: obligation.generation,
+                  hostKeyIdentity: opaque({ hostKey: startup.hostKey }),
+                  disposition: 'dispose',
+                  releaseState: 'pending',
+                  receipt: startup.receipt,
+                }, { deadlineAtMs: reserveDeadlineAtMs, signal: reserveController.signal })
+                  .catch(() => undefined)
+              }
+              throw new OpenCodeOperationHostAcquisitionCleanupError(error)
+            }
+            // HostManager only rejects ordinarily after proving its exact
+            // native containment empty. Durably clear the matching obligation
+            // with a private bounded reserve; cancellation of the launch
+            // envelope cannot turn a failed clear into cleanup-complete.
+            const clearController = new AbortController()
+            const clearDeadlineAtMs = launchMonotonicNow() + 10_000
+            try {
+              await hostReleaseLedger.clearObligation(obligation,
+                { deadlineAtMs: clearDeadlineAtMs, signal: clearController.signal })
+            } catch (clearError) {
+              clearController.abort(clearError)
+              throw new OpenCodeOperationHostAcquisitionCleanupError(clearError)
+            }
             throw error
           }
           const handle = reference.handle

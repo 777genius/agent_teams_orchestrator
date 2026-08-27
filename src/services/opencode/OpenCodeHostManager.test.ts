@@ -1899,10 +1899,11 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       spawnHostProcess: () => createMockChildProcess(44130).child,
       fetchJson: async () => ({ status: 200, data: { healthy: true } }),
       isProcessAlive: () => false,
+      isProcessGroupAlive: () => false,
       killProcess: () => {},
       afterPersistentRegistryWrite: async () => {
         writes += 1
-        if (writes === 1) {
+        if (writes === 2) {
           upsertPublished.resolve()
           await releasePublication.promise
         }
@@ -3272,7 +3273,7 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
-  test('removes a reused registry pid without disposing or signaling the unrelated process', async () => {
+  test('retains a reused registry pid tombstone while original containment remains live', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
     const fetchUrls: string[] = []
@@ -3309,6 +3310,7 @@ describe('OpenCodeHostManager', () => {
           return { status: 200, data: { ok: true } }
         },
         isProcessAlive: pid => pid === 43114,
+        isProcessGroupAlive: pid => pid === 43114,
         readProcessStartTimeMs: async () => 2_000,
         killProcess: (_pid, signal) => {
           killedSignals.push(signal)
@@ -3321,14 +3323,14 @@ describe('OpenCodeHostManager', () => {
         mode: 'force',
       })
 
-      expect(result.cleaned).toBe(1)
+      expect(result.cleaned).toBe(0)
       expect(result.hosts[0]).toMatchObject({
-        action: 'removed_dead',
-        reason: 'registered pid was reused by a different process',
+        action: 'failed',
+        reason: 'leader exited during identity verification but containment remains unproven',
       })
       expect(fetchUrls).toEqual([])
       expect(killedSignals).toEqual([])
-      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      await expect(readFile(registryPath, 'utf8')).resolves.toContain('host-key')
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -3436,6 +3438,7 @@ describe('OpenCodeHostManager', () => {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
         },
         isProcessAlive: pid => pid === 43114,
+        isProcessGroupAlive: pid => pid === 43114,
         readProcessStartTimeMs: async () => {
           startTimeReadCount += 1
           return startTimeReadCount === 1 ? 1_000 : 2_000
@@ -3447,10 +3450,10 @@ describe('OpenCodeHostManager', () => {
       })
 
       await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
-        'fresh host requested after pid reuse',
+        'containment cleanup is incomplete',
       )
       expect(fetchUrls).toEqual(['http://127.0.0.1:43114/global/health'])
-      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      await expect(readFile(registryPath, 'utf8')).resolves.toContain('host-key')
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -3851,6 +3854,7 @@ describe('OpenCodeHostManager', () => {
     const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
     let nowMs = 0
     let healthCalls = 0
+    let processAlive = true
 
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
@@ -3873,9 +3877,11 @@ describe('OpenCodeHostManager', () => {
           data: {},
         }
       },
-      isProcessAlive: pid => pid === spawned.child.pid,
+      isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      isProcessGroupAlive: pid => pid === spawned.child.pid && processAlive,
       killProcess: (pid, signal) => {
         killedSignals.push({ pid, signal })
+        if (signal === 'SIGKILL') processAlive = false
       },
       now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
       sleepMs: async () => {
@@ -3890,6 +3896,7 @@ describe('OpenCodeHostManager', () => {
     })
 
     const message = thrown instanceof Error ? thrown.message : String(thrown)
+    expect(thrown).toMatchObject({ cleanupDisposition: 'complete', cleanupIncomplete: false })
     expect(message).toContain('OpenCode host did not become healthy')
     expect(message).toContain('stdout: server booting')
     expect(message).toContain('stderr: waiting for config')
@@ -3901,10 +3908,37 @@ describe('OpenCodeHostManager', () => {
     ])
   })
 
+  test('failed startup reports incomplete cleanup when TERM exits leader but descendant survives', async () => {
+    const spawned = createMockChildProcess(43_135)
+    let leaderAlive = true
+    let descendantAlive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43_135,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 503, data: { healthy: false } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 43_135 && leaderAlive,
+      isProcessGroupAlive: pid => pid === 43_135 && (leaderAlive || descendantAlive),
+      killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const failure = manager.ensureHost({ hostKey: 'failed-startup', healthTimeoutMs: 1 })
+    await expect(failure).rejects.toMatchObject({ cleanupIncomplete: true })
+    expect(signals).toEqual(['SIGTERM'])
+    expect(descendantAlive).toBe(true)
+    descendantAlive = false
+  })
+
   test('uses a caller-provided host health timeout during startup verification', async () => {
     const spawned = createMockChildProcess(43136)
     const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
     let nowMs = 0
+    let processAlive = true
 
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
@@ -3922,9 +3956,11 @@ describe('OpenCodeHostManager', () => {
           data: {},
         }
       },
-      isProcessAlive: pid => pid === spawned.child.pid,
+      isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      isProcessGroupAlive: pid => pid === spawned.child.pid && processAlive,
       killProcess: (pid, signal) => {
         killedSignals.push({ pid, signal })
+        if (signal === 'SIGKILL') processAlive = false
       },
       now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
       sleepMs: async ms => {

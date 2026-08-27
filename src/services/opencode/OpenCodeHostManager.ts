@@ -70,6 +70,30 @@ const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
+
+/** Startup created native containment whose complete rollback was not proved. */
+export class OpenCodeHostStartupCleanupError extends Error {
+  readonly cleanupDisposition: 'complete' | 'incomplete'
+  readonly cleanupIncomplete: boolean
+  readonly startupCleanupReceipt?: Readonly<{
+    hostKey: string
+    receipt: OpenCodeHostReleaseReceipt
+  }>
+
+  constructor(cleanupDisposition: 'complete' | 'incomplete', cause?: unknown,
+    startupCleanupReceipt?: Readonly<{
+    hostKey: string
+    receipt: OpenCodeHostReleaseReceipt
+  }>, message = cleanupDisposition === 'complete'
+      ? 'OpenCode host startup failed after complete cleanup'
+      : 'OpenCode host startup cleanup is incomplete') {
+    super(message, { cause })
+    this.name = 'OpenCodeHostStartupCleanupError'
+    this.cleanupDisposition = cleanupDisposition
+    this.cleanupIncomplete = cleanupDisposition === 'incomplete'
+    this.startupCleanupReceipt = startupCleanupReceipt
+  }
+}
 // Bun/OpenTUI temp dylib prefixes vary between builds (.bbb, .bbc, .b9dd, ...).
 // Keep the match constrained to hidden hexadecimal dylibs inside the app-owned
 // profile tmp directory so unrelated user files are never removed.
@@ -2639,7 +2663,7 @@ export class OpenCodeHostManager {
       }
       const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
       if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-        if (processIdentity.state === 'gone' && !this.persistentContainmentExited(record.pid)) {
+        if (!this.persistentContainmentExited(record.pid)) {
           throw new Error(
             `OpenCode host pid ${record.pid} leader exited during adoption but containment cleanup is incomplete`,
           )
@@ -2673,6 +2697,12 @@ export class OpenCodeHostManager {
         processStartedAtMs: processIdentity.startedAtMs ?? record.processStartedAtMs,
       })
       if (identityAfterHealth.state === 'gone' || identityAfterHealth.state === 'changed') {
+        if (!this.persistentContainmentExited(record.pid)) {
+          throw new Error(
+            `OpenCode host pid ${record.pid} leader identity changed during adoption but ` +
+            'containment cleanup is incomplete',
+          )
+        }
         await removeStaleRecord()
         return null
       }
@@ -2979,12 +3009,24 @@ export class OpenCodeHostManager {
     })
   }
 
-  private async forceKillSpawnedHostProcess(child: ChildProcess): Promise<void> {
+  private async forceKillSpawnedHostProcess(
+    child: ChildProcess,
+    handle: OpenCodeHostHandle,
+  ): Promise<'complete' | 'incomplete'> {
+    if ((this.deps.platform ?? process.platform) === 'win32') {
+      if (await this.killOwnedChildAndWait(
+        child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+      )) return 'complete'
+      return await this.killOwnedChildAndWait(
+        child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+      ) ? 'complete' : 'incomplete'
+    }
     const pid = child.pid
     try {
       if (pid) {
-        if (await this.killProcessAndWait(pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)) {
-          return
+        if (await this.killProcessAndWait(pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+          handle.processStartedAtMs, true, handle.processBirthToken)) {
+          return 'complete'
         }
       } else {
         child.kill('SIGTERM')
@@ -2994,14 +3036,16 @@ export class OpenCodeHostManager {
     }
 
     if (!pid) {
-      return
+      return 'incomplete'
     }
 
     try {
-      await this.killProcessAndWait(pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
+      if (await this.killProcessAndWait(pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+        handle.processStartedAtMs, true, handle.processBirthToken)) return 'complete'
     } catch {
       // Best effort.
     }
+    return this.hasStableProcessContainmentExited(pid) ? 'complete' : 'incomplete'
   }
 
   private hasOwnedChildExited(child: ChildProcess): boolean {
@@ -3195,16 +3239,15 @@ export class OpenCodeHostManager {
 
     let persistentWriteReceipt: PersistentHostWriteReceipt | null = null
     try {
-      const health = await this.waitForHealthyHost(
-        baseUrl,
-        () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
-        abortSignal,
-      )
-      handle.version = health.version
+      // Capture native generation authority before health awaits. Startup can
+      // fail after the fixture has detached descendants, so rollback must not
+      // fall back to leader-only ChildProcess signalling.
+      const startupStartedAtMs = await this.captureProcessStartTimeMs(handle.pid)
+      const startupBirthToken = this.readProcessBirthToken(handle.pid)
+      handle.processStartedAtMs = startupStartedAtMs
+      handle.processBirthToken = startupBirthToken
       handle.resolvedConfigFingerprint = profile.managedConfigFingerprint
-      handle.state = 'healthy'
-      handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
-      handle.processBirthToken = this.readProcessBirthToken(handle.pid)
+      this.captureCreatedHostDisposalReceipt(entry, null)
       if (
         handle.processStartedAtMs === null &&
         lifetime === 'persistent' &&
@@ -3223,10 +3266,32 @@ export class OpenCodeHostManager {
           'cleanup is restricted to the owned child process handle',
         )
       }
+      // Publish exact native containment before the health await. If startup
+      // fails and descendants cannot be proved gone, this registry record is
+      // the restart-reconcilable receipt paired with the attempt obligation.
       if (lifetime === 'persistent') {
         persistentWriteReceipt = await this.upsertPersistentHost(handle, generation, abortSignal)
+        this.captureCreatedHostDisposalReceipt(entry, persistentWriteReceipt?.written ?? null)
       }
-      this.captureCreatedHostDisposalReceipt(entry, persistentWriteReceipt?.written ?? null)
+      const health = await this.waitForHealthyHost(
+        baseUrl,
+        () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
+        abortSignal,
+      )
+      handle.version = health.version
+      handle.resolvedConfigFingerprint = profile.managedConfigFingerprint
+      handle.state = 'healthy'
+      if (lifetime === 'persistent') {
+        const healthyWriteReceipt = await this.upsertPersistentHost(handle, generation, abortSignal)
+        if (healthyWriteReceipt) {
+          persistentWriteReceipt = {
+            ...healthyWriteReceipt,
+            previous: persistentWriteReceipt?.previous,
+          }
+        }
+        this.captureCreatedHostDisposalReceipt(entry, healthyWriteReceipt?.written ?? null)
+      }
+      if (lifetime !== 'persistent') this.captureCreatedHostDisposalReceipt(entry, null)
       this.assertStartupCurrent(hostKey, generation, abortSignal, entry, child)
       return handle
     } catch (error) {
@@ -3236,18 +3301,38 @@ export class OpenCodeHostManager {
         : error instanceof Error ? error.message : String(error)
       diagnostics.push(message)
       if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
-      await this.forceKillSpawnedHostProcess(child)
-      if (persistentWriteReceipt) {
+      const startupCleanup = await this.forceKillSpawnedHostProcess(child, handle)
+      if (persistentWriteReceipt && startupCleanup === 'complete') {
         await this.restorePersistentHostAfterFailedStartup(persistentWriteReceipt)
           .catch(() => undefined)
       }
       await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
-      if (abortSignal?.aborted && abortSignal.reason instanceof Error) {
-        throw abortSignal.reason
+      const diagnosticSuffix = diagnostics.length > 0 ? ` Diagnostics: ${diagnostics.join(' | ')}` : ''
+      if (startupCleanup === 'incomplete') {
+        const startupCleanupReceipt = Number.isFinite(handle.processStartedAtMs)
+          ? Object.freeze({
+              hostKey: handle.hostKey,
+              receipt: Object.freeze({
+                schemaVersion: handle.processBirthToken ? 2 as const : 1 as const,
+                receiptId: randomUUID(),
+                hostKeyDigest: createHash('sha256').update(handle.hostKey).digest('hex'),
+                pid: handle.pid,
+                processStartedAtMs: handle.processStartedAtMs!,
+                ...(handle.processBirthToken ? { processBirthToken: handle.processBirthToken } : {}),
+                lifetime,
+              }),
+            })
+          : undefined
+        throw new OpenCodeHostStartupCleanupError(
+          'incomplete', error, startupCleanupReceipt,
+        )
       }
-      const diagnosticSuffix =
-        diagnostics.length > 0 ? ` Diagnostics: ${diagnostics.join(' | ')}` : ''
-      throw new Error(`${message}${diagnosticSuffix}`)
+      throw new OpenCodeHostStartupCleanupError(
+        'complete', error, undefined,
+        abortSignal?.aborted && abortSignal.reason instanceof Error
+          ? abortSignal.reason.message
+          : `${message}${diagnosticSuffix}`,
+      )
     }
   }
 
@@ -3497,6 +3582,9 @@ export class OpenCodeHostManager {
       }))
     } catch (error) {
       if (!verifiedBinary) stageResultAbandoned = true
+      if (error && typeof error === 'object'
+        && ((error as { cleanupDisposition?: unknown }).cleanupDisposition === 'complete'
+          || (error as { cleanupDisposition?: unknown }).cleanupDisposition === 'incomplete')) throw error
       if (params.abortSignal?.aborted) throwOpenCodeAbortReason(params.abortSignal)
       if (!verifiedBinary || !startupDelegated) throw error
       throw new Error('OpenCode scoped host startup failed [redacted]')
@@ -4357,7 +4445,7 @@ export class OpenCodeHostManager {
 
         const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
         if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-          if (processIdentity.state === 'gone' && !this.persistentContainmentExited(record.pid)) {
+          if (!this.persistentContainmentExited(record.pid)) {
             hosts.push({ hostKey, projectPath: projectLabel, pid: record.pid, port: record.port,
               action: 'failed', reason: 'leader exited during identity verification but containment remains unproven',
               leaseCount })
