@@ -5,8 +5,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    FileDispositionInfo, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, SetFileInformationByHandle, FILE_DEVICE_DISK, FILE_ID_INFO,
+    FileDispositionInfo, FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    SetFileInformationByHandle, FILE_DEVICE_DISK, FILE_ID_INFO,
 };
 
 /// A volume-qualified, full FILE_ID_128 identity.  Do not truncate this to the
@@ -54,8 +54,14 @@ struct ObjectAttributes {
 }
 #[repr(C)]
 struct IoStatusBlock {
-    status: isize,
+    status: NtStatus,
     information: usize,
+}
+
+type NtStatus = i32;
+
+fn nt_success(status: NtStatus) -> bool {
+    status >= 0
 }
 
 #[repr(C)]
@@ -78,21 +84,22 @@ extern "system" {
         create_options: u32,
         ea_buffer: *mut c_void,
         ea_length: u32,
-    ) -> i32;
+    ) -> NtStatus;
     fn NtSetInformationFile(
         file_handle: HANDLE,
         io_status_block: *mut IoStatusBlock,
         file_information: *mut c_void,
         length: u32,
         file_information_class: i32,
-    ) -> i32;
+    ) -> NtStatus;
+    fn NtFlushBuffersFile(file_handle: HANDLE, io_status_block: *mut IoStatusBlock) -> NtStatus;
     fn NtQueryVolumeInformationFile(
         file_handle: HANDLE,
         io_status_block: *mut IoStatusBlock,
         fs_information: *mut c_void,
         length: u32,
         fs_information_class: i32,
-    ) -> i32;
+    ) -> NtStatus;
     fn NtQueryDirectoryFile(
         file_handle: HANDLE,
         event: HANDLE,
@@ -105,7 +112,19 @@ extern "system" {
         return_single_entry: u8,
         file_name: *mut UnicodeString,
         restart_scan: u8,
-    ) -> i32;
+    ) -> NtStatus;
+}
+
+pub(super) fn flush_directory(directory: &File) -> Result<(), ()> {
+    let mut status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let result = unsafe { NtFlushBuffersFile(directory.as_raw_handle(), &mut status) };
+    if !nt_success(result) || !nt_success(status.status) {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Enumerate names from the retained directory object itself.  No DOS/Win32
@@ -539,40 +558,75 @@ pub(super) fn rename_relative(
     {
         return Err(());
     }
-    // FILE_RENAME_INFO has an architecture-aligned HANDLE following its
-    // BOOLEAN/DWORD union, then a DWORD length and an inline UTF-16 name.
-    let pointer = std::mem::size_of::<HANDLE>();
-    let root_offset = (4 + pointer - 1) & !(pointer - 1);
-    let length_offset = root_offset + pointer;
-    let name_offset = length_offset + 4;
-    let mut information = vec![0u8; name_offset + wide.len() * 2];
-    // FileRenameInfoEx interprets the first DWORD as flags. POSIX semantics is
-    // required for a true pinned replacement: it permits the retained prior
-    // handle to deny FILE_SHARE_DELETE while the temporary handle atomically
-    // replaces its directory entry. Without this flag legacy rename fails with
-    // a sharing violation, which tempts callers into releasing prior authority.
-    let flags = if replace { 0x1 | 0x2 } else { 0 }; // REPLACE_IF_EXISTS|POSIX_SEMANTICS
-    information[..4].copy_from_slice(&(flags as u32).to_ne_bytes());
-    information[root_offset..root_offset + pointer]
-        .copy_from_slice(&(destination_parent.as_raw_handle() as usize).to_ne_bytes());
-    information[length_offset..name_offset]
-        .copy_from_slice(&((wide.len() * 2) as u32).to_ne_bytes());
-    for (index, value) in wide.iter().enumerate() {
-        information[name_offset + index * 2..name_offset + index * 2 + 2]
-            .copy_from_slice(&value.to_le_bytes());
-    }
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut information =
+        RenameInformation::new(destination_parent.as_raw_handle(), &wide, replace)?;
+    let mut status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let result = unsafe {
+        NtSetInformationFile(
             file.as_raw_handle(),
-            FileRenameInfoEx,
-            information.as_ptr() as *const c_void,
-            information.len() as u32,
+            &mut status,
+            information.as_mut_ptr(),
+            information.byte_len,
+            65, // FileRenameInformationEx
         )
-    } == 0
-    {
+    };
+    if !nt_success(result) || !nt_success(status.status) {
         return Err(());
     }
     Ok(())
+}
+
+const RENAME_FLAGS_OFFSET: usize = 0;
+const RENAME_ROOT_OFFSET: usize = 8;
+const RENAME_LENGTH_OFFSET: usize = 16;
+const RENAME_NAME_OFFSET: usize = 20;
+
+// Vec<usize> gives the variable-sized FILE_RENAME_INFORMATION_EX allocation
+// the alignment of HANDLE on both supported Windows ABIs. The byte length sent
+// to NT excludes only the allocation's trailing word padding.
+struct RenameInformation {
+    storage: Vec<usize>,
+    byte_len: u32,
+}
+
+impl RenameInformation {
+    fn new(destination_parent: HANDLE, wide: &[u16], replace: bool) -> Result<Self, ()> {
+        if std::mem::size_of::<HANDLE>() != 8
+            || std::mem::align_of::<usize>() < std::mem::align_of::<HANDLE>()
+        {
+            return Err(());
+        }
+        let name_bytes = wide.len().checked_mul(2).ok_or(())?;
+        let byte_len = RENAME_NAME_OFFSET.checked_add(name_bytes).ok_or(())?;
+        let byte_len = u32::try_from(byte_len).map_err(|_| ())?;
+        let word = std::mem::size_of::<usize>();
+        let words = (byte_len as usize).checked_add(word - 1).ok_or(())? / word;
+        let mut storage = vec![0usize; words];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, words * word)
+        };
+        // POSIX semantics permits replacement while the exact prior object is
+        // retained without FILE_SHARE_DELETE. Never weaken this to legacy
+        // replace semantics or release that retained authority.
+        let flags: u32 = if replace { 0x1 | 0x2 } else { 0 };
+        bytes[RENAME_FLAGS_OFFSET..RENAME_FLAGS_OFFSET + 4].copy_from_slice(&flags.to_ne_bytes());
+        bytes[RENAME_ROOT_OFFSET..RENAME_ROOT_OFFSET + 8]
+            .copy_from_slice(&(destination_parent as usize).to_ne_bytes());
+        bytes[RENAME_LENGTH_OFFSET..RENAME_NAME_OFFSET]
+            .copy_from_slice(&(name_bytes as u32).to_ne_bytes());
+        for (index, value) in wide.iter().enumerate() {
+            bytes[RENAME_NAME_OFFSET + index * 2..RENAME_NAME_OFFSET + index * 2 + 2]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(Self { storage, byte_len })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.storage.as_mut_ptr() as *mut c_void
+    }
 }
 
 pub(super) fn link_relative(file: &File, destination_parent: &File, name: &Path) -> Result<(), ()> {
@@ -672,6 +726,59 @@ mod tests {
     fn fixture_volume_matches_production_ntfs_contract() {
         let root = fixture("ntfs-contract");
         let parent = directory(&root);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_information_ex_is_handle_aligned_and_byte_exact() {
+        assert_eq!(RENAME_FLAGS_OFFSET, 0);
+        assert_eq!(RENAME_ROOT_OFFSET, 8);
+        assert_eq!(RENAME_LENGTH_OFFSET, 16);
+        assert_eq!(RENAME_NAME_OFFSET, 20);
+
+        let destination = 0x0102_0304_0506_0708usize as HANDLE;
+        let wide = [b'A' as u16, 0xd83d, 0xde80];
+        let information = RenameInformation::new(destination, &wide, true).unwrap();
+        assert_eq!(
+            information.storage.as_ptr() as usize % std::mem::align_of::<HANDLE>(),
+            0
+        );
+        assert_eq!(
+            information.byte_len as usize,
+            RENAME_NAME_OFFSET + wide.len() * 2
+        );
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                information.storage.as_ptr() as *const u8,
+                information.byte_len as usize,
+            )
+        };
+        assert_eq!(
+            &bytes[RENAME_FLAGS_OFFSET..RENAME_FLAGS_OFFSET + 4],
+            &(0x1u32 | 0x2).to_ne_bytes()
+        );
+        assert_eq!(
+            &bytes[RENAME_ROOT_OFFSET..RENAME_ROOT_OFFSET + 8],
+            &(destination as usize).to_ne_bytes()
+        );
+        assert_eq!(
+            &bytes[RENAME_LENGTH_OFFSET..RENAME_NAME_OFFSET],
+            &((wide.len() * 2) as u32).to_ne_bytes()
+        );
+        let expected_name = wide
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(&bytes[RENAME_NAME_OFFSET..], expected_name.as_slice());
+    }
+
+    #[test]
+    fn nt_directory_flush_accepts_a_retained_ntfs_directory() {
+        let root = fixture("directory-flush");
+        let parent = directory(&root);
+        flush_directory(&parent).unwrap();
         drop(parent);
         std::fs::remove_dir_all(root).unwrap();
     }

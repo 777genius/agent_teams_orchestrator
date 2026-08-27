@@ -118,17 +118,43 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(nativeSuite).not.toContain('path.join(os.tmpdir()')
   })
 
-  test('keeps the documented 64-bit rename ABI and existing directory durability primitive', async () => {
+  test('uses aligned NT rename and flush primitives for every directory barrier', async () => {
     const [identity, publication] = await Promise.all([
       readFile(identityPath, 'utf8'),
       readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
     ])
-    expect(identity).toContain('let root_offset = (4 + pointer - 1) & !(pointer - 1)')
-    expect(identity).toContain('let name_offset = length_offset + 4')
-    expect(identity).toContain('let flags = if replace { 0x1 | 0x2 } else { 0 }')
-    expect(identity).toMatch(/SetFileInformationByHandle\([\s\S]*?FileRenameInfoEx/)
+    const rename = identity.slice(
+      identity.indexOf('pub(super) fn rename_relative'),
+      identity.indexOf('pub(super) fn link_relative'),
+    )
+    const flush = identity.slice(
+      identity.indexOf('pub(super) fn flush_directory'),
+      identity.indexOf('pub(super) fn list_relative_names'),
+    )
+    expect(identity).toContain('#[repr(C)]\nstruct IoStatusBlock')
+    expect(identity).toContain('fn NtSetInformationFile(')
+    expect(identity).toContain('fn NtFlushBuffersFile(')
+    expect(identity).toContain('fn nt_success(status: NtStatus) -> bool')
+    expect(identity).toContain('const RENAME_FLAGS_OFFSET: usize = 0')
+    expect(identity).toContain('const RENAME_ROOT_OFFSET: usize = 8')
+    expect(identity).toContain('const RENAME_LENGTH_OFFSET: usize = 16')
+    expect(identity).toContain('const RENAME_NAME_OFFSET: usize = 20')
+    expect(identity).toContain('storage: Vec<usize>')
+    expect(identity).toContain('std::mem::align_of::<HANDLE>()')
+    expect(identity).toContain('let flags: u32 = if replace { 0x1 | 0x2 } else { 0 }')
+    expect(rename).toMatch(/NtSetInformationFile\([\s\S]*?\n\s*65, \/\/ FileRenameInformationEx/)
+    expect(rename).not.toContain('SetFileInformationByHandle')
+    expect(flush).toContain('NtFlushBuffersFile(directory.as_raw_handle(), &mut status)')
+    expect(flush).toContain('!nt_success(result) || !nt_success(status.status)')
     expect(identity).toMatch(/NtSetInformationFile\([\s\S]*?\n\s*11,/)
-    expect(publication).toContain('parent.sync_all().map_err')
+    expect(identity).not.toContain('FileRenameInfoEx')
+    expect(identity).not.toContain('FlushFileBuffers')
+    expect(publication.match(/windows_identity::flush_directory/g)).toHaveLength(39)
+    expect(publication).not.toMatch(/(?:parent|source_parent|destination_parent|directory)\.sync_all\(/)
+    expect(publication).not.toMatch(/\.handle\s*\.sync_all\(/)
+    expect(publication).toContain('recovery.sync_all().map_err')
+    expect(publication).toContain('file.sync_all().map_err')
+    expect(publication).toContain('temporary.sync_all().map_err')
     expect(identity).not.toContain('symlink_metadata')
   })
 })

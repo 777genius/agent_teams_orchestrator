@@ -272,7 +272,7 @@ fn append_atomic_recovery_record(
     serde_json::to_writer(&mut *recovery, record).map_err(|_| "RECOVERY_REQUIRED")?;
     recovery.write_all(b"\n").map_err(|_| "RECOVERY_REQUIRED")?;
     recovery.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
-    parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+    crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
     Ok(())
 }
 
@@ -518,7 +518,7 @@ impl RetainedWindowsRoot {
                 .map_err(|_| "FILE_REJECTED")?;
         let identity =
             crate::windows_identity::file_identity(&directory).map_err(|_| "FILE_REJECTED")?;
-        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         self.namespace_directories
             .push((path.to_string(), directory, identity));
         Ok(json!({}))
@@ -716,9 +716,10 @@ impl RetainedWindowsRoot {
             !source_is_directory,
         )
         .map_err(|_| "FILE_REJECTED")?;
-        source_parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&source_parent).map_err(|_| "FILE_REJECTED")?;
         if from_parent != to_parent {
-            destination_parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+            crate::windows_identity::flush_directory(&destination_parent)
+                .map_err(|_| "FILE_REJECTED")?;
         }
         if source_is_directory {
             self.namespace_directories
@@ -769,7 +770,7 @@ impl RetainedWindowsRoot {
             }
         })?;
         drop(file);
-        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         self.namespace_directories
             .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
         Ok(json!({}))
@@ -778,7 +779,7 @@ impl RetainedWindowsRoot {
     fn namespace_sync_directory(&mut self, path: &str) -> Result<Value, &'static str> {
         let (directory, identity) = self.namespace_directory(path)?;
         validate_retained_directory(&directory, identity)?;
-        directory.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&directory).map_err(|_| "FILE_REJECTED")?;
         Ok(json!({}))
     }
 
@@ -856,7 +857,8 @@ impl RetainedWindowsRoot {
                     // write/delete access would conflict with this lease's
                     // deliberately narrow share mask.
                     temporary.sync_all().map_err(|_| "FILE_REJECTED")?;
-                    parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+                    crate::windows_identity::flush_directory(&parent)
+                        .map_err(|_| "FILE_REJECTED")?;
                     true
                 }
                 Err(()) => false,
@@ -887,7 +889,7 @@ impl RetainedWindowsRoot {
         })();
         crate::windows_identity::delete_on_close(&temporary).map_err(|_| "FILE_REJECTED")?;
         drop(temporary);
-        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         result
     }
 
@@ -915,7 +917,7 @@ impl RetainedWindowsRoot {
             crate::windows_identity::delete_on_close(&file).map_err(|_| "FILE_REJECTED")?;
             drop(file);
         }
-        parent.sync_all().map_err(|_| "FILE_REJECTED")
+        crate::windows_identity::flush_directory(parent).map_err(|_| "FILE_REJECTED")
     }
 
     fn namespace_remove_tree(&mut self, path: &str) -> Result<Value, &'static str> {
@@ -969,7 +971,7 @@ impl RetainedWindowsRoot {
                 }
                 crate::windows_identity::delete_on_close(&existing).map_err(|_| "NS_EXISTS")?;
                 drop(existing);
-                parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+                crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
                 crate::windows_identity::create_relative_file(&parent, Path::new(name))
                     .map_err(|_| "NS_EXISTS")?
             }
@@ -977,7 +979,7 @@ impl RetainedWindowsRoot {
         file.write_all(token.as_bytes())
             .map_err(|_| "FILE_REJECTED")?;
         file.sync_all().map_err(|_| "FILE_REJECTED")?;
-        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         let identity =
             crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
         self.namespace_locks
@@ -1020,7 +1022,7 @@ impl RetainedWindowsRoot {
         drop(file);
         let (parent_key, _) = Self::namespace_parent(&path)?;
         let (parent, _) = self.namespace_directory(parent_key)?;
-        parent.sync_all().map_err(|_| "FILE_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         Ok(json!({"released":true}))
     }
 
@@ -1153,7 +1155,8 @@ impl RetainedWindowsRoot {
             cursor.push(component.as_os_str());
             if was_created {
                 if durable {
-                    parent.handle.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                    crate::windows_identity::flush_directory(&parent.handle)
+                        .map_err(|_| "ROOT_REJECTED")?;
                 }
                 created.push(cursor.to_string_lossy().into_owned());
             }
@@ -1190,11 +1193,7 @@ impl RetainedWindowsRoot {
 
     fn sync(&self) -> Result<(), &'static str> {
         self.validate_namespace()?;
-        self.held
-            .last()
-            .ok_or("ROOT_REJECTED")?
-            .handle
-            .sync_all()
+        crate::windows_identity::flush_directory(&self.held.last().ok_or("ROOT_REJECTED")?.handle)
             .map_err(|_| "ROOT_REJECTED")
     }
 
@@ -1314,7 +1313,7 @@ impl RetainedWindowsRoot {
         self.pinned_directories
             .push((name.to_string(), file, identity));
         self.materialization_root = Some(name.to_string());
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "ROOT_REJECTED")?;
         Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
     }
 
@@ -1355,7 +1354,7 @@ impl RetainedWindowsRoot {
             crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
         self.pinned_directories
             .push((key.to_string(), file, identity));
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "ROOT_REJECTED")?;
         Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
     }
 
@@ -1396,7 +1395,7 @@ impl RetainedWindowsRoot {
             crate::windows_identity::file_identity(&file).map_err(|_| "FILE_REJECTED")?;
         self.pinned_files
             .push((key.to_string(), file, identity, 0, false));
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "ROOT_REJECTED")?;
         Ok(json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string()}))
     }
 
@@ -1484,7 +1483,7 @@ impl RetainedWindowsRoot {
         let parent = &self.held.last().ok_or("ROOT_REJECTED")?.handle;
         crate::windows_identity::rename_relative(file, parent, Path::new(to), false)
             .map_err(|_| "FILE_REJECTED")?;
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
         let named = crate::windows_identity::probe_relative_directory(parent, Path::new(to))
             .map_err(|_| "FILE_REJECTED")?;
         if crate::windows_identity::file_identity(&named).map_err(|_| "FILE_REJECTED")? != *expected
@@ -1511,11 +1510,7 @@ impl RetainedWindowsRoot {
             crate::windows_identity::delete_on_close(directory).map_err(|_| "FILE_REJECTED")?;
             self.pinned_directories.pop();
         }
-        self.held
-            .last()
-            .ok_or("ROOT_REJECTED")?
-            .handle
-            .sync_all()
+        crate::windows_identity::flush_directory(&self.held.last().ok_or("ROOT_REJECTED")?.handle)
             .map_err(|_| "ROOT_REJECTED")?;
         self.materialization_rolled_back = true;
         Ok(json!({"settled":true}))
@@ -1696,7 +1691,7 @@ impl RetainedWindowsRoot {
                 .as_mut()
                 .ok_or("STATE_REJECTED")?
                 .backup_created = true;
-            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
         }
         self.write_recovery_record()?;
         let parent = &parent_handle;
@@ -1710,7 +1705,7 @@ impl RetainedWindowsRoot {
         .map_err(|_| "FILE_REJECTED")?;
         self.publication.as_mut().ok_or("STATE_REJECTED")?.stage =
             AtomicPublicationStage::Published;
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
         self.write_recovery_record()?;
         let parent = &parent_handle;
         let named = crate::windows_identity::probe_relative_file(parent, Path::new(final_name))
@@ -1785,7 +1780,7 @@ impl RetainedWindowsRoot {
         if let Some(recovery) = publication.recovery.take() {
             drop(recovery);
             fail_atomic_cleanup_boundary("recovery_parent_sync")?;
-            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
         }
         Ok(())
     }
@@ -1823,7 +1818,7 @@ impl RetainedWindowsRoot {
             }
             crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
             drop(recovery);
-            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
             return Ok(json!({"recovered":true}));
         }
         let Some(complete_length) = bytes.iter().rposition(|value| *value == b'\n') else {
@@ -1836,7 +1831,7 @@ impl RetainedWindowsRoot {
             }
             crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
             drop(recovery);
-            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
             return Ok(json!({"recovered":true}));
         };
         let mut records = Vec::new();
@@ -1959,7 +1954,7 @@ impl RetainedWindowsRoot {
             }
             crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
             drop(recovery);
-            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
             return Ok(json!({"recovered":true}));
         }
         let temporary_identity = match (&record.temporary_volume_serial, &record.temporary_file_id)
@@ -2048,7 +2043,7 @@ impl RetainedWindowsRoot {
             cleanup_attempt_links()?;
             crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
             drop(recovery);
-            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
             return Ok(json!({"recovered":true,"superseded":true}));
         }
         if decision == "commit" {
@@ -2092,7 +2087,8 @@ impl RetainedWindowsRoot {
                                 Path::new(&record.backup_name),
                             )
                             .map_err(|_| "RECOVERY_REQUIRED")?;
-                            parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                            crate::windows_identity::flush_directory(parent)
+                                .map_err(|_| "RECOVERY_REQUIRED")?;
                         }
                     }
                 }
@@ -2103,7 +2099,8 @@ impl RetainedWindowsRoot {
                     final_identity.is_some(),
                 )
                 .map_err(|_| "RECOVERY_REQUIRED")?;
-                parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                crate::windows_identity::flush_directory(parent)
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
                 final_identity = identity_at(&record.final_name)?;
             }
             if final_identity != Some(temporary_identity) {
@@ -2133,7 +2130,8 @@ impl RetainedWindowsRoot {
                     false,
                 )
                 .map_err(|_| "RECOVERY_REQUIRED")?;
-                parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                crate::windows_identity::flush_directory(parent)
+                    .map_err(|_| "RECOVERY_REQUIRED")?;
                 final_identity = identity_at(&record.final_name)?;
             }
             if final_identity != prior_identity {
@@ -2158,7 +2156,8 @@ impl RetainedWindowsRoot {
                         Path::new(&record.final_name),
                     )
                     .map_err(|_| "RECOVERY_REQUIRED")?;
-                    parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+                    crate::windows_identity::flush_directory(parent)
+                        .map_err(|_| "RECOVERY_REQUIRED")?;
                 }
             }
             if identity_at(&record.final_name)? != prior_identity {
@@ -2168,7 +2167,7 @@ impl RetainedWindowsRoot {
         cleanup_attempt_links()?;
         crate::windows_identity::delete_on_close(&recovery).map_err(|_| "RECOVERY_REQUIRED")?;
         drop(recovery);
-        parent.sync_all().map_err(|_| "RECOVERY_REQUIRED")?;
+        crate::windows_identity::flush_directory(parent).map_err(|_| "RECOVERY_REQUIRED")?;
         Ok(json!({"recovered":true}))
     }
 
@@ -2195,7 +2194,7 @@ impl RetainedWindowsRoot {
                 // independently reaches the same decision from the durable
                 // `published` recovery record.
                 publication.stage = AtomicPublicationStage::Committed;
-                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
             }
             drop(publication.prior.take());
             if publication.backup_created {
@@ -2208,7 +2207,8 @@ impl RetainedWindowsRoot {
                         && crate::windows_identity::delete_on_close(&backup).is_ok()
                     {
                         drop(backup);
-                        let _ = parent.sync_all();
+                        crate::windows_identity::flush_directory(parent)
+                            .map_err(|_| "ROOT_REJECTED")?;
                     }
                 }
             }
@@ -2222,14 +2222,14 @@ impl RetainedWindowsRoot {
                 crate::windows_identity::delete_on_close(&temporary)
                     .map_err(|_| "FILE_REJECTED")?;
                 drop(temporary);
-                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
             }
             // A captured prior remains authoritative until all fallible work
             // is complete. Its attempt-owned hard-link backup may remain as
             // conservative evidence; no pathname cleanup justifies releasing
             // that authority early.
             Self::clear_recovery_required(publication, parent)?;
-            parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+            crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
             self.publication = None;
             return Ok(json!({"settled":true}));
         } else {
@@ -2251,7 +2251,7 @@ impl RetainedWindowsRoot {
                     false,
                 )
                 .map_err(|_| "FILE_REJECTED")?;
-                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
             } else if named_identity != publication.prior_identity && named_identity.is_some() {
                 return Err("SUCCESSOR_PRESENT");
             }
@@ -2268,7 +2268,8 @@ impl RetainedWindowsRoot {
                         Path::new(&publication.final_name),
                     )
                     .map_err(|_| "FILE_REJECTED")?;
-                    parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                    crate::windows_identity::flush_directory(parent)
+                        .map_err(|_| "ROOT_REJECTED")?;
                 }
             }
             let restored = crate::windows_identity::probe_relative_file_optional(
@@ -2288,14 +2289,14 @@ impl RetainedWindowsRoot {
                 crate::windows_identity::delete_on_close(&temporary)
                     .map_err(|_| "FILE_REJECTED")?;
                 drop(temporary);
-                parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+                crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
             }
         }
         // Keep the prior handle (and therefore every hard link to that exact
         // object) pinned through the last fallible recovery barrier. Backup
         // removal after releasing it would create a successor-unlink race, so
         // rollback deliberately leaves that attempt-owned link as evidence.
-        parent.sync_all().map_err(|_| "ROOT_REJECTED")?;
+        crate::windows_identity::flush_directory(parent).map_err(|_| "ROOT_REJECTED")?;
         Self::clear_recovery_required(publication, parent)?;
         self.publication = None;
         Ok(json!({"settled":true}))
