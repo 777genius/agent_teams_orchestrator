@@ -44,6 +44,7 @@ jobs:
           bun test
           phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts
           phase0-opencode-tests/PortableOpenCodeAcceptance.e2e.test.ts
+          phase0-opencode-tests/WorkflowContract.test.ts
       - name: Build deterministic static OpenCode host child/grandchild fixture
         run: cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
       - name: Test real Linux recycled-pid production cleanup across process restart
@@ -100,6 +101,7 @@ jobs:
           bun test
           phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts
           phase0-opencode-tests/PortableOpenCodeAcceptance.e2e.test.ts
+          phase0-opencode-tests/WorkflowContract.test.ts
       - name: Build and test retained native authority
         run: |
           cargo test --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
@@ -138,12 +140,12 @@ jobs:
           src/services/opencode/OpenCodePassiveSnapshotPersistencePolicy.test.ts
           src/services/runtimeBackends/openCodePassiveStatus.test.ts
       - name: Test Windows production cleanup composition and owned authority
-        run: |
-          bun test \
-            src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts \
-            src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts \
-            src/services/opencode/OpenCodeHostManager.test.ts \
-            src/utils/processKill.test.ts
+        run: >-
+          bun test
+          src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          src/services/opencode/OpenCodeHostManager.test.ts
+          src/utils/processKill.test.ts
       - name: Prove native NTFS handle retention
         timeout-minutes: 10
         run: bun test scripts/windows-publication-native.test.ts
