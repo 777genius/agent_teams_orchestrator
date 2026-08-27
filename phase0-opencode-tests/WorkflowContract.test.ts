@@ -40,9 +40,12 @@ const linuxProductionFiles = [
 const windowsProductionFiles = [
   'src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts',
   'src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts',
+  'src/services/opencode/OpenCodeWindowsPassiveProductionComposition.test.ts',
   'src/services/opencode/OpenCodeHostManager.test.ts',
   'src/utils/processKill.test.ts',
 ]
+const windowsPassiveProductionComposition =
+  'src/services/opencode/OpenCodeWindowsPassiveProductionComposition.test.ts'
 
 function command(files: string[]): string {
   return ['bun test', ...files].join(' ')
@@ -142,6 +145,16 @@ test('portable fake and production-composition gates are one command under their
     namedStep(windows!, 'Test Windows production cleanup composition and owned authority'),
     'pwsh', command(windowsProductionFiles),
   )
+
+  const windowsPassiveSelections = Object.entries(workflow.jobs ?? {}).flatMap(([jobId, job]) =>
+    (job.steps ?? [])
+      .filter(step => step.run?.split(/\s+/).includes(windowsPassiveProductionComposition))
+      .map(step => ({ jobId, stepName: step.name })),
+  )
+  expect(windowsPassiveSelections).toEqual([{
+    jobId: 'windows-passive-snapshot',
+    stepName: 'Test Windows production cleanup composition and owned authority',
+  }])
 
   expectPinnedBun(posix!)
   expectPinnedBun(windows!)

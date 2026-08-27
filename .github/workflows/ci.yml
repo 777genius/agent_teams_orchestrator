@@ -144,6 +144,7 @@ jobs:
           bun test
           src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts
           src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          src/services/opencode/OpenCodeWindowsPassiveProductionComposition.test.ts
           src/services/opencode/OpenCodeHostManager.test.ts
           src/utils/processKill.test.ts
       - name: Prove native NTFS handle retention
