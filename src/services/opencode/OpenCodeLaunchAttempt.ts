@@ -346,6 +346,10 @@ export class OpenCodeLaunchAttempt {
       deadlineAtMs: initialPolicy.workDeadlineAtMs, signal: controller.signal,
       monotonicNow: () => this.ports.clock.monotonicNow(),
     }
+    const releaseStoreContext = {
+      deadlineAtMs: initialPolicy.absoluteDeadlineAtMs, signal: reserveController.signal,
+      monotonicNow: () => this.ports.clock.monotonicNow(),
+    }
 
     try {
       return await this.store.withGeneration(
@@ -994,7 +998,7 @@ export class OpenCodeLaunchAttempt {
             immutableDigest, lease.generation, status, committed, members, failure, cleanup,
             request, acceptedProofResponse, owned, reserveController.signal)
         },
-        initialStoreContext,
+        { acquisition: initialStoreContext, body: initialStoreContext, release: releaseStoreContext },
       )
     } catch (error) {
       if (input.continuation && error instanceof OpenCodeLaunchJournalError) {

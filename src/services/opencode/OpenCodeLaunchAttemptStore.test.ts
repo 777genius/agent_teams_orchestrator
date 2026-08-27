@@ -78,7 +78,7 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
   activeWrites = 0
   maximumActiveWrites = 0
   async read() { return this.bytes?.slice() ?? null }
-  async replaceAndSync(bytes: Uint8Array) {
+  async replaceAndSync(bytes: Uint8Array, _context?: OpenCodeLaunchStoreContext) {
     this.activeWrites += 1
     this.maximumActiveWrites = Math.max(this.maximumActiveWrites, this.activeWrites)
     await Promise.resolve()
@@ -1331,6 +1331,55 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     expect(releaseContext?.monotonicNow).toBe(context.monotonicNow)
     expect(releaseContext?.signal).not.toBe(controller.signal)
     expect(releaseContext?.signal.aborted).toBe(false)
+  })
+
+  test('uses explicit acquisition, body, and release contexts without extending any deadline', async () => {
+    const persistence = new MemoryPersistence()
+    const acquiredDeadlines: number[] = []
+    const bodyDeadlines: number[] = []
+    const releasedDeadlines: number[] = []
+    const replace = persistence.replaceAndSync.bind(persistence)
+    persistence.acquireExclusive = async context => {
+      acquiredDeadlines.push(context.deadlineAtMs)
+      return async releaseContext => { releasedDeadlines.push(releaseContext!.deadlineAtMs) }
+    }
+    persistence.replaceAndSync = async (bytes, context) => {
+      bodyDeadlines.push(context!.deadlineAtMs)
+      await replace(bytes)
+    }
+    const acquisition = { deadlineAtMs: 10, monotonicNow: () => 0,
+      signal: new AbortController().signal }
+    const body = { ...acquisition, deadlineAtMs: 20 }
+    const release = { ...acquisition, deadlineAtMs: 30 }
+
+    await new OpenCodeLaunchAttemptStore(persistence).withGeneration(
+      { ...identity, startedAtMs: 0, totalBudgetMs: 30 }, 'begin', async () => undefined,
+      { acquisition, body, release },
+    )
+
+    expect(acquiredDeadlines).toEqual([10])
+    expect(bodyDeadlines).toEqual([20])
+    expect(releasedDeadlines).toEqual([30])
+  })
+
+  test.each([
+    ['body failure', true, false, 'body failed'],
+    ['release failure after body success', false, true, 'release failed'],
+    ['release failure after body failure', true, true, 'release failed'],
+  ] as const)('preserves %s precedence and releases exactly once', async (_name, bodyFails, releaseFails, message) => {
+    const persistence = new MemoryPersistence()
+    let releases = 0
+    persistence.acquireExclusive = async () => async () => {
+      releases += 1
+      if (releaseFails) throw new Error('release failed')
+    }
+    const running = new OpenCodeLaunchAttemptStore(persistence).withGeneration(
+      identity, 'begin', async () => {
+        if (bodyFails) throw new Error('body failed')
+      },
+    )
+    await expect(running).rejects.toThrow(message)
+    expect(releases).toBe(1)
   })
 
   test('cancelled local-tail wait releases its queue node and late acquisition is explicitly reaped', async () => {

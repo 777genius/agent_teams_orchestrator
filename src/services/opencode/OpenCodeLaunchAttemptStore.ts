@@ -156,6 +156,13 @@ export type OpenCodeLaunchJournalPersistenceSnapshot = Readonly<{
 
 export type OpenCodeLaunchStoreContext = { deadlineAtMs: number; signal: AbortSignal; monotonicNow(): number }
 
+/** Distinct bounded authorities for entering, running, and leaving one generation lease. */
+export type OpenCodeLaunchGenerationContexts = Readonly<{
+  acquisition: OpenCodeLaunchStoreContext
+  body: OpenCodeLaunchStoreContext
+  release: OpenCodeLaunchStoreContext
+}>
+
 export class OpenCodeLaunchJournalError extends Error {
   constructor(readonly code: 'corrupt' | 'foreign' | 'fenced', message: string) {
     super(message)
@@ -1495,25 +1502,29 @@ export class OpenCodeLaunchAttemptStore {
     identity: OpenCodeLaunchJournalIdentity,
     mode: 'begin' | 'continue' | 'replay',
     operation: (lease: OpenCodeLaunchJournalLease) => Promise<T>,
-    context?: OpenCodeLaunchStoreContext,
+    context?: OpenCodeLaunchStoreContext | OpenCodeLaunchGenerationContexts,
   ): Promise<T> {
-    // Normalize once at the public boundary.  The same absolute deadline must
-    // govern lock acquisition, the initial read, every publication and lease
-    // release; passing the optional argument deeper used to leave the actual
-    // persistence operation unbounded even though the queue wait was bounded.
-    context ??= boundedDefaultContext()
+    // Legacy callers retain one finite context for all three phases. Callers
+    // with a cleanup reserve can explicitly keep entry/body on the work
+    // deadline while release remains bounded by the same absolute deadline.
+    const fallbackContext = context ?? boundedDefaultContext()
+    const contexts: OpenCodeLaunchGenerationContexts = 'acquisition' in fallbackContext
+      ? fallbackContext
+      : { acquisition: fallbackContext, body: fallbackContext, release: fallbackContext }
+    const bodyContext = contexts.body
     let retainedPhysicalSettlement: Promise<void> | undefined
     let deactivateLease = (): void => undefined
-    let acquisitionContext = context
-    if (context && mode !== 'replay') {
-      const timing = await this.peekTiming(identity, context)
+    let acquisitionContext = contexts.acquisition
+    if (mode !== 'replay') {
+      const timing = await this.peekTiming(identity, acquisitionContext)
       // A durable final is absorbing: same-generation `begin` can only project
       // it or reconcile its bound cleanup obligations. Give that safe replay
       // the current invocation's finite deadline; unfinished work and every
       // continuation remain fenced by the original absolute envelope.
       if (timing && !(mode === 'begin' && timing.finalized)) acquisitionContext = {
-        ...context,
-        deadlineAtMs: Math.min(context.deadlineAtMs, safeAdd(timing.startedAtMs, timing.totalBudgetMs, 'absoluteDeadlineAtMs')),
+        ...acquisitionContext,
+        deadlineAtMs: Math.min(acquisitionContext.deadlineAtMs,
+          safeAdd(timing.startedAtMs, timing.totalBudgetMs, 'absoluteDeadlineAtMs')),
       }
     }
     return this.exclusive(async acquisitionToken => {
@@ -1523,12 +1534,12 @@ export class OpenCodeLaunchAttemptStore {
         totalBudgetMs: undefined,
         ...(mode === 'continue' ? { inputDigest: undefined } : {}),
       }
-      let journal = await this.load(loadIdentity, context)
+      let journal = await this.load(loadIdentity, bodyContext)
       let consumedContinuationMembers: OpenCodeOpaqueIdentity[] = []
-      let effectiveContext = context
-      if (journal && context && !(mode === 'begin' && journal.finalResponse)) {
+      let effectiveContext = bodyContext
+      if (journal && !(mode === 'begin' && journal.finalResponse)) {
         const persistedDeadlineAtMs = safeAdd(journal.startedAtMs, journal.totalBudgetMs, 'absoluteDeadlineAtMs')
-        effectiveContext = { ...context, deadlineAtMs: Math.min(context.deadlineAtMs, persistedDeadlineAtMs) }
+        effectiveContext = { ...bodyContext, deadlineAtMs: Math.min(bodyContext.deadlineAtMs, persistedDeadlineAtMs) }
         ensureContext(effectiveContext)
       }
       let beganGeneration = false
@@ -1548,7 +1559,7 @@ export class OpenCodeLaunchAttemptStore {
         beganGeneration = true
         assertSafeNonnegative(journal.startedAtMs, 'startedAtMs')
         assertSafePositive(journal.totalBudgetMs, 'totalBudgetMs')
-        await this.persist(journal, context)
+        await this.persist(journal, bodyContext)
       } else if (mode === 'begin') {
         // Same identity is an idempotent replay. It does not create a new writer.
         if (identity.generation !== undefined && identity.generation !== journal.generation) {
@@ -1993,7 +2004,7 @@ export class OpenCodeLaunchAttemptStore {
         if (leasePoison) throw leasePoison
         throw error
       } finally { externalRevalidationActive = false }
-    }, acquisitionContext, () => {
+    }, acquisitionContext, contexts.release, () => {
       const settlement = retainedPhysicalSettlement
       if (!settlement) { deactivateLease(); return undefined }
       return settlement.finally(deactivateLease)
@@ -2140,6 +2151,7 @@ export class OpenCodeLaunchAttemptStore {
   private async exclusive<T>(
     operation: (acquisitionToken: string) => Promise<T>,
     context?: OpenCodeLaunchStoreContext,
+    releaseContext?: OpenCodeLaunchStoreContext,
     retainedSettlement?: () => Promise<void> | undefined,
   ): Promise<T> {
     const effectiveExclusiveContext = context ?? boundedDefaultContext()
@@ -2161,10 +2173,11 @@ export class OpenCodeLaunchAttemptStore {
     } finally {
       const settlement = poisonSettlement ?? retainedSettlement?.()
       const releaseAll = async () => {
-        const releaseContext = context
-          ? { ...context, signal: new AbortController().signal }
+        const boundedRelease = releaseContext ?? context
+        const effectiveReleaseContext = boundedRelease
+          ? { ...boundedRelease, signal: new AbortController().signal }
           : undefined
-        await releasePersistence?.(releaseContext).catch(error => {
+        await releasePersistence?.(effectiveReleaseContext).catch(error => {
           if (!(error instanceof OpenCodeLaunchJournalError && error.code === 'fenced')) throw error
         })
         release()

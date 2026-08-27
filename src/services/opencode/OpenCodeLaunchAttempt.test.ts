@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 import { OpenCodeLaunchAttempt, OpenCodeOperationHostAcquisitionCleanupError,
   OpenCodeOperationHostAcquisitionSettledError,
@@ -9,6 +12,8 @@ import { projectOpenCodeLaunchAttemptResponse } from './OpenCodeLaunchAttemptPro
 import { decodeOpenCodeLaunchAttemptResponse } from './OpenCodeBridgeContractV2.js'
 import {
   OpenCodeLaunchAttemptStore,
+  deriveOpenCodeLaunchNamespacePaths,
+  OpenCodeLaunchFileJournalPersistence,
   OpenCodeLaunchPoisonedLeaseError,
   type OpenCodeLaunchJournalPersistence,
   type OpenCodeLaunchStoreContext,
@@ -1049,6 +1054,90 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     ).run({ request: request(), members, requestedBudgetMs: 10_000 })
     expect(replay.durableFinalResponse).toEqual(result.durableFinalResponse)
     expect(subject.calls.filter(call => call.startsWith('create:'))).toHaveLength(0)
+  })
+
+  test('FileJournal returns a durable partial and releases its lease through the cleanup reserve', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'opencode-work-exhaustion-'))
+    const journalPath = path.join(directory, 'launch-attempts', `${attemptId}.journal`)
+    const persistence = new OpenCodeLaunchFileJournalPersistence(journalPath)
+    const acquiredDeadlines: number[] = []
+    const releasedDeadlines: number[] = []
+    const acquire = persistence.acquireExclusive.bind(persistence)
+    persistence.acquireExclusive = async context => {
+      acquiredDeadlines.push(context.deadlineAtMs)
+      const release = await acquire(context)
+      return async releaseContext => {
+        releasedDeadlines.push(releaseContext!.deadlineAtMs)
+        await release(releaseContext)
+      }
+    }
+    const subject = setup()
+    subject.ports.sessions.createBootstrapAndCommit = async input => {
+      await input.revalidateBeforeCommit()
+      const applied = { outcome: 'applied' as const, linkage: linkage(input.memberIdentity),
+        owned: { memberIdentity: input.memberIdentity } }
+      expect(await input.commitIfClaimLive(applied.linkage)).toBe('committed')
+      subject.setNow(9_000)
+      return applied
+    }
+    try {
+      const result = await new OpenCodeLaunchAttempt(
+        new OpenCodeLaunchAttemptStore(persistence), subject.ports,
+      ).run({ request: request(), members, requestedBudgetMs: 10_000 })
+      expect(result.status).toBe('partial')
+      expect(result.failure?.kind).toBe('deadline_after_partial')
+      expect(result.committed).toEqual([linkage(members[0])])
+      expect(result.durableFinalResponse).toMatchObject({ launchAttempt: { outcome: 'partial' } })
+      expect(acquiredDeadlines).toEqual([9_000])
+      expect(releasedDeadlines).toEqual([10_000])
+      const durable = await new OpenCodeLaunchAttemptStore(
+        new OpenCodeLaunchFileJournalPersistence(journalPath),
+      ).snapshotReadOnly({ attemptId, payloadHash: hash, inputDigest: result.inputDigest,
+        immutableDigest: result.immutableDigest }, {
+        deadlineAtMs: 10_000, monotonicNow: () => 9_000, signal: new AbortController().signal,
+      })
+      expect(durable?.finalResponse).toEqual(result.durableFinalResponse)
+      expect(durable?.events.map(event => event.type)).toEqual(['member_intent', 'member_applied'])
+      await expect(stat(deriveOpenCodeLaunchNamespacePaths(journalPath, path).lock))
+        .rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test('FileJournal fails closed when final persistence reaches the absolute deadline and reaps its lease', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'opencode-absolute-exhaustion-'))
+    const journalPath = path.join(directory, 'launch-attempts', `${attemptId}.journal`)
+    const persistence = new OpenCodeLaunchFileJournalPersistence(journalPath)
+    const subject = setup()
+    subject.ports.sessions.createBootstrapAndCommit = async input => {
+      await input.revalidateBeforeCommit()
+      const applied = { outcome: 'applied' as const, linkage: linkage(input.memberIdentity),
+        owned: { memberIdentity: input.memberIdentity } }
+      expect(await input.commitIfClaimLive(applied.linkage)).toBe('committed')
+      subject.setNow(10_000)
+      return applied
+    }
+    try {
+      const running = new OpenCodeLaunchAttempt(
+        new OpenCodeLaunchAttemptStore(persistence), subject.ports,
+      ).run({ request: request(), members, requestedBudgetMs: 10_000 })
+      await expect(running).rejects.toMatchObject({ code: 'fenced' })
+      const lock = deriveOpenCodeLaunchNamespacePaths(journalPath, path).lock
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try { await stat(lock); await Bun.sleep(1) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') break
+          throw error
+        }
+      }
+      await expect(stat(lock)).rejects.toMatchObject({ code: 'ENOENT' })
+      const durable = await new OpenCodeLaunchAttemptStore(
+        new OpenCodeLaunchFileJournalPersistence(journalPath),
+      ).snapshotReadOnly({ attemptId, payloadHash: hash }, {
+        deadlineAtMs: 10_000, monotonicNow: () => 0, signal: new AbortController().signal,
+      })
+      expect(durable?.events.map(event => event.type)).toEqual(['member_intent', 'member_applied'])
+      expect(durable?.finalResponse).toBeUndefined()
+    } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
   test('retains the host when deferred physical cleanup rejects and never starts cleanup twice', async () => {
