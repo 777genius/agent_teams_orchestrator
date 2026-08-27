@@ -1014,6 +1014,49 @@ class OpenCodeProductionLaunchRuntime {
         continuationToken: command.request.launchAttempt.continuationToken,
       }) === 'replay'
     }
+    // Classify every current or predecessor host obligation from read-only
+    // durable state before any final/continuation branch or member recovery.
+    // A tokenless v1 receipt is actionable only while this exact manager still
+    // retains its live receipt capability; reconstructed PID identity is never
+    // sufficient authority on any platform.
+    const inspectedReleaseRecords = await hostReleaseLedger.readAllPending({
+      attemptId: command.request.launchAttempt.attemptId,
+      payloadHash: command.request.launchAttempt.payloadHash,
+      currentGeneration: command.request.launchAttempt.generation,
+    }, preflightLedgerContext)
+    const unretainedTokenlessObligation = inspectedReleaseRecords.find(record =>
+      record.releaseState === 'pending'
+      && record.receipt.schemaVersion === 1
+      && !openCodeHostManager.hasExactRetainedHostReleaseCapability(record.receipt))
+    if (unretainedTokenlessObligation) {
+      if (!journal?.finalResponse || !exactCurrentGeneration
+        || journal.cleanupState !== 'incomplete') {
+        throw new Error('OpenCode launch host cleanup requires exact retained generation authority')
+      }
+      const final = journal.finalResponse
+      validateOpenCodeDurableFinalResponse(command.request, final, {
+        inputDigest,
+        immutableDigest,
+        generation: command.request.launchAttempt.generation,
+        acceptedProofResponse: journal.acceptedProofResponse,
+        profileBinding: journal.profileBinding,
+        members: command.members.map(member => member.memberIdentity),
+      })
+      const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
+      const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
+      return {
+        snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
+          profile: null, host: null, config: null, configProviders: null, providers: null,
+          providerAuth: null, agents: [], mcp: null, appMcp: null,
+          probeError: 'launch cleanup requires reconciliation', diagnostics: [] },
+        data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
+          members: Object.fromEntries(command.members.map(member => [member.name, {
+            launchState: committedIds.has(member.memberIdentity) ? 'created'
+              : failedIds.has(member.memberIdentity) ? 'failed' : 'pending',
+            evidence: [], diagnostics: [],
+          }])), launchAttempt: final },
+      }
+    }
     if (journal?.finalResponse && exactCurrentGeneration
       && journal.cleanupState === 'complete') {
       const final = journal.finalResponse
@@ -1052,8 +1095,7 @@ class OpenCodeProductionLaunchRuntime {
       const obligationIds = await hostReleaseLedger.listCleanupObligationIds(
         releaseIdentity, preflightLedgerContext)
       const boundObligations = journal.hostCleanupObligations
-      const releaseRecords = await hostReleaseLedger.readAllPending(
-        releaseIdentity, preflightLedgerContext)
+      const releaseRecords = inspectedReleaseRecords
       const boundById = new Map(boundObligations?.map(item => [item.obligationId, item]) ?? [])
       const hasExactObligationSet = boundObligations !== undefined
         && JSON.stringify([...obligationIds].sort())

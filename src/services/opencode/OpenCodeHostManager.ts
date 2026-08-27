@@ -3746,6 +3746,14 @@ export class OpenCodeHostManager {
     return Object.freeze({ ...authority.receipt })
   }
 
+  /** Read-only proof that this manager still holds the exact live authority for a receipt. */
+  hasExactRetainedHostReleaseCapability(receipt: OpenCodeHostReleaseReceipt): boolean {
+    const retained = durableHostReferenceCapabilities.get(receipt.receiptId)
+    return retained?.manager === this
+      && canonicalSerializeOpenCodePolicyIdentity(retained.receipt)
+        === canonicalSerializeOpenCodePolicyIdentity(receipt)
+  }
+
   async reconcileHostReleaseReceipt(
     receipt: OpenCodeHostReleaseReceipt,
     options: {
@@ -3788,15 +3796,14 @@ export class OpenCodeHostManager {
       await this.releaseHostReference(retained.capability, options)
       return
     }
-    // A tokenless legacy receipt has no exact Linux generation authority after
-    // a process restart. PID plus wall-clock start time can alias a same-second
-    // recycled leader, and the current registry token belongs to the current
+    // A tokenless legacy receipt has no exact generation authority after a
+    // process restart on any platform. PID plus wall-clock start time can alias
+    // a recycled leader, and a current registry record belongs to the current
     // process rather than proving that the legacy receipt acquired it. Only a
     // retained live capability above may independently bind such a receipt to
     // its original generation. Keep every other legacy obligation durable and
-    // perform no registry containment probe or mutation.
-    if ((this.deps.platform ?? process.platform) === 'linux'
-      && (receipt.schemaVersion !== 2 || !receipt.processBirthToken)) {
+    // perform no registry/PID/containment probe, remote disposal, mutation, or signal.
+    if (receipt.schemaVersion !== 2 || !receipt.processBirthToken) {
       throw new Error('OpenCode durable host cleanup lacks exact native generation authority [redacted]')
     }
     const entry = Array.from(this.hosts.values()).find(candidate =>
