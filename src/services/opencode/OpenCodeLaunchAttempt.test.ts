@@ -1007,7 +1007,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(result.committed).toEqual([])
     expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
     expect(subject.persistence.json().events.at(-1)).toMatchObject({
-      type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
+      type: 'member_unknown', memberIdentity: members[0],
     })
     expect(subject.persistence.json().cleanupState).toBe('incomplete')
     callerDeadlineExpired = false
@@ -1109,7 +1109,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls).not.toContain('release')
     expect(subject.persistence.json().finalResponse).toEqual(publishedFinal)
     expect(subject.persistence.json().events.at(-1)).toMatchObject({
-      type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
+      type: 'member_unknown', memberIdentity: members[0],
     })
     expect(subject.persistence.json().cleanupState).toBe('incomplete')
     const restarted = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
@@ -1500,10 +1500,31 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().finalResponse).toBeUndefined()
   })
 
+  test('releases the exact acquired host with a live cleanup context after pre-proof MCP failure', async () => {
+    const subject = setup()
+    let released: OpenCodeRetainedHostIdentity | undefined
+    let cleanupSignal: AbortSignal | undefined
+    subject.ports.mcp.verifyAppMcp = async () => { throw new Error('fake MCP configuration failure') }
+    subject.ports.host.releaseOperationHost = async input => {
+      released = input.host
+      cleanupSignal = input.signal
+      subject.calls.push('release')
+    }
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(result.status).toBe('failed')
+    expect(released).toEqual(host)
+    expect(cleanupSignal?.aborted).toBe(false)
+    expect(subject.calls.some(call => call.startsWith('create:'))).toBe(false)
+  })
+
   test('returns at the absolute deadline when physical host release never settles', async () => {
     const subject = setup()
     let releaseSignal: AbortSignal | undefined
+    let releaseCalls = 0
     subject.ports.host.releaseOperationHost = input => {
+      releaseCalls += 1
       releaseSignal = input.signal
       subject.setNow(input.deadlineAtMs)
       return new Promise<void>(() => undefined)
@@ -1513,5 +1534,10 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     })).rejects.toMatchObject({ code: 'fenced' })
     expect(releaseSignal?.aborted).toBe(true)
     expect(subject.persistence.json().finalResponse).toBeUndefined()
+    subject.setNow(1)
+    await expect(subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000, deadlineAtMs: 2,
+    })).rejects.toMatchObject({ code: 'fenced' })
+    expect(releaseCalls).toBe(1)
   })
 })

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { join } from 'node:path'
 
 import {
@@ -51,5 +51,52 @@ describe('processKill', () => {
   it('does not spawn an identity query for an invalid pid', async () => {
     await expect(readProcessStartTimeMs(0, 'win32')).resolves.toBeNull()
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
+  })
+
+  it('signals an ordinary POSIX child by positive PID', async () => {
+    const calls: number[] = []
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number) => {
+      calls.push(pid)
+      const error = new Error('gone') as NodeJS.ErrnoException
+      error.code = 'ESRCH'
+      throw error
+    }) as typeof process.kill)
+    try {
+      await expect(killProcessTreeAndWait(44_301, 'SIGTERM', { timeoutMs: 10 }))
+        .resolves.toBe(true)
+      expect(calls).toEqual([44_301, 44_301])
+    } finally {
+      kill.mockRestore()
+    }
+  })
+
+  it('signals a detached owned POSIX group only with explicit authority', async () => {
+    const calls: number[] = []
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number) => {
+      calls.push(pid)
+      const error = new Error('gone') as NodeJS.ErrnoException
+      error.code = 'ESRCH'
+      throw error
+    }) as typeof process.kill)
+    try {
+      await expect(killProcessTreeAndWait(44_302, 'SIGKILL', {
+        timeoutMs: 10, posixProcessGroupLeader: true,
+      })).resolves.toBe(true)
+      expect(calls).toEqual([-44_302, -44_302, 44_302])
+    } finally {
+      kill.mockRestore()
+    }
+  })
+
+  it('never treats a zero timeout as cleanup proof or sends a signal', async () => {
+    const kill = spyOn(process, 'kill')
+    try {
+      await expect(killProcessTreeAndWait(44_303, 'SIGKILL', {
+        timeoutMs: 0, posixProcessGroupLeader: true,
+      })).resolves.toBe(false)
+      expect(kill).not.toHaveBeenCalled()
+    } finally {
+      kill.mockRestore()
+    }
   })
 })

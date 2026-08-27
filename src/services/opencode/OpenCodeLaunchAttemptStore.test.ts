@@ -323,6 +323,27 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     )
   })
 
+  test('publishes final response and conservative cleanup truth in one durable transition', async () => {
+    const persistence = new MemoryPersistence()
+    const observed: Array<Record<string, unknown>> = []
+    const replace = persistence.replaceAndSync.bind(persistence)
+    persistence.replaceAndSync = async bytes => {
+      observed.push(JSON.parse(new TextDecoder().decode(bytes)))
+      await replace(bytes)
+    }
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    const response = finalResponse()
+    await store.withGeneration(exact, 'begin', lease =>
+      lease.commitTerminalResponse(response, 'incomplete'))
+    const terminalCandidates = observed.filter(candidate => candidate.finalResponse !== undefined)
+    expect(terminalCandidates).toHaveLength(1)
+    expect(terminalCandidates[0]?.cleanupState).toBe('incomplete')
+    expect((await store.inspect(exact))).toMatchObject({
+      cleanupState: 'incomplete', finalResponse: response,
+    })
+  })
+
   test.each([
     ['cleanup before rejected final publication', 'cleanup-first'],
     ['rejected final publication before retained cleanup', 'final-first'],
@@ -1457,7 +1478,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     expect((await store.inspect(exact))?.cleanupState).toBe('incomplete')
   })
 
-  test('resets cleanup truth only for an explicit new continuation generation', async () => {
+  test('carries incomplete cleanup truth across continuation and rejects a generation upgrade', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     const first = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
@@ -1468,10 +1489,18 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const second = { ...first, inputDigest: 'd'.repeat(64), generation: 2, continuationToken: token }
     await store.withGeneration(second, 'continue', async lease => {
       expect(lease.beganGeneration).toBe(true)
-      expect(lease.journal.cleanupState).toBe('unknown')
-      await lease.recordCleanupState('complete')
+      expect(lease.journal.cleanupState).toBe('incomplete')
+      await expect(lease.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
+      const attemptedFinal = finalResponse()
+      attemptedFinal.launchAttempt.generation = 2
+      attemptedFinal.launchAttempt.inputDigest = second.inputDigest
+      attemptedFinal.proof!.generation = 2
+      await expect(lease.commitTerminalResponse(attemptedFinal, 'complete'))
+        .rejects.toMatchObject({ code: 'fenced' })
     })
-    expect((await store.inspect(second))?.cleanupState).toBe('complete')
+    const durable = await store.inspect(second)
+    expect(durable).toMatchObject({ generation: 2, cleanupState: 'incomplete' })
+    expect(durable?.finalResponse).toBeUndefined()
   })
 
   test('two processes fence duplicate begin writers and preserve the winning journal', async () => {

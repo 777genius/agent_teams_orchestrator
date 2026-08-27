@@ -94,8 +94,6 @@ export type OpenCodeLaunchAttemptPorts = {
       host: OpenCodeRetainedHostIdentity
       deadlineAtMs: number
       signal: AbortSignal
-      /** Original attempt cancellation remains authoritative during cleanup. */
-      attemptSignal?: AbortSignal
     }): Promise<void>
   }
   mcp: {
@@ -257,6 +255,10 @@ export class OpenCodeLaunchAttempt {
       deadlineAtMs: input.deadlineAtMs,
     })
     const controller = new AbortController()
+    // Cleanup and terminal persistence retain their own bounded authority. A
+    // work-phase failure aborts `controller`, but must not pre-abort release of
+    // the exact acquired capability during the reserved absolute-deadline tail.
+    const reserveController = new AbortController()
     const cancel = () => controller.abort(input.signal?.reason)
     input.signal?.addEventListener('abort', cancel, { once: true })
     if (input.signal?.aborted) cancel()
@@ -345,19 +347,20 @@ export class OpenCodeLaunchAttempt {
           if (recovery === 'required') {
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, 'reconciliation_required', committed,
-              members, 'unknown_transport_after_side_effect', 'complete', request, acceptedProofResponse)
+              members, 'unknown_transport_after_side_effect', 'complete', request, acceptedProofResponse,
+              [], reserveController.signal)
           }
           if (recovery) {
             const recoveryStatus = recovery === 'unknown_transport_after_side_effect'
               ? 'reconciliation_required' : committed.length ? 'partial' : 'failed'
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, recoveryStatus, committed,
-              members, recovery, 'complete', request, acceptedProofResponse)
+              members, recovery, 'complete', request, acceptedProofResponse, [], reserveController.signal)
           }
           if (committed.length === members.length) {
             return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
               immutableDigest, lease.generation, 'succeeded', committed, members,
-              undefined, 'complete', request, acceptedProofResponse)
+              undefined, 'complete', request, acceptedProofResponse, [], reserveController.signal)
           }
 
           const owned: OpenCodeLaunchOwnedResources[] = []
@@ -680,7 +683,6 @@ export class OpenCodeLaunchAttempt {
                   const releaseController = new AbortController()
                   const physicalRelease = this.ports.host.releaseOperationHost({
                     host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs, signal: releaseController.signal,
-                    attemptSignal: controller.signal,
                   })
                   try {
                     await this.ports.deadline.run(
@@ -689,9 +691,11 @@ export class OpenCodeLaunchAttempt {
                   } catch {
                     cleanup = 'timed_out'
                     // The physical release may ignore cancellation.  Abort its supplied signal and
-                    // observe its eventual settlement without extending the caller's absolute
-                    // deadline.  In particular, never await it again after the bounded race lost.
+                    // retain the generation fence until its eventual settlement without extending
+                    // the caller's absolute deadline. This keeps a timed-out host capability from
+                    // becoming unreachable or being bypassed by replay.
                     releaseController.abort(new DeadlineError())
+                    lease.retainUntilPhysicalSettlement(physicalRelease)
                     void physicalRelease.then(() => undefined, () => undefined)
                   }
                 })()
@@ -746,16 +750,10 @@ export class OpenCodeLaunchAttempt {
                     if (!cleanupClaimToken) continue
                     try {
                       await lease.append({ type: 'cleanup', memberIdentity: resource.memberIdentity,
-                        outcome: cleanup, claimToken: cleanupClaimToken }, deferredAuthoritySettlement
-                        ? {
-                          deadlineAtMs: Number.MAX_SAFE_INTEGER,
-                          signal: new AbortController().signal,
-                          monotonicNow: () => this.ports.clock.monotonicNow(),
-                        }
-                        : {
-                          deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
-                          monotonicNow: () => this.ports.clock.monotonicNow(),
-                        })
+                        outcome: cleanup, claimToken: cleanupClaimToken }, {
+                        deadlineAtMs: policy.absoluteDeadlineAtMs, signal: cleanupController.signal,
+                        monotonicNow: () => this.ports.clock.monotonicNow(),
+                      })
                     } catch (appendError) { persistenceFailure ??= appendError }
                   }
                 })()
@@ -779,7 +777,7 @@ export class OpenCodeLaunchAttempt {
                   : 'failed'
           return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
             immutableDigest, lease.generation, status, committed, members, failure, cleanup,
-            request, acceptedProofResponse, owned)
+            request, acceptedProofResponse, owned, reserveController.signal)
         },
         initialStoreContext,
       )
@@ -903,20 +901,14 @@ export class OpenCodeLaunchAttempt {
     failure: OpenCodeLaunchFailureKind | undefined,
     cleanup: OpenCodeLaunchCleanupOutcome,
     request: OpenCodeLaunchAttemptRequest,
-    acceptedProofResponse?: OpenCodeLaunchAttemptResponse,
-    currentOwned: readonly OpenCodeLaunchOwnedResources[] = [],
+    acceptedProofResponse: OpenCodeLaunchAttemptResponse | undefined,
+    currentOwned: readonly OpenCodeLaunchOwnedResources[],
+    cleanupSignal: AbortSignal,
   ): Promise<OpenCodeLaunchAttemptResult> {
     const persistedCleanup = lease.journal.cleanupState ?? 'unknown'
     const cleanupState = persistedCleanup === 'complete' ? 'complete'
       : persistedCleanup === 'incomplete' ? 'incomplete'
         : cleanup === 'complete' && lease.beganGeneration ? 'complete' : 'incomplete'
-    if (persistedCleanup === 'unknown') {
-      await lease.recordCleanupState(cleanupState, {
-        deadlineAtMs: Number.MAX_SAFE_INTEGER,
-        signal: new AbortController().signal,
-        monotonicNow: () => this.ports.clock.monotonicNow(),
-      })
-    }
     cleanup = cleanupState === 'complete' ? 'complete' : 'timed_out'
     // Preserve the actual member/contract taxonomy. A partial roster does not turn a
     // provider or policy failure into a deadline; only the deadline path authors that code.
@@ -952,7 +944,7 @@ export class OpenCodeLaunchAttempt {
       && classifyOpenCodeLaunchFailure(aggregateFailure).retryable
       ? members.filter(member => !committedIds.has(member)) : []
     const persistenceContext = { deadlineAtMs: policy.absoluteDeadlineAtMs,
-      signal: new AbortController().signal,
+      signal: cleanupSignal,
       monotonicNow: () => this.ports.clock.monotonicNow() }
     const continuationToken = eligible.length > 0
       ? await lease.issueContinuation(eligible, persistenceContext) : undefined
@@ -999,7 +991,7 @@ export class OpenCodeLaunchAttempt {
         throw new OpenCodeLaunchAttemptError('proof.nonceHash')
       }
       validateOpenCodeLaunchResponseRoster(decoded.value.response, members, request.launchAttempt.parent)
-      await lease.commitFinalResponse(response, persistenceContext)
+      await lease.commitTerminalResponse(response, cleanupState, persistenceContext)
       return { ...result, durableFinalResponse: decoded.value.response }
     }
     return result

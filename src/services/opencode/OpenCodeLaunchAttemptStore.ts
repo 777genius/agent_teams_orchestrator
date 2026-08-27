@@ -1302,6 +1302,12 @@ export type OpenCodeLaunchJournalLease = {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<void>
   commitFinalResponse(response: OpenCodeLaunchAttemptResponse, context?: OpenCodeLaunchStoreContext): Promise<void>
+  /** Atomically publishes the durable terminal projection and physical cleanup truth. */
+  commitTerminalResponse(
+    response: OpenCodeLaunchAttemptResponse,
+    cleanupState: 'complete' | 'incomplete',
+    context?: OpenCodeLaunchStoreContext,
+  ): Promise<void>
   recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
@@ -1420,7 +1426,12 @@ export class OpenCodeLaunchAttemptStore {
             consumedContinuationToken: identity.continuationToken,
             acceptedProofResponse: undefined,
             finalResponse: undefined,
-            cleanupState: 'unknown' as const }
+            // Incomplete cleanup truth is aggregate across generations. A new
+            // logical generation cannot erase an unreconciled physical cleanup
+            // obligation from its predecessor. Prior complete proof does not
+            // cover resources the new generation may acquire, so only that
+            // non-absorbing state returns to unknown.
+            cleanupState: journal.cleanupState === 'incomplete' ? 'incomplete' : 'unknown' }
           assertSafePositive(candidate.generation, 'generation')
           assertSafePositive(candidate.fence, 'fence')
           await this.persist(candidate, effectiveContext)
@@ -1601,6 +1612,51 @@ export class OpenCodeLaunchAttemptStore {
               return
             }
             const candidate = { ...journal!, finalResponse: encoded }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            let persistenceError: unknown | undefined
+            try {
+              persistenceError = await this.persistRecoverableProjection(
+                candidate, responseContext ?? effectiveContext)
+            } catch (error) {
+              active = false
+              leaseFailure = error
+              if (error instanceof OpenCodeLaunchPoisonedLeaseError) leasePoison = error
+              throw error
+            }
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+            if (persistenceError !== undefined) {
+              leaseFailure = persistenceError
+              throw persistenceError
+            }
+          }, responseContext)
+        },
+        commitTerminalResponse: async (response, cleanupState, responseContext) => {
+          const encoded = encodeOpenCodeLaunchAttemptResponse(response)
+          if (encoded.launchAttempt.attemptId !== journal!.attemptId
+            || encoded.launchAttempt.payloadHash !== journal!.payloadHash
+            || encoded.launchAttempt.generation !== generation
+            || encoded.launchAttempt.inputDigest !== journal!.inputDigest
+            || encoded.launchAttempt.immutableDigest !== journal!.immutableDigest) {
+            throw new OpenCodeLaunchJournalError('foreign', 'terminal response identity mismatch')
+          }
+          await pauseAfterCandidateCapture('finalResponse')
+          await serializeMutation(async () => {
+            const currentCleanup = journal!.cleanupState ?? 'unknown'
+            if (cleanupState === 'complete' && !beganGeneration && currentCleanup !== 'complete') {
+              throw new OpenCodeLaunchJournalError('fenced', 'only the generation creator may prove cleanup complete')
+            }
+            if (currentCleanup !== 'unknown' && currentCleanup !== cleanupState) {
+              throw new OpenCodeLaunchJournalError('fenced', 'terminal cleanup state is immutable')
+            }
+            if (journal!.finalResponse) {
+              if (JSON.stringify(journal!.finalResponse) !== JSON.stringify(encoded)) {
+                throw new OpenCodeLaunchJournalError('fenced', 'final response changed')
+              }
+              return
+            }
+            const candidate = { ...journal!, finalResponse: encoded, cleanupState }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
             let persistenceError: unknown | undefined

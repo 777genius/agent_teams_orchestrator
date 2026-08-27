@@ -767,7 +767,7 @@ class OpenCodeProductionLaunchRuntime {
           }
           await bounded(openCodeHostManager.releaseHostReference(reference,
             { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive(),
-              signal: input.attemptSignal ?? input.signal,
+              signal: input.signal,
               remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()) }),
           input.deadlineAtMs, input.signal)
           hostReferences.delete(input.host.hostKeyIdentity)

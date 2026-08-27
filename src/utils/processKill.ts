@@ -190,15 +190,15 @@ export function killProcessTree(
   }
 }
 
-function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
+function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<boolean> {
   return new Promise(resolve => {
     let done = false
     let child: ReturnType<typeof spawn> | null = null
-    const finish = () => {
+    const finish = (complete: boolean) => {
       if (done) return
       done = true
       clearTimeout(timeout)
-      resolve()
+      resolve(complete)
     }
     const timeout = setTimeout(() => {
       try {
@@ -206,7 +206,7 @@ function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
       } catch {
         // Best-effort cleanup.
       }
-      finish()
+      finish(false)
     }, timeoutMs)
 
     try {
@@ -216,10 +216,10 @@ function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
         detached: true,
         windowsHide: true,
       })
-      child.once('error', finish)
-      child.once('close', finish)
+      child.once('error', () => finish(false))
+      child.once('close', code => finish(code === 0))
     } catch {
-      finish()
+      finish(false)
     }
   })
 }
@@ -279,6 +279,13 @@ export async function killProcessTreeAndWait(
     pollMs?: number
     taskkillTimeoutMs?: number
     expectedStartedAtMs?: number | null
+    /**
+     * Explicit authority to signal a detached, manager-owned POSIX process
+     * group whose leader is exactly `pid`. Ordinary children must omit this.
+     */
+    posixProcessGroupLeader?: boolean
+    /** taskkill /T completion is the manager-owned Windows tree proof. */
+    windowsTaskkillTreeAuthority?: boolean
   } = {},
 ): Promise<boolean> {
   if (!pid || !Number.isFinite(pid) || pid <= 0) {
@@ -287,11 +294,12 @@ export async function killProcessTreeAndWait(
 
   const timeoutMs = options.timeoutMs ?? 2_500
   const pollMs = options.pollMs ?? 50
+  if (timeoutMs <= 0) return false
 
   if (process.platform === 'win32') {
-    await runWindowsTaskkill(pid, options.taskkillTimeoutMs ?? timeoutMs)
+    const treeDisposed = await runWindowsTaskkill(pid, options.taskkillTimeoutMs ?? timeoutMs)
     if (!isProcessAlive(pid)) {
-      return true
+      return options.windowsTaskkillTreeAuthority === true ? treeDisposed : true
     }
     if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null) {
       const currentStartedAtMs = await readProcessStartTimeMs(pid)
@@ -312,13 +320,18 @@ export async function killProcessTreeAndWait(
     if (currentStartedAtMs !== options.expectedStartedAtMs) return false
   }
 
-  try {
-    // Managed POSIX hosts are detached process-group leaders. Observe the
-    // entire exact group; leader exit alone is never cleanup proof.
-    process.kill(-pid, signal)
-  } catch {
-    return !isPosixProcessGroupAlive(pid) && !isProcessAlive(pid)
+  if (options.posixProcessGroupLeader === true) {
+    try {
+      process.kill(-pid, signal)
+    } catch {
+      return !isPosixProcessGroupAlive(pid) && !isProcessAlive(pid)
+    }
+    return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs)
   }
-
-  return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs)
+  try {
+    process.kill(pid, signal)
+  } catch {
+    return !isProcessAlive(pid)
+  }
+  return waitForProcessExit(pid, timeoutMs, pollMs)
 }

@@ -383,6 +383,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-host-temp-'))
     const registryPath = path.join(tempDir, 'registry.json')
     let spawnCount = 0
+    let processAlive = true
     const manager = new OpenCodeHostManager({
       allocateLoopbackPort: async () => 44101,
       spawnHostProcess: profile => {
@@ -397,7 +398,9 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
         throw new Error(`unexpected scoped host request ${url}`)
       },
-      isProcessAlive: () => false,
+      isProcessAlive: () => processAlive,
+      isProcessGroupAlive: () => processAlive,
+      killProcess: () => { processAlive = false },
       sleepMs: async () => {},
       persistentRegistryPath: registryPath,
     })
@@ -414,7 +417,10 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       })
       expect(spawnCount).toBe(1)
       expect(await pathExists(registryPath)).toBe(false)
-      await manager.releaseHostReference(reference)
+      const duplicate = await Promise.allSettled([
+        manager.releaseHostReference(reference), manager.releaseHostReference(reference),
+      ])
+      expect(duplicate.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected'])
       expect(manager.getHost(handle.hostKey)).not.toBeNull()
       await expect(manager.releaseHostReference({ handle } as never)).rejects.toThrow('invalid')
       await expect(manager.releaseHostReference(reference)).rejects.toThrow('already consumed')
@@ -443,7 +449,10 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       },
       isProcessAlive: pid => pid === 443 && leaderAlive,
       isProcessGroupAlive: pid => pid === 443 && (leaderAlive || descendant507Alive),
-      killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
+      killProcess: (_pid, signal) => {
+        signals.push(signal)
+        leaderAlive = false
+      },
       sleepMs: async () => {},
       persistentRegistryPath: null,
     })
@@ -452,6 +461,10 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     })
     await expect(manager.releaseHostReference(reference)).rejects.toThrow('did not exit')
     expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(descendant507Alive).toBe(true)
+    await expect(manager.releaseHostReference(reference)).rejects.toThrow()
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(manager.getHost(reference.handle.hostKey)).not.toBeNull()
     expect(descendant507Alive).toBe(true)
   })
 
@@ -486,6 +499,76 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       signal: controller.signal, remainingMs: () => 1_000,
     })).rejects.toThrow('hostile cancellation')
     expect(signals).toEqual(['SIGTERM'])
+  })
+
+  test('keeps a process host strongly tracked and administratively reapable after caller release timeout', async () => {
+    const profile = scopedProfile('execution-probe')
+    const child = createMockChildProcess(447)
+    let leaderAlive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44115,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 447 && leaderAlive,
+      killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    const reference = await manager.ensureScopedHostReference({
+      preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+    })
+
+    await expect(manager.releaseHostReference(reference, { remainingMs: () => 0 }))
+      .rejects.toThrow('deadline expired')
+    expect(manager.getHost(reference.handle.hostKey)).not.toBeNull()
+    expect(signals).toEqual([])
+
+    const reaped = await manager.disposeUnregisteredOwnedHosts()
+    expect(reaped).toEqual({ disposed: 1, kept: 0, diagnostics: [] })
+    expect(signals).toEqual([])
+    expect(child.killedSignals).toEqual(['SIGTERM'])
+    expect(manager.getHost(reference.handle.hostKey)).toBeNull()
+  })
+
+  test('persistent cleanup retains its receipt when leader exits but descendant 507 survives', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-persistent-descendant-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(446)
+    let leaderAlive = true
+    let descendant507Alive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44114,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 446 && leaderAlive,
+      isProcessGroupAlive: pid => pid === 446 && (leaderAlive || descendant507Alive),
+      killProcess: (_pid, signal) => {
+        signals.push(signal)
+        leaderAlive = false
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+    })
+    try {
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await expect(manager.releaseHostReference(reference)).rejects.toThrow('containment')
+      expect(await pathExists(registryPath)).toBe(true)
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+      await expect(manager.releaseHostReference(reference)).rejects.toThrow()
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(await pathExists(registryPath)).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
   })
 
   test('treats a TERM observer crossing the absolute deadline as incomplete and never force mutates', async () => {
@@ -534,6 +617,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         throw new Error(`unexpected scoped host request ${url}`)
       },
       isProcessAlive: () => processAlive,
+      isProcessGroupAlive: () => processAlive,
       killProcess: () => { processAlive = false },
       readProcessStartTimeMs: async () => 1_000,
       readProcessCommandLine: async () => `opencode serve --hostname 127.0.0.1 --port 44102`,
@@ -2498,6 +2582,30 @@ describe('OpenCodeHostManager', () => {
     expect(spawned.killedSignals).toEqual(['SIGTERM'])
   })
 
+  test('does not commit a pending waiter reference when abort wins pending resolution', async () => {
+    const spawned = createMockChildProcess(43138)
+    const controller = new AbortController()
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43138,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true, version: '1.4.0' } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      persistentRegistryPath: null,
+    })
+    const first = manager.ensureHost({ hostKey: 'pending-abort-race', hostLifetime: 'process' })
+    void first.then(() => controller.abort(new Error('controlled pending abort')))
+    const waiter = manager.ensureHost({
+      hostKey: 'pending-abort-race', hostLifetime: 'process', abortSignal: controller.signal,
+    })
+    const handle = await first
+    await expect(waiter).rejects.toThrow('controlled pending abort')
+    const tracked = (manager as unknown as { hosts: Map<string, { refCount: number }> }).hosts
+    expect(tracked.get(handle.hostKey)?.refCount).toBe(1)
+  })
+
   test('scopes disposal single-flight to the exact host generation', async () => {
     const children = [
       createMockChildProcess(43131),
@@ -3050,6 +3158,7 @@ describe('OpenCodeHostManager', () => {
         const manager = new OpenCodeHostManager({
           fetchJson: async () => ({ status: 200, data: { ok: true } }),
           isProcessAlive: pid => pid === 43141 && processAlive,
+          isProcessGroupAlive: pid => pid === 43141 && processAlive,
           readProcessStartTimeMs: async () => 1_000,
           killProcess: () => {
             processAlive = false
@@ -3234,6 +3343,7 @@ describe('OpenCodeHostManager', () => {
           throw new Error('must not start a replacement while the registered host is alive')
         },
         isProcessAlive: pid => pid === 43115,
+        isProcessGroupAlive: pid => pid === 43115,
         readProcessStartTimeMs: async () => 1_000,
         killProcess: (_pid, signal) => {
           killedSignals.push(signal)
@@ -3243,7 +3353,7 @@ describe('OpenCodeHostManager', () => {
       })
 
       await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
-        'pid 43115 remained alive after forced cleanup',
+        'pid 43115 containment remained alive or unproven after cleanup',
       )
       expect(killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
       const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
@@ -4153,6 +4263,7 @@ describe('OpenCodeHostManager', () => {
           return { status: 200, data: { ok: true } }
         },
         isProcessAlive: pid => pid === 43116 && processAlive,
+        isProcessGroupAlive: pid => pid === 43116 && processAlive,
         killProcess: (pid, signal) => {
           killedSignals.push({ pid, signal })
           processAlive = false
@@ -4319,6 +4430,7 @@ describe('OpenCodeHostManager', () => {
           return { status: 200, data: { ok: true } }
         },
         isProcessAlive: pid => alivePids.has(pid),
+        isProcessGroupAlive: pid => alivePids.has(pid),
         killProcess: (pid, signal) => {
           killedSignals.push({ pid, signal })
           alivePids.delete(pid)
@@ -4395,6 +4507,7 @@ describe('OpenCodeHostManager', () => {
       const manager = new OpenCodeHostManager({
         fetchJson: async () => ({ status: 200, data: { ok: true } }),
         isProcessAlive: pid => pid === 43118 && processAlive,
+        isProcessGroupAlive: pid => pid === 43118 && processAlive,
         killProcess: (pid, signal) => {
           killedSignals.push({ pid, signal })
           if (signal === 'SIGKILL') processAlive = false
@@ -4452,6 +4565,7 @@ describe('OpenCodeHostManager', () => {
       const manager = new OpenCodeHostManager({
         fetchJson: async () => ({ status: 200, data: { ok: true } }),
         isProcessAlive: pid => pid === 43118,
+        isProcessGroupAlive: pid => pid === 43118,
         killProcess: (_pid, signal) => {
           killedSignals.push(signal)
         },
@@ -4468,7 +4582,7 @@ describe('OpenCodeHostManager', () => {
       expect(result.cleaned).toBe(0)
       expect(result.remaining).toBe(1)
       expect(result.hosts[0]?.action).toBe('failed')
-      expect(result.hosts[0]?.reason).toContain('pid 43118 remained alive')
+      expect(result.hosts[0]?.reason).toContain('pid 43118 containment remained alive')
       expect(result.diagnostics[0]).toContain('Failed to dispose OpenCode host host-key')
       expect(killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
       const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
