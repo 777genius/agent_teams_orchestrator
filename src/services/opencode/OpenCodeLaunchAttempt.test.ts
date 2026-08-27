@@ -1583,12 +1583,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     let acquireEntered!: () => void
     const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
     const acquisition = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
-    const releaseInputs: Array<{ deadlineAtMs: number; signal: AbortSignal }> = []
+    const releaseInputs: Array<{ deadlineAtMs: number; signal: AbortSignal; lateSettlement?: true }> = []
     const physicalRelease = new Promise<void>(() => undefined)
     const subject = setup()
     subject.ports.host.acquireOperationHost = async () => { acquireEntered(); return acquisition }
     subject.ports.host.releaseOperationHost = async input => {
-      releaseInputs.push({ deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+      releaseInputs.push({ deadlineAtMs: input.deadlineAtMs, signal: input.signal,
+        lateSettlement: input.lateSettlement })
       return physicalRelease
     }
 
@@ -1603,6 +1604,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
 
     expect(releaseInputs).toHaveLength(1)
     expect(releaseInputs[0]?.deadlineAtMs).toBe(10_000)
+    expect(releaseInputs[0]?.lateSettlement).toBe(true)
     expect(releaseInputs[0]?.signal.aborted).toBe(true)
     expect(subject.persistence.json().cleanupState).not.toBe('complete')
     expect(subject.persistence.json().finalResponse).toBeUndefined()

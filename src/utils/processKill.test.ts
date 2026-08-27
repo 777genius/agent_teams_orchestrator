@@ -135,6 +135,20 @@ describe('processKill', () => {
     }
   })
 
+  it.each(['darwin', 'freebsd'] as const)(
+    'fails closed on %s detached groups without any negative signal or probe',
+    async platform => {
+      const kill = spyOn(process, 'kill')
+      try {
+        await expect(killProcessTreeAndWait(44_305, 'SIGTERM', {
+          platform, timeoutMs: 10, posixProcessGroupLeader: true,
+          expectedStartedAtMs: 1_000,
+        })).resolves.toBe(false)
+        expect(kill).not.toHaveBeenCalled()
+      } finally { kill.mockRestore() }
+    },
+  )
+
   it.each(['EACCES', 'EIO'] as const)('treats Linux proc %s as unknown, never empty', code => {
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'], readFile: () => {

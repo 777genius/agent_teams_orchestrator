@@ -124,6 +124,8 @@ type ManagedHostEntry = {
   createdDisposalReceipt?: CreatedHostDisposalReceipt
 }
 
+class OpenCodeHostDurablyLeasedError extends Error {}
+
 declare const openCodeHostReferenceBrand: unique symbol
 /** Manager-minted, attempt-bound authority for exactly one acquired host reference. */
 export type OpenCodeHostReferenceCapability = Readonly<{
@@ -1876,6 +1878,13 @@ export class OpenCodeHostManager {
     requireStableContainment = false,
     expectedBirthToken?: string | null,
   ): Promise<boolean> {
+    const platform = this.deps.platform ?? process.platform
+    if (requireStableContainment && platform !== 'linux' && platform !== 'win32') {
+      // No exact native process-generation authority exists here. In
+      // particular, never let an injected/legacy observer turn Darwin's
+      // second-resolution wall clock identity into PGID mutation authority.
+      return false
+    }
     if (this.deps.killProcess) {
       if (requireStableContainment && !this.isProcessAlive(pid)) return false
       this.deps.killProcess(pid, signal)
@@ -1899,6 +1908,7 @@ export class OpenCodeHostManager {
   }
 
   private hasStableProcessContainmentExited(pid: number): boolean {
+    if ((this.deps.platform ?? process.platform) !== 'linux') return false
     if (this.deps.isProcessGroupAlive) return this.deps.isProcessGroupAlive(pid) === false
     // A fake mutation hook without a matching strong observer is deliberately
     // unproven. Production POSIX cleanup observes the detached process group.
@@ -1907,6 +1917,7 @@ export class OpenCodeHostManager {
   }
 
   private persistentContainmentExited(pid: number): boolean {
+    if ((this.deps.platform ?? process.platform) !== 'linux') return false
     if (this.deps.isProcessGroupAlive) return this.deps.isProcessGroupAlive(pid) === false
     return isProcessTreeContainmentAlive(pid) === false
   }
@@ -3637,6 +3648,45 @@ export class OpenCodeHostManager {
     if (!disposed) throw new Error('OpenCode durable host containment cleanup remains incomplete [redacted]')
   }
 
+  /**
+   * Consume a final operation reference while holding the same durable
+   * registry lock used by member-lease writers. A stale attempt-local view may
+   * never dispose a persistent generation that now serves a committed member.
+   * Returning false means disposal may be attempted, but its registry CAS will
+   * still fence a lease published after this inspection.
+   */
+  private async consumeFinalReferenceForDurableLease(
+    entry: ManagedHostEntry,
+    consume: () => void,
+  ): Promise<boolean> {
+    if (entry.lifetime !== 'persistent' || !this.persistentRegistryPath) return false
+    return this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      if (registry.schemaVersion !== 2) {
+        throw new Error('OpenCode persistent host registry cannot prove release disposition [redacted]')
+      }
+      const record = registry.hosts[entry.handle.hostKey]
+      const expectedRecord = entry.ownedByProcess
+        ? entry.createdDisposalReceipt?.registryReceipt : entry.adoptedRegistryReceipt
+      if (!record
+        || !expectedRecord
+        || record.pid !== entry.handle.pid
+        || record.processStartedAtMs !== entry.handle.processStartedAtMs
+        || (entry.handle.processBirthToken !== undefined
+          && record.processBirthToken !== entry.handle.processBirthToken)
+        || canonicalSerializeOpenCodePolicyIdentity(
+          persistentHostLifecycleIdentity(record, this.scopedTransportOwnerKey),
+        ) !== canonicalSerializeOpenCodePolicyIdentity(
+          persistentHostLifecycleIdentity(expectedRecord, this.scopedTransportOwnerKey),
+        )) {
+        throw new Error('OpenCode persistent host registry generation changed before release [redacted]')
+      }
+      if (Object.keys(normalizePersistentHostLeases(record.leases)).length === 0) return false
+      consume()
+      return true
+    })
+  }
+
   async releaseHostReference(
     capability: OpenCodeHostReferenceCapability,
     options: {
@@ -3671,10 +3721,20 @@ export class OpenCodeHostManager {
         durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
         return
       }
-      if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
+      const consumeReference = (): void => {
         entry.refCount = 0
         authority.state = 'released'
         durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
+      }
+      // Durable member/session leases outrank both a stale `dispose` intent and
+      // a retained in-memory capability. Inspect and consume under the registry
+      // lock on every final persistent-reference release path.
+      if (entry.lifetime === 'persistent'
+        && await this.consumeFinalReferenceForDurableLease(entry, consumeReference)) {
+        return
+      }
+      if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
+        consumeReference()
         return
       }
       if (entry.ownedByProcess) {
@@ -3688,18 +3748,24 @@ export class OpenCodeHostManager {
             'retaining containment receipt for conservative reconciliation',
           )
         }
-        await this.disposeHost(entry.handle.hostKey, {
-          restoreOnFailure: true,
-          signal: options.signal,
-          remainingMs: options.remainingMs,
-          requireStableContainment: true,
-        })
+        try {
+          await this.disposeHost(entry.handle.hostKey, {
+            restoreOnFailure: true,
+            signal: options.signal,
+            remainingMs: options.remainingMs,
+            requireStableContainment: true,
+          })
+        } catch (error) {
+          if (error instanceof OpenCodeHostDurablyLeasedError) {
+            consumeReference()
+            return
+          }
+          throw error
+        }
       } else if (this.hosts.get(entry.handle.hostKey) === entry) {
         this.hosts.delete(entry.handle.hostKey)
       }
-      entry.refCount = 0
-      authority.state = 'released'
-      durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
+      consumeReference()
     })()
     authority.release = release
     try {
@@ -3855,11 +3921,16 @@ export class OpenCodeHostManager {
 
     this.assertCleanupAllowed(options)
 
-    if (options.requireStableContainment && pid > 0 && !terminated
-      && (!this.isProcessAlive(pid) || !this.hasStableProcessContainmentExited(pid))) {
-      throw new Error(
-        `OpenCode host pid ${pid} containment remained alive or unproven after cleanup`,
-      )
+    if (options.requireStableContainment && pid > 0 && !terminated) {
+      // Leader loss revokes signalling authority, but Linux's complete stable
+      // /proc observer may still prove that the whole containment is empty.
+      // No group signal or probe occurs in this branch.
+      if (this.isProcessAlive(pid) || !this.hasStableProcessContainmentExited(pid)) {
+        throw new Error(
+          `OpenCode host pid ${pid} containment remained alive or unproven after cleanup`,
+        )
+      }
+      terminated = true
     }
 
     if (pid > 0 && !terminated && this.isProcessAlive(pid)) {
@@ -3927,6 +3998,10 @@ export class OpenCodeHostManager {
         if (!current || canonicalSerializeOpenCodePolicyIdentity(current)
           !== canonicalSerializeOpenCodePolicyIdentity(receipt)) {
           throw new Error('OpenCode adopted host registry compare-and-swap failed [redacted]')
+        }
+        if (Object.keys(normalizePersistentHostLeases(current.leases)).length > 0) {
+          throw new OpenCodeHostDurablyLeasedError(
+            'OpenCode persistent host gained a durable lease before disposal [redacted]')
         }
         const processIdentity = await this.inspectPersistentHostProcessIdentity(current)
         if (
@@ -4004,6 +4079,10 @@ export class OpenCodeHostManager {
         if (!current || canonicalSerializeOpenCodePolicyIdentity(current)
           !== canonicalSerializeOpenCodePolicyIdentity(receipt.registryReceipt)) {
           throw new Error('OpenCode created host registry compare-and-swap failed [redacted]')
+        }
+        if (Object.keys(normalizePersistentHostLeases(current.leases)).length > 0) {
+          throw new OpenCodeHostDurablyLeasedError(
+            'OpenCode persistent host gained a durable lease before disposal [redacted]')
         }
         const processIdentity = await this.inspectPersistentHostProcessIdentity(receipt.record)
         if (processIdentity.state !== 'confirmed'

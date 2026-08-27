@@ -103,6 +103,8 @@ export type OpenCodeLaunchAttemptPorts = {
       host: OpenCodeRetainedHostIdentity
       deadlineAtMs: number
       signal: AbortSignal
+      /** The acquisition settled after the caller envelope closed. Physical cleanup owns a private bound. */
+      lateSettlement?: true
     }): Promise<void>
     /** Reconcile an attempt-bound release receipt before replay can authorize cleanup. */
     reconcileOperationHost?(input: {
@@ -502,6 +504,7 @@ export class OpenCodeLaunchAttempt {
                       host: candidate,
                       deadlineAtMs: policy.absoluteDeadlineAtMs,
                       signal: lateReleaseController.signal,
+                      lateSettlement: true,
                     })
                     try {
                       await this.ports.deadline.run(

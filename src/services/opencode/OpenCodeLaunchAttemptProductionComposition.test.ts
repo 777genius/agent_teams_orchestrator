@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -11,6 +11,12 @@ import {
 } from './OpenCodeLaunchAttemptBridge.js'
 import type { OpenCodeLaunchAttemptResult } from './OpenCodeLaunchAttempt.js'
 import { OpenCodeLaunchMutationLedger } from './OpenCodeLaunchMutationLedger.js'
+import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { OpenCodeProfileManager } from './OpenCodeProfileManager.js'
+import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { createOpenCodeLaunchAttemptProductionTestBridge,
+  OpenCodeLaunchHostReleaseLedger } from './OpenCodeLaunchAttemptProduction.js'
+import { isProcessAlive } from '../../utils/processKill.js'
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
 const identity = (character: string) => `sha256:${character.repeat(64)}` as const
@@ -311,4 +317,146 @@ describe('OpenCode production launch composition', () => {
     await expect(bridge.execute({ ...command(), signal: controller.signal })).rejects.toBe(reason)
     expect(canonicalCalls).toBe(1)
   })
+
+  test('static child/grandchild runs through production bridge, real HostManager, durable receipt, native containment, and restart replay', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-composition-'))
+    const project = path.join(root, 'project')
+    const data = path.join(root, 'data')
+    const cache = path.join(root, 'cache')
+    const userHome = path.join(root, 'home')
+    await Promise.all([mkdir(project), mkdir(userHome)])
+    const fixtureName = `opencode-host-fixture${process.platform === 'win32' ? '.exe' : ''}`
+    const fixtureBinary = path.resolve(import.meta.dir, '../../../native/opencode-host-fixture/target/debug', fixtureName)
+    const prior = { ...process.env }
+    const restoreEnvironment = () => {
+      for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key]
+      Object.assign(process.env, prior)
+    }
+    try {
+      process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = cache
+      process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = fixtureBinary
+      process.env.HOME = userHome
+      process.env.USERPROFILE = userHome
+      process.env.XDG_CONFIG_HOME = path.join(root, 'user-config')
+      process.env.XDG_DATA_HOME = path.join(root, 'user-data')
+      process.env.DEEPINFRA_API_KEY = 'static-fixture-key'
+      delete process.env.OPENCODE_CONFIG
+      delete process.env.OPENCODE_CONFIG_CONTENT
+
+      const profileManager = new OpenCodeProfileManager()
+      const current = await profileManager.captureCurrentScopedProfilePlan({
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/static-model',
+        runtimeInstanceId: result.attemptId, projectPath: project,
+      })
+      const value = command()
+      value.projectPath = project
+      value.selectedModel = 'deepinfra/static-model'
+      value.request.launchAttempt.providerId = 'deepinfra'
+      value.request.launchAttempt.modelId = 'deepinfra/static-model'
+      value.request.launchAttempt.proofNonce = 'A'.repeat(22)
+      value.preconditions.expectedBehaviorFingerprint = current.evidence.projectBehaviorFingerprint
+      value.request.launchAttempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest(value)
+      const sessionStore = new OpenCodeSessionStore(path.join(root, 'sessions.json'))
+      const registryPath = path.join(data, 'opencode', 'hosts.json')
+      const disconnectedMcp = { ensureAppMcp: async () => ({ mcp: {}, summary: {
+        serverName: 'agent-teams', matchedServerName: null, status: 'missing', connected: false,
+        launchSource: null, availableServerNames: [], diagnostics: ['static failure boundary'],
+      } }) }
+      const createBridge = () => createOpenCodeLaunchAttemptProductionTestBridge({
+        dataDirectory: data,
+        profileManager,
+        sessionStore,
+        hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }),
+        mcpManager: disconnectedMcp as never,
+      })
+
+      const first = await createBridge().execute(value)
+      if (!first.data?.launchAttempt) {
+        const journal = await readFile(path.join(data, 'opencode', 'launch-attempts',
+          `${value.request.launchAttempt.attemptId}.journal`), 'utf8').catch(() => 'missing journal')
+        throw new Error(`missing launch result: ${JSON.stringify(first)} journal=${journal}`)
+      }
+      expect(first.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      const pidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+        .trim().split('\n')
+      expect(pidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
+      for (const line of pidLines) expect(isProcessAlive(Number(line.split(':')[1]))).toBe(false)
+
+      const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
+        `${value.request.launchAttempt.attemptId}.host-release.json`))
+      const receipt = await ledger.read({ attemptId: value.request.launchAttempt.attemptId,
+        payloadHash: value.request.launchAttempt.payloadHash, generation: 1 })
+      expect(receipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
+      await expect(readFile(registryPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+
+      // A new production runtime/HostManager must project the exact durable
+      // outcome without reacquisition or a PID-only cleanup attempt.
+      const replay = await createBridge().execute(value)
+      expect(replay.data?.launchAttempt).toEqual(first.data?.launchAttempt)
+
+      // Hold a second real native acquisition after HostManager has returned
+      // its exact capability, close the caller envelope, and only then expose
+      // it to the production runtime. The caller-facing operation is already
+      // cancelled, while the private physical settlement must still publish
+      // the exact completed receipt and reap both fixture processes.
+      const lateValue = structuredClone(value)
+      lateValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee654321'
+      lateValue.request.launchAttempt.payloadHash = 'e'.repeat(64)
+      lateValue.request.launchAttempt.proofNonce = 'AQEBAQEBAQEBAQEBAQEBAQ'
+      lateValue.request.launchAttempt.parent = {
+        sessionIdentity: identity('e'), messageIdentity: identity('f'),
+      }
+      lateValue.members = [{ name: 'late', memberIdentity: identity('9') }]
+      lateValue.preconditions.idempotencyKey = lateValue.request.launchAttempt.attemptId
+      lateValue.preconditions.commandLeaseId = 'lease-late'
+      const caller = new AbortController()
+      lateValue.signal = caller.signal
+      lateValue.request.launchAttempt.requestCorrelationDigest =
+        computeOpenCodeLaunchRequestCorrelationDigest(lateValue)
+      const physicalManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      let exposeReference!: () => void
+      const exposure = new Promise<void>(resolve => { exposeReference = resolve })
+      let referenceReady!: () => void
+      const atReference = new Promise<void>(resolve => { referenceReady = resolve })
+      const delayedManager = new Proxy(physicalManager, {
+        get(target, property, receiver) {
+          if (property === 'ensureScopedHostReference') return async (...input: Parameters<OpenCodeHostManager['ensureScopedHostReference']>) => {
+            const reference = await target.ensureScopedHostReference(...input)
+            referenceReady()
+            await exposure
+            return reference
+          }
+          const member = Reflect.get(target, property, receiver)
+          return typeof member === 'function' ? member.bind(target) : member
+        },
+      })
+      const lateBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
+        profileManager, sessionStore, hostManager: delayedManager,
+        mcpManager: disconnectedMcp as never })
+      const lateRun = lateBridge.execute(lateValue)
+      await atReference
+      caller.abort(new Error('static caller envelope closed after physical acquisition'))
+      exposeReference()
+      await lateRun.catch(() => undefined)
+      const lateLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
+        `${lateValue.request.launchAttempt.attemptId}.host-release.json`))
+      let lateReceipt = null
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        lateReceipt = await lateLedger.read({ attemptId: lateValue.request.launchAttempt.attemptId,
+          payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 }).catch(() => null)
+        if (lateReceipt?.releaseState === 'complete') break
+        await Bun.sleep(20)
+      }
+      expect(lateReceipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
+      const allPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+        .trim().split('\n')
+      expect(allPidLines).toHaveLength(4)
+      for (const line of allPidLines) expect(isProcessAlive(Number(line.split(':')[1]))).toBe(false)
+    } finally {
+      restoreEnvironment()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 })

@@ -365,6 +365,11 @@ export async function killProcessTreeAndWait(
   }
 
   if (options.posixProcessGroupLeader === true) {
+    // Linux is the only POSIX platform where this runtime owns an exact native
+    // birth token (boot id + /proc starttime). Wall-clock `ps lstart` is not
+    // generation authority, so Darwin and every other POSIX platform must not
+    // issue even a signal-0 probe or a negative-PGID signal.
+    if ((options.platform ?? process.platform) !== 'linux') return false
     // Revalidate immediately before every group signal.  Callers may retry,
     // but no successful validation is reusable across an await or retry.
     if (!isProcessAlive(pid)) return false
@@ -374,11 +379,9 @@ export async function killProcessTreeAndWait(
     // Wall-clock process start timestamps (notably `ps lstart`) are not a
     // generation token. Production group mutation requires Linux boot-id plus
     // /proc starttime and re-reads it synchronously in the final syscall window.
-    if ((options.platform ?? process.platform) === 'linux') {
-      if (!options.expectedBirthToken
-        || (options.birthTokenReader ?? readProcessBirthToken)(pid, 'linux')
-          !== options.expectedBirthToken) return false
-    } else if (options.expectedBirthToken) return false
+    if (!options.expectedBirthToken
+      || (options.birthTokenReader ?? readProcessBirthToken)(pid, 'linux')
+        !== options.expectedBirthToken) return false
     try {
       process.kill(-pid, signal)
     } catch {

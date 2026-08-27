@@ -888,7 +888,16 @@ class OpenCodeProductionLaunchRuntime {
       const target = targetByMember.get(member.memberIdentity)!
       let claim = await mutationLedger.read(target, { deadlineAtMs: preflightDeadlineAtMs,
         signal: preflightSignal, monotonicNow: launchMonotonicNow })
-      if (!claim) return { member, claim: null, record: null, linkage: null }
+      if (!claim) {
+        // A durable member intent without its exact mutation claim is not
+        // absence and must never authorize a fresh mutation. This journal
+        // evidence also avoids consulting a same-name projection. With no
+        // intent at all, claim absence is the normal first-launch path.
+        const hasDurableIntent = journal?.events.some(event =>
+          event.memberIdentity === member.memberIdentity) === true
+        return { member, claim: null, record: null, linkage: null,
+          reconciliationError: hasDurableIntent ? 'local_metadata' : null }
+      }
       if (claim.attemptId !== command.request.launchAttempt.attemptId
         || claim.payloadHash !== command.request.launchAttempt.payloadHash
         || claim.memberIdentity !== member.memberIdentity) {
@@ -1146,10 +1155,12 @@ class OpenCodeProductionLaunchRuntime {
             // settlement retains the durable obligation until release proof is
             // obtained and then token-clears that exact obligation.
             const reserveSignal = new AbortController().signal
-            const reserveDeadlineAtMs = launchMonotonicNow() + 5_000
+            const reserveStartedAtMs = launchMonotonicNow()
+            const physicalReleaseDeadlineAtMs = reserveStartedAtMs + 5_000
+            const reserveDeadlineAtMs = reserveStartedAtMs + 10_000
             const physicalRelease = openCodeHostManager.releaseHostReference(reference, {
               signal: reserveSignal,
-              remainingMs: () => Math.max(0, reserveDeadlineAtMs - launchMonotonicNow()),
+              remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()),
             }).then(() => hostReleaseLedger.record({ ...releaseRecord,
               disposition: 'dispose', releaseState: 'complete' }, {
                 deadlineAtMs: reserveDeadlineAtMs, signal: reserveSignal,
@@ -1174,11 +1185,23 @@ class OpenCodeProductionLaunchRuntime {
           return identity
         },
         releaseOperationHost: async input => {
+          // A host can become ours only after the caller's absolute envelope has
+          // closed. Its cleanup is a physical settlement, not new launch work:
+          // give it an independent finite reserve while the caller continues to
+          // observe the original deadline. The durable obligation remains the
+          // replay fence if this private settlement does not prove release.
+          const settlementController = input.lateSettlement ? new AbortController() : null
+          const lateSettlementStartedAtMs = input.lateSettlement ? launchMonotonicNow() : null
+          const settlementContext = input.lateSettlement
+            ? { deadlineAtMs: lateSettlementStartedAtMs! + 10_000, signal: settlementController!.signal }
+            : { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
+          const physicalReleaseDeadlineAtMs = input.lateSettlement
+            ? lateSettlementStartedAtMs! + 5_000 : settlementContext.deadlineAtMs
           const releaseRecord = await hostReleaseLedger.read({
             attemptId: command.request.launchAttempt.attemptId,
             payloadHash: command.request.launchAttempt.payloadHash,
             generation: command.request.launchAttempt.generation,
-          }, { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+          }, settlementContext)
           if (!releaseRecord || releaseRecord.hostKeyIdentity !== input.host.hostKeyIdentity) {
             throw new Error('OpenCode operation host release receipt is absent or mismatched')
           }
@@ -1187,7 +1210,7 @@ class OpenCodeProductionLaunchRuntime {
           // Commit intent before proof cleanup or host release effects. A crash
           // can now distinguish keep-alive from disposal without guessing.
           await hostReleaseLedger.record(intendedRelease,
-            { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+            settlementContext)
           const reference = hostReferences.get(input.host.hostKeyIdentity)
           if (reference && reference.handle !== hostFor(input.host)) {
             throw new Error('OpenCode operation host release capability is mismatched')
@@ -1199,8 +1222,8 @@ class OpenCodeProductionLaunchRuntime {
               && proofSession.state !== 'foreign') {
               const handle = hostFor(input.host)
               const client = openCodeClientFactory.create(handle.baseUrl, {
-                signal: input.signal,
-                remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
+                signal: settlementContext.signal,
+                remainingMs: () => Math.max(0, settlementContext.deadlineAtMs - launchMonotonicNow()),
               })
               const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
                 authoritativeSessionId: proofSession.authoritativeSessionId,
@@ -1209,7 +1232,7 @@ class OpenCodeProductionLaunchRuntime {
                 deleteSession: id => client.deleteSession(id),
               }).catch(() => 'unresolved' as const)
               persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup,
-                { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+                settlementContext)
                 .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
             }
             proofSessions.set(input.host.hostKeyIdentity, persisted)
@@ -1221,11 +1244,11 @@ class OpenCodeProductionLaunchRuntime {
           }
           await bounded(openCodeHostManager.reconcileHostReleaseReceipt(intendedRelease.receipt,
             { keepPersistentAlive: disposition === 'keep_alive',
-              signal: input.signal,
-              remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()) }),
-          input.deadlineAtMs, input.signal)
+              signal: settlementContext.signal,
+              remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()) }),
+          settlementContext.deadlineAtMs, settlementContext.signal)
           await hostReleaseLedger.record({ ...intendedRelease, releaseState: 'complete' },
-            { deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+            settlementContext)
           hostReferences.delete(input.host.hostKeyIdentity)
         },
         reconcileOperationHost: async input => {

@@ -664,6 +664,82 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     } finally { await rm(tempDir, { recursive: true, force: true }) }
   })
 
+  test('every final persistent reference release consumes only the operation reference when a durable member lease exists', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-leased-live-release-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_444)
+    const signals: NodeJS.Signals[] = []
+    let alive = true
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44_444,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 45_444 && alive,
+      isProcessGroupAlive: () => false,
+      readProcessStartTimeMs: async pid => pid === 45_444 ? 12_345 : null,
+      killProcess: (_pid, signal) => { signals.push(signal); alive = false },
+      sleepMs: async () => {}, persistentRegistryPath: registryPath,
+    })
+    try {
+      const first = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await manager.retainHostLease(first.handle.hostKey, {
+        teamId: 'committed-team', laneId: 'lane', memberName: 'durable-member',
+        runId: 'committed-run', sessionId: 'committed-session',
+      })
+      // Simulate a later launch attempt acquiring the same persistent host
+      // without reconstructing that unrelated member into its run-local set.
+      const laterAttempt = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await manager.releaseHostReference(first)
+      // Retained receipt reconciliation is used after publication/restart;
+      // the in-memory retained-capability branch must make the same locked
+      // durable-lease decision as a direct publication-fallback release.
+      await manager.reconcileHostReleaseReceipt(manager.hostReleaseReceipt(laterAttempt))
+      const publicationFallback = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await manager.releaseHostReference(publicationFallback)
+      expect(signals).toEqual([])
+      expect(manager.getHost(first.handle.hostKey)).not.toBeNull()
+      const registry = JSON.parse(await readFile(registryPath, 'utf8'))
+      expect(Object.keys(registry.hosts[first.handle.hostKey].leases)).toHaveLength(1)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('Darwin strict persistent release fails closed without a negative group signal or probe', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-darwin-fail-closed-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_445)
+    let signals = 0
+    let groupProbes = 0
+    const manager = new OpenCodeHostManager({ platform: 'darwin',
+      allocateLoopbackPort: async () => 44_445, spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 45_445,
+      readProcessStartTimeMs: async pid => pid === 45_445 ? 1_000 : null,
+      killProcess: () => { signals += 1 },
+      isProcessGroupAlive: () => { groupProbes += 1; return true },
+      persistentRegistryPath: registryPath,
+    })
+    try {
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await expect(manager.releaseHostReference(reference)).rejects.toThrow('containment')
+      expect(signals).toBe(0)
+      expect(groupProbes).toBe(0)
+      expect(await pathExists(registryPath)).toBe(true)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
   test.skipIf(process.platform !== 'linux')('restart receipt refuses same-second recycled Linux generation', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-birth-reuse-'))
     const registryPath = path.join(tempDir, 'registry.json')
