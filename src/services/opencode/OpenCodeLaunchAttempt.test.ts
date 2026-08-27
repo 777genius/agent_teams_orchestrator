@@ -1694,6 +1694,52 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().cleanupState).toBe('complete')
   })
 
+  test('classifies acquisition once after asynchronous durable binding and never releases an accepted host early', async () => {
+    const cancellation = new AbortController()
+    const subject = setup()
+    const obligation = { obligationId: '123e4567-e89b-42d3-a456-426614174488',
+      reservationDigest: '8'.repeat(64) }
+    const binding = { ...obligation, receiptIdentityDigest: '9'.repeat(64) }
+    let publishBinding!: () => void
+    const bindingPublished = new Promise<void>(resolve => { publishBinding = resolve })
+    let bindingRead!: () => void
+    const atBindingRead = new Promise<void>(resolve => { bindingRead = resolve })
+    let mcpEntered!: () => void
+    const atMcp = new Promise<void>(resolve => { mcpEntered = resolve })
+    subject.ports.host.reserveOperationHostCleanup = async () => obligation
+    subject.ports.host.acquireOperationHost = async () => host
+    subject.ports.host.readOperationHostCleanupBinding = async () => {
+      bindingRead()
+      await bindingPublished
+      return binding
+    }
+    subject.ports.mcp.verifyAppMcp = async () => {
+      mcpEntered()
+      await new Promise<never>((_, reject) => cancellation.signal.addEventListener('abort',
+        () => reject(cancellation.signal.reason), { once: true }))
+      return { host, observedTools: ['mcp__app__team'] }
+    }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => Promise.race([
+      operation,
+      new Promise<never>((_, reject) => signal.addEventListener('abort',
+        () => reject(signal.reason), { once: true })),
+    ])
+
+    const running = subject.launch.run({ request: request(), members: [members[0]],
+      requestedBudgetMs: 10_000, signal: cancellation.signal })
+    await atBindingRead
+    await Bun.sleep(0)
+    expect(subject.calls).not.toContain('release')
+    publishBinding()
+    await atMcp
+    expect(subject.calls).not.toContain('release')
+    cancellation.abort(new Error('finish accepted-host regression'))
+    const result = await running
+    expect(result.cleanup).toBe('complete')
+    expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
+    expect(subject.persistence.json().hostCleanupObligations).toEqual([binding])
+  })
+
   test('self-releases when the deadline expires immediately before acquisition resolution', async () => {
     let entered!: () => void
     const atAcquire = new Promise<void>(resolve => { entered = resolve })

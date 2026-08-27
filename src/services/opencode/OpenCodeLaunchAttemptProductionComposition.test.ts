@@ -353,6 +353,9 @@ describe('OpenCode production launch composition', () => {
       process.env.XDG_CONFIG_HOME = path.join(root, 'user-config')
       process.env.XDG_DATA_HOME = path.join(root, 'user-data')
       process.env.DEEPINFRA_API_KEY = 'static-fixture-key'
+      if (process.platform !== 'win32') {
+        process.env.PATH = ['/usr/bin', '/bin', process.env.PATH ?? ''].join(path.delimiter)
+      }
       delete process.env.OPENCODE_CONFIG
       delete process.env.OPENCODE_CONFIG_CONTENT
 
@@ -371,15 +374,36 @@ describe('OpenCode production launch composition', () => {
       value.request.launchAttempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest(value)
       const sessionStore = new OpenCodeSessionStore(path.join(root, 'sessions.json'))
       const registryPath = path.join(data, 'opencode', 'hosts.json')
-      const disconnectedMcp = { ensureAppMcp: async () => ({ mcp: {}, summary: {
-        serverName: 'agent-teams', matchedServerName: null, status: 'missing', connected: false,
-        launchSource: null, availableServerNames: [], diagnostics: ['static failure boundary'],
-      } }) }
+      let firstMcpObservedHostAlive: boolean | undefined
+      const disconnectedMcp = { ensureAppMcp: async () => {
+        if (firstMcpObservedHostAlive === undefined) {
+          const childLine = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+            .trim().split('\n').find(line => line.startsWith('child:'))
+          firstMcpObservedHostAlive = childLine !== undefined
+            && isProcessAlive(Number(childLine.split(':')[1]))
+        }
+        return { mcp: {}, summary: {
+          serverName: 'agent-teams', matchedServerName: null, status: 'missing', connected: false,
+          launchSource: null, availableServerNames: [], diagnostics: ['static failure boundary'],
+        } }
+      } }
+      let exactReleaseCalls = 0
       const createBridge = () => createOpenCodeLaunchAttemptProductionTestBridge({
         dataDirectory: data,
         profileManager,
         sessionStore,
-        hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }),
+        hostManager: new Proxy(new OpenCodeHostManager({ persistentRegistryPath: registryPath }), {
+          get(target, property, receiver) {
+            if (property === 'reconcileHostReleaseReceipt') return async (
+              ...input: Parameters<OpenCodeHostManager['reconcileHostReleaseReceipt']>
+            ) => {
+              exactReleaseCalls += 1
+              return target.reconcileHostReleaseReceipt(...input)
+            }
+            const member = Reflect.get(target, property, receiver)
+            return typeof member === 'function' ? member.bind(target) : member
+          },
+        }),
         mcpManager: disconnectedMcp as never,
       })
 
@@ -390,6 +414,8 @@ describe('OpenCode production launch composition', () => {
         throw new Error(`missing launch result: ${JSON.stringify(first)} journal=${journal}`)
       }
       expect(projectedLaunchAttempt(first)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      expect(firstMcpObservedHostAlive).toBe(true)
+      expect(exactReleaseCalls).toBe(1)
       const pidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n')
       expect(pidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
@@ -561,6 +587,97 @@ describe('OpenCode production launch composition', () => {
     } finally {
       restoreEnvironment()
       await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  test('separate acquisition and replay processes repair receipt and disposition publication crash boundaries', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'win32') return
+    const fixtureName = `opencode-host-fixture${process.platform === 'win32' ? '.exe' : ''}`
+    const fixtureBinary = path.resolve(import.meta.dir,
+      '../../../native/opencode-host-fixture/target/debug', fixtureName)
+    const fixtureScript = path.resolve(import.meta.dir,
+      'OpenCodeLaunchAttemptProductionRestartFixture.ts')
+    const boundaries = ['crash-after-receipt', 'crash-before-disposition'] as const
+    for (const boundary of boundaries) {
+      const root = await mkdtemp(path.join(os.tmpdir(), `opencode-${boundary}-`))
+      const project = path.join(root, 'project')
+      const data = path.join(root, 'data')
+      const userHome = path.join(root, 'home')
+      const fixtureSystemRoot = path.join(root, 'system-root')
+      const runPhase = (phase: typeof boundary | 'replay') => new Promise<{
+        code: number | null; output: string
+      }>((resolve, reject) => {
+        const child = spawn(process.execPath, [fixtureScript, phase], {
+          env: { ...process.env, OPENCODE_RESTART_FIXTURE_ROOT: root,
+            ...(process.platform === 'win32' ? { SystemRoot: fixtureSystemRoot } : {}) },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let output = ''
+        child.stdout?.on('data', chunk => { output += String(chunk) })
+        child.stderr?.on('data', chunk => { output += String(chunk) })
+        child.once('error', reject)
+        child.once('exit', code => resolve({ code, output }))
+      })
+      try {
+        await Promise.all([mkdir(project), mkdir(userHome), mkdir(data, { recursive: true })])
+        if (process.platform === 'win32') {
+          await mkdir(path.join(fixtureSystemRoot, 'System32'), { recursive: true })
+          await copyFile(fixtureBinary, path.join(fixtureSystemRoot, 'System32', 'taskkill.exe'))
+        }
+        await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
+        const crashed = await runPhase(boundary)
+        expect(crashed.code, crashed.output).toBe(86)
+
+        const attempt = '018f47a2-4a13-7c2f-8d44-c0ffee777777'
+        const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+          'launch-attempts', `${attempt}.host-release.json`))
+        const beforeReplay = await ledger.read({ attemptId: attempt,
+          payloadHash: '7'.repeat(64), generation: 1 })
+        expect(beforeReplay).toMatchObject({ disposition: 'unknown', releaseState: 'pending' })
+        const journalPath = path.join(data, 'opencode', 'launch-attempts', `${attempt}.journal`)
+        const journalManifest = JSON.parse(await readFile(journalPath, 'utf8'))
+        const journal = JSON.parse(await readFile(`${journalPath}.slot${journalManifest.slot}`, 'utf8'))
+        const durableBinding = journal.hostCleanupObligations.find(
+          (item: { obligationId: string }) => item.obligationId === beforeReplay!.obligationId)
+        expect(durableBinding).toMatchObject({ obligationId: beforeReplay!.obligationId,
+          reservationDigest: beforeReplay!.reservationDigest })
+        if (boundary === 'crash-after-receipt') {
+          expect(durableBinding.receiptIdentityDigest).toBeUndefined()
+        } else {
+          expect(durableBinding.receiptIdentityDigest).toBe(beforeReplay!.receiptIdentityDigest)
+        }
+
+        const replayed = await runPhase('replay')
+        expect(replayed.code, replayed.output).toBe(0)
+        const records = await ledger.readAllPending({ attemptId: attempt,
+          payloadHash: '7'.repeat(64), currentGeneration: 1 })
+        const repaired = records.find(record => record.obligationId === beforeReplay!.obligationId)
+        expect(repaired).toMatchObject({
+          obligationId: beforeReplay!.obligationId,
+          reservationDigest: beforeReplay!.reservationDigest,
+          receiptIdentityDigest: beforeReplay!.receiptIdentityDigest,
+          disposition: 'dispose',
+          releaseState: process.platform === 'linux' ? 'complete' : 'pending',
+        })
+        const reboundManifest = JSON.parse(await readFile(journalPath, 'utf8'))
+        const reboundJournal = JSON.parse(await readFile(
+          `${journalPath}.slot${reboundManifest.slot}`, 'utf8'))
+        expect(reboundJournal.hostCleanupObligations).toContainEqual({
+          obligationId: beforeReplay!.obligationId,
+          reservationDigest: beforeReplay!.reservationDigest,
+          receiptIdentityDigest: beforeReplay!.receiptIdentityDigest,
+        })
+      } finally {
+        const lines = await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8')
+          .catch(() => '')
+        for (const line of lines.trim().split('\n')) {
+          const pid = Number(line.split(':')[1])
+          if (pid > 0 && isProcessAlive(pid)) {
+            try { process.kill(pid, 'SIGKILL') } catch {}
+          }
+        }
+        await rm(root, { recursive: true, force: true })
+      }
     }
   }, 30_000)
 

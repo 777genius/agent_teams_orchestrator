@@ -15,8 +15,9 @@ import { createOpenCodeLaunchAttemptProductionTestBridge,
 
 const root = process.env.OPENCODE_RESTART_FIXTURE_ROOT
 const phase = process.argv[2]
-if (!root || (phase !== 'acquire' && phase !== 'replay')) {
-  throw new Error('restart fixture requires a root and acquire/replay phase')
+if (!root || (phase !== 'acquire' && phase !== 'replay'
+  && phase !== 'crash-after-receipt' && phase !== 'crash-before-disposition')) {
+  throw new Error('restart fixture requires a supported acquisition/replay phase')
 }
 
 const project = path.join(root, 'project')
@@ -34,6 +35,9 @@ Object.assign(process.env, {
   XDG_CONFIG_HOME: path.join(root, 'user-config'),
   XDG_DATA_HOME: path.join(root, 'user-data'),
   DEEPINFRA_API_KEY: 'static-fixture-key',
+  ...(process.platform === 'win32' ? {} : {
+    PATH: ['/usr/bin', '/bin', process.env.PATH ?? ''].join(path.delimiter),
+  }),
 })
 delete process.env.OPENCODE_CONFIG
 delete process.env.OPENCODE_CONFIG_CONTENT
@@ -83,12 +87,21 @@ const disconnectedMcp = { ensureAppMcp: async () => ({ mcp: {}, summary: {
 } }) }
 const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
   profileManager, sessionStore: new OpenCodeSessionStore(path.join(root, 'sessions.json')),
-  hostManager, mcpManager: disconnectedMcp as never })
+  hostManager, mcpManager: disconnectedMcp as never,
+  ...(phase === 'crash-after-receipt' || phase === 'crash-before-disposition'
+    ? { crashBoundary: boundary => {
+      if ((phase === 'crash-after-receipt' && boundary === 'after_host_receipt_publication')
+        || (phase === 'crash-before-disposition'
+          && boundary === 'before_host_disposition_publication')) process.exit(86)
+    } } : {}),
+})
 const result = await bridge.execute(command)
 const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
   `${command.request.launchAttempt.attemptId}.host-release.json`))
 const receipt = await ledger.read({ attemptId: command.request.launchAttempt.attemptId,
-  payloadHash: command.request.launchAttempt.payloadHash, generation: 1 })
+  payloadHash: command.request.launchAttempt.payloadHash, generation: 1 }).catch(async () =>
+  (await ledger.readAllPending({ attemptId: command.request.launchAttempt.attemptId,
+    payloadHash: command.request.launchAttempt.payloadHash, currentGeneration: 1 }))[0] ?? null)
 const projected = (result.data as { launchAttempt?: { launchAttempt?: { outcome?: string } } } | undefined)
   ?.launchAttempt
 await writeFile(path.join(root, `restart-${phase}.json`), `${JSON.stringify({

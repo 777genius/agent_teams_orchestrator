@@ -516,27 +516,52 @@ export class OpenCodeLaunchAttempt {
                     deadlineAtMs: deadline, signal: controller.signal,
                   })
                   const acceptedAcquisition = physicalAcquisition.then(async candidate => {
-                    if (!acquisitionOpen || controller.signal.aborted
-                      || this.ports.clock.monotonicNow() >= deadline) throw new DeadlineError()
-                    if (hostCleanupObligationId && this.ports.host.readOperationHostCleanupBinding) {
-                      const exactBinding = await this.ports.host.readOperationHostCleanupBinding({
-                        cleanupObligationId: hostCleanupObligationId, deadlineAtMs: deadline,
-                        signal: controller.signal,
-                      })
-                      if (!hostCleanupObligation
-                        || exactBinding.obligationId !== hostCleanupObligation.obligationId
-                        || exactBinding.reservationDigest !== hostCleanupObligation.reservationDigest
-                        || !exactBinding.receiptIdentityDigest) {
-                        throw new OpenCodeLaunchAttemptError('host.cleanupObligationIdentity')
+                    try {
+                      if (hostCleanupObligationId && this.ports.host.readOperationHostCleanupBinding) {
+                        const exactBinding = await this.ports.host.readOperationHostCleanupBinding({
+                          cleanupObligationId: hostCleanupObligationId, deadlineAtMs: deadline,
+                          signal: controller.signal,
+                        })
+                        if (!hostCleanupObligation
+                          || exactBinding.obligationId !== hostCleanupObligation.obligationId
+                          || exactBinding.reservationDigest !== hostCleanupObligation.reservationDigest
+                          || !exactBinding.receiptIdentityDigest) {
+                          throw new OpenCodeLaunchAttemptError('host.cleanupObligationIdentity')
+                        }
+                        await lease.bindHostCleanupObligation(exactBinding)
+                        hostCleanupObligation = exactBinding
                       }
-                      await lease.bindHostCleanupObligation(exactBinding)
-                      hostCleanupObligation = exactBinding
+                      if (candidate.profileScopeIdentity !== profile.profileIdentity) {
+                        throw new OpenCodeLaunchAttemptError('host.profileScopeIdentity')
+                      }
+                      // Binding is an awaited durable transition. Classification
+                      // must happen only after it completes, using a final view of
+                      // the caller envelope, and exactly one branch may own the
+                      // physical candidate.
+                      if (!acquisitionOpen || controller.signal.aborted
+                        || this.ports.clock.monotonicNow() >= deadline) throw new DeadlineError()
+                      host = deepFreeze(candidate)
+                      return host
+                    } catch (classificationError) {
+                      const lateReleaseController = new AbortController()
+                      try {
+                        const physicalRelease = this.ports.host.releaseOperationHost({
+                          host: candidate,
+                          ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
+                          deadlineAtMs: policy.absoluteDeadlineAtMs,
+                          signal: lateReleaseController.signal,
+                          lateSettlement: true,
+                        })
+                        await this.ports.deadline.run(
+                          physicalRelease, policy.absoluteDeadlineAtMs, lateReleaseController.signal,
+                        )
+                        hostAcquisitionCleanupComplete = true
+                      } catch (releaseError) {
+                        lateReleaseController.abort(new DeadlineError())
+                        throw new OpenCodeOperationHostAcquisitionCleanupError(releaseError)
+                      }
+                      throw classificationError
                     }
-                    if (candidate.profileScopeIdentity !== profile.profileIdentity) {
-                      throw new OpenCodeLaunchAttemptError('host.profileScopeIdentity')
-                    }
-                    host = deepFreeze(candidate)
-                    return host
                   }).catch(async error => {
                     if (error instanceof OpenCodeOperationHostAcquisitionCleanupError
                       && error.cleanupBinding) {
@@ -572,29 +597,10 @@ export class OpenCodeLaunchAttempt {
                     }
                     throw error
                   })
-                  // This reaction is registered after the synchronous transfer reaction above.
-                  // If the outer deadline/abort already closed acquisition, the exact late host
-                  // is self-released and its physical settlement keeps the generation fenced.
-                  lateHostSettlement = physicalAcquisition.then(async candidate => {
-                    if (host === candidate) return
-                    const lateReleaseController = new AbortController()
-                    const physicalRelease = this.ports.host.releaseOperationHost({
-                      host: candidate,
-                      ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
-                      deadlineAtMs: policy.absoluteDeadlineAtMs,
-                      signal: lateReleaseController.signal,
-                      lateSettlement: true,
-                    })
-                    try {
-                      await this.ports.deadline.run(
-                        physicalRelease, policy.absoluteDeadlineAtMs, lateReleaseController.signal,
-                      )
-                    } catch (error) {
-                      lateReleaseController.abort(new DeadlineError())
-                      throw error
-                    }
-                    hostAcquisitionCleanupComplete = true
-                  }, error => {
+                  // The single classified promise is the exact settlement
+                  // state machine. A sibling reaction must never race durable
+                  // binding and release a candidate selected for acceptance.
+                  lateHostSettlement = acceptedAcquisition.then(() => undefined, error => {
                     if (!(error instanceof OpenCodeOperationHostAcquisitionCleanupError)
                       && !(error instanceof OpenCodeOperationHostAcquisitionSettledError)
                       && !(error && typeof error === 'object'

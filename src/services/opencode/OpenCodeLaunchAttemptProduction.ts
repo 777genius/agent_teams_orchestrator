@@ -862,6 +862,7 @@ export type OpenCodeProductionLaunchRuntimeTestDependencies = Readonly<{
   profileManager?: typeof globalThisOpenCodeProfileManager
   sessionStore?: typeof globalThisOpenCodeSessionStore
   dataDirectory?: string
+  crashBoundary?: (boundary: 'after_host_receipt_publication' | 'before_host_disposition_publication') => void
 }>
 
 class OpenCodeProductionLaunchRuntime {
@@ -1179,17 +1180,18 @@ class OpenCodeProductionLaunchRuntime {
           releaseIdentity, preflightLedgerContext)
         if (releaseRecords.length === 0 || releaseRecords.some(record => {
           const binding = boundById.get(record.obligationId)
-          return record.disposition === 'unknown' || !binding
-            || binding.reservationDigest !== record.reservationDigest
+          return !binding || binding.reservationDigest !== record.reservationDigest
         })) throw new Error('OpenCode final host cleanup obligation identity is unresolved')
-        // Receipt publication and journal binding are separate durable CAS
-        // transitions. A crash (or the caller deadline) may land between them.
-        // Complete that exact transition under the same-generation replay
-        // lease before any HostManager reconciliation is allowed to observe the
-        // capability. The immutable reservation digest fences substitution.
-        const missingReceiptBindings = releaseRecords.filter(record =>
-          boundById.get(record.obligationId)?.receiptIdentityDigest === undefined)
-        if (missingReceiptBindings.length > 0) {
+        // Receipt publication, journal binding, and disposition publication
+        // are distinct durable transitions. Repair only the exact immutable
+        // reservation while holding the same-generation replay lease. The
+        // already-recovered durable member leases are the sole keep-alive
+        // authority; no HostManager effect is allowed before both CAS updates.
+        const needsDurableClassification = releaseRecords.some(record => {
+          const binding = boundById.get(record.obligationId)!
+          return binding.receiptIdentityDigest === undefined || record.disposition === 'unknown'
+        })
+        if (needsDurableClassification) {
           await attemptStore.withGeneration({
             attemptId: command.request.launchAttempt.attemptId,
             payloadHash: command.request.launchAttempt.payloadHash,
@@ -1197,12 +1199,26 @@ class OpenCodeProductionLaunchRuntime {
             immutableDigest,
             generation: command.request.launchAttempt.generation,
           }, 'replay', async lease => {
-            for (const record of missingReceiptBindings) {
-              await lease.bindHostCleanupObligation({
-                obligationId: record.obligationId,
-                reservationDigest: record.reservationDigest,
-                receiptIdentityDigest: record.receiptIdentityDigest,
-              }, preflightLedgerContext)
+            for (const record of releaseRecords) {
+              const binding = lease.journal.hostCleanupObligations?.find(
+                item => item.obligationId === record.obligationId)
+              if (!binding || binding.reservationDigest !== record.reservationDigest
+                || (binding.receiptIdentityDigest !== undefined
+                  && binding.receiptIdentityDigest !== record.receiptIdentityDigest)) {
+                throw new Error('OpenCode final host cleanup reservation changed')
+              }
+              if (binding.receiptIdentityDigest === undefined) {
+                await lease.bindHostCleanupObligation({
+                  obligationId: record.obligationId,
+                  reservationDigest: record.reservationDigest,
+                  receiptIdentityDigest: record.receiptIdentityDigest,
+                }, preflightLedgerContext)
+              }
+              if (record.disposition === 'unknown') {
+                await hostReleaseLedger.record({ ...record,
+                  disposition: retainedSessionLeases.shouldKeepHostAlive()
+                    ? 'keep_alive' : 'dispose' }, preflightLedgerContext)
+              }
             }
           }, preflightLedgerContext)
           return this.run(command, false, inspectionOnly)
@@ -1210,6 +1226,9 @@ class OpenCodeProductionLaunchRuntime {
         if (releaseRecords.some(record =>
           boundById.get(record.obligationId)?.receiptIdentityDigest !== record.receiptIdentityDigest)) {
           throw new Error('OpenCode final host cleanup receipt identity is unresolved')
+        }
+        if (releaseRecords.some(record => record.disposition === 'unknown')) {
+          throw new Error('OpenCode final host cleanup disposition is unresolved')
         }
         for (const releaseRecord of releaseRecords) {
           if (releaseRecord.releaseState === 'complete') continue
@@ -1271,7 +1290,8 @@ class OpenCodeProductionLaunchRuntime {
         if (pendingReleases.some(record => {
           const binding = boundById.get(record.obligationId)
           return !binding || binding.reservationDigest !== record.reservationDigest
-            || binding.receiptIdentityDigest !== record.receiptIdentityDigest
+            || (binding.receiptIdentityDigest !== undefined
+              && binding.receiptIdentityDigest !== record.receiptIdentityDigest)
         })) throw new Error('OpenCode launch host cleanup obligation identity changed')
       } else if (pendingReleases.some(record => record.schemaVersion === 4)) {
         throw new Error('OpenCode launch host cleanup obligation identity is unbound')
@@ -1281,6 +1301,43 @@ class OpenCodeProductionLaunchRuntime {
           throw new Error('OpenCode launch host cleanup requires exact reconciliation evidence')
         }
       } else {
+        const needsDurableClassification = pendingReleases.some(record => {
+          const binding = journal.hostCleanupObligations?.find(
+            item => item.obligationId === record.obligationId)
+          return binding?.receiptIdentityDigest === undefined || record.disposition === 'unknown'
+        })
+        if (needsDurableClassification) {
+          await attemptStore.withGeneration({
+            attemptId: command.request.launchAttempt.attemptId,
+            payloadHash: command.request.launchAttempt.payloadHash,
+            inputDigest,
+            immutableDigest,
+            generation: command.request.launchAttempt.generation,
+          }, 'replay', async lease => {
+            for (const record of pendingReleases) {
+              const binding = lease.journal.hostCleanupObligations?.find(
+                item => item.obligationId === record.obligationId)
+              if (!binding || binding.reservationDigest !== record.reservationDigest
+                || (binding.receiptIdentityDigest !== undefined
+                  && binding.receiptIdentityDigest !== record.receiptIdentityDigest)) {
+                throw new Error('OpenCode launch host cleanup reservation changed')
+              }
+              if (binding.receiptIdentityDigest === undefined) {
+                await lease.bindHostCleanupObligation({
+                  obligationId: record.obligationId,
+                  reservationDigest: record.reservationDigest,
+                  receiptIdentityDigest: record.receiptIdentityDigest,
+                }, preflightLedgerContext)
+              }
+              if (record.disposition === 'unknown') {
+                await hostReleaseLedger.record({ ...record,
+                  disposition: retainedSessionLeases.shouldKeepHostAlive()
+                    ? 'keep_alive' : 'dispose' }, preflightLedgerContext)
+              }
+            }
+          }, preflightLedgerContext)
+          return this.run(command, false, inspectionOnly)
+        }
         for (const pendingRelease of pendingReleases) {
           if (pendingRelease.disposition === 'unknown') {
             throw new Error('OpenCode launch host cleanup disposition is unknown')
@@ -1476,6 +1533,7 @@ class OpenCodeProductionLaunchRuntime {
             await hostReleaseLedger.record(releaseRecord,
               { deadlineAtMs: productionDeadlineAtMs, signal: input.signal })
             hostAcquisitionObligations.set(obligation.obligationId, releaseRecord)
+            this.dependencies.crashBoundary?.('after_host_receipt_publication')
           } catch (error) {
             // Publication failure must not make cleanup depend on an already
             // expired caller deadline. Start the physical release immediately
@@ -1559,6 +1617,7 @@ class OpenCodeProductionLaunchRuntime {
           const intendedRelease = { ...releaseRecord, disposition } as OpenCodeLaunchHostReleaseRecord
           // Commit intent before proof cleanup or host release effects. A crash
           // can now distinguish keep-alive from disposal without guessing.
+          this.dependencies.crashBoundary?.('before_host_disposition_publication')
           await hostReleaseLedger.record(intendedRelease,
             settlementContext)
           const reference = hostReferences.get(input.host.hostKeyIdentity)
