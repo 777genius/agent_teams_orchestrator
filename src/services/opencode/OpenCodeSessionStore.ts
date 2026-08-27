@@ -15,6 +15,17 @@ type SessionStoreShape = {
 
 type UpsertResult = 'created' | 'updated' | 'unchanged'
 
+export type ConditionalMarkStaleResult =
+  | { status: 'applied'; record: OpenCodeSessionRecord }
+  | { status: 'already-satisfied'; record: OpenCodeSessionRecord }
+  | { status: 'absent' }
+  | { status: 'foreign'; record: OpenCodeSessionRecord }
+
+export type ConditionalDeleteResult =
+  | { status: 'applied'; record: OpenCodeSessionRecord }
+  | { status: 'absent' }
+  | { status: 'foreign'; record: OpenCodeSessionRecord }
+
 const LOCK_OPTIONS = {
   retries: {
     retries: 30,
@@ -154,6 +165,41 @@ export class OpenCodeSessionStore {
     })
   }
 
+  async markStaleIfSessionMatches(
+    teamId: string,
+    laneId: string,
+    memberName: string,
+    expectedOpencodeSessionId: string,
+    staleReason: string,
+  ): Promise<ConditionalMarkStaleResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey({ teamId, laneId, memberName })
+      const previous = store.records[key]
+      if (!previous) {
+        return { status: 'absent' }
+      }
+
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
+      }
+
+      if (previous.staleReason === staleReason) {
+        return { status: 'already-satisfied', record: previous }
+      }
+
+      const next: OpenCodeSessionRecord = {
+        ...previous,
+        staleReason,
+        updatedAt: new Date().toISOString(),
+      }
+
+      store.records[key] = next
+      await this.writeStore(store)
+      return { status: 'applied', record: next }
+    })
+  }
+
   async delete(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<boolean> {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
@@ -167,6 +213,37 @@ export class OpenCodeSessionStore {
       delete store.records[key]
       await this.writeStore(store)
       return true
+    })
+  }
+
+  /**
+   * Deletes only the record currently owned by `expectedOpencodeSessionId`.
+   *
+   * `absent` is an idempotent cleanup result, but it does not prove that this
+   * session was previously stored at the key. A durable cleanup journal may
+   * treat it as satisfied only for the exact cleanup entry it is replaying.
+   */
+  async deleteIfSessionMatches(
+    teamId: string,
+    laneId: string,
+    memberName: string,
+    expectedOpencodeSessionId: string,
+  ): Promise<ConditionalDeleteResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey({ teamId, laneId, memberName })
+      const previous = store.records[key]
+      if (!previous) {
+        return { status: 'absent' }
+      }
+
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
+      }
+
+      delete store.records[key]
+      await this.writeStore(store)
+      return { status: 'applied', record: previous }
     })
   }
 }
