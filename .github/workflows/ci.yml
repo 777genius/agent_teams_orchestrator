@@ -5,6 +5,8 @@ on:
     branches: [main, dev]
     paths:
       - 'src/**'
+      - 'native/**'
+      - 'phase0-opencode-tests/**'
       - 'scripts/**'
       - '.github/workflows/**'
       - 'package.json'
@@ -13,6 +15,8 @@ on:
   pull_request:
     paths:
       - 'src/**'
+      - 'native/**'
+      - 'phase0-opencode-tests/**'
       - 'scripts/**'
       - '.github/workflows/**'
       - 'package.json'
@@ -23,13 +27,152 @@ permissions:
   contents: read
 
 jobs:
+  posix-passive-snapshot:
+    name: POSIX passive snapshot publication
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test portable fake OpenCode acceptance
+        run: >-
+          bun test
+          phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts
+          phase0-opencode-tests/PortableOpenCodeAcceptance.e2e.test.ts
+          phase0-opencode-tests/WorkflowContract.test.ts
+      - name: Build deterministic native OpenCode catalog and host fixtures
+        run: |
+          cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
+      - name: Test real Linux recycled-pid production cleanup across process restart
+        run: >-
+          sudo unshare --pid --fork --mount-proc
+          native/opencode-host-fixture/target/debug/opencode-host-fixture
+          --pid-namespace-supervisor
+          env "PATH=$PATH" OPENCODE_REQUIRE_NATIVE_PID_RECYCLE=1
+          bun test
+          src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          --test-name-pattern
+          "native cleanup acquisition and replay use separate OS processes"
+      - name: Test immutable passive publication on a supported platform
+        run: >-
+          bun test
+          src/services/opencode/OpenCodePassiveStatusSnapshotWriter.test.ts
+          src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
+          src/services/opencode/OpenCodeActiveStatusSnapshotPublisher.test.ts
+      - name: Test production launch cleanup composition and safety contracts
+        run: >-
+          bun test
+          src/services/opencode/OpenCodeLaunchAttempt.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptStore.test.ts
+          src/services/opencode/OpenCodeHostManager.test.ts
+          src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
+          src/services/opencode/OpenCodeProviderCatalogService.test.ts
+          src/utils/processKill.test.ts
+
+  windows-passive-snapshot:
+    name: Windows retained publication (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+          - runner: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Enable Windows long paths
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test portable fake OpenCode acceptance
+        run: >-
+          bun test
+          phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts
+          phase0-opencode-tests/PortableOpenCodeAcceptance.e2e.test.ts
+          phase0-opencode-tests/WorkflowContract.test.ts
+      - name: Build and test retained native authority
+        run: |
+          cargo test --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
+          cargo test --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
+      - name: Prove production native launcher round-trip
+        timeout-minutes: 1
+        run: bun test src/services/opencode/OpenCodeWindowsPublicationAuthorityRoundTrip.test.ts
+      - name: Regress first Windows passive production read in an owned child
+        timeout-minutes: 2
+        env:
+          OPENCODE_WINDOWS_NATIVE_EXPECTED_ARCH: ${{ matrix.arch }}
+          OPENCODE_WINDOWS_NATIVE_EXPECTED_PROFILE: debug
+        run: >-
+          bun test
+          src/services/opencode/OpenCodePassiveSnapshotConsistency.test.ts
+          --test-name-pattern "Windows parent-owned child production read"
+      - name: Test publication protocol and integrations
+        timeout-minutes: 15
+        run: >-
+          bun test
+          src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
+          src/services/opencode/OpenCodeNativeLauncherDiagnostic.test.ts
+          src/services/opencode/OpenCodeWindowsPublicationAuthorityProtocol.test.ts
+          src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.test.ts
+          src/services/opencode/OpenCodeWindowsPassiveReadAuthority.test.ts
+          src/services/opencode/OpenCodeWindowsRetainedCallerLayer.test.ts
+          src/services/opencode/OpenCodeSafePublication.test.ts
+          src/services/opencode/OpenCodeScopedProfileAuthPublication.test.ts
+          src/services/opencode/OpenCodeProviderCatalogService.test.ts
+          src/services/opencode/OpenCodePassiveSnapshotConsistency.test.ts
+          src/services/opencode/OpenCodePassiveStatusSnapshotWriter.test.ts
+          src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
+          src/services/opencode/OpenCodePassiveSnapshotPersistencePolicy.test.ts
+          src/services/runtimeBackends/openCodePassiveStatus.test.ts
+      - name: Test Windows production cleanup composition and owned authority
+        run: >-
+          bun test
+          src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          src/services/opencode/OpenCodeWindowsPassiveProductionComposition.test.ts
+          src/services/opencode/OpenCodeHostManager.test.ts
+          src/utils/processKill.test.ts
+      - name: Prove native NTFS handle retention
+        timeout-minutes: 10
+        run: bun test scripts/windows-publication-native.test.ts
+      - name: Build and compile runtime
+        run: |
+          bun run build
+          bun run compile
+      - name: Test packaged native pair
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $env:OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR = (Resolve-Path dist)
+          bun test scripts/windows-publication-native.test.ts
+
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - name: Checkout

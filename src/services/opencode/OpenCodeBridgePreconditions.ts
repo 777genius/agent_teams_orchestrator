@@ -137,6 +137,25 @@ export function parseOpenCodeBridgePreconditions(
   }
 }
 
+export function validateOpenCodeLaunchBoundaryPreconditions(
+  preconditions: OpenCodeBridgeCommandPreconditions | null,
+  attemptId: string,
+): OpenCodeBridgeCommandPreconditions {
+  if (!preconditions) throw new Error('OpenCode launch requires strict bridge preconditions')
+  if (!/^[a-f0-9]{64}$/.test(preconditions.handshakeIdentityHash)) {
+    throw new Error('OpenCode launch handshake identity must be a SHA-256 digest')
+  }
+  if (!preconditions.expectedBehaviorFingerprint
+    || !/^[a-f0-9]{64}$/.test(preconditions.expectedBehaviorFingerprint)) {
+    throw new Error('OpenCode launch expected behavior fingerprint must be a SHA-256 digest')
+  }
+  if (!preconditions.commandLeaseId) throw new Error('OpenCode launch command lease is absent')
+  if (preconditions.idempotencyKey !== attemptId) {
+    throw new Error('OpenCode launch idempotency key must equal launchAttempt.attemptId')
+  }
+  return Object.freeze({ ...preconditions })
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>

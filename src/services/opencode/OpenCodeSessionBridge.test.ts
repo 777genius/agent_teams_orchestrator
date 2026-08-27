@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 
 import {
   buildOpenCodeRuntimePromptMessageId,
@@ -104,6 +105,56 @@ function buildPreviewSummary(
 describe('OpenCodeSessionBridge', () => {
   beforeEach(() => {
     resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
+  })
+
+  test.each([
+    ['accepts exact returned and persisted ownership',
+      { id: 'msg-bootstrap', sessionID: 'session-1' }, { id: 'msg-bootstrap', sessionID: 'session-1' }, true],
+    ['rejects a missing returned message id',
+      { sessionID: 'session-1' }, { id: 'msg-bootstrap', sessionID: 'session-1' }, false],
+    ['rejects a mismatched returned message id',
+      { id: 'msg-other', sessionID: 'session-1' }, { id: 'msg-bootstrap', sessionID: 'session-1' }, false],
+    ['rejects a missing returned session id',
+      { id: 'msg-bootstrap' }, { id: 'msg-bootstrap', sessionID: 'session-1' }, false],
+    ['rejects a mismatched returned session id',
+      { id: 'msg-bootstrap', sessionID: 'session-other' },
+      { id: 'msg-bootstrap', sessionID: 'session-1' }, false],
+    ['rejects a missing persisted message id',
+      { id: 'msg-bootstrap', sessionID: 'session-1' }, { sessionID: 'session-1' }, false],
+    ['rejects a mismatched persisted message id',
+      { id: 'msg-bootstrap', sessionID: 'session-1' }, { id: 'msg-other', sessionID: 'session-1' }, false],
+    ['rejects a missing persisted session id',
+      { id: 'msg-bootstrap', sessionID: 'session-1' }, { id: 'msg-bootstrap' }, false],
+    ['rejects a mismatched persisted session id',
+      { id: 'msg-bootstrap', sessionID: 'session-1' },
+      { id: 'msg-bootstrap', sessionID: 'session-other' }, false],
+  ] as const)('app-managed bootstrap %s', async (_name, returnedInfo, persistedInfo, valid) => {
+    const text = '<exact-bootstrap>'
+    const messageID = 'msg-bootstrap'
+    const exactMessage = { info: persistedInfo,
+      parts: [{ type: 'text', text }] }
+    let exactReads = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      oauthRefreshCoordinator: { ensureFreshForPrompt: async () => ({ checked: true, refreshed: false }) },
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getSessionMessage: async () => ++exactReads === 1 ? null : exactMessage,
+        getSessionMessages: async () => [],
+        sendSessionMessage: async () => ({ info: returnedInfo, parts: [{ type: 'text', text }] }),
+      } as never) },
+    })
+    const operation = bridge.injectAppManagedBootstrapContext(buildRecord(), {
+      messageID, text, agent: 'teammate-bootstrap',
+      contextHash: createHash('sha256').update(text).digest('hex'), briefingHash: 'b'.repeat(64),
+    })
+    if (valid) {
+      await expect(operation).resolves.toMatchObject({
+        messageID, runtimeSessionId: 'session-1', alreadyPresent: false,
+      })
+    } else {
+      await expect(operation).rejects.toThrow(/bootstrap context (id|session) mismatch after (send|read-after-send)/)
+    }
   })
 
   test('reuses an existing clean session record', async () => {

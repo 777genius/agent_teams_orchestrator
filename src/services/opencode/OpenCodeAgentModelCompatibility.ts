@@ -50,6 +50,7 @@ export function getOpenCodeModelInputModalities(
 export function evaluateOpenCodeAgentModelCompatibility(
   modelId: string,
   metadata: OpenCodeModelMetadata | null | undefined,
+  options: { requireAffirmativeCapabilities?: boolean } = {},
 ): OpenCodeAgentModelCompatibility {
   const normalizedModelId = modelId.trim().toLowerCase()
   const raw = metadata?.raw ?? null
@@ -73,6 +74,18 @@ export function evaluateOpenCodeAgentModelCompatibility(
     return {
       compatible: false,
       reason: 'This model does not support tool calls required by Agent Teams.',
+    }
+  }
+
+  if (options.requireAffirmativeCapabilities) {
+    const textOutputVerified = outputCapabilities?.text === true
+      || outputModalities?.includes('text') === true
+    const toolCallsVerified = capabilities?.toolcall === true || raw?.tool_call === true
+    if (!textOutputVerified || !toolCallsVerified) {
+      return {
+        compatible: false,
+        reason: 'Live model metadata did not affirm text output and tool-call support required by Agent Teams.',
+      }
     }
   }
 

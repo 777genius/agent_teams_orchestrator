@@ -17,30 +17,6 @@ import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
-import {
-  buildOpenCodeCapabilityInfo,
-  buildOpenCodeDetailMessage,
-  buildOpenCodeStatusMessage,
-} from '../opencode/OpenCodeDiagnostics.js'
-import {
-  OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
-  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
-  createOpenCodeInventoryProbeProgressTracker,
-  hasOpenCodeBuiltinFreeModel,
-  isOpenCodeModelFree,
-  openCodeInventoryService,
-  withOpenCodeInventoryProbeTimeout,
-} from '../opencode/OpenCodeInventoryService.js'
-import {
-  buildOpenCodeModelAccessCatalogFromInventorySnapshot,
-  buildOpenCodeModelRouteMetadata,
-  hasOpenCodeConfiguredAuthlessModel,
-} from '../opencode/OpenCodeModelAccessPolicy.js'
-import {
-  evaluateOpenCodeAgentModelCompatibility,
-  filterOpenCodeAgentModels,
-  getOpenCodeModelInputModalities,
-} from '../opencode/OpenCodeAgentModelCompatibility.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
@@ -82,6 +58,11 @@ import type {
   RuntimeStatusDetailLevel,
   RuntimeStatusPayload,
 } from './types.js'
+import {
+  buildOpenCodePassiveRuntimeStatus,
+  dispatchOpenCodeRuntimeStatus,
+  type OpenCodePassiveRuntimeStatusDeps,
+} from './openCodePassiveStatus.js'
 
 const GEMINI_BACKEND_LABELS: Record<GeminiRuntimeBackendId, string> = {
   auto: 'Auto',
@@ -418,7 +399,7 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
-type RuntimeStatusRegistryDeps = {
+type RuntimeStatusRegistryDeps = OpenCodePassiveRuntimeStatusDeps & {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
   getAnthropicSubscriptionRateLimits?: (
     authMethod: string | null,
@@ -595,10 +576,47 @@ async function buildOpenCodeStatus(
   deps: RuntimeStatusRegistryDeps = {},
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeProviderStatus> {
-  const summary = options.detailLevel === 'summary'
+  return dispatchOpenCodeRuntimeStatus(options.detailLevel, {
+    readPassive: () => buildOpenCodePassiveRuntimeStatus(deps),
+    readActive: () => buildOpenCodeActiveStatus(deps),
+  })
+}
+
+async function buildOpenCodeActiveStatus(
+  deps: RuntimeStatusRegistryDeps = {},
+): Promise<RuntimeProviderStatus> {
+  const [diagnostics, inventoryModule, modelAccess, agentCompatibility] = await Promise.all([
+    import('../opencode/OpenCodeDiagnostics.js'),
+    import('../opencode/OpenCodeInventoryService.js'),
+    import('../opencode/OpenCodeModelAccessPolicy.js'),
+    import('../opencode/OpenCodeAgentModelCompatibility.js'),
+  ])
+  const {
+    buildOpenCodeCapabilityInfo,
+    buildOpenCodeDetailMessage,
+    buildOpenCodeStatusMessage,
+  } = diagnostics
+  const {
+    OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+    createOpenCodeInventoryProbeProgressTracker,
+    hasOpenCodeBuiltinFreeModel,
+    isOpenCodeModelFree,
+    openCodeInventoryService,
+    withOpenCodeInventoryProbeTimeout,
+  } = inventoryModule
+  const {
+    buildOpenCodeModelAccessCatalogFromInventorySnapshot,
+    buildOpenCodeModelRouteMetadata,
+    hasOpenCodeConfiguredAuthlessModel,
+  } = modelAccess
+  const {
+    evaluateOpenCodeAgentModelCompatibility,
+    filterOpenCodeAgentModels,
+    getOpenCodeModelInputModalities,
+  } = agentCompatibility
   const timeoutMs =
     deps.openCodeInventoryTimeoutMs ??
-    (summary ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
   const abortController = new AbortController()
   const progress = createOpenCodeInventoryProbeProgressTracker()
   const snapshot = await withOpenCodeInventoryProbeTimeout(
@@ -606,20 +624,12 @@ async function buildOpenCodeStatus(
       ? deps.getOpenCodeInventorySnapshot()
       : openCodeInventoryService.probe(
           null,
-          summary
-            ? {
-                mode: 'summary',
-                bypassCache: true,
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              }
-            : {
-                mode: 'full',
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              },
+          {
+            mode: 'full',
+            includeAppMcp: false,
+            abortSignal: abortController.signal,
+            progress,
+          },
         ),
     {
       timeoutMs,
@@ -793,10 +803,8 @@ async function buildOpenCodeStatus(
       : null,
   }
 
-  if (!summary) {
-    provider.modelCatalog = modelCatalog
-    provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
-  }
+  provider.modelCatalog = modelCatalog
+  provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
 
   return provider
 }

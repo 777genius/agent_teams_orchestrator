@@ -115,6 +115,39 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   }
   const provider = readOption(providerArgs, '--provider') ?? ''
   const model = readOption(providerArgs, '--model') ?? ''
+  const { shouldUseOpenCodePassiveProviderDirectoryFastPath, dispatchRuntimeProvidersDirectory } = await import('./runtimeProvidersPassiveFastPath.js')
+  const directoryDispatchInput = {
+    command,
+    summary: hasOption(providerArgs, '--summary'),
+    runtime: common.runtime,
+  }
+  if (shouldUseOpenCodePassiveProviderDirectoryFastPath(directoryDispatchInput)) {
+    await dispatchRuntimeProvidersDirectory(directoryDispatchInput, {
+      readPassive: async () => {
+        const { runtimeOpenCodePassiveProviderDirectory } = await import('../cli/handlers/runtimePassive.js')
+        await runtimeOpenCodePassiveProviderDirectory({
+          projectPath: common.projectPath,
+          query: readOption(providerArgs, '--query'),
+          filter: readOption(providerArgs, '--filter'),
+          limit: readNumberOption(providerArgs, '--limit'),
+          cursor: readOption(providerArgs, '--cursor'),
+        })
+      },
+      readActive: async () => {
+        const { runtimeProvidersDirectory } = await import('../cli/handlers/runtime.js')
+        await runtimeProvidersDirectory({
+          ...common,
+          query: readOption(providerArgs, '--query'),
+          filter: readOption(providerArgs, '--filter'),
+          limit: readNumberOption(providerArgs, '--limit'),
+          cursor: readOption(providerArgs, '--cursor'),
+          refresh: hasOption(providerArgs, '--refresh'),
+          summary: true,
+        })
+      },
+    })
+    return true
+  }
   const {
     runtimeProvidersClearProjectDefault,
     runtimeProvidersConnect,
@@ -224,6 +257,19 @@ async function main(): Promise<void> {
   // For all other paths, load the startup profiler
   const { profileCheckpoint } = await import('../utils/startupProfiler.js')
   profileCheckpoint('cli_entry')
+
+  if (
+    args[0] === 'runtime' &&
+    args[1] === 'status' &&
+    hasOption(args, '--summary') &&
+    readOption(args, '--provider') === 'opencode' &&
+    !hasHelpOption(args)
+  ) {
+    profileCheckpoint('cli_runtime_opencode_passive_status_path')
+    const { runtimeOpenCodePassiveStatus } = await import('../cli/handlers/runtimePassive.js')
+    await runtimeOpenCodePassiveStatus({ text: hasOption(args, '--text') })
+    return
+  }
 
   if (
     args[0] === 'runtime' &&

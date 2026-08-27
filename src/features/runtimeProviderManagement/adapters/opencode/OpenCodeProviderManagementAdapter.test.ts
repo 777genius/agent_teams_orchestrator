@@ -1,6 +1,18 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
+import { OpenCodeActiveStatusSnapshotPublisher } from '../../../../services/opencode/OpenCodeActiveStatusSnapshotPublisher.js'
+import { openCodePassiveDatabasePath } from '../../../../services/opencode/OpenCodePassiveSnapshotStore.js'
+import { normalizeOpenCodeScopedProviderCatalogResponse } from '../../../../services/opencode/OpenCodeLiveProviderNormalizer.js'
+import {
+  getOpenCodeGlobalManagedPreferencesPath,
+  readOpenCodeGlobalManagedRuntimePreferences,
+} from '../../../../services/opencode/OpenCodeManagedPreferences.js'
+import { canonicalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -12,6 +24,40 @@ import type {
   OpenCodePersistentHostReconcileOptions,
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { ProviderManagementError, ProviderManagementResult } from '../../domain/types.js'
+import type {
+  OpenCodePassiveObservation,
+  OpenCodePassiveProviderStatus,
+  OpenCodePassiveStatusV1,
+} from '../../../../services/opencode/OpenCodePassiveStatusContract.js'
+import { OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS } from '../../../../services/opencode/OpenCodePassiveProviderDirectory.js'
+
+function passiveObservation<T>(value: T): OpenCodePassiveObservation<T> {
+  return { value, authority: 'none', freshness: 'unknown', condition: 'degraded', observedAt: null, validUntil: null, issueCode: 'read_timeout' }
+}
+
+function passiveProvider(providerId: string, configured = false): OpenCodePassiveProviderStatus {
+  return {
+    providerId,
+    configured: configured
+      ? { value: 'configured', authority: 'config_metadata', freshness: 'fresh', condition: 'normal', observedAt: 900, validUntil: 2_000, issueCode: 'none' }
+      : passiveObservation('unknown'),
+    lastConnected: passiveObservation({ state: 'unknown' }),
+    catalogAvailable: passiveObservation('unknown'),
+    executionVerified: passiveObservation('unknown'),
+  }
+}
+
+function passiveStatus(providers: OpenCodePassiveProviderStatus[]): OpenCodePassiveStatusV1 {
+  return {
+    contractVersion: 1,
+    projectScope: `sha256:${'a'.repeat(64)}`,
+    binary: passiveObservation({ presence: 'unknown', version: null }),
+    providers,
+    authorization: 'unknown',
+    launchReadiness: 'not_authorized',
+    completedAt: 1_000,
+  }
+}
 
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
   return {
@@ -86,6 +132,43 @@ function authStore() {
   }
 }
 
+function providerCatalog(
+  providerId: string,
+  models: Record<string, unknown>,
+  connected = true,
+) {
+  return {
+    loadCatalog: async (input: { projectPath?: string | null }) => ({
+      catalog: normalizeOpenCodeScopedProviderCatalogResponse({
+        requestedProviderId: providerId,
+        response: {
+          all: [{ id: providerId, name: providerId, models }],
+          connected: connected ? [providerId] : [],
+        },
+        observedAtMs: 1,
+        nowMs: 1,
+      }),
+      catalogEvidence: fakeCatalogEvidence(providerId),
+      catalogObservedAt: 1,
+      catalogExpiresAt: 2,
+      catalogProvenance: 'fresh-live' as const,
+      profileRootPath: '/tmp/profile',
+      projectPath: input.projectPath ?? '/tmp/project',
+      diagnostics: [],
+    }),
+  }
+}
+
+function fakeCatalogEvidence(providerId: string) {
+  return {
+    providerId, requestGeneration: 1, startedAt: 1,
+    attemptIdentity: `sha256:${'a'.repeat(64)}` as const,
+    binaryFingerprint: `sha256:${'b'.repeat(64)}` as const,
+    configFingerprint: `sha256:${'c'.repeat(64)}` as const,
+    authFingerprint: `sha256:${'d'.repeat(64)}` as const,
+  }
+}
+
 function expectFailure<T>(result: ProviderManagementResult<T>): ProviderManagementError {
   expect(result.ok).toBe(false)
   if ('error' in result) {
@@ -99,9 +182,14 @@ function executionProbeResult(
   outcome: 'available' | 'unavailable' | 'not_authenticated' | 'unknown' = 'available',
   reason: string | null = null,
 ): OpenCodeExecutionProbeResult {
+  const separator = modelId.indexOf('/')
+  const observedProviderId = separator > 0 ? modelId.slice(0, separator) : null
+  const observedModelId = separator > 0 ? modelId.slice(separator + 1) : null
   return {
     providerId: 'opencode',
     modelId,
+    observedProviderId,
+    observedModelId,
     probePrompt: 'Output only the single word PONG.',
     expectedOutput: 'PONG',
     outcome,
@@ -114,10 +202,560 @@ function executionProbeResult(
     toolCallCount: 0,
     errorCount: outcome === 'available' ? 0 : 1,
     diagnostics: reason ? [reason] : [],
+    ...(outcome === 'not_authenticated'
+      ? { failureCode: 'definitive_auth_rejected' as const }
+      : {}),
   }
 }
 
+function activeModelActionAdapter(input: {
+  probe: (modelId: string) => OpenCodeExecutionProbeResult | Promise<OpenCodeExecutionProbeResult>
+  publishExecutionUpdate: (update: {
+    projectPath: string
+    providerId: string
+    executionVerified?: boolean
+  }) => Promise<void>
+  connected?: boolean
+  configured?: boolean
+  providerId?: string
+  setDefaultModel?: () => Promise<void>
+  setModelLimits?: () => Promise<void>
+}) {
+  const providerId = input.providerId ?? 'local'
+  const modelId = `${providerId}/qwen`
+  return new OpenCodeProviderManagementAdapter({
+    inventoryService: {
+      probe: async projectPath => inventory({
+        projectPath: projectPath ?? '/tmp/action-project',
+        connectedProviders: input.connected
+          ? [{ id: providerId, authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }]
+          : [],
+        availableProviders: [providerId],
+        models: [modelId],
+      }),
+      clearCache: () => {},
+    },
+    hostManager: {
+      ensureHost: async () => host(),
+      releaseHost: async () => {},
+    },
+    clientFactory: {
+      create: () => ({
+        getConfigProviders: async () => ({
+          providers: input.configured === false
+            ? []
+            : [{ id: providerId, name: providerId, models: { qwen: {} } }],
+          default: {},
+        }),
+        getProviders: async () => ({
+          all: [{ id: providerId, name: providerId, models: { qwen: {} } }],
+          connected: input.connected ? [providerId] : [],
+          default: {},
+        }),
+        getProviderAuth: async () => input.connected
+          ? { [providerId]: [{ type: 'api' as const }] }
+          : {},
+      }),
+    },
+    executionProbe: {
+      probeModel: async ({ selectedModel }) => input.probe(selectedModel),
+    },
+    managedPreferences: {
+      resolveProjectRoot: () => '/tmp/profile',
+      canonicalizeProjectIdentity: async projectPath => projectPath,
+      setDefaultModel: input.setDefaultModel ?? (async () => {}),
+      setModelLimits: input.setModelLimits ?? (async () => {}),
+    },
+    activeStatusPublisher: {
+      publishInventory: async () => {},
+      publishProviderUpdate: async () => {},
+      publishExecutionUpdate: input.publishExecutionUpdate,
+      publishCatalogResult: async () => {},
+    },
+  })
+}
+
 describe('OpenCodeProviderManagementAdapter', () => {
+  test('keeps project preference reads, writes, and clears on one alias-stable missing identity', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-adapter-missing-preference-'))
+    try {
+      const realAncestor = path.join(root, 'real')
+      const aliasAncestor = path.join(root, 'alias')
+      const realProject = path.join(realAncestor, 'nested', 'project')
+      const aliasProject = path.join(aliasAncestor, 'nested', 'project')
+      await mkdir(realAncestor)
+      await symlink(realAncestor, aliasAncestor)
+
+      const readRoots: string[] = []
+      const writeRoots: string[] = []
+      const clearRoots: string[] = []
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('openrouter', { model: {} }),
+        inventoryService: {
+          probe: async projectPath => inventory({
+            projectPath: projectPath ?? aliasProject,
+            connectedProviders: [{
+              id: 'openrouter', authHint: 'api', source: 'credentials',
+              credentialScopes: ['managed'],
+            }],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/model'],
+          }),
+          clearCache: () => {},
+        },
+        hostManager: {
+          ensureHost: async () => host(),
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({
+              providers: [{ id: 'openrouter', name: 'OpenRouter', models: { model: {} } }],
+              default: {},
+            }),
+            getProviders: async () => ({
+              all: [{ id: 'openrouter', name: 'OpenRouter', models: { model: {} } }],
+              connected: ['openrouter'],
+              default: {},
+            }),
+            getProviderAuth: async () => ({ openrouter: [{ type: 'api' as const }] }),
+          }),
+        },
+        managedPreferences: {
+          resolveProjectRoot: canonicalIdentity => canonicalIdentity,
+          read: async preferenceRoot => {
+            readRoots.push(preferenceRoot)
+            return { schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }
+          },
+          readGlobal: async () => ({
+            schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+          }),
+          setDefaultModel: async preferenceRoot => { writeRoots.push(preferenceRoot) },
+          clearProjectDefaultModel: async preferenceRoot => { clearRoots.push(preferenceRoot) },
+        },
+        activeStatusPublisher: {
+          publishInventory: async () => {},
+          publishProviderUpdate: async () => {},
+          publishExecutionUpdate: async () => {},
+          publishCatalogResult: async () => {},
+        },
+      })
+
+      expect((await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'openrouter', projectPath: aliasProject,
+      })).ok).toBe(true)
+      expect((await adapter.setDefaultModel({
+        runtimeId: 'opencode', providerId: 'openrouter', modelId: 'openrouter/model',
+        projectPath: aliasProject, probe: false,
+      })).ok).toBe(true)
+      expect((await adapter.clearProjectDefaultModel({
+        runtimeId: 'opencode', projectPath: aliasProject,
+      })).ok).toBe(true)
+
+      await mkdir(realProject, { recursive: true })
+      expect((await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'openrouter', projectPath: realProject,
+      })).ok).toBe(true)
+      expect((await adapter.clearProjectDefaultModel({
+        runtimeId: 'opencode', projectPath: realProject,
+      })).ok).toBe(true)
+
+      expect(readRoots).toEqual([realProject, realProject])
+      expect(writeRoots).toEqual([realProject])
+      expect(clearRoots).toEqual([realProject, realProject])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('passes the missing-project policy through deterministic Windows preference identity', async () => {
+    const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' })
+    const stat = { dev: 3, ino: 7, isDirectory: () => true }
+    const optionsSeen: Array<Readonly<{ allowMissing: true }>> = []
+    const canonicalizeProjectIdentity = async (
+      projectPath: string,
+      options: Readonly<{ allowMissing: true }>,
+    ) => {
+      optionsSeen.push(options)
+      return canonicalizeOpenCodeProjectIdentity(projectPath, {
+        ...options,
+        platform: 'win32',
+        filesystem: {
+          realpath: async value => {
+            if (value.toLowerCase() === 'c:\\alias') return 'D:\\Real'
+            throw missing()
+          },
+          lstat: async value => value.toLowerCase() === 'd:\\real' ? stat : Promise.reject(missing()),
+        },
+      })
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      managedPreferences: {
+        canonicalizeProjectIdentity,
+        resolveProjectRoot: canonicalIdentity => canonicalIdentity,
+        setDefaultModel: async () => {},
+      },
+    })
+    const resolvePreferenceRoot = adapter as unknown as {
+      resolveCanonicalPreferenceRoot(projectPath: string): Promise<string>
+    }
+
+    await expect(resolvePreferenceRoot.resolveCanonicalPreferenceRoot('C:\\Alias\\Nested\\Project'))
+      .resolves.toBe('d:\\real\\nested\\project')
+    expect(optionsSeen).toEqual([{ allowMissing: true }])
+  })
+
+  test('publishes exact scoped execution evidence after each successful active model probe', async () => {
+    const updates: Array<{
+      projectPath: string
+      providerId: string
+      executionVerified?: boolean
+    }> = []
+    const adapter = activeModelActionAdapter({
+      probe: modelId => executionProbeResult(modelId),
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const tested = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      projectPath: '/tmp/project',
+    })
+    const defaulted = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+      projectPath: '/tmp/project',
+    })
+    const configured = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+      projectPath: '/tmp/project',
+    })
+
+    expect([tested.ok, defaulted.ok, configured.ok]).toEqual([true, true, true])
+    expect(updates).toEqual(Array.from({ length: 3 }, () => ({
+      projectPath: '/tmp/project',
+      providerId: 'local',
+      executionVerified: true,
+    })))
+  })
+
+  test('does not publish set-default execution evidence when no probe occurred', async () => {
+    const updates: unknown[] = []
+    let probes = 0
+    const adapter = activeModelActionAdapter({
+      connected: true,
+      configured: false,
+      providerId: 'openrouter',
+      probe: modelId => {
+        probes += 1
+        return executionProbeResult(modelId)
+      },
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'openrouter', modelId: 'openrouter/qwen', probe: false,
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probes).toBe(0)
+    expect(updates).toEqual([])
+  })
+
+  test('publishes rejection only for exact definitive authentication rejection', async () => {
+    const updates: unknown[] = []
+    let probeResult = executionProbeResult('local/qwen', 'not_authenticated', 'invalid token')
+    const adapter = activeModelActionAdapter({
+      probe: () => probeResult,
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(updates).toEqual([{
+      projectPath: '/tmp/action-project', providerId: 'local', executionVerified: false,
+    }])
+
+    probeResult = executionProbeResult('local/qwen', 'not_authenticated', 'HTTP 403 Forbidden')
+    delete probeResult.failureCode
+    const genericForbidden = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(genericForbidden.ok).toBe(true)
+    if (genericForbidden.ok) {
+      expect(genericForbidden.value.availability).toBe('unknown')
+    }
+
+    for (const uncertain of [
+      { outcome: 'unavailable' as const, reason: 'rate limited', failureCode: undefined },
+      { outcome: 'unknown' as const, reason: 'malformed response', failureCode: undefined },
+      { outcome: 'unavailable' as const, reason: 'transport failed', failureCode: 'provider_endpoint_unreachable' as const },
+      { outcome: 'unknown' as const, reason: 'probe timed out', failureCode: 'execution_timeout' as const },
+    ]) {
+      const uncertainProbe = executionProbeResult(
+        'local/qwen', uncertain.outcome, uncertain.reason,
+      )
+      if (!uncertain.failureCode) delete uncertainProbe.failureCode
+      probeResult = uncertain.failureCode
+        ? { ...uncertainProbe, failureCode: uncertain.failureCode }
+        : uncertainProbe
+      await adapter.testModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      })
+    }
+
+    probeResult = {
+      ...executionProbeResult('local/qwen', 'not_authenticated', 'Invalid API key.'),
+      observedProviderId: 'fallback-provider',
+    }
+    await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(updates).toHaveLength(1)
+  })
+
+  test('does not publish success when probe evidence names a different model or provider', async () => {
+    const updates: unknown[] = []
+    let observedProviderId: string | null = 'local'
+    let observedModelId: string | null = 'other'
+    const adapter = activeModelActionAdapter({
+      probe: () => ({
+        ...executionProbeResult('local/qwen'),
+        observedProviderId,
+        observedModelId,
+      }),
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const wrongModel = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    observedProviderId = 'other'
+    observedModelId = 'qwen'
+    const wrongProvider = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    observedProviderId = null
+    observedModelId = null
+    const missingIdentity = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+
+    expect([wrongModel.ok, wrongProvider.ok, missingIdentity.ok]).toEqual([true, true, true])
+    if (wrongModel.ok && wrongProvider.ok && missingIdentity.ok) {
+      expect([
+        wrongModel.value.availability,
+        wrongProvider.value.availability,
+        missingIdentity.value.availability,
+      ]).toEqual([
+        'unknown', 'unknown', 'unknown',
+      ])
+    }
+    expect(updates).toEqual([])
+  })
+
+  test('does not persist defaults or limits when observed execution identity is missing or mismatched', async () => {
+    let defaultWrites = 0
+    let limitWrites = 0
+    let probeResult: OpenCodeExecutionProbeResult = {
+      ...executionProbeResult('local/qwen'),
+      observedProviderId: null,
+      observedModelId: null,
+    }
+    const adapter = activeModelActionAdapter({
+      probe: () => probeResult,
+      publishExecutionUpdate: async () => {},
+      setDefaultModel: async () => { defaultWrites += 1 },
+      setModelLimits: async () => { limitWrites += 1 },
+    })
+
+    const missingDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    probeResult = {
+      ...executionProbeResult('local/qwen'),
+      observedProviderId: 'fallback-provider',
+    }
+    const providerFallbackDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    probeResult = { ...executionProbeResult('local/qwen'), observedModelId: 'fallback' }
+    const fallbackLimits = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+    })
+
+    expect([missingDefault.ok, providerFallbackDefault.ok, fallbackLimits.ok]).toEqual([
+      false, false, false,
+    ])
+    expect({ defaultWrites, limitWrites }).toEqual({ defaultWrites: 0, limitWrites: 0 })
+  })
+
+  test('preserves successful model action semantics when execution publication fails', async () => {
+    const adapter = activeModelActionAdapter({
+      probe: modelId => executionProbeResult(modelId),
+      publishExecutionUpdate: async () => { throw new Error('snapshot store unavailable') },
+    })
+
+    const tested = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    const defaulted = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    const configured = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+    })
+
+    expect([tested.ok, defaulted.ok, configured.ok]).toEqual([true, true, true])
+    if (!tested.ok || !defaulted.ok || !configured.ok) return
+    expect(tested.value.ok).toBe(true)
+    expect(tested.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+    expect(defaulted.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+    expect(configured.value).toMatchObject({ saved: true, verified: true })
+    expect(configured.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+  })
+
+  test('rejects uppercase and malformed provider rows without throwing before the catalog boundary', async () => {
+    let catalogCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: {
+        loadCatalog: async () => {
+          catalogCalls += 1
+          throw new Error('invalid boundary input must not reach the catalog')
+        },
+      },
+    })
+
+    for (const providerId of ['DEEPINFRA', '../deepinfra', { trim: () => { throw new Error('getter') } }, Symbol('provider')]) {
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: providerId as any, projectPath: '/project-a',
+      })
+      expect(result).toMatchObject({ ok: false, error: { code: 'provider-missing' } })
+    }
+    expect(catalogCalls).toBe(0)
+  })
+
+  test('routes catalog loading through canonical preferences after the attempt profile is gone', async () => {
+    let catalogCalls = 0
+    const statusUpdates: any[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      activeStatusPublisher: {
+        publishInventory: async () => {},
+        publishProviderUpdate: async input => { statusUpdates.push(input) },
+        publishExecutionUpdate: async input => { statusUpdates.push(input) },
+        publishCatalogResult: async input => { statusUpdates.push(input) },
+      },
+      providerCatalog: {
+        loadCatalog: async input => {
+          catalogCalls += 1
+          expect(input).toEqual({ providerId: 'deepinfra', projectPath: '/project-a' })
+          return {
+            catalog: normalizeOpenCodeScopedProviderCatalogResponse({
+              requestedProviderId: 'deepinfra',
+              response: {
+                all: [{ id: 'deepinfra', models: { model: { name: 'Model' } } }],
+                connected: ['deepinfra'],
+              },
+              observedAtMs: 1,
+              nowMs: 1,
+            }),
+            catalogEvidence: fakeCatalogEvidence('deepinfra'),
+            profileRootPath: '/scoped/deepinfra',
+            projectPath: '/project-a',
+            diagnostics: [],
+          }
+        },
+      },
+      inventoryService: {
+        probe: async () => { throw new Error('legacy inventory must not run') },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('legacy host must not run') },
+        releaseHost: async () => {},
+      },
+      managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        read: async profileRootPath => {
+          expect(profileRootPath).toBe('/tmp/canonical-project-preferences')
+          return {
+            schemaVersion: 2,
+            defaultModelId: null,
+            modelLimitOverrides: {},
+            updatedAt: '2026-08-18T00:00:00.000Z',
+          }
+        },
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode', providerId: 'deepinfra', projectPath: '/project-a',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(catalogCalls).toBe(1)
+    expect(statusUpdates).toEqual([{
+      projectPath: '/project-a', evidence: fakeCatalogEvidence('deepinfra'), catalogAvailable: true,
+      modelIds: ['deepinfra/model'],
+    }])
+    expect(result.value.models.map(model => model.modelId)).toEqual(['deepinfra/model'])
+    expect(result.value.models[0]).toMatchObject({
+      accessKind: 'catalog_selection_only',
+      routeKind: 'catalog_provider',
+      proofState: 'needs_probe',
+      requiresExecutionProof: true,
+    })
+    expect(result.value.models[0]).not.toHaveProperty('credentials')
+    expect(result.value.models[0]).not.toHaveProperty('connected')
+    expect(result.value.models[0]).not.toHaveProperty('authority')
+    expect(result.value.models[0]).not.toHaveProperty('providerResponse')
+    expect(result.value.defaultModelId).toBeNull()
+  })
+
+  test('bounds passive SQLite publication while provider catalog loading still completes', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.adapter-passive-publication-lock-'))
+    const canonicalProject = '/canonical/publication-project'
+    let database: Database | null = null
+    try {
+      await new OpenCodeActiveStatusSnapshotPublisher({
+        rootDirectory: root,
+        canonicalizePath: async () => canonicalProject,
+        publicationDeadlineMs: 5_000,
+      }).publishProviderUpdate({ projectPath: canonicalProject, providerId: 'deepinfra', configured: true })
+      database = new Database(openCodePassiveDatabasePath(root))
+      database.exec('BEGIN IMMEDIATE')
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('deepinfra', { model: {} }, false),
+        activeStatusPublisher: new OpenCodeActiveStatusSnapshotPublisher({
+          rootDirectory: root,
+          canonicalizePath: async () => canonicalProject,
+          publicationDeadlineMs: 25,
+        }),
+        managedPreferences: {
+          resolveProjectRoot: () => '/canonical/preferences',
+          read: async () => ({ schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }),
+          readGlobal: async () => ({ schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }),
+          setDefaultModel: async () => {},
+        },
+      })
+      const startedAt = performance.now()
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'deepinfra' })
+      expect(performance.now() - startedAt).toBeLessThan(500)
+      expect(result.ok).toBe(true)
+      if (result.ok) {
+        expect(result.value.models.map(model => model.modelId)).toEqual(['deepinfra/model'])
+        expect(result.value.diagnostics.join('\n')).toContain('Passive status publication')
+      }
+    } finally {
+      if (database) { try { database.exec('ROLLBACK') } catch {} database.close(false) }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   test('returns a needs-setup view when OpenCode is missing', async () => {
     let ensureHostCalled = false
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -225,6 +863,130 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
+  test('loads live custom provider models and auth from profile-only inventory', async () => {
+    const inventoryModes: Array<string | undefined> = []
+    const liveReads: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          inventoryModes.push(options?.mode)
+          if (options?.mode !== 'profile') {
+            throw new Error('full CLI model probe failed')
+          }
+          return inventory({
+            connectedProviders: [
+              {
+                id: 'custom-ai',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: [],
+            models: [],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => {
+            liveReads.push('config')
+            return {
+              providers: [
+                { id: 'custom-ai', name: 'Custom AI', models: { 'custom-model': {} } },
+              ],
+              default: { 'custom-ai': 'custom-model' },
+            }
+          },
+          getProviders: async () => {
+            liveReads.push('providers')
+            return {
+              all: [
+                { id: 'custom-ai', name: 'Custom AI', models: { 'custom-model': {} } },
+              ],
+              connected: ['custom-ai'],
+              default: { 'custom-ai': 'custom-model' },
+            }
+          },
+          getProviderAuth: async () => {
+            liveReads.push('auth')
+            return { 'custom-ai': [{ type: 'api', label: 'Custom API key' }] }
+          },
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    expect(inventoryModes).toEqual(['profile'])
+    expect(liveReads).toEqual(['config', 'providers', 'auth'])
+    if (!result.ok) return
+    expect(result.value.defaultModel).toBe('custom-ai/custom-model')
+    expect(result.value.configuredModels).toContainEqual(
+      expect.objectContaining({ modelId: 'custom-ai/custom-model' }),
+    )
+    expect(result.value.providers.find(provider => provider.providerId === 'custom-ai'))
+      .toMatchObject({
+        state: 'connected',
+        ownership: ['managed'],
+        modelCount: 1,
+        authMethods: ['api'],
+        connectedAuthHint: 'api',
+      })
+  })
+
+  test('authorizes anonymous live zero-cost OpenCode models but not arbitrary providers', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: [],
+          models: [],
+          modelMetadata: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async options => {
+          expect(options.managedPluginStartupPolicy).toBe('serve-startup')
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              { id: 'opencode', models: { 'free-live': { cost: { input: 0, output: 0 } } } },
+              { id: 'custom-ai', models: { 'zero-cost': { cost: { input: 0, output: 0 } } } },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.configuredModels).toContainEqual(expect.objectContaining({
+      modelId: 'opencode/free-live',
+      free: true,
+      routeKind: 'builtin_free',
+      accessKind: 'builtin_free',
+    }))
+    expect(result.value.configuredModels).not.toContainEqual(expect.objectContaining({
+      modelId: 'custom-ai/zero-cost',
+    }))
+  })
+
   test('does not run provider writes when OpenCode inventory probing stalls', async () => {
     const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
@@ -309,6 +1071,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const releasedHostLeases: Array<{ hostKey: string; lease: OpenCodeHostLeaseInput }> = []
     const reconcileCalls: OpenCodePersistentHostReconcileOptions[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('openai', { 'gpt-5.4-mini': {} }),
       inventoryService: {
         probe: async () => inventory(),
       },
@@ -389,18 +1152,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
         preparedProfile: true,
         includeAppMcp: false,
       },
-      {
-        projectPath: '/tmp/project',
-        hostLifetime: 'persistent',
-        healthTimeoutMs: undefined,
-        preparedProfile: false,
-        includeAppMcp: undefined,
-      },
     ])
-    expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
-    expect(retainedHostLeases).toHaveLength(3)
+    expect(releasedHosts).toEqual(['host-key', 'host-key'])
+    expect(retainedHostLeases).toHaveLength(2)
     expect(releasedHostLeases).toEqual(retainedHostLeases)
-    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(3)
+    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(2)
     expect(
       retainedHostLeases.every(
         ({ hostKey, lease }) =>
@@ -409,7 +1165,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(3)
+    expect(reconcileCalls).toHaveLength(2)
     expect(
       reconcileCalls.every(
         options =>
@@ -1336,6 +2092,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let ensureHostCalls = 0
     let clientFactoryCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
+      getOpenCodePassiveStatus: async input => passiveStatus(
+        input.providerIds.map(providerId => passiveProvider(providerId, providerId === 'deepinfra')),
+      ),
       inventoryService: {
         probe: async (_projectPath, options) => {
           inventoryModes.push(options?.mode)
@@ -1426,65 +2185,27 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(inventoryModes).toEqual(['summary'])
+    expect(inventoryModes).toEqual([])
     expect(ensureHostCalls).toBe(0)
     expect(clientFactoryCalls).toBe(0)
-    expect(result.value.entries.map(entry => entry.providerId).sort()).toEqual([
-      'cursor-acp',
-      'github-copilot',
-      'kimi-for-coding',
-      'kiro',
-      'minimax-coding-plan',
-      'xai',
-      'xiaomi-token-plan-ams',
-      'xiaomi-token-plan-cn',
-      'xiaomi-token-plan-sgp',
-      'zai-coding-plan',
-    ])
-
-    const entry = (providerId: string) =>
-      result.value.entries.find(candidate => candidate.providerId === providerId)
-    expect(entry('xai')).toMatchObject({
-      state: 'connected',
-      connectedAuthHint: 'oauth',
-      setupKind: 'connected',
+    expect(result.value.entries.map(entry => entry.providerId)).toEqual(OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS)
+    expect(result.value.entries.find(entry => entry.providerId === 'deepinfra')).toMatchObject({
+      state: 'not-connected',
+      connectedAuthHint: null,
+      setupKind: 'available-readonly',
     })
-    expect(entry('github-copilot')).toMatchObject({
-      state: 'connected',
-      connectedAuthHint: 'oauth',
-      ownership: ['local'],
-    })
-    expect(entry('minimax-coding-plan')).toMatchObject({
-      state: 'connected',
-      connectedAuthHint: 'api',
-    })
-    expect(entry('xiaomi-token-plan-sgp')).toMatchObject({
-      state: 'connected',
-      connectedAuthHint: 'api',
-    })
-    expect(entry('zai-coding-plan')).toMatchObject({
-      state: 'available',
-      setupKind: 'connect-api-key',
-      modelCount: 1,
-    })
-    expect(entry('kimi-for-coding')).toMatchObject({
-      state: 'available',
-      setupKind: 'connect-api-key',
-      modelCount: 1,
-    })
-    expect(entry('kiro')).toMatchObject({
-      state: 'connected',
-      metadata: { configuredAuthless: true },
-    })
-    expect(entry('cursor-acp')).toMatchObject({
-      state: 'connected',
-      metadata: { configuredAuthless: true },
-    })
+    expect(result.value.entries.every(entry => entry.actions.every(action => !action.enabled))).toBe(true)
   })
 
   test('does not infer companion connectivity from summary config alone', async () => {
     let ensureHostCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
+      getOpenCodePassiveStatus: async input => passiveStatus(
+        input.providerIds.map(providerId => passiveProvider(
+          providerId,
+          providerId === 'kiro' || providerId === 'cursor-acp',
+        )),
+      ),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -1518,27 +2239,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(ensureHostCalls).toBe(0)
     for (const providerId of ['kiro', 'cursor-acp']) {
       expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
-        state: 'available',
-        metadata: { configuredAuthless: true },
+        state: 'not-connected',
+        connectedAuthHint: null,
       })
     }
     for (const providerId of ['xai', 'github-copilot']) {
       expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
-        state: 'not-connected',
-        setupKind: 'connect-oauth',
-      })
-    }
-    for (const providerId of [
-      'minimax-coding-plan',
-      'zai-coding-plan',
-      'kimi-for-coding',
-      'xiaomi-token-plan-ams',
-      'xiaomi-token-plan-sgp',
-      'xiaomi-token-plan-cn',
-    ]) {
-      expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
-        state: 'not-connected',
-        setupKind: 'connect-api-key',
+        state: 'available',
+        setupKind: 'available-readonly',
       })
     }
   })
@@ -2461,7 +3169,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
           return executionProbeResult(
             input.selectedModel,
             'not_authenticated',
-            'The requested model is not supported',
+            input.selectedModel === 'github-copilot/claude-sonnet-4.6'
+              ? 'The requested model is not available for integrator "opencode"'
+              : 'The requested model is not supported',
           )
         },
       },
@@ -2485,15 +3195,15 @@ describe('OpenCodeProviderManagementAdapter', () => {
     )
 
     const failure = expectFailure(result)
-    expect(failure.code).toBe('model-test-failed')
+    expect(failure.code).toBe('model-access-unavailable')
     expect(failure.message).toBe(
-      'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.',
+      'GitHub sign-in succeeded, but no tested explicit Copilot model was usable. GitHub/OpenCode did not report the plan name. This can mean an Auto-only Free or Student account, an organization model policy, or an OpenCode integration restriction blocked the tested models. Agent Teams cannot use Copilot Auto yet.',
     )
     expect(probedModelIds).toEqual([
-      'github-copilot/gpt-5-mini',
-      'github-copilot/gpt-5.5',
       'github-copilot/claude-haiku-4.5',
       'github-copilot/claude-sonnet-4.6',
+      'github-copilot/gpt-5-mini',
+      'github-copilot/gpt-5.5',
       'github-copilot/gpt-5.6-luna',
     ])
     expect(callbackStarted).toBe(true)
@@ -2513,9 +3223,21 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
   })
 
-  test('keeps a paid Copilot connection when a later policy fallback is available', async () => {
+  test('uses a later live Copilot catalog model without a hard-coded candidate cap', async () => {
     let connected = false
     const probedModelIds: string[] = []
+    const catalogModelIds = [
+      'github-copilot/catalog-model-01',
+      'github-copilot/catalog-model-02',
+      'github-copilot/catalog-model-03',
+      'github-copilot/catalog-model-04',
+      'github-copilot/catalog-model-05',
+      'github-copilot/catalog-model-06',
+      'github-copilot/catalog-model-07',
+      'github-copilot/catalog-model-08',
+      'github-copilot/catalog-model-09',
+      'github-copilot/plan-allowed-model',
+    ]
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
@@ -2531,13 +3253,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
                 ]
               : [],
             availableProviders: ['github-copilot'],
-            models: [
-              'github-copilot/gpt-5-mini',
-              'github-copilot/gpt-5.5',
-              'github-copilot/gpt-5.6-luna',
-              'github-copilot/claude-haiku-4.5',
-              'github-copilot/claude-sonnet-4.6',
-            ],
+            models: catalogModelIds,
           }),
       },
       hostManager: {
@@ -2589,7 +3305,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       executionProbe: {
         probeModel: async input => {
           probedModelIds.push(input.selectedModel)
-          return input.selectedModel === 'github-copilot/gpt-5.6-luna'
+          return input.selectedModel === 'github-copilot/plan-allowed-model'
             ? executionProbeResult(input.selectedModel)
             : executionProbeResult(
                 input.selectedModel,
@@ -2615,14 +3331,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.value.verifiedModelId).toBe('github-copilot/gpt-5.6-luna')
-    expect(probedModelIds).toEqual([
-      'github-copilot/gpt-5-mini',
-      'github-copilot/gpt-5.5',
-      'github-copilot/claude-haiku-4.5',
-      'github-copilot/claude-sonnet-4.6',
-      'github-copilot/gpt-5.6-luna',
-    ])
+    expect(result.value.verifiedModelId).toBe('github-copilot/plan-allowed-model')
+    expect(probedModelIds).toEqual(catalogModelIds)
   })
 
   test('does not accept a stale pre-existing Copilot credential as OAuth completion evidence', async () => {
@@ -5575,6 +6285,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('loads provider-scoped models lazily with query filtering', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('openrouter', {
+        'openai/gpt-oss-20b:free': { free: true },
+        'moonshotai/kimi-k2': {},
+      }),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5650,8 +6364,32 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('returns provider-missing for a malformed provider id without loading a catalog', async () => {
+    let catalogCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: {
+        loadCatalog: async () => {
+          catalogCalls += 1
+          throw new Error('catalog must not load')
+        },
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: '../openrouter',
+    })
+
+    expect(result.ok).toBe(false)
+    expect(expectFailure(result)).toMatchObject({ code: 'provider-missing' })
+    expect(catalogCalls).toBe(0)
+  })
+
   test('paginates the filtered union of inventory, config, and live provider models', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('openrouter', {
+        'alpha-one': {}, 'alpha-two': {}, 'alpha-three': {}, 'alpha-four': {},
+      }),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5736,6 +6474,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('marks provider-scoped zero-cost OpenRouter models as free', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('openrouter', {
+        'anthropic/claude-haiku-4.5': { free: true },
+      }),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5804,9 +6545,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
-  test('filters deprecated catalog models but keeps a persisted deprecated default visible', async () => {
+  test('filters deprecated provider-scoped catalog models unless one is the managed default', async () => {
     let defaultModelId = 'active-model'
+    let managedDefaultModelId = 'google/active-model'
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('google', {
+        'active-model': {},
+        'alpha-model': { status: 'alpha' },
+        'beta-model': { status: 'beta' },
+        'old-model': { status: 'deprecated' },
+      }, false),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5859,6 +6607,15 @@ describe('OpenCodeProviderManagementAdapter', () => {
           getProviderAuth: async () => ({ google: [{ type: 'api' }] }),
         }),
       },
+      managedPreferences: {
+        read: async () => ({
+          schemaVersion: 2,
+          defaultModelId: managedDefaultModelId,
+          modelLimitOverrides: {},
+          updatedAt: '2026-08-20T00:00:00.000Z',
+        }),
+        setDefaultModel: async () => {},
+      },
     })
 
     const activeDefault = await adapter.loadModels({
@@ -5878,7 +6635,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(activeDefault.value.models.find(model => model.modelId === 'google/beta-model'))
       .toMatchObject({ catalogStatus: 'beta' })
 
-    defaultModelId = 'old-model'
+    expect(activeDefault.value.models.find(model => model.modelId === 'google/old-model'))
+      .toBeUndefined()
+    expect(activeDefault.value.defaultModelId).toBe('google/active-model')
+    expect(activeDefault.value.models.find(model => model.modelId === 'google/active-model'))
+      .toMatchObject({ default: true })
+
+    managedDefaultModelId = 'google/old-model'
     const deprecatedDefault = await adapter.loadModels({
       runtimeId: 'opencode',
       providerId: 'google',
@@ -5886,12 +6649,112 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(deprecatedDefault.ok).toBe(true)
     if (!deprecatedDefault.ok) return
+    expect(deprecatedDefault.value.defaultModelId).toBe('google/old-model')
     expect(deprecatedDefault.value.models.find(model => model.modelId === 'google/old-model'))
-      .toMatchObject({ catalogStatus: 'deprecated', default: true })
+      .toMatchObject({ default: true, catalogStatus: 'deprecated' })
+  })
+
+  test('uses a project managed default before the all-projects global default', async () => {
+    const reads: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('google', {
+        'project-model': {},
+        'global-old-model': { status: 'deprecated' },
+      }, false),
+      managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        read: async profileRootPath => {
+          reads.push(`project:${profileRootPath}`)
+          return {
+            schemaVersion: 2,
+            defaultModelId: 'google/project-model',
+            modelLimitOverrides: {},
+            updatedAt: null,
+          }
+        },
+        readGlobal: async dataRootPath => {
+          reads.push(`global:${dataRootPath}`)
+          return {
+            schemaVersion: 2,
+            defaultModelId: 'google/global-old-model',
+            modelLimitOverrides: {},
+            updatedAt: null,
+          }
+        },
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModelId).toBe('google/project-model')
+    expect(result.value.models.find(model => model.modelId === 'google/project-model'))
+      .toMatchObject({ default: true })
+    expect(result.value.models.find(model => model.modelId === 'google/global-old-model'))
+      .toBeUndefined()
+    expect(reads.some(value => value === 'project:/tmp/canonical-project-preferences')).toBe(true)
+    expect(reads.some(value => value.startsWith('global:'))).toBe(true)
+  })
+
+  test('falls back to the all-projects default and keeps a matching deprecated model visible', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('google', {
+        'active-model': {},
+        'global-old-model': { status: 'deprecated' },
+      }, false),
+      managedPreferences: {
+        read: async () => ({
+          schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+        }),
+        readGlobal: async () => ({
+          schemaVersion: 2,
+          defaultModelId: 'google/global-old-model',
+          modelLimitOverrides: {},
+          updatedAt: null,
+        }),
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModelId).toBe('google/global-old-model')
+    expect(result.value.models.find(model => model.modelId === 'google/global-old-model'))
+      .toMatchObject({ default: true, catalogStatus: 'deprecated' })
+  })
+
+  test('ignores a malformed all-projects preference without hiding catalog models', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-malformed-global-preference-'))
+    try {
+      const globalPath = getOpenCodeGlobalManagedPreferencesPath(dataRoot)
+      await mkdir(path.dirname(globalPath), { recursive: true })
+      await writeFile(globalPath, '{ malformed json', 'utf8')
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('google', { 'active-model': {} }, false),
+        managedPreferences: {
+          read: async () => ({
+            schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+          }),
+          readGlobal: async () => readOpenCodeGlobalManagedRuntimePreferences(dataRoot),
+          setDefaultModel: async () => {},
+        },
+      })
+
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.defaultModelId).toBeNull()
+      expect(result.value.models.map(model => model.modelId)).toEqual(['google/active-model'])
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true })
+    }
   })
 
   test('loads provider-scoped models reported only by the live provider catalog', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('openrouter', { 'qwen/qwen3-coder': {} }),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5944,8 +6807,71 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.models.map(model => model.modelId)).toEqual(['openrouter/qwen/qwen3-coder'])
   })
 
+  test('requires a real execution proof for each catalog-reported Copilot model', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('github-copilot', { 'gpt-5-mini': {} }),
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'github-copilot',
+                authHint: 'oauth',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['github-copilot'],
+            models: ['github-copilot/gpt-5-mini'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'github-copilot',
+                name: 'GitHub Copilot',
+                models: { 'gpt-5-mini': {} },
+              },
+            ],
+            connected: ['github-copilot'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'github-copilot': [{ type: 'oauth' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'github-copilot',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models).toHaveLength(1)
+    expect(result.value.models[0]).toMatchObject({
+      modelId: 'github-copilot/gpt-5-mini',
+      routeKind: 'catalog_provider',
+      accessKind: 'catalog_selection_only',
+      proofState: 'needs_probe',
+      requiresExecutionProof: true,
+      availability: 'untested',
+    })
+    expect(result.value.models[0]?.accessReason).toContain('selection only')
+  })
+
   test('marks configured local OpenCode models as authless routes that need proof', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('llama.cpp', { 'qwen-test:0.5b': {} }, false),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5994,8 +6920,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.models[0]).toMatchObject({
       modelId: 'llama.cpp/qwen-test:0.5b',
       providerId: 'llama.cpp',
-      routeKind: 'configured_local',
-      accessKind: 'configured_authless',
+      routeKind: 'catalog_provider',
+      accessKind: 'catalog_selection_only',
       proofState: 'needs_probe',
       requiresExecutionProof: true,
       availability: 'untested',
@@ -6004,6 +6930,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('surfaces configured Ollama Cloud models as launchable authless routes', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('ollama', {
+        'kimi-k2.6:cloud': {
+          name: 'kimi-k2.6:cloud',
+          limit: { context: 262_144, output: 262_144 },
+          attachment: true,
+        },
+      }, false),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -6131,9 +7064,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       providerId: 'ollama',
       displayName: 'kimi-k2.6:cloud',
       sourceLabel: 'Ollama',
-      default: true,
-      routeKind: 'configured_local',
-      accessKind: 'configured_authless',
+      default: false,
+      routeKind: 'catalog_provider',
+      accessKind: 'catalog_selection_only',
       proofState: 'needs_probe',
       requiresExecutionProof: true,
     })
@@ -6141,6 +7074,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('tests configured authless local models without requiring a connected provider', async () => {
     let probedModel: string | null = null
+    let probedBaseUrl: string | null | undefined
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
@@ -6161,8 +7095,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
               {
                 id: 'llama.cpp',
                 name: 'llama.cpp',
+                source: 'config',
                 npm: '@ai-sdk/openai-compatible',
-                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                options: {
+                  baseURL:
+                    'http://token:secret@127.0.0.1:8080/v1/private/path-token?api_key=secret#fragment',
+                },
                 models: { 'qwen-test:0.5b': {} },
               },
             ],
@@ -6175,6 +7113,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       executionProbe: {
         probeModel: async input => {
           probedModel = input.selectedModel
+          probedBaseUrl = input.providerBaseUrl
           return executionProbeResult(input.selectedModel)
         },
       },
@@ -6188,8 +7127,18 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     expect(probedModel).toBe('llama.cpp/qwen-test:0.5b')
+    expect(probedBaseUrl).toBe('http://127.0.0.1:8080')
     if (!result.ok) return
     expect(result.value.availability).toBe('available')
+    expect(result.value).toMatchObject({
+      effectiveBaseUrl: 'http://127.0.0.1:8080',
+      providerSource: 'config',
+      failureCode: null,
+    })
+    expect(result.value.diagnostics).toContain(
+      'OpenCode resolved provider endpoint: http://127.0.0.1:8080 (provider source: config)',
+    )
+    expect(result.value.diagnostics.join('\n')).not.toContain('path-token')
   })
 
   test('uses live provider defaults when managed config has no default model', async () => {
@@ -6298,6 +7247,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probeModel: async input => ({
           providerId: 'opencode',
           modelId: input.selectedModel,
+          observedProviderId: 'openrouter',
+          observedModelId: 'openai/gpt-oss-20b:free',
           probePrompt: 'Output only the single word PONG.',
           expectedOutput: 'PONG',
           outcome: 'available',
@@ -6313,6 +7264,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -6407,6 +7359,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -6434,7 +7387,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.diagnostics).toContain(timeoutMessage)
   })
 
-  test('clears the project default and inherits the all-projects default without probing', async () => {
+  test('clears the canonical project default without probing or starting a host', async () => {
     const clearedProfiles: string[] = []
     let inventoryProbeCount = 0
     let executionProbeCount = 0
@@ -6486,6 +7439,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        readGlobal: async () => ({
+          schemaVersion: 2, defaultModelId: 'openrouter/base-model', modelLimitOverrides: {}, updatedAt: null,
+        }),
         clearProjectDefaultModel: async profileRootPath => {
           clearedProfiles.push(profileRootPath)
         },
@@ -6500,15 +7457,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(clearedProfiles).toEqual(['/tmp/profile'])
+    expect(clearedProfiles).toEqual(['/tmp/canonical-project-preferences'])
+    expect(inventoryProbeCount).toBe(0)
     expect(executionProbeCount).toBe(0)
     expect(result.value.projectDefaultModel).toBeNull()
-    expect(result.value.allProjectsDefaultModel).toBe('openrouter/base-model')
-    expect(result.value.defaultModel).toBe('openrouter/base-model')
-    expect(result.value.defaultModelSource).toBe('all_projects')
+    expect(result.value.diagnostics.join('\n')).toContain('without probing or provisioning')
   })
 
-  test('preserves an imported OpenCode config default when clear refresh times out', async () => {
+  test('clears the canonical project default without depending on a timeout summary', async () => {
     const clearedProfiles: string[] = []
     let probeCallCount = 0
     const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
@@ -6551,6 +7507,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        readGlobal: async () => ({
+          schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+        }),
         clearProjectDefaultModel: async profileRootPath => {
           clearedProfiles.push(profileRootPath)
         },
@@ -6565,12 +7525,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(clearedProfiles).toEqual(['/tmp/profile'])
+    expect(clearedProfiles).toEqual(['/tmp/canonical-project-preferences'])
+    expect(probeCallCount).toBe(0)
     expect(result.value.projectDefaultModel).toBeNull()
     expect(result.value.allProjectsDefaultModel).toBeNull()
-    expect(result.value.defaultModel).toBe('ollama/imported-model')
-    expect(result.value.defaultModelSource).toBe('opencode_config')
-    expect(result.value.diagnostics).toContain(timeoutMessage)
+    expect(result.value.diagnostics.join('\n')).toContain('without probing or provisioning')
   })
 
   test('rejects clearing a project default without a project path using the public error contract', async () => {
@@ -6643,6 +7602,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           projectWrites.push({ profileRootPath, modelId })
         },
@@ -6734,6 +7694,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           projectWrites.push({ profileRootPath, modelId })
         },
@@ -6807,6 +7768,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -7047,6 +8009,157 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toBe('openrouter/new-model')
   })
 
+  test('prepares only profile inventory before active model actions', async () => {
+    const inventoryModes: Array<string | undefined> = []
+    const hostPolicies: Array<string | undefined> = []
+    const probedModels: string[] = []
+    const savedDefaults: Array<[string, string]> = []
+    const savedLimits: Array<[string, string]> = []
+    const authMutations: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          inventoryModes.push(options?.mode)
+          return inventory({
+            connectedProviders: [],
+            availableProviders: ['local', 'kiro', 'cursor-acp'],
+            models: ['local/qwen', 'kiro/claude', 'cursor-acp/gpt'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async input => {
+          hostPolicies.push(input.managedPluginStartupPolicy)
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              { id: 'local', name: 'Local', models: { qwen: {} } },
+              { id: 'kiro', name: 'Kiro', models: { claude: {} } },
+              { id: 'cursor-acp', name: 'Cursor', models: { gpt: {} } },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [
+              { id: 'local', name: 'Local' },
+              { id: 'kiro', name: 'Kiro' },
+              { id: 'cursor-acp', name: 'Cursor' },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async providerId => {
+            authMutations.push(`set:${providerId}`)
+            return true
+          },
+          deleteProviderAuth: async providerId => {
+            authMutations.push(`delete:${providerId}`)
+            return true
+          },
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModels.push(input.selectedModel)
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+      managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
+        setDefaultModel: async (profileRootPath, modelId) => {
+          savedDefaults.push([profileRootPath, modelId])
+        },
+        setModelLimits: async (profileRootPath, input) => {
+          savedLimits.push([profileRootPath, input.modelId])
+        },
+      },
+    })
+
+    const setDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: false,
+      projectPath: '/tmp/project',
+    })
+    const testModel = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      projectPath: '/tmp/project',
+    })
+    const configureLimits = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000, projectPath: '/tmp/project',
+    })
+
+    expect([setDefault.ok, testModel.ok, configureLimits.ok]).toEqual([true, true, true])
+    expect(inventoryModes).toEqual(['profile', 'profile', 'profile', 'profile'])
+    expect(inventoryModes).not.toContain('summary')
+    expect(inventoryModes).not.toContain('full')
+    expect(hostPolicies).toEqual(['serve-startup', 'serve-startup', 'serve-startup'])
+    expect(probedModels).toEqual(['local/qwen', 'local/qwen', 'local/qwen'])
+    expect(savedDefaults).toEqual([['/tmp/profile', 'local/qwen']])
+    expect(savedLimits).toEqual([['/tmp/profile', 'local/qwen']])
+    expect(authMutations).toEqual([])
+  })
+
+  test('fails active model actions safely when profile preparation is missing or cancelled', async () => {
+    const actionCalls: string[] = []
+    const clientFactory = {
+      create: () => {
+        actionCalls.push('client')
+        throw new Error('active client must not be created')
+      },
+    }
+    const missingAdapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          expect(options?.mode).toBe('profile')
+          return inventory({ detected: false, binaryPath: null, version: null, profile: null })
+        },
+      },
+      clientFactory,
+    })
+    const cancelledAdapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          expect(options?.mode).toBe('profile')
+          throw new DOMException('profile preparation cancelled', 'AbortError')
+        },
+      },
+      clientFactory,
+    })
+    const actions = (adapter: OpenCodeProviderManagementAdapter) => [
+      adapter.setDefaultModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: false,
+      }),
+      adapter.testModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      }),
+      adapter.configureModelLimits({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+        contextTokens: 32_000, outputTokens: 8_000,
+      }),
+    ]
+
+    const missing = await Promise.all(actions(missingAdapter))
+    const cancelled = await Promise.all(actions(cancelledAdapter))
+    expect(missing.map(result => expectFailure(result).code)).toEqual([
+      'runtime-missing', 'runtime-missing', 'runtime-missing',
+    ])
+    expect(cancelled.map(result => expectFailure(result).code)).toEqual([
+      'model-test-failed', 'model-test-failed', 'model-test-failed',
+    ])
+    expect(cancelled.map(result => expectFailure(result).message)).toEqual([
+      'profile preparation cancelled',
+      'profile preparation cancelled',
+      'profile preparation cancelled',
+    ])
+    expect(actionCalls).toEqual([])
+  })
+
   test('tests models when live OpenCode server reports the provider as connected', async () => {
     let probedModel: string | null = null
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -7088,6 +8201,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
           return {
             providerId: 'opencode',
             modelId: input.selectedModel,
+            observedProviderId: 'opencode',
+            observedModelId: 'nemotron-3-super-free',
             probePrompt: 'Output only the single word PONG.',
             expectedOutput: 'PONG',
             outcome: 'available',
@@ -7315,6 +8430,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('loads catalog and project-managed context limits for the exact model', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('local', {
+        qwen: { limits: { context: 64_000, output: 8_000 } },
+      }, false),
       inventoryService: {
         probe: async projectPath =>
           inventory({
@@ -7353,6 +8471,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         read: async profileRootPath => {
           expect(profileRootPath).toBe('/tmp/profile')
           return {

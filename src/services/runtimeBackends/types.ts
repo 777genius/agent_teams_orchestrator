@@ -199,6 +199,8 @@ export type RuntimeProviderStatus = {
     authMethodDetail?: string | null
   } | null
   capabilitiesInfo?: RuntimeCapabilityInfo[]
+  /** Read-only OpenCode evidence. It never grants authentication or launch authority. */
+  passiveStatus?: import('../opencode/OpenCodePassiveStatusContract.js').OpenCodePassiveStatusV1
 }
 
 export type RuntimeStatusPayload = {

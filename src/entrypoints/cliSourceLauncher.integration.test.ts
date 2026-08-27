@@ -62,6 +62,14 @@ function buildLauncherEnv(params: {
 }
 
 describe('cli-source launcher', () => {
+  it('provides an explicit locked offline native preflight without package installation', async () => {
+    const source = await readFile(launcherPath, 'utf8')
+    expect(source).toContain('build --locked --offline --manifest-path')
+    expect(source).toContain('$HOME/.cargo/bin/cargo')
+    expect(source).toContain('opencode-catalog-authority opencode-catalog-launcher')
+    expect(source).not.toMatch(/(?:bun|npm|pnpm|yarn) install/)
+  })
+
   it('normalizes production NODE_ENV to development for source smoke runs', async () => {
     const { homeDir, capturePath } = await createFakeBunHome()
 

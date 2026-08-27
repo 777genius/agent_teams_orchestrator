@@ -153,11 +153,13 @@ jobs:
             platform: win32-x64
             archive_name: agent-teams-runtime-win32-x64.zip
             binary_name: claude-multimodel.exe
-          - runner: ubuntu-24.04
+          # Native Windows ARM64 catalog artifacts cannot be produced by the
+          # Bun-only Ubuntu cross compiler: Rust/MSVC and bundled SQLite must
+          # run on a real ARM64 Windows toolchain.
+          - runner: windows-11-arm
             platform: win32-arm64
             archive_name: agent-teams-runtime-win32-arm64.zip
             binary_name: claude-multimodel.exe
-            compile_target: bun-windows-arm64
           - runner: macos-14
             platform: darwin-arm64
             archive_name: agent-teams-runtime-darwin-arm64.tar.gz
@@ -186,6 +188,11 @@ jobs:
         if: matrix.platform == 'win32-arm64'
         run: bun install --frozen-lockfile --os=win32 --cpu=arm64
 
+      - name: Fetch locked native catalog dependencies
+        run: |
+          cargo fetch --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
+          cargo fetch --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+
       - name: Compile runtime
         env:
           BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
@@ -206,7 +213,7 @@ jobs:
           ./dist/cli --version
 
       - name: Verify compiled runtime (Windows)
-        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        if: runner.os == 'Windows'
         env:
           EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: pwsh
@@ -219,7 +226,7 @@ jobs:
           node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
 
       - name: Verify compiled Windows architecture
-        if: matrix.platform == 'win32-x64'
+        if: startsWith(matrix.platform, 'win32-')
         env:
           EXPECTED_PLATFORM: ${{ matrix.platform }}
         shell: pwsh
@@ -234,18 +241,17 @@ jobs:
           $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
           $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
           $expectedMachine = if ($env:EXPECTED_PLATFORM -eq "win32-arm64") { 0xaa64 } else { 0x8664 }
-          if ($machine -ne $expectedMachine) {
-            throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
-          }
+           if ($machine -ne $expectedMachine) {
+             throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
+           }
 
-      - name: Verify cross-compiled Windows ARM64 architecture
-        if: matrix.platform == 'win32-arm64'
-        shell: bash
+      - name: Prove packaged Windows retained publication
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
         run: |
-          set -euo pipefail
-          binary_metadata="$(file dist/cli.exe)"
-          echo "$binary_metadata"
-          grep -Fq 'Aarch64' <<<"$binary_metadata"
+          $env:OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR = (Resolve-Path dist)
+          bun test scripts/windows-publication-native.test.ts
 
       - name: Package runtime archive
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
@@ -268,27 +274,18 @@ jobs:
           rm -rf release
           mkdir -p release/runtime
           cp "$src" "release/runtime/${{ matrix.binary_name }}"
+          # Copy native catalog artifacts adjacent to the main executable.
+          authority_src="dist/opencode-catalog-authority"
+          launcher_src="dist/opencode-catalog-launcher"
+          [[ -f "$authority_src" && -f "$launcher_src" ]] || { echo "Compiled native catalog artifacts not found"; exit 1; }
+          cp "$authority_src" release/runtime/opencode-catalog-authority
+          cp "$launcher_src" release/runtime/opencode-catalog-launcher
           chmod +x "release/runtime/${{ matrix.binary_name }}"
+          chmod +x release/runtime/opencode-catalog-authority release/runtime/opencode-catalog-launcher
+          (cd release/runtime && sha256sum opencode-catalog-authority opencode-catalog-launcher > NATIVE_SHA256SUMS)
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
-
-      - name: Package cross-compiled Windows ARM64 runtime archive
-        if: matrix.platform == 'win32-arm64'
-        env:
-          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          runtime_version="${RAW_RUNTIME_VERSION#v}"
-          runtime_commit="$(git rev-parse HEAD)"
-
-          rm -rf release
-          mkdir -p release/runtime
-          cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
-          printf '%s\n' "$runtime_version" > release/runtime/VERSION
-          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
-          (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
@@ -310,9 +307,36 @@ jobs:
           Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
+          # Copy native catalog artifacts adjacent to the main executable.
+          $authoritySource = "dist/opencode-catalog-authority.exe"
+          $launcherSource = "dist/opencode-catalog-launcher.exe"
+          if (-not (Test-Path $authoritySource) -or -not (Test-Path $launcherSource)) {
+            throw "Compiled native catalog artifacts not found"
+          }
+          Copy-Item $authoritySource "release/runtime/opencode-catalog-authority.exe"
+          Copy-Item $launcherSource "release/runtime/opencode-catalog-launcher.exe"
+          $nativeSums = @(
+            "$(Get-FileHash -Algorithm SHA256 release/runtime/opencode-catalog-authority.exe | Select-Object -ExpandProperty Hash)  opencode-catalog-authority.exe",
+            "$(Get-FileHash -Algorithm SHA256 release/runtime/opencode-catalog-launcher.exe | Select-Object -ExpandProperty Hash)  opencode-catalog-launcher.exe"
+          )
+          Set-Content -Path release/runtime/NATIVE_SHA256SUMS -Value $nativeSums
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
+
+      - name: Verify deterministic archive layout
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release/runtime && sha256sum -c NATIVE_SHA256SUMS)
+          case "$ARCHIVE_NAME" in
+            *.tar.gz) tar -tzf "release/$ARCHIVE_NAME" ;;
+            *.zip) unzip -Z1 "release/$ARCHIVE_NAME" ;;
+            *) echo "Unsupported archive extension: $ARCHIVE_NAME" >&2; exit 1 ;;
+          esac | bun run ./scripts/release-archive-layout.ts "$RELEASE_PLATFORM"
 
       - name: Rename archive to versioned asset name
         id: versioned-archive

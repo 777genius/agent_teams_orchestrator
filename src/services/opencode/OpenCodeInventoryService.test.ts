@@ -20,6 +20,8 @@ import {
   parseOpenCodeModelsOutput,
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
+  resolveOpenCodeModelsWithFallback,
+  runOpenCodeInventoryPreparedProfileProbe,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
@@ -157,6 +159,78 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(result.agentsResult.stdout).toBe('agent list')
   })
 
+  test('preserves a failed verbose models result without running the plain fallback', async () => {
+    const original = {
+      stdout: '',
+      stderr: 'verbose probe failed',
+      code: 1,
+      error: 'OpenCode command timed out after 15000ms',
+    }
+    let fallbackCalls = 0
+
+    const result = await resolveOpenCodeModelsWithFallback({
+      mode: 'full',
+      modelsResult: original,
+      execOpenCode: async () => {
+        fallbackCalls += 1
+        return { stdout: 'openai/gpt-5.4', stderr: '', code: 0 }
+      },
+    })
+
+    expect(fallbackCalls).toBe(0)
+    expect(result.modelsResult).toBe(original)
+    expect(result.modelsResult.error).toBe('OpenCode command timed out after 15000ms')
+  })
+
+  test('preserves a non-timeout verbose models failure without running the plain fallback', async () => {
+    const original = { stdout: '', stderr: 'provider catalog failed', code: 1 }
+    let fallbackCalls = 0
+
+    const result = await resolveOpenCodeModelsWithFallback({
+      mode: 'full',
+      modelsResult: original,
+      execOpenCode: async () => {
+        fallbackCalls += 1
+        return { stdout: 'openai/gpt-5.4', stderr: '', code: 0 }
+      },
+    })
+
+    expect(fallbackCalls).toBe(0)
+    expect(result.modelsResult).toBe(original)
+    expect(result.modelsResult.stderr).toBe('provider catalog failed')
+  })
+
+  test('runs the plain models fallback only for a successful empty verbose result', async () => {
+    const calls: string[] = []
+    const result = await resolveOpenCodeModelsWithFallback({
+      mode: 'full',
+      modelsResult: { stdout: '', stderr: '', code: 0 },
+      execOpenCode: async args => {
+        calls.push(args.join(' '))
+        return { stdout: 'openai/gpt-5.4', stderr: '', code: 0 }
+      },
+    })
+
+    expect(calls).toEqual(['models'])
+    expect(result.models).toEqual(['openai/gpt-5.4'])
+  })
+
+  test('does not treat an empty refresh result as an empty verbose probe', async () => {
+    let fallbackCalls = 0
+    const result = await resolveOpenCodeModelsWithFallback({
+      mode: 'full',
+      refreshModels: true,
+      modelsResult: { stdout: '', stderr: '', code: 0 },
+      execOpenCode: async () => {
+        fallbackCalls += 1
+        return { stdout: 'openai/gpt-5.4', stderr: '', code: 0 }
+      },
+    })
+
+    expect(fallbackCalls).toBe(0)
+    expect(result.models).toEqual([])
+  })
+
   test('returns a degraded inventory snapshot when OpenCode probing stalls', async () => {
     const result = await withOpenCodeInventoryProbeTimeout(new Promise(() => {}), {
       projectPath: '/tmp/project',
@@ -260,6 +334,27 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(result.providersResult.stdout).toBe('')
     expect(result.modelsResult.stdout).toBe('')
     expect(result.agentsResult.stdout).toBe('')
+  })
+
+  test('profile inventory does not enter the inventory command lock', async () => {
+    let lockCalls = 0
+    let probeCalls = 0
+    const result = await runOpenCodeInventoryPreparedProfileProbe({
+      mode: 'profile',
+      profile: {} as OpenCodePreparedProfile,
+      probe: async () => {
+        probeCalls += 1
+        return 'prepared'
+      },
+      withCommandLock: async (_profile, callback) => {
+        lockCalls += 1
+        return callback()
+      },
+    })
+
+    expect(result).toBe('prepared')
+    expect(probeCalls).toBe(1)
+    expect(lockCalls).toBe(0)
   })
 
   test('portable inventory command runner captures stdout and stderr', async () => {

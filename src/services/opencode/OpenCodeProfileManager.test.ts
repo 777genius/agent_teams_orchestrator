@@ -1,8 +1,11 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { PassThrough } from 'node:stream'
 
 import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test'
 
@@ -13,9 +16,18 @@ import {
   ensureOpenCodeCursorPluginAuthCredential,
   ensureOpenCodeKiroPluginAuthCredential,
   ensureOpenCodeNativeCliCredentialBridge,
+  fingerprintOpenCodeScopedInheritedEnvironment,
+  ensureOpenCodeManagedDirectoryPath,
+  isOpenCodeManagedPathComponentOwnershipValid,
   isKiroCliWhoamiAuthenticated,
+  resolveOpenCodeNativeAccountIdentity,
   OpenCodeProfileManager,
+  planScopedProfile,
+  probeNativeCredentialIdentity,
   orderOpenCodeAuthSyncSources,
+  publishOpenCodeProjectBehaviorSnapshotForTest,
+  revalidateOpenCodeScopedPreparedProfileInputs,
+  verifyOpenCodeWindowsRetainedSnapshotTreeForTest,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -32,6 +44,1479 @@ import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
 } from './OpenCodeManagedPaths.js'
+import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPolicy.js'
+import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { prepareOpenCodeProviderCatalogProductionProfile } from './OpenCodeProviderCatalogProduction.js'
+import { OpenCodeProviderCatalogService } from './OpenCodeProviderCatalogService.js'
+import {
+  authorizeOpenCodeLaunchScopedProfile,
+  prepareAuthorizedOpenCodeLaunchScopedProfile,
+} from './OpenCodePlanScopedProfile.js'
+
+const pureDigest = (value: string): string => createHash('sha256').update(value).digest('hex')
+const fakePluginTree = [{
+  path: 'opencode-kiro/package.json',
+  bytesBase64: Buffer.from('{"name":"opencode-kiro","version":"0.4.0"}').toString('base64'),
+  mode: 0o400 as const,
+}]
+const fakePluginTreeFingerprint = pureDigest(canonicalSerializeOpenCodePolicyIdentity(fakePluginTree.map(entry => ({
+  path: entry.path,
+  mode: entry.mode,
+  fingerprint: pureDigest(Buffer.from(entry.bytesBase64, 'base64').toString()),
+}))))
+const fakeResolvedIdentity = (
+  version: string,
+  treeFingerprint: string,
+  manifestBytes: string,
+  packageName = 'opencode-kiro',
+): string => {
+  const packageIntegrity = `sha512-${createHash('sha512')
+    .update(treeFingerprint)
+    .digest('base64')}`
+  return `sha256:${pureDigest(canonicalSerializeOpenCodePolicyIdentity({
+    packageName,
+    version,
+    packageIntegrity,
+    manifestFingerprint: pureDigest(manifestBytes),
+    dependencyTreeFingerprint: treeFingerprint,
+  }))}`
+}
+
+describe('retained Windows profile snapshot verification', () => {
+  test('rejects an already-expired preparation deadline before planning or writes', async () => {
+    const manager = new OpenCodeProfileManager()
+    await expect(manager.prepareScopedProfile(
+      { deadlineAtMs: Date.now() - 1 } as never, {} as never,
+    )).rejects.toThrow('publication deadline expired')
+  })
+
+  test('rejects a target junction without a pathname verification fallback', async () => {
+    let childOpens = 0
+    const retained = {
+      childNames: async () => ['plugins'],
+      openChildDirectory: async () => { childOpens += 1; throw new Error('reparse point') },
+    }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      retained as never, 'plugins', new Map([['plugin.js', pureDigest('trusted')]]),
+    )).rejects.toThrow('replacement or junction')
+    expect(childOpens).toBe(1)
+  })
+
+  test('verifies nested bytes only through retained directory and file authority', async () => {
+    const operations: string[] = []
+    const nested = {
+      childNames: async () => { operations.push('list:nested'); return ['plugin.js'] },
+      readBoundedRegularBytes: async (name: string) => {
+        operations.push(`read:nested/${name}`); return Buffer.from('trusted')
+      },
+      close: async () => { operations.push('close:nested') },
+    }
+    const root = {
+      childNames: async () => { operations.push('list:root'); return ['nested'] },
+      openChildDirectory: async (name: string) => {
+        operations.push(`open:root/${name}`); return nested
+      },
+      close: async () => { operations.push('close:root') },
+    }
+    const parent = {
+      childNames: async () => { operations.push('list:parent'); return ['plugins'] },
+      openChildDirectory: async (name: string) => {
+        operations.push(`open:parent/${name}`); return root
+      },
+    }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never, 'plugins', new Map([['nested/plugin.js', pureDigest('trusted')]]),
+    )).resolves.toBe(true)
+    expect(operations).toEqual(['list:parent', 'open:parent/plugins', 'list:root',
+      'open:root/nested', 'list:nested', 'read:nested/plugin.js', 'close:nested', 'close:root'])
+  })
+
+  test('accepts the inclusive 64 MiB retained evidence boundary without a per-file cap', async () => {
+    const first = Buffer.alloc(32 * 1024 * 1024, 0x61)
+    const second = Buffer.alloc(32 * 1024 * 1024, 0x62)
+    const maxima: number[] = []
+    const root = {
+      childNames: async () => ['first.bin', 'second.bin'],
+      readBoundedRegularBytes: async (name: string, maximum: number) => {
+        maxima.push(maximum); return name === 'first.bin' ? first : second
+      },
+      close: async () => {},
+    }
+    const parent = { childNames: async () => ['snapshot'], openChildDirectory: async () => root }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never,
+      'snapshot',
+      new Map([['first.bin', pureDigest(first)], ['second.bin', pureDigest(second)]]),
+    )).resolves.toBe(true)
+    expect(maxima).toEqual([64 * 1024 * 1024, 32 * 1024 * 1024 + 1])
+  })
+
+  test('rejects one byte beyond the cumulative 64 MiB retained evidence boundary', async () => {
+    const first = Buffer.alloc(32 * 1024 * 1024, 0x61)
+    const second = Buffer.alloc(32 * 1024 * 1024 + 1, 0x62)
+    const root = {
+      childNames: async () => ['first.bin', 'second.bin'],
+      readBoundedRegularBytes: async (name: string) => name === 'first.bin' ? first : second,
+      close: async () => {},
+    }
+    const parent = { childNames: async () => ['snapshot'], openChildDirectory: async () => root }
+    await expect(verifyOpenCodeWindowsRetainedSnapshotTreeForTest(
+      parent as never,
+      'snapshot',
+      new Map([['first.bin', pureDigest(first)], ['second.bin', pureDigest(second)]]),
+    )).rejects.toThrow('fingerprint mismatch')
+  })
+})
+
+describe('pure planScopedProfile contract', () => {
+  const evidence = () => ({
+    canonicalProjectPathFingerprint: pureDigest('project-path'),
+    projectBehaviorFingerprint: pureDigest('project-behavior'),
+    providerEnvironmentFingerprint: pureDigest('provider-environment'),
+    selectedAuthFingerprint: pureDigest('selected-auth'),
+    binaryFingerprint: pureDigest('binary'),
+    configFingerprint: pureDigest('config'),
+    nativeAccountIdentityFingerprint: pureDigest('official-account-id'),
+    nativeAccountIdentitySource: 'official-provider-cli' as const,
+    nativeTargetExecutableFingerprint: pureDigest('native-binary'),
+    profileLayoutFingerprint: pureDigest('layout'),
+    plugins: [{
+      spec: 'opencode-kiro@0.4.0',
+      provenance: 'app-managed' as const,
+      dependencyTreeFingerprint: fakePluginTreeFingerprint,
+      resolvedIdentity: fakeResolvedIdentity(
+        '0.4.0', fakePluginTreeFingerprint, '{"name":"opencode-kiro","version":"0.4.0"}',
+      ),
+      immutableTreeEntries: fakePluginTree,
+    }],
+  })
+  const input = () => ({
+    purpose: 'provider-catalog' as const,
+    providerId: 'kiro',
+    runtimeInstanceId: 'runtime-a',
+    projectPath: '/never-read-by-pure-planner',
+    evidence: evidence(),
+  })
+
+  test('is deterministic, runtime-instance independent, redacted, and side-effect free', () => {
+    const before = { ...process.env }
+    const first = planScopedProfile(input())
+    const second = planScopedProfile({ ...input(), runtimeInstanceId: 'runtime-b' })
+    expect(second).toEqual(first)
+    expect(Object.isFrozen(first)).toBe(true)
+    expect(Object.isFrozen(first.plugins)).toBe(true)
+    expect(first.expectedHostKey).toMatch(/^opencode-host-v2:[a-f0-9]{64}$/)
+    expect(process.env).toEqual(before)
+    const serialized = JSON.stringify(first)
+    expect(serialized).not.toContain('/never-read-by-pure-planner')
+    expect(serialized).not.toContain('runtime-a')
+  })
+
+  test('every planning identity mutation changes the digest', () => {
+    const baseline = planScopedProfile(input()).digest
+    const mutations = [
+      { canonicalProjectPathFingerprint: pureDigest('other-project') },
+      { projectBehaviorFingerprint: pureDigest('other-behavior') },
+      { providerEnvironmentFingerprint: pureDigest('rotated-env') },
+      { selectedAuthFingerprint: pureDigest('rotated-auth') },
+      { binaryFingerprint: pureDigest('other-binary') },
+      { configFingerprint: pureDigest('other-config') },
+      { nativeAccountIdentityFingerprint: pureDigest('other-account') },
+      { nativeTargetExecutableFingerprint: pureDigest('other-native-binary') },
+      { profileLayoutFingerprint: pureDigest('other-layout') },
+    ]
+    for (const mutation of mutations) {
+      expect(planScopedProfile({
+        ...input(), evidence: { ...evidence(), ...mutation },
+      }).digest).not.toBe(baseline)
+    }
+    const changedManifest = '{"name":"opencode-kiro","version":"0.4.0","fixture":true}'
+    const changedTreeFingerprint = pureDigest(canonicalSerializeOpenCodePolicyIdentity([{
+      path: fakePluginTree[0].path,
+      mode: fakePluginTree[0].mode,
+      fingerprint: pureDigest(changedManifest),
+    }]))
+    expect(planScopedProfile({
+      ...input(), evidence: {
+        ...evidence(),
+        plugins: [{
+          ...evidence().plugins[0]!,
+          spec: 'opencode-kiro@0.4.0',
+          immutableTreeEntries: [{
+            ...fakePluginTree[0],
+            bytesBase64: Buffer.from(changedManifest).toString('base64'),
+          }],
+          dependencyTreeFingerprint: changedTreeFingerprint,
+          resolvedIdentity: fakeResolvedIdentity('0.4.0', changedTreeFingerprint, changedManifest),
+        }],
+      },
+    }).digest).not.toBe(baseline)
+  })
+
+  test('rejects mutable specifiers and fails closed for unavailable package/account evidence', () => {
+    expect(() => planScopedProfile({
+      ...input(), evidence: {
+        ...evidence(), plugins: [{ ...evidence().plugins[0]!, spec: 'opencode-kiro@latest' }],
+      },
+    })).toThrow('exact registry package version')
+    expect(() => planScopedProfile({
+      ...input(), evidence: { ...evidence(), plugins: [] },
+    })).toThrow('immutable evidence is unavailable')
+    expect(() => planScopedProfile({
+      ...input(), evidence: {
+        ...evidence(), nativeAccountIdentityFingerprint: 'not-definitive',
+      },
+    })).toThrow('canonical native account identity evidence')
+    expect(() => planScopedProfile({
+      ...input(), evidence: {
+        ...evidence(), nativeAccountIdentitySource: 'managed-auth',
+      },
+    })).toThrow('official stable account identity')
+  })
+
+  test('prepare rejects expected-plan drift before any async preparation', async () => {
+    const manager = new OpenCodeProfileManager()
+    const plannedInput = input()
+    const expected = planScopedProfile(plannedInput)
+    await expect(manager.prepareScopedProfile(
+      { ...plannedInput, evidence: { ...plannedInput.evidence, binaryFingerprint: pureDigest('drift') } },
+      expected,
+    )).rejects.toThrow('expected plan mismatch')
+  })
+})
+
+async function createScopedTestManager(tempDir: string): Promise<{
+  manager: OpenCodeProfileManager
+  binaryPath: string
+  restore: () => void
+}> {
+  const previous = { ...process.env }
+  const binaryPath = path.join(tempDir, 'opencode-test-bin')
+  await writeFile(binaryPath, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(tempDir, 'app-data')
+  process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(tempDir, 'app-cache')
+  process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binaryPath
+  process.env.HOME = path.join(tempDir, 'home')
+  process.env.USERPROFILE = process.env.HOME
+  process.env.XDG_CONFIG_HOME = path.join(tempDir, 'user-config')
+  process.env.XDG_DATA_HOME = path.join(tempDir, 'user-data')
+  const nativeBinPath = path.join(tempDir, 'fake-native-bin')
+  await mkdir(nativeBinPath, { recursive: true })
+  await writeFile(
+    path.join(nativeBinPath, 'kiro-cli'),
+    '#!/bin/sh\necho kiro >> "$FAKE_NATIVE_PROBE_LOG"\nprintf \'{"accountType":"Builder ID","userId":"fake-kiro-account"}\\n\'\n',
+    { mode: 0o700 },
+  )
+  await writeFile(
+    path.join(nativeBinPath, 'cursor-agent'),
+    '#!/bin/sh\necho cursor >> "$FAKE_NATIVE_PROBE_LOG"\nprintf \'Logged in\\n{"userId":"fake-cursor-account"}\\n\'\n',
+    { mode: 0o700 },
+  )
+  process.env.FAKE_NATIVE_PROBE_LOG = path.join(tempDir, 'native-probes.log')
+  process.env.PATH = `${nativeBinPath}${path.delimiter}${previous.PATH ?? ''}`
+  delete process.env.OPENCODE_CONFIG
+  delete process.env.OPENCODE_CONFIG_CONTENT
+  return {
+    manager: new OpenCodeProfileManager(),
+    binaryPath,
+    restore: () => {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key]
+      }
+      Object.assign(process.env, previous)
+    },
+  }
+}
+
+async function buildDeepinfraPlannedInput(
+  fixture: { binaryPath: string },
+  projectPath: string,
+  plugins: Array<{
+    spec: string
+    provenance: 'user' | 'project' | 'environment' | 'app-managed'
+    dependencyTreeFingerprint: string
+    resolvedIdentity: string
+    immutableTreeEntries: Array<{ path: string, bytesBase64: string, mode: 0o400 | 0o500 }>
+  }> = [],
+  options: {
+    purpose?: 'provider-catalog' | 'launch' | 'session-resume'
+    modelId?: string | null
+  } = {},
+) {
+  const canonicalFingerprint = (value: unknown): string => pureDigest(
+    canonicalSerializeOpenCodePolicyIdentity(value),
+  )
+  const behavior = await collectProjectBehaviorMetadata(projectPath)
+  const purpose = options.purpose ?? 'provider-catalog'
+  const modelId = options.modelId ?? (purpose === 'provider-catalog' ? null : 'deepinfra/model')
+  const appMcpConfig = purpose === 'provider-catalog'
+    ? null
+    : await resolveOpenCodeAppMcpLaunchConfig().then(result => result.config).catch(() => null)
+  const managedConfig = buildManagedConfig(appMcpConfig, {
+    allowAutoUpdate: false,
+    defaultModelId: modelId,
+    toolApprovalMode: purpose === 'provider-catalog' ? undefined : 'auto',
+  })
+  managedConfig.provider = {}
+  managedConfig.plugin = plugins.map(plugin => {
+    const packageName = plugin.spec.startsWith('@')
+      ? plugin.spec.slice(0, plugin.spec.indexOf('@', 1))
+      : plugin.spec.split('@')[0]!
+    return `file:./node_modules/${packageName}`
+  })
+  if (purpose === 'provider-catalog') {
+    managedConfig.agent = Object.fromEntries(
+      Object.entries(managedConfig.agent as Record<string, unknown>).map(([name, value]) => [
+        name,
+        {
+          ...(value as Record<string, unknown>),
+          tools: { '*': false },
+          permission: { '*': 'deny' },
+        },
+      ]),
+    )
+  }
+  return {
+    purpose,
+    providerId: 'deepinfra',
+    modelId,
+    runtimeInstanceId: purpose === 'provider-catalog' ? 'catalog-g1-planned' : 'planned',
+    projectPath,
+    evidence: {
+      canonicalProjectPathFingerprint: canonicalFingerprint(await realpath(projectPath)),
+      projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+      providerEnvironmentFingerprint: canonicalFingerprint({
+        inherited: fingerprintOpenCodeScopedInheritedEnvironment(process.env),
+        nativeBridgeInputs: canonicalFingerprint(null),
+        finalEnvironmentInputs: {
+          npmConfigCache: path.join(process.env.CLAUDE_MULTIMODEL_CACHE_HOME!, 'opencode', 'package-downloads'),
+          multimodelDataHome: process.env.CLAUDE_MULTIMODEL_DATA_HOME,
+          multimodelCacheHome: process.env.CLAUDE_MULTIMODEL_CACHE_HOME,
+          disableAutoUpdate: applyOpenCodeAutoUpdatePolicy({ ...process.env })
+            .OPENCODE_DISABLE_AUTOUPDATE ?? null,
+        },
+      }),
+      selectedAuthFingerprint: canonicalFingerprint({}),
+      binaryFingerprint: pureDigest((await readFile(fixture.binaryPath)).toString()),
+      configFingerprint: buildManagedConfigFingerprint(managedConfig),
+      nativeAccountIdentityFingerprint: canonicalFingerprint(null),
+      nativeAccountIdentitySource: 'managed-auth' as const,
+      nativeTargetExecutableFingerprint: canonicalFingerprint(null),
+      profileLayoutFingerprint: canonicalFingerprint('1'),
+      plugins,
+    },
+  }
+}
+
+describe('OpenCodeProfileManager immutable planned preparation', () => {
+  test('Windows read-only capture composes through production catalog and launch planning without effects', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-current-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const manager = new OpenCodeProfileManager('win32')
+    try {
+      await writeFile(path.join(tempDir, 'AGENTS.md'), 'windows scoped behavior\n')
+      const catalogInput = {
+        purpose: 'provider-catalog' as const,
+        providerId: 'deepinfra',
+        runtimeInstanceId: 'catalog-g1-windows-attempt',
+        projectPath: tempDir,
+      }
+      let catalogPrepared = false
+      await prepareOpenCodeProviderCatalogProductionProfile({
+        captureCurrentScopedProfilePlan: input => manager.captureCurrentScopedProfilePlan(input),
+        planScopedProfile: input => manager.planScopedProfile(input),
+        prepareScopedProfile: async current => {
+          catalogPrepared = true
+          expect(current.evidence.projectBehaviorFingerprint).toMatch(/^[a-f0-9]{64}$/)
+          return current as never
+        },
+      }, catalogInput)
+      expect(catalogPrepared).toBe(true)
+
+      const launch = await authorizeOpenCodeLaunchScopedProfile(manager, {
+        purpose: 'launch',
+        providerId: 'deepinfra',
+        modelId: 'deepinfra/model',
+        runtimeInstanceId: 'windows-launch-attempt',
+        projectPath: tempDir,
+      })
+      expect(launch.expected.projectBehaviorFingerprint).toMatch(/^[a-f0-9]{64}$/)
+      expect(launch.expected.purpose).toBe('launch')
+      expect(await lstat(process.env.CLAUDE_MULTIMODEL_DATA_HOME!).catch(() => null)).toBeNull()
+      expect(await lstat(process.env.FAKE_NATIVE_PROBE_LOG!).catch(() => null)).toBeNull()
+
+      const firstUseCatalog = await prepareOpenCodeProviderCatalogProductionProfile(manager, {
+        ...catalogInput,
+        runtimeInstanceId: 'catalog-g1-windows-first-use',
+      })
+      expect(firstUseCatalog.scopeSchema).toBe('opencode-scoped-profile-v1')
+      expect((await lstat(firstUseCatalog.profileRootPath)).isDirectory()).toBe(true)
+      const firstUseLaunchAuthorization = await authorizeOpenCodeLaunchScopedProfile(manager, {
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'windows-first-use-launch', projectPath: tempDir,
+      })
+      const firstUseLaunch = await prepareAuthorizedOpenCodeLaunchScopedProfile(
+        manager, firstUseLaunchAuthorization,
+      )
+      expect(firstUseLaunch.purpose).toBe('launch')
+      expect((await lstat(firstUseLaunch.xdgCacheHome)).isDirectory()).toBe(true)
+
+      const localAppData = path.join(tempDir, 'LocalAppData')
+      await mkdir(localAppData)
+      delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      process.env.LOCALAPPDATA = localAppData
+      const nestedFirstUseManager = new OpenCodeProfileManager('win32')
+      const nestedCatalog = await prepareOpenCodeProviderCatalogProductionProfile(
+        nestedFirstUseManager,
+        { ...catalogInput, runtimeInstanceId: 'catalog-g1-windows-nested-env-paths' },
+      )
+      expect(nestedCatalog.profileRootPath).toStartWith(path.join(
+        localAppData, 'claude-multimodel-nodejs', 'Data',
+      ))
+      const nestedLaunchAuthorization = await authorizeOpenCodeLaunchScopedProfile(
+        nestedFirstUseManager,
+        { purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+          runtimeInstanceId: 'windows-nested-env-paths-launch', projectPath: tempDir },
+      )
+      const nestedLaunch = await prepareAuthorizedOpenCodeLaunchScopedProfile(
+        nestedFirstUseManager, nestedLaunchAuthorization,
+      )
+      expect(nestedLaunch.xdgCacheHome).toStartWith(path.join(
+        localAppData, 'claude-multimodel-nodejs', 'Cache',
+      ))
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows read-only behavior capture rejects a reparse-aware ambiguous path', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-reparse-'))
+    const project = path.join(root, 'project')
+    const outside = path.join(root, 'outside')
+    try {
+      await Promise.all([mkdir(project), mkdir(outside)])
+      await writeFile(path.join(outside, 'AGENTS.md'), 'must not be captured\n')
+      await symlink(outside, path.join(project, '.opencode'))
+      await expect(collectProjectBehaviorMetadata(project, 'win32'))
+        .rejects.toThrow(/reparse point|canonical/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test.each(['before-config-read', 'after-config-identity'] as const)(
+    'Windows capture preserves the initial config identity across a %s swap',
+    async boundary => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `opencode-windows-config-${boundary}-`))
+      const project = path.join(root, 'project')
+      const snapshots = path.join(root, 'snapshots')
+      const config = path.join(project, 'opencode.json')
+      const displaced = path.join(root, 'captured-config.json')
+      try {
+        await Promise.all([mkdir(project), mkdir(snapshots)])
+        await writeFile(config, '{"model":"captured"}\n')
+        let swapped = false
+        const swap = async (): Promise<void> => {
+          if (swapped) return
+          swapped = true
+          await rename(config, displaced)
+          await writeFile(config, '{"model":"captured"}\n')
+        }
+        await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+          project,
+          path.join(snapshots, 'project-behavior'),
+          {
+            capturePlatform: 'win32',
+            ...(boundary === 'before-config-read'
+              ? { afterWindowsComponentWalk: swap }
+              : { afterWindowsFileIdentityCaptured: async relativePath => {
+                if (relativePath === 'opencode.json') await swap()
+              } }),
+          },
+        )).rejects.toThrow(/changed during capture|changed before capture/)
+        expect(swapped).toBe(true)
+        expect(await readdir(snapshots)).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('Windows capture preserves the initial directory manifest before later walks', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-manifest-baseline-'))
+    const project = path.join(root, 'project')
+    const tools = path.join(project, '.opencode', 'tools')
+    const snapshots = path.join(root, 'snapshots')
+    try {
+      await mkdir(tools, { recursive: true }); await mkdir(snapshots)
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+        project,
+        path.join(snapshots, 'project-behavior'),
+        {
+          capturePlatform: 'win32',
+          afterWindowsComponentWalk: () => writeFile(path.join(tools, 'late.ts'), 'export {}\n'),
+        },
+      )).rejects.toThrow('directory changed during capture')
+      expect(await readdir(snapshots)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows capture preserves an initially missing project root through publication', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-missing-root-'))
+    const project = path.join(root, 'project')
+    const snapshots = path.join(root, 'snapshots')
+    try {
+      await mkdir(snapshots)
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(
+        project,
+        path.join(snapshots, 'project-behavior'),
+        {
+          capturePlatform: 'win32',
+          afterCaptureBeforeCopy: async () => {
+            await mkdir(project)
+            await writeFile(path.join(project, 'opencode.json'), '{}\n')
+          },
+        },
+      )).rejects.toThrow('path appeared before materialization')
+      expect(await readdir(snapshots)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('production catalog composition captures current evidence through the actual manager and policy', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-catalog-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      const prepared = await prepareOpenCodeProviderCatalogProductionProfile(fixture.manager, {
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g1-attempt-a',
+        projectPath: tempDir,
+      })
+      expect(prepared.providerId).toBe('deepinfra')
+      expect(prepared.purpose).toBe('provider-catalog')
+      expect(prepared.scopedPlanDigest).toMatch(/^[a-f0-9]{64}$/)
+      expect(prepared.catalogAttemptPlan).toMatchObject({
+        runtimeInstanceId: 'catalog-g1-attempt-a',
+        profileRootKey: prepared.profileRootKey,
+        configDirectory: path.join(prepared.profileRootPath, 'catalog-project-config'),
+      })
+
+      const launchAuthorization = await authorizeOpenCodeLaunchScopedProfile(fixture.manager, {
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'launch-attempt-a', projectPath: tempDir,
+      })
+      expect(launchAuthorization.expected.purpose).toBe('launch')
+      expect(launchAuthorization.input.runtimeInstanceId).toBe('launch-attempt-a')
+      expect(launchAuthorization.effectivePlanDigest).toMatch(/^[a-f0-9]{64}$/)
+
+      const first = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g2-attempt-b',
+        projectPath: tempDir,
+      })
+      await writeFile(path.join(tempDir, 'AGENTS.md'), 'fresh attempt evidence\n')
+      const second = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g3-attempt-c',
+        projectPath: tempDir,
+      })
+      expect(fixture.manager.planScopedProfile(second).digest)
+        .not.toBe(fixture.manager.planScopedProfile(first).digest)
+      await expect(fixture.manager.prepareScopedProfile(first, fixture.manager.planScopedProfile(first)))
+        .rejects.toThrow('evidence drifted')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production catalog cache miss passes real preparation and host validation before fake I/O', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-host-e2e-'))
+    const fixture = await createScopedTestManager(tempDir)
+    let fakeIo = 0
+    let prepared: Awaited<ReturnType<typeof prepareOpenCodeProviderCatalogProductionProfile>> | null = null
+    const child = new EventEmitter() as ChildProcess
+    Object.assign(child, {
+      pid: 54143,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      unref() {},
+      kill() { return true },
+    })
+    const hostManager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44143,
+      spawnHostProcess: () => child,
+      fetchJson: async (url: string) => {
+        fakeIo += 1
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.2.3' } }
+        }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`unexpected fake host request ${url}`)
+      },
+      isProcessAlive: () => false,
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    let generation = 0
+    const service = new OpenCodeProviderCatalogService({
+      profileManager: fixture.manager,
+      canonicalizeProjectPath: async value => path.resolve(value),
+      allocateAttempt: () => ({ requestGeneration: ++generation,
+        attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` }),
+      readPersisted: async () => null,
+      writePersisted: async () => {},
+      ensureHost: async input => {
+        prepared = input.preparedProfile
+        const handle = await hostManager.ensureScopedHost(input)
+        return { hostKey: handle.hostKey, baseUrl: handle.baseUrl }
+      },
+      releaseHost: key => hostManager.releaseHost(key),
+      fetchProviderCatalog: async () => {
+        fakeIo += 1
+        return { all: [{ id: 'deepinfra', models: { 'model-a': { name: 'model-a' } } }],
+          connected: ['deepinfra'] }
+      },
+    })
+    try {
+      const loaded = await service.loadCatalog({ providerId: 'deepinfra', projectPath: tempDir })
+      expect(loaded.catalogProvenance).toBe('fresh-live')
+      expect(fakeIo).toBeGreaterThanOrEqual(2)
+      expect(prepared).not.toBeNull()
+      const profile = prepared!
+      expect(profile.profileRootKey).not.toBe(profile.profileScopeIdentity)
+      expect(profile.env.OPENCODE_CONFIG_DIR).toBe(path.join(
+        profile.profileRootPath, 'catalog-project-config',
+      ))
+      expect(Object.keys(profile.managedConfig.provider as object)
+        .every(providerId => providerId === 'deepinfra')).toBe(true)
+
+      for (const tampered of [
+        { ...profile, profileRootKey: `${profile.profileRootKey}-replaced` },
+        { ...profile, env: { ...profile.env, OPENCODE_CONFIG_DIR: profile.executionProjectPath } },
+      ]) {
+        const before = fakeIo
+        await expect(hostManager.ensureScopedHost({
+          preparedProfile: tampered,
+          expectedHostKey: profile.plannedHostKey,
+        })).rejects.toThrow('valid policy-bearing prepared profile')
+        expect(fakeIo).toBe(before)
+      }
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('catalog profile omits ordinary plugins while preserving canonical plugin config bytes', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-deepinfra-plugin-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
+      const packageRoot = path.join(
+        process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+        'opencode', 'shared-cache', 'opencode', 'packages', 'ordinary-user-choice@1.2.3',
+      )
+      await mkdir(packageRoot, { recursive: true })
+      await writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+        name: 'ordinary-user-choice', version: '1.2.3',
+      }))
+      await writeFile(path.join(packageRoot, 'index.js'), 'export default {}\n')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'catalog-g1-deepinfra-user-plugin-attempt', projectPath: tempDir,
+      })
+      expect(current.evidence.plugins).toEqual([])
+      const expected = fixture.manager.planScopedProfile(current)
+      const prepared = await fixture.manager.prepareScopedProfile(current, expected)
+      expect(prepared.policy.plugins).toEqual([])
+      expect(prepared.managedConfig.plugin).toEqual([])
+      expect(prepared.managedConfig.agent).toBeUndefined()
+      expect(prepared.managedConfig.mcp).toBeUndefined()
+      expect(await readFile(path.join(tempDir, 'opencode.json'), 'utf8')).toBe(JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production planning resolves ordinary mutable specs only from verified local trees', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-mutable-plugins-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packagesRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const urlSpec = 'https://plugins.example.invalid/releases/url-plugin.tgz'
+    const writeResolved = async (
+      directory: string, name: string, version: string, source?: string,
+    ): Promise<void> => {
+      await mkdir(directory, { recursive: true })
+      await writeFile(path.join(directory, 'package.json'), JSON.stringify({
+        name, version, ...(source ? { opencodeSpec: source } : {}),
+      }))
+      await writeFile(path.join(directory, 'index.js'), `export default ${JSON.stringify(name)}\n`)
+    }
+    try {
+      await mkdir(path.join(process.env.XDG_CONFIG_HOME!, 'opencode'), { recursive: true })
+      await writeFile(
+        path.join(process.env.XDG_CONFIG_HOME!, 'opencode', 'opencode.json'),
+        JSON.stringify({ plugin: ['user-plugin'] }),
+      )
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['tag-plugin@latest', 'file:./resolved/file-plugin', urlSpec],
+      }))
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ plugin: ['environment-plugin@next'] })
+      await writeResolved(path.join(packagesRoot, 'installed-user'), 'user-plugin', '1.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-tag'), 'tag-plugin', '2.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-env'), 'environment-plugin', '3.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-url'), 'url-plugin', '4.0.0', urlSpec)
+      await writeResolved(path.join(tempDir, 'resolved', 'file-plugin'), 'file-plugin', '5.0.0')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'mutable-plugin-attempt', projectPath: tempDir,
+      })
+      expect(current.evidence.plugins.map(plugin =>
+        [plugin.spec, plugin.packageName, plugin.provenance])).toEqual([
+        ['user-plugin', 'user-plugin', 'user'],
+        ['tag-plugin@latest', 'tag-plugin', 'project'],
+        ['file:./resolved/file-plugin', 'file-plugin', 'project'],
+        [urlSpec, 'url-plugin', 'project'],
+        ['environment-plugin@next', 'environment-plugin', 'environment'],
+      ])
+      const firstExpected = fixture.manager.planScopedProfile(current)
+      await writeFile(path.join(packagesRoot, 'installed-tag', 'index.js'), 'export default "changed"\n')
+      const changedCurrent = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'catalog-g2-mutable-plugin-changed-attempt', projectPath: tempDir,
+      })
+      const expected = fixture.manager.planScopedProfile(changedCurrent)
+      expect(expected.digest).not.toBe(firstExpected.digest)
+      const prepared = await fixture.manager.prepareScopedProfile(changedCurrent, expected)
+      expect(prepared.managedConfig.plugin).toEqual([
+        'file:./node_modules/user-plugin',
+        'file:./node_modules/tag-plugin',
+        'file:./node_modules/file-plugin',
+        'file:./node_modules/url-plugin',
+        'file:./node_modules/environment-plugin',
+      ])
+      for (const plugin of expected.plugins) {
+        expect(await readFile(
+          path.join(prepared.pluginNodeModulesPath, plugin.packageName, 'package.json'), 'utf8',
+        )).toContain(`"name":"${plugin.packageName}"`)
+      }
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production mutable plugin capture rejects unresolved content and symlink escapes', async () => {
+    if (process.platform === 'win32') return
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-plugin-reject-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packagesRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({ plugin: ['missing-plugin'] }))
+      await expect(fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'missing-plugin-attempt', projectPath: tempDir,
+      })).rejects.toThrow('immutable planning evidence is unavailable')
+
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({ plugin: ['linked-plugin'] }))
+      const linkedRoot = path.join(packagesRoot, 'installed-linked')
+      const outside = path.join(tempDir, 'outside.js')
+      await mkdir(linkedRoot, { recursive: true })
+      await writeFile(path.join(linkedRoot, 'package.json'), JSON.stringify({
+        name: 'linked-plugin', version: '1.0.0',
+      }))
+      await writeFile(outside, 'external bytes\n')
+      await symlink(outside, path.join(linkedRoot, 'index.js'))
+      await expect(fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'linked-plugin-attempt', projectPath: tempDir,
+      })).rejects.toThrow('immutable planning evidence is unavailable')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('actual production planning preserves ordinary plugins and materializes only the selected Kiro app plugin', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-kiro-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packageCacheRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const writeCachedPackage = async (spec: string, name: string, version: string): Promise<void> => {
+      const root = path.join(packageCacheRoot, spec)
+      await mkdir(root, { recursive: true })
+      await writeFile(path.join(root, 'package.json'), JSON.stringify({ name, version }))
+      await writeFile(path.join(root, 'index.js'), 'export default {}\n')
+    }
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
+      await writeCachedPackage('ordinary-user-choice@1.2.3', 'ordinary-user-choice', '1.2.3')
+      await writeCachedPackage('opencode-kiro@0.4.0', 'opencode-kiro', '0.4.0')
+      // This unrelated app-managed package is present in the shared cache but
+      // is not selected and must never be injected into the Kiro plan.
+      await writeCachedPackage('@rama_nigg/open-cursor@2.5.2', '@rama_nigg/open-cursor', '2.5.2')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'catalog-g1-kiro-attempt',
+        projectPath: tempDir,
+      })
+      expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
+        ['opencode-kiro@0.4.0', 'app-managed'],
+      ])
+      expect(current.evidence.nativeAccountIdentitySource).toBe('official-provider-cli')
+      const expected = fixture.manager.planScopedProfile(current)
+      expect(expected.plugins.map(plugin => plugin.spec)).toEqual([
+        'opencode-kiro@0.4.0',
+      ])
+      expect(JSON.stringify(expected)).not.toContain('@rama_nigg/open-cursor')
+      const prepared = await fixture.manager.prepareScopedProfile(current, expected)
+      expect(prepared.managedConfig.plugin).toEqual([
+        'file:./node_modules/opencode-kiro',
+      ])
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('actual production manager rejects unrelated app-managed plugin evidence', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-unrelated-managed-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packageCacheRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const writeCachedPackage = async (spec: string, name: string, version: string): Promise<void> => {
+      const root = path.join(packageCacheRoot, spec)
+      await mkdir(root, { recursive: true })
+      await writeFile(path.join(root, 'package.json'), JSON.stringify({ name, version }))
+    }
+    try {
+      await writeCachedPackage('opencode-kiro@0.4.0', 'opencode-kiro', '0.4.0')
+      await writeCachedPackage('@rama_nigg/open-cursor@2.5.2', '@rama_nigg/open-cursor', '2.5.2')
+      const kiro = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'kiro-attempt',
+        projectPath: tempDir,
+      })
+      const cursor = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'cursor-acp', runtimeInstanceId: 'cursor-attempt',
+        projectPath: tempDir,
+      })
+      const unrelated = cursor.evidence.plugins.find(plugin => plugin.provenance === 'app-managed')!
+      const injected = {
+        ...kiro,
+        evidence: { ...kiro.evidence, plugins: [...kiro.evidence.plugins, unrelated] },
+      }
+      expect(() => fixture.manager.planScopedProfile(injected))
+        .toThrow('app-managed plugin pin is invalid')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(['root', 'nested'] as const)(
+    'rejects a replaced %s project parent after capture and before descriptor-relative copy',
+    async replacement => {
+      if (process.platform !== 'linux' && process.platform !== 'darwin') return
+      const root = await mkdtemp(path.join(os.tmpdir(), `opencode-project-retained-${replacement}-`))
+      const project = path.join(root, 'project')
+      const displaced = path.join(root, `displaced-${replacement}`)
+      const outside = path.join(root, 'outside')
+      const snapshots = path.join(root, 'snapshots')
+      const target = path.join(snapshots, 'project-behavior')
+      try {
+        await Promise.all([
+          mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true }),
+          mkdir(path.join(outside, 'plugins'), { recursive: true }),
+          mkdir(snapshots),
+        ])
+        await Promise.all([
+          writeFile(path.join(project, '.opencode', 'plugins', 'fixture.js'), 'same bytes\n'),
+          writeFile(path.join(outside, 'plugins', 'fixture.js'), 'same bytes\n'),
+        ])
+        await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+          afterCaptureBeforeCopy: async () => {
+            if (replacement === 'root') {
+              await rename(project, displaced)
+              await symlink(path.join(root, 'outside-project'), project, 'dir')
+              await mkdir(path.join(root, 'outside-project'), { recursive: true })
+              await symlink(outside, path.join(root, 'outside-project', '.opencode'), 'dir')
+            } else {
+              await rename(path.join(project, '.opencode'), displaced)
+              await symlink(outside, path.join(project, '.opencode'), 'dir')
+            }
+          },
+        })).rejects.toThrow('ancestry changed before materialization')
+        expect(await lstat(target).catch(() => null)).toBeNull()
+        expect((await readdir(snapshots)).filter(name => name.includes('.snapshot-'))).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.each(['add', 'remove', 'type'] as const)(
+    'rejects project behavior directory %s drift from the descriptor-relative name/type manifest',
+    async mutation => {
+      if (process.platform !== 'linux' && process.platform !== 'darwin') return
+      const root = await mkdtemp(path.join(os.tmpdir(), `opencode-project-entry-${mutation}-`))
+      const project = path.join(root, 'project')
+      const behaviorDirectory = path.join(project, '.opencode', 'tools')
+      const target = path.join(root, 'snapshots', 'project-behavior')
+      try {
+        await mkdir(path.join(behaviorDirectory, 'empty'), { recursive: true })
+        await mkdir(path.dirname(target), { recursive: true })
+        await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+          afterCaptureBeforeCopy: async () => {
+            const entry = path.join(behaviorDirectory, mutation === 'add' ? 'added' : 'empty')
+            if (mutation === 'add') await mkdir(entry)
+            if (mutation === 'remove') await rm(entry, { recursive: true })
+            if (mutation === 'type') {
+              await rm(entry, { recursive: true })
+              await writeFile(entry, 'changed type\n')
+            }
+          },
+        })).rejects.toThrow('directory entry set changed before materialization')
+        expect(await lstat(target).catch(() => null)).toBeNull()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('attempt abort at the verified project-tree barrier prevents the final profile rename', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-abort-before-publish-'))
+    const project = path.join(root, 'project')
+    const target = path.join(root, 'snapshots', 'project-behavior')
+    const controller = new AbortController()
+    const reason = new Error('catalog profile deadline')
+    try {
+      await mkdir(path.join(project, '.opencode'), { recursive: true })
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(path.join(project, '.opencode', 'fixture.ts'), 'export default true\n')
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        abortSignal: controller.signal,
+        afterTemporaryTreeVerified: () => controller.abort(reason),
+      })).rejects.toBe(reason)
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      expect((await readdir(path.dirname(target))).filter(name => name.includes('.snapshot-'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('freezes and verifies the complete temporary project tree before rename and remains retryable', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-freeze-before-publish-'))
+    const project = path.join(root, 'project')
+    const snapshots = path.join(root, 'snapshots')
+    const target = path.join(snapshots, 'project-behavior')
+    try {
+      await mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true })
+      await mkdir(snapshots)
+      await writeFile(path.join(project, '.opencode', 'plugins', 'fixture.js'), 'fixture\n')
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        afterTemporaryTreeVerified: async temporaryPath => {
+          expect((await lstat(temporaryPath)).mode & 0o777).toBe(0o500)
+          expect((await lstat(path.join(temporaryPath, 'plugins'))).mode & 0o777).toBe(0o500)
+          expect((await lstat(path.join(temporaryPath, 'plugins', 'fixture.js'))).mode & 0o777)
+            .toBe(0o400)
+          throw new Error('deterministic publication interruption')
+        },
+      })).rejects.toThrow('deterministic publication interruption')
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      expect((await readdir(snapshots)).filter(name =>
+        name.includes('.snapshot-') || name.includes('.incomplete-'))).toEqual([])
+
+      const displacedTemporary = path.join(snapshots, 'verified-temporary-original')
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        afterTemporaryTreeVerified: async temporaryPath => {
+          await rename(temporaryPath, displacedTemporary)
+          await mkdir(path.join(temporaryPath, 'plugins'), { recursive: true, mode: 0o700 })
+          await writeFile(path.join(temporaryPath, 'plugins', 'fixture.js'), 'fixture\n', {
+            mode: 0o400,
+          })
+          await chmod(path.join(temporaryPath, 'plugins'), 0o500)
+          await chmod(temporaryPath, 0o500)
+        },
+      })).rejects.toThrow('pathname changed before publication')
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      await rm(displacedTemporary, { recursive: true, force: true })
+
+      const displacedPublished = path.join(snapshots, 'published-original')
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        afterRenameBeforeFinalVerify: async publishedTarget => {
+          await rename(publishedTarget, displacedPublished)
+          await mkdir(publishedTarget, { mode: 0o700 })
+        },
+      })).rejects.toThrow('directory ownership or mode mismatch')
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      expect((await lstat(displacedPublished)).isDirectory()).toBe(true)
+      expect((await readdir(snapshots)).filter(name =>
+        name.includes('.snapshot-') || name.includes('.incomplete-'))).toEqual([])
+
+      await publishOpenCodeProjectBehaviorSnapshotForTest(project, target)
+      expect((await lstat(target)).mode & 0o777).toBe(0o500)
+      expect((await lstat(path.join(target, 'plugins'))).mode & 0o777).toBe(0o500)
+      expect((await lstat(path.join(target, 'plugins', 'fixture.js'))).mode & 0o777).toBe(0o400)
+
+      await chmod(path.join(target, 'plugins'), 0o700)
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target))
+        .rejects.toThrow('directory ownership or mode mismatch')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('failed publication cleanup preserves a later valid replacement inode', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-valid-replacement-'))
+    const project = path.join(root, 'project')
+    const snapshots = path.join(root, 'snapshots')
+    const target = path.join(snapshots, 'project-behavior')
+    const replacement = path.join(snapshots, 'valid-replacement')
+    const displaced = path.join(snapshots, 'published-original')
+    try {
+      await mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true })
+      await mkdir(snapshots)
+      await writeFile(path.join(project, '.opencode', 'plugins', 'fixture.js'), 'fixture\n')
+      await publishOpenCodeProjectBehaviorSnapshotForTest(project, replacement)
+      const replacementIdentity = await lstat(replacement)
+
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        afterRenameBeforeFinalVerify: async publishedTarget => {
+          await rename(publishedTarget, displaced)
+          await rename(replacement, publishedTarget)
+        },
+      })).rejects.toThrow('inode changed after publication')
+
+      const finalIdentity = await lstat(target)
+      expect([finalIdentity.dev, finalIdentity.ino]).toEqual([
+        replacementIdentity.dev, replacementIdentity.ino,
+      ])
+      expect(await readFile(path.join(target, 'plugins', 'fixture.js'), 'utf8')).toBe('fixture\n')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('failed publication cleanup quarantines a symlink replacement without touching its target', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-symlink-replacement-'))
+    const project = path.join(root, 'project')
+    const snapshots = path.join(root, 'snapshots')
+    const target = path.join(snapshots, 'project-behavior')
+    const displaced = path.join(snapshots, 'published-original')
+    const outside = path.join(root, 'outside')
+    try {
+      await mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true })
+      await mkdir(snapshots)
+      await mkdir(outside)
+      await writeFile(path.join(project, '.opencode', 'plugins', 'fixture.js'), 'fixture\n')
+      await writeFile(path.join(outside, 'sentinel'), 'preserved\n')
+
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        afterRenameBeforeFinalVerify: async publishedTarget => {
+          await rename(publishedTarget, displaced)
+          await symlink(outside, publishedTarget, 'dir')
+        },
+      })).rejects.toThrow()
+
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      expect(await readFile(path.join(outside, 'sentinel'), 'utf8')).toBe('preserved\n')
+      await publishOpenCodeProjectBehaviorSnapshotForTest(project, target)
+      expect(await readFile(path.join(target, 'plugins', 'fixture.js'), 'utf8')).toBe('fixture\n')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a symlink at an intermediate project behavior component', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-descriptor-link-'))
+    try {
+      const project = path.join(root, 'project')
+      const outside = path.join(root, 'outside')
+      await Promise.all([mkdir(project), mkdir(outside)])
+      await writeFile(path.join(outside, 'opencode.json'), '{"provider":{}}')
+      await symlink(outside, path.join(project, '.opencode'), 'dir')
+      await expect(collectProjectBehaviorMetadata(project)).rejects.toThrow(
+        'link or unsupported component',
+      )
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+  test('requires the exact pure plan and materializes its canonical host key', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-planned-v2-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
+      const expectedPlan = fixture.manager.planScopedProfile(input)
+      const prepared = await fixture.manager.prepareScopedProfile(input, expectedPlan)
+      expect(prepared.scopedPlanDigest).toBe(expectedPlan.digest)
+      expect(prepared.plannedHostKey).toBe(expectedPlan.expectedHostKey)
+      expect(prepared.policy.plugins).toEqual([])
+      expect((await lstat(prepared.managedAuthPath)).mode & 0o777).toBe(0o600)
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects the removed one-argument bypass before managed filesystem effects', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-no-bypass-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir)
+      await expect((fixture.manager.prepareScopedProfile as unknown as (
+        plannedInput: typeof input,
+      ) => Promise<never>)(input)).rejects.toThrow('requires expectedPlan')
+      expect(await lstat(path.join(tempDir, 'app-data')).catch(() => null)).toBeNull()
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('materializes and revalidates a complete immutable dependency snapshot', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-package-v2-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['custom-package@7.2.1'],
+      }))
+      const manifest = '{"name":"custom-package","version":"7.2.1","dependencies":{"dependency":"1.0.0"}}'
+      const dependencyManifest = '{"name":"dependency","version":"1.0.0"}'
+      const immutableTreeEntries = [
+        { path: 'custom-package/package.json', bytesBase64: Buffer.from(manifest).toString('base64'), mode: 0o400 as const },
+        { path: 'custom-package/node_modules/dependency/package.json', bytesBase64: Buffer.from(dependencyManifest).toString('base64'), mode: 0o400 as const },
+        { path: 'custom-package/node_modules/dependency/index.js', bytesBase64: Buffer.from('module.exports = 42\n').toString('base64'), mode: 0o400 as const },
+      ]
+      const treeFingerprint = pureDigest(canonicalSerializeOpenCodePolicyIdentity(
+        immutableTreeEntries.map(entry => ({
+          path: entry.path,
+          mode: entry.mode,
+          fingerprint: pureDigest(Buffer.from(entry.bytesBase64, 'base64').toString()),
+        })).sort((left, right) => left.path.localeCompare(right.path)),
+      ))
+      const plugin = {
+        spec: 'custom-package@7.2.1',
+        provenance: 'project' as const,
+        dependencyTreeFingerprint: treeFingerprint,
+        resolvedIdentity: fakeResolvedIdentity('7.2.1', treeFingerprint, manifest, 'custom-package'),
+        immutableTreeEntries,
+      }
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [plugin], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
+      const expectedPlan = fixture.manager.planScopedProfile(input)
+      const prepared = await fixture.manager.prepareScopedProfile(input, expectedPlan)
+      const dependencyPath = path.join(
+        prepared.pluginNodeModulesPath,
+        'custom-package', 'node_modules', 'dependency', 'index.js',
+      )
+      expect(await readFile(dependencyPath, 'utf8')).toBe('module.exports = 42\n')
+      await expect(revalidateOpenCodeScopedPreparedProfileInputs(prepared)).resolves.toBeUndefined()
+      await writeFile(dependencyPath, 'module.exports = 99\n')
+      await expect(revalidateOpenCodeScopedPreparedProfileInputs(prepared))
+        .rejects.toThrow('entry inputs changed')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('snapshots caller plans before yielding so async byte mutation cannot publish B with A identity', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-plan-mutation-race-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['custom-package@7.2.1'],
+      }))
+      const manifest = '{"name":"custom-package","version":"7.2.1"}'
+      const makePlugin = (implementation: string) => {
+        const immutableTreeEntries = [
+          { path: 'custom-package/package.json', bytesBase64: Buffer.from(manifest).toString('base64'), mode: 0o400 as const },
+          { path: 'custom-package/index.js', bytesBase64: Buffer.from(implementation).toString('base64'), mode: 0o500 as const },
+        ]
+        const treeFingerprint = pureDigest(canonicalSerializeOpenCodePolicyIdentity(
+          immutableTreeEntries.map(entry => ({
+            path: entry.path,
+            mode: entry.mode,
+            fingerprint: pureDigest(Buffer.from(entry.bytesBase64, 'base64').toString()),
+          })).sort((left, right) => left.path.localeCompare(right.path)),
+        ))
+        return {
+          spec: 'custom-package@7.2.1',
+          provenance: 'project' as const,
+          dependencyTreeFingerprint: treeFingerprint,
+          resolvedIdentity: fakeResolvedIdentity('7.2.1', treeFingerprint, manifest, 'custom-package'),
+          immutableTreeEntries,
+        }
+      }
+      const pluginA = makePlugin('module.exports = "A"\n')
+      const pluginB = makePlugin('module.exports = "B"\n')
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginA], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
+      const expectedA = fixture.manager.planScopedProfile(input)
+      const mutableExpected = structuredClone(expectedA)
+      const inputB = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginB], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
+      const expectedB = fixture.manager.planScopedProfile(inputB)
+
+      const preparation = fixture.manager.prepareScopedProfile(input, mutableExpected)
+      // prepareScopedProfile has reached its first await. Both caller-owned
+      // objects are now changed coherently to authorized-looking B evidence.
+      input.evidence.plugins[0] = pluginB
+      Object.assign(mutableExpected, structuredClone(expectedB))
+
+      const prepared = await preparation
+      expect(prepared.scopedPlanDigest).toBe(expectedA.digest)
+      expect(prepared.plannedHostKey).toBe(expectedA.expectedHostKey)
+      expect(prepared.scopedPlanDigest).not.toBe(expectedB.digest)
+      expect(await readFile(
+        path.join(prepared.pluginNodeModulesPath, 'custom-package', 'index.js'),
+        'utf8',
+      )).toBe('module.exports = "A"\n')
+      const hostManager = new OpenCodeHostManager({ persistentRegistryPath: null })
+      await expect(hostManager.ensureScopedHost({
+        preparedProfile: prepared,
+        expectedHostKey: expectedB.expectedHostKey,
+      })).rejects.toThrow('expectedHostKey mismatch')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('binds provider environment rotation without retaining raw values', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-env-v2-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      process.env.OPENAI_API_KEY = 'rotation-secret-one'
+      const firstInput = await buildDeepinfraPlannedInput(fixture, tempDir)
+      const first = fixture.manager.planScopedProfile(firstInput)
+      process.env.OPENAI_API_KEY = 'rotation-secret-two'
+      const secondInput = await buildDeepinfraPlannedInput(fixture, tempDir)
+      const second = fixture.manager.planScopedProfile(secondInput)
+      expect(second.expectedHostKey).not.toBe(first.expectedHostKey)
+      expect(JSON.stringify([first, second])).not.toContain('rotation-secret')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a symlinked app-owned boundary with zero writes through it', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-boundary-v2-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const outside = path.join(tempDir, 'outside-data')
+    try {
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir)
+      const expectedPlan = fixture.manager.planScopedProfile(input)
+      await mkdir(outside)
+      await symlink(outside, path.join(tempDir, 'app-data'), 'dir')
+      await expect(fixture.manager.prepareScopedProfile(input, expectedPlan))
+        .rejects.toThrow('ancestry is not canonical')
+      expect(await readdir(outside)).toEqual([])
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('anchors missing managed components to held descriptors during an adversarial swap', async () => {
+    if (process.platform !== 'linux') return
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-mkdirat-v2-'))
+    const boundary = path.join(tempDir, 'managed')
+    const displacedBoundary = path.join(tempDir, 'managed-original')
+    const outside = path.join(tempDir, 'outside')
+    const target = path.join(boundary, 'one', 'two')
+    await mkdir(boundary)
+    await mkdir(outside)
+    let swapped = false
+    try {
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, async componentPath => {
+        if (componentPath !== boundary || swapped) return
+        swapped = true
+        await rename(boundary, displacedBoundary)
+        await symlink(outside, boundary, 'dir')
+      })).rejects.toThrow('ancestry is not canonical')
+      expect(swapped).toBe(true)
+      expect(await readdir(outside)).toEqual([])
+      expect(await stat(path.join(displacedBoundary, 'one', 'two')).then(value => value.isDirectory()))
+        .toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('creates a trusted Windows tree on first use and rejects a swap at the mkdir boundary', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-windows-v2-'))
+    const boundary = path.join(tempDir, 'managed')
+    const target = path.join(boundary, 'one', 'two')
+    const outside = path.join(tempDir, 'outside')
+    const displacedBoundary = path.join(tempDir, 'managed-original')
+    try {
+      await ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32')
+      await mkdir(outside)
+      expect((await stat(target)).isDirectory()).toBe(true)
+
+      let swapped = false
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, async componentPath => {
+        if (componentPath !== boundary || swapped) return
+        swapped = true
+        await rename(boundary, displacedBoundary)
+        await symlink(outside, boundary, 'dir')
+      }, 'win32')).rejects.toThrow('ancestry is not canonical')
+      expect(swapped).toBe(true)
+      expect(await readdir(outside)).toEqual([])
+      await rm(boundary)
+      await rename(displacedBoundary, boundary)
+
+      await symlink(outside, path.join(boundary, 'linked'), 'dir')
+      await expect(ensureOpenCodeManagedDirectoryPath(
+        path.join(boundary, 'linked', 'child'),
+        boundary,
+        undefined,
+        'win32',
+      )).rejects.toThrow('ancestry is not canonical')
+      expect(await readdir(outside)).toEqual([])
+
+      await expect(ensureOpenCodeManagedDirectoryPath(
+        path.join(boundary, '..', 'outside', 'child'),
+        boundary,
+        undefined,
+        'win32',
+      )).rejects.toThrow('ownership boundary is invalid')
+      expect(await readdir(outside)).toEqual([])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('accepts root-owned platform ancestors above a non-root app-owned boundary', () => {
+    const currentUid = 12_345
+    expect(isOpenCodeManagedPathComponentOwnershipValid(
+      '/tmp', '/tmp/app-data', { uid: 0, mode: 0o41777 }, currentUid,
+    )).toBe(true)
+    expect(isOpenCodeManagedPathComponentOwnershipValid(
+      '/tmp/app-data', '/tmp/app-data', { uid: currentUid, mode: 0o40755 }, currentUid,
+    )).toBe(true)
+    expect(isOpenCodeManagedPathComponentOwnershipValid(
+      '/tmp/app-data/opencode', '/tmp/app-data', { uid: 0, mode: 0o40755 }, currentUid,
+    )).toBe(false)
+  })
+
+  test('links plan, preparation, retained host adoption, and late-exit cleanup', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-integrated-v2-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const child = new EventEmitter() as ChildProcess
+    Object.assign(child, {
+      pid: 52221,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      unref() {},
+      kill() { return true },
+    })
+    let spawnCount = 0
+    let failExitCleanup = false
+    const ownerKey = Buffer.alloc(32, 7)
+    const dependencies = () => ({
+      allocateLoopbackPort: async () => 44221,
+      spawnHostProcess: () => {
+        spawnCount += 1
+        return child
+      },
+      fetchJson: async (url: string) => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.2.3' } }
+        }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`unexpected integrated scoped request ${url}`)
+      },
+      isProcessAlive: (pid: number) => pid === 52221,
+      readProcessStartTimeMs: async () => 1_000,
+      readProcessCommandLine: async () => 'opencode serve --hostname 127.0.0.1 --port 44221',
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+      scopedTransportOwnerKey: ownerKey,
+      beforePersistentRegistryUnlink: async () => {
+        if (failExitCleanup) throw new Error('fake durable registry unlink failure')
+      },
+    })
+    try {
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [], {
+        purpose: 'launch',
+        modelId: 'deepinfra/model',
+      })
+      const plan = fixture.manager.planScopedProfile(input)
+      const prepared = await fixture.manager.prepareScopedProfile(input, plan)
+      expect(prepared.plannedHostKey).toBe(plan.expectedHostKey)
+
+      const owner = new OpenCodeHostManager(dependencies())
+      const created = await owner.ensureScopedHost({
+        preparedProfile: prepared,
+        expectedHostKey: plan.expectedHostKey,
+      })
+      const adopter = new OpenCodeHostManager(dependencies())
+      const adopted = await adopter.ensureScopedHost({
+        preparedProfile: prepared,
+        expectedHostKey: plan.expectedHostKey,
+      })
+      expect(adopted.hostKey).toBe(plan.expectedHostKey)
+      expect(adopted.pid).toBe(created.pid)
+      expect(adopted.diagnostics.join(' ')).toContain('adopted persistent')
+      expect(spawnCount).toBe(1)
+
+      failExitCleanup = true
+      child.emit('exit', 1, null)
+      const pendingCleanup = await owner.reconcilePendingExitCleanups()
+      expect(pendingCleanup.pending).toBe(1)
+      expect(pendingCleanup.diagnostics.join(' ')).toContain('fake durable registry unlink failure')
+      const pendingRegistry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>
+      }
+      expect(pendingRegistry.hosts[plan.expectedHostKey]).toBeDefined()
+      failExitCleanup = false
+      expect(await owner.reconcilePendingExitCleanups()).toMatchObject({ cleaned: 1, pending: 0 })
+      const registryBytes = await readFile(registryPath, 'utf8').catch(() => null)
+      if (registryBytes !== null) {
+        const registry = JSON.parse(registryBytes) as { hosts: Record<string, unknown> }
+        expect(registry.hosts[plan.expectedHostKey]).toBeUndefined()
+      }
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+})
 
 setDefaultTimeout(30_000)
 
@@ -126,6 +1611,49 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       stdout: '',
       stderr: '{"accountType":"BuilderId"}',
     })).toBe(true)
+  })
+
+  test('requires a definitive native account id and hashes stable ids distinctly', () => {
+    expect(resolveOpenCodeNativeAccountIdentity(
+      'kiro', '{"accountType":"BuilderId"}', '',
+    )).toBeNull()
+    expect(resolveOpenCodeNativeAccountIdentity(
+      'cursor-acp', 'Logged in', '',
+    )).toBeNull()
+    const first = resolveOpenCodeNativeAccountIdentity(
+      'kiro', '{"accountType":"BuilderId","userId":"account-a"}', '',
+    )
+    const second = resolveOpenCodeNativeAccountIdentity(
+      'kiro', '{"accountType":"BuilderId","userId":"account-b"}', '',
+    )
+    expect(first).toMatch(/^[a-f0-9]{64}$/)
+    expect(second).toMatch(/^[a-f0-9]{64}$/)
+    expect(first).not.toBe(second)
+    expect(`${first}${second}`).not.toContain('account-')
+  })
+
+  test('native account proof executes the resolved bytes with the captured environment', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-proof-target-'))
+    try {
+      const resolved = path.join(root, 'resolved-kiro')
+      const decoyDir = path.join(root, 'decoy')
+      await mkdir(decoyDir)
+      await writeFile(resolved,
+        '#!/bin/sh\nprintf \'{"accountType":"Builder ID","userId":"%s"}\\n\' "$PROOF_ACCOUNT"\n',
+        { mode: 0o700 })
+      await writeFile(path.join(decoyDir, 'kiro-cli'),
+        '#!/bin/sh\nprintf \'{"accountType":"Builder ID","userId":"decoy"}\\n\'\n',
+        { mode: 0o700 })
+      const result = await probeNativeCredentialIdentity('kiro', resolved, process.platform, {
+        PATH: decoyDir,
+        PROOF_ACCOUNT: 'captured-account',
+      })
+      expect(result.reportsAuthenticated).toBe(true)
+      expect(result.accountIdentity).toBe(resolveOpenCodeNativeAccountIdentity(
+        'kiro', '{"accountType":"Builder ID","userId":"captured-account"}', '',
+      ))
+    } finally { await rm(root, { recursive: true, force: true }) }
   })
 
   test('tracks project plugin sources without shadowing plugin config in managed overrides', async () => {
@@ -559,11 +2087,28 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     )).toContain('RESOURCE_EXHAUSTED')
   })
 
+  test('rejects a symlinked native bridge directory without writing its target', async () => {
+    const profileRootPath = path.join(tempDir, 'bridge-link-profile')
+    const outside = path.join(tempDir, 'bridge-link-outside')
+    await mkdir(profileRootPath)
+    await mkdir(outside)
+    await symlink(outside, path.join(profileRootPath, 'native-subscription-cli-bin'))
+    await expect(ensureOpenCodeNativeCliCredentialBridge(
+      profileRootPath,
+      { HOME: tempDir, PATH: '' },
+      process.platform,
+      'kiro',
+    )).rejects.toThrow('bridge parent is not canonical')
+    expect(await readdir(outside)).toEqual([])
+  })
+
   test('applies the Cursor resource exhaustion override by default with a kill switch', async () => {
     if (process.platform === 'win32') return
 
     const nodePath = Bun.which('node')
-    expect(nodePath).toBeTruthy()
+    // The hosted source-test image can intentionally contain Bun without a
+    // separate Node executable. The bridge behavior is covered when Node is
+    // available; absence is an environment limitation, not a product failure.
     if (!nodePath) return
     const hostBinPath = path.join(tempDir, 'host-bin')
     const profileRootPath = path.join(tempDir, 'profile-root')
@@ -1800,7 +3345,7 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
     ])
   })
 
-  test('keeps managed config fingerprint stable across volatile app MCP environment values', async () => {
+  test('changes managed config fingerprint across behavior-affecting MCP environment values', async () => {
     const launchBase = await resolveOpenCodeAppMcpLaunchConfig({
       env: {
         CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/usr/local/bin/node',
@@ -1826,10 +3371,13 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
       buildManagedConfig(launchVolatile.config)
     )
 
-    expect(volatileFingerprint).toBe(baseFingerprint)
+    expect(volatileFingerprint).not.toBe(baseFingerprint)
+    expect(volatileFingerprint).toMatch(/^[a-f0-9]{64}$/)
+    expect(volatileFingerprint).not.toContain('43123')
+    expect(volatileFingerprint).not.toContain('/var/folders/runtime-a')
   })
 
-  test('keeps managed config fingerprint stable across remote app MCP URL port drift', async () => {
+  test('changes managed config fingerprint across remote app MCP URL changes without leaking it', async () => {
     const launchFirst = await resolveOpenCodeAppMcpLaunchConfig({
       env: {
         CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
@@ -1843,9 +3391,10 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
       pathExists: async () => false,
     })
 
-    expect(
-      buildManagedConfigFingerprint(buildManagedConfig(launchSecond.config))
-    ).toBe(buildManagedConfigFingerprint(buildManagedConfig(launchFirst.config)))
+    const first = buildManagedConfigFingerprint(buildManagedConfig(launchFirst.config))
+    const second = buildManagedConfigFingerprint(buildManagedConfig(launchSecond.config))
+    expect(second).not.toBe(first)
+    expect(second).not.toContain('41002')
   })
 
   test('still changes managed config fingerprint when the MCP command changes', async () => {

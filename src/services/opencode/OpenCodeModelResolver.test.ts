@@ -165,6 +165,28 @@ describe('resolveOpenCodeProviderScopedModel', () => {
     ).toBe('openrouter/qwen/qwen3-coder')
   })
 
+  test('skips malformed provider rows while resolving valid config and live catalog rows', () => {
+    expect(resolveOpenCodeProviderScopedModel(
+      'target-model',
+      snapshot({
+        configProviders: {
+          providers: [
+            { id: '../config-provider', models: { 'target-model': {} } },
+          ],
+          default: { '../default-provider': 'target-model' },
+        },
+        providers: {
+          all: [
+            { id: 'provider/../malformed', models: { 'target-model': {} } },
+            { id: 'openrouter', models: { 'target-model': {} } },
+          ],
+          default: {},
+          connected: ['../connected-provider', 'openrouter'],
+        },
+      }),
+    )).toBe('openrouter/target-model')
+  })
+
   test('resolves raw catalog ids that contain slashes when the first segment is not a provider', () => {
     expect(resolveOpenCodeProviderScopedModel('moonshotai/kimi-k2', snapshot())).toBe(
       'openrouter/moonshotai/kimi-k2',

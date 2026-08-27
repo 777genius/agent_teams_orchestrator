@@ -21,6 +21,14 @@ type OpenCodeRuntimeDeadlineDeps = {
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void
 }
 
+let lastOpenCodeMonotonicMs = Date.now()
+
+/** Epoch-compatible monotonic clock so durable deadlines survive process boundaries. */
+export function openCodeMonotonicNow(): number {
+  lastOpenCodeMonotonicMs = Math.max(lastOpenCodeMonotonicMs, Date.now())
+  return lastOpenCodeMonotonicMs
+}
+
 export class OpenCodeRuntimeDeadlineError extends Error {
   readonly kind = 'timeout' as const
 
@@ -105,7 +113,7 @@ export class OpenCodeRuntimeDeadline {
   private readonly monotonicNow: () => number
   private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void
   private readonly startedAtMs: number
-  private readonly deadlineAtMs: number
+  private readonly absoluteDeadlineAtMs: number
   private readonly controller = new AbortController()
   private readonly timer: ReturnType<typeof setTimeout>
   private currentPhase: OpenCodeReadinessPhase = 'host_start'
@@ -119,10 +127,10 @@ export class OpenCodeRuntimeDeadline {
       throw new Error('OpenCode runtime deadline requires a positive finite command budget')
     }
 
-    this.monotonicNow = deps.monotonicNow ?? (() => performance.now())
+    this.monotonicNow = deps.monotonicNow ?? openCodeMonotonicNow
     this.clearTimer = deps.clearTimer ?? clearTimeout
     this.startedAtMs = this.monotonicNow()
-    this.deadlineAtMs = this.startedAtMs + commandBudgetMs
+    this.absoluteDeadlineAtMs = this.startedAtMs + commandBudgetMs
     const setTimer = deps.setTimer ?? setTimeout
     this.timer = setTimer(
       () => this.abortForDeadline(),
@@ -139,8 +147,13 @@ export class OpenCodeRuntimeDeadline {
     return Math.max(0, Math.ceil(this.monotonicNow() - this.startedAtMs))
   }
 
+  /** Absolute monotonic deadline shared with nested launch orchestration. */
+  get deadlineAtMs(): number {
+    return Math.floor(this.absoluteDeadlineAtMs)
+  }
+
   remainingMs(): number {
-    return Math.max(0, Math.ceil(this.deadlineAtMs - this.monotonicNow()))
+    return Math.max(0, Math.ceil(this.absoluteDeadlineAtMs - this.monotonicNow()))
   }
 
   throwIfExpired(phase: OpenCodeReadinessPhase = this.currentPhase): void {

@@ -117,6 +117,21 @@ describe('OpenCodeClientFactory permissions API', () => {
     ])
   })
 
+  test('physically deletes an exact session through the encoded OpenCode endpoint', async () => {
+    const requests: Array<{ url: string; method: string | undefined }> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method })
+        return new Response('true', { status: 200, headers: { 'content-type': 'application/json' } })
+      },
+    })
+    await expect(factory.create('http://127.0.0.1:4096').deleteSession('session/owned'))
+      .resolves.toBe(true)
+    expect(requests).toEqual([{
+      url: 'http://127.0.0.1:4096/session/session%2Fowned', method: 'DELETE',
+    }])
+  })
+
   test('lists pending permissions from the SDK v2 endpoint without trailing slash', async () => {
     const paths: string[] = []
     const factory = new OpenCodeClientFactory({
@@ -312,5 +327,43 @@ describe('OpenCodeClientFactory request context', () => {
     abortController.abort(new Error('late abort'))
 
     expect(requestSignals[0]?.aborted).toBe(false)
+  })
+})
+
+describe('OpenCodeClientFactory provider response bounds', () => {
+  test('uses the explicit provider-scoped catalog route without full inventory fallback', async () => {
+    const paths: string[] = []
+    const factory = new OpenCodeClientFactory({ fetchImpl: async input => {
+      paths.push(String(input)); return new Response('{}', { status: 200 })
+    } })
+    await factory.create('http://127.0.0.1:4096').getProviderCatalog('cursor-acp')
+    expect(paths).toEqual(['http://127.0.0.1:4096/provider/cursor-acp'])
+  })
+
+  test('rejects an oversized provider body from content-length before parsing', async () => {
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => new Response('{}', {
+        status: 200,
+        headers: { 'content-length': String(2 * 1024 * 1024 + 1) },
+      }),
+    })
+    await expect(factory.create('http://127.0.0.1:4096').getProviders())
+      .rejects.toThrow('response body exceeded the allowed size')
+  })
+
+  test('cancels an oversized streamed provider body when no length is declared', async () => {
+    const chunk = new Uint8Array(1024 * 1024 + 1)
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunk)
+        controller.enqueue(chunk)
+        controller.close()
+      },
+    })
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => new Response(body, { status: 200 }),
+    })
+    await expect(factory.create('http://127.0.0.1:4096').getProviders())
+      .rejects.toThrow('response body exceeded the allowed size')
   })
 })

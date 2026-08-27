@@ -8,6 +8,7 @@ import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
+import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -1013,6 +1014,11 @@ export class OpenCodeSessionBridge {
             `OpenCode app-managed bootstrap context id mismatch after ${phase}: expected ${params.messageID}, got ${actualId ?? 'missing'}`,
           )
         }
+        if (!hasExactOpenCodeMessageOwnership(message, params.messageID, record.opencodeSessionId)) {
+          throw new Error(
+            `OpenCode app-managed bootstrap context session mismatch after ${phase}: expected ${record.opencodeSessionId}`,
+          )
+        }
         const actualHash = hashText(getMessageText(message))
         if (actualHash !== params.contextHash) {
           throw new Error(
@@ -1043,7 +1049,7 @@ export class OpenCodeSessionBridge {
       // deterministic; the side-effect check below protects against OpenCode
       // accidentally producing assistant/tool output that could be mistaken for
       // launch readiness or a visible teammate reply.
-      await client.sendSessionMessage(record.opencodeSessionId, {
+      const returned = await client.sendSessionMessage(record.opencodeSessionId, {
         messageID: params.messageID,
         ...(params.agent ? { agent: params.agent } : {}),
         noReply: true,
@@ -1051,6 +1057,7 @@ export class OpenCodeSessionBridge {
         model: parseProviderScopedModel(record.selectedModel),
         parts: [{ type: 'text', text: params.text }],
       })
+      assertMessageMatches(returned, 'send')
 
       let written: OpenCodeMessage | null = null
       for (const delay of [0, 100, 250, 500]) {

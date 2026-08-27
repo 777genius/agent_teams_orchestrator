@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -243,6 +244,39 @@ function runBuild(cmd: string[]): void {
   }
 }
 
+const nativeSuffix = compileTarget.includes('windows') || (compileTarget === 'bun' && process.platform === 'win32')
+  ? '.exe' : ''
+
+function buildCatalogNativeArtifacts(destination: string): void {
+  const explicitTarget: Record<string, string> = {
+    'bun-darwin-arm64': 'aarch64-apple-darwin',
+    'bun-darwin-x64': 'x86_64-apple-darwin',
+    'bun-linux-arm64': 'aarch64-unknown-linux-gnu',
+    'bun-linux-x64': 'x86_64-unknown-linux-gnu',
+    'bun-windows-arm64': 'aarch64-pc-windows-msvc',
+    'bun-windows-x64': 'x86_64-pc-windows-msvc',
+  }
+  const target = explicitTarget[compileTarget]
+  for (const artifact of ['opencode-catalog-authority', 'opencode-catalog-launcher']) {
+    const manifest = join('native', artifact, 'Cargo.toml')
+    const command = ['cargo', 'build', '--release', '--locked']
+    // Hosted/offline verification can opt in without making clean production
+    // and release runners depend on a pre-populated Cargo cache.
+    if (process.env.OPENCODE_CATALOG_CARGO_OFFLINE === '1') command.push('--offline')
+    command.push('--manifest-path', manifest)
+    if (target) command.push('--target', target)
+    runBuild(command)
+    const source = target
+      ? join('native', artifact, 'target', target, 'release', `${artifact}${nativeSuffix}`)
+      : join('native', artifact, 'target', 'release', `${artifact}${nativeSuffix}`)
+    if (!existsSync(source)) throw new Error(`Native catalog artifact missing after build: ${source}`)
+    mkdirSync(destination, { recursive: true })
+    const output = join(destination, `${artifact}${nativeSuffix}`)
+    copyFileSync(source, output)
+    chmodSync(output, 0o755)
+  }
+}
+
 function writeLauncher(launcherPath: string, targetPath: string): void {
   const launcherDir = dirname(resolve(launcherPath))
   const targetRelativePath = relative(launcherDir, resolve(targetPath))
@@ -393,6 +427,7 @@ function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {
 }
 
 if (compile) {
+  buildCatalogNativeArtifacts(dirname(outfile))
   const cmd = extendBuildArgs([
     'bun',
     'build',
@@ -441,6 +476,7 @@ if (compile) {
   ])
 
   runBuild(cmd)
+  buildCatalogNativeArtifacts(bundleOutdir)
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 

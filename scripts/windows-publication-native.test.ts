@@ -1,0 +1,388 @@
+import { afterAll, describe, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
+import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { OpenCodeWindowsPublicationAuthorityClient } from '../src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.js'
+import { resolveOpenCodeNativeAuthorityArtifacts } from '../src/services/opencode/OpenCodeNativeAuthorityArtifacts.js'
+import { OpenCodeSafePublicationDirectory } from '../src/services/opencode/OpenCodeSafePublication.js'
+import { maintainOpenCodePassiveStore } from '../src/services/opencode/OpenCodePassiveSnapshotStore.js'
+import { OpenCodePassiveStatusSnapshotWriter } from '../src/services/opencode/OpenCodePassiveStatusSnapshotWriter.js'
+import { publishOpenCodeProjectBehaviorSnapshotForTest } from '../src/services/opencode/OpenCodeProfileManager.js'
+
+const roots: string[] = []
+afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
+const windowsTest = process.platform === 'win32' ? test : test.skip
+function nativeFixtureBase(): string {
+  if (process.platform !== 'win32') return os.tmpdir()
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData || !path.win32.isAbsolute(localAppData)) {
+    throw new Error('Windows native fixture LocalAppData is unavailable [redacted]')
+  }
+  return path.join(localAppData, 'Temp')
+}
+function artifacts() { const directory = process.env.OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR; return directory ? {
+  launcherPath: path.join(directory, 'opencode-catalog-launcher.exe'), workerPath: path.join(directory, 'opencode-catalog-authority.exe'),
+} : {} }
+async function boundedText(stream: ReadableStream<Uint8Array>, maximumBytes: number): Promise<string> {
+  const reader = stream.getReader(); const chunks: Uint8Array[] = []; let total = 0
+  try {
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) break
+      total += next.value.byteLength
+      if (total > maximumBytes) throw new Error(`native publication helper output exceeded ${maximumBytes} bytes`)
+      chunks.push(next.value)
+    }
+  } finally { reader.releaseLock() }
+  const bytes = new Uint8Array(total); let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return new TextDecoder().decode(bytes)
+}
+async function nativeRequests(requests: object[]): Promise<Record<string, unknown>[]> {
+  const explicit = artifacts(); const workerPath = 'workerPath' in explicit
+    ? explicit.workerPath : resolveOpenCodeNativeAuthorityArtifacts({}).workerPath
+  const controller = new AbortController()
+  let child: ReturnType<typeof Bun.spawn> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutMs = 30_000
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(); child?.kill()
+      reject(new Error(`native publication helper exceeded ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+  try {
+    child = Bun.spawn([workerPath, '--windows-publication-authority-v1'], {
+      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', signal: controller.signal,
+    })
+    child.stdin.write(requests.map(request => `${JSON.stringify(request)}\n`).join('')); child.stdin.end()
+    const completed = Promise.all([
+      boundedText(child.stdout, 1024 * 1024), boundedText(child.stderr, 64 * 1024), child.exited,
+    ]).then(([output, error, exitCode]) => {
+      if (exitCode !== 0) throw new Error(`native publication helper exited ${exitCode}: ${error.slice(0, 4096)}`)
+      return output.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    })
+    return await Promise.race([completed, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+    controller.abort(); child?.kill()
+    if (child) {
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([child.exited, new Promise<void>(resolve => {
+          cleanupTimer = setTimeout(resolve, 2_000)
+        })])
+      } finally { if (cleanupTimer) clearTimeout(cleanupTimer) }
+    }
+  }
+}
+
+describe('Windows retained publication native contract', () => {
+  test('native request startup, stdout, stderr, exit, and cleanup are statically bounded', async () => {
+    const source = await Bun.file(new URL('./windows-publication-native.test.ts', import.meta.url)).text()
+    expect(source).toContain("const timeoutMs = 30_000")
+    expect(source).toContain('boundedText(child.stdout, 1024 * 1024)')
+    expect(source).toContain('boundedText(child.stderr, 64 * 1024)')
+    expect(source).toContain('controller.abort(); child?.kill()')
+    expect(source).toContain('cleanupTimer = setTimeout(resolve, 2_000)')
+  })
+
+  windowsTest('passive SQLite retains its DB, rollback journal, and full ancestry before pathname VFS use', async () => {
+    const makeSnapshot = () => ({ schemaVersion: 1 as const, projectScope: `sha256:${'a'.repeat(64)}` as const,
+      capturedAt: 1, binary: { value: { presence: 'present' as const, version: '1.0.0' },
+        authority: 'binary_metadata' as const, freshness: 'fresh' as const, condition: 'normal' as const,
+        observedAt: 1, validUntil: 300_001, issueCode: 'none' as const }, providers: [] })
+    for (const target of ['database', 'journal'] as const) {
+      const sandbox = await mkdtemp(path.join(nativeFixtureBase(), `opencode-passive-hardlink-${target}-`)); roots.push(sandbox)
+      const root = path.join(sandbox, 'parent', 'store'); await mkdir(root, { recursive: true })
+      const database = path.join(root, 'passive-status.sqlite3')
+      const journal = `${database}-journal`; const selected = target === 'database' ? database : journal
+      await writeFile(database, ''); if (target === 'journal') await writeFile(journal, 'attacker-sentinel')
+      const outside = path.join(sandbox, `${target}-outside`); await link(selected, outside)
+      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(makeSnapshot(), new AbortController().signal)).rejects.toThrow(/unsafe|unavailable/)
+      expect(await readFile(outside, 'utf8')).toBe(target === 'journal' ? 'attacker-sentinel' : '')
+    }
+
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-passive-vfs-race-')); roots.push(sandbox)
+    const parent = path.join(sandbox, 'parent'); const root = path.join(parent, 'store'); await mkdir(root, { recursive: true })
+    const database = path.join(root, 'passive-status.sqlite3'); const journal = `${database}-journal`
+    await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
+      afterDatabasePinned: async () => {
+        await expect(rename(parent, path.join(sandbox, 'parent-replaced'))).rejects.toBeDefined()
+        await expect(rename(database, path.join(root, 'database-replaced'))).rejects.toBeDefined()
+        await expect(rename(journal, path.join(root, 'journal-replaced'))).rejects.toBeDefined()
+        await expect(link(database, path.join(sandbox, 'late-hardlink'))).rejects.toBeDefined()
+      },
+    } }).write(makeSnapshot(), new AbortController().signal)
+    expect((await readdir(root)).sort()).toEqual(['passive-status.sqlite3', 'passive-status.sqlite3-journal'])
+    await maintainOpenCodePassiveStore(root)
+    expect((await readdir(root)).some(name => name.endsWith('-wal') || name.endsWith('-shm'))).toBe(false)
+  })
+
+  windowsTest('denies root and primary database replacement until close', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'store'); const displaced = path.join(sandbox, 'displaced')
+    await mkdir(root); await writeFile(path.join(root, 'passive-status.sqlite3'), '')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    await client.openRoot(root, false, false); await expect(rename(root, displaced)).rejects.toBeDefined()
+    await client.pinRegular('passive-status.sqlite3')
+    await expect(rename(path.join(root, 'passive-status.sqlite3'), path.join(root, 'moved.sqlite3'))).rejects.toBeDefined()
+    client.kill(); await rename(root, displaced); await rename(displaced, root)
+  })
+  windowsTest('retains both pre-existing and atomically-created root components', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-root-components-')); roots.push(sandbox)
+    const existing = path.join(sandbox, 'existing'); const created = path.join(existing, 'created')
+    const target = path.join(created, 'nested'); const displaced = path.join(sandbox, 'displaced')
+    await mkdir(existing)
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    const opened = await client.openRoot(target, true, true)
+    expect(opened.createdPaths.map(value => value.toLowerCase())).toEqual([
+      created.toLowerCase(), target.toLowerCase(),
+    ])
+    await expect(rename(existing, displaced)).rejects.toBeDefined()
+    await expect(rename(created, path.join(existing, 'created-old'))).rejects.toBeDefined()
+    await client.close()
+    await rename(existing, displaced); await rename(displaced, existing)
+  })
+  windowsTest('read-only pin denies in-place SQLite writes until the bounded copy releases', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-readonly-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
+    await mkdir(root); await writeFile(database, 'stable-checkpoint')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    await client.openRoot(root, false, false); await client.pinRegular('passive-status.sqlite3', true)
+    await expect(writeFile(database, 'mutated')).rejects.toBeDefined()
+    await client.close(); await writeFile(database, 'after-close')
+  })
+  windowsTest('production passive directory reads through retained native namespace without writes', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-passive-native-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
+    await mkdir(root); await writeFile(database, 'stable-checkpoint')
+    const before = (await readdir(root)).sort()
+    const directory = await OpenCodeSafePublicationDirectory.openReadOnly(root, {
+      windowsAuthorityFactory: input => new OpenCodeWindowsPublicationAuthorityClient({ ...input, ...artifacts() }),
+    })
+    try {
+      expect(await directory.childNames()).toEqual(before)
+      await directory.pinRegularFile('passive-status.sqlite3', true)
+      expect(new TextDecoder().decode((await directory.readBoundedRegularBytes(
+        'passive-status.sqlite3', 64,
+      ))!)).toBe('stable-checkpoint')
+      await expect(directory.ensureRegularFile('must-not-exist')).rejects.toThrow('unavailable [redacted]')
+    } finally {
+      try { await directory.close() } finally { await directory.awaitPhysicalSettlement() }
+    }
+    expect((await readdir(root)).sort()).toEqual(before)
+  })
+  windowsTest('creates and publishes a temp root through one retained relative handle', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-retained-temp-root-')); roots.push(sandbox)
+    const displaced = path.join(sandbox, 'displaced')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    await client.openRoot(sandbox, false, false)
+    await client.createDirectory('attempt.snapshot')
+    await expect(rename(path.join(sandbox, 'attempt.snapshot'), displaced)).rejects.toBeDefined()
+    await client.createChildFile('attempt.snapshot', 'attempt.snapshot/evidence.txt', 'evidence.txt')
+    await client.writeChildFile('attempt.snapshot/evidence.txt', 0, new TextEncoder().encode('retained'), true)
+    await expect(writeFile(path.join(sandbox, 'attempt.snapshot', 'evidence.txt'), 'swapped')).rejects.toBeDefined()
+    await client.renameDirectory('attempt.snapshot', 'published')
+    expect(await readFile(path.join(sandbox, 'published', 'evidence.txt'), 'utf8')).toBe('retained')
+    await client.close()
+  })
+  windowsTest('project snapshot temp-root swap writes zero attacker files and keeps captured bytes', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-retained-project-')); roots.push(sandbox)
+    const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
+    const outside = path.join(sandbox, 'outside'); const displaced = path.join(sandbox, 'displaced')
+    await mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true })
+    await mkdir(snapshots); await mkdir(outside)
+    await writeFile(path.join(project, '.opencode', 'plugins', 'fixture.js'), 'captured')
+    const target = path.join(snapshots, 'project-behavior')
+    await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+      afterCaptureBeforeCopy: async () => {
+        const temporary = (await readdir(snapshots)).find(name => name.includes('.snapshot-'))!
+        await expect(rename(path.join(snapshots, temporary), displaced)).rejects.toBeDefined()
+        await symlink(outside, path.join(snapshots, temporary, 'plugins'), 'junction')
+      },
+    })).rejects.toBeDefined()
+    expect(await readdir(outside)).toEqual([])
+    const rejectedEntries = await readdir(snapshots)
+    expect(rejectedEntries).not.toContain('project-behavior')
+    expect(rejectedEntries.every(name => name.startsWith('project-behavior.snapshot-'))).toBe(true)
+    await publishOpenCodeProjectBehaviorSnapshotForTest(project, target)
+    expect(await readFile(path.join(snapshots, 'project-behavior', 'plugins', 'fixture.js'), 'utf8')).toBe('captured')
+  })
+  windowsTest('project replacement after capture never becomes the new identity baseline', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-project-capture-swap-')); roots.push(sandbox)
+    const project = path.join(sandbox, 'project'); const displaced = path.join(sandbox, 'captured-project')
+    const snapshots = path.join(sandbox, 'snapshots'); await mkdir(path.join(project, '.opencode'), { recursive: true })
+    await mkdir(snapshots); await writeFile(path.join(project, 'opencode.json'), '{"model":"captured"}')
+    await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, path.join(snapshots, 'project-behavior'), {
+      afterCaptureBeforeCopy: async () => {
+        await rename(project, displaced); await mkdir(path.join(project, '.opencode'), { recursive: true })
+        await writeFile(path.join(project, 'opencode.json'), '{"model":"captured"}')
+      },
+    })).rejects.toThrow('ancestry changed before materialization')
+    expect(await readdir(snapshots)).toEqual([])
+  })
+  windowsTest('project config swaps at both capture boundaries never replace the initial identity', async () => {
+    for (const boundary of ['before-config-read', 'after-config-identity'] as const) {
+      const sandbox = await mkdtemp(path.join(nativeFixtureBase(), `opencode-project-config-${boundary}-`)); roots.push(sandbox)
+      const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
+      const config = path.join(project, 'opencode.json'); const displaced = path.join(sandbox, 'captured.json')
+      await mkdir(project); await mkdir(snapshots); await writeFile(config, '{"model":"captured"}')
+      let swapped = false
+      const swap = async () => {
+        if (swapped) return
+        swapped = true; await rename(config, displaced); await writeFile(config, '{"model":"captured"}')
+      }
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, path.join(snapshots, 'project-behavior'), {
+        ...(boundary === 'before-config-read' ? { afterWindowsComponentWalk: swap }
+          : { afterWindowsFileIdentityCaptured: async (relative: string) => { if (relative === 'opencode.json') await swap() } }),
+      })).rejects.toThrow(/changed during capture|changed before capture/)
+      expect(swapped).toBe(true); expect(await readdir(snapshots)).toEqual([])
+    }
+  })
+  windowsTest('an initially missing project cannot appear after Windows capture', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-project-missing-capture-')); roots.push(sandbox)
+    const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
+    await mkdir(snapshots)
+    await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, path.join(snapshots, 'project-behavior'), {
+      afterCaptureBeforeCopy: async () => {
+        await mkdir(project); await writeFile(path.join(project, 'opencode.json'), '{}')
+      },
+    })).rejects.toThrow('path appeared before materialization')
+    expect(await readdir(snapshots)).toEqual([])
+  })
+  windowsTest('rejects a pre-existing junction with a fixed redacted failure', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-junction-')); roots.push(sandbox)
+    const attacker = path.join(sandbox, 'attacker'); const junction = path.join(sandbox, 'junction')
+    await mkdir(attacker); await symlink(attacker, junction, 'junction')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    await expect(client.openRoot(junction, false, false)).rejects.toThrow('unavailable [redacted]'); await client.close()
+  })
+  windowsTest('rejects ADS, devices, extended paths, and traversal at the native boundary', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-native-path-rejection-')); roots.push(sandbox)
+    const client = () => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    for (const candidate of [`${sandbox}:stream`, `\\\\?\\${sandbox}`, `\\\\.\\${sandbox}`,
+      `${sandbox}\\..\\${path.basename(sandbox)}`, `${sandbox}\\.\\child`, `${sandbox}\\NUL`]) {
+      const authority = client()
+      await expect(authority.openRoot(candidate, false, false)).rejects.toThrow('unavailable [redacted]')
+      await authority.close()
+    }
+    const root = client(); await root.openRoot(sandbox, false, false)
+    for (const leaf of ['auth.json:stream', 'CON', 'NUL.txt', 'COM1.log', '..']) {
+      await expect(root.pinRegular(leaf)).rejects.toThrow('unavailable [redacted]')
+    }
+    await root.close()
+
+    for (const candidate of [`${sandbox}:stream`, `\\\\?\\${sandbox}`, `\\\\.\\${sandbox}`,
+      `${sandbox}\\..\\${path.basename(sandbox)}`, `${sandbox}\\.\\child`, `${sandbox}\\NUL`]) {
+      const id = randomUUID()
+      const [reply] = await nativeRequests([{ version: 1, id, op: 'OPEN_ROOT', wait_ms: 5_000,
+        root_path: candidate, create_missing: false, durable_ancestors: false }])
+      expect(reply).toMatchObject({ version: 1, id, ok: false })
+    }
+    for (const leaf of ['auth.json:stream', 'CON', 'NUL.txt', 'COM1.log', '..']) {
+      const openId = randomUUID(); const leafId = randomUUID()
+      const replies = await nativeRequests([
+        { version: 1, id: openId, op: 'OPEN_ROOT', wait_ms: 5_000, root_path: sandbox,
+          create_missing: false, durable_ancestors: false },
+        { version: 1, id: leafId, op: 'PIN_REGULAR', wait_ms: 5_000, parent_key: '.', name: leaf },
+      ])
+      expect(replies[0]).toMatchObject({ version: 1, id: openId, ok: true })
+      expect(replies[1]).toMatchObject({ version: 1, id: leafId, ok: false })
+    }
+  })
+  windowsTest('holds an auth root through rollback settlement and releases it afterward', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-retained-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'profile'); const displaced = path.join(sandbox, 'profile-old')
+    await mkdir(root); await writeFile(path.join(root, 'auth.json'), '{"old":true}')
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    let transaction: { rollback(): Promise<void> } | undefined
+    await directory.writeFileAtomic('auth.json', new TextEncoder().encode('{"credential-sentinel":true}'), 0o600,
+      undefined, { retainTransaction: value => { transaction = value } })
+    await expect(rename(root, displaced)).rejects.toBeDefined()
+    await transaction!.rollback(); await directory.close()
+    expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"old":true}')
+    await rename(root, displaced); await rename(displaced, root)
+  })
+  windowsTest('pins the verified auth inode against regular, hard-link, and reparse replacement', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-pinned-boundaries-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'profile'); const auth = path.join(root, 'auth.json')
+    const attacker = path.join(root, 'attacker.json'); const displaced = path.join(root, 'displaced.json')
+    await mkdir(root); await writeFile(auth, '{"prior":true}'); await writeFile(attacker, '{"attacker":true}')
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    await directory.writeFileAtomic('auth.json', '{"next":true}', 0o600, undefined, {
+      afterRenameBeforeVerification: async () => {
+        await expect(writeFile(auth, '{"different":true}')).rejects.toBeDefined()
+        await expect(rename(auth, displaced)).rejects.toBeDefined()
+        await expect(unlink(auth)).rejects.toBeDefined()
+        await expect(link(attacker, auth)).rejects.toBeDefined()
+        await expect(symlink(attacker, auth, 'file')).rejects.toBeDefined()
+      },
+    })
+    await directory.close()
+    expect(await readFile(auth, 'utf8')).toBe('{"next":true}')
+  })
+  windowsTest('failed rollback keeps exact root authority retained until retry settles', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-retry-retained-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'profile'); const displaced = path.join(sandbox, 'profile-old')
+    await mkdir(root); await writeFile(path.join(root, 'auth.json'), '{"old":true}')
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    let transaction: { rollback(): Promise<void> } | undefined; let attempts = 0
+    await directory.writeFileAtomic('auth.json', new TextEncoder().encode('{"attempt":true}'), 0o600,
+      undefined, { beforeSettlementSync: () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('injected rollback barrier failure')
+      }, retainTransaction: value => { transaction = value } })
+    await expect(transaction!.rollback()).rejects.toThrow('injected rollback barrier failure')
+    await expect(rename(root, displaced)).rejects.toBeDefined()
+    await transaction!.rollback(); await directory.close()
+    expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"old":true}')
+    await rename(root, displaced); await rename(displaced, root)
+  })
+  windowsTest('retained namespace primitives list, publish, clean and release without pathname fallback', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-namespace-primitives-')); roots.push(sandbox)
+    await mkdir(path.join(sandbox, 'retired', 'nested'), { recursive: true })
+    await writeFile(path.join(sandbox, 'retired', 'nested', 'old.txt'), 'old')
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
+    await client.openRoot(sandbox, false, false)
+    expect(await client.namespaceList('.')).toContain('retired')
+    expect(await client.namespaceModifiedAt('retired', 'directory')).toBeGreaterThan(0)
+    await client.namespacePublishImmutable('evidence.json', Buffer.from('{"stable":true}'))
+    await client.namespacePublishImmutable('evidence.json', Buffer.from('{"stable":true}'))
+    expect(await readFile(path.join(sandbox, 'evidence.json'), 'utf8')).toBe('{"stable":true}')
+    await client.namespaceRemoveTree('retired')
+    expect(await readdir(sandbox)).not.toContain('retired')
+    const release = await client.namespaceAcquireLock('owner.lock', {
+      stale: 5_000, update: 1_000, retries: { retries: 1, minTimeout: 1, maxTimeout: 1 },
+    })
+    expect(await readFile(path.join(sandbox, 'owner.lock'), 'utf8')).not.toBe('')
+    await release(); await release()
+    expect(await readdir(sandbox)).not.toContain('owner.lock')
+    await client.close()
+  })
+  windowsTest('a crashed atomic publication is identity-recovered and never wedges its successor', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-crash-evidence-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'profile'); await mkdir(root)
+    await writeFile(path.join(root, 'auth.json'), '{"prior":true}')
+    const replies = await nativeRequests([
+      { version: 1, id: randomUUID(), op: 'OPEN_ROOT', wait_ms: 5_000, root_path: root,
+        create_missing: false, durable_ancestors: false },
+      { version: 1, id: randomUUID(), op: 'PREPARE_ATOMIC', wait_ms: 5_000,
+        final_name: 'auth.json', temporary_name: '.auth.json.tmp.crash',
+        backup_name: '.auth.json.rollback.crash', quarantine_name: '.auth.json.quarantine.crash',
+        recovery_name: '.auth.json.recovery-required.crash',
+        expected_prior: 'any',
+        content_base64: Buffer.from('{"attempt":true}').toString('base64') },
+    ])
+    expect(replies).toMatchObject([{ ok: true }, { ok: true }])
+    expect(await readFile(path.join(root, '.auth.json.recovery-required.crash'), 'utf8'))
+      .toContain('"stage":"published"')
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    await directory.writeFileAtomic('auth.json', '{"retry":true}')
+    await directory.close()
+    expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"retry":true}')
+    expect((await readdir(root)).filter(name => name.includes('recovery-required'))).toEqual([])
+  })
+})
