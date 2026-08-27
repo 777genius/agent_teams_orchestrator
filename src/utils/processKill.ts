@@ -252,17 +252,17 @@ export function isProcessTreeContainmentAlive(
   const readdir = observation.readdir ?? (target => readdirSync(target))
   const readStat = observation.readFile ?? (target => readFileSync(target, 'utf8'))
   try {
-    const scan = (): { names: string[]; identities: string[] } | null => {
+    const scan = (): string[] | null => {
       const names = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
       const identities: string[] = []
       for (const entry of names) {
         let stat: string
         try { stat = readStat(`/proc/${entry}/stat`) }
         catch (error) {
-          // ENOENT after enumeration is churn, not negative evidence. Even if
-          // the same numeric name appears in the next directory listing, it
-          // may be a different process generation. A complete scan is the
-          // minimum authority for proving containment empty.
+          // A process that vanished after /proc enumeration cannot still be a
+          // live member of this containment. Other read failures can hide a
+          // member, so they keep the result unknown.
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
           return null
         }
         const commandEnd = stat.lastIndexOf(')')
@@ -275,18 +275,21 @@ export function isProcessTreeContainmentAlive(
         // emptiness proof.
         if (fields.length < 20 || !/^\d+$/.test(fields[2] ?? '')
           || !/^\d+$/.test(fields[19] ?? '') || !/^[A-Z]$/.test(fields[0] ?? '')) return null
-        identities.push(`${entry}:${fields[19]}:${fields[2]}:${fields[0]}`)
+        if (fields[2] === String(groupLeaderPid)) {
+          identities.push(`${entry}:${fields[19]}:${fields[0]}`)
+        }
       }
-      return { names, identities }
+      return identities
     }
     const before = scan()
     const after = scan()
-    if (!before || !after
-      || JSON.stringify(before.names) !== JSON.stringify(after.names)
-      || JSON.stringify(before.identities) !== JSON.stringify(after.identities)) return null
-    return after.identities.some(identity => {
+    // Stability belongs to the exact containment, not to every unrelated
+    // process in the system. Global /proc churn must not make an already-empty
+    // owned group permanently unprovable.
+    if (!before || !after || JSON.stringify(before) !== JSON.stringify(after)) return null
+    return after.some(identity => {
       const fields = identity.split(':')
-      return fields[2] === String(groupLeaderPid) && fields[3] !== 'Z'
+      return fields[2] !== 'Z' && fields[2] !== 'X'
     })
   } catch {
     return null

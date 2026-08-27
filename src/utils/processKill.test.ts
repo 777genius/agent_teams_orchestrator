@@ -166,8 +166,8 @@ describe('processKill', () => {
   })
 
   it('requires well-formed and stable Linux proc observations before proving empty', () => {
-    const stat = (name: string, pgrp: number, birth = 99) =>
-      `10 (${name}) S 1 ${pgrp} ${Array(16).fill('0').join(' ')} ${birth}`
+    const stat = (name: string, pgrp: number, birth = 99, state = 'S') =>
+      `10 (${name}) ${state} 1 ${pgrp} ${Array(16).fill('0').join(' ')} ${birth}`
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'], readFile: () => 'malformed',
     })).toBeNull()
@@ -175,15 +175,27 @@ describe('processKill', () => {
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ++reads === 1 ? ['10'] : [],
       readFile: () => stat('gone', 10),
-    })).toBeNull()
+    })).toBe(false)
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'],
       readFile: () => stat('stable', 10),
+    })).toBe(false)
+    let unrelatedScan = 0
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux',
+      readdir: () => ++unrelatedScan === 1 ? ['10'] : ['10', '11'],
+      readFile: target => stat(target.endsWith('/10/stat') ? 'stable' : 'new', 10),
     })).toBe(false)
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'],
       readFile: () => stat('live', 443),
     })).toBe(true)
+    for (const state of ['Z', 'X']) {
+      expect(isProcessTreeContainmentAlive(443, {
+        platform: 'linux', readdir: () => ['10'],
+        readFile: () => stat('dead', 443, 99, state),
+      })).toBe(false)
+    }
     let identityRead = 0
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'],
@@ -191,12 +203,12 @@ describe('processKill', () => {
     })).toBeNull()
   })
 
-  it('treats ENOENT during either complete proc scan as churn, never empty', () => {
+  it('accepts a vanished proc entry while retaining stable empty containment proof', () => {
     const gone = new Error('gone') as NodeJS.ErrnoException
     gone.code = 'ENOENT'
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'], readFile: () => { throw gone },
-    })).toBeNull()
+    })).toBe(false)
   })
 
   it('binds Linux birth to boot id and native start ticks', () => {

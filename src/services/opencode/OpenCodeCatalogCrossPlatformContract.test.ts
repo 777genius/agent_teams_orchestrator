@@ -92,6 +92,13 @@ describe('native catalog cross-platform source contract', () => {
     } finally { processKill.mockRestore() }
   })
 
+  test('native artifact overrides expose exactly the retained launcher pair', async () => {
+    const { resolveOpenCodeNativeAuthorityArtifacts } = await import('./OpenCodeNativeAuthorityArtifacts.js')
+    expect(Object.keys(resolveOpenCodeNativeAuthorityArtifacts({
+      launcherPath: '/static/launcher', workerPath: '/static/worker', extra: 'secret',
+    } as never)).sort()).toEqual(['launcherPath', 'workerPath'])
+  })
+
   test('launcher enforces same-object Unix exec and locked Windows job launch', async () => {
     const source = await readFile('native/opencode-catalog-launcher/src/main.rs', 'utf8')
     expect(source).toContain('SYS_execveat')

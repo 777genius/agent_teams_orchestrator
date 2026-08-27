@@ -3224,6 +3224,22 @@ pub fn run() {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    fn fixture_root(label: &str) -> PathBuf {
+        let base = PathBuf::from(
+            std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is required on Windows"),
+        )
+        .join("Temp");
+        assert!(base.is_absolute());
+        base.join(format!(
+            "opencode-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
     #[test]
     fn publication_leaf_contract_is_strict() {
         assert!(valid_leaf("passive-status.sqlite3"));
@@ -3258,14 +3274,7 @@ mod protocol_tests {
 
     #[test]
     fn retained_materialization_publish_and_rollback_are_exact_and_retryable() {
-        let root = std::env::temp_dir().join(format!(
-            "opencode-publication-state-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root("publication-state");
         std::fs::create_dir(&root).unwrap();
         let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
         authority.create_directory("attempt.snapshot").unwrap();
@@ -3307,14 +3316,7 @@ mod protocol_tests {
 
     #[test]
     fn recovery_evidence_is_retained_until_atomic_rollback_is_durable() {
-        let root = std::env::temp_dir().join(format!(
-            "opencode-publication-recovery-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root("publication-recovery");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("auth.json"), b"prior").unwrap();
         let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
@@ -3342,13 +3344,8 @@ mod protocol_tests {
     fn committed_atomic_cleanup_failures_never_reinterpret_as_rollback() {
         for boundary in ["recovery_marker_delete", "recovery_parent_sync"] {
             for had_prior in [true, false] {
-                let root = std::env::temp_dir().join(format!(
-                    "opencode-publication-committed-cleanup-{}-{}-{boundary}-{had_prior}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
+                let root = fixture_root(&format!(
+                    "publication-committed-cleanup-{boundary}-{had_prior}"
                 ));
                 std::fs::create_dir(&root).unwrap();
                 if had_prior {
@@ -3389,14 +3386,7 @@ mod protocol_tests {
     #[test]
     fn durable_atomic_record_recovers_after_authority_restart() {
         for decision in ["commit", "rollback"] {
-            let root = std::env::temp_dir().join(format!(
-                "opencode-publication-restart-{}-{}-{decision}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let root = fixture_root(&format!("publication-restart-{decision}"));
             std::fs::create_dir(&root).unwrap();
             std::fs::write(root.join("auth.json"), b"prior").unwrap();
             {
@@ -3470,14 +3460,7 @@ mod protocol_tests {
 
     #[test]
     fn superseded_recovery_consumes_only_identity_matched_attempt_links() {
-        let root = std::env::temp_dir().join(format!(
-            "opencode-publication-superseded-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root("publication-superseded");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("auth.json"), b"prior").unwrap();
         {
@@ -3519,14 +3502,7 @@ mod protocol_tests {
 
     #[test]
     fn intent_record_unwedges_failed_creation_without_adopting_unknown_temporary() {
-        let root = std::env::temp_dir().join(format!(
-            "opencode-publication-intent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root("publication-intent");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("auth.json"), b"prior").unwrap();
         std::fs::write(root.join(".auth.tmp"), b"foreign").unwrap();

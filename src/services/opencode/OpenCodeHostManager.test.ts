@@ -3923,6 +3923,40 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
+  test('never publishes healthy when abort arrives with the successful health response', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-health-resolution-abort-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43138)
+    const controller = new AbortController()
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43138,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          controller.abort(new Error('cancelled at health resolution'))
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        return { status: 200, data: {} }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+    })
+
+    try {
+      await expect(manager.ensureHost({
+        hostKey: 'health-resolution-host', abortSignal: controller.signal,
+      })).rejects.toThrow('cancelled at health resolution')
+      expect(manager.getHost('health-resolution-host')).toBeNull()
+      const registry = await readFile(registryPath, 'utf8').catch(() => '')
+      expect(registry).not.toContain('"state":"healthy"')
+      expect(registry).not.toContain('"health-resolution-host"')
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('releases persistent host startup lock when host creation fails', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')

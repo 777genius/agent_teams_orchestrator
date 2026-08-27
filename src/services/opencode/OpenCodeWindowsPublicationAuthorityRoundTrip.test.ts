@@ -1,6 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import { mkdtemp, rename, rm } from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { launchOpenCodeNativeAuthority, resolveOpenCodeNativeAuthorityArtifacts,
   verifyOpenCodeNativeAuthorityArtifacts, type OpenCodeNativeAuthorityChild,
@@ -9,6 +8,13 @@ import { OpenCodeWindowsPublicationAuthorityClient,
   type OpenCodeWindowsPublicationAuthorityOptions } from './OpenCodeWindowsPublicationAuthorityClient.js'
 
 const sandboxes: string[] = []
+function nativeFixtureBase(): string {
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData || !path.win32.isAbsolute(localAppData)) {
+    throw new Error('Windows native fixture LocalAppData is unavailable [redacted]')
+  }
+  return path.join(localAppData, 'Temp')
+}
 afterAll(async () => {
   for (const sandbox of sandboxes) await rm(sandbox, { recursive: true, force: true })
 })
@@ -17,14 +23,14 @@ describe('Windows production publication authority launcher round-trip', () => {
   test.skipIf(process.platform !== 'win32')(
     'resolves the real pair, correlates OPEN_ROOT/CLOSE, exits zero, and physically releases the sandbox',
     async () => {
-      const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-authority-roundtrip-'))
+      const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-authority-roundtrip-'))
       sandboxes.push(sandbox)
       const artifacts = resolveOpenCodeNativeAuthorityArtifacts()
       verifyOpenCodeNativeAuthorityArtifacts(artifacts)
       let child: OpenCodeNativeAuthorityChild | undefined
       const deadline = Date.now() + 15_000
       const launch: NonNullable<OpenCodeWindowsPublicationAuthorityOptions['launch']> = input => {
-        expect(input).toEqual({ ...artifacts, deadline, launch, argument: '--windows-publication-authority-v1' })
+        expect(input).toEqual({ ...artifacts, argument: '--windows-publication-authority-v1' })
         child = launchOpenCodeNativeAuthority(input)
         return child
       }

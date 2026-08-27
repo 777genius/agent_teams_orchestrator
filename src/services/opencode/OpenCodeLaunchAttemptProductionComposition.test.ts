@@ -89,9 +89,7 @@ function requestExactNativePidRecycle(leaderPid: number, grandchildPid: number,
 async function waitForCompletedHostReleaseReceipt(ledger: OpenCodeLaunchHostReleaseLedger,
   key: Parameters<OpenCodeLaunchHostReleaseLedger['read']>[0]) {
   let receipt: Awaited<ReturnType<OpenCodeLaunchHostReleaseLedger['read']>> = null
-  // Physical release is bounded at five seconds, while the independent
-  // private settlement retains ten seconds to publish its durable receipt.
-  // Observe the full settlement bound without changing runtime behavior.
+  // Observe durable release settlement without changing runtime behavior.
   for (let attempt = 0; attempt < 500; attempt += 1) {
     receipt = await ledger.read(key).catch(() => null)
     if (receipt?.releaseState === 'complete') break

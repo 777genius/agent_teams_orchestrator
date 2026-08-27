@@ -13,6 +13,14 @@ import { publishOpenCodeProjectBehaviorSnapshotForTest } from '../src/services/o
 const roots: string[] = []
 afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
 const windowsTest = process.platform === 'win32' ? test : test.skip
+function nativeFixtureBase(): string {
+  if (process.platform !== 'win32') return os.tmpdir()
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData || !path.win32.isAbsolute(localAppData)) {
+    throw new Error('Windows native fixture LocalAppData is unavailable [redacted]')
+  }
+  return path.join(localAppData, 'Temp')
+}
 function artifacts() { const directory = process.env.OPENCODE_WINDOWS_NATIVE_ARTIFACT_DIR; return directory ? {
   launcherPath: path.join(directory, 'opencode-catalog-launcher.exe'), workerPath: path.join(directory, 'opencode-catalog-authority.exe'),
 } : {} }
@@ -86,7 +94,7 @@ describe('Windows retained publication native contract', () => {
         authority: 'binary_metadata' as const, freshness: 'fresh' as const, condition: 'normal' as const,
         observedAt: 1, validUntil: 300_001, issueCode: 'none' as const }, providers: [] })
     for (const target of ['database', 'journal'] as const) {
-      const sandbox = await mkdtemp(path.join(os.tmpdir(), `opencode-passive-hardlink-${target}-`)); roots.push(sandbox)
+      const sandbox = await mkdtemp(path.join(nativeFixtureBase(), `opencode-passive-hardlink-${target}-`)); roots.push(sandbox)
       const root = path.join(sandbox, 'parent', 'store'); await mkdir(root, { recursive: true })
       const database = path.join(root, 'passive-status.sqlite3')
       const journal = `${database}-journal`; const selected = target === 'database' ? database : journal
@@ -97,7 +105,7 @@ describe('Windows retained publication native contract', () => {
       expect(await readFile(outside, 'utf8')).toBe(target === 'journal' ? 'attacker-sentinel' : '')
     }
 
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-passive-vfs-race-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-passive-vfs-race-')); roots.push(sandbox)
     const parent = path.join(sandbox, 'parent'); const root = path.join(parent, 'store'); await mkdir(root, { recursive: true })
     const database = path.join(root, 'passive-status.sqlite3'); const journal = `${database}-journal`
     await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
@@ -114,7 +122,7 @@ describe('Windows retained publication native contract', () => {
   })
 
   windowsTest('denies root and primary database replacement until close', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const displaced = path.join(sandbox, 'displaced')
     await mkdir(root); await writeFile(path.join(root, 'passive-status.sqlite3'), '')
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
@@ -124,7 +132,7 @@ describe('Windows retained publication native contract', () => {
     client.kill(); await rename(root, displaced); await rename(displaced, root)
   })
   windowsTest('retains both pre-existing and atomically-created root components', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-root-components-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-root-components-')); roots.push(sandbox)
     const existing = path.join(sandbox, 'existing'); const created = path.join(existing, 'created')
     const target = path.join(created, 'nested'); const displaced = path.join(sandbox, 'displaced')
     await mkdir(existing)
@@ -139,7 +147,7 @@ describe('Windows retained publication native contract', () => {
     await rename(existing, displaced); await rename(displaced, existing)
   })
   windowsTest('read-only pin denies in-place SQLite writes until the bounded copy releases', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-readonly-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-readonly-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
     await mkdir(root); await writeFile(database, 'stable-checkpoint')
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
@@ -148,7 +156,7 @@ describe('Windows retained publication native contract', () => {
     await client.close(); await writeFile(database, 'after-close')
   })
   windowsTest('production passive directory reads through retained native namespace without writes', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-publication-passive-native-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-passive-native-')); roots.push(sandbox)
     const root = path.join(sandbox, 'store'); const database = path.join(root, 'passive-status.sqlite3')
     await mkdir(root); await writeFile(database, 'stable-checkpoint')
     const before = (await readdir(root)).sort()
@@ -168,7 +176,7 @@ describe('Windows retained publication native contract', () => {
     expect((await readdir(root)).sort()).toEqual(before)
   })
   windowsTest('creates and publishes a temp root through one retained relative handle', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-retained-temp-root-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-retained-temp-root-')); roots.push(sandbox)
     const displaced = path.join(sandbox, 'displaced')
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await client.openRoot(sandbox, false, false)
@@ -182,7 +190,7 @@ describe('Windows retained publication native contract', () => {
     await client.close()
   })
   windowsTest('project snapshot temp-root swap writes zero attacker files and keeps captured bytes', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-retained-project-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-retained-project-')); roots.push(sandbox)
     const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
     const outside = path.join(sandbox, 'outside'); const displaced = path.join(sandbox, 'displaced')
     await mkdir(path.join(project, '.opencode', 'plugins'), { recursive: true })
@@ -204,7 +212,7 @@ describe('Windows retained publication native contract', () => {
     expect(await readFile(path.join(snapshots, 'project-behavior', 'plugins', 'fixture.js'), 'utf8')).toBe('captured')
   })
   windowsTest('project replacement after capture never becomes the new identity baseline', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-capture-swap-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-project-capture-swap-')); roots.push(sandbox)
     const project = path.join(sandbox, 'project'); const displaced = path.join(sandbox, 'captured-project')
     const snapshots = path.join(sandbox, 'snapshots'); await mkdir(path.join(project, '.opencode'), { recursive: true })
     await mkdir(snapshots); await writeFile(path.join(project, 'opencode.json'), '{"model":"captured"}')
@@ -218,7 +226,7 @@ describe('Windows retained publication native contract', () => {
   })
   windowsTest('project config swaps at both capture boundaries never replace the initial identity', async () => {
     for (const boundary of ['before-config-read', 'after-config-identity'] as const) {
-      const sandbox = await mkdtemp(path.join(os.tmpdir(), `opencode-project-config-${boundary}-`)); roots.push(sandbox)
+      const sandbox = await mkdtemp(path.join(nativeFixtureBase(), `opencode-project-config-${boundary}-`)); roots.push(sandbox)
       const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
       const config = path.join(project, 'opencode.json'); const displaced = path.join(sandbox, 'captured.json')
       await mkdir(project); await mkdir(snapshots); await writeFile(config, '{"model":"captured"}')
@@ -235,7 +243,7 @@ describe('Windows retained publication native contract', () => {
     }
   })
   windowsTest('an initially missing project cannot appear after Windows capture', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-missing-capture-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-project-missing-capture-')); roots.push(sandbox)
     const project = path.join(sandbox, 'project'); const snapshots = path.join(sandbox, 'snapshots')
     await mkdir(snapshots)
     await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, path.join(snapshots, 'project-behavior'), {
@@ -246,14 +254,14 @@ describe('Windows retained publication native contract', () => {
     expect(await readdir(snapshots)).toEqual([])
   })
   windowsTest('rejects a pre-existing junction with a fixed redacted failure', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-junction-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-junction-')); roots.push(sandbox)
     const attacker = path.join(sandbox, 'attacker'); const junction = path.join(sandbox, 'junction')
     await mkdir(attacker); await symlink(attacker, junction, 'junction')
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     await expect(client.openRoot(junction, false, false)).rejects.toThrow('unavailable [redacted]'); await client.close()
   })
   windowsTest('rejects ADS, devices, extended paths, and traversal at the native boundary', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-path-rejection-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-native-path-rejection-')); roots.push(sandbox)
     const client = () => new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
     for (const candidate of [`${sandbox}:stream`, `\\\\?\\${sandbox}`, `\\\\.\\${sandbox}`,
       `${sandbox}\\..\\${path.basename(sandbox)}`, `${sandbox}\\.\\child`, `${sandbox}\\NUL`]) {
@@ -286,7 +294,7 @@ describe('Windows retained publication native contract', () => {
     }
   })
   windowsTest('holds an auth root through rollback settlement and releases it afterward', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-retained-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-retained-')); roots.push(sandbox)
     const root = path.join(sandbox, 'profile'); const displaced = path.join(sandbox, 'profile-old')
     await mkdir(root); await writeFile(path.join(root, 'auth.json'), '{"old":true}')
     const directory = await OpenCodeSafePublicationDirectory.open(root)
@@ -299,7 +307,7 @@ describe('Windows retained publication native contract', () => {
     await rename(root, displaced); await rename(displaced, root)
   })
   windowsTest('pins the verified auth inode against regular, hard-link, and reparse replacement', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-pinned-boundaries-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-pinned-boundaries-')); roots.push(sandbox)
     const root = path.join(sandbox, 'profile'); const auth = path.join(root, 'auth.json')
     const attacker = path.join(root, 'attacker.json'); const displaced = path.join(root, 'displaced.json')
     await mkdir(root); await writeFile(auth, '{"prior":true}'); await writeFile(attacker, '{"attacker":true}')
@@ -317,7 +325,7 @@ describe('Windows retained publication native contract', () => {
     expect(await readFile(auth, 'utf8')).toBe('{"next":true}')
   })
   windowsTest('failed rollback keeps exact root authority retained until retry settles', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-retry-retained-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-retry-retained-')); roots.push(sandbox)
     const root = path.join(sandbox, 'profile'); const displaced = path.join(sandbox, 'profile-old')
     await mkdir(root); await writeFile(path.join(root, 'auth.json'), '{"old":true}')
     const directory = await OpenCodeSafePublicationDirectory.open(root)
@@ -334,7 +342,7 @@ describe('Windows retained publication native contract', () => {
     await rename(root, displaced); await rename(displaced, root)
   })
   windowsTest('retained namespace primitives list, publish, clean and release without pathname fallback', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-namespace-primitives-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-namespace-primitives-')); roots.push(sandbox)
     await mkdir(path.join(sandbox, 'retired', 'nested'), { recursive: true })
     await writeFile(path.join(sandbox, 'retired', 'nested', 'old.txt'), 'old')
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 10_000, ...artifacts() })
@@ -355,7 +363,7 @@ describe('Windows retained publication native contract', () => {
     await client.close()
   })
   windowsTest('a crashed atomic publication is identity-recovered and never wedges its successor', async () => {
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-crash-evidence-')); roots.push(sandbox)
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-auth-crash-evidence-')); roots.push(sandbox)
     const root = path.join(sandbox, 'profile'); await mkdir(root)
     await writeFile(path.join(root, 'auth.json'), '{"prior":true}')
     const replies = await nativeRequests([

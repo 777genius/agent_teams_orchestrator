@@ -26,7 +26,10 @@ export function resolveOpenCodeCatalogSourceArtifacts(sourceRoot: string,
 }
 
 export function resolveOpenCodeNativeAuthorityArtifacts(overrides: Partial<OpenCodeNativeAuthorityArtifacts> = {}): OpenCodeNativeAuthorityArtifacts {
-  if (overrides.launcherPath && overrides.workerPath) return overrides as OpenCodeNativeAuthorityArtifacts
+  if (overrides.launcherPath && overrides.workerPath) return {
+    launcherPath: overrides.launcherPath,
+    workerPath: overrides.workerPath,
+  }
   const bunHostedBundle = /(?:^|[\\/])bun(?:\.exe)?$/i.test(process.execPath)
   const packaged = bunHostedBundle ? import.meta.dir : path.dirname(process.execPath)
   const source = resolveOpenCodeCatalogSourceArtifacts(path.resolve(import.meta.dir, '../../..'))

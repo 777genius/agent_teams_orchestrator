@@ -99,6 +99,91 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     client.kill()
   })
 
+  test.each([
+    ['write', 'write'],
+    ['flush', 'flush'],
+    ['decode', 'decode'],
+    ['native rejection', 'native_rejection authority_code=ROOT_REJECTED'],
+  ] as const)('reports bounded %s stage evidence without forwarding transport data', async (failure, stage) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const encoder = new TextEncoder()
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
+      exited: new Promise<number>(() => {}), unref() {}, kill() { try { controller.close() } catch {} },
+      stdin: {
+        end() {},
+        write(line: string) {
+          if (failure === 'write') throw new Error('C:\\secret\\request provider-token')
+          const request = JSON.parse(line)
+          if (failure === 'decode') controller.enqueue(encoder.encode('C:\\secret\\not-json\n'))
+          if (failure === 'native rejection') controller.enqueue(encoder.encode(`${JSON.stringify({
+            version: 1, id: request.id, ok: false, error: 'ROOT_REJECTED',
+          })}\n`))
+          return line.length
+        },
+        flush() {
+          if (failure === 'flush') throw new Error('C:\\secret\\flush provider-token')
+          return 0
+        },
+      },
+    }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
+      launch: () => child })
+    let error: Error | undefined
+    try { await client.openRoot('C:\\safe', false, false) } catch (value) { error = value as Error }
+    expect(error?.message).toBe(
+      `OpenCode Windows publication authority is unavailable [redacted] (native_stage=${stage})`,
+    )
+    expect(error?.message).not.toContain('secret')
+    expect(error?.message).not.toContain('provider-token')
+  })
+
+  test('reports a bounded read stage when the native reply pipe fails', async () => {
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ pull() { throw new Error('C:\\secret\\pipe') } }),
+      exited: new Promise<number>(() => {}), unref() {}, kill() {},
+      stdin: { end() {}, flush() { return 0 }, write(line: string) { return line.length } },
+    }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
+      launch: () => child })
+    let error: Error | undefined
+    try { await client.openRoot('C:\\safe', false, false) } catch (value) { error = value as Error }
+    expect(error?.message).toBe(
+      'OpenCode Windows publication authority is unavailable [redacted] (native_stage=read)',
+    )
+    expect(error?.message).not.toContain('secret')
+  })
+
+  test('keeps retained cleanup authority after a correlated bounded native rejection', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0
+    const encoder = new TextEncoder(); const operations: string[] = []
+    const child = {
+      pid: 123,
+      stdout: new ReadableStream<Uint8Array>({ start(value) { controller = value } }),
+      exited: new Promise<number>(() => {}), unref() {}, kill() { kills += 1 },
+      stdin: { end() {}, flush() { return 0 }, write(line: string) {
+        const request = JSON.parse(line); operations.push(request.op)
+        const rejected = request.op === 'VALIDATE_ROOT'
+        controller.enqueue(encoder.encode(`${JSON.stringify(rejected
+          ? { version: 1, id: request.id, ok: false, error: 'ROOT_REJECTED' }
+          : { version: 1, id: request.id, ok: true, value: request.op === 'OPEN_ROOT'
+              ? { volumeSerial: '1', fileId: '2', createdPaths: [] } : {} })}\n`))
+        return line.length
+      } },
+    }
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,
+      launch: () => child })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.validateRoot()).rejects.toThrow(
+      'native_stage=native_rejection authority_code=ROOT_REJECTED',
+    )
+    expect(kills).toBe(0)
+    await client.close()
+    expect(operations).toEqual(['OPEN_ROOT', 'VALIDATE_ROOT', 'CLOSE'])
+  })
+
   test('cancels caller waits but preserves retained cleanup authority after owner loss', async () => {
     const process = fake(); const abort = new AbortController()
     const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: Date.now() + 5_000,

@@ -100,4 +100,35 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(source).toMatch(/open_windows_state_file\(&confirmed_path, false\)/)
     expect(source).toMatch(/expected\.is_some_and\(\|value\| contents != value\)/)
   })
+
+  test('native Windows fixtures select the production LocalAppData volume explicitly', async () => {
+    const [identity, publication, roundTrip, passive, nativeSuite] = await Promise.all([
+      readFile(identityPath, 'utf8'),
+      readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
+      readFile('src/services/opencode/OpenCodeWindowsPublicationAuthorityRoundTrip.test.ts', 'utf8'),
+      readFile('src/services/opencode/OpenCodePassiveSnapshotConsistency.test.ts', 'utf8'),
+      readFile('scripts/windows-publication-native.test.ts', 'utf8'),
+    ])
+    for (const source of [identity, publication, roundTrip, passive, nativeSuite]) {
+      expect(source).toContain('LOCALAPPDATA')
+    }
+    expect(identity).toContain('Windows authority fixtures require local NTFS')
+    expect(roundTrip).not.toContain('os.tmpdir()')
+    expect(passive).not.toContain('os.tmpdir()')
+    expect(nativeSuite).not.toContain('path.join(os.tmpdir()')
+  })
+
+  test('keeps the documented 64-bit rename ABI and existing directory durability primitive', async () => {
+    const [identity, publication] = await Promise.all([
+      readFile(identityPath, 'utf8'),
+      readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
+    ])
+    expect(identity).toContain('let root_offset = (4 + pointer - 1) & !(pointer - 1)')
+    expect(identity).toContain('let name_offset = length_offset + 4')
+    expect(identity).toContain('let flags = if replace { 0x1 | 0x2 } else { 0 }')
+    expect(identity).toMatch(/SetFileInformationByHandle\([\s\S]*?FileRenameInfoEx/)
+    expect(identity).toMatch(/NtSetInformationFile\([\s\S]*?\n\s*11,/)
+    expect(publication).toContain('parent.sync_all().map_err')
+    expect(identity).not.toContain('symlink_metadata')
+  })
 })

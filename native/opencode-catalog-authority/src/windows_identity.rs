@@ -638,7 +638,15 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
 
     fn fixture(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        // The authority intentionally admits local NTFS only. Hosted Windows
+        // runners may point TEMP at the ReFS checkout volume, so use the
+        // per-user LocalAppData temp root on the production profile volume.
+        let base = std::path::PathBuf::from(
+            std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is required on Windows"),
+        )
+        .join("Temp");
+        assert!(base.is_absolute());
+        let root = base.join(format!(
             "opencode-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -650,12 +658,22 @@ mod tests {
         root
     }
     fn directory(path: &Path) -> File {
-        std::fs::OpenOptions::new()
+        let directory = std::fs::OpenOptions::new()
             .access_mode(0x0010_0000 | 0x80 | 0x1 | 0x2 | 0x4)
             .share_mode(0x1 | 0x2)
             .custom_flags(0x0200_0000 | 0x0020_0000)
             .open(path)
-            .unwrap()
+            .unwrap();
+        validate_local_ntfs(&directory).expect("Windows authority fixtures require local NTFS");
+        directory
+    }
+
+    #[test]
+    fn fixture_volume_matches_production_ntfs_contract() {
+        let root = fixture("ntfs-contract");
+        let parent = directory(&root);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

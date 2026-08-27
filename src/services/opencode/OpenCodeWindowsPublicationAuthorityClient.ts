@@ -21,6 +21,12 @@ export type OpenCodeWindowsPublicationAuthorityOptions = Readonly<{
 }>
 
 const unavailable = () => new Error('OpenCode Windows publication authority is unavailable [redacted]')
+const transportUnavailable = (stage: 'write' | 'flush' | 'read' | 'decode' | 'native_rejection',
+  authorityCode?: string) =>
+  new OpenCodeNativeAuthorityTransportError(
+    `OpenCode Windows publication authority is unavailable [redacted] (native_stage=${stage}`
+      + `${authorityCode === undefined ? '' : ` authority_code=${authorityCode}`})`,
+  )
 const OPEN_CODE_WINDOWS_PUBLICATION_SETTLEMENT_RESERVE_MS = 1_000
 
 export class OpenCodeWindowsPublicationAuthorityClient {
@@ -383,24 +389,34 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     const encoded = `${JSON.stringify(wire)}\n`
     if (new TextEncoder().encode(encoded).byteLength > OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES) throw unavailable()
     let timer: ReturnType<typeof setTimeout> | undefined
+    let stage: 'write' | 'flush' | 'read' | 'decode' = 'write'
     try {
       this.#child.stdin.write(encoded)
       // Bun.spawn exposes piped stdin as a buffered FileSink. A request keeps
       // stdin open for subsequent commands, so write() alone is not a delivery
       // boundary on Windows; end() happened only during failure cleanup, too
       // late to establish the request/reply protocol boundary.
-      await this.#child.stdin.flush()
+      stage = 'flush'; await this.#child.stdin.flush()
+      stage = 'read'
       const physical = Promise.race([this.#readLine(), this.#exitFailure.then(error => { throw error })])
       const line = await Promise.race([physical,
         new Promise<never>((_, reject) => { timer = setTimeout(() => { this.kill(); reject(unavailable()) }, remaining); timer.unref?.() })])
+      stage = 'decode'
       const value = decodeOpenCodeWindowsPublicationReply(line, request.id)
       if (request.op !== 'MARK_RECOVERY_REQUIRED' && request.op !== 'NS_RELEASE_LOCK' && request.op !== 'CLOSE') this.#armOwnerReaper()
       return value
     } catch (error) {
       if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained
         && request.op.startsWith('NS_')) throw error
-      if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained) throw unavailable()
-      const reported = error instanceof OpenCodeNativeAuthorityTransportError ? error : unavailable()
+      // A correlated native rejection proves the transport is still usable;
+      // preserve retained cleanup authority while reporting only its bounded,
+      // protocol-allowlisted code.
+      if (error instanceof OpenCodeWindowsPublicationRejectedError && this.#retained) {
+        throw transportUnavailable('native_rejection', error.authorityCode)
+      }
+      const reported = error instanceof OpenCodeNativeAuthorityTransportError ? error
+        : error instanceof OpenCodeWindowsPublicationRejectedError
+          ? transportUnavailable('native_rejection', error.authorityCode) : transportUnavailable(stage)
       // Internal transport teardown must not resolve caller cancellation before
       // the queued initiating failure rejects with its safe native evidence.
       this.#terminate(false); throw reported

@@ -12,6 +12,7 @@ import { openCodeProfileManager as globalThisOpenCodeProfileManager } from './Op
 import { openCodeSessionStore as globalThisOpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
+  DeadlineError,
   OpenCodeOperationHostAcquisitionCleanupError,
   OpenCodeOperationHostAcquisitionSettledError,
   computeOpenCodeLaunchAttemptInputDigest,
@@ -845,8 +846,6 @@ function bootstrapText(command: Command, memberName: string, sessionId: string, 
     '</agent_teams_app_managed_bootstrap>',
   ].join('\n')
 }
-
-class DeadlineError extends Error {}
 
 function launchMonotonicNow(): number {
   return openCodeMonotonicNow()
@@ -1826,18 +1825,11 @@ class OpenCodeProductionLaunchRuntime {
             receiptIdentityDigest: record.receiptIdentityDigest }
         },
         releaseOperationHost: async input => {
-          // A host can become ours only after the caller's absolute envelope has
-          // closed. Its cleanup is a physical settlement, not new launch work:
-          // give it an independent finite reserve while the caller continues to
-          // observe the original deadline. The durable obligation remains the
-          // replay fence if this private settlement does not prove release.
-          const settlementController = input.lateSettlement ? new AbortController() : null
-          const lateSettlementStartedAtMs = input.lateSettlement ? launchMonotonicNow() : null
-          const settlementContext = input.lateSettlement
-            ? { deadlineAtMs: lateSettlementStartedAtMs! + 10_000, signal: settlementController!.signal }
-            : { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
-          const physicalReleaseDeadlineAtMs = input.lateSettlement
-            ? lateSettlementStartedAtMs! + 5_000 : settlementContext.deadlineAtMs
+          // Late physical settlement may use only the attempt's existing
+          // absolute cleanup reserve. Its independent signal is not aborted
+          // when the caller-facing reserve wait ends.
+          const settlementContext = { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
+          const physicalReleaseDeadlineAtMs = input.deadlineAtMs
           if (!input.cleanupObligationId) {
             throw new Error('OpenCode operation host release obligation is absent')
           }

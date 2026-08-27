@@ -6,6 +6,7 @@ import path from 'node:path'
 
 import { OpenCodeLaunchAttempt, OpenCodeOperationHostAcquisitionCleanupError,
   OpenCodeOperationHostAcquisitionSettledError,
+  DeadlineError,
   validateOpenCodeLaunchResponseRoster,
   type OpenCodeLaunchAttemptPorts } from './OpenCodeLaunchAttempt.js'
 import { projectOpenCodeLaunchAttemptResponse } from './OpenCodeLaunchAttemptProduction.js'
@@ -105,6 +106,7 @@ function setup(options: {
   authoritative?: Map<string, OpenCodeLaunchMemberLinkage | null>
   claim?: OpenCodeLaunchAttemptPorts['sessions']['claimMemberMutation']
   transition?: OpenCodeLaunchAttemptPorts['sessions']['transitionMemberClaim']
+  onRetainPhysicalSettlement?: (settlement: Promise<unknown>) => void
 } = {}) {
   const persistence = new MemoryPersistence()
   let now = options.initialNow ?? 0
@@ -178,7 +180,9 @@ function setup(options: {
       return result
     } },
   }
-  const store = new OpenCodeLaunchAttemptStore(persistence)
+  const store = new OpenCodeLaunchAttemptStore(persistence, {
+    onRetainPhysicalSettlement: options.onRetainPhysicalSettlement,
+  })
   return {
     persistence, calls, cleaned, deadlines, ports,
     store, launch: new OpenCodeLaunchAttempt(store, ports),
@@ -1743,6 +1747,105 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(releaseCalls).toBe(1)
   })
 
+  test('aborts the exact phase signal as soon as the phase deadline rejects', async () => {
+    const subject = setup()
+    let phaseSignal: AbortSignal | undefined
+    let profileEntered!: () => void
+    const atProfile = new Promise<void>(resolve => { profileEntered = resolve })
+    let expirePhase!: (error: Error) => void
+    const phaseDeadline = new Promise<never>((_, reject) => { expirePhase = reject })
+    subject.ports.profile.createSelectedProviderProfile = async input => {
+      phaseSignal = input.signal
+      profileEntered()
+      return new Promise<never>((_, reject) => input.signal.addEventListener(
+        'abort', () => reject(input.signal.reason), { once: true },
+      ))
+    }
+    subject.ports.deadline.run = async operation => Promise.race([operation, phaseDeadline])
+
+    const running = subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    await atProfile
+    expect(phaseSignal?.aborted).toBe(false)
+    expirePhase(new DeadlineError())
+    const result = await running
+    expect(phaseSignal?.aborted).toBe(true)
+    expect(result.failure?.kind).toBe('deadline_before_partial')
+    expect(subject.calls).not.toContain('host')
+  })
+
+  test('registers the acquisition settlement fence before waiting for the host', async () => {
+    let retained = false
+    let acquireEntered!: () => void
+    const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
+    let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
+    const acquisition = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
+    const cancellation = new AbortController()
+    const subject = setup({
+      onRetainPhysicalSettlement: () => { retained = true },
+    })
+    subject.ports.host.acquireOperationHost = async () => {
+      acquireEntered()
+      return acquisition
+    }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => Promise.race([
+      operation,
+      new Promise<never>((_, reject) => signal.addEventListener(
+        'abort', () => reject(signal.reason), { once: true },
+      )),
+    ])
+
+    const running = subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+      signal: cancellation.signal,
+    })
+    await atAcquire
+    expect(retained).toBe(true)
+    cancellation.abort(new Error('finish settlement-fence observation'))
+    resolveAcquire(host)
+    await running
+  })
+
+  test('rejects acceptance after cancellation during late durable binding and settles fast rollback in reserve', async () => {
+    const cancellation = new AbortController()
+    const obligation = { obligationId: '123e4567-e89b-42d3-a456-426614174477',
+      reservationDigest: '7'.repeat(64) }
+    const binding = { ...obligation, receiptIdentityDigest: '6'.repeat(64) }
+    let bindingRead!: () => void
+    const atBindingRead = new Promise<void>(resolve => { bindingRead = resolve })
+    let publishBinding!: () => void
+    const bindingPublished = new Promise<void>(resolve => { publishBinding = resolve })
+    let bindingSignal: AbortSignal | undefined
+    const subject = setup()
+    subject.ports.host.reserveOperationHostCleanup = async () => obligation
+    subject.ports.host.acquireOperationHost = async () => host
+    subject.ports.host.readOperationHostCleanupBinding = async input => {
+      bindingSignal = input.signal
+      bindingRead()
+      await bindingPublished
+      return binding
+    }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => Promise.race([
+      operation,
+      new Promise<never>((_, reject) => signal.addEventListener(
+        'abort', () => reject(signal.reason), { once: true },
+      )),
+    ])
+
+    const running = subject.launch.run({ request: request(), members: [members[0]],
+      requestedBudgetMs: 10_000, signal: cancellation.signal })
+    await atBindingRead
+    cancellation.abort(new Error('cancel during durable host binding'))
+    expect(bindingSignal?.aborted).toBe(true)
+    publishBinding()
+    const result = await running
+    expect(result.status).toBe('cancelled')
+    expect(subject.calls).not.toContain('mcp')
+    expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
+    expect(result.cleanup).toBe('complete')
+  })
+
   test('self-releases a host acquired immediately after abort and never publishes false cleanup', async () => {
     const cancellation = new AbortController()
     let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
@@ -1767,16 +1870,13 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     await atAcquire
     cancellation.abort(new Error('cancel immediately before acquisition resolution'))
     resolveAcquire(host)
-    const result = await running
     await atRelease
+    rejectRelease(new Error('late physical release rejected'))
+    await physicalRelease.catch(() => undefined)
+    const result = await running
     expect(result.cleanup).toBe('timed_out')
     expect(subject.persistence.json().cleanupState).toBe('incomplete')
     expect(subject.calls).not.toContain('mcp')
-
-    rejectRelease(new Error('late physical release rejected'))
-    await physicalRelease.catch(() => undefined)
-    await Bun.sleep(0)
-    expect(subject.persistence.json().cleanupState).toBe('incomplete')
   })
 
   test('bounds a host acquired after the absolute deadline and retains incomplete replay state', async () => {
@@ -1785,30 +1885,54 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
     const acquisition = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
     const releaseInputs: Array<{ deadlineAtMs: number; signal: AbortSignal; lateSettlement?: true }> = []
-    const physicalRelease = new Promise<void>(() => undefined)
-    const subject = setup()
+    let finishRelease!: () => void
+    const physicalRelease = new Promise<void>(resolve => { finishRelease = resolve })
+    let retainedSettlement: Promise<unknown> | undefined
+    const subject = setup({
+      onRetainPhysicalSettlement: settlement => { retainedSettlement = settlement },
+    })
     subject.ports.host.acquireOperationHost = async () => { acquireEntered(); return acquisition }
     subject.ports.host.releaseOperationHost = async input => {
       releaseInputs.push({ deadlineAtMs: input.deadlineAtMs, signal: input.signal,
         lateSettlement: input.lateSettlement })
       return physicalRelease
     }
+    let expirePhase!: (error: Error) => void
+    const phaseDeadline = new Promise<never>((_, reject) => { expirePhase = reject })
+    subject.ports.deadline.run = async (operation, deadlineAtMs) => {
+      if (deadlineAtMs === 10_000) throw new DeadlineError()
+      return Promise.race([operation, phaseDeadline])
+    }
 
     const running = subject.launch.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,
     })
     await atAcquire
-    subject.setNow(10_000)
+    subject.setNow(9_000)
+    expirePhase(new DeadlineError())
     resolveAcquire(host)
-    await running.catch(() => undefined)
+    const result = await running
     await Bun.sleep(0)
 
     expect(releaseInputs).toHaveLength(1)
     expect(releaseInputs[0]?.deadlineAtMs).toBe(10_000)
     expect(releaseInputs[0]?.lateSettlement).toBe(true)
-    expect(releaseInputs[0]?.signal.aborted).toBe(true)
+    expect(releaseInputs[0]?.signal.aborted).toBe(false)
+    expect(retainedSettlement).toBeDefined()
     expect(subject.persistence.json().cleanupState).not.toBe('complete')
-    expect(subject.persistence.json().finalResponse).toBeUndefined()
+    expect(subject.persistence.json().finalResponse).toMatchObject({
+      failure: { code: 'deadline_before_partial', phase: 'retained_host_start' },
+    })
+    let reacquired = false
+    const blockedReacquisition = subject.store.inspect({ attemptId, payloadHash: hash,
+      inputDigest: result.inputDigest })
+      .then(value => { reacquired = true; return value })
+    await Bun.sleep(0)
+    expect(reacquired).toBe(false)
+    finishRelease()
+    await retainedSettlement
+    await blockedReacquisition.catch(() => undefined)
+    expect(reacquired).toBe(true)
   })
 
   test('persists incomplete cleanup when acquisition rejects after unproved fallback release', async () => {

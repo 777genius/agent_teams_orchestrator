@@ -24,6 +24,13 @@ import {
 } from './OpenCodeRedactedStatusSnapshot.js'
 
 const canonical = '/canonical/project'
+function windowsNativeFixtureBase(): string {
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData || !path.win32.isAbsolute(localAppData)) {
+    throw new Error('Windows native fixture LocalAppData is unavailable [redacted]')
+  }
+  return path.join(localAppData, 'Temp')
+}
 const scope = `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonical).digest('hex')}` as const
 const direct = <T>(value: T, authority: any, at: number, evidenceGeneration?: number) => ({
   value, authority, freshness: 'fresh' as const, condition: 'normal' as const,
@@ -110,7 +117,7 @@ async function status(root: string, providerIds = ['deepinfra']) {
 describe('OpenCode passive SQLite transaction consistency', () => {
   test.skipIf(process.platform !== 'win32')(
     'Windows parent-owned child production read exits and preserves exact publication identity', async () => {
-      const root = await mkdtemp(path.join(process.cwd(), '.passive-windows-readonly-'))
+      const root = await mkdtemp(path.join(windowsNativeFixtureBase(), 'passive-windows-readonly-'))
       try {
         const writerUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveStatusSnapshotWriter.ts')).href
         const storeUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveSnapshotStore.ts')).href

@@ -35,6 +35,10 @@ export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'NS_REFRESH_LOCK' | 'NS_RELEASE_LOCK'; wait_ms: number; token: string }
 
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|clock\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\..*)?$/i
+const SAFE_AUTHORITY_REJECTIONS = new Set([
+  'ROOT_REJECTED', 'FILE_REJECTED', 'STATE_REJECTED', 'RECOVERY_REQUIRED',
+  'NS_NOT_FOUND', 'NS_EXISTS', 'NS_NOT_EMPTY',
+])
 
 function validWindowsComponent(value: string): boolean {
   return value.length > 0 && value !== '.' && value !== '..' && !/[<>:"/\\|?*\x00-\x1f]/.test(value)
@@ -73,7 +77,7 @@ export function decodeOpenCodeWindowsPublicationReply(line: string, id: string):
   const keys = Object.keys(reply).sort().join(',')
   if (keys !== (reply.ok ? 'id,ok,value,version' : 'error,id,ok,version')) throw new Error('OpenCode Windows publication authority failed [redacted]')
   if (!reply.ok) throw new OpenCodeWindowsPublicationRejectedError(
-    typeof reply.error === 'string' && ['NS_NOT_FOUND', 'NS_EXISTS', 'NS_NOT_EMPTY'].includes(reply.error) ? reply.error : 'REJECTED',
+    typeof reply.error === 'string' && SAFE_AUTHORITY_REJECTIONS.has(reply.error) ? reply.error : 'REJECTED',
   )
   return reply.value
 }

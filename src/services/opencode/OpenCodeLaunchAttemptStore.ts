@@ -1434,6 +1434,8 @@ export type OpenCodeLaunchJournalMutationKind = 'event' | 'finalResponse'
 export type OpenCodeLaunchAttemptStoreTestHooks = {
   /** Test-only boundary after a mutation has captured its candidate but before it joins the lease-local writer queue. */
   afterMutationCandidateCaptured?: (kind: OpenCodeLaunchJournalMutationKind) => Promise<void>
+  /** Test-only observation of the physical-settlement fence registration. */
+  onRetainPhysicalSettlement?: (settlement: Promise<unknown>) => void
 }
 
 /**
@@ -1927,6 +1929,7 @@ export class OpenCodeLaunchAttemptStore {
         },
         revalidate: async () => { throw new OpenCodeLaunchJournalError('fenced', 'lease initialization incomplete') },
         retainUntilPhysicalSettlement: settlement => {
+          this.testHooks.onRetainPhysicalSettlement?.(settlement)
           const normalized = settlement.then(() => undefined, () => undefined)
           retainedPhysicalSettlement = retainedPhysicalSettlement
             ? Promise.all([retainedPhysicalSettlement, normalized]).then(() => undefined)

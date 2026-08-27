@@ -501,9 +501,9 @@ export class OpenCodeLaunchAttempt {
           try {
             this.ensureWork(policy, controller.signal)
             const profile = deepFreeze(await this.phase('profile_prepare', policy, controller.signal,
-              deadline => this.ports.profile.createSelectedProviderProfile({
+              (deadline, phaseSignal) => this.ports.profile.createSelectedProviderProfile({
                 providerId: attempt.providerId, purpose: 'launch_attempt', deadlineAtMs: deadline,
-                signal: controller.signal,
+                signal: phaseSignal,
               })))
             this.validateProfile(profile, attempt.providerId)
             await lease.bindProfile({
@@ -519,26 +519,26 @@ export class OpenCodeLaunchAttempt {
               activePhase = 'retained_host_start'
               if (this.ports.host.reserveOperationHostCleanup) {
                 hostCleanupObligation = await this.phase('retained_host_start', policy, controller.signal,
-                  deadline => this.ports.host.reserveOperationHostCleanup!({
+                  (deadline, phaseSignal) => this.ports.host.reserveOperationHostCleanup!({
                     profile, attemptId: attempt.attemptId, payloadHash: attempt.payloadHash,
-                    generation: attempt.generation, deadlineAtMs: deadline, signal: controller.signal,
+                    generation: attempt.generation, deadlineAtMs: deadline, signal: phaseSignal,
                   }))
                 hostCleanupObligationId = hostCleanupObligation.obligationId
                 await lease.bindHostCleanupObligation(hostCleanupObligation)
               }
               host = deepFreeze(await this.phase('retained_host_start', policy, controller.signal,
-                deadline => {
+                (deadline, phaseSignal) => {
                   hostAcquisitionStarted = true
                   const physicalAcquisition = this.ports.host.acquireOperationHost({
                     profile, ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
-                    deadlineAtMs: deadline, signal: controller.signal,
+                    deadlineAtMs: deadline, signal: phaseSignal,
                   })
                   const acceptedAcquisition = physicalAcquisition.then(async candidate => {
                     try {
                       if (hostCleanupObligationId && this.ports.host.readOperationHostCleanupBinding) {
                         const exactBinding = await this.ports.host.readOperationHostCleanupBinding({
                           cleanupObligationId: hostCleanupObligationId, deadlineAtMs: deadline,
-                          signal: controller.signal,
+                          signal: phaseSignal,
                         })
                         if (!hostCleanupObligation
                           || exactBinding.obligationId !== hostCleanupObligation.obligationId
@@ -556,26 +556,24 @@ export class OpenCodeLaunchAttempt {
                       // must happen only after it completes, using a final view of
                       // the caller envelope, and exactly one branch may own the
                       // physical candidate.
-                      if (!acquisitionOpen || controller.signal.aborted
+                      if (phaseSignal.aborted || !acquisitionOpen
                         || this.ports.clock.monotonicNow() >= deadline) throw new DeadlineError()
                       host = deepFreeze(candidate)
                       return host
                     } catch (classificationError) {
-                      const lateReleaseController = new AbortController()
                       try {
                         const physicalRelease = this.ports.host.releaseOperationHost({
                           host: candidate,
                           ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
                           deadlineAtMs: policy.absoluteDeadlineAtMs,
-                          signal: lateReleaseController.signal,
+                          // Physical rollback is not cancelled when the caller-facing
+                          // reserve stops waiting for its settlement.
+                          signal: new AbortController().signal,
                           lateSettlement: true,
                         })
-                        await this.ports.deadline.run(
-                          physicalRelease, policy.absoluteDeadlineAtMs, lateReleaseController.signal,
-                        )
+                        await physicalRelease
                         hostAcquisitionCleanupComplete = true
                       } catch (releaseError) {
-                        lateReleaseController.abort(new DeadlineError())
                         throw new OpenCodeOperationHostAcquisitionCleanupError(releaseError)
                       }
                       throw classificationError
@@ -583,33 +581,27 @@ export class OpenCodeLaunchAttempt {
                   }).catch(async error => {
                     if (error instanceof OpenCodeOperationHostAcquisitionCleanupError
                       && error.cleanupBinding) {
-                      const cleanupController = new AbortController()
-                      const cleanupDeadlineAtMs = this.ports.clock.monotonicNow() + 10_000
                       try {
                         await lease.bindHostCleanupObligation(error.cleanupBinding, {
-                          deadlineAtMs: cleanupDeadlineAtMs,
-                          signal: cleanupController.signal,
+                          deadlineAtMs: policy.absoluteDeadlineAtMs,
+                          signal: reserveController.signal,
                           monotonicNow: () => this.ports.clock.monotonicNow(),
                         })
                         hostCleanupObligation = error.cleanupBinding
                       } catch (bindingError) {
-                        cleanupController.abort(bindingError)
                         throw new OpenCodeOperationHostAcquisitionCleanupError(bindingError)
                       }
                     }
                     if (error instanceof OpenCodeOperationHostAcquisitionSettledError) {
-                      const cleanupController = new AbortController()
-                      const cleanupDeadlineAtMs = this.ports.clock.monotonicNow() + 10_000
                       try {
                         await lease.bindHostCleanupObligation(error.cleanupBinding, {
-                          deadlineAtMs: cleanupDeadlineAtMs,
-                          signal: cleanupController.signal,
+                          deadlineAtMs: policy.absoluteDeadlineAtMs,
+                          signal: reserveController.signal,
                           monotonicNow: () => this.ports.clock.monotonicNow(),
                         })
                         hostCleanupObligation = error.cleanupBinding
                         hostAcquisitionCleanupComplete = true
                       } catch (bindingError) {
-                        cleanupController.abort(bindingError)
                         throw new OpenCodeOperationHostAcquisitionCleanupError(bindingError)
                       }
                     }
@@ -625,13 +617,11 @@ export class OpenCodeLaunchAttempt {
                         && (error as { cleanupIncomplete?: unknown }).cleanupIncomplete === true)) {
                       hostAcquisitionCleanupComplete = true
                     }
-                    throw error
                   })
-                  // The accepted acquisition path may spend its private reserve
-                  // durably binding an incomplete-cleanup receipt. Retain a
-                  // rejection handler immediately so the sibling late-settlement
-                  // promise cannot surface as unhandled during that bounded wait.
-                  void lateHostSettlement.catch(() => undefined)
+                  // Retain the generation fence before the phase/deadline race can
+                  // reject. The exact classified settlement is also the only
+                  // promise the cleanup reserve waits for below.
+                  lease.retainUntilPhysicalSettlement(lateHostSettlement)
                   return acceptedAcquisition
                 }))
             } finally {
@@ -640,8 +630,8 @@ export class OpenCodeLaunchAttempt {
 
             activePhase = 'provider_live_validate'
             const mcp = await this.phase('provider_live_validate', policy, controller.signal,
-              deadline => this.ports.mcp.verifyAppMcp({
-                host: host!, requiredTools: attempt.requiredMcpTools, deadlineAtMs: deadline, signal: controller.signal,
+              (deadline, phaseSignal) => this.ports.mcp.verifyAppMcp({
+                host: host!, requiredTools: attempt.requiredMcpTools, deadlineAtMs: deadline, signal: phaseSignal,
               }))
             if (!sameHost(mcp.host, host)) throw new OpenCodeLaunchAttemptError('mcp.host')
             for (const tool of attempt.requiredMcpTools) {
@@ -653,8 +643,8 @@ export class OpenCodeLaunchAttempt {
             activePhase = 'retained_host_mcp_proof'
             const proofResult = durableAcceptedProof ? undefined
               : await this.phase('retained_host_mcp_proof', policy, controller.signal,
-                deadline => this.ports.proof.runFreshExactModelProof({
-                  request, profile, host: host!, deadlineAtMs: deadline, signal: controller.signal,
+                (deadline, phaseSignal) => this.ports.proof.runFreshExactModelProof({
+                  request, profile, host: host!, deadlineAtMs: deadline, signal: phaseSignal,
                 }))
             const proofCompletedAt = this.ports.clock.monotonicNow()
             const decoded = durableAcceptedProof ? undefined : decodeOpenCodeLaunchAttemptResponse(proofResult!.response)
@@ -707,8 +697,8 @@ export class OpenCodeLaunchAttempt {
               if (committed.some(link => link.memberIdentity === memberIdentity)) continue
               activePhase = 'provider_live_validate'
               const observation = await this.phase('provider_live_validate', policy, controller.signal,
-                deadline => this.ports.proof.observeRetainedProofState({
-                  request, profile, host: host!, deadlineAtMs: deadline, signal: controller.signal,
+                (deadline, phaseSignal) => this.ports.proof.observeRetainedProofState({
+                  request, profile, host: host!, deadlineAtMs: deadline, signal: phaseSignal,
                 }))
               this.validateProofObservation(observation, profile, host, attempt.providerId,
                 attempt.modelId, attempt.proofNonce, attempt.requiredMcpTools)
@@ -910,10 +900,16 @@ export class OpenCodeLaunchAttempt {
               inFlightAmbiguous = undefined
             }
           } finally {
-            if (!host && hostAcquisitionStarted && !hostAcquisitionCleanupComplete && lateHostSettlement) {
-              cleanup = 'timed_out'
-              lease.retainUntilPhysicalSettlement(lateHostSettlement)
-              void lateHostSettlement.catch(() => undefined)
+            if (!host && hostAcquisitionStarted && lateHostSettlement) {
+              try {
+                await this.ports.deadline.run(
+                  lateHostSettlement, policy.absoluteDeadlineAtMs, reserveController.signal,
+                )
+              } catch {
+                // The exact settlement remains retained and physically active;
+                // only the caller-facing cleanup wait has ended.
+              }
+              if (!hostAcquisitionCleanupComplete) cleanup = 'timed_out'
             }
             if (host) {
               let cleanupHostChain: Promise<void> | undefined
@@ -1086,11 +1082,30 @@ export class OpenCodeLaunchAttempt {
     phase: OpenCodeLaunchPhase,
     policy: OpenCodeLaunchAttemptPolicy,
     signal: AbortSignal,
-    operation: (deadlineAtMs: number) => Promise<T>,
+    operation: (deadlineAtMs: number, signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     this.ensureWork(policy, signal)
     const budget = policy.phaseBudget(phase, this.ports.clock.monotonicNow())
-    return this.ports.deadline.run(operation(budget.deadlineAtMs), budget.deadlineAtMs, signal)
+    const phaseController = new AbortController()
+    const abortPhase = () => {
+      phaseController.abort(signal.reason instanceof Error ? signal.reason : new DeadlineError())
+    }
+    signal.addEventListener('abort', abortPhase, { once: true })
+    if (signal.aborted) abortPhase()
+    try {
+      return await this.ports.deadline.run(
+        operation(budget.deadlineAtMs, phaseController.signal),
+        budget.deadlineAtMs,
+        phaseController.signal,
+      )
+    } catch (error) {
+      phaseController.abort(error)
+      if (error instanceof DeadlineError
+        || this.ports.clock.monotonicNow() >= budget.deadlineAtMs) throw new DeadlineError()
+      throw error
+    } finally {
+      signal.removeEventListener('abort', abortPhase)
+    }
   }
 
   private ensureWork(policy: OpenCodeLaunchAttemptPolicy, signal: AbortSignal): void {
@@ -1577,7 +1592,7 @@ function deepFreeze<T>(value: T): T {
   return value
 }
 
-class DeadlineError extends Error {}
+export class DeadlineError extends Error {}
 
 function sameHost(left: OpenCodeRetainedHostIdentity, right: OpenCodeRetainedHostIdentity): boolean {
   return left.hostKeyIdentity === right.hostKeyIdentity && left.processId === right.processId

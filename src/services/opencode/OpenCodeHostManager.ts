@@ -3380,6 +3380,7 @@ export class OpenCodeHostManager {
         () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
         abortSignal,
       )
+      this.assertStartupCurrent(hostKey, generation, abortSignal, entry, child)
       handle.version = health.version
       handle.resolvedConfigFingerprint = profile.managedConfigFingerprint
       handle.state = 'healthy'
