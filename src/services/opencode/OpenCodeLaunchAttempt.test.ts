@@ -96,6 +96,7 @@ function proofResponse(generation: number, nonceHash = hash, verifiedAt = 1): Op
 }
 
 function setup(options: {
+  initialNow?: number
   generation?: number
   proof?: (response: OpenCodeLaunchAttemptResponse) => void
   proofIdentities?: Partial<{ authIdentity: OpenCodeOpaqueIdentity; configIdentity: OpenCodeOpaqueIdentity; binaryIdentity: OpenCodeOpaqueIdentity }>
@@ -106,7 +107,7 @@ function setup(options: {
   transition?: OpenCodeLaunchAttemptPorts['sessions']['transitionMemberClaim']
 } = {}) {
   const persistence = new MemoryPersistence()
-  let now = 0
+  let now = options.initialNow ?? 0
   const calls: string[] = []
   const cleaned: OpenCodeOpaqueIdentity[][] = []
   const deadlines: number[] = []
@@ -249,6 +250,57 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     ).run({ request: request(), members, requestedBudgetMs: 10_000 })
     expect(replay).toMatchObject({ failurePhase: 'profile_prepare', failureAtMs: 0 })
     expect(replay.durableFinalResponse).toEqual(result.durableFinalResponse)
+  })
+
+  test('projects a proof-null profile preparation failure relative to a nonzero monotonic start', async () => {
+    const subject = setup({ initialNow: 1_000_000 })
+    subject.ports.profile.createSelectedProviderProfile = async () => {
+      throw new Error('noncanonical Windows profile path')
+    }
+
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+
+    expect(result).toMatchObject({
+      status: 'failed', failurePhase: 'profile_prepare', failureAtMs: 1_000_000,
+      durableFinalResponse: {
+        launchAttempt: { startedAt: 1_000_000, elapsedMs: 0 },
+        failure: { code: 'contract_violation', phase: 'profile_prepare' },
+      },
+    })
+    expect(subject.persistence.json().finalResponse).toEqual(result.durableFinalResponse)
+
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports,
+    ).run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay).toMatchObject({ failureAtMs: 1_000_000 })
+    expect(replay.durableFinalResponse).toEqual(result.durableFinalResponse)
+  })
+
+  test.each([
+    ['ambiguous thrown transport', async () => { throw new Error('transport failed') }, 'member_unknown'],
+    ['known member failure', async (member: OpenCodeOpaqueIdentity) => ({
+      outcome: 'known_failure' as const, failure: 'pre_side_effect_transport' as const,
+      externalEffect: false as const, owned: { memberIdentity: member },
+    }), 'member_failed'],
+  ])('captures %s before delayed member persistence', async (_name, materialize, terminalEvent) => {
+    const subject = setup({ materialize: async member => {
+      subject.setNow(1_037)
+      return materialize(member)
+    } })
+    const replace = subject.persistence.replaceAndSync.bind(subject.persistence)
+    subject.persistence.replaceAndSync = async bytes => {
+      await replace(bytes)
+      const journal = JSON.parse(new TextDecoder().decode(bytes))
+      if (journal.events.at(-1)?.type === terminalEvent) subject.setNow(1_500)
+    }
+
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+
+    expect(result.failureAtMs).toBe(1_037)
+    expect(result.durableFinalResponse?.launchAttempt.elapsedMs).toBe(1_037)
+    expect(subject.persistence.json().events.some((event: any) => event.type === terminalEvent)).toBe(true)
   })
 
   test('retains a later provider phase and failure timestamp across cleanup failure', async () => {

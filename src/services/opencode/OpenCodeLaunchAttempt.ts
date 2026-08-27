@@ -753,6 +753,8 @@ export class OpenCodeLaunchAttempt {
               const claim = await this.ports.deadline.run(claimOperation, budget.memberDeadlineAtMs, controller.signal)
               inFlightAmbiguous = undefined
               if (claim !== 'claimed') {
+                const memberFailureAtMs = this.ports.clock.monotonicNow()
+                recordFailure('unknown_transport_after_side_effect', memberFailureAtMs)
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
                   attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest, immutableDigest,
@@ -762,7 +764,7 @@ export class OpenCodeLaunchAttempt {
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                 memberUnknownPersisted = true
-                recordFailure('unknown_transport_after_side_effect'); break
+                break
               }
               await lease.revalidate(memberIdentity, claimToken)
               let claimCommitted = false
@@ -804,6 +806,8 @@ export class OpenCodeLaunchAttempt {
                 materializeOperation, budget.memberDeadlineAtMs, controller.signal)
               inFlightAmbiguous = undefined
               if (materialized.outcome === 'unknown_transport') {
+                const memberFailureAtMs = this.ports.clock.monotonicNow()
+                recordFailure('unknown_transport_after_side_effect', memberFailureAtMs)
                 if (materialized.owned) registerOwned(materialized.owned, memberIdentity)
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
@@ -814,12 +818,13 @@ export class OpenCodeLaunchAttempt {
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                 memberUnknownPersisted = true
-                recordFailure('unknown_transport_after_side_effect')
                 pending.push(...members.filter(member => member !== memberIdentity
                   && !committed.some(link => link.memberIdentity === member)))
                 break
               }
               if (materialized.outcome === 'known_failure') {
+                const memberFailureAtMs = this.ports.clock.monotonicNow()
+                recordFailure(materialized.failure, memberFailureAtMs)
                 if (materialized.owned) registerOwned(materialized.owned, memberIdentity)
                 const abortSignal = new AbortController().signal
                 const abortResult = await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
@@ -830,9 +835,9 @@ export class OpenCodeLaunchAttempt {
                   signal: abortSignal,
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 if (abortResult !== 'cancelled' && abortResult !== 'fenced') {
+                  recordFailure('unknown_transport_after_side_effect', memberFailureAtMs)
                   await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                   memberUnknownPersisted = true
-                  recordFailure('unknown_transport_after_side_effect')
                   break
                 }
                 await lease.append({
@@ -841,7 +846,6 @@ export class OpenCodeLaunchAttempt {
                 })
                 ambiguousMember = undefined
                 ambiguousClaimToken = undefined
-                recordFailure(materialized.failure)
                 pending.push(...members.filter(member => member !== memberIdentity
                   && !committed.some(link => link.memberIdentity === member)))
                 break
@@ -863,6 +867,7 @@ export class OpenCodeLaunchAttempt {
             }
             controller.abort(error)
             if (ambiguousMember) {
+              recordFailure('unknown_transport_after_side_effect', caughtAtMs)
               if (ambiguousClaimToken) {
                 const abortSignal = new AbortController().signal
                 await this.ports.deadline.run(this.ports.sessions.transitionMemberClaim({
@@ -883,7 +888,6 @@ export class OpenCodeLaunchAttempt {
                   memberUnknownPersisted = true
                 } catch (appendError) { persistenceFailure = appendError }
               }
-              recordFailure('unknown_transport_after_side_effect')
             } else {
               recordFailure(error instanceof DeadlineError
                 || policy.remainingWorkMs(caughtAtMs) <= 0
@@ -895,7 +899,7 @@ export class OpenCodeLaunchAttempt {
             // does not make the physical operation finished. This also covers a transport that
             // became ambiguous after its inner commit durably succeeded.
             if (inFlightAmbiguous && !inFlightAmbiguousSettled) {
-              recordFailure('unknown_transport_after_side_effect')
+              recordFailure('unknown_transport_after_side_effect', caughtAtMs)
               const physicalSettlement = inFlightAmbiguous.then(() => undefined, () => undefined)
               lease.retainUntilPhysicalSettlement(physicalSettlement)
               deferredAuthoritySettlement = deferredAuthoritySettlement
@@ -1201,7 +1205,7 @@ export class OpenCodeLaunchAttempt {
       absoluteDeadlineAtMs: policy.absoluteDeadlineAtMs,
       workDeadlineAtMs: policy.workDeadlineAtMs,
     })
-    const response = createOpenCodeLaunchDesktopResponse(result, request)
+    const response = createOpenCodeLaunchDesktopResponse(result, request, policy.startedAtMs)
     if (response && lease.journal.finalResponse === undefined) {
       const decoded = decodeOpenCodeLaunchAttemptResponse(response)
       if (!decoded.ok || decoded.value.kind !== 'v2') {
@@ -1261,10 +1265,11 @@ function desktopFailure(
 export function createOpenCodeLaunchDesktopResponse(
   result: OpenCodeLaunchAttemptResult,
   request?: OpenCodeLaunchAttemptRequest,
+  startedAtMs = 0,
 ): OpenCodeLaunchAttemptResponse | undefined {
   if (result.durableFinalResponse) return encodeOpenCodeLaunchAttemptResponse(result.durableFinalResponse)
   const accepted = result.acceptedProofResponse ?? (request && result.failure
-    ? terminalFailureBasis(result, request) : undefined)
+    ? terminalFailureBasis(result, request, startedAtMs) : undefined)
   if (!accepted) return undefined
   const cleanupReserveMs = result.absoluteDeadlineAtMs - result.workDeadlineAtMs
   if (cleanupReserveMs <= 0) return undefined
@@ -1509,6 +1514,7 @@ function resultFromOpenCodeDurableFinal(final: OpenCodeLaunchAttemptResponse): O
 function terminalFailureBasis(
   result: OpenCodeLaunchAttemptResult,
   request: OpenCodeLaunchAttemptRequest,
+  startedAtMs: number,
 ): OpenCodeLaunchAttemptResponse {
   const terminal = (field: string): OpenCodeOpaqueIdentity => `sha256:${createHash('sha256')
     .update(`terminal-not-authorized\0${request.launchAttempt.attemptId}\0${field}`).digest('hex')}`
@@ -1518,7 +1524,7 @@ function terminalFailureBasis(
       contractVersion: 1, attemptId: result.attemptId, idempotencyKey: 'attemptId',
       payloadHash: result.payloadHash, generation: result.generation,
       inputDigest: result.inputDigest, immutableDigest: result.immutableDigest,
-      outcome: result.status, phase: 'complete', startedAt: 0,
+      outcome: result.status, phase: 'complete', startedAt: startedAtMs,
       absoluteDeadlineAt: result.absoluteDeadlineAtMs, workDeadlineAt: result.workDeadlineAtMs,
       cleanupReserveMs: result.absoluteDeadlineAtMs - result.workDeadlineAtMs, elapsedMs: 0,
       providerId: request.launchAttempt.providerId, modelId: request.launchAttempt.modelId,
