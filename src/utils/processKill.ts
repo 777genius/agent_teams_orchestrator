@@ -215,25 +215,36 @@ export function isProcessTreeContainmentAlive(
   const readdir = observation.readdir ?? (target => readdirSync(target))
   const readStat = observation.readFile ?? (target => readFileSync(target, 'utf8'))
   try {
-    const before = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
-    for (const entry of before) {
-      if (!/^\d+$/.test(entry)) continue
-      let stat: string
-      try { stat = readStat(`/proc/${entry}/stat`) }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
-        return null
+    const scan = (): { names: string[]; identities: string[] } | null => {
+      const names = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
+      const identities: string[] = []
+      for (const entry of names) {
+        let stat: string
+        try { stat = readStat(`/proc/${entry}/stat`) }
+        catch (error) {
+          // A process disappearing during enumeration is ordinary churn.  It
+          // may be ignored only if the repeated namespace snapshot proves the
+          // whole observation stable; every other read failure is unknown.
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          return null
+        }
+        const commandEnd = stat.lastIndexOf(')')
+        if (commandEnd < 0) return null
+        const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
+        // Fields after comm start with state. pgrp is index 2 and starttime
+        // (the process birth identity) is index 19.
+        if (fields.length < 20 || !/^\d+$/.test(fields[2] ?? '')
+          || !/^\d+$/.test(fields[19] ?? '')) return null
+        identities.push(`${entry}:${fields[19]}:${fields[2]}`)
       }
-      const commandEnd = stat.lastIndexOf(')')
-      if (commandEnd < 0) return null
-      const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
-      // proc_pid_stat fields after comm begin with state, ppid, pgrp.
-      if (fields.length < 3 || !/^\d+$/.test(fields[2] ?? '')) return null
-      if (Number(fields[2]) === groupLeaderPid) return true
+      return { names, identities }
     }
-    const after = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
-    return before.length === after.length && before.every((entry, index) => entry === after[index])
-      ? false : null
+    const before = scan()
+    const after = scan()
+    if (!before || !after
+      || JSON.stringify(before.names) !== JSON.stringify(after.names)
+      || JSON.stringify(before.identities) !== JSON.stringify(after.identities)) return null
+    return after.identities.some(identity => identity.endsWith(`:${groupLeaderPid}`))
   } catch {
     return null
   }
@@ -253,12 +264,14 @@ async function waitForPosixProcessGroupExit(
     if (!isProcessAlive(groupLeaderPid)) return false
     if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
       && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
+    if (!isProcessAlive(groupLeaderPid)) return false
     if (!isPosixProcessGroupAlive(groupLeaderPid)) return true
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }
   if (!isProcessAlive(groupLeaderPid)) return false
   if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
     && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
+  if (!isProcessAlive(groupLeaderPid)) return false
   return !isPosixProcessGroupAlive(groupLeaderPid)
 }
 
@@ -320,6 +333,7 @@ export async function killProcessTreeAndWait(
     if (!isProcessAlive(pid)) return false
     if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null
       && await readProcessStartTimeMs(pid) !== options.expectedStartedAtMs) return false
+    if (!isProcessAlive(pid)) return false
     try {
       process.kill(-pid, signal)
     } catch {

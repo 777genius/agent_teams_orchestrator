@@ -4287,6 +4287,7 @@ describe('OpenCodeHostManager', () => {
       )
       const manager = new OpenCodeHostManager({
         isProcessAlive: () => false,
+        isProcessGroupAlive: () => false,
         persistentRegistryPath: registryPath,
       })
 

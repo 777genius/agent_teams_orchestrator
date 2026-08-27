@@ -58,11 +58,14 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
   try {
     const first = new OpenCodeLaunchHostReleaseLedger(file)
     await first.record(record)
-    const raw = await readFile(file, 'utf8')
+    const recordFile = path.join(`${file}.records`,
+      `${expected.generation}.${record.receipt.receiptId}.json`)
+    const raw = await readFile(recordFile, 'utf8')
     expect(raw).not.toContain('://')
     expect(raw).not.toContain('auth')
     const restarted = new OpenCodeLaunchHostReleaseLedger(file)
-    const migrated = { ...record, schemaVersion: 2 as const, disposition: 'unknown' as const,
+    const migrated = { ...record, schemaVersion: 3 as const,
+      obligationId: record.receipt.receiptId, disposition: 'unknown' as const,
       releaseState: 'pending' as const }
     expect(await restarted.read(expected)).toEqual(migrated)
     expect(await restarted.readPending({ attemptId: expected.attemptId,
@@ -71,13 +74,49 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
       releaseState: 'complete' as const }
     await restarted.record(completedKeepAlive)
     expect(await restarted.read(expected)).toEqual(completedKeepAlive)
-    await expect(restarted.read({ ...expected, generation: 4 })).rejects.toThrow('foreign')
+    expect(await restarted.read({ ...expected, generation: 4 })).toBeNull()
     await restarted.clear(completedKeepAlive)
     await restarted.clear(completedKeepAlive)
     expect(await restarted.read(expected)).toBeNull()
 
-    await writeFile(file, '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')
+    await writeFile(recordFile, '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')
     await expect(restarted.read(expected)).rejects.toThrow('corrupt')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('attempt host release ledger preserves every generation and prepublished acquisition obligation', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-generations-'))
+  const file = path.join(directory, 'receipt.json')
+  const attemptId = '123e4567-e89b-42d3-a456-426614174000'
+  const payloadHash = 'b'.repeat(64)
+  try {
+    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const firstObligation = await ledger.reserve({ attemptId, payloadHash, generation: 1,
+      hostKeyIdentity: identity })
+    expect(await new OpenCodeLaunchHostReleaseLedger(file).hasUnresolvedAcquisition({
+      attemptId, payloadHash, currentGeneration: 2,
+    })).toBe(true)
+    const first = { ...firstObligation, receipt: { schemaVersion: 1 as const,
+      receiptId: '123e4567-e89b-42d3-a456-426614174441', hostKeyDigest: 'c'.repeat(64),
+      pid: 441, processStartedAtMs: 1_441, lifetime: 'process' as const } }
+    await ledger.record(first)
+    const secondObligation = await ledger.reserve({ attemptId, payloadHash, generation: 2,
+      hostKeyIdentity: identity })
+    const second = { ...secondObligation, disposition: 'keep_alive' as const,
+      releaseState: 'complete' as const, receipt: { schemaVersion: 1 as const,
+        receiptId: '123e4567-e89b-42d3-a456-426614174442', hostKeyDigest: 'd'.repeat(64),
+        pid: 442, processStartedAtMs: 1_442, lifetime: 'persistent' as const } }
+    await ledger.record(second)
+
+    const restarted = new OpenCodeLaunchHostReleaseLedger(file)
+    expect(await restarted.hasUnresolvedAcquisition({ attemptId, payloadHash, currentGeneration: 2 }))
+      .toBe(false)
+    expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
+      .map(record => [record.generation, record.receipt.receiptId]))
+      .toEqual([[1, first.receipt.receiptId], [2, second.receipt.receiptId]])
+    await restarted.clear(second)
+    expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
+      .map(record => record.generation)).toEqual([1])
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 

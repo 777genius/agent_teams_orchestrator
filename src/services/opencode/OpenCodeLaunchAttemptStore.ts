@@ -93,6 +93,8 @@ export type OpenCodeLaunchJournal = {
   finalResponse?: OpenCodeLaunchAttemptResponse
   /** Additive schema-v1 physical cleanup truth. Missing legacy state decodes as unknown. */
   cleanupState: 'unknown' | 'complete' | 'incomplete'
+  /** Immutable attempt-bound ids for every host acquisition cleanup obligation. */
+  hostCleanupObligationIds?: string[]
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -1309,6 +1311,7 @@ export type OpenCodeLaunchJournalLease = {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<void>
   recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
+  bindHostCleanupObligation(obligationId: string, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Exact same-generation replay promotion after physical receipt reconciliation. */
   reconcileCleanupComplete(context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
@@ -1342,7 +1345,8 @@ export class OpenCodeLaunchAttemptStore {
   ) {}
 
   async inspect(identity: OpenCodeLaunchJournalIdentity, context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournal | null> {
-    return this.exclusive(async () => this.load(identity, context), context)
+    const effectiveContext = context ?? boundedDefaultContext()
+    return this.exclusive(async () => this.load(identity, effectiveContext), effectiveContext)
   }
 
   async withGeneration<T>(
@@ -1351,6 +1355,11 @@ export class OpenCodeLaunchAttemptStore {
     operation: (lease: OpenCodeLaunchJournalLease) => Promise<T>,
     context?: OpenCodeLaunchStoreContext,
   ): Promise<T> {
+    // Normalize once at the public boundary.  The same absolute deadline must
+    // govern lock acquisition, the initial read, every publication and lease
+    // release; passing the optional argument deeper used to leave the actual
+    // persistence operation unbounded even though the queue wait was bounded.
+    context ??= boundedDefaultContext()
     let retainedPhysicalSettlement: Promise<void> | undefined
     let deactivateLease = (): void => undefined
     let acquisitionContext = context
@@ -1696,6 +1705,21 @@ export class OpenCodeLaunchAttemptStore {
             journal = candidate
             Object.assign(lease.journal, candidate)
           }, cleanupContext)
+        },
+        bindHostCleanupObligation: async (obligationId, obligationContext) => {
+          if (!/^[0-9a-f-]{36}$/i.test(obligationId)) {
+            throw new OpenCodeLaunchJournalError('foreign', 'host cleanup obligation id is invalid')
+          }
+          await serializeMutation(async () => {
+            const existing = journal!.hostCleanupObligationIds ?? []
+            if (existing.includes(obligationId)) return
+            const candidate = { ...journal!, hostCleanupObligationIds: [...existing, obligationId] }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, obligationContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, obligationContext)
         },
         reconcileCleanupComplete: async cleanupContext => {
           if (beganGeneration) {
@@ -2053,6 +2077,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
   const allowedJournalKeys = new Set<string>([
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
     'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse', 'cleanupState',
+    'hostCleanupObligationIds',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -2134,6 +2159,14 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     && source.cleanupState !== 'complete'
     && source.cleanupState !== 'incomplete') {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid cleanup state')
+  }
+  if (source.hostCleanupObligationIds !== undefined
+    && (!Array.isArray(source.hostCleanupObligationIds)
+      || source.hostCleanupObligationIds.length > 1_000
+      || new Set(source.hostCleanupObligationIds).size !== source.hostCleanupObligationIds.length
+      || source.hostCleanupObligationIds.some(value => typeof value !== 'string'
+        || !/^[0-9a-f-]{36}$/i.test(value)))) {
+    throw new OpenCodeLaunchJournalError('corrupt', 'invalid host cleanup obligations')
   }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid journal event count')

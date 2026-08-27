@@ -1402,8 +1402,12 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
   test('tightens continuation writes to the persisted absolute deadline instead of resetting it', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
-    await store.withGeneration({ ...identity, startedAtMs: 0, totalBudgetMs: 10 }, 'begin', async () => undefined)
-    const continuationToken = await issueContinuation(store, identity)
+    const initialContext = { deadlineAtMs: 10, monotonicNow: () => 0,
+      signal: new AbortController().signal }
+    await store.withGeneration({ ...identity, startedAtMs: 0, totalBudgetMs: 10 }, 'begin',
+      async () => undefined, initialContext)
+    const continuationToken = await store.withGeneration(identity, 'replay',
+      lease => lease.issueContinuation([member], initialContext), initialContext)
     await expect(store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
       continuationToken }, 'continue', async () => undefined, {
       deadlineAtMs: 110, monotonicNow: () => 10, signal: new AbortController().signal,

@@ -43,7 +43,7 @@ jobs:
           src/services/opencode/OpenCodePassiveStatusSnapshotWriter.test.ts
           src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
           src/services/opencode/OpenCodeActiveStatusSnapshotPublisher.test.ts
-      - name: Test fake-only launch cleanup recovery
+      - name: Test production launch cleanup composition and safety contracts
         run: >-
           bun test
           src/services/opencode/OpenCodeLaunchAttempt.test.ts
@@ -51,6 +51,8 @@ jobs:
           src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
           src/services/opencode/OpenCodeLaunchAttemptStore.test.ts
           src/services/opencode/OpenCodeHostManager.test.ts
+          src/services/opencode/OpenCodeCatalogCrossPlatformContract.test.ts
+          src/services/opencode/OpenCodeProviderCatalogService.test.ts
           src/utils/processKill.test.ts
 
   windows-passive-snapshot:
@@ -112,7 +114,7 @@ jobs:
           src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
           src/services/opencode/OpenCodePassiveSnapshotPersistencePolicy.test.ts
           src/services/runtimeBackends/openCodePassiveStatus.test.ts
-      - name: Test fake-only Windows launch cleanup authority
+      - name: Test Windows production cleanup composition and owned authority
         run: |
           bun test \
             src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts \

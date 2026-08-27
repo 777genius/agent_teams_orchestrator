@@ -85,8 +85,17 @@ export type OpenCodeLaunchAttemptPorts = {
     }): Promise<OpenCodeLaunchProfile>
   }
   host: {
+    reserveOperationHostCleanup?(input: {
+      profile: OpenCodeLaunchProfile
+      attemptId: string
+      payloadHash: string
+      generation: number
+      deadlineAtMs: number
+      signal: AbortSignal
+    }): Promise<string>
     acquireOperationHost(input: {
       profile: OpenCodeLaunchProfile
+      cleanupObligationId?: string
       deadlineAtMs: number
       signal: AbortSignal
     }): Promise<OpenCodeRetainedHostIdentity>
@@ -100,6 +109,7 @@ export type OpenCodeLaunchAttemptPorts = {
       attemptId: string
       payloadHash: string
       generation: number
+      cleanupObligationIds?: readonly string[]
       deadlineAtMs: number
       signal: AbortSignal
     }): Promise<'complete' | 'incomplete'>
@@ -363,6 +373,8 @@ export class OpenCodeLaunchAttempt {
                 attemptId: attempt.attemptId,
                 payloadHash: attempt.payloadHash,
                 generation: attempt.generation,
+                ...(lease.journal.hostCleanupObligationIds
+                  ? { cleanupObligationIds: lease.journal.hostCleanupObligationIds } : {}),
                 deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
                 signal: reserveController.signal,
               }).catch(() => 'incomplete' as const)
@@ -416,6 +428,7 @@ export class OpenCodeLaunchAttempt {
             if (!existing) owned.push(deepFreeze(structuredClone(resource)))
           }
           let host: OpenCodeRetainedHostIdentity | undefined
+          let hostCleanupObligationId: string | undefined
           let hostAcquisitionStarted = false
           let hostAcquisitionCleanupComplete = false
           let lateHostSettlement: Promise<void> | undefined
@@ -455,11 +468,20 @@ export class OpenCodeLaunchAttempt {
             })
             let acquisitionOpen = true
             try {
+              if (this.ports.host.reserveOperationHostCleanup) {
+                hostCleanupObligationId = await this.phase('retained_host_start', policy, controller.signal,
+                  deadline => this.ports.host.reserveOperationHostCleanup!({
+                    profile, attemptId: attempt.attemptId, payloadHash: attempt.payloadHash,
+                    generation: attempt.generation, deadlineAtMs: deadline, signal: controller.signal,
+                  }))
+                await lease.bindHostCleanupObligation(hostCleanupObligationId)
+              }
               host = deepFreeze(await this.phase('retained_host_start', policy, controller.signal,
                 deadline => {
                   hostAcquisitionStarted = true
                   const physicalAcquisition = this.ports.host.acquireOperationHost({
-                    profile, deadlineAtMs: deadline, signal: controller.signal,
+                    profile, ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
+                    deadlineAtMs: deadline, signal: controller.signal,
                   })
                   const acceptedAcquisition = physicalAcquisition.then(candidate => {
                     if (!acquisitionOpen || controller.signal.aborted

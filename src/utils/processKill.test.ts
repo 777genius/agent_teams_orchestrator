@@ -87,7 +87,7 @@ describe('processKill', () => {
       await expect(killProcessTreeAndWait(44_302, 'SIGKILL', {
         timeoutMs: 10, posixProcessGroupLeader: true,
       })).resolves.toBe(true)
-      expect(calls).toEqual([44_302, -44_302, 44_302, -44_302])
+      expect(calls).toEqual([44_302, 44_302, -44_302, 44_302, 44_302, -44_302])
     } finally {
       kill.mockRestore()
     }
@@ -143,22 +143,29 @@ describe('processKill', () => {
   })
 
   it('requires well-formed and stable Linux proc observations before proving empty', () => {
+    const stat = (name: string, pgrp: number, birth = 99) =>
+      `10 (${name}) S 1 ${pgrp} ${Array(16).fill('0').join(' ')} ${birth}`
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'], readFile: () => 'malformed',
     })).toBeNull()
     let reads = 0
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ++reads === 1 ? ['10'] : [],
-      readFile: () => '10 (gone) S 1 10 0 0',
+      readFile: () => stat('gone', 10),
     })).toBeNull()
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'],
-      readFile: () => '10 (stable) S 1 10 0 0',
+      readFile: () => stat('stable', 10),
     })).toBe(false)
     expect(isProcessTreeContainmentAlive(443, {
       platform: 'linux', readdir: () => ['10'],
-      readFile: () => '10 (live) S 1 443 0 0',
+      readFile: () => stat('live', 443),
     })).toBe(true)
+    let identityRead = 0
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'],
+      readFile: () => stat('churn', identityRead++ === 0 ? 10 : 443, identityRead),
+    })).toBeNull()
   })
 
   it('fails closed for strict Windows PID-only cleanup and accepts owned job completion', async () => {
