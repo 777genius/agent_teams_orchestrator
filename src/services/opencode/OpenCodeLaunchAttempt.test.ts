@@ -227,6 +227,52 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     expect(subject.calls).toHaveLength(calls)
   })
 
+  test('publishes a profile preparation exception at its true frozen-clock timestamp', async () => {
+    const subject = setup()
+    subject.ports.profile.createSelectedProviderProfile = async () => {
+      throw new Error('noncanonical Windows profile path')
+    }
+
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+
+    expect(result).toMatchObject({
+      status: 'failed', failurePhase: 'profile_prepare', failureAtMs: 0,
+      durableFinalResponse: {
+        launchAttempt: { elapsedMs: 0 },
+        failure: { code: 'contract_violation', phase: 'profile_prepare' },
+      },
+    })
+    expect(subject.persistence.json().finalResponse).toEqual(result.durableFinalResponse)
+
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports,
+    ).run({ request: request(), members, requestedBudgetMs: 10_000 })
+    expect(replay).toMatchObject({ failurePhase: 'profile_prepare', failureAtMs: 0 })
+    expect(replay.durableFinalResponse).toEqual(result.durableFinalResponse)
+  })
+
+  test('retains a later provider phase and failure timestamp across cleanup failure', async () => {
+    const subject = setup()
+    subject.ports.mcp.verifyAppMcp = async () => {
+      subject.setNow(37)
+      throw new Error('MCP validation failed')
+    }
+    subject.ports.host.releaseOperationHost = async () => {
+      subject.setNow(500)
+      throw new Error('host cleanup failed')
+    }
+
+    const result = await subject.launch.run({ request: request(), members, requestedBudgetMs: 10_000 })
+
+    expect(result).toMatchObject({
+      status: 'failed', cleanup: 'timed_out', failurePhase: 'provider_live_validate', failureAtMs: 37,
+      durableFinalResponse: {
+        launchAttempt: { elapsedMs: 37 },
+        failure: { code: 'contract_violation', phase: 'provider_live_validate' },
+      },
+    })
+  })
+
   test.each([
     ['missing roster identity', (value: OpenCodeLaunchAttemptResponse) => { value.members.committed.pop() }],
     ['invented roster identity', (value: OpenCodeLaunchAttemptResponse) => {
@@ -547,6 +593,13 @@ describe('OpenCodeLaunchAttempt exact proof and deadlines', () => {
     const subject = setup({ proof: () => subject.setNow(9_000) })
     const result = await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
     expect(result.status).toBe('failed')
+    expect(result).toMatchObject({
+      failurePhase: 'retained_host_mcp_proof', failureAtMs: 9_002,
+      durableFinalResponse: {
+        launchAttempt: { elapsedMs: 9_002 },
+        failure: { code: 'deadline_before_partial', phase: 'retained_host_mcp_proof' },
+      },
+    })
     expect(subject.persistence.json().events).toEqual([])
     expect(subject.calls.some(call => call.startsWith('create:'))).toBe(false)
   })

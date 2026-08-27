@@ -7,6 +7,7 @@ import {
   isOpenCodeOpaqueIdentity,
   validateOpenCodeLaunchAttemptCorrelation,
   type OpenCodeLaunchAttemptRequest,
+  type OpenCodeLaunchAttemptPhase,
   type OpenCodeLaunchAttemptResponse,
   type OpenCodeLaunchFailureDetails,
   type OpenCodeLaunchMemberLinkage,
@@ -280,6 +281,10 @@ export type OpenCodeLaunchAttemptResult = {
   /** Canonical persisted Desktop V1 outcome, including proof-null terminal failures. */
   durableFinalResponse?: OpenCodeLaunchAttemptResponse
   failure?: ReturnType<typeof classifyOpenCodeLaunchFailure>
+  /** Phase active when the terminal failure was classified. Absent on legacy in-memory callers. */
+  failurePhase?: OpenCodeLaunchAttemptPhase
+  /** Monotonic timestamp captured before cleanup/persistence can consume the reserve. */
+  failureAtMs?: number
   cleanup: OpenCodeLaunchCleanupOutcome
   absoluteDeadlineAtMs: number
   workDeadlineAtMs: number
@@ -468,6 +473,14 @@ export class OpenCodeLaunchAttempt {
           let hostAcquisitionCleanupComplete = false
           let lateHostSettlement: Promise<void> | undefined
           let failure: OpenCodeLaunchFailureKind | undefined
+          let failurePhase: OpenCodeLaunchPhase | undefined
+          let failureAtMs: number | undefined
+          let activePhase: OpenCodeLaunchPhase = 'profile_prepare'
+          const recordFailure = (kind: OpenCodeLaunchFailureKind, atMs = this.ports.clock.monotonicNow()): void => {
+            failure = kind
+            failurePhase ??= activePhase
+            failureAtMs ??= atMs
+          }
           let cleanup: OpenCodeLaunchCleanupOutcome = 'complete'
           let ambiguousMember: OpenCodeOpaqueIdentity | undefined
           let ambiguousClaimToken: string | undefined
@@ -503,6 +516,7 @@ export class OpenCodeLaunchAttempt {
             })
             let acquisitionOpen = true
             try {
+              activePhase = 'retained_host_start'
               if (this.ports.host.reserveOperationHostCleanup) {
                 hostCleanupObligation = await this.phase('retained_host_start', policy, controller.signal,
                   deadline => this.ports.host.reserveOperationHostCleanup!({
@@ -624,6 +638,7 @@ export class OpenCodeLaunchAttempt {
               acquisitionOpen = false
             }
 
+            activePhase = 'provider_live_validate'
             const mcp = await this.phase('provider_live_validate', policy, controller.signal,
               deadline => this.ports.mcp.verifyAppMcp({
                 host: host!, requiredTools: attempt.requiredMcpTools, deadlineAtMs: deadline, signal: controller.signal,
@@ -635,6 +650,7 @@ export class OpenCodeLaunchAttempt {
 
             const durableAcceptedProof = lease.journal.acceptedProofResponse
             const proofStartedAt = this.ports.clock.monotonicNow()
+            activePhase = 'retained_host_mcp_proof'
             const proofResult = durableAcceptedProof ? undefined
               : await this.phase('retained_host_mcp_proof', policy, controller.signal,
                 deadline => this.ports.proof.runFreshExactModelProof({
@@ -689,12 +705,14 @@ export class OpenCodeLaunchAttempt {
             const memberPhaseStartedAt = this.ports.clock.monotonicNow()
             for (const memberIdentity of members) {
               if (committed.some(link => link.memberIdentity === memberIdentity)) continue
+              activePhase = 'provider_live_validate'
               const observation = await this.phase('provider_live_validate', policy, controller.signal,
                 deadline => this.ports.proof.observeRetainedProofState({
                   request, profile, host: host!, deadlineAtMs: deadline, signal: controller.signal,
                 }))
               this.validateProofObservation(observation, profile, host, attempt.providerId,
                 attempt.modelId, attempt.proofNonce, attempt.requiredMcpTools)
+              activePhase = 'member_materialize'
               this.ensureWork(policy, controller.signal)
               const budget = policy.memberMaterializationBudget(
                 memberPhaseStartedAt,
@@ -744,7 +762,7 @@ export class OpenCodeLaunchAttempt {
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                 memberUnknownPersisted = true
-                failure = 'unknown_transport_after_side_effect'; break
+                recordFailure('unknown_transport_after_side_effect'); break
               }
               await lease.revalidate(memberIdentity, claimToken)
               let claimCommitted = false
@@ -796,7 +814,7 @@ export class OpenCodeLaunchAttempt {
                 }), policy.absoluteDeadlineAtMs, abortSignal).catch(() => 'unknown' as const)
                 await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                 memberUnknownPersisted = true
-                failure = 'unknown_transport_after_side_effect'
+                recordFailure('unknown_transport_after_side_effect')
                 pending.push(...members.filter(member => member !== memberIdentity
                   && !committed.some(link => link.memberIdentity === member)))
                 break
@@ -814,7 +832,7 @@ export class OpenCodeLaunchAttempt {
                 if (abortResult !== 'cancelled' && abortResult !== 'fenced') {
                   await lease.append({ type: 'member_unknown', memberIdentity, claimToken })
                   memberUnknownPersisted = true
-                  failure = 'unknown_transport_after_side_effect'
+                  recordFailure('unknown_transport_after_side_effect')
                   break
                 }
                 await lease.append({
@@ -823,7 +841,7 @@ export class OpenCodeLaunchAttempt {
                 })
                 ambiguousMember = undefined
                 ambiguousClaimToken = undefined
-                failure = materialized.failure
+                recordFailure(materialized.failure)
                 pending.push(...members.filter(member => member !== memberIdentity
                   && !committed.some(link => link.memberIdentity === member)))
                 break
@@ -839,6 +857,7 @@ export class OpenCodeLaunchAttempt {
               this.ensureWork(policy, controller.signal)
             }
           } catch (error) {
+            const caughtAtMs = this.ports.clock.monotonicNow()
             if (error instanceof OpenCodeLaunchPoisonedLeaseError) {
               deferredAuthoritySettlement = error.physicalSettlement
             }
@@ -864,18 +883,19 @@ export class OpenCodeLaunchAttempt {
                   memberUnknownPersisted = true
                 } catch (appendError) { persistenceFailure = appendError }
               }
-              failure = 'unknown_transport_after_side_effect'
+              recordFailure('unknown_transport_after_side_effect')
             } else {
-              failure = error instanceof DeadlineError
-                || policy.remainingWorkMs(this.ports.clock.monotonicNow()) <= 0
+              recordFailure(error instanceof DeadlineError
+                || policy.remainingWorkMs(caughtAtMs) <= 0
                 ? (committed.length ? 'deadline_after_partial' : 'deadline_before_partial')
-                : failure ?? (controller.signal.aborted && input.signal?.aborted ? 'cancelled' : 'contract_violation')
+                : failure ?? (controller.signal.aborted && input.signal?.aborted ? 'cancelled' : 'contract_violation'),
+              caughtAtMs)
             }
             // A durable tombstone prevents a late commit from becoming authoritative, but it
             // does not make the physical operation finished. This also covers a transport that
             // became ambiguous after its inner commit durably succeeded.
             if (inFlightAmbiguous && !inFlightAmbiguousSettled) {
-              failure = 'unknown_transport_after_side_effect'
+              recordFailure('unknown_transport_after_side_effect')
               const physicalSettlement = inFlightAmbiguous.then(() => undefined, () => undefined)
               lease.retainUntilPhysicalSettlement(physicalSettlement)
               deferredAuthoritySettlement = deferredAuthoritySettlement
@@ -996,7 +1016,7 @@ export class OpenCodeLaunchAttempt {
                   : 'failed'
           return this.result(lease, policy, attempt.attemptId, attempt.payloadHash, inputDigest,
             immutableDigest, lease.generation, status, committed, members, failure, cleanup,
-            request, acceptedProofResponse, owned, reserveController.signal)
+            request, acceptedProofResponse, owned, reserveController.signal, failurePhase, failureAtMs)
         },
         { acquisition: initialStoreContext, body: initialStoreContext, release: releaseStoreContext },
       )
@@ -1123,6 +1143,8 @@ export class OpenCodeLaunchAttempt {
     acceptedProofResponse: OpenCodeLaunchAttemptResponse | undefined,
     currentOwned: readonly OpenCodeLaunchOwnedResources[],
     cleanupSignal: AbortSignal,
+    failurePhase?: OpenCodeLaunchAttemptPhase,
+    failureAtMs?: number,
   ): Promise<OpenCodeLaunchAttemptResult> {
     const persistedCleanup = lease.journal.cleanupState ?? 'unknown'
     const cleanupState = persistedCleanup === 'complete' ? 'complete'
@@ -1173,6 +1195,8 @@ export class OpenCodeLaunchAttempt {
       ...(continuationToken === undefined ? {} : { continuationToken }),
       ...(acceptedProofResponse === undefined ? {} : { acceptedProofResponse }),
       ...(aggregateFailure === undefined ? {} : { failure: classifyOpenCodeLaunchFailure(aggregateFailure) }),
+      ...(aggregateFailure === undefined || failurePhase === undefined ? {} : { failurePhase }),
+      ...(aggregateFailure === undefined || failureAtMs === undefined ? {} : { failureAtMs }),
       cleanup,
       absoluteDeadlineAtMs: policy.absoluteDeadlineAtMs,
       workDeadlineAtMs: policy.workDeadlineAtMs,
@@ -1219,6 +1243,7 @@ export class OpenCodeLaunchAttempt {
 
 function desktopFailure(
   failure: NonNullable<OpenCodeLaunchAttemptResult['failure']>,
+  phase: OpenCodeLaunchAttemptPhase = 'member_materialize',
 ): OpenCodeLaunchFailureDetails {
   const code = failure.kind
   return {
@@ -1228,7 +1253,7 @@ function desktopFailure(
         : 'provider',
     retryDisposition: failure.retryDisposition,
     retryable: failure.retryable,
-    phase: 'member_materialize',
+    phase,
     sideEffectsStarted: failure.sideEffectsStarted,
   }
 }
@@ -1243,7 +1268,10 @@ export function createOpenCodeLaunchDesktopResponse(
   if (!accepted) return undefined
   const cleanupReserveMs = result.absoluteDeadlineAtMs - result.workDeadlineAtMs
   if (cleanupReserveMs <= 0) return undefined
-  const failure = result.failure ? desktopFailure(result.failure) : undefined
+  const failure = result.failure ? desktopFailure(result.failure, result.failurePhase) : undefined
+  const terminalAt = result.failureAtMs
+    ?? accepted.proof?.verifiedAt
+    ?? result.absoluteDeadlineAtMs
   return encodeOpenCodeLaunchAttemptResponse({
     launchAttempt: {
       ...accepted.launchAttempt,
@@ -1257,8 +1285,8 @@ export function createOpenCodeLaunchDesktopResponse(
       workDeadlineAt: result.workDeadlineAtMs,
       absoluteDeadlineAt: result.absoluteDeadlineAtMs,
       cleanupReserveMs,
-      elapsedMs: Math.max(0, Math.min(result.absoluteDeadlineAtMs,
-        accepted.proof?.verifiedAt ?? result.absoluteDeadlineAtMs) - accepted.launchAttempt.startedAt),
+      elapsedMs: Math.max(0, Math.min(result.absoluteDeadlineAtMs, terminalAt)
+        - accepted.launchAttempt.startedAt),
     },
     ...(accepted.proof === undefined ? {} : { proof: { ...accepted.proof, generation: result.generation } }),
     members: {
@@ -1319,6 +1347,8 @@ export function createOpenCodeLaunchAttemptResult(
     ...(input.acceptedProofResponse === undefined ? {} : { acceptedProofResponse: input.acceptedProofResponse }),
     ...(input.durableFinalResponse === undefined ? {} : { durableFinalResponse: input.durableFinalResponse }),
     ...(input.failure === undefined ? {} : { failure: input.failure }),
+    ...(input.failurePhase === undefined ? {} : { failurePhase: input.failurePhase }),
+    ...(input.failureAtMs === undefined ? {} : { failureAtMs: input.failureAtMs }),
     cleanup: input.cleanup,
     absoluteDeadlineAtMs: input.absoluteDeadlineAtMs,
     workDeadlineAtMs: input.workDeadlineAtMs,
@@ -1466,6 +1496,10 @@ function resultFromOpenCodeDurableFinal(final: OpenCodeLaunchAttemptResponse): O
     ...(final.proof ? { acceptedProofResponse: final } : {}),
     durableFinalResponse: final,
     ...(final.failure === undefined ? {} : { failure: classifyOpenCodeLaunchFailure(final.failure.code) }),
+    ...(final.failure === undefined ? {} : {
+      failurePhase: final.failure.phase,
+      failureAtMs: final.launchAttempt.startedAt + final.launchAttempt.elapsedMs,
+    }),
     cleanup: final.members.cleanupPending.length === 0 ? 'complete' : 'timed_out',
     absoluteDeadlineAtMs: final.launchAttempt.absoluteDeadlineAt,
     workDeadlineAtMs: final.launchAttempt.workDeadlineAt,
@@ -1502,7 +1536,7 @@ function terminalFailureBasis(
     members: { committed: [], failed: result.failed.map(item => ({ memberIdentity: item.memberIdentity,
       failure: desktopFailure(item.failure) })), pending: result.pending,
       cleanupPending: result.cleanupPending },
-    failure: desktopFailure(result.failure!),
+    failure: desktopFailure(result.failure!, result.failurePhase),
   })
 }
 
