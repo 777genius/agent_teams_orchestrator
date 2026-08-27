@@ -10,6 +10,50 @@ import {
 } from './OpenCodeSafePublication.js'
 
 describe('OpenCodeSafePublication', () => {
+  test('Windows passive validation uses the retained read authority without a writer handle', async () => {
+    let validations = 0
+    const passiveAuthority = {
+      validate: () => { validations += 1 },
+    }
+    const directory = new OpenCodeSafePublicationDirectory(
+      null, 'C:\\retained', { dev: 1n, ino: 2n }, null, '.', true, true,
+      passiveAuthority as never,
+    )
+
+    await directory.validate()
+
+    expect(validations).toBe(1)
+  })
+
+  test.each(['missing', 'corrupt', 'transient'])(
+    'Windows passive validation fails closed for %s retained authority state',
+    async state => {
+      const passiveAuthority = {
+        validate: () => { throw new Error(state) },
+      }
+      const directory = new OpenCodeSafePublicationDirectory(
+        null, 'C:\\retained', { dev: 1n, ino: 2n }, null, '.', true, true,
+        passiveAuthority as never,
+      )
+
+      await expect(directory.validate()).rejects.toThrow('OpenCode safe publication primitive is unavailable [redacted]')
+    },
+  )
+
+  test('Windows writer validation continues through the retained native authority', async () => {
+    let validations = 0
+    const writerAuthority = {
+      validateRoot: async () => { validations += 1 },
+    }
+    const directory = new OpenCodeSafePublicationDirectory(
+      null, 'C:\\retained', { dev: 1n, ino: 2n }, writerAuthority as never,
+    )
+
+    await directory.validate()
+
+    expect(validations).toBe(1)
+  })
+
   test('physical settlement uses a referenced finite deadline and kills a wedged launcher', async () => {
     let kills = 0
     const authority = {

@@ -290,7 +290,7 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async validate(): Promise<void> {
-    if (this.#windowsAuthority) return this.#assertWindowsRoot()
+    if (this.#windowsPassiveAuthority || this.#windowsAuthority) return this.#assertWindowsRoot()
     const metadata = await this.#handle!.stat().catch(fail)
     if (!metadata.isDirectory()) fail()
   }
