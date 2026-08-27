@@ -196,6 +196,20 @@ export type OpenCodeLaunchAttemptPorts = {
   }
 }
 
+/**
+ * Acquisition failed after a host may have been created and its physical
+ * release could not be proved.  The marker is intentionally data-free so it
+ * can cross production composition without exposing host details.
+ */
+export class OpenCodeOperationHostAcquisitionCleanupError extends Error {
+  readonly cleanupIncomplete = true
+
+  constructor(cause?: unknown) {
+    super('OpenCode operation host acquisition cleanup is incomplete', { cause })
+    this.name = 'OpenCodeOperationHostAcquisitionCleanupError'
+  }
+}
+
 export type OpenCodeLaunchAttemptInput = {
   request: OpenCodeLaunchAttemptRequest
   members: readonly OpenCodeOpaqueIdentity[]
@@ -476,8 +490,13 @@ export class OpenCodeLaunchAttempt {
                       throw error
                     }
                     hostAcquisitionCleanupComplete = true
-                  }, () => {
-                    hostAcquisitionCleanupComplete = true
+                  }, error => {
+                    if (!(error instanceof OpenCodeOperationHostAcquisitionCleanupError)
+                      && !(error && typeof error === 'object'
+                        && (error as { cleanupIncomplete?: unknown }).cleanupIncomplete === true)) {
+                      hostAcquisitionCleanupComplete = true
+                    }
+                    throw error
                   })
                   return acceptedAcquisition
                 }))

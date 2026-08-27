@@ -603,6 +603,67 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     }
   })
 
+  test('restart receipt reconciliation preserves a persistent host with durable member leases', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-leased-receipt-restart-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_443)
+    const ownerKey = Buffer.alloc(32, 7)
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44_443,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 45_443,
+      readProcessStartTimeMs: async pid => pid === 45_443 ? 12_345 : null,
+      persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+    })
+    try {
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      await manager.retainHostLease(reference.handle.hostKey, {
+        teamId: 'team', laneId: 'lane', memberName: 'member', runId: 'run', sessionId: 'session',
+      })
+      const registry = JSON.parse(await readFile(registryPath, 'utf8'))
+      const [hostKey, record] = Object.entries(registry.hosts)[0] as [string, any]
+      const restarted = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: pid => pid === record.pid,
+        readProcessStartTimeMs: async pid => pid === record.pid ? record.processStartedAtMs : null,
+        isProcessGroupAlive: () => true,
+        killProcess: (_pid, signal) => { signals.push(signal) },
+      })
+      await restarted.reconcileHostReleaseReceipt({
+        schemaVersion: 1, receiptId: '44444444-4444-4444-8444-444444444444',
+        hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
+        pid: record.pid, processStartedAtMs: record.processStartedAtMs, lifetime: 'persistent',
+      })
+      expect(signals).toEqual([])
+      expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
+      await manager.releaseHostLease(reference.handle.hostKey, {
+        teamId: 'team', laneId: 'lane', memberName: 'member', runId: 'run', sessionId: 'session',
+      })
+      let remoteEffects = 0
+      const windowsRestart = new OpenCodeHostManager({
+        platform: 'win32', persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: pid => pid === record.pid,
+        readProcessStartTimeMs: async pid => pid === record.pid ? record.processStartedAtMs : null,
+        fetchJson: async () => { remoteEffects += 1; return { status: 200, data: {} } },
+        killProcess: () => { remoteEffects += 1 },
+      })
+      await expect(windowsRestart.reconcileHostReleaseReceipt({
+        schemaVersion: 1, receiptId: '55555555-5555-4555-8555-555555555555',
+        hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
+        pid: record.pid, processStartedAtMs: record.processStartedAtMs, lifetime: 'persistent',
+      })).rejects.toThrow('no owned Windows launcher/job handle')
+      expect(remoteEffects).toBe(0)
+      expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
   test('force cleanup retains registry when the leader vanishes at the force identity read', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-force-identity-race-'))
     const registryPath = path.join(tempDir, 'registry.json')

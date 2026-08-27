@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 
-import { OpenCodeLaunchAttempt, validateOpenCodeLaunchResponseRoster,
+import { OpenCodeLaunchAttempt, OpenCodeOperationHostAcquisitionCleanupError,
+  validateOpenCodeLaunchResponseRoster,
   type OpenCodeLaunchAttemptPorts } from './OpenCodeLaunchAttempt.js'
 import { projectOpenCodeLaunchAttemptResponse } from './OpenCodeLaunchAttemptProduction.js'
 import { decodeOpenCodeLaunchAttemptResponse } from './OpenCodeBridgeContractV2.js'
@@ -1605,6 +1606,28 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(releaseInputs[0]?.signal.aborted).toBe(true)
     expect(subject.persistence.json().cleanupState).not.toBe('complete')
     expect(subject.persistence.json().finalResponse).toBeUndefined()
+  })
+
+  test('persists incomplete cleanup when acquisition rejects after unproved fallback release', async () => {
+    const subject = setup()
+    subject.ports.host.acquireOperationHost = async () => {
+      throw new OpenCodeOperationHostAcquisitionCleanupError(new Error('release resisted TERM'))
+    }
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(result.cleanup).toBe('timed_out')
+    expect(subject.persistence.json()).toMatchObject({
+      cleanupState: 'incomplete',
+      finalResponse: { members: { cleanupPending: [] } },
+    })
+    subject.ports.host.reconcileOperationHost = async () => 'incomplete'
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports).run({
+        request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+      })
+    expect(replay.cleanup).toBe('timed_out')
+    expect(subject.persistence.json().cleanupState).toBe('incomplete')
   })
 
   test('accepts an immediately resolved host synchronously and uses the normal one-shot release path', async () => {

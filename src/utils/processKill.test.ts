@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 import {
   buildWindowsTaskkillInvocation,
+  isProcessTreeContainmentAlive,
   isProcessAlive,
   killProcessTreeAndWait,
   readProcessCommandLine,
@@ -129,5 +130,72 @@ describe('processKill', () => {
     } finally {
       kill.mockRestore()
     }
+  })
+
+  it.each(['EACCES', 'EIO'] as const)('treats Linux proc %s as unknown, never empty', code => {
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'], readFile: () => {
+        const error = new Error(code) as NodeJS.ErrnoException
+        error.code = code
+        throw error
+      },
+    })).toBeNull()
+  })
+
+  it('requires well-formed and stable Linux proc observations before proving empty', () => {
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'], readFile: () => 'malformed',
+    })).toBeNull()
+    let reads = 0
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ++reads === 1 ? ['10'] : [],
+      readFile: () => '10 (gone) S 1 10 0 0',
+    })).toBeNull()
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'],
+      readFile: () => '10 (stable) S 1 10 0 0',
+    })).toBe(false)
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'],
+      readFile: () => '10 (live) S 1 443 0 0',
+    })).toBe(true)
+  })
+
+  it('fails closed for strict Windows PID-only cleanup and accepts owned job completion', async () => {
+    await expect(killProcessTreeAndWait(44_305, 'SIGTERM', {
+      platform: 'win32', timeoutMs: 10, windowsTaskkillTreeAuthority: true,
+    })).resolves.toBe(false)
+    await expect(killProcessTreeAndWait(44_305, 'SIGTERM', {
+      platform: 'win32', timeoutMs: 10, expectedStartedAtMs: 12_345,
+    })).resolves.toBe(false)
+    const releases: NodeJS.Signals[] = []
+    await expect(killProcessTreeAndWait(44_305, 'SIGKILL', {
+      platform: 'win32', timeoutMs: 10, windowsTaskkillTreeAuthority: true,
+      windowsOwnedTreeRelease: async signal => { releases.push(signal); return true },
+    })).resolves.toBe(true)
+    expect(releases).toEqual(['SIGKILL'])
+    await expect(killProcessTreeAndWait(44_305, 'SIGKILL', {
+      platform: 'win32', timeoutMs: 10, windowsTaskkillTreeAuthority: true,
+      windowsOwnedTreeRelease: async () => false,
+    })).resolves.toBe(false)
+  })
+
+  it('never invokes a PID-only Windows tree mutation', async () => {
+    const calls: Array<[number, NodeJS.Signals | number | undefined]> = []
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      calls.push([pid, signal])
+      if (signal === 0) {
+        const error = new Error('gone') as NodeJS.ErrnoException
+        error.code = 'ESRCH'
+        throw error
+      }
+      return true
+    }) as typeof process.kill)
+    try {
+      await expect(killProcessTreeAndWait(44_306, 'SIGTERM', {
+        platform: 'win32', timeoutMs: 10,
+      })).resolves.toBe(true)
+      expect(calls).toEqual([[44_306, 'SIGTERM'], [44_306, 0]])
+    } finally { kill.mockRestore() }
   })
 })

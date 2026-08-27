@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises'
 
 import { openCodeClientFactory as globalThisOpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeHostManager as globalThisOpenCodeHostManager } from './OpenCodeHostManager.js'
@@ -11,6 +11,7 @@ import { openCodeProfileManager as globalThisOpenCodeProfileManager } from './Op
 import { openCodeSessionStore as globalThisOpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
+  OpenCodeOperationHostAcquisitionCleanupError,
   computeOpenCodeLaunchAttemptInputDigest,
   computeOpenCodeLaunchAttemptImmutableDigest,
   createOpenCodeLaunchAttemptResult,
@@ -85,27 +86,41 @@ import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
 type OpenCodeLaunchHostReleaseRecord = Readonly<{
-  schemaVersion: 1
+  schemaVersion: 2
   attemptId: string
   payloadHash: string
   generation: number
   hostKeyIdentity: OpenCodeOpaqueIdentity
+  disposition: 'dispose' | 'keep_alive' | 'unknown'
+  releaseState: 'pending' | 'complete'
   receipt: OpenCodeHostReleaseReceipt
 }>
+type LegacyOpenCodeLaunchHostReleaseRecord = Readonly<
+  Omit<OpenCodeLaunchHostReleaseRecord, 'schemaVersion' | 'disposition' | 'releaseState'>
+  & { schemaVersion: 1 }
+>
 
 /** Minimal attempt ledger: it intentionally contains no URL, auth, or profile path. */
 export class OpenCodeLaunchHostReleaseLedger {
   constructor(private readonly filePath: string) {}
 
-  async record(record: OpenCodeLaunchHostReleaseRecord): Promise<void> {
-    validateLaunchHostReleaseRecord(record)
+  async record(record: OpenCodeLaunchHostReleaseRecord | LegacyOpenCodeLaunchHostReleaseRecord): Promise<void> {
+    const normalized = validateLaunchHostReleaseRecord(record)
     await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 })
     const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`
-    await writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
+    const temporaryHandle = await open(temporary, 'wx', 0o600)
+    try {
+      await temporaryHandle.writeFile(`${JSON.stringify(normalized)}\n`, 'utf8')
+      await temporaryHandle.sync()
+    } finally { await temporaryHandle.close() }
     await rename(temporary, this.filePath).catch(async error => {
       await unlink(temporary).catch(() => undefined)
       throw error
     })
+    if (process.platform !== 'win32') {
+      const directory = await open(path.dirname(this.filePath), 'r')
+      try { await directory.sync() } finally { await directory.close() }
+    }
   }
 
   async read(expected: Pick<OpenCodeLaunchHostReleaseRecord,
@@ -169,6 +184,10 @@ export class OpenCodeLaunchHostReleaseLedger {
     await unlink(this.filePath).catch(error => {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     })
+    if (process.platform !== 'win32') {
+      const directory = await open(path.dirname(this.filePath), 'r')
+      try { await directory.sync() } finally { await directory.close() }
+    }
   }
 }
 
@@ -178,10 +197,17 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
   }
   const record = value as Record<string, unknown>
   const keys = Object.keys(record).sort().join(',')
-  if (keys !== 'attemptId,generation,hostKeyIdentity,payloadHash,receipt,schemaVersion'
-    || record.schemaVersion !== 1 || typeof record.attemptId !== 'string'
+  const legacy = record.schemaVersion === 1
+    && keys === 'attemptId,generation,hostKeyIdentity,payloadHash,receipt,schemaVersion'
+  const current = record.schemaVersion === 2
+    && keys === 'attemptId,disposition,generation,hostKeyIdentity,payloadHash,receipt,releaseState,schemaVersion'
+  if ((!legacy && !current) || typeof record.attemptId !== 'string'
     || typeof record.payloadHash !== 'string' || !Number.isSafeInteger(record.generation)
-    || typeof record.hostKeyIdentity !== 'string' || !record.receipt
+    || typeof record.hostKeyIdentity !== 'string'
+    || (!legacy && record.disposition !== 'dispose' && record.disposition !== 'keep_alive'
+      && record.disposition !== 'unknown')
+    || (!legacy && record.releaseState !== 'pending' && record.releaseState !== 'complete')
+    || !record.receipt
     || typeof record.receipt !== 'object' || Array.isArray(record.receipt)) {
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }
@@ -194,7 +220,10 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
     || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }
-  return structuredClone(value) as OpenCodeLaunchHostReleaseRecord
+  return { ...(structuredClone(value) as Omit<OpenCodeLaunchHostReleaseRecord,
+    'schemaVersion' | 'disposition' | 'releaseState'>), schemaVersion: 2,
+    disposition: legacy ? 'unknown' : record.disposition,
+    releaseState: legacy ? 'pending' : record.releaseState } as OpenCodeLaunchHostReleaseRecord
 }
 
 export function assertOpenCodeProductionBootstrapOwnership(input: Readonly<{
@@ -575,20 +604,6 @@ class OpenCodeProductionLaunchRuntime {
     const requestedBudgetMs = command.deadlineAtMs === undefined
       ? command.outerRemainingBudgetMs ?? command.requestedBudgetMs : command.requestedBudgetMs
     const effectiveBudgetMs = Math.min(requestedBudgetMs, 300_000)
-    const pendingRelease = await hostReleaseLedger.readPending({
-      attemptId: command.request.launchAttempt.attemptId,
-      payloadHash: command.request.launchAttempt.payloadHash,
-      currentGeneration: command.request.launchAttempt.generation,
-    })
-    if (pendingRelease) {
-      const startupDeadlineAtMs = command.deadlineAtMs
-        ?? launchMonotonicNow() + effectiveBudgetMs
-      await openCodeHostManager.reconcileHostReleaseReceipt(pendingRelease.receipt, {
-        signal: command.signal,
-        remainingMs: () => Math.max(0, startupDeadlineAtMs - launchMonotonicNow()),
-      })
-      await hostReleaseLedger.clear(pendingRelease)
-    }
     const commandInputDigest = computeOpenCodeLaunchCommandInputDigest(command)
     const inputDigest = computeOpenCodeLaunchAttemptInputDigest(command.request,
       command.members.map(member => member.memberIdentity), command.continuation ? 'continue' : 'begin',
@@ -611,6 +626,10 @@ class OpenCodeProductionLaunchRuntime {
         projectIdentity,
         memberIdentity: member.memberIdentity,
       })]))
+    // Recovery populates this set before any incomplete host receipt is
+    // reconciled. A restart must not dispose a persistent host which already
+    // serves a committed durable member.
+    const retainedSessionLeases = new OpenCodeLaunchRetainedHostLeases()
     const linkageFor = (memberIdentity: OpenCodeOpaqueIdentity, record: OpenCodeSessionRecord):
     OpenCodeLaunchMemberLinkage | null => {
       const messageID = record.appManagedBootstrap?.messageID
@@ -648,7 +667,8 @@ class OpenCodeProductionLaunchRuntime {
         continuationToken: command.request.launchAttempt.continuationToken,
       }) === 'replay'
     }
-    if (journal?.finalResponse && exactCurrentGeneration) {
+    if (journal?.finalResponse && exactCurrentGeneration
+      && (journal.cleanupState === 'complete' || inspectionOnly)) {
       const final = journal.finalResponse
       validateOpenCodeDurableFinalResponse(command.request, final, {
         inputDigest,
@@ -705,6 +725,15 @@ class OpenCodeProductionLaunchRuntime {
       }
       let record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
       let linkage = record ? linkageFor(member.memberIdentity, record) : null
+      if (claim.state === 'committed' && record && linkage) {
+        await hydrateOpenCodeRecoveredSessionLease({
+          record, memberIdentity: member.memberIdentity, runId: command.runId,
+          leases: retainedSessionLeases,
+          retainHostLease: async (hostKey, owner) => {
+            await openCodeHostManager.retainHostLease(hostKey, owner)
+          },
+        })
+      }
       let reconciliationError: string | null = null
       if (claim.state === 'claimed') {
         if (!hasExactOpenCodeClaimReconciliationAuthority(journal, exactCurrentGeneration, claim)) {
@@ -773,6 +802,40 @@ class OpenCodeProductionLaunchRuntime {
       }
       return { member, claim, record, linkage, reconciliationError }
     }))
+    if (journal && exactCurrentGeneration && !journal.finalResponse) {
+      const durableProofCleanup = await proofCleanupLedger.read({
+        deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal,
+      })
+      if (durableProofCleanup && (durableProofCleanup.attemptId !== command.request.launchAttempt.attemptId
+        || durableProofCleanup.requestGeneration > command.request.launchAttempt.generation
+        || (durableProofCleanup.state !== 'absent' && durableProofCleanup.state !== 'deleted'
+          && durableProofCleanup.state !== 'foreign'))) {
+        throw new Error('OpenCode launch proof cleanup requires explicit reconciliation')
+      }
+      const pendingRelease = await hostReleaseLedger.readPending({
+        attemptId: command.request.launchAttempt.attemptId,
+        payloadHash: command.request.launchAttempt.payloadHash,
+        currentGeneration: command.request.launchAttempt.generation,
+      })
+      if (!pendingRelease) {
+        if (journal.cleanupState === 'incomplete') {
+          throw new Error('OpenCode launch host cleanup requires exact reconciliation evidence')
+        }
+      } else {
+        if (pendingRelease.disposition === 'unknown') {
+          throw new Error('OpenCode launch host cleanup disposition is unknown')
+        }
+        if (pendingRelease.releaseState === 'pending') {
+          await openCodeHostManager.reconcileHostReleaseReceipt(pendingRelease.receipt, {
+            keepPersistentAlive: pendingRelease.disposition === 'keep_alive'
+              || retainedSessionLeases.shouldKeepHostAlive(),
+            signal: preflightSignal,
+            remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+          })
+          await hostReleaseLedger.record({ ...pendingRelease, releaseState: 'complete' })
+        }
+      }
+    }
     if (recoveryHost) {
       const reference = await recoveryReference.catch(() => null)
       if (reference) await bounded(openCodeHostManager.releaseHostReference(reference, {
@@ -798,7 +861,6 @@ class OpenCodeProductionLaunchRuntime {
     }
     if (inspectionOnly) return null
     }
-    const retainedSessionLeases = new OpenCodeLaunchRetainedHostLeases()
     const profileFor = (profile: OpenCodeLaunchProfile) => {
       const prepared = profiles.get(profile.profileIdentity)
       if (!prepared) throw new Error('OpenCode launch profile ownership was lost')
@@ -858,17 +920,26 @@ class OpenCodeProductionLaunchRuntime {
             profileScopeIdentity: input.profile.profileIdentity,
           }
           const releaseRecord: OpenCodeLaunchHostReleaseRecord = {
-            schemaVersion: 1,
+            schemaVersion: 2,
             attemptId: command.request.launchAttempt.attemptId,
             payloadHash: command.request.launchAttempt.payloadHash,
             generation: command.request.launchAttempt.generation,
             hostKeyIdentity: identity.hostKeyIdentity,
+            disposition: 'unknown',
+            releaseState: 'pending',
             receipt: openCodeHostManager.hostReleaseReceipt(reference),
           }
           try {
             await hostReleaseLedger.record(releaseRecord)
           } catch (error) {
-            await openCodeHostManager.releaseHostReference(reference).catch(() => undefined)
+            try {
+              await openCodeHostManager.releaseHostReference(reference, {
+                signal: input.signal,
+                remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
+              })
+            } catch (releaseError) {
+              throw new OpenCodeOperationHostAcquisitionCleanupError(releaseError)
+            }
             throw error
           }
           hosts.set(identity.hostKeyIdentity, handle)
@@ -889,6 +960,11 @@ class OpenCodeProductionLaunchRuntime {
           if (!releaseRecord || releaseRecord.hostKeyIdentity !== input.host.hostKeyIdentity) {
             throw new Error('OpenCode operation host release receipt is absent or mismatched')
           }
+          const disposition = retainedSessionLeases.shouldKeepHostAlive() ? 'keep_alive' : 'dispose'
+          const intendedRelease = { ...releaseRecord, disposition } as OpenCodeLaunchHostReleaseRecord
+          // Commit intent before proof cleanup or host release effects. A crash
+          // can now distinguish keep-alive from disposal without guessing.
+          await hostReleaseLedger.record(intendedRelease)
           const reference = hostReferences.get(input.host.hostKeyIdentity)
           if (reference && reference.handle !== hostFor(input.host)) {
             throw new Error('OpenCode operation host release capability is mismatched')
@@ -920,28 +996,40 @@ class OpenCodeProductionLaunchRuntime {
             }
             proofSessions.delete(input.host.hostKeyIdentity)
           }
-          await bounded(openCodeHostManager.reconcileHostReleaseReceipt(releaseRecord.receipt,
-            { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive(),
+          await bounded(openCodeHostManager.reconcileHostReleaseReceipt(intendedRelease.receipt,
+            { keepPersistentAlive: disposition === 'keep_alive',
               signal: input.signal,
               remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()) }),
           input.deadlineAtMs, input.signal)
-          await hostReleaseLedger.clear(releaseRecord)
+          await hostReleaseLedger.record({ ...intendedRelease, releaseState: 'complete' })
           hostReferences.delete(input.host.hostKeyIdentity)
         },
         reconcileOperationHost: async input => {
+          let proofCleanup: OpenCodeProofSessionCleanupRecord | null
+          try {
+            proofCleanup = await proofCleanupLedger.read({
+              deadlineAtMs: input.deadlineAtMs, signal: input.signal,
+            })
+          } catch { return 'incomplete' }
+          if (proofCleanup && (proofCleanup.attemptId !== input.attemptId
+            || proofCleanup.requestGeneration > input.generation
+            || (proofCleanup.state !== 'absent' && proofCleanup.state !== 'deleted'
+              && proofCleanup.state !== 'foreign'))) return 'incomplete'
           const releaseRecord = await hostReleaseLedger.readPending({
             attemptId: input.attemptId,
             payloadHash: input.payloadHash,
             currentGeneration: input.generation,
           })
-          if (!releaseRecord) return 'complete'
+          if (!releaseRecord || releaseRecord.disposition === 'unknown') return 'incomplete'
+          if (releaseRecord.releaseState === 'complete') return 'complete'
           try {
             await openCodeHostManager.reconcileHostReleaseReceipt(releaseRecord.receipt, {
-              keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive(),
+              keepPersistentAlive: releaseRecord.disposition === 'keep_alive'
+                || retainedSessionLeases.shouldKeepHostAlive(),
               signal: input.signal,
               remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
             })
-            await hostReleaseLedger.clear(releaseRecord)
+            await hostReleaseLedger.record({ ...releaseRecord, releaseState: 'complete' })
             return 'complete'
           } catch {
             return 'incomplete'
@@ -1374,6 +1462,16 @@ class OpenCodeProductionLaunchRuntime {
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(command) })
+    if (result.cleanup === 'complete') {
+      const completedRelease = await hostReleaseLedger.readPending({
+        attemptId: command.request.launchAttempt.attemptId,
+        payloadHash: command.request.launchAttempt.payloadHash,
+        currentGeneration: command.request.launchAttempt.generation,
+      }).catch(() => null)
+      if (completedRelease?.releaseState === 'complete') {
+        await hostReleaseLedger.clear(completedRelease).catch(() => undefined)
+      }
+    }
     // The core returns only after authoring its durable final. Project that immutable result
     // immediately; reacquiring the store here can deadlock behind a retained cleanup lease and
     // can turn a bounded partial/cancellation return into an unbounded production wait.

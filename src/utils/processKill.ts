@@ -167,62 +167,9 @@ export function killProcessTree(
     return
   }
 
-  try {
-    const { command, args } = buildWindowsTaskkillInvocation(pid)
-    const child = spawn(command, args, {
-      stdio: 'ignore',
-      detached: true,
-      windowsHide: true,
-    })
-    child.on('error', () => {
-      try {
-        process.kill(pid, signal)
-      } catch {
-        // Best-effort cleanup.
-      }
-    })
-    child.unref()
-  } catch {
-    try {
-      process.kill(pid, signal)
-    } catch {
-      // Best-effort cleanup.
-    }
-  }
-}
-
-function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<boolean> {
-  return new Promise(resolve => {
-    let done = false
-    let child: ReturnType<typeof spawn> | null = null
-    const finish = (complete: boolean) => {
-      if (done) return
-      done = true
-      clearTimeout(timeout)
-      resolve(complete)
-    }
-    const timeout = setTimeout(() => {
-      try {
-        child?.kill('SIGKILL')
-      } catch {
-        // Best-effort cleanup.
-      }
-      finish(false)
-    }, timeoutMs)
-
-    try {
-      const { command, args } = buildWindowsTaskkillInvocation(pid)
-      child = spawn(command, args, {
-        stdio: 'ignore',
-        detached: true,
-        windowsHide: true,
-      })
-      child.once('error', () => finish(false))
-      child.once('close', code => finish(code === 0))
-    } catch {
-      finish(false)
-    }
-  })
+  // A PID-only caller has no stable Windows tree authority. Signal only the
+  // leader; HostManager's owned launcher/job path performs strict tree cleanup.
+  try { process.kill(pid, signal) } catch { /* Best-effort cleanup. */ }
 }
 
 async function waitForProcessExit(
@@ -253,23 +200,40 @@ function isPosixProcessGroupAlive(groupLeaderPid: number): boolean {
  * Returns whether the owned containment unit is alive, or null when this
  * platform cannot strongly observe descendants after their leader exits.
  */
-export function isProcessTreeContainmentAlive(groupLeaderPid: number): boolean | null {
+export function isProcessTreeContainmentAlive(
+  groupLeaderPid: number,
+  observation: {
+    platform?: NodeJS.Platform
+    readdir?: (path: string) => string[]
+    readFile?: (path: string) => string
+  } = {},
+): boolean | null {
   if (!Number.isInteger(groupLeaderPid) || groupLeaderPid <= 0) return false
-  if (process.platform === 'win32') return null
-  if (process.platform !== 'linux') return null
+  const platform = observation.platform ?? process.platform
+  if (platform === 'win32') return null
+  if (platform !== 'linux') return null
+  const readdir = observation.readdir ?? (target => readdirSync(target))
+  const readStat = observation.readFile ?? (target => readFileSync(target, 'utf8'))
   try {
-    for (const entry of readdirSync('/proc')) {
+    const before = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
+    for (const entry of before) {
       if (!/^\d+$/.test(entry)) continue
       let stat: string
-      try { stat = readFileSync(`/proc/${entry}/stat`, 'utf8') }
-      catch { continue }
+      try { stat = readStat(`/proc/${entry}/stat`) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        return null
+      }
       const commandEnd = stat.lastIndexOf(')')
-      if (commandEnd < 0) continue
+      if (commandEnd < 0) return null
       const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
       // proc_pid_stat fields after comm begin with state, ppid, pgrp.
+      if (fields.length < 3 || !/^\d+$/.test(fields[2] ?? '')) return null
       if (Number(fields[2]) === groupLeaderPid) return true
     }
-    return false
+    const after = readdir('/proc').filter(entry => /^\d+$/.test(entry)).sort()
+    return before.length === after.length && before.every((entry, index) => entry === after[index])
+      ? false : null
   } catch {
     return null
   }
@@ -304,6 +268,7 @@ export async function killProcessTreeAndWait(
   options: {
     timeoutMs?: number
     pollMs?: number
+    /** @deprecated Kept for call compatibility; PID-only taskkill is disabled. */
     taskkillTimeoutMs?: number
     expectedStartedAtMs?: number | null
     /**
@@ -311,8 +276,12 @@ export async function killProcessTreeAndWait(
      * group whose leader is exactly `pid`. Ordinary children must omit this.
      */
     posixProcessGroupLeader?: boolean
-    /** taskkill /T completion is the manager-owned Windows tree proof. */
+    /** Legacy strict-tree request; completes only through windowsOwnedTreeRelease. */
     windowsTaskkillTreeAuthority?: boolean
+    /** Exact in-process launcher/job authority. Its completion proves tree exit. */
+    windowsOwnedTreeRelease?: (signal: NodeJS.Signals) => Promise<boolean>
+    /** Test-only platform selection; production omits it. */
+    platform?: NodeJS.Platform
   } = {},
 ): Promise<boolean> {
   if (!pid || !Number.isFinite(pid) || pid <= 0) {
@@ -323,17 +292,15 @@ export async function killProcessTreeAndWait(
   const pollMs = options.pollMs ?? 50
   if (timeoutMs <= 0) return false
 
-  if (process.platform === 'win32') {
-    const treeDisposed = await runWindowsTaskkill(pid, options.taskkillTimeoutMs ?? timeoutMs)
-    if (!isProcessAlive(pid)) {
-      return options.windowsTaskkillTreeAuthority === true ? treeDisposed : true
+  if ((options.platform ?? process.platform) === 'win32') {
+    // A PID and a successful taskkill exit are not stable tree authority: the
+    // PID may be reused before taskkill opens it. Strict callers must use their
+    // already-owned launcher/job/ChildProcess handle instead.
+    if (options.windowsTaskkillTreeAuthority === true) {
+      return options.windowsOwnedTreeRelease?.(signal) ?? false
     }
-    if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null) {
-      const currentStartedAtMs = await readProcessStartTimeMs(pid)
-      if (currentStartedAtMs !== options.expectedStartedAtMs) {
-        return false
-      }
-    }
+    if (Number.isFinite(options.expectedStartedAtMs)
+      && options.expectedStartedAtMs !== null) return false
     try {
       process.kill(pid, signal)
     } catch {

@@ -1708,6 +1708,11 @@ export class OpenCodeLaunchAttemptStore {
             if (current !== 'incomplete') {
               throw new OpenCodeLaunchJournalError('fenced', 'cleanup reconciliation has no durable receipt')
             }
+            if (!journal!.finalResponse
+              || journal!.finalResponse.members.cleanupPending.length !== 0) {
+              throw new OpenCodeLaunchJournalError('fenced',
+                'member cleanup obligations remain incomplete')
+            }
             const candidate = { ...journal!, cleanupState: 'complete' as const }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
@@ -1949,17 +1954,18 @@ export class OpenCodeLaunchAttemptStore {
     context?: OpenCodeLaunchStoreContext,
     retainedSettlement?: () => Promise<void> | undefined,
   ): Promise<T> {
+    const effectiveExclusiveContext = context ?? boundedDefaultContext()
     const previous = this.tail
     let release!: () => void
     this.tail = new Promise<void>(resolve => { release = resolve })
     let releasePersistence: ((context?: OpenCodeLaunchStoreContext) => Promise<void>) | undefined
     let poisonSettlement: Promise<void> | undefined
     try {
-      await waitWithContext(previous, context)
-      ensureContext(context)
-      const acquisition = this.persistence.acquireExclusive(context ?? infiniteContext())
-      releasePersistence = await acquireWithLateReap(acquisition, context)
-      ensureContext(context)
+      await waitWithContext(previous, effectiveExclusiveContext)
+      ensureContext(effectiveExclusiveContext)
+      const acquisition = this.persistence.acquireExclusive(effectiveExclusiveContext)
+      releasePersistence = await acquireWithLateReap(acquisition, effectiveExclusiveContext)
+      ensureContext(effectiveExclusiveContext)
       return await operation(randomUUID())
     } catch (error) {
       if (error instanceof OpenCodeLaunchPoisonedLeaseError) poisonSettlement = error.physicalSettlement
@@ -2237,8 +2243,10 @@ function sameProfileBinding(left: OpenCodeLaunchProfileBinding, right: OpenCodeL
     && left.binaryIdentity === right.binaryIdentity
 }
 
-function infiniteContext(): OpenCodeLaunchStoreContext {
-  return { deadlineAtMs: Number.MAX_SAFE_INTEGER, signal: new AbortController().signal, monotonicNow: () => 0 }
+function boundedDefaultContext(): OpenCodeLaunchStoreContext {
+  const monotonicNow = (): number => performance.now()
+  return { deadlineAtMs: monotonicNow() + 300_000,
+    signal: new AbortController().signal, monotonicNow }
 }
 
 function boundedReleaseContext(): OpenCodeLaunchStoreContext {

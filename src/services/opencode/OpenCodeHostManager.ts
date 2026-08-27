@@ -1857,6 +1857,7 @@ export class OpenCodeHostManager {
       expectedStartedAtMs,
       posixProcessGroupLeader: requireStableContainment,
       windowsTaskkillTreeAuthority: requireStableContainment,
+      platform: this.deps.platform,
     })
     return exited
   }
@@ -3031,9 +3032,11 @@ export class OpenCodeHostManager {
         && this.deps.isProcessGroupAlive !== undefined && this.deps.isProcessGroupAlive(pid) === false))
     if (!terminated) {
       terminated = controls.requireStableContainment
-        ? pid !== null && pid !== undefined && await this.killProcessAndWait(
-          pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
-          receipt.record.processStartedAtMs, true)
+        ? (this.deps.platform ?? process.platform) === 'win32'
+          ? await this.killOwnedChildAndWait(child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
+          : pid !== null && pid !== undefined && await this.killProcessAndWait(
+            pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+            receipt.record.processStartedAtMs, true)
         : await this.killOwnedChildAndWait(
           child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
     }
@@ -3043,9 +3046,11 @@ export class OpenCodeHostManager {
         ? await this.captureEntryContainmentAuthority(entry)
         : true
       terminated = controls.requireStableContainment
-        ? forceContainmentAuthority && pid !== null && pid !== undefined && await this.killProcessAndWait(
-          pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
-          receipt.record.processStartedAtMs, true)
+        ? (this.deps.platform ?? process.platform) === 'win32'
+          ? await this.killOwnedChildAndWait(child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
+          : forceContainmentAuthority && pid !== null && pid !== undefined && await this.killProcessAndWait(
+            pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+            receipt.record.processStartedAtMs, true)
         : await this.killOwnedChildAndWait(
           child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
     }
@@ -3236,7 +3241,7 @@ export class OpenCodeHostManager {
         // A compatibility release retains this exact map entry as its retry
         // receipt. Wait for that generation to settle before deciding whether
         // it can be reused or a replacement may be created.
-        await disposal.catch(() => undefined)
+        await disposal
         return this.ensurePreparedHost(params)
       }
     }
@@ -3534,6 +3539,14 @@ export class OpenCodeHostManager {
       if (record.pid !== receipt.pid || record.processStartedAtMs !== receipt.processStartedAtMs) {
         throw new Error('OpenCode host release receipt process generation changed [redacted]')
       }
+      const durableLeases = normalizePersistentHostLeases(record.leases)
+      if (receipt.lifetime === 'persistent'
+        && (options.keepPersistentAlive === true || Object.keys(durableLeases).length > 0)) {
+        // Releasing an operation reference is complete without terminating the
+        // persistent host. Durable member leases take precedence over a stale
+        // disposal intent recovered after a crash.
+        return
+      }
       await this.terminatePersistentHostRecord(record, {
         force: true,
         ignoreTrackedHandle: true,
@@ -3665,10 +3678,11 @@ export class OpenCodeHostManager {
 
   private async terminatePersistentHostRecord(
     record: PersistentHostRegistryRecord,
-    options: { force: boolean; ignoreTrackedHandle?: boolean; cleanupTempPath?: string }
+    options: { force: boolean; ignoreTrackedHandle?: boolean; cleanupTempPath?: string;
+      ownedEntry?: ManagedHostEntry }
       & OpenCodeHostCleanupControls,
   ): Promise<void> {
-    const entry = options.ignoreTrackedHandle ? undefined : this.hosts.get(record.hostKey)
+    const entry = options.ownedEntry ?? (options.ignoreTrackedHandle ? undefined : this.hosts.get(record.hostKey))
     const baseUrl = entry?.handle.baseUrl ?? scopedRecordBaseUrl(
       record,
       record.scopedIdentity ? this.scopedTransportOwnerKey : undefined,
@@ -3698,6 +3712,13 @@ export class OpenCodeHostManager {
       )
     }
 
+    if (!terminated && options.requireStableContainment === true
+      && (this.deps.platform ?? process.platform) === 'win32' && !entry?.child) {
+      throw new Error(
+        `OpenCode host pid ${pid} has no owned Windows launcher/job handle; cleanup remains incomplete`,
+      )
+    }
+
     if (!terminated) {
       this.assertCleanupAllowed(options)
       try {
@@ -3723,13 +3744,17 @@ export class OpenCodeHostManager {
         }
         terminated = true
       } else if (entry?.child?.pid) {
-        terminated = await this.killProcessAndWait(
-          entry.child.pid,
-          'SIGTERM',
-          OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
-          processIdentity.startedAtMs,
-          options.requireStableContainment === true,
-        )
+        terminated = options.requireStableContainment === true
+          && (this.deps.platform ?? process.platform) === 'win32'
+          ? await this.killOwnedChildAndWait(entry.child, 'SIGTERM',
+            OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
+          : await this.killProcessAndWait(
+            entry.child.pid,
+            'SIGTERM',
+            OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+            processIdentity.startedAtMs,
+            options.requireStableContainment === true,
+          )
       } else {
         terminated = await this.killProcessAndWait(
           pid,
@@ -3753,13 +3778,17 @@ export class OpenCodeHostManager {
         }
         terminated = true
       } else {
-        terminated = await this.killProcessAndWait(
+        terminated = entry?.child && options.requireStableContainment === true
+          && (this.deps.platform ?? process.platform) === 'win32'
+          ? await this.killOwnedChildAndWait(entry.child, 'SIGKILL',
+            OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
+          : await this.killProcessAndWait(
           pid,
           'SIGKILL',
           OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
-        )
+          )
       }
     }
 
@@ -3889,6 +3918,7 @@ export class OpenCodeHostManager {
       await this.terminatePersistentHostRecord(receipt.record, {
         force: true,
         ignoreTrackedHandle: true,
+        ownedEntry: entry,
         cleanupTempPath: receipt.profileTmpPath,
         ...controls,
       })

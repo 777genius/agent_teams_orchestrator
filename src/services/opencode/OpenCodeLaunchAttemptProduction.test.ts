@@ -62,12 +62,18 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
     expect(raw).not.toContain('://')
     expect(raw).not.toContain('auth')
     const restarted = new OpenCodeLaunchHostReleaseLedger(file)
-    expect(await restarted.read(expected)).toEqual(record)
+    const migrated = { ...record, schemaVersion: 2 as const, disposition: 'unknown' as const,
+      releaseState: 'pending' as const }
+    expect(await restarted.read(expected)).toEqual(migrated)
     expect(await restarted.readPending({ attemptId: expected.attemptId,
-      payloadHash: expected.payloadHash, currentGeneration: 4 })).toEqual(record)
+      payloadHash: expected.payloadHash, currentGeneration: 4 })).toEqual(migrated)
+    const completedKeepAlive = { ...migrated, disposition: 'keep_alive' as const,
+      releaseState: 'complete' as const }
+    await restarted.record(completedKeepAlive)
+    expect(await restarted.read(expected)).toEqual(completedKeepAlive)
     await expect(restarted.read({ ...expected, generation: 4 })).rejects.toThrow('foreign')
-    await restarted.clear(record)
-    await restarted.clear(record)
+    await restarted.clear(completedKeepAlive)
+    await restarted.clear(completedKeepAlive)
     expect(await restarted.read(expected)).toBeNull()
 
     await writeFile(file, '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')

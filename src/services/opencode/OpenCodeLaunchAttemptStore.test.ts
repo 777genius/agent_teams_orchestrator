@@ -1342,6 +1342,21 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     expect(reaped).toBe(1)
   })
 
+  test('uses a finite monotonic default context when legacy callers omit one', async () => {
+    const persistence = new MemoryPersistence()
+    let acquiredContext: OpenCodeLaunchStoreContext | undefined
+    persistence.acquireExclusive = async context => {
+      acquiredContext = context
+      return async () => undefined
+    }
+    await new OpenCodeLaunchAttemptStore(persistence).inspect(identity)
+    expect(acquiredContext).toBeDefined()
+    expect(acquiredContext!.deadlineAtMs).toBeLessThan(Number.MAX_SAFE_INTEGER)
+    const remaining = acquiredContext!.deadlineAtMs - acquiredContext!.monotonicNow()
+    expect(remaining).toBeGreaterThan(0)
+    expect(remaining).toBeLessThanOrEqual(300_000)
+  })
+
   test('bounds a never-resolving store read by the supplied absolute deadline', async () => {
     const persistence: OpenCodeLaunchJournalPersistence = {
       read: () => new Promise(() => undefined), replaceAndSync: async () => undefined,
@@ -1467,13 +1482,21 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
     await store.withGeneration(exact, 'begin', async lease => {
       expect(lease.beganGeneration).toBe(true)
-      await lease.recordCleanupState('incomplete')
+      await lease.commitTerminalResponse(finalResponse(), 'incomplete')
       await expect(lease.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
     })
     await store.withGeneration(exact, 'begin', async replay => {
       expect(replay.beganGeneration).toBe(false)
       expect(replay.journal.cleanupState).toBe('incomplete')
       await expect(replay.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
+      await expect(replay.reconcileCleanupComplete()).rejects.toThrow('member cleanup obligations')
+    })
+    const withoutMemberCleanup = finalResponse()
+    withoutMemberCleanup.members.cleanupPending = []
+    const durable = JSON.parse(persistence.text())
+    durable.finalResponse = withoutMemberCleanup
+    persistence.set(durable)
+    await store.withGeneration(exact, 'begin', async replay => {
       await replay.reconcileCleanupComplete()
     })
     expect((await store.inspect(exact))?.cleanupState).toBe('complete')
