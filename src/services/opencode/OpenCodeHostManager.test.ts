@@ -515,6 +515,8 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       isProcessAlive: pid => pid === 447 && leaderAlive,
       isProcessGroupAlive: () => false,
       readProcessStartTimeMs: async pid => pid === 447 ? 12_345 : null,
+      readProcessBirthToken: pid => pid === 447
+        ? 'linux:11111111-2222-3333-4444-555555555555:447' : null,
       killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
       sleepMs: async () => {},
       persistentRegistryPath: null,
@@ -551,11 +553,12 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       persistentRegistryPath: null,
     })
     const receipt = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       receiptId: '11111111-1111-4111-8111-111111111111',
       hostKeyDigest: 'a'.repeat(64),
       pid: 50_701,
       processStartedAtMs: 12_345,
+      processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:100',
       lifetime: 'persistent' as const,
     }
 
@@ -618,6 +621,8 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         : { status: 200, data: {} },
       isProcessAlive: pid => pid === 45_443,
       readProcessStartTimeMs: async pid => pid === 45_443 ? 12_345 : null,
+      readProcessBirthToken: pid => pid === 45_443
+        ? 'linux:11111111-2222-3333-4444-555555555555:123' : null,
       persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
     })
     try {
@@ -633,13 +638,15 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
         isProcessAlive: pid => pid === record.pid,
         readProcessStartTimeMs: async pid => pid === record.pid ? record.processStartedAtMs : null,
+        readProcessBirthToken: pid => pid === record.pid ? record.processBirthToken : null,
         isProcessGroupAlive: () => true,
         killProcess: (_pid, signal) => { signals.push(signal) },
       })
       await restarted.reconcileHostReleaseReceipt({
-        schemaVersion: 1, receiptId: '44444444-4444-4444-8444-444444444444',
+        schemaVersion: 2, receiptId: '44444444-4444-4444-8444-444444444444',
         hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
-        pid: record.pid, processStartedAtMs: record.processStartedAtMs, lifetime: 'persistent',
+        pid: record.pid, processStartedAtMs: record.processStartedAtMs,
+        processBirthToken: record.processBirthToken, lifetime: 'persistent',
       })
       expect(signals).toEqual([])
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
@@ -769,6 +776,70 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       expect(signals).toBe(0)
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
     } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform !== 'linux')('legacy restart receipt never touches a same-second recycled Linux generation', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-legacy-birth-reuse-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const hostKey = 'legacy-native-birth-host'
+    const currentToken = 'linux:11111111-2222-3333-4444-555555555555:101'
+    let livenessChecks = 0
+    let birthChecks = 0
+    let containmentProbes = 0
+    let signals = 0
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 2, hosts: { [hostKey]: {
+        hostKey, profileRootKey: 'profile', projectPath: '/static/project',
+        projectBehaviorFingerprint: 'behavior', baseUrl: 'http://127.0.0.1:44444',
+        port: 44444, pid: 44444, processStartedAtMs: 1_000, processBirthToken: currentToken,
+        version: null, resolvedConfigFingerprint: null,
+        updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
+      } } }))
+      const original = await readFile(registryPath, 'utf8')
+      const manager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+        platform: 'linux',
+        isProcessAlive: () => { livenessChecks += 1; return true },
+        readProcessStartTimeMs: async () => 1_000,
+        readProcessBirthToken: () => { birthChecks += 1; return currentToken },
+        isProcessGroupAlive: () => { containmentProbes += 1; return true },
+        killProcess: () => { signals += 1 },
+        fetchJson: async () => ({ status: 200, data: {} }), sleepMs: async () => {} })
+
+      await expect(manager.reconcileHostReleaseReceipt({ schemaVersion: 1,
+        receiptId: '77777777-7777-4777-8777-777777777777',
+        hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
+        pid: 44444, processStartedAtMs: 1_000,
+        lifetime: 'persistent' })).rejects.toThrow('lacks exact native generation authority')
+      expect({ livenessChecks, birthChecks, containmentProbes, signals })
+        .toEqual({ livenessChecks: 0, birthChecks: 0, containmentProbes: 0, signals: 0 })
+      expect(await readFile(registryPath, 'utf8')).toBe(original)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform !== 'linux')('legacy receipt still releases through its exact retained live capability', async () => {
+    const profile = scopedProfile('execution-probe')
+    const child = createMockChildProcess(44_446)
+    let alive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({ platform: 'linux',
+      allocateLoopbackPort: async () => 44_446,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 44_446 && alive,
+      isProcessGroupAlive: () => false,
+      readProcessStartTimeMs: async pid => pid === 44_446 ? 1_000 : null,
+      killProcess: (_pid, signal) => { signals.push(signal); alive = false },
+      sleepMs: async () => {}, persistentRegistryPath: null })
+    const reference = await manager.ensureScopedHostReference({
+      preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+    })
+    const receipt = manager.hostReleaseReceipt(reference)
+    expect(receipt.schemaVersion).toBe(1)
+
+    await manager.reconcileHostReleaseReceipt(receipt)
+    expect(signals).toEqual(['SIGTERM'])
+    expect(manager.getHost(reference.handle.hostKey)).toBeNull()
   })
 
   test('force cleanup retains registry when the leader vanishes at the force identity read', async () => {

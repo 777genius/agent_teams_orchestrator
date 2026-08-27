@@ -1228,7 +1228,8 @@ test('production composition routes an incomplete exact final through real HostM
   await writeFile(registryPath, JSON.stringify({ schemaVersion: 2, hosts: { host: {
     hostKey: 'host', profileRootKey: 'profile', projectPath: '/static/project',
     projectBehaviorFingerprint: '2'.repeat(64), baseUrl: 'http://127.0.0.1:44443',
-    port: 44443, pid: 443, processStartedAtMs: 1, version: null,
+    port: 44443, pid: 443, processStartedAtMs: 1,
+    processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443', version: null,
     resolvedConfigFingerprint: null, updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
   } } }))
   let leaderAlive = true
@@ -1238,6 +1239,7 @@ test('production composition routes an incomplete exact final through real HostM
     platform: 'linux', isProcessAlive: () => leaderAlive,
     isProcessGroupAlive: () => containmentAlive,
     readProcessStartTimeMs: async () => 1,
+    readProcessBirthToken: () => 'linux:11111111-2222-3333-4444-555555555555:443',
     killProcess: (_pid, signal) => {
       signals.push(signal); leaderAlive = false; containmentAlive = false
     },
@@ -1262,9 +1264,11 @@ test('production composition routes an incomplete exact final through real HostM
         pending: [], cleanupPending: [] }, failure }
     await hostLedger.record({ ...obligation,
       disposition: 'dispose', releaseState: 'pending', receipt: {
-        schemaVersion: 1, receiptId: '88888888-8888-4888-8888-888888888888',
+        schemaVersion: 2, receiptId: '88888888-8888-4888-8888-888888888888',
         hostKeyDigest: createHash('sha256').update('host').digest('hex'),
-        pid: 443, processStartedAtMs: 1, lifetime: 'persistent',
+        pid: 443, processStartedAtMs: 1,
+        processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443',
+        lifetime: 'persistent',
       } }, harness.context)
     const exact = await hostLedger.readObligation({
       attemptId: obligation.attemptId, payloadHash: obligation.payloadHash,
@@ -1300,6 +1304,82 @@ test('production composition routes an incomplete exact final through real HostM
     harness.context))?.releaseState).toBe('complete')
     await expect(readFile(registryPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     expect(signals).toEqual(['SIGTERM'])
+  } finally {
+    await harness.dispose()
+    await rm(managerDirectory, { recursive: true, force: true })
+  }
+})
+
+test('production replay keeps a legacy Linux receipt incomplete without touching a recycled host', async () => {
+  const managerDirectory = await mkdtemp(path.join(tmpdir(), 'opencode-production-legacy-receipt-'))
+  const registryPath = path.join(managerDirectory, 'registry.json')
+  const registryBytes = JSON.stringify({ schemaVersion: 2, hosts: { host: {
+    hostKey: 'host', profileRootKey: 'profile', projectPath: '/static/project',
+    projectBehaviorFingerprint: '2'.repeat(64), baseUrl: 'http://127.0.0.1:44443',
+    port: 44443, pid: 443, processStartedAtMs: 1,
+    processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:recycled', version: null,
+    resolvedConfigFingerprint: null, updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
+  } } })
+  await writeFile(registryPath, registryBytes)
+  let processProbes = 0
+  let containmentProbes = 0
+  let signals = 0
+  const realHostManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+    platform: 'linux',
+    isProcessAlive: () => { processProbes += 1; return true },
+    isProcessGroupAlive: () => { containmentProbes += 1; return true },
+    readProcessStartTimeMs: async () => 1,
+    readProcessBirthToken: () => 'linux:11111111-2222-3333-4444-555555555555:recycled',
+    killProcess: () => { signals += 1 },
+    sleepMs: async () => {}, fetchJson: async () => ({ status: 200, data: { ok: true } }) })
+  const harness = await productionRecoveryHarness(realHostManager)
+  try {
+    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+      `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
+    const obligation = await hostLedger.reserve({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1,
+      hostKeyIdentity: harness.acceptedProof().launchAttempt.retainedHostIdentity!.hostKeyIdentity,
+      hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+    }, harness.context)
+    const failure = { code: 'contract_violation' as const, origin: 'session' as const,
+      retryDisposition: 'never' as const, retryable: false,
+      phase: 'member_materialize' as const, sideEffectsStarted: false }
+    const basis = harness.acceptedProof()
+    const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
+      members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+        pending: [], cleanupPending: [] }, failure }
+    await hostLedger.record({ ...obligation,
+      disposition: 'dispose', releaseState: 'pending', receipt: {
+        schemaVersion: 1, receiptId: '99999999-9999-4999-8999-999999999999',
+        hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+        pid: 443, processStartedAtMs: 1, lifetime: 'persistent',
+      } }, harness.context)
+    const exact = await hostLedger.readObligation({
+      attemptId: obligation.attemptId, payloadHash: obligation.payloadHash,
+      generation: obligation.generation, obligationId: obligation.obligationId,
+    }, harness.context)
+    await harness.store.withGeneration({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest,
+      generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000,
+    }, 'begin', async lease => {
+      await lease.commitAcceptedProofResponse(basis, harness.context)
+      await lease.bindHostCleanupObligation({ obligationId: exact!.obligationId,
+        reservationDigest: exact!.reservationDigest,
+        receiptIdentityDigest: exact!.receiptIdentityDigest }, harness.context)
+      await lease.commitTerminalResponse(final, 'incomplete', harness.context)
+    }, harness.context)
+
+    await harness.bridge.execute(harness.command)
+    expect((await harness.inspectJournal())?.cleanupState).toBe('incomplete')
+    expect((await hostLedger.readObligation({ attemptId: obligation.attemptId,
+      payloadHash: obligation.payloadHash, generation: 1,
+      obligationId: obligation.obligationId }, harness.context))?.releaseState).toBe('pending')
+    expect(await readFile(registryPath, 'utf8')).toBe(registryBytes)
+    expect({ processProbes, containmentProbes, signals })
+      .toEqual({ processProbes: 0, containmentProbes: 0, signals: 0 })
   } finally {
     await harness.dispose()
     await rm(managerDirectory, { recursive: true, force: true })

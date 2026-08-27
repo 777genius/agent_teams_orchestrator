@@ -3788,6 +3788,17 @@ export class OpenCodeHostManager {
       await this.releaseHostReference(retained.capability, options)
       return
     }
+    // A tokenless legacy receipt has no exact Linux generation authority after
+    // a process restart. PID plus wall-clock start time can alias a same-second
+    // recycled leader, and the current registry token belongs to the current
+    // process rather than proving that the legacy receipt acquired it. Only a
+    // retained live capability above may independently bind such a receipt to
+    // its original generation. Keep every other legacy obligation durable and
+    // perform no registry containment probe or mutation.
+    if ((this.deps.platform ?? process.platform) === 'linux'
+      && (receipt.schemaVersion !== 2 || !receipt.processBirthToken)) {
+      throw new Error('OpenCode durable host cleanup lacks exact native generation authority [redacted]')
+    }
     const entry = Array.from(this.hosts.values()).find(candidate =>
       createHash('sha256').update(candidate.handle.hostKey).digest('hex') === receipt.hostKeyDigest
       && candidate.handle.pid === receipt.pid
