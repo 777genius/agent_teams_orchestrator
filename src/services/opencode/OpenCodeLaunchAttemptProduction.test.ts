@@ -58,20 +58,20 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
       lifetime: 'process' as const } }
   try {
     const first = new OpenCodeLaunchHostReleaseLedger(file)
-    await first.record(record)
+    await writeFile(file, `${JSON.stringify(record)}\n`)
+    const migrated = await first.read(expected)
+    await first.record(migrated)
     const recordFile = path.join(`${file}.records`,
       `${expected.generation}.${record.receipt.receiptId}.json`)
     const raw = await readFile(recordFile, 'utf8')
     expect(raw).not.toContain('://')
     expect(raw).not.toContain('auth')
     const restarted = new OpenCodeLaunchHostReleaseLedger(file)
-    const migrated = { ...record, schemaVersion: 3 as const,
-      obligationId: record.receipt.receiptId, disposition: 'unknown' as const,
-      releaseState: 'pending' as const }
-    expect(await restarted.read(expected)).toEqual(migrated)
+    expect(migrated).toMatchObject({ ...record, schemaVersion: 4,
+      obligationId: record.receipt.receiptId, disposition: 'unknown', releaseState: 'pending' })
     expect(await restarted.readPending({ attemptId: expected.attemptId,
       payloadHash: expected.payloadHash, currentGeneration: 4 })).toEqual(migrated)
-    const completedKeepAlive = { ...migrated, disposition: 'keep_alive' as const,
+    const completedKeepAlive = { ...migrated!, disposition: 'keep_alive' as const,
       releaseState: 'complete' as const }
     await restarted.record(completedKeepAlive)
     expect(await restarted.read(expected)).toEqual(completedKeepAlive)
@@ -93,7 +93,7 @@ test('attempt host release ledger preserves every generation and prepublished ac
   try {
     const ledger = new OpenCodeLaunchHostReleaseLedger(file)
     const firstObligation = await ledger.reserve({ attemptId, payloadHash, generation: 1,
-      hostKeyIdentity: identity })
+      hostKeyIdentity: identity, hostKeyDigest: 'c'.repeat(64) })
     expect(await new OpenCodeLaunchHostReleaseLedger(file).hasUnresolvedAcquisition({
       attemptId, payloadHash, currentGeneration: 2,
     })).toBe(true)
@@ -102,7 +102,7 @@ test('attempt host release ledger preserves every generation and prepublished ac
       pid: 441, processStartedAtMs: 1_441, lifetime: 'process' as const } }
     await ledger.record(first)
     const secondObligation = await ledger.reserve({ attemptId, payloadHash, generation: 2,
-      hostKeyIdentity: identity })
+      hostKeyIdentity: identity, hostKeyDigest: 'd'.repeat(64) })
     const second = { ...secondObligation, disposition: 'keep_alive' as const,
       releaseState: 'complete' as const, receipt: { schemaVersion: 1 as const,
         receiptId: '123e4567-e89b-42d3-a456-426614174442', hostKeyDigest: 'd'.repeat(64),
@@ -115,7 +115,8 @@ test('attempt host release ledger preserves every generation and prepublished ac
     expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
       .map(record => [record.generation, record.receipt.receiptId]))
       .toEqual([[1, first.receipt.receiptId], [2, second.receipt.receiptId]])
-    await restarted.clear(second)
+    await restarted.clear((await restarted.readObligation({ attemptId, payloadHash, generation: 2,
+      obligationId: secondObligation.obligationId }))!)
     expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
       .map(record => record.generation)).toEqual([1])
   } finally { await rm(directory, { recursive: true, force: true }) }
@@ -128,8 +129,10 @@ test('attempt host release ledger updates only the exact obligation when one gen
     payloadHash: 'b'.repeat(64), generation: 1 }
   try {
     const ledger = new OpenCodeLaunchHostReleaseLedger(file)
-    const predecessor = await ledger.reserve({ ...expected, hostKeyIdentity: identity })
-    const current = await ledger.reserve({ ...expected, hostKeyIdentity: identity })
+    const predecessor = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
+      hostKeyDigest: 'c'.repeat(64) })
+    const current = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
+      hostKeyDigest: 'd'.repeat(64) })
     const predecessorReceipt = { ...predecessor, disposition: 'dispose' as const,
       releaseState: 'complete' as const, receipt: { schemaVersion: 1 as const,
         receiptId: '123e4567-e89b-42d3-a456-426614174451', hostKeyDigest: 'c'.repeat(64),
@@ -141,15 +144,56 @@ test('attempt host release ledger updates only the exact obligation when one gen
     await ledger.record(currentReceipt)
 
     await expect(ledger.read(expected)).rejects.toThrow('ambiguous')
-    expect(await ledger.readObligation({ ...expected, obligationId: current.obligationId }))
-      .toEqual(currentReceipt)
-    const completedCurrent = { ...currentReceipt, disposition: 'dispose' as const,
+    const persistedCurrent = await ledger.readObligation({ ...expected, obligationId: current.obligationId })
+    expect(persistedCurrent).toMatchObject({ obligationId: current.obligationId,
+      disposition: 'unknown', releaseState: 'pending', receipt: currentReceipt.receipt })
+    const completedCurrent = { ...persistedCurrent!, disposition: 'dispose' as const,
       releaseState: 'complete' as const }
     await ledger.record(completedCurrent)
     expect(await ledger.readObligation({ ...expected, obligationId: predecessor.obligationId }))
-      .toEqual(predecessorReceipt)
+      .toMatchObject({ obligationId: predecessor.obligationId, disposition: 'dispose',
+        releaseState: 'complete', receipt: predecessorReceipt.receipt })
     expect(await ledger.readObligation({ ...expected, obligationId: current.obligationId }))
       .toEqual(completedCurrent)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('attempt host release ledger CAS fences host substitution and non-monotonic transitions', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-cas-'))
+  const file = path.join(directory, 'receipt.json')
+  const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
+    payloadHash: 'b'.repeat(64), generation: 1 }
+  try {
+    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const reservation = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
+      hostKeyDigest: 'c'.repeat(64) })
+    await ledger.record({ ...reservation, receipt: { schemaVersion: 1,
+      receiptId: '123e4567-e89b-42d3-a456-426614174461', hostKeyDigest: 'c'.repeat(64),
+      pid: 461, processStartedAtMs: 1_461, lifetime: 'process' } })
+    const acquired = (await ledger.readObligation({ ...expected,
+      obligationId: reservation.obligationId }))!
+
+    await expect(ledger.record({ ...acquired, hostKeyIdentity: `sha256:${'d'.repeat(64)}`,
+      receipt: { ...acquired.receipt, hostKeyDigest: 'd'.repeat(64), pid: 462 } }))
+      .rejects.toThrow('identity')
+    const contender = new OpenCodeLaunchHostReleaseLedger(file)
+    const competing = await Promise.allSettled([
+      ledger.record({ ...acquired, disposition: 'dispose' }),
+      contender.record({ ...acquired, disposition: 'keep_alive' }),
+    ])
+    expect(competing.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(competing.filter(result => result.status === 'rejected')).toHaveLength(1)
+    const intended = (await ledger.readObligation({ ...expected,
+      obligationId: reservation.obligationId }))!
+    const conflictingDisposition = intended.disposition === 'dispose' ? 'keep_alive' : 'dispose'
+    await expect(ledger.record({ ...intended, disposition: conflictingDisposition }))
+      .rejects.toThrow('disposition changed')
+    const completed = { ...intended, releaseState: 'complete' as const }
+    await ledger.record(completed)
+    await expect(ledger.record({ ...completed, releaseState: 'pending' }))
+      .rejects.toThrow('completion regressed')
+    expect(await ledger.readObligation({ ...expected, obligationId: reservation.obligationId }))
+      .toEqual(completed)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -1201,7 +1245,14 @@ test('production composition routes an incomplete exact final through real HostM
     fetchJson: async () => ({ status: 200, data: { ok: true } }) })
   const harness = await productionRecoveryHarness(realHostManager)
   try {
-    const obligationId = '77777777-7777-4777-8777-777777777777'
+    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+      `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
+    const obligation = await hostLedger.reserve({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1,
+      hostKeyIdentity: harness.acceptedProof().launchAttempt.retainedHostIdentity!.hostKeyIdentity,
+      hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+    }, harness.context)
     const failure = { code: 'contract_violation' as const, origin: 'session' as const,
       retryDisposition: 'never' as const, retryable: false,
       phase: 'member_materialize' as const, sideEffectsStarted: false }
@@ -1209,6 +1260,16 @@ test('production composition routes an incomplete exact final through real HostM
     const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
       members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
         pending: [], cleanupPending: [] }, failure }
+    await hostLedger.record({ ...obligation,
+      disposition: 'dispose', releaseState: 'pending', receipt: {
+        schemaVersion: 1, receiptId: '88888888-8888-4888-8888-888888888888',
+        hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+        pid: 443, processStartedAtMs: 1, lifetime: 'persistent',
+      } }, harness.context)
+    const exact = await hostLedger.readObligation({
+      attemptId: obligation.attemptId, payloadHash: obligation.payloadHash,
+      generation: obligation.generation, obligationId: obligation.obligationId,
+    }, harness.context)
     await harness.store.withGeneration({
       attemptId: harness.command.request.launchAttempt.attemptId,
       payloadHash: harness.command.request.launchAttempt.payloadHash,
@@ -1216,21 +1277,21 @@ test('production composition routes an incomplete exact final through real HostM
       generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000,
     }, 'begin', async lease => {
       await lease.commitAcceptedProofResponse(basis, harness.context)
-      await lease.bindHostCleanupObligation(obligationId, harness.context)
+      await lease.bindHostCleanupObligation({ obligationId: exact!.obligationId,
+        reservationDigest: exact!.reservationDigest,
+        receiptIdentityDigest: exact!.receiptIdentityDigest }, harness.context)
       await lease.commitTerminalResponse(final, 'incomplete', harness.context)
     }, harness.context)
-    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
-      `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
-    await hostLedger.record({ schemaVersion: 3, obligationId,
-      attemptId: harness.command.request.launchAttempt.attemptId,
-      payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1,
-      hostKeyIdentity: final.launchAttempt.retainedHostIdentity!.hostKeyIdentity,
-      disposition: 'dispose', releaseState: 'pending', receipt: {
-        schemaVersion: 1, receiptId: '88888888-8888-4888-8888-888888888888',
-        hostKeyDigest: createHash('sha256').update('host').digest('hex'),
-        pid: 443, processStartedAtMs: 1,
-        lifetime: 'persistent',
-      } }, harness.context)
+    const boundJournal = (await harness.inspectJournal())!
+    await expect(harness.store.withGeneration({
+      attemptId: boundJournal.attemptId, payloadHash: boundJournal.payloadHash,
+      inputDigest: boundJournal.inputDigest, immutableDigest: boundJournal.immutableDigest,
+      generation: boundJournal.generation, startedAtMs: boundJournal.startedAtMs,
+      totalBudgetMs: boundJournal.totalBudgetMs,
+    }, 'replay', lease => lease.bindHostCleanupObligation({
+      obligationId: exact!.obligationId, reservationDigest: 'f'.repeat(64),
+      receiptIdentityDigest: exact!.receiptIdentityDigest,
+    }, harness.context), harness.context)).rejects.toThrow('identity changed')
 
     await harness.bridge.execute(harness.command)
     expect((await harness.inspectJournal())?.cleanupState).toBe('complete')

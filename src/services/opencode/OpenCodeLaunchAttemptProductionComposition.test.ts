@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { accessSync, constants as fsConstants } from 'node:fs'
+import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -16,10 +18,12 @@ import { OpenCodeProfileManager } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { createOpenCodeLaunchAttemptProductionTestBridge,
   OpenCodeLaunchHostReleaseLedger } from './OpenCodeLaunchAttemptProduction.js'
-import { isProcessAlive } from '../../utils/processKill.js'
+import { isProcessAlive, readProcessBirthToken } from '../../utils/processKill.js'
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
 const identity = (character: string) => `sha256:${character.repeat(64)}` as const
+const projectedLaunchAttempt = (value: { data?: unknown }): unknown =>
+  (value.data as { launchAttempt?: unknown } | undefined)?.launchAttempt
 const snapshot = { detected: false } as OpenCodeProvisioningSnapshot
 const result: OpenCodeLaunchAttemptResult = {
   attemptId: '018f47a2-4a13-7c2f-8d44-c0ffee123456', payloadHash: 'a'.repeat(64),
@@ -33,6 +37,13 @@ const result: OpenCodeLaunchAttemptResult = {
   cleanup: 'complete',
   absoluteDeadlineAtMs: 10_000,
   workDeadlineAtMs: 9_000,
+}
+const nativePidRecycleRequired = process.env.OPENCODE_REQUIRE_NATIVE_PID_RECYCLE === '1'
+const canExerciseNativePidRecycle = process.platform !== 'linux' || (nativePidRecycleRequired && (() => {
+  try { accessSync('/proc/sys/kernel/ns_last_pid', fsConstants.W_OK); return true } catch { return false }
+})())
+if (nativePidRecycleRequired && !canExerciseNativePidRecycle) {
+  throw new Error('mandatory Linux native PID-recycle authority is unavailable')
 }
 let projectPath = ''
 beforeAll(async () => { projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-composition-')) })
@@ -373,12 +384,12 @@ describe('OpenCode production launch composition', () => {
       })
 
       const first = await createBridge().execute(value)
-      if (!first.data?.launchAttempt) {
+      if (!projectedLaunchAttempt(first)) {
         const journal = await readFile(path.join(data, 'opencode', 'launch-attempts',
           `${value.request.launchAttempt.attemptId}.journal`), 'utf8').catch(() => 'missing journal')
         throw new Error(`missing launch result: ${JSON.stringify(first)} journal=${journal}`)
       }
-      expect(first.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      expect(projectedLaunchAttempt(first)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
       const pidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n')
       expect(pidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
@@ -394,7 +405,7 @@ describe('OpenCode production launch composition', () => {
       // A new production runtime/HostManager must project the exact durable
       // outcome without reacquisition or a PID-only cleanup attempt.
       const replay = await createBridge().execute(value)
-      expect(replay.data?.launchAttempt).toEqual(first.data?.launchAttempt)
+      expect(projectedLaunchAttempt(replay)).toEqual(projectedLaunchAttempt(first))
 
       // Hold a second real native acquisition after HostManager has returned
       // its exact capability, close the caller envelope, and only then expose
@@ -474,7 +485,7 @@ describe('OpenCode production launch composition', () => {
       unhealthyValue.request.launchAttempt.requestCorrelationDigest =
         computeOpenCodeLaunchRequestCorrelationDigest(unhealthyValue)
       const unhealthy = await createBridge().execute(unhealthyValue)
-      expect(unhealthy.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      expect(projectedLaunchAttempt(unhealthy)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
       const unhealthyLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
         'launch-attempts', `${unhealthyValue.request.launchAttempt.attemptId}.host-release.json`))
       expect(await unhealthyLedger.read({ attemptId: unhealthyValue.request.launchAttempt.attemptId,
@@ -505,8 +516,16 @@ describe('OpenCode production launch composition', () => {
       failedValue.outerRemainingBudgetMs = 10_000
       failedValue.request.launchAttempt.requestCorrelationDigest =
         computeOpenCodeLaunchRequestCorrelationDigest(failedValue)
-      const failed = await createBridge().execute(failedValue)
-      expect(failed.data?.launchAttempt).toMatchObject({ launchAttempt: { outcome: 'failed' } })
+      // Keep this manager for the post-kill retry. The separate-process case
+      // below covers restart semantics; here the live manager still owns the
+      // exact receipt capability and must settle it once the non-signalling
+      // Linux observer proves that the killed descendant left no live member.
+      const failedHostManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      const failedBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
+        profileManager, sessionStore, hostManager: failedHostManager,
+        mcpManager: disconnectedMcp as never })
+      const failed = await failedBridge.execute(failedValue)
+      expect(projectedLaunchAttempt(failed)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
       const failedLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
         'launch-attempts', `${failedValue.request.launchAttempt.attemptId}.host-release.json`))
       let failedReceipt = null
@@ -518,8 +537,8 @@ describe('OpenCode production launch composition', () => {
       }
       expect(failedReceipt)
         .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
-      const blockedReplay = await createBridge().execute(failedValue)
-      expect(blockedReplay.data?.launchAttempt).toEqual(failed.data?.launchAttempt)
+      const blockedReplay = await failedBridge.execute(failedValue)
+      expect(projectedLaunchAttempt(blockedReplay)).toEqual(projectedLaunchAttempt(failed))
       expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
         payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
         .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
@@ -533,116 +552,143 @@ describe('OpenCode production launch composition', () => {
       for (let attempt = 0; attempt < 100 && isProcessAlive(failedGrandchild); attempt += 1) {
         await Bun.sleep(10)
       }
-      await createBridge().execute(failedValue)
+      await failedBridge.execute(failedValue)
       expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
         payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
         .toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
 
-      // Crash after a second real native acquisition publishes its receipt,
-      // then present a changed/recycled birth token to the restarted production
-      // bridge. The real HostManager must reject the changed generation before
-      // any containment mutation and leave the exact obligation pending.
-      await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
-      const changedValue = structuredClone(value)
-      changedValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee999999'
-      changedValue.request.launchAttempt.payloadHash = '9'.repeat(64)
-      changedValue.request.launchAttempt.proofNonce = 'BQUFBQUFBQUFBQUFBQUFBQ'
-      changedValue.request.launchAttempt.parent = {
-        sessionIdentity: identity('8'), messageIdentity: identity('9'),
-      }
-      changedValue.members = [{ name: 'changed-native', memberIdentity: identity('9') }]
-      changedValue.preconditions.idempotencyKey = changedValue.request.launchAttempt.attemptId
-      changedValue.preconditions.commandLeaseId = 'lease-changed-native'
-      changedValue.request.launchAttempt.requestCorrelationDigest =
-        computeOpenCodeLaunchRequestCorrelationDigest(changedValue)
-      const changedOwningManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
-      const crashingChangedManager = new Proxy(changedOwningManager, {
-        get(target, property, receiver) {
-          if (property === 'reconcileHostReleaseReceipt') return async () => {
-            throw new Error('deterministic crash before Linux containment release')
-          }
-          const member = Reflect.get(target, property, receiver)
-          return typeof member === 'function' ? member.bind(target) : member
-        },
-      })
-      const changedBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
-        profileManager, sessionStore, hostManager: crashingChangedManager,
-        mcpManager: disconnectedMcp as never })
-      const changedResult = await changedBridge.execute(changedValue)
-      const changedLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
-        'launch-attempts', `${changedValue.request.launchAttempt.attemptId}.host-release.json`))
-      const originalChangedReceipt = await changedLedger.read({
-        attemptId: changedValue.request.launchAttempt.attemptId,
-        payloadHash: changedValue.request.launchAttempt.payloadHash, generation: 1,
-      })
-      expect(originalChangedReceipt).toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
-      const recycledReceipt = { ...originalChangedReceipt!, receipt: {
-        ...originalChangedReceipt!.receipt,
-        processBirthToken: 'linux:changed-recycled-native-generation',
-      } }
-      await changedLedger.record(recycledReceipt)
-      const changedReplay = await createBridge().execute(changedValue)
-      expect(changedReplay.data?.launchAttempt).toEqual(changedResult.data?.launchAttempt)
-      expect(await changedLedger.read({ attemptId: changedValue.request.launchAttempt.attemptId,
-        payloadHash: changedValue.request.launchAttempt.payloadHash, generation: 1 }))
-        .toMatchObject({ receipt: { processBirthToken: 'linux:changed-recycled-native-generation' },
-          releaseState: 'pending' })
-      await changedOwningManager.reconcileHostReleaseReceipt(originalChangedReceipt!.receipt)
-      } else {
-        // Crash at the exact boundary after the real production bridge has
-        // acquired through the native launcher/job and durably published its
-        // receipt/disposition, but before the owning manager closes the job.
-        // A restarted bridge/ledger/HostManager path has no owned handle and
-        // therefore must keep the receipt pending without PID-only taskkill.
-        await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
-        const windowsValue = structuredClone(value)
-        windowsValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee888888'
-        windowsValue.request.launchAttempt.payloadHash = '8'.repeat(64)
-        windowsValue.request.launchAttempt.proofNonce = 'BAQEBAQEBAQEBAQEBAQEBA'
-        windowsValue.request.launchAttempt.parent = {
-          sessionIdentity: identity('7'), messageIdentity: identity('8'),
-        }
-        windowsValue.members = [{ name: 'windows-restart', memberIdentity: identity('8') }]
-        windowsValue.preconditions.idempotencyKey = windowsValue.request.launchAttempt.attemptId
-        windowsValue.preconditions.commandLeaseId = 'lease-windows-restart'
-        windowsValue.request.launchAttempt.requestCorrelationDigest =
-          computeOpenCodeLaunchRequestCorrelationDigest(windowsValue)
-        const owningManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
-        let crashBoundaryCalls = 0
-        const crashingManager = new Proxy(owningManager, {
-          get(target, property, receiver) {
-            if (property === 'reconcileHostReleaseReceipt') return async () => {
-              crashBoundaryCalls += 1
-              throw new Error('deterministic crash before native job close')
-            }
-            const member = Reflect.get(target, property, receiver)
-            return typeof member === 'function' ? member.bind(target) : member
-          },
-        })
-        const crashedBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
-          profileManager, sessionStore, hostManager: crashingManager,
-          mcpManager: disconnectedMcp as never })
-        const crashed = await crashedBridge.execute(windowsValue)
-        expect(crashBoundaryCalls).toBe(1)
-        const windowsLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
-          'launch-attempts', `${windowsValue.request.launchAttempt.attemptId}.host-release.json`))
-        const pending = await windowsLedger.read({
-          attemptId: windowsValue.request.launchAttempt.attemptId,
-          payloadHash: windowsValue.request.launchAttempt.payloadHash, generation: 1,
-        })
-        expect(pending).toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
-        const restarted = await createBridge().execute(windowsValue)
-        expect(restarted.data?.launchAttempt).toEqual(crashed.data?.launchAttempt)
-        expect(await windowsLedger.read({ attemptId: windowsValue.request.launchAttempt.attemptId,
-          payloadHash: windowsValue.request.launchAttempt.payloadHash, generation: 1 }))
-          .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
-        // Teardown retains the original owning manager solely to close the
-        // deterministic fixture job after the restart assertions.
-        await owningManager.reconcileHostReleaseReceipt(pending!.receipt)
       }
     } finally {
       restoreEnvironment()
       await rm(root, { recursive: true, force: true })
     }
   }, 30_000)
+
+  test.skipIf(!canExerciseNativePidRecycle)(
+    'native cleanup acquisition and replay use separate OS processes with no retained authority', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-process-restart-'))
+    const project = path.join(root, 'project')
+    const data = path.join(root, 'data')
+    const userHome = path.join(root, 'home')
+    const fixtureName = `opencode-host-fixture${process.platform === 'win32' ? '.exe' : ''}`
+    const fixtureBinary = path.resolve(import.meta.dir,
+      '../../../native/opencode-host-fixture/target/debug', fixtureName)
+    const fixtureScript = path.resolve(import.meta.dir,
+      'OpenCodeLaunchAttemptProductionRestartFixture.ts')
+    const fixtureSystemRoot = path.join(root, 'system-root')
+    const runPhase = (phase: 'acquire' | 'replay') => new Promise<void>((resolve, reject) => {
+      const child = spawn(process.execPath, [fixtureScript, phase], {
+        env: { ...process.env, OPENCODE_RESTART_FIXTURE_ROOT: root,
+          ...(process.platform === 'win32' ? { SystemRoot: fixtureSystemRoot } : {}) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let output = ''
+      child.stdout?.on('data', chunk => { output += String(chunk) })
+      child.stderr?.on('data', chunk => { output += String(chunk) })
+      child.once('error', reject)
+      child.once('exit', code => code === 0 ? resolve()
+        : reject(new Error(`restart fixture ${phase} exited ${code}: ${output}`)))
+    })
+    let recycledLeader: ReturnType<typeof spawn> | null = null
+    let recycledLeaderBirthToken: string | null = null
+    try {
+      await Promise.all([mkdir(project), mkdir(userHome)])
+      await mkdir(data, { recursive: true })
+      if (process.platform === 'win32') {
+        await mkdir(path.join(fixtureSystemRoot, 'System32'), { recursive: true })
+        await copyFile(fixtureBinary, path.join(fixtureSystemRoot, 'System32', 'taskkill.exe'))
+      }
+      await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
+      await runPhase('acquire')
+      const acquired = JSON.parse(await readFile(path.join(root, 'restart-acquire.json'), 'utf8'))
+      expect(acquired).toMatchObject({ outcome: 'failed', disposition: 'dispose',
+        releaseState: 'pending' })
+      expect(acquired.reservationDigest).toMatch(/^[a-f0-9]{64}$/)
+      expect(acquired.receiptIdentityDigest).toMatch(/^[a-f0-9]{64}$/)
+      const pidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+        .trim().split('\n')
+      const leaderPid = Number(pidLines.find(line => line.startsWith('child:'))!.split(':')[1])
+      const grandchildPid = Number(pidLines.find(line => line.startsWith('grandchild:'))!.split(':')[1])
+
+      if (process.platform === 'linux') {
+        process.kill(leaderPid, 'SIGKILL')
+        process.kill(grandchildPid, 'SIGKILL')
+        for (let attempt = 0; attempt < 200 && isProcessAlive(leaderPid); attempt += 1) {
+          await Bun.sleep(10)
+        }
+        for (let attempt = 0; attempt < 200 && isProcessAlive(grandchildPid); attempt += 1) {
+          await Bun.sleep(10)
+        }
+        // This test runs inside the CI pid namespace. Setting ns_last_pid and
+        // spawning the static holder produces a real recycled kernel PID with
+        // a different /proc starttime; no receipt or registry bytes are edited.
+        await writeFile('/proc/sys/kernel/ns_last_pid', String(leaderPid - 1))
+        recycledLeader = spawn(fixtureBinary, ['--static-recycled-leader'], {
+          detached: true, stdio: 'ignore', env: { ...process.env,
+            CLAUDE_MULTIMODEL_DATA_HOME: data },
+        })
+        recycledLeader.unref()
+        expect(recycledLeader.pid).toBe(leaderPid)
+        recycledLeaderBirthToken = readProcessBirthToken(leaderPid, 'linux')
+        expect(recycledLeaderBirthToken).not.toBeNull()
+        expect(recycledLeaderBirthToken).not.toBe(acquired.processBirthToken)
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const lines = await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8')
+          if (lines.includes('recycled-follower:')) break
+          await Bun.sleep(10)
+        }
+      }
+
+      await runPhase('replay')
+      const replayed = JSON.parse(await readFile(path.join(root, 'restart-replay.json'), 'utf8'))
+      expect(replayed).toMatchObject({ outcome: 'failed', disposition: 'dispose',
+        releaseState: 'pending', obligationId: acquired.obligationId,
+        reservationDigest: acquired.reservationDigest,
+        receiptIdentityDigest: acquired.receiptIdentityDigest })
+      const registry = JSON.parse(await readFile(path.join(data, 'opencode', 'hosts.json'), 'utf8'))
+      const retainedRegistryRecords = Object.values(registry.hosts) as Array<{
+        pid: number; processBirthToken?: string; scopedIdentityBinding?: string
+      }>
+      expect(retainedRegistryRecords).toHaveLength(1)
+      expect(retainedRegistryRecords[0]).toMatchObject({ pid: acquired.pid })
+      expect(retainedRegistryRecords[0]!.scopedIdentityBinding).toMatch(/^[a-f0-9]{64}$/)
+      if (acquired.processBirthToken) {
+        expect(retainedRegistryRecords[0]!.processBirthToken).toBe(acquired.processBirthToken)
+      }
+      if (process.platform === 'linux') {
+        const replayPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+          .trim().split('\n')
+        const recycledFollowerPid = Number(replayPidLines
+          .find(line => line.startsWith('recycled-follower:'))!.split(':')[1])
+        // The recycled leader resists TERM while its follower does not. A
+        // negative-PGID mutation would kill the follower and a direct KILL
+        // would kill the recycled leader. Both remaining alive proves the
+        // changed-native-birth branch made zero containment mutation.
+        expect(isProcessAlive(leaderPid)).toBe(true)
+        expect(isProcessAlive(recycledFollowerPid)).toBe(true)
+        expect(readProcessBirthToken(leaderPid, 'linux')).toBe(recycledLeaderBirthToken)
+      } else {
+        // The acquisition process owned the launcher/job. Replay is a genuinely
+        // fresh process without that handle and must leave the exact receipt pending.
+        expect(replayed.releaseState).toBe('pending')
+        const replayPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
+          .trim().split('\n')
+        expect(replayPidLines.some(line => line.startsWith('taskkill-mutation:'))).toBe(false)
+      }
+    } finally {
+      if (recycledLeader?.pid && isProcessAlive(recycledLeader.pid)) {
+        try { process.kill(recycledLeader.pid, 'SIGKILL') } catch {}
+      }
+      const lines = await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8')
+        .catch(() => '')
+      for (const line of lines.trim().split('\n')) {
+        const pid = Number(line.split(':')[1])
+        if (pid > 0 && isProcessAlive(pid)) {
+          try { process.kill(pid, 'SIGKILL') } catch {}
+        }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+    }, 30_000)
 })

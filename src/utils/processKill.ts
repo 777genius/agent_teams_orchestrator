@@ -26,6 +26,17 @@ export function isProcessAlive(pid: number): boolean {
   }
   try {
     process.kill(pid, 0)
+    if (process.platform === 'linux') {
+      try {
+        const stat = readFileSync(`/proc/${Math.trunc(pid)}/stat`, 'utf8')
+        const commandEnd = stat.lastIndexOf(')')
+        const state = commandEnd < 0 ? null : stat.slice(commandEnd + 2).trim().split(/\s+/, 1)[0]
+        if (state === 'Z' || state === 'X') return false
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        // A failed observation cannot prove the process dead.
+      }
+    }
     return true
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM'
@@ -258,10 +269,13 @@ export function isProcessTreeContainmentAlive(
         if (commandEnd < 0) return null
         const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
         // Fields after comm start with state. pgrp is index 2 and starttime
-        // (the process birth identity) is index 19.
+        // (the process birth identity) is index 19. Retain state in the stable
+        // snapshot as well: a zombie is no longer a live containment member,
+        // but a concurrent live-to-zombie transition is churn rather than an
+        // emptiness proof.
         if (fields.length < 20 || !/^\d+$/.test(fields[2] ?? '')
-          || !/^\d+$/.test(fields[19] ?? '')) return null
-        identities.push(`${entry}:${fields[19]}:${fields[2]}`)
+          || !/^\d+$/.test(fields[19] ?? '') || !/^[A-Z]$/.test(fields[0] ?? '')) return null
+        identities.push(`${entry}:${fields[19]}:${fields[2]}:${fields[0]}`)
       }
       return { names, identities }
     }
@@ -270,7 +284,10 @@ export function isProcessTreeContainmentAlive(
     if (!before || !after
       || JSON.stringify(before.names) !== JSON.stringify(after.names)
       || JSON.stringify(before.identities) !== JSON.stringify(after.identities)) return null
-    return after.identities.some(identity => identity.endsWith(`:${groupLeaderPid}`))
+    return after.identities.some(identity => {
+      const fields = identity.split(':')
+      return fields[2] === String(groupLeaderPid) && fields[3] !== 'Z'
+    })
   } catch {
     return null
   }

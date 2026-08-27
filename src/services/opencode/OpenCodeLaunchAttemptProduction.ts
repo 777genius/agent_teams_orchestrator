@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises'
+import * as lockfile from '../../utils/lockfile.js'
 
 import { openCodeClientFactory as globalThisOpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeHostManager as globalThisOpenCodeHostManager } from './OpenCodeHostManager.js'
@@ -12,6 +13,7 @@ import { openCodeSessionStore as globalThisOpenCodeSessionStore } from './OpenCo
 import {
   OpenCodeLaunchAttempt,
   OpenCodeOperationHostAcquisitionCleanupError,
+  OpenCodeOperationHostAcquisitionSettledError,
   computeOpenCodeLaunchAttemptInputDigest,
   computeOpenCodeLaunchAttemptImmutableDigest,
   createOpenCodeLaunchAttemptResult,
@@ -53,6 +55,7 @@ import type {
   OpenCodeHostReferenceCapability,
   OpenCodeHostReleaseReceipt,
 } from './OpenCodeHostManager.js'
+import { computeOpenCodeHostReleaseObligationIdentityDigest } from './OpenCodeHostManager.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import {
   OpenCodeLaunchMutationLedger,
@@ -86,30 +89,29 @@ import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 
 type OpenCodeLaunchHostReleaseRecord = Readonly<{
-  schemaVersion: 3
+  schemaVersion: 4
   obligationId: string
+  reservationDigest: string
+  receiptIdentityDigest: string
   attemptId: string
   payloadHash: string
   generation: number
   hostKeyIdentity: OpenCodeOpaqueIdentity
+  hostKeyDigest: string
   disposition: 'dispose' | 'keep_alive' | 'unknown'
   releaseState: 'pending' | 'complete'
   receipt: OpenCodeHostReleaseReceipt
 }>
-type LegacyOpenCodeLaunchHostReleaseRecord = Readonly<
-  Omit<OpenCodeLaunchHostReleaseRecord, 'schemaVersion' | 'obligationId' | 'disposition' | 'releaseState'>
-  & { schemaVersion: 1 }
->
-type OpenCodeLaunchHostReleaseRecordV2 = Readonly<
-  Omit<OpenCodeLaunchHostReleaseRecord, 'schemaVersion' | 'obligationId'> & { schemaVersion: 2 }
->
 type OpenCodeLaunchHostAcquisitionObligation = Readonly<{
-  schemaVersion: 3
+  schemaVersion: 4
   obligationId: string
+  reservationDigest: string
+  receiptIdentityDigest: null
   attemptId: string
   payloadHash: string
   generation: number
   hostKeyIdentity: OpenCodeOpaqueIdentity
+  hostKeyDigest: string
   disposition: 'unknown'
   releaseState: 'pending'
   receipt: null
@@ -117,6 +119,32 @@ type OpenCodeLaunchHostAcquisitionObligation = Readonly<{
 type OpenCodeLaunchHostCleanupRecord = OpenCodeLaunchHostReleaseRecord
   | OpenCodeLaunchHostAcquisitionObligation
 type OpenCodeLaunchHostLedgerContext = Readonly<{ deadlineAtMs: number; signal: AbortSignal }>
+
+function isOpenCodeLaunchHostAcquisitionObligation(
+  record: OpenCodeLaunchHostCleanupRecord,
+): record is OpenCodeLaunchHostAcquisitionObligation {
+  return record.receipt === null && record.receiptIdentityDigest === null
+    && record.disposition === 'unknown' && record.releaseState === 'pending'
+}
+
+function launchHostReservationDigest(input: Readonly<{ obligationId: string; attemptId: string;
+  payloadHash: string; generation: number; hostKeyIdentity: OpenCodeOpaqueIdentity;
+  hostKeyDigest: string }>): string {
+  return createHash('sha256').update(JSON.stringify({
+    schema: 'opencode-host-cleanup-reservation-v1',
+    obligationId: input.obligationId,
+    attemptId: input.attemptId,
+    payloadHash: input.payloadHash,
+    generation: input.generation,
+    hostKeyIdentity: input.hostKeyIdentity,
+    hostKeyDigest: input.hostKeyDigest,
+  })).digest('hex')
+}
+
+function launchHostReceiptIdentityDigest(input: Readonly<{ reservationDigest: string;
+  hostKeyIdentity: OpenCodeOpaqueIdentity; receipt: OpenCodeHostReleaseReceipt }>): string {
+  return computeOpenCodeHostReleaseObligationIdentityDigest(input)
+}
 
 function hostLedgerContext(context?: OpenCodeLaunchHostLedgerContext): OpenCodeLaunchHostLedgerContext {
   return context ?? { deadlineAtMs: launchMonotonicNow() + 300_000,
@@ -140,37 +168,102 @@ export class OpenCodeLaunchHostReleaseLedger {
     return path.join(`${this.filePath}.records`, `${record.generation}.${record.obligationId}.json`)
   }
 
-  private async serialized<T>(operation: () => Promise<T>): Promise<T> {
+  private async serialized<T>(context: OpenCodeLaunchHostLedgerContext,
+    operation: () => Promise<T>): Promise<T> {
     const previous = this.tail
     let release!: () => void
     this.tail = new Promise<void>(resolve => { release = resolve })
     await previous
-    try { return await operation() } finally { release() }
+    let unlock: (() => Promise<void>) | undefined
+    try {
+      if (context.signal.aborted || launchMonotonicNow() >= context.deadlineAtMs) {
+        throw context.signal.reason ?? new DeadlineError('OpenCode launch deadline expired')
+      }
+      const directory = `${this.filePath}.records`
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const lockPath = path.join(directory, '.ledger-cas')
+      const lockHandle = await open(lockPath, 'a', 0o600)
+      await lockHandle.close()
+      for (;;) {
+        try {
+          unlock = await lockfile.lock(lockPath, { stale: 2_000, update: 500, retries: 0 })
+          break
+        } catch (error) {
+          if ((error as { code?: unknown }).code !== 'ELOCKED') throw error
+          if (context.signal.aborted || launchMonotonicNow() >= context.deadlineAtMs) {
+            throw context.signal.reason ?? new DeadlineError('OpenCode launch deadline expired')
+          }
+          await new Promise<void>(resolve => setTimeout(resolve, 5))
+        }
+      }
+      return await operation()
+    } finally {
+      if (unlock) await unlock()
+      release()
+    }
   }
 
   async reserve(input: Readonly<{ attemptId: string; payloadHash: string; generation: number;
-    hostKeyIdentity: OpenCodeOpaqueIdentity }>, context?: OpenCodeLaunchHostLedgerContext):
+    hostKeyIdentity: OpenCodeOpaqueIdentity; hostKeyDigest: string }>,
+  context?: OpenCodeLaunchHostLedgerContext):
   Promise<OpenCodeLaunchHostAcquisitionObligation> {
+    const obligationId = randomUUID()
     const obligation: OpenCodeLaunchHostAcquisitionObligation = {
-      schemaVersion: 3, obligationId: randomUUID(), ...input,
+      schemaVersion: 4, obligationId, ...input,
+      reservationDigest: launchHostReservationDigest({ obligationId, ...input }),
+      receiptIdentityDigest: null,
       disposition: 'unknown', releaseState: 'pending', receipt: null,
     }
     const effective = hostLedgerContext(context)
-    await runHostLedgerOperation(effective, () => this.write(obligation))
+    await runHostLedgerOperation(effective, () => this.write(obligation, effective))
     return obligation
   }
 
-  async record(record: OpenCodeLaunchHostReleaseRecord | OpenCodeLaunchHostReleaseRecordV2
-    | LegacyOpenCodeLaunchHostReleaseRecord, context?: OpenCodeLaunchHostLedgerContext): Promise<void> {
-    const normalized = validateLaunchHostReleaseRecord(record)
+  async record(record: unknown, context?: OpenCodeLaunchHostLedgerContext): Promise<void> {
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || (record as { schemaVersion?: unknown }).schemaVersion !== 4) {
+      throw new Error('OpenCode launch host release update lacks an immutable reservation [redacted]')
+    }
+    let candidate = record
+    if (record && typeof record === 'object' && !Array.isArray(record)) {
+      const source = record as Record<string, unknown>
+      if (source.schemaVersion === 4 && source.receipt && typeof source.receipt === 'object'
+        && typeof source.reservationDigest === 'string' && typeof source.hostKeyIdentity === 'string'
+        && (source.receiptIdentityDigest === null || source.receiptIdentityDigest === undefined)) {
+        candidate = { ...source, receiptIdentityDigest: launchHostReceiptIdentityDigest({
+          reservationDigest: source.reservationDigest,
+          hostKeyIdentity: source.hostKeyIdentity as OpenCodeOpaqueIdentity,
+          receipt: source.receipt as OpenCodeHostReleaseReceipt,
+        }) }
+      }
+    }
+    const normalized = validateLaunchHostReleaseRecord(candidate)
     const effective = hostLedgerContext(context)
-    await runHostLedgerOperation(effective, () => this.write(normalized))
+    await runHostLedgerOperation(effective, () => this.write(normalized, effective))
   }
 
-  private async write(record: OpenCodeLaunchHostCleanupRecord): Promise<void> {
-    await this.serialized(async () => {
+  private async write(record: OpenCodeLaunchHostCleanupRecord,
+    context: OpenCodeLaunchHostLedgerContext): Promise<void> {
+    await this.serialized(context, async () => {
       const target = this.recordPath(record)
       await mkdir(path.dirname(target), { recursive: true, mode: 0o700 })
+      let predecessor: OpenCodeLaunchHostCleanupRecord | null = null
+      try {
+        predecessor = validateLaunchHostCleanupRecord(JSON.parse(await readFile(target, 'utf8')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (!predecessor && record.receipt !== null) {
+        try {
+          const legacy = validateLaunchHostReleaseRecord(JSON.parse(await readFile(this.filePath, 'utf8')))
+          if (legacy.obligationId === record.obligationId && legacy.generation === record.generation) {
+            predecessor = legacy
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+      }
+      assertMonotonicLaunchHostCleanupTransition(predecessor, record)
       const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`
       const temporaryHandle = await open(temporary, 'wx', 0o600)
       try {
@@ -264,6 +357,7 @@ export class OpenCodeLaunchHostReleaseLedger {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') names = []
       else throw error
     }
+    names = names.filter(name => name !== '.ledger-cas' && name !== '.ledger-cas.lock')
     const records: OpenCodeLaunchHostCleanupRecord[] = []
     const insert = (record: OpenCodeLaunchHostCleanupRecord): void => {
       if (record.attemptId !== expected.attemptId || record.payloadHash !== expected.payloadHash
@@ -313,17 +407,18 @@ export class OpenCodeLaunchHostReleaseLedger {
 
   async clear(record: OpenCodeLaunchHostReleaseRecord, context?: OpenCodeLaunchHostLedgerContext): Promise<void> {
     const effective = hostLedgerContext(context)
-    await runHostLedgerOperation(effective, () => this.clearRecord(record))
+    await runHostLedgerOperation(effective, () => this.clearRecord(record, effective))
   }
 
   async clearObligation(record: OpenCodeLaunchHostAcquisitionObligation,
     context?: OpenCodeLaunchHostLedgerContext): Promise<void> {
     const effective = hostLedgerContext(context)
-    await runHostLedgerOperation(effective, () => this.clearRecord(record))
+    await runHostLedgerOperation(effective, () => this.clearRecord(record, effective))
   }
 
-  private async clearRecord(record: OpenCodeLaunchHostCleanupRecord): Promise<void> {
-    await this.serialized(async () => {
+  private async clearRecord(record: OpenCodeLaunchHostCleanupRecord,
+    context: OpenCodeLaunchHostLedgerContext): Promise<void> {
+    await this.serialized(context, async () => {
       const target = this.recordPath(record)
       let current: OpenCodeLaunchHostCleanupRecord
       try { current = validateLaunchHostCleanupRecord(JSON.parse(await readFile(target, 'utf8'))) }
@@ -357,11 +452,19 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
     && keys === 'attemptId,disposition,generation,hostKeyIdentity,payloadHash,receipt,releaseState,schemaVersion'
   const current = record.schemaVersion === 3
     && keys === 'attemptId,disposition,generation,hostKeyIdentity,obligationId,payloadHash,receipt,releaseState,schemaVersion'
-  if ((!legacy && !versionTwo && !current) || typeof record.attemptId !== 'string'
+  const versionFour = record.schemaVersion === 4
+    && keys === 'attemptId,disposition,generation,hostKeyDigest,hostKeyIdentity,obligationId,payloadHash,receipt,receiptIdentityDigest,releaseState,reservationDigest,schemaVersion'
+  if ((!legacy && !versionTwo && !current && !versionFour) || typeof record.attemptId !== 'string'
     || typeof record.payloadHash !== 'string' || !Number.isSafeInteger(record.generation)
     || typeof record.hostKeyIdentity !== 'string'
-    || (current && (typeof record.obligationId !== 'string'
+    || ((current || versionFour) && (typeof record.obligationId !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(record.obligationId)))
+    || (versionFour && (typeof record.reservationDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(record.reservationDigest)
+      || typeof record.receiptIdentityDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(record.receiptIdentityDigest)))
+    || (versionFour && (typeof record.hostKeyDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(record.hostKeyDigest)))
     || (!legacy && record.disposition !== 'dispose' && record.disposition !== 'keep_alive'
       && record.disposition !== 'unknown')
     || (!legacy && record.releaseState !== 'pending' && record.releaseState !== 'complete')
@@ -383,9 +486,25 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
     || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }
-  const obligationId = current ? record.obligationId as string : receipt.receiptId as string
+  const obligationId = current || versionFour ? record.obligationId as string : receipt.receiptId as string
+  const reservationDigest = versionFour ? record.reservationDigest as string : launchHostReservationDigest({
+    obligationId, attemptId: record.attemptId as string, payloadHash: record.payloadHash as string,
+    generation: record.generation as number, hostKeyIdentity: record.hostKeyIdentity as OpenCodeOpaqueIdentity,
+    hostKeyDigest: receipt.hostKeyDigest as string,
+  })
+  const hostKeyDigest = versionFour ? record.hostKeyDigest as string : receipt.hostKeyDigest as string
+  if (hostKeyDigest !== receipt.hostKeyDigest) {
+    throw new Error('OpenCode launch host release host identity is corrupt [redacted]')
+  }
+  const receiptIdentityDigest = launchHostReceiptIdentityDigest({ reservationDigest,
+    hostKeyIdentity: record.hostKeyIdentity as OpenCodeOpaqueIdentity,
+    receipt: receipt as OpenCodeHostReleaseReceipt })
+  if (versionFour && record.receiptIdentityDigest !== receiptIdentityDigest) {
+    throw new Error('OpenCode launch host release receipt identity is corrupt [redacted]')
+  }
   return { ...(structuredClone(value) as Omit<OpenCodeLaunchHostReleaseRecord,
-    'schemaVersion' | 'obligationId' | 'disposition' | 'releaseState'>), schemaVersion: 3, obligationId,
+    'schemaVersion' | 'obligationId' | 'reservationDigest' | 'receiptIdentityDigest' | 'disposition' | 'releaseState'>),
+    schemaVersion: 4, obligationId, reservationDigest, receiptIdentityDigest, hostKeyDigest,
     disposition: legacy ? 'unknown' : record.disposition,
     releaseState: legacy ? 'pending' : record.releaseState } as OpenCodeLaunchHostReleaseRecord
 }
@@ -395,17 +514,58 @@ function validateLaunchHostCleanupRecord(value: unknown): OpenCodeLaunchHostClea
     && (value as { receipt?: unknown }).receipt === null) {
     const record = value as Record<string, unknown>
     if (Object.keys(record).sort().join(',')
-        !== 'attemptId,disposition,generation,hostKeyIdentity,obligationId,payloadHash,receipt,releaseState,schemaVersion'
-      || record.schemaVersion !== 3 || typeof record.obligationId !== 'string'
+        !== 'attemptId,disposition,generation,hostKeyDigest,hostKeyIdentity,obligationId,payloadHash,receipt,receiptIdentityDigest,releaseState,reservationDigest,schemaVersion'
+      || record.schemaVersion !== 4 || typeof record.obligationId !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(record.obligationId)
       || typeof record.attemptId !== 'string' || typeof record.payloadHash !== 'string'
       || !Number.isSafeInteger(record.generation) || typeof record.hostKeyIdentity !== 'string'
+      || typeof record.reservationDigest !== 'string' || !/^[a-f0-9]{64}$/.test(record.reservationDigest)
+      || typeof record.hostKeyDigest !== 'string' || !/^[a-f0-9]{64}$/.test(record.hostKeyDigest)
+      || record.receiptIdentityDigest !== null
       || record.disposition !== 'unknown' || record.releaseState !== 'pending') {
       throw new Error('OpenCode launch host acquisition obligation is corrupt [redacted]')
     }
-    return structuredClone(value) as OpenCodeLaunchHostAcquisitionObligation
+    const obligation = structuredClone(value) as OpenCodeLaunchHostAcquisitionObligation
+    if (obligation.reservationDigest !== launchHostReservationDigest(obligation)) {
+      throw new Error('OpenCode launch host acquisition reservation identity is corrupt [redacted]')
+    }
+    return obligation
   }
   return validateLaunchHostReleaseRecord(value)
+}
+
+function assertMonotonicLaunchHostCleanupTransition(
+  predecessor: OpenCodeLaunchHostCleanupRecord | null,
+  candidate: OpenCodeLaunchHostCleanupRecord,
+): void {
+  if (!predecessor) {
+    if (candidate.receipt !== null) {
+      throw new Error('OpenCode launch host release receipt has no immutable reservation [redacted]')
+    }
+    return
+  }
+  const immutable = (record: OpenCodeLaunchHostCleanupRecord) => ({
+    obligationId: record.obligationId, reservationDigest: record.reservationDigest,
+    attemptId: record.attemptId, payloadHash: record.payloadHash, generation: record.generation,
+    hostKeyIdentity: record.hostKeyIdentity, hostKeyDigest: record.hostKeyDigest,
+  })
+  if (JSON.stringify(immutable(predecessor)) !== JSON.stringify(immutable(candidate))) {
+    throw new Error('OpenCode launch host cleanup reservation changed [redacted]')
+  }
+  if (predecessor.receipt !== null && (candidate.receipt === null
+    || predecessor.receiptIdentityDigest !== candidate.receiptIdentityDigest
+    || JSON.stringify(predecessor.receipt) !== JSON.stringify(candidate.receipt))) {
+    throw new Error('OpenCode launch host cleanup receipt identity changed [redacted]')
+  }
+  if (predecessor.disposition !== 'unknown' && candidate.disposition !== predecessor.disposition) {
+    throw new Error('OpenCode launch host cleanup disposition changed [redacted]')
+  }
+  if (predecessor.releaseState === 'complete' && candidate.releaseState !== 'complete') {
+    throw new Error('OpenCode launch host cleanup completion regressed [redacted]')
+  }
+  if (candidate.releaseState === 'complete' && candidate.receipt === null) {
+    throw new Error('OpenCode launch host cleanup completed without a receipt [redacted]')
+  }
 }
 
 export function assertOpenCodeProductionBootstrapOwnership(input: Readonly<{
@@ -766,7 +926,7 @@ class OpenCodeProductionLaunchRuntime {
     const profiles = new Map<OpenCodeOpaqueIdentity, OpenCodeScopedPreparedProfile>()
     const hosts = new Map<OpenCodeOpaqueIdentity, OpenCodeHostHandle>()
     const hostReferences = new Map<OpenCodeOpaqueIdentity, OpenCodeHostReferenceCapability>()
-    const hostAcquisitionObligations = new Map<string, OpenCodeLaunchHostAcquisitionObligation>()
+    const hostAcquisitionObligations = new Map<string, OpenCodeLaunchHostCleanupRecord>()
     const records = new Map<OpenCodeOpaqueIdentity, OpenCodeSessionRecord>()
     const memberOwnershipTitles = new Map<OpenCodeOpaqueIdentity, string>()
     const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord>()
@@ -837,7 +997,8 @@ class OpenCodeProductionLaunchRuntime {
     // command is projected from the authoritative session store.
     const preflightDeadlineAtMs = productionDeadlineAtMs
     const preflightSignal = command.signal ?? new AbortController().signal
-    const preflightLedgerContext = { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal }
+    const preflightLedgerContext = { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal,
+      monotonicNow: launchMonotonicNow }
     const journal = await attemptStore.inspect({
       attemptId: command.request.launchAttempt.attemptId,
       payloadHash: command.request.launchAttempt.payloadHash,
@@ -996,6 +1157,89 @@ class OpenCodeProductionLaunchRuntime {
       }
       return { member, claim, record, linkage, reconciliationError }
     }))
+    if (journal?.finalResponse && exactCurrentGeneration
+      && journal.cleanupState === 'incomplete'
+      && journal.finalResponse.members.cleanupPending.length === 0) {
+      const releaseIdentity = {
+        attemptId: command.request.launchAttempt.attemptId,
+        payloadHash: command.request.launchAttempt.payloadHash,
+        currentGeneration: command.request.launchAttempt.generation,
+      }
+      try {
+        const ledgerObligationIds = await hostReleaseLedger.listCleanupObligationIds(
+          releaseIdentity, preflightLedgerContext)
+        if (!journal.hostCleanupObligations
+          || JSON.stringify([...ledgerObligationIds].sort())
+            !== JSON.stringify(journal.hostCleanupObligations.map(item => item.obligationId).sort())
+          || await hostReleaseLedger.hasUnresolvedAcquisition(releaseIdentity, preflightLedgerContext)) {
+          throw new Error('OpenCode final host cleanup obligation set is unresolved')
+        }
+        const boundById = new Map(journal.hostCleanupObligations.map(item => [item.obligationId, item]))
+        const releaseRecords = await hostReleaseLedger.readAllPending(
+          releaseIdentity, preflightLedgerContext)
+        if (releaseRecords.length === 0 || releaseRecords.some(record => {
+          const binding = boundById.get(record.obligationId)
+          return record.disposition === 'unknown' || !binding
+            || binding.reservationDigest !== record.reservationDigest
+        })) throw new Error('OpenCode final host cleanup obligation identity is unresolved')
+        // Receipt publication and journal binding are separate durable CAS
+        // transitions. A crash (or the caller deadline) may land between them.
+        // Complete that exact transition under the same-generation replay
+        // lease before any HostManager reconciliation is allowed to observe the
+        // capability. The immutable reservation digest fences substitution.
+        const missingReceiptBindings = releaseRecords.filter(record =>
+          boundById.get(record.obligationId)?.receiptIdentityDigest === undefined)
+        if (missingReceiptBindings.length > 0) {
+          await attemptStore.withGeneration({
+            attemptId: command.request.launchAttempt.attemptId,
+            payloadHash: command.request.launchAttempt.payloadHash,
+            inputDigest,
+            immutableDigest,
+            generation: command.request.launchAttempt.generation,
+          }, 'replay', async lease => {
+            for (const record of missingReceiptBindings) {
+              await lease.bindHostCleanupObligation({
+                obligationId: record.obligationId,
+                reservationDigest: record.reservationDigest,
+                receiptIdentityDigest: record.receiptIdentityDigest,
+              }, preflightLedgerContext)
+            }
+          }, preflightLedgerContext)
+          return this.run(command, false, inspectionOnly)
+        }
+        if (releaseRecords.some(record =>
+          boundById.get(record.obligationId)?.receiptIdentityDigest !== record.receiptIdentityDigest)) {
+          throw new Error('OpenCode final host cleanup receipt identity is unresolved')
+        }
+        for (const releaseRecord of releaseRecords) {
+          if (releaseRecord.releaseState === 'complete') continue
+          await openCodeHostManager.reconcileHostReleaseReceipt(releaseRecord.receipt, {
+            obligationIdentity: releaseRecord,
+            keepPersistentAlive: releaseRecord.disposition === 'keep_alive'
+              || retainedSessionLeases.shouldKeepHostAlive(),
+            signal: preflightSignal,
+            remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+          })
+          await hostReleaseLedger.record({ ...releaseRecord, releaseState: 'complete' },
+            preflightLedgerContext)
+        }
+        await attemptStore.withGeneration({
+          attemptId: command.request.launchAttempt.attemptId,
+          payloadHash: command.request.launchAttempt.payloadHash,
+          inputDigest,
+          immutableDigest,
+          generation: command.request.launchAttempt.generation,
+        }, 'replay', lease => lease.reconcileCleanupComplete(preflightLedgerContext),
+        preflightLedgerContext)
+        // Re-read and project only the now-complete exact final. This recursive
+        // inspection cannot reach profile, host acquisition, proof, or member
+        // effects because the complete-final gate is the first journal branch.
+        return this.run(command, false, true)
+      } catch (error) {
+        // Durable incomplete remains authoritative. The core's replay lease
+        // projects cleanup timed_out without authorizing fresh effects.
+      }
+    }
     if (journal && exactCurrentGeneration && !journal.finalResponse) {
       const durableProofCleanup = await proofCleanupLedger.read({
         deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal,
@@ -1022,6 +1266,16 @@ class OpenCodeProductionLaunchRuntime {
         throw new Error('OpenCode launch host acquisition cleanup requires exact reconciliation evidence')
       }
       const pendingReleases = await hostReleaseLedger.readAllPending(releaseIdentity, preflightLedgerContext)
+      if (journal.hostCleanupObligations) {
+        const boundById = new Map(journal.hostCleanupObligations.map(item => [item.obligationId, item]))
+        if (pendingReleases.some(record => {
+          const binding = boundById.get(record.obligationId)
+          return !binding || binding.reservationDigest !== record.reservationDigest
+            || binding.receiptIdentityDigest !== record.receiptIdentityDigest
+        })) throw new Error('OpenCode launch host cleanup obligation identity changed')
+      } else if (pendingReleases.some(record => record.schemaVersion === 4)) {
+        throw new Error('OpenCode launch host cleanup obligation identity is unbound')
+      }
       if (pendingReleases.length === 0) {
         if (journal.cleanupState === 'incomplete') {
           throw new Error('OpenCode launch host cleanup requires exact reconciliation evidence')
@@ -1033,6 +1287,7 @@ class OpenCodeProductionLaunchRuntime {
           }
           if (pendingRelease.releaseState !== 'pending') continue
           await openCodeHostManager.reconcileHostReleaseReceipt(pendingRelease.receipt, {
+            obligationIdentity: pendingRelease,
             keepPersistentAlive: pendingRelease.disposition === 'keep_alive'
               || retainedSessionLeases.shouldKeepHostAlive(),
             signal: preflightSignal,
@@ -1118,16 +1373,21 @@ class OpenCodeProductionLaunchRuntime {
           const obligation = await hostReleaseLedger.reserve({
             attemptId: input.attemptId, payloadHash: input.payloadHash, generation: input.generation,
             hostKeyIdentity: opaque({ hostKey: prepared.plannedHostKey }),
+            hostKeyDigest: createHash('sha256').update(prepared.plannedHostKey).digest('hex'),
           }, { deadlineAtMs: productionDeadlineAtMs, signal: input.signal })
           hostAcquisitionObligations.set(obligation.obligationId, obligation)
-          return obligation.obligationId
+          return { obligationId: obligation.obligationId,
+            reservationDigest: obligation.reservationDigest }
         },
         acquireOperationHost: async input => {
           const prepared = profileFor(input.profile)
           const obligation = input.cleanupObligationId
             ? hostAcquisitionObligations.get(input.cleanupObligationId) : undefined
-          if (!obligation) throw new OpenCodeOperationHostAcquisitionCleanupError(
-            new Error('OpenCode host acquisition cleanup obligation is absent'))
+          if (!obligation || !isOpenCodeLaunchHostAcquisitionObligation(obligation)) {
+            throw new OpenCodeOperationHostAcquisitionCleanupError(
+              new Error('OpenCode host acquisition cleanup obligation is absent'))
+          }
+          const acquisitionObligation: OpenCodeLaunchHostAcquisitionObligation = obligation
           let reference: OpenCodeHostReferenceCapability
           try {
             reference = await openCodeHostManager.ensureScopedHostReference({ preparedProfile: prepared,
@@ -1144,18 +1404,33 @@ class OpenCodeProductionLaunchRuntime {
               if (startup) {
                 const reserveController = new AbortController()
                 const reserveDeadlineAtMs = launchMonotonicNow() + 10_000
-                await hostReleaseLedger.record({
-                  schemaVersion: 3,
+                const hostKeyIdentity = opaque({ hostKey: startup.hostKey })
+                const startupRecordBase = {
+                  schemaVersion: 4,
                   obligationId: obligation.obligationId,
+                  reservationDigest: obligation.reservationDigest,
+                  hostKeyDigest: obligation.hostKeyDigest,
                   attemptId: obligation.attemptId,
                   payloadHash: obligation.payloadHash,
                   generation: obligation.generation,
-                  hostKeyIdentity: opaque({ hostKey: startup.hostKey }),
+                  hostKeyIdentity,
                   disposition: 'dispose',
                   releaseState: 'pending',
                   receipt: startup.receipt,
-                }, { deadlineAtMs: reserveDeadlineAtMs, signal: reserveController.signal })
-                  .catch(() => undefined)
+                } as const
+                const startupRecord: OpenCodeLaunchHostReleaseRecord = { ...startupRecordBase,
+                  receiptIdentityDigest: launchHostReceiptIdentityDigest(startupRecordBase) }
+                const published = await hostReleaseLedger.record(startupRecord,
+                  { deadlineAtMs: reserveDeadlineAtMs, signal: reserveController.signal })
+                  .then(() => true, () => false)
+                if (published) {
+                  hostAcquisitionObligations.set(obligation.obligationId, startupRecord)
+                  throw new OpenCodeOperationHostAcquisitionCleanupError(error, {
+                    obligationId: startupRecord.obligationId,
+                    reservationDigest: startupRecord.reservationDigest,
+                    receiptIdentityDigest: startupRecord.receiptIdentityDigest,
+                  })
+                }
               }
               throw new OpenCodeOperationHostAcquisitionCleanupError(error)
             }
@@ -1166,7 +1441,7 @@ class OpenCodeProductionLaunchRuntime {
             const clearController = new AbortController()
             const clearDeadlineAtMs = launchMonotonicNow() + 10_000
             try {
-              await hostReleaseLedger.clearObligation(obligation,
+              await hostReleaseLedger.clearObligation(acquisitionObligation,
                 { deadlineAtMs: clearDeadlineAtMs, signal: clearController.signal })
             } catch (clearError) {
               clearController.abort(clearError)
@@ -1181,20 +1456,26 @@ class OpenCodeProductionLaunchRuntime {
             processStartedAtMs: handle.processStartedAtMs,
             profileScopeIdentity: input.profile.profileIdentity,
           }
-          const releaseRecord: OpenCodeLaunchHostReleaseRecord = {
-            schemaVersion: 3,
+          const releaseReceipt = openCodeHostManager.hostReleaseReceipt(reference)
+          const releaseRecordBase = {
+            schemaVersion: 4,
             obligationId: obligation.obligationId,
+            reservationDigest: obligation.reservationDigest,
+            hostKeyDigest: obligation.hostKeyDigest,
             attemptId: command.request.launchAttempt.attemptId,
             payloadHash: command.request.launchAttempt.payloadHash,
             generation: command.request.launchAttempt.generation,
             hostKeyIdentity: identity.hostKeyIdentity,
             disposition: 'unknown',
             releaseState: 'pending',
-            receipt: openCodeHostManager.hostReleaseReceipt(reference),
-          }
+            receipt: releaseReceipt,
+          } as const
+          const releaseRecord: OpenCodeLaunchHostReleaseRecord = { ...releaseRecordBase,
+            receiptIdentityDigest: launchHostReceiptIdentityDigest(releaseRecordBase) }
           try {
             await hostReleaseLedger.record(releaseRecord,
               { deadlineAtMs: productionDeadlineAtMs, signal: input.signal })
+            hostAcquisitionObligations.set(obligation.obligationId, releaseRecord)
           } catch (error) {
             // Publication failure must not make cleanup depend on an already
             // expired caller deadline. Start the physical release immediately
@@ -1205,13 +1486,16 @@ class OpenCodeProductionLaunchRuntime {
             const reserveStartedAtMs = launchMonotonicNow()
             const physicalReleaseDeadlineAtMs = reserveStartedAtMs + 5_000
             const reserveDeadlineAtMs = reserveStartedAtMs + 10_000
+            const completedReleaseRecord = { ...releaseRecord,
+              disposition: 'dispose', releaseState: 'complete' } as const
             const physicalRelease = openCodeHostManager.releaseHostReference(reference, {
               signal: reserveSignal,
               remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()),
-            }).then(() => hostReleaseLedger.record({ ...releaseRecord,
-              disposition: 'dispose', releaseState: 'complete' }, {
+            }).then(() => hostReleaseLedger.record(completedReleaseRecord, {
                 deadlineAtMs: reserveDeadlineAtMs, signal: reserveSignal,
-              }))
+              })).then(() => {
+                hostAcquisitionObligations.set(obligation.obligationId, completedReleaseRecord)
+              })
             // Retain a rejection handler even when the caller's wait expires;
             // the on-disk acquisition obligation remains the restart fence.
             physicalRelease.catch(() => undefined)
@@ -1220,7 +1504,11 @@ class OpenCodeProductionLaunchRuntime {
             } catch (releaseError) {
               throw new OpenCodeOperationHostAcquisitionCleanupError(releaseError)
             }
-            throw error
+            throw new OpenCodeOperationHostAcquisitionSettledError({
+              obligationId: completedReleaseRecord.obligationId,
+              reservationDigest: completedReleaseRecord.reservationDigest,
+              receiptIdentityDigest: completedReleaseRecord.receiptIdentityDigest,
+            }, error)
           }
           hosts.set(identity.hostKeyIdentity, handle)
           hostReferences.set(identity.hostKeyIdentity, reference)
@@ -1230,6 +1518,17 @@ class OpenCodeProductionLaunchRuntime {
             providerAuth: null, agents: [], mcp: null, appMcp: null, probeError: null, diagnostics: [],
           }
           return identity
+        },
+        readOperationHostCleanupBinding: async input => {
+          const record = hostAcquisitionObligations.get(input.cleanupObligationId)
+          if (!record || record.receipt === null) {
+            throw new Error('OpenCode operation host cleanup receipt identity is absent')
+          }
+          if (input.signal.aborted || launchMonotonicNow() >= input.deadlineAtMs) {
+            throw input.signal.reason ?? new DeadlineError('OpenCode launch deadline expired')
+          }
+          return { obligationId: record.obligationId, reservationDigest: record.reservationDigest,
+            receiptIdentityDigest: record.receiptIdentityDigest }
         },
         releaseOperationHost: async input => {
           // A host can become ours only after the caller's absolute envelope has
@@ -1294,7 +1593,8 @@ class OpenCodeProductionLaunchRuntime {
             proofSessions.delete(input.host.hostKeyIdentity)
           }
           await bounded(openCodeHostManager.reconcileHostReleaseReceipt(intendedRelease.receipt,
-            { keepPersistentAlive: disposition === 'keep_alive',
+            { obligationIdentity: intendedRelease,
+              keepPersistentAlive: disposition === 'keep_alive',
               signal: settlementContext.signal,
               remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()) }),
           settlementContext.deadlineAtMs, settlementContext.signal)
@@ -1321,19 +1621,29 @@ class OpenCodeProductionLaunchRuntime {
           const ledgerContext = { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
           const ledgerObligationIds = await hostReleaseLedger.listCleanupObligationIds(
             releaseIdentity, ledgerContext)
-          if (input.cleanupObligationIds
+          if (input.cleanupObligations
             && JSON.stringify([...ledgerObligationIds].sort())
-              !== JSON.stringify([...input.cleanupObligationIds].sort())) {
+              !== JSON.stringify(input.cleanupObligations.map(item => item.obligationId).sort())) {
             return 'incomplete'
           }
-          if (await hostReleaseLedger.hasUnresolvedAcquisition(releaseIdentity, ledgerContext)) return 'incomplete'
+          const hasUnresolvedAcquisition = await hostReleaseLedger.hasUnresolvedAcquisition(
+            releaseIdentity, ledgerContext)
+          if (hasUnresolvedAcquisition) return 'incomplete'
           const releaseRecords = await hostReleaseLedger.readAllPending(releaseIdentity, ledgerContext)
+          if (releaseRecords.length > 0 && !input.cleanupObligations) return 'incomplete'
+          const boundById = new Map(input.cleanupObligations?.map(item => [item.obligationId, item]))
+          if (input.cleanupObligations && releaseRecords.some(record => {
+            const binding = boundById.get(record.obligationId)
+            return !binding || binding.reservationDigest !== record.reservationDigest
+              || binding.receiptIdentityDigest !== record.receiptIdentityDigest
+          })) return 'incomplete'
           if (releaseRecords.length === 0
             || releaseRecords.some(record => record.disposition === 'unknown')) return 'incomplete'
           for (const releaseRecord of releaseRecords) {
             if (releaseRecord.releaseState === 'complete') continue
             try {
               await openCodeHostManager.reconcileHostReleaseReceipt(releaseRecord.receipt, {
+                obligationIdentity: releaseRecord,
                 keepPersistentAlive: releaseRecord.disposition === 'keep_alive'
                   || retainedSessionLeases.shouldKeepHostAlive(),
                 signal: input.signal,

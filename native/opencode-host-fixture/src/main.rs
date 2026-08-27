@@ -53,6 +53,35 @@ fn fixture_state_path(name: &str) -> Option<PathBuf> {
 }
 
 fn main() {
+    if env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_ascii_lowercase()))
+        .is_some_and(|name| name == "taskkill.exe")
+    {
+        record_pid("taskkill-mutation");
+        process::exit(97);
+    }
+    if env::args().any(|arg| arg == "--static-recycled-leader") {
+        record_pid("recycled-leader");
+        let executable = env::current_exe().expect("fixture executable");
+        let _follower = Command::new(executable)
+            .arg("--static-recycled-follower")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn static recycled follower");
+        ignore_termination();
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+    if env::args().any(|arg| arg == "--static-recycled-follower") {
+        record_pid("recycled-follower");
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
     if env::args().any(|arg| arg == "--static-grandchild") {
         record_pid("grandchild");
         if fixture_mode() == "leader-exit" {
@@ -94,6 +123,10 @@ fn main() {
             }
             thread::sleep(Duration::from_millis(5));
         }
+        // Give the real HostManager a deterministic window to capture the
+        // leader's native birth token before exercising leader-loss replay.
+        // The listener is intentionally not bound, so health cannot succeed.
+        thread::sleep(Duration::from_millis(250));
         process::exit(72);
     }
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind fixture loopback");

@@ -1,4 +1,5 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID,
+  timingSafeEqual } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import { closeSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -221,6 +222,13 @@ type OpenCodeHostCleanupControls = {
   requireStableContainment?: boolean
   /** Compatibility release keeps its exact retry receipt reachable by key. */
   retainExactEntryDuringDisposal?: boolean
+  /** Attempt-ledger binding for the exact immutable reservation and receipt tuple. */
+  obligationIdentity?: Readonly<{
+    reservationDigest: string
+    hostKeyIdentity: string
+    hostKeyDigest: string
+    receiptIdentityDigest: string
+  }>
 }
 
 export type OpenCodeWindowsOwnerKeyProtection = {
@@ -264,7 +272,7 @@ type PersistentHostRegistryRecord = {
   coordinationProtectedUntil?: string
   leases?: Record<string, PersistentHostLeaseRecord>
   scopedIdentity?: OpenCodeScopedHostIdentity
-  /** Digest binding the complete scoped identity to this exact registry key. */
+  /** Owner-authenticated binding of the immutable scoped lifecycle and containment identity. */
   scopedIdentityBinding?: string
   scopedTransportToken?: string
 }
@@ -408,19 +416,47 @@ export type OpenCodeScopedHostIdentity = {
 }
 
 function scopedHostIdentityBinding(
-  hostKey: string,
-  identity: OpenCodeScopedHostIdentity,
+  record: Omit<PersistentHostRegistryRecord, 'scopedIdentityBinding'>,
+  ownerKey: Buffer,
 ): string {
-  return hashText(canonicalSerializeOpenCodePolicyIdentity({
-    schema: 'opencode-scoped-registry-binding-v1',
-    hostKey,
-    identity,
-  }))
+  return createHmac('sha256', ownerKey).update(canonicalSerializeOpenCodePolicyIdentity({
+    schema: 'opencode-scoped-registry-lifecycle-binding-v2',
+    hostKey: record.hostKey,
+    profileRootKey: record.profileRootKey,
+    projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+    managedConfigFingerprint: record.managedConfigFingerprint ?? null,
+    port: record.port,
+    pid: record.pid,
+    processStartedAtMs: record.processStartedAtMs ?? null,
+    processBirthToken: record.processBirthToken ?? null,
+    version: record.version,
+    resolvedConfigFingerprint: record.resolvedConfigFingerprint,
+    coordinationProtectedUntil: record.coordinationProtectedUntil,
+    scopedIdentity: record.scopedIdentity,
+    scopedTransportToken: record.scopedTransportToken,
+  })).digest('hex')
 }
 
-function hasExactScopedHostIdentityBinding(record: PersistentHostRegistryRecord): boolean {
-  return record.scopedIdentity !== undefined
-    && record.scopedIdentityBinding === scopedHostIdentityBinding(record.hostKey, record.scopedIdentity)
+function hasExactScopedHostIdentityBinding(record: PersistentHostRegistryRecord, ownerKey: Buffer): boolean {
+  if (record.scopedIdentity === undefined || typeof record.scopedIdentityBinding !== 'string'
+    || !/^[a-f0-9]{64}$/.test(record.scopedIdentityBinding)) return false
+  const { scopedIdentityBinding: _binding, ...unbound } = record
+  const expected = Buffer.from(scopedHostIdentityBinding(unbound, ownerKey), 'hex')
+  const observed = Buffer.from(record.scopedIdentityBinding, 'hex')
+  return observed.length === expected.length && timingSafeEqual(observed, expected)
+}
+
+export function computeOpenCodeHostReleaseObligationIdentityDigest(input: Readonly<{
+  reservationDigest: string
+  hostKeyIdentity: string
+  receipt: OpenCodeHostReleaseReceipt
+}>): string {
+  return createHash('sha256').update(JSON.stringify({
+    schema: 'opencode-host-cleanup-receipt-identity-v1',
+    reservationDigest: input.reservationDigest,
+    hostKeyIdentity: input.hostKeyIdentity,
+    receipt: input.receipt,
+  })).digest('hex')
 }
 
 type PersistentHostProcessIdentity = {
@@ -2207,8 +2243,8 @@ export class OpenCodeHostManager {
       ).toISOString(),
       leases: normalizePersistentHostLeases(previous?.leases),
     }
-    return isScopedPreparedProfile(handle.profile)
-      ? {
+    if (isScopedPreparedProfile(handle.profile)) {
+      const unbound = {
           ...common,
           port: 0,
           version: null,
@@ -2216,11 +2252,11 @@ export class OpenCodeHostManager {
             handle.hostKey, handle.port, this.scopedTransportOwnerKey,
           ),
           scopedIdentity: buildOpenCodeScopedHostIdentity(handle.profile),
-          scopedIdentityBinding: scopedHostIdentityBinding(
-            handle.hostKey, buildOpenCodeScopedHostIdentity(handle.profile),
-          ),
         }
-      : { ...common, projectPath: handle.projectPath, baseUrl: handle.baseUrl }
+      return { ...unbound,
+        scopedIdentityBinding: scopedHostIdentityBinding(unbound, this.scopedTransportOwnerKey) }
+    }
+    return { ...common, projectPath: handle.projectPath, baseUrl: handle.baseUrl }
   }
 
   private captureCreatedHostDisposalReceipt(
@@ -2381,9 +2417,12 @@ export class OpenCodeHostManager {
       let previous: PersistentHostRegistryRecord | undefined = registry.hosts[handle.hostKey]
       const expectedScopedIdentity = isScopedPreparedProfile(handle.profile)
         ? buildOpenCodeScopedHostIdentity(handle.profile) : null
+      if (previous?.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(previous, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode scoped host tombstone lifecycle binding is invalid [redacted]')
+      }
       if (previous && expectedScopedIdentity && (
-        !hasExactScopedHostIdentityBinding(previous)
-        || canonicalSerializeOpenCodePolicyIdentity(previous.scopedIdentity)
+        canonicalSerializeOpenCodePolicyIdentity(previous.scopedIdentity)
           !== canonicalSerializeOpenCodePolicyIdentity(expectedScopedIdentity)
       )) {
         // A structurally valid record in this key slot is still foreign unless
@@ -2459,6 +2498,7 @@ export class OpenCodeHostManager {
         || current.profileRootKey !== expected.profileRootKey
         || (expectedScopedIdentity !== null && (
           !current.scopedIdentity
+          || !hasExactScopedHostIdentityBinding(current, this.scopedTransportOwnerKey)
           || canonicalSerializeOpenCodePolicyIdentity(current.scopedIdentity)
             !== canonicalSerializeOpenCodePolicyIdentity(expectedScopedIdentity)
         ))
@@ -2483,6 +2523,14 @@ export class OpenCodeHostManager {
       const registry = await this.readPersistentRegistryUnlocked()
       if (registry.schemaVersion !== 2) return
       const current = registry.hosts[hostKey]
+      if (current?.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(current, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode scoped host tombstone lifecycle binding is invalid [redacted]')
+      }
+      if (expected.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(expected, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode scoped host receipt lifecycle binding is invalid [redacted]')
+      }
       if (!current || canonicalSerializeOpenCodePolicyIdentity(
         persistentHostLifecycleIdentity(current, this.scopedTransportOwnerKey),
       ) !== canonicalSerializeOpenCodePolicyIdentity(
@@ -2667,6 +2715,10 @@ export class OpenCodeHostManager {
       if (registry.schemaVersion !== 2) return null
       const record = registry.hosts[hostKey]
       if (!record) return null
+      if (record.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode scoped host tombstone lifecycle binding is invalid [redacted]')
+      }
       const removeStaleRecord = async (): Promise<void> => {
         if (registry.hosts[hostKey] !== record) return
         delete registry.hosts[hostKey]
@@ -2687,9 +2739,11 @@ export class OpenCodeHostManager {
         && record.resolvedConfigFingerprint !== record.scopedIdentity.managedConfigFingerprint) {
         return rejectForeignUnlessContainmentEmpty()
       }
+      if (isScopedPreparedProfile(profile)
+        && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode scoped host tombstone lifecycle binding is invalid [redacted]')
+      }
       if (isScopedPreparedProfile(profile) && (
-        !record.scopedIdentity ||
-        !hasExactScopedHostIdentityBinding(record) ||
         canonicalSerializeOpenCodePolicyIdentity(record.scopedIdentity)
           !== canonicalSerializeOpenCodePolicyIdentity(buildOpenCodeScopedHostIdentity(profile))
       )) return rejectForeignUnlessContainmentEmpty()
@@ -3694,7 +3748,12 @@ export class OpenCodeHostManager {
 
   async reconcileHostReleaseReceipt(
     receipt: OpenCodeHostReleaseReceipt,
-    options: Parameters<OpenCodeHostManager['releaseHostReference']>[1] = {},
+    options: {
+      keepPersistentAlive?: boolean
+      signal?: AbortSignal
+      remainingMs?: () => number
+      obligationIdentity?: NonNullable<OpenCodeHostCleanupControls['obligationIdentity']>
+    } = {},
   ): Promise<void> {
     if ((receipt.schemaVersion !== 1 && receipt.schemaVersion !== 2) || typeof receipt.receiptId !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(receipt.receiptId)
@@ -3705,6 +3764,19 @@ export class OpenCodeHostManager {
         || !receipt.processBirthToken.startsWith('linux:')))
       || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
       throw new Error('OpenCode host release receipt is corrupt [redacted]')
+    }
+    if (options.obligationIdentity) {
+      if (options.obligationIdentity.hostKeyDigest !== receipt.hostKeyDigest) {
+        throw new Error('OpenCode host release obligation host identity is mismatched [redacted]')
+      }
+      const expected = computeOpenCodeHostReleaseObligationIdentityDigest({
+        reservationDigest: options.obligationIdentity.reservationDigest,
+        hostKeyIdentity: options.obligationIdentity.hostKeyIdentity,
+        receipt,
+      })
+      if (expected !== options.obligationIdentity.receiptIdentityDigest) {
+        throw new Error('OpenCode host release obligation identity is mismatched [redacted]')
+      }
     }
     const retained = durableHostReferenceCapabilities.get(receipt.receiptId)
     if (retained) {
@@ -3734,6 +3806,10 @@ export class OpenCodeHostManager {
       if (!matched) return
       registryReceiptFound = true
       const [hostKey, record] = matched
+      if (record.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode host registry lifecycle binding is invalid [redacted]')
+      }
       if (record.pid !== receipt.pid || record.processStartedAtMs !== receipt.processStartedAtMs
         || (receipt.processBirthToken !== undefined
           && record.processBirthToken !== receipt.processBirthToken)) {
@@ -3876,16 +3952,10 @@ export class OpenCodeHostManager {
         return
       }
       if (entry.ownedByProcess) {
-        // This authority is deliberately scoped to this single TERM -> bounded
-        // SIGKILL operation. A failed call must revalidate the exact live leader
-        // on retry; leader exit can never leave reusable PGID authority behind.
-        const exactLeaderAvailable = await this.captureEntryContainmentAuthority(entry)
-        if (!exactLeaderAvailable) {
-          throw new Error(
-            `OpenCode host pid ${entry.handle.pid} exact leader is unavailable; ` +
-            'retaining containment receipt for conservative reconciliation',
-          )
-        }
+        // disposeHost revalidates the exact leader while holding the durable
+        // registry generation lock. Leader loss reaches only the stable,
+        // non-signalling Linux containment observer and retains the receipt
+        // whenever emptiness is not proven.
         try {
           await this.disposeHost(entry.handle.hostKey, {
             restoreOnFailure: true,
@@ -3944,6 +4014,10 @@ export class OpenCodeHostManager {
       ownedEntry?: ManagedHostEntry }
       & OpenCodeHostCleanupControls,
   ): Promise<void> {
+    if (record.scopedIdentity
+      && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+      throw new Error('OpenCode host registry lifecycle binding is invalid [redacted]')
+    }
     const entry = options.ownedEntry ?? (options.ignoreTrackedHandle ? undefined : this.hosts.get(record.hostKey))
     const baseUrl = entry?.handle.baseUrl ?? scopedRecordBaseUrl(
       record,
@@ -3958,8 +4032,8 @@ export class OpenCodeHostManager {
       ...record,
       processStartedAtMs: entry?.handle.processStartedAtMs ?? record.processStartedAtMs,
     })
-    if (processIdentity.state === 'gone') {
-      // A gone exact leader invalidates its numeric PGID authority. Do not
+    if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
+      // A gone or changed exact leader invalidates its numeric PGID authority. Do not
       // probe or signal the group after this point. Cleanup completes
       // only when the non-signalling containment observer proves it empty.
       if (!this.persistentContainmentExited(pid)) {
@@ -3967,11 +4041,7 @@ export class OpenCodeHostManager {
       }
       terminated = true
     } else if (processIdentity.state !== 'confirmed') {
-      throw new Error(
-        processIdentity.state === 'changed'
-          ? `OpenCode host pid ${pid} identity changed; refusing to terminate a reused pid`
-          : `OpenCode host pid ${pid} identity could not be verified; refusing unsafe termination`,
-      )
+      throw new Error(`OpenCode host pid ${pid} identity could not be verified; refusing unsafe termination`)
     }
 
     if (!terminated && options.requireStableContainment === true
@@ -4223,15 +4293,35 @@ export class OpenCodeHostManager {
             'OpenCode persistent host gained a durable lease before disposal [redacted]')
         }
         const processIdentity = await this.inspectPersistentHostProcessIdentity(receipt.record)
-        if (processIdentity.state !== 'confirmed'
-          || (Number.isFinite(receipt.record.processStartedAtMs)
-            ? processIdentity.startedAtMs !== receipt.record.processStartedAtMs
-            : processIdentity.startedAtMs !== null)
-        ) {
+        const exactLeader = processIdentity.state === 'confirmed'
+          && (Number.isFinite(receipt.record.processStartedAtMs)
+            ? processIdentity.startedAtMs === receipt.record.processStartedAtMs
+            : processIdentity.startedAtMs === null)
+        const safelyEmptyAfterLeaderLoss = (processIdentity.state === 'gone'
+          || processIdentity.state === 'changed')
+          && this.persistentContainmentExited(receipt.record.pid)
+        if (!exactLeader && !safelyEmptyAfterLeaderLoss) {
           throw new Error('OpenCode created host process compare-and-swap failed [redacted]')
         }
 
-        await terminate()
+        if (exactLeader) {
+          await terminate()
+        } else {
+          // The exact created generation is still CAS-bound by both the
+          // immutable disposal receipt and the authenticated registry record,
+          // but its leader authority is gone.  A complete stable Linux
+          // containment scan proved that no member of the original process
+          // group remains, so settle the retained capability without issuing
+          // any signal or PID/group probe.  This is deliberately unavailable
+          // on platforms whose observer cannot provide that proof.
+          this.assertCleanupAllowed(controls)
+          entry.child?.stdout?.destroy()
+          entry.child?.stderr?.destroy()
+          entry.child?.stdin?.destroy()
+          entry.handle.state = 'disposed'
+          if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
+          await this.cleanupOpenTuiTempArtifactsIfUnused(receipt.profileTmpPath, receipt.record.pid)
+        }
         if (canonicalSerializeOpenCodePolicyIdentity(registry.hosts[hostKey])
           !== canonicalSerializeOpenCodePolicyIdentity(receipt.registryReceipt)) {
           throw new Error('OpenCode created host registry compare-and-swap failed [redacted]')
@@ -4386,6 +4476,17 @@ export class OpenCodeHostManager {
 
       for (const [hostKey, record] of Object.entries(registry.hosts)) {
         const projectLabel = scopedRecordProjectLabel(record)
+        if (record.scopedIdentity
+          && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+          // The PID and containment tuple are untrusted unless the separately
+          // retained owner authority authenticates the complete lifecycle.
+          // Do not use a corrupt PID even for an apparent emptiness proof.
+          hosts.push({ hostKey, projectPath: projectLabel, pid: record.pid, port: record.port,
+            action: 'failed', reason: 'scoped lifecycle binding is absent or invalid',
+            leaseCount: Object.keys(normalizePersistentHostLeases(record.leases)).length })
+          diagnostics.push(`Retained OpenCode host ${hostKey}: scoped lifecycle binding is invalid`)
+          continue
+        }
         const leases = normalizePersistentHostLeases(record.leases)
         let droppedStaleLeaseCount = 0
         const dropStaleLeases = (

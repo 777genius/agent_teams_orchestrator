@@ -765,7 +765,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         receiptId: '66666666-6666-4666-8666-666666666666',
         hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
         pid: 44443, processStartedAtMs: 1_000, processBirthToken: oldToken,
-        lifetime: 'persistent' })).rejects.toThrow('identity changed')
+        lifetime: 'persistent' })).rejects.toThrow('containment remained alive or unproven')
       expect(signals).toBe(0)
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
     } finally { await rm(tempDir, { recursive: true, force: true }) }
@@ -1555,7 +1555,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     }
   })
 
-  test('retains a structurally valid foreign scoped tombstone until stable Linux containment is empty', async () => {
+  test('retains a scoped tombstone with an invalid owner lifecycle binding without trusting its pid', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-foreign-tombstone-'))
     const registryPath = path.join(tempDir, 'registry.json')
     const profile = scopedProfile('launch', { projectPath: tempDir })
@@ -1576,6 +1576,11 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         hosts: Record<string, { scopedIdentity: { providerFingerprint: string } }>
       }
       registry.hosts[hostKey]!.scopedIdentity.providerFingerprint = 'f'.repeat(64)
+      Object.assign(registry.hosts[hostKey]!, {
+        pid: 99_999,
+        processStartedAtMs: 9_999,
+        processBirthToken: 'linux:forged-boot:9999',
+      })
       await writeFile(registryPath, `${JSON.stringify(registry)}\n`, { mode: 0o600 })
       const foreignBytes = await readFile(registryPath, 'utf8')
 
@@ -1590,22 +1595,21 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       expect(spawnCount).toBe(0)
       expect(await readFile(registryPath, 'utf8')).toBe(foreignBytes)
 
-      const safeReplacement = new OpenCodeHostManager({
+      let containmentProbes = 0
+      const stillBlocked = new OpenCodeHostManager({
         platform: 'linux', persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
-        isProcessAlive: () => false, isProcessGroupAlive: () => false,
+        isProcessAlive: () => { containmentProbes += 1; return false },
+        isProcessGroupAlive: () => { containmentProbes += 1; return false },
         allocateLoopbackPort: async () => 44502,
         spawnHostProcess: () => { spawnCount += 1; return createMockChildProcess(44502).child },
         fetchJson: async () => ({ status: 200, data: { healthy: true, version: 'static' } }),
         readProcessStartTimeMs: async () => 2_000,
       })
-      const replacement = await safeReplacement.ensureScopedHost({
-        preparedProfile: profile, expectedHostKey: hostKey,
-      })
-      expect(replacement.pid).toBe(44502)
-      expect(spawnCount).toBe(1)
-      const replaced = JSON.parse(await readFile(registryPath, 'utf8'))
-      expect(replaced.hosts[hostKey].scopedIdentity.providerFingerprint)
-        .toBe(buildOpenCodeScopedHostIdentity(profile).providerFingerprint)
+      await expect(stillBlocked.ensureScopedHost({ preparedProfile: profile, expectedHostKey: hostKey }))
+        .rejects.toThrow('startup failed [redacted]')
+      expect(containmentProbes).toBe(0)
+      expect(spawnCount).toBe(0)
+      expect(await readFile(registryPath, 'utf8')).toBe(foreignBytes)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

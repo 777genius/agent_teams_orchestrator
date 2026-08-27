@@ -74,7 +74,9 @@ describe('processKill', () => {
 
   it('signals a detached owned POSIX group only with explicit authority', async () => {
     const calls: number[] = []
+    const pid = process.pid
     let groupAlive = true
+    const now = spyOn(Date, 'now').mockReturnValue(0)
     const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
       calls.push(pid)
       if (pid > 0) return true
@@ -85,26 +87,29 @@ describe('processKill', () => {
       throw error
     }) as typeof process.kill)
     try {
-      await expect(killProcessTreeAndWait(44_302, 'SIGKILL', {
-        timeoutMs: 10, posixProcessGroupLeader: true,
+      await expect(killProcessTreeAndWait(pid, 'SIGKILL', {
+        timeoutMs: 10, posixProcessGroupLeader: true, platform: 'linux',
         expectedBirthToken: 'linux:boot:42', birthTokenReader: () => 'linux:boot:42',
       })).resolves.toBe(true)
-      expect(calls).toEqual([44_302, 44_302, -44_302, 44_302, 44_302, -44_302])
+      expect(calls).toEqual([pid, pid, -pid, pid, pid, -pid])
     } finally {
       kill.mockRestore()
+      now.mockRestore()
     }
   })
 
   it('never touches a recycled process group after TERM removes the exact leader', async () => {
     const calls: Array<[number, NodeJS.Signals | number | undefined]> = []
+    const pid = process.pid
     let leaderAlive = true
+    const now = spyOn(Date, 'now').mockReturnValue(0)
     const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
       calls.push([pid, signal])
-      if (pid === -44_304 && signal === 'SIGTERM') {
+      if (pid === -process.pid && signal === 'SIGTERM') {
         leaderAlive = false
         return true
       }
-      if (pid === 44_304 && signal === 0 && !leaderAlive) {
+      if (pid === process.pid && signal === 0 && !leaderAlive) {
         const error = new Error('gone') as NodeJS.ErrnoException
         error.code = 'ESRCH'
         throw error
@@ -112,14 +117,15 @@ describe('processKill', () => {
       return true
     }) as typeof process.kill)
     try {
-      await expect(killProcessTreeAndWait(44_304, 'SIGTERM', {
-        timeoutMs: 10, pollMs: 1, posixProcessGroupLeader: true,
+      await expect(killProcessTreeAndWait(pid, 'SIGTERM', {
+        timeoutMs: 10, pollMs: 1, posixProcessGroupLeader: true, platform: 'linux',
         expectedBirthToken: 'linux:boot:42', birthTokenReader: () => 'linux:boot:42',
       })).resolves.toBe(false)
       const negativeCalls = calls.filter(([pid]) => pid < 0)
-      expect(negativeCalls).toEqual([[-44_304, 'SIGTERM']])
+      expect(negativeCalls).toEqual([[-pid, 'SIGTERM']])
     } finally {
       kill.mockRestore()
+      now.mockRestore()
     }
   })
 

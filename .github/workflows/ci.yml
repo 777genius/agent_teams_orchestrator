@@ -39,6 +39,14 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Build deterministic static OpenCode host child/grandchild fixture
         run: cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
+      - name: Test real Linux recycled-pid production cleanup across process restart
+        run: >-
+          sudo unshare --pid --fork --mount-proc
+          env "PATH=$PATH" OPENCODE_REQUIRE_NATIVE_PID_RECYCLE=1
+          bun test
+          src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
+          --test-name-pattern
+          "native cleanup acquisition and replay use separate OS processes"
       - name: Test immutable passive publication on a supported platform
         run: >-
           bun test

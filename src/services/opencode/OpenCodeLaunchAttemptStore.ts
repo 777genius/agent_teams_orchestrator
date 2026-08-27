@@ -30,6 +30,12 @@ export const OPEN_CODE_LAUNCH_JOURNAL_VERSION = 1 as const
 export const OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES = 1_048_576
 export const OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS = 4_096
 
+export type OpenCodeHostCleanupObligationBinding = Readonly<{
+  obligationId: string
+  reservationDigest: string
+  receiptIdentityDigest?: string
+}>
+
 export function deriveOpenCodeLaunchNamespacePaths(filePath: string, pathApi: PlatformPath): {
   directory: string; trustedRoot: string; marker: string; slots: readonly [string, string]; fence: string; lock: string
 } {
@@ -95,6 +101,8 @@ export type OpenCodeLaunchJournal = {
   cleanupState: 'unknown' | 'complete' | 'incomplete'
   /** Immutable attempt-bound ids for every host acquisition cleanup obligation. */
   hostCleanupObligationIds?: string[]
+  /** Monotonic exact reservation/receipt identity bindings for those obligations. */
+  hostCleanupObligations?: OpenCodeHostCleanupObligationBinding[]
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -1311,7 +1319,8 @@ export type OpenCodeLaunchJournalLease = {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<void>
   recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
-  bindHostCleanupObligation(obligationId: string, context?: OpenCodeLaunchStoreContext): Promise<void>
+  bindHostCleanupObligation(binding: OpenCodeHostCleanupObligationBinding,
+    context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Exact same-generation replay promotion after physical receipt reconciliation. */
   reconcileCleanupComplete(context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
@@ -1363,9 +1372,13 @@ export class OpenCodeLaunchAttemptStore {
     let retainedPhysicalSettlement: Promise<void> | undefined
     let deactivateLease = (): void => undefined
     let acquisitionContext = context
-    if (context) {
+    if (context && mode !== 'replay') {
       const timing = await this.peekTiming(identity, context)
-      if (timing) acquisitionContext = {
+      // A durable final is absorbing: same-generation `begin` can only project
+      // it or reconcile its bound cleanup obligations. Give that safe replay
+      // the current invocation's finite deadline; unfinished work and every
+      // continuation remain fenced by the original absolute envelope.
+      if (timing && !(mode === 'begin' && timing.finalized)) acquisitionContext = {
         ...context,
         deadlineAtMs: Math.min(context.deadlineAtMs, safeAdd(timing.startedAtMs, timing.totalBudgetMs, 'absoluteDeadlineAtMs')),
       }
@@ -1380,7 +1393,7 @@ export class OpenCodeLaunchAttemptStore {
       let journal = await this.load(loadIdentity, context)
       let consumedContinuationMembers: OpenCodeOpaqueIdentity[] = []
       let effectiveContext = context
-      if (journal && context) {
+      if (journal && context && !(mode === 'begin' && journal.finalResponse)) {
         const persistedDeadlineAtMs = safeAdd(journal.startedAtMs, journal.totalBudgetMs, 'absoluteDeadlineAtMs')
         effectiveContext = { ...context, deadlineAtMs: Math.min(context.deadlineAtMs, persistedDeadlineAtMs) }
         ensureContext(effectiveContext)
@@ -1430,7 +1443,7 @@ export class OpenCodeLaunchAttemptStore {
             throw new OpenCodeLaunchJournalError('fenced', 'continuation capability mismatch')
           }
           consumedContinuationMembers = [...journal.continuation.eligibleMemberIdentities]
-          const candidate = { ...journal, inputDigest: identity.inputDigest,
+          const candidate: OpenCodeLaunchJournal = { ...journal, inputDigest: identity.inputDigest,
             generation: journal.generation + 1, fence: journal.fence + 1,
             continuation: undefined,
             authorizedMemberIdentities: consumedContinuationMembers,
@@ -1706,14 +1719,31 @@ export class OpenCodeLaunchAttemptStore {
             Object.assign(lease.journal, candidate)
           }, cleanupContext)
         },
-        bindHostCleanupObligation: async (obligationId, obligationContext) => {
-          if (!/^[0-9a-f-]{36}$/i.test(obligationId)) {
+        bindHostCleanupObligation: async (binding, obligationContext) => {
+          if (!/^[0-9a-f-]{36}$/i.test(binding.obligationId)
+            || !/^[a-f0-9]{64}$/.test(binding.reservationDigest)
+            || (binding.receiptIdentityDigest !== undefined
+              && !/^[a-f0-9]{64}$/.test(binding.receiptIdentityDigest))) {
             throw new OpenCodeLaunchJournalError('foreign', 'host cleanup obligation id is invalid')
           }
           await serializeMutation(async () => {
             const existing = journal!.hostCleanupObligationIds ?? []
-            if (existing.includes(obligationId)) return
-            const candidate = { ...journal!, hostCleanupObligationIds: [...existing, obligationId] }
+            const existingBindings = journal!.hostCleanupObligations ?? []
+            const prior = existingBindings.find(item => item.obligationId === binding.obligationId)
+            if (prior && (prior.reservationDigest !== binding.reservationDigest
+              || (prior.receiptIdentityDigest !== undefined
+                && prior.receiptIdentityDigest !== binding.receiptIdentityDigest))) {
+              throw new OpenCodeLaunchJournalError('fenced', 'host cleanup obligation identity changed')
+            }
+            if (prior && (prior.receiptIdentityDigest !== undefined
+              || binding.receiptIdentityDigest === undefined)) return
+            const hostCleanupObligations = prior
+              ? existingBindings.map(item => item.obligationId === binding.obligationId ? binding : item)
+              : [...existingBindings, binding]
+            const candidate = { ...journal!,
+              hostCleanupObligationIds: existing.includes(binding.obligationId)
+                ? existing : [...existing, binding.obligationId],
+              hostCleanupObligations }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
             await this.persist(candidate, obligationContext ?? effectiveContext)
@@ -1840,7 +1870,7 @@ export class OpenCodeLaunchAttemptStore {
   private async peekTiming(
     identity: OpenCodeLaunchJournalIdentity,
     context: OpenCodeLaunchStoreContext,
-  ): Promise<{ startedAtMs: number; totalBudgetMs: number } | null> {
+  ): Promise<{ startedAtMs: number; totalBudgetMs: number; finalized: boolean } | null> {
     const bytes = await awaitWithContext(this.persistence.read(context), context)
     if (!bytes) return null
     if (bytes.byteLength > OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES) {
@@ -1855,7 +1885,8 @@ export class OpenCodeLaunchAttemptStore {
     }
     assertSafeNonnegative(source.startedAtMs, 'startedAtMs')
     assertSafePositive(source.totalBudgetMs, 'totalBudgetMs')
-    return { startedAtMs: source.startedAtMs, totalBudgetMs: source.totalBudgetMs }
+    return { startedAtMs: source.startedAtMs, totalBudgetMs: source.totalBudgetMs,
+      finalized: source.finalResponse !== undefined }
   }
 
   private async load(identity: OpenCodeLaunchJournalIdentity, context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournal | null> {
@@ -2077,7 +2108,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
   const allowedJournalKeys = new Set<string>([
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
     'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse', 'cleanupState',
-    'hostCleanupObligationIds',
+    'hostCleanupObligationIds', 'hostCleanupObligations',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -2167,6 +2198,26 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
       || source.hostCleanupObligationIds.some(value => typeof value !== 'string'
         || !/^[0-9a-f-]{36}$/i.test(value)))) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid host cleanup obligations')
+  }
+  if (source.hostCleanupObligations !== undefined) {
+    if (!Array.isArray(source.hostCleanupObligations)
+      || source.hostCleanupObligations.length > 1_000) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid host cleanup obligation bindings')
+    }
+    const bindings = source.hostCleanupObligations as Array<Record<string, unknown>>
+    if (bindings.some(binding => !binding || typeof binding !== 'object' || Array.isArray(binding)
+      || Object.keys(binding).some(key => key !== 'obligationId'
+        && key !== 'reservationDigest' && key !== 'receiptIdentityDigest')
+      || typeof binding.obligationId !== 'string' || !/^[0-9a-f-]{36}$/i.test(binding.obligationId)
+      || typeof binding.reservationDigest !== 'string' || !/^[a-f0-9]{64}$/.test(binding.reservationDigest)
+      || (binding.receiptIdentityDigest !== undefined
+        && (typeof binding.receiptIdentityDigest !== 'string'
+          || !/^[a-f0-9]{64}$/.test(binding.receiptIdentityDigest)))
+      || !source.hostCleanupObligationIds?.includes(binding.obligationId as string))
+      || new Set(bindings.map(binding => binding.obligationId)).size !== bindings.length
+      || source.hostCleanupObligationIds?.length !== bindings.length) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid host cleanup obligation bindings')
+    }
   }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid journal event count')

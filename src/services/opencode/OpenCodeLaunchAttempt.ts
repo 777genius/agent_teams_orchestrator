@@ -26,6 +26,7 @@ import {
   type OpenCodeLaunchJournalEvent,
   type OpenCodeLaunchJournalReconciliationEvent,
   type OpenCodeLaunchStoreContext,
+  type OpenCodeHostCleanupObligationBinding,
 } from './OpenCodeLaunchAttemptStore.js'
 import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
 
@@ -92,13 +93,18 @@ export type OpenCodeLaunchAttemptPorts = {
       generation: number
       deadlineAtMs: number
       signal: AbortSignal
-    }): Promise<string>
+    }): Promise<OpenCodeHostCleanupObligationBinding>
     acquireOperationHost(input: {
       profile: OpenCodeLaunchProfile
       cleanupObligationId?: string
       deadlineAtMs: number
       signal: AbortSignal
     }): Promise<OpenCodeRetainedHostIdentity>
+    readOperationHostCleanupBinding?(input: {
+      cleanupObligationId: string
+      deadlineAtMs: number
+      signal: AbortSignal
+    }): Promise<OpenCodeHostCleanupObligationBinding>
     releaseOperationHost(input: {
       host: OpenCodeRetainedHostIdentity
       /** Exact acquisition obligation authorizing this release, even when a generation has predecessors. */
@@ -113,7 +119,7 @@ export type OpenCodeLaunchAttemptPorts = {
       attemptId: string
       payloadHash: string
       generation: number
-      cleanupObligationIds?: readonly string[]
+      cleanupObligations?: readonly OpenCodeHostCleanupObligationBinding[]
       deadlineAtMs: number
       signal: AbortSignal
     }): Promise<'complete' | 'incomplete'>
@@ -173,6 +179,7 @@ export type OpenCodeLaunchAttemptPorts = {
       attemptId: string
       payloadHash: string
       inputDigest: string
+      immutableDigest: string
       memberIdentity: OpenCodeOpaqueIdentity
       host: OpenCodeRetainedHostIdentity
       generation: number
@@ -218,9 +225,28 @@ export type OpenCodeLaunchAttemptPorts = {
 export class OpenCodeOperationHostAcquisitionCleanupError extends Error {
   readonly cleanupIncomplete = true
 
-  constructor(cause?: unknown) {
+  constructor(
+    cause?: unknown,
+    readonly cleanupBinding?: OpenCodeHostCleanupObligationBinding,
+  ) {
     super('OpenCode operation host acquisition cleanup is incomplete', { cause })
     this.name = 'OpenCodeOperationHostAcquisitionCleanupError'
+  }
+}
+
+/**
+ * Receipt publication failed, but an independent cleanup reserve proved the
+ * physical release and durably published its exact completed receipt.  The
+ * core must still bind that receipt identity into the journal before it may
+ * treat acquisition cleanup as complete.
+ */
+export class OpenCodeOperationHostAcquisitionSettledError extends Error {
+  constructor(
+    readonly cleanupBinding: OpenCodeHostCleanupObligationBinding,
+    cause?: unknown,
+  ) {
+    super('OpenCode operation host acquisition was durably settled', { cause })
+    this.name = 'OpenCodeOperationHostAcquisitionSettledError'
   }
 }
 
@@ -373,12 +399,12 @@ export class OpenCodeLaunchAttempt {
             if (replayCleanup !== 'complete'
               && lease.journal.finalResponse.members.cleanupPending.length === 0
               && this.ports.host.reconcileOperationHost) {
+              const cleanupObligations = lease.journal.hostCleanupObligations
               const reconciled = await this.ports.host.reconcileOperationHost({
                 attemptId: attempt.attemptId,
                 payloadHash: attempt.payloadHash,
                 generation: attempt.generation,
-                ...(lease.journal.hostCleanupObligationIds
-                  ? { cleanupObligationIds: lease.journal.hostCleanupObligationIds } : {}),
+                ...(cleanupObligations ? { cleanupObligations } : {}),
                 deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
                 signal: reserveController.signal,
               }).catch(() => 'incomplete' as const)
@@ -433,6 +459,7 @@ export class OpenCodeLaunchAttempt {
           }
           let host: OpenCodeRetainedHostIdentity | undefined
           let hostCleanupObligationId: string | undefined
+          let hostCleanupObligation: OpenCodeHostCleanupObligationBinding | undefined
           let hostAcquisitionStarted = false
           let hostAcquisitionCleanupComplete = false
           let lateHostSettlement: Promise<void> | undefined
@@ -473,12 +500,13 @@ export class OpenCodeLaunchAttempt {
             let acquisitionOpen = true
             try {
               if (this.ports.host.reserveOperationHostCleanup) {
-                hostCleanupObligationId = await this.phase('retained_host_start', policy, controller.signal,
+                hostCleanupObligation = await this.phase('retained_host_start', policy, controller.signal,
                   deadline => this.ports.host.reserveOperationHostCleanup!({
                     profile, attemptId: attempt.attemptId, payloadHash: attempt.payloadHash,
                     generation: attempt.generation, deadlineAtMs: deadline, signal: controller.signal,
                   }))
-                await lease.bindHostCleanupObligation(hostCleanupObligationId)
+                hostCleanupObligationId = hostCleanupObligation.obligationId
+                await lease.bindHostCleanupObligation(hostCleanupObligation)
               }
               host = deepFreeze(await this.phase('retained_host_start', policy, controller.signal,
                 deadline => {
@@ -487,14 +515,62 @@ export class OpenCodeLaunchAttempt {
                     profile, ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
                     deadlineAtMs: deadline, signal: controller.signal,
                   })
-                  const acceptedAcquisition = physicalAcquisition.then(candidate => {
+                  const acceptedAcquisition = physicalAcquisition.then(async candidate => {
                     if (!acquisitionOpen || controller.signal.aborted
                       || this.ports.clock.monotonicNow() >= deadline) throw new DeadlineError()
+                    if (hostCleanupObligationId && this.ports.host.readOperationHostCleanupBinding) {
+                      const exactBinding = await this.ports.host.readOperationHostCleanupBinding({
+                        cleanupObligationId: hostCleanupObligationId, deadlineAtMs: deadline,
+                        signal: controller.signal,
+                      })
+                      if (!hostCleanupObligation
+                        || exactBinding.obligationId !== hostCleanupObligation.obligationId
+                        || exactBinding.reservationDigest !== hostCleanupObligation.reservationDigest
+                        || !exactBinding.receiptIdentityDigest) {
+                        throw new OpenCodeLaunchAttemptError('host.cleanupObligationIdentity')
+                      }
+                      await lease.bindHostCleanupObligation(exactBinding)
+                      hostCleanupObligation = exactBinding
+                    }
                     if (candidate.profileScopeIdentity !== profile.profileIdentity) {
                       throw new OpenCodeLaunchAttemptError('host.profileScopeIdentity')
                     }
                     host = deepFreeze(candidate)
                     return host
+                  }).catch(async error => {
+                    if (error instanceof OpenCodeOperationHostAcquisitionCleanupError
+                      && error.cleanupBinding) {
+                      const cleanupController = new AbortController()
+                      const cleanupDeadlineAtMs = this.ports.clock.monotonicNow() + 10_000
+                      try {
+                        await lease.bindHostCleanupObligation(error.cleanupBinding, {
+                          deadlineAtMs: cleanupDeadlineAtMs,
+                          signal: cleanupController.signal,
+                          monotonicNow: () => this.ports.clock.monotonicNow(),
+                        })
+                        hostCleanupObligation = error.cleanupBinding
+                      } catch (bindingError) {
+                        cleanupController.abort(bindingError)
+                        throw new OpenCodeOperationHostAcquisitionCleanupError(bindingError)
+                      }
+                    }
+                    if (error instanceof OpenCodeOperationHostAcquisitionSettledError) {
+                      const cleanupController = new AbortController()
+                      const cleanupDeadlineAtMs = this.ports.clock.monotonicNow() + 10_000
+                      try {
+                        await lease.bindHostCleanupObligation(error.cleanupBinding, {
+                          deadlineAtMs: cleanupDeadlineAtMs,
+                          signal: cleanupController.signal,
+                          monotonicNow: () => this.ports.clock.monotonicNow(),
+                        })
+                        hostCleanupObligation = error.cleanupBinding
+                        hostAcquisitionCleanupComplete = true
+                      } catch (bindingError) {
+                        cleanupController.abort(bindingError)
+                        throw new OpenCodeOperationHostAcquisitionCleanupError(bindingError)
+                      }
+                    }
+                    throw error
                   })
                   // This reaction is registered after the synchronous transfer reaction above.
                   // If the outer deadline/abort already closed acquisition, the exact late host
@@ -520,12 +596,18 @@ export class OpenCodeLaunchAttempt {
                     hostAcquisitionCleanupComplete = true
                   }, error => {
                     if (!(error instanceof OpenCodeOperationHostAcquisitionCleanupError)
+                      && !(error instanceof OpenCodeOperationHostAcquisitionSettledError)
                       && !(error && typeof error === 'object'
                         && (error as { cleanupIncomplete?: unknown }).cleanupIncomplete === true)) {
                       hostAcquisitionCleanupComplete = true
                     }
                     throw error
                   })
+                  // The accepted acquisition path may spend its private reserve
+                  // durably binding an incomplete-cleanup receipt. Retain a
+                  // rejection handler immediately so the sibling late-settlement
+                  // promise cannot surface as unhandled during that bounded wait.
+                  void lateHostSettlement.catch(() => undefined)
                   return acceptedAcquisition
                 }))
             } finally {
@@ -1110,7 +1192,7 @@ export class OpenCodeLaunchAttempt {
           expectedRetainedHostIdentity: accepted.launchAttempt.retainedHostIdentity,
           requiredMcpTools: request.launchAttempt.requiredMcpTools,
         })
-        if (!correlation.ok) throw new OpenCodeLaunchAttemptError(correlation.failure.field)
+        if (correlation.ok === false) throw new OpenCodeLaunchAttemptError(correlation.failure.field)
       } else if (!accepted || lease.journal.acceptedProofResponse === undefined
         || JSON.stringify(decoded.value.response.proof) !== JSON.stringify(accepted.proof)) {
         // Crash recovery uses the journal's already-correlated proof basis. A fresh in-memory
@@ -1309,15 +1391,15 @@ export function validateOpenCodeDurableFinalResponse(
     expectedRetainedHostIdentity: basis.launchAttempt.retainedHostIdentity,
     requiredMcpTools: request.launchAttempt.requiredMcpTools,
   })
-  if (!correlation.ok
-    || (binding !== undefined && (
-      final.launchAttempt.profileIdentity !== binding.profileIdentity
-      || final.launchAttempt.pluginPolicyIdentity !== binding.pluginPolicyIdentity
-      || final.launchAttempt.cacheIdentity !== binding.cacheIdentity
-      || final.launchAttempt.authIdentity !== binding.authIdentity
-      || final.launchAttempt.configIdentity !== binding.configIdentity
-      || final.launchAttempt.binaryIdentity !== binding.binaryIdentity
-    ))) throw new OpenCodeLaunchAttemptError(correlation.ok ? 'durableFinal.profileBinding' : correlation.failure.field)
+  if (correlation.ok === false) throw new OpenCodeLaunchAttemptError(correlation.failure.field)
+  if (binding !== undefined && (
+    final.launchAttempt.profileIdentity !== binding.profileIdentity
+    || final.launchAttempt.pluginPolicyIdentity !== binding.pluginPolicyIdentity
+    || final.launchAttempt.cacheIdentity !== binding.cacheIdentity
+    || final.launchAttempt.authIdentity !== binding.authIdentity
+    || final.launchAttempt.configIdentity !== binding.configIdentity
+    || final.launchAttempt.binaryIdentity !== binding.binaryIdentity
+  )) throw new OpenCodeLaunchAttemptError('durableFinal.profileBinding')
   if (expected.members) validateOpenCodeLaunchResponseRoster(final, expected.members, request.launchAttempt.parent)
 }
 

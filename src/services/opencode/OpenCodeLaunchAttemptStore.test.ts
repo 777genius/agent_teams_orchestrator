@@ -1506,6 +1506,28 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     expect((await store.inspect(exact))?.cleanupState).toBe('complete')
   })
 
+  test('uses the fresh invocation deadline only for reconciliation of an exact durable final', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64),
+      startedAtMs: 0, totalBudgetMs: 10_000 }
+    const initialContext = { deadlineAtMs: 10_000, monotonicNow: () => 0,
+      signal: new AbortController().signal }
+    await store.withGeneration(exact, 'begin', async lease => {
+      const response = finalResponse()
+      response.members.cleanupPending = []
+      await lease.commitTerminalResponse(response, 'incomplete', initialContext)
+    }, initialContext)
+
+    const replayContext = { deadlineAtMs: 20_000, monotonicNow: () => 15_000,
+      signal: new AbortController().signal }
+    await store.withGeneration(exact, 'begin', async lease => {
+      expect(lease.beganGeneration).toBe(false)
+      await lease.reconcileCleanupComplete(replayContext)
+    }, replayContext)
+    expect((await store.inspect(exact))?.cleanupState).toBe('complete')
+  })
+
   test('carries incomplete cleanup truth across continuation and rejects a generation upgrade', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)

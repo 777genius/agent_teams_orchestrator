@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 
 import { OpenCodeLaunchAttempt, OpenCodeOperationHostAcquisitionCleanupError,
+  OpenCodeOperationHostAcquisitionSettledError,
   validateOpenCodeLaunchResponseRoster,
   type OpenCodeLaunchAttemptPorts } from './OpenCodeLaunchAttempt.js'
 import { projectOpenCodeLaunchAttemptResponse } from './OpenCodeLaunchAttemptProduction.js'
@@ -1507,7 +1508,8 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     let releasedObligationId: string | undefined
     let cleanupSignal: AbortSignal | undefined
     const exactObligationId = '77777777-7777-4777-8777-777777777777'
-    subject.ports.host.reserveOperationHostCleanup = async () => exactObligationId
+    subject.ports.host.reserveOperationHostCleanup = async () => ({ obligationId: exactObligationId,
+      reservationDigest: '7'.repeat(64) })
     subject.ports.mcp.verifyAppMcp = async () => { throw new Error('fake MCP configuration failure') }
     subject.ports.host.releaseOperationHost = async input => {
       released = input.host
@@ -1635,6 +1637,27 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       })
     expect(replay.cleanup).toBe('timed_out')
     expect(subject.persistence.json().cleanupState).toBe('incomplete')
+  })
+
+  test('binds the exact completed receipt before accepting publication-fallback cleanup proof', async () => {
+    const subject = setup()
+    const reservation = { obligationId: '123e4567-e89b-42d3-a456-426614174499',
+      reservationDigest: 'a'.repeat(64) }
+    const completed = { ...reservation, receiptIdentityDigest: 'b'.repeat(64) }
+    subject.ports.host.reserveOperationHostCleanup = async () => reservation
+    subject.ports.host.acquireOperationHost = async () => {
+      throw new OpenCodeOperationHostAcquisitionSettledError(completed,
+        new Error('receipt publication crossed the caller deadline'))
+    }
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(result.cleanup).toBe('complete')
+    expect(subject.persistence.json()).toMatchObject({
+      cleanupState: 'complete',
+      hostCleanupObligationIds: [reservation.obligationId],
+      hostCleanupObligations: [completed],
+    })
   })
 
   test('accepts an immediately resolved host synchronously and uses the normal one-shot release path', async () => {
