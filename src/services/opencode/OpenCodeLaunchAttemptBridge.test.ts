@@ -106,6 +106,7 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
         calls.push('legacy-member'); throw new Error('must not run')
       }) as typeof openCodeSessionBridge.ensureSession
       const bridge = createOpenCodeLaunchAttemptProductionBridge({
+        preflightAuthorization: async () => {},
         authorize: async value => { calls.push('plan'); return value },
         inspect: async () => {
           calls.push('ledger')
@@ -129,6 +130,7 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
   test('absent optional version ledger mismatch fails with zero launch effects', async () => {
     const calls: string[] = []
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); return value },
       inspect: async () => { calls.push('ledger'); throw new Error('immutable plan mismatch') },
       executeAfterPreflight: async () => {
@@ -156,6 +158,7 @@ describe('OpenCodeLaunchAttempt production-handler boundary', () => {
   test('old Desktop request without correlation fails before realpath, authorization, ledger, or effects', async () => {
     const calls: string[] = []
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); return value },
       inspect: async () => { calls.push('ledger'); return null },
       executeAfterPreflight: async () => {

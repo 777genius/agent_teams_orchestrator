@@ -13,7 +13,13 @@ type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
 type Output = Awaited<ReturnType<OpenCodeLaunchAttemptBridgePort['execute']>>
 
 export type OpenCodeLaunchAttemptProductionRuntime = {
-  /** Read-only S1 authorization; must run before the durable ledger gate. */
+  /** Effect-free durable classification; must precede authorization/profile capture. */
+  preflightAuthorization(command: Command, controls: Readonly<{
+    signal: AbortSignal
+    deadlineAtMs: number
+    remainingMs(): number
+  }>): Promise<void>
+  /** Read-only S1 authorization; runs only after durable safety classification. */
   authorize(command: Command, controls: Readonly<{
     signal: AbortSignal
     deadlineAtMs: number
@@ -125,6 +131,9 @@ export function createOpenCodeLaunchAttemptProductionBridge(
         ])
         const canonicalCommand = Object.freeze({ ...exactCommand, projectPath: projectIdentity,
           projectIdentity, deadlineAtMs, signal: controller.signal })
+        await Promise.race([
+          runtime.preflightAuthorization(canonicalCommand, controls), boundary,
+        ])
         const authorized = await Promise.race([
           runtime.authorize(canonicalCommand, controls), boundary,
         ])

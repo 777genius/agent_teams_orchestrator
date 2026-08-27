@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 
 import { tmpdir } from 'node:os'
 
 import { createHash } from 'node:crypto'
+import * as childProcess from 'node:child_process'
 
 import {
   commitOpenCodeMemberProjection,
@@ -24,6 +25,7 @@ import type { OpenCodeCurrentScopedProfilePlan, OpenCodeScopedPreparedProfile,
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { OpenCodeProfileManager } from './OpenCodeProfileManager.js'
 import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
 import { planScopedProfile } from './OpenCodeOperationPolicy.js'
 import { computeOpenCodeLaunchCommandImmutableDigest, computeOpenCodeLaunchCommandInputDigest,
@@ -1059,8 +1061,12 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
       automaticUserPluginFingerprint: hash('a'), plugins: [],
     },
   })
+  let authorizationCaptureCount = 0
   const profileManager = {
-    captureCurrentScopedProfilePlan: async (input: Parameters<typeof current>[0]) => current(input),
+    captureCurrentScopedProfilePlan: async (input: Parameters<typeof current>[0]) => {
+      authorizationCaptureCount += 1
+      return current(input)
+    },
     planScopedProfile,
     prepareScopedProfile: async (input: OpenCodeCurrentScopedProfilePlan, expected: ReturnType<typeof planScopedProfile>) => ({
       scopeSchema: 'opencode-scoped-profile-v1', purpose: expected.purpose,
@@ -1093,6 +1099,7 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
     purpose: 'launch', providerId: 'openrouter', modelId: 'openrouter/model', runtimeInstanceId: attemptId,
     projectPath,
   })
+  authorizationCaptureCount = 0
   const durableCommand = { ...rawCommand, requestProjectPath: projectPath, projectIdentity: projectPath,
     effectiveProfilePlanDigest: authorization.effectivePlanDigest }
   const commandInputDigest = computeOpenCodeLaunchCommandInputDigest(durableCommand)
@@ -1221,9 +1228,116 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
     sessionReads: () => sessionReadCount,
     mcpChecks: () => mcpCheckCount,
     hostReconciles: () => hostReconcileCount,
+    authorizationCaptures: () => authorizationCaptureCount,
     dispose: () => rm(directory, { recursive: true, force: true }),
   }
 }
+
+test.each(['kiro', 'cursor-acp'] as const)(
+  'production-composed %s authorization and native exec stay behind every unsafe tokenless-v1 state',
+  async providerId => {
+  for (const state of ['current', 'cleanupPending', 'predecessor', 'continuation'] as const) {
+    const harness = await productionRecoveryHarness()
+    try {
+      const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+        `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
+      const receipt = { schemaVersion: 1 as const,
+        receiptId: `${state === 'current' ? '1' : state === 'cleanupPending' ? '2'
+          : state === 'predecessor' ? '3' : '4'}7777777-7777-4777-8777-777777777777`,
+        hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+        pid: 443, processStartedAtMs: 1, lifetime: 'persistent' as const }
+      const obligation = await hostLedger.reserve({
+        attemptId: harness.command.request.launchAttempt.attemptId,
+        payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1,
+        hostKeyIdentity: harness.acceptedProof().launchAttempt.retainedHostIdentity!.hostKeyIdentity,
+        hostKeyDigest: receipt.hostKeyDigest,
+      }, harness.context)
+      await hostLedger.record({ ...obligation, disposition: 'dispose', releaseState: 'pending', receipt },
+        harness.context)
+      const exact = await hostLedger.readObligation({ attemptId: obligation.attemptId,
+        payloadHash: obligation.payloadHash, generation: 1, obligationId: obligation.obligationId },
+      harness.context)
+      let continuationToken: string | undefined
+      await harness.store.withGeneration({
+        attemptId: harness.command.request.launchAttempt.attemptId,
+        payloadHash: harness.command.request.launchAttempt.payloadHash,
+        inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest,
+        generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000,
+      }, 'begin', async lease => {
+        if (state === 'predecessor' || state === 'continuation') {
+          continuationToken = await lease.issueContinuation([harness.memberIdentity], harness.context)
+          return
+        }
+        const basis = harness.acceptedProof()
+        const failure = { code: 'contract_violation' as const, origin: 'session' as const,
+          retryDisposition: 'never' as const, retryable: false,
+          phase: 'member_materialize' as const, sideEffectsStarted: false }
+        const final = { ...basis,
+          launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
+          members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+            pending: [], cleanupPending: state === 'cleanupPending' ? [harness.memberIdentity] : [] },
+          failure }
+        await lease.commitAcceptedProofResponse(basis, harness.context)
+        await lease.bindHostCleanupObligation({ obligationId: exact!.obligationId,
+          reservationDigest: exact!.reservationDigest,
+          receiptIdentityDigest: exact!.receiptIdentityDigest }, harness.context)
+        await lease.commitTerminalResponse(final, 'incomplete', harness.context)
+      }, harness.context)
+
+      const value = structuredClone(harness.command)
+      value.request.launchAttempt.providerId = providerId
+      value.request.launchAttempt.modelId = providerId === 'kiro' ? 'kiro/auto' : 'cursor-acp/auto'
+      value.selectedModel = value.request.launchAttempt.modelId
+      if (state === 'predecessor' || state === 'continuation') {
+        value.continuation = true
+        value.request.launchAttempt.generation = 2
+        value.request.launchAttempt.continuationToken = continuationToken
+      }
+      value.request.launchAttempt.requestCorrelationDigest = computeOpenCodeLaunchRequestCorrelationDigest(value)
+      if (state === 'predecessor') {
+        await harness.store.withGeneration({ attemptId: obligation.attemptId,
+          payloadHash: obligation.payloadHash, inputDigest: 'f'.repeat(64),
+          immutableDigest: harness.immutableDigest, generation: 2,
+          continuationToken, startedAtMs: Date.now(), totalBudgetMs: 30_000,
+        }, 'continue', async () => {}, harness.context)
+      }
+
+      const before = await durableTreeSnapshot(harness.directory)
+      const profileManager = new OpenCodeProfileManager()
+      const captureSpy = spyOn(profileManager, 'captureCurrentScopedProfilePlan')
+      const execSpy = spyOn(childProcess, 'execFile')
+      let clientEffects = 0
+      let hostEffects = 0
+      let mcpEffects = 0
+      const bridge = createOpenCodeLaunchAttemptProductionTestBridge({
+        dataDirectory: path.join(harness.directory, 'data'), profileManager,
+        sessionStore: harness.sessionStore,
+        clientFactory: { create: () => { clientEffects += 1; throw new Error('client effect') } } as never,
+        hostManager: {
+          hasExactRetainedHostReleaseCapability: () => false,
+          ensureScopedHostReference: async () => { hostEffects += 1; throw new Error('host effect') },
+          releaseHostReference: async () => { hostEffects += 1 },
+          retainHostLease: async () => { hostEffects += 1 },
+          reconcileHostReleaseReceipt: async () => { hostEffects += 1 },
+        } as never,
+        mcpManager: { ensureAppMcp: async () => { mcpEffects += 1; throw new Error('mcp effect') } } as never,
+      })
+      try {
+        await expect(bridge.execute(value)).rejects.toThrow('requires exact retained generation authority')
+        expect({ capture: captureSpy.mock.calls.length, exec: execSpy.mock.calls.length,
+          clientEffects, hostEffects, mcpEffects }).toEqual({ capture: 0, exec: 0,
+          clientEffects: 0, hostEffects: 0, mcpEffects: 0 })
+        expect(await durableTreeSnapshot(harness.directory)).toEqual(before)
+        expect({ member: harness.memberCreates(), remote: harness.remoteReads(),
+          session: harness.sessionReads(), mcp: harness.mcpChecks(), reconcile: harness.hostReconciles() })
+          .toEqual({ member: 0, remote: 0, session: 0, mcp: 0, reconcile: 0 })
+      } finally {
+        captureSpy.mockRestore()
+        execSpy.mockRestore()
+      }
+    } finally { await harness.dispose() }
+  }
+}, 60_000)
 
 async function durableTreeSnapshot(root: string): Promise<Record<string, string>> {
   const snapshot: Record<string, string> = {}
@@ -1394,6 +1508,7 @@ test('production composition reconciles tokenless v1 only through the exact reta
 
     const replay = await harness.bridge.execute(harness.command)
     expect((replay.data as { launchAttempt: unknown }).launchAttempt).toEqual(final)
+    expect(harness.authorizationCaptures()).toBe(1)
     expect(reconciles).toBe(1)
     expect((await hostLedger.readObligation({ attemptId: obligation.attemptId,
       payloadHash: obligation.payloadHash, generation: 1, obligationId: obligation.obligationId },
@@ -1501,8 +1616,9 @@ test.each(['committed', 'claimed'] as const)(
     const reconcileSpy = spyOn(realHostManager, 'reconcileHostReleaseReceipt')
 
     try {
-      const replay = await harness.bridge.execute(harness.command)
-      expect((replay.data as { launchAttempt: unknown }).launchAttempt).toEqual(final)
+      await expect(harness.bridge.execute(harness.command)).rejects.toThrow(
+        'requires exact retained generation authority')
+      expect(harness.authorizationCaptures()).toBe(0)
       expect(await durableTreeSnapshot(harness.directory)).toEqual(beforeDurableTree)
       expect(await durableTreeSnapshot(managerDirectory)).toEqual(beforeManagerTree)
       expect((await harness.store.snapshotReadOnly({

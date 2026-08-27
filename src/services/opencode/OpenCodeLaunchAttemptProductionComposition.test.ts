@@ -90,11 +90,31 @@ function correlate(
 }
 
 describe('OpenCode production launch composition', () => {
+  test('read-only host-obligation classification precedes authorization and every accepted-core effect', async () => {
+    const calls: string[] = []
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {
+        calls.push('tokenless-v1')
+        throw new Error('unsafe host obligation')
+      },
+      authorize: async value => { calls.push('authorization'); return value },
+      inspect: async () => { calls.push('command-ledger'); return null },
+      executeAfterPreflight: async () => {
+        calls.push('core')
+        return { output: { snapshot, data: null }, result }
+      },
+    })
+
+    await expect(bridge.execute(command())).rejects.toThrow('unsafe host obligation')
+    expect(calls).toEqual(['tokenless-v1'])
+  })
+
   for (const status of ['succeeded', 'reconciliation_required'] as const) {
     test(`durable ${status} gate runs before every profile, host, and member effect`, async () => {
       const calls: string[] = []
       const output = { snapshot, data: { launchAttempt: { status }, durable: true } }
       const bridge = createOpenCodeLaunchAttemptProductionBridge({
+        preflightAuthorization: async () => {},
         authorize: async value => { calls.push('plan'); return value },
         inspect: async () => { calls.push('command-ledger'); return output },
         executeAfterPreflight: async () => {
@@ -111,6 +131,7 @@ describe('OpenCode production launch composition', () => {
   test('durable mismatch fails closed before launch effects', async () => {
     const calls: string[] = []
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); return value },
       inspect: async () => { calls.push('command-ledger'); throw new Error('immutable plan mismatch') },
       executeAfterPreflight: async () => {
@@ -126,6 +147,7 @@ describe('OpenCode production launch composition', () => {
   test('missing correlation fails before realpath, authorization, ledger, or effects', async () => {
     const calls: string[] = []
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); return value },
       inspect: async () => { calls.push('command-ledger'); return null },
       executeAfterPreflight: async () => {
@@ -146,6 +168,7 @@ describe('OpenCode production launch composition', () => {
       let effects = 0
       const output = { snapshot, data: { launchAttempt: { outcome: status } } }
       const bridge = createOpenCodeLaunchAttemptProductionBridge({
+        preflightAuthorization: async () => {},
         authorize: async value => value,
         inspect: async (_value, key) => {
           durableKey ??= { ...key }
@@ -175,6 +198,7 @@ describe('OpenCode production launch composition', () => {
     const calls: string[] = []
     const output = { snapshot, data: { launchAttempt: result } }
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); return value },
       inspect: async () => { calls.push('command-ledger'); return null },
       executeAfterPreflight: async () => {
@@ -191,6 +215,7 @@ describe('OpenCode production launch composition', () => {
     const value = correlate({ ...command(), requestedBudgetMs: 250, outerRemainingBudgetMs: 250 })
     let authorizationSignal: AbortSignal | undefined
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async (_command, controls) => {
         authorizationSignal = controls.signal
         return new Promise<never>(() => {})
@@ -211,6 +236,7 @@ describe('OpenCode production launch composition', () => {
     const observed: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0][] = []
     const output = { snapshot, data: { launchAttempt: { status: 'succeeded' } } }
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { observed.push(value); return value },
       inspect: async () => output,
       executeAfterPreflight: async () => { throw new Error('effects must not run') },
@@ -260,6 +286,7 @@ describe('OpenCode production launch composition', () => {
     let authorized: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] | undefined
     const output = { snapshot, data: { launchAttempt: { status: 'succeeded' } } }
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async value => { calls.push('plan'); authorized = value; return value },
       inspect: async () => { calls.push('command-ledger'); return output },
       executeAfterPreflight: async () => { throw new Error('effects must not run') },
@@ -291,6 +318,7 @@ describe('OpenCode production launch composition', () => {
     let executed: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] | undefined
     const output = { snapshot, data: { launchAttempt: result } }
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async (value, controls) => {
         expect(controls.deadlineAtMs).toBe(1_100)
         return value
@@ -320,6 +348,7 @@ describe('OpenCode production launch composition', () => {
     const controller = new AbortController(); controller.abort(reason)
     let canonicalCalls = 0
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {},
       authorize: async () => { throw new Error('authorization must not run') },
       inspect: async () => { throw new Error('ledger must not run') },
       executeAfterPreflight: async () => { throw new Error('effects must not run') },
@@ -563,8 +592,18 @@ describe('OpenCode production launch composition', () => {
       }
       expect(failedReceipt)
         .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
-      const blockedReplay = await failedBridge.execute(failedValue)
-      expect(projectedLaunchAttempt(blockedReplay)).toEqual(projectedLaunchAttempt(failed))
+      let blockedReplay: Awaited<ReturnType<typeof failedBridge.execute>> | undefined
+      for (let attempt = 0; attempt < 100 && blockedReplay === undefined; attempt += 1) {
+        try { blockedReplay = await failedBridge.execute(failedValue) }
+        catch (error) {
+          if (!(error instanceof Error)
+            || !/(?:read-only .*changed|changed during pre-authorization cleanup snapshot)/
+              .test(error.message)) throw error
+          await Bun.sleep(20)
+        }
+      }
+      expect(blockedReplay).toBeDefined()
+      expect(projectedLaunchAttempt(blockedReplay!)).toEqual(projectedLaunchAttempt(failed))
       expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
         payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
         .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
