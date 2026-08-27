@@ -86,6 +86,20 @@ function requestExactNativePidRecycle(leaderPid: number, grandchildPid: number,
   })
 }
 
+async function waitForCompletedHostReleaseReceipt(ledger: OpenCodeLaunchHostReleaseLedger,
+  key: Parameters<OpenCodeLaunchHostReleaseLedger['read']>[0]) {
+  let receipt: Awaited<ReturnType<OpenCodeLaunchHostReleaseLedger['read']>> = null
+  // Physical release is bounded at five seconds, while the independent
+  // private settlement retains ten seconds to publish its durable receipt.
+  // Observe the full settlement bound without changing runtime behavior.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    receipt = await ledger.read(key).catch(() => null)
+    if (receipt?.releaseState === 'complete') break
+    await Bun.sleep(20)
+  }
+  return receipt
+}
+
 function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
   const value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
     request: {
@@ -489,7 +503,8 @@ describe('OpenCode production launch composition', () => {
 
       const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
         `${value.request.launchAttempt.attemptId}.host-release.json`))
-      const receipt = await ledger.read({ attemptId: value.request.launchAttempt.attemptId,
+      const receipt = await waitForCompletedHostReleaseReceipt(ledger, {
+        attemptId: value.request.launchAttempt.attemptId,
         payloadHash: value.request.launchAttempt.payloadHash, generation: 1 })
       expect(receipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
       await expect(readFile(registryPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
@@ -545,16 +560,9 @@ describe('OpenCode production launch composition', () => {
       await lateRun.catch(() => undefined)
       const lateLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
         `${lateValue.request.launchAttempt.attemptId}.host-release.json`))
-      let lateReceipt = null
-      // Physical release is bounded at five seconds, while the independent
-      // private settlement retains ten seconds to publish its durable receipt.
-      // Observe the full settlement bound without changing runtime behavior.
-      for (let attempt = 0; attempt < 500; attempt += 1) {
-        lateReceipt = await lateLedger.read({ attemptId: lateValue.request.launchAttempt.attemptId,
-          payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 }).catch(() => null)
-        if (lateReceipt?.releaseState === 'complete') break
-        await Bun.sleep(20)
-      }
+      const lateReceipt = await waitForCompletedHostReleaseReceipt(lateLedger, {
+        attemptId: lateValue.request.launchAttempt.attemptId,
+        payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 })
       expect(lateReceipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
       const allPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n')
