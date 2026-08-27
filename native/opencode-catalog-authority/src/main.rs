@@ -613,7 +613,7 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         // Persist a newly-created child while its parent and the exact child
         // are both retained without delete sharing.
         if created {
-            parent.handle.sync_all().map_err(|_| "ROOT_SYNC")?;
+            windows_identity::flush_directory(&parent.handle).map_err(|_| "ROOT_SYNC")?;
         }
         let opened = file.metadata().map_err(|_| "ROOT_HANDLE")?;
         let opened_identity =
@@ -851,19 +851,13 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
             }
             drop(confirmed.take());
             std::fs::remove_file(&confirmed_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-            held.last()
-                .ok_or("ROOT_HANDLE")?
-                .handle
-                .sync_all()
+            windows_identity::flush_directory(&held.last().ok_or("ROOT_HANDLE")?.handle)
                 .map_err(|_| "ROOT_STATE_CLEANUP")?;
         } else if pending.is_some() {
             drop(pending.take());
             fault("root-before-state-cleanup");
             std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-            held.last()
-                .ok_or("ROOT_HANDLE")?
-                .handle
-                .sync_all()
+            windows_identity::flush_directory(&held.last().ok_or("ROOT_HANDLE")?.handle)
                 .map_err(|_| "ROOT_STATE_CLEANUP")?;
             return retain_windows_root_marker(confirmed_path, confirmed.unwrap(), &expected);
         } else {
@@ -879,15 +873,12 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
         None => create_windows_state_file(&pending_path, b"unconfirmed\n", true)?,
     };
     pending.sync_all().map_err(|_| "ROOT_STATE")?;
-    held.last()
-        .ok_or("ROOT_HANDLE")?
-        .handle
-        .sync_all()
+    windows_identity::flush_directory(&held.last().ok_or("ROOT_HANDLE")?.handle)
         .map_err(|_| "ROOT_STATE_SYNC")?;
 
     for parent in held.iter().take(held.len().saturating_sub(1)) {
         fault("root-before-directory-sync");
-        parent.handle.sync_all().map_err(|_| "ROOT_SYNC")?;
+        windows_identity::flush_directory(&parent.handle).map_err(|_| "ROOT_SYNC")?;
         validate_windows_root_components(held)?;
     }
 
@@ -899,18 +890,12 @@ fn confirm_windows_root(target: &Path, held: &[WindowsRootComponent]) -> Result<
             file
         }
     };
-    held.last()
-        .ok_or("ROOT_HANDLE")?
-        .handle
-        .sync_all()
+    windows_identity::flush_directory(&held.last().ok_or("ROOT_HANDLE")?.handle)
         .map_err(|_| "ROOT_STATE_SYNC")?;
     drop(pending);
     fault("root-before-state-cleanup");
     std::fs::remove_file(&pending_path).map_err(|_| "ROOT_STATE_CLEANUP")?;
-    held.last()
-        .ok_or("ROOT_HANDLE")?
-        .handle
-        .sync_all()
+    windows_identity::flush_directory(&held.last().ok_or("ROOT_HANDLE")?.handle)
         .map_err(|_| "ROOT_STATE_CLEANUP")?;
     // A newly created marker handle still has write access. Close it and
     // recapture the immutable marker read-only so its share mask both blocks
@@ -1816,14 +1801,13 @@ fn sync_directory() -> Result<(), String> {
 }
 #[cfg(windows)]
 fn sync_directory() -> Result<(), String> {
-    WINDOWS_ROOT_HANDLES
+    let directory = &WINDOWS_ROOT_HANDLES
         .get()
         .ok_or("DIR_HANDLES")?
         .last()
         .ok_or("DIR_HANDLES")?
-        .handle
-        .sync_all()
-        .map_err(|_| "DIR_SYNC".into())
+        .handle;
+    windows_identity::flush_directory(directory).map_err(|_| "DIR_SYNC".into())
 }
 
 fn validate(db: &Db) -> Result<(), String> {

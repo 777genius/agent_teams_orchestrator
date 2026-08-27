@@ -80,7 +80,7 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(protocol).toContain('WINDOWS_ROOT_CONFIRMED')
     expect(protocol).toMatch(/open_windows_state_file\(&confirmed_path, false\)/)
     expect(protocol).toMatch(/held\.iter\(\)\.take\(held\.len\(\)\.saturating_sub\(1\)\)/)
-    expect(protocol).toMatch(/fault\("root-before-directory-sync"\)[\s\S]*parent\.handle\.sync_all\(\)[\s\S]*validate_windows_root_components\(held\)/)
+    expect(protocol).toMatch(/fault\("root-before-directory-sync"\)[\s\S]*windows_identity::flush_directory\(&parent\.handle\)[\s\S]*validate_windows_root_components\(held\)/)
     expect(protocol).toMatch(/pending\.is_none\(\)[\s\S]*!expected\.starts_with\(&contents\)/)
     expect(protocol.indexOf('create_windows_state_file(&confirmed_path')).toBeGreaterThan(
       protocol.indexOf('held.iter().take(held.len().saturating_sub(1))'))
@@ -119,9 +119,10 @@ describe('OpenCode catalog Windows authority security contract', () => {
   })
 
   test('uses aligned NT rename and flush primitives for every directory barrier', async () => {
-    const [identity, publication] = await Promise.all([
+    const [identity, publication, authority] = await Promise.all([
       readFile(identityPath, 'utf8'),
       readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
+      readFile(authorityPath, 'utf8'),
     ])
     const rename = identity.slice(
       identity.indexOf('pub(super) fn rename_relative'),
@@ -155,6 +156,10 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(publication).toContain('recovery.sync_all().map_err')
     expect(publication).toContain('file.sync_all().map_err')
     expect(publication).toContain('temporary.sync_all().map_err')
+    expect(authority.match(/windows_identity::flush_directory/g)).toHaveLength(8)
+    expect(authority).not.toMatch(/\.handle\s*\.sync_all\(/)
+    expect(authority).toContain('file.sync_all().map_err(|_| "ROOT_STATE")?')
+    expect(authority).toContain('pending.sync_all().map_err(|_| "ROOT_STATE")?')
     expect(identity).not.toContain('symlink_metadata')
   })
 })
