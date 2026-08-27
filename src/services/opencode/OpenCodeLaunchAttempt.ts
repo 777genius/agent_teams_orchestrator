@@ -462,11 +462,19 @@ export class OpenCodeLaunchAttempt {
                   lateHostSettlement = physicalAcquisition.then(async candidate => {
                     if (host === candidate) return
                     const lateReleaseController = new AbortController()
-                    await this.ports.host.releaseOperationHost({
+                    const physicalRelease = this.ports.host.releaseOperationHost({
                       host: candidate,
-                      deadlineAtMs: Number.MAX_SAFE_INTEGER,
+                      deadlineAtMs: policy.absoluteDeadlineAtMs,
                       signal: lateReleaseController.signal,
                     })
+                    try {
+                      await this.ports.deadline.run(
+                        physicalRelease, policy.absoluteDeadlineAtMs, lateReleaseController.signal,
+                      )
+                    } catch (error) {
+                      lateReleaseController.abort(new DeadlineError())
+                      throw error
+                    }
                     hostAcquisitionCleanupComplete = true
                   }, () => {
                     hostAcquisitionCleanupComplete = true

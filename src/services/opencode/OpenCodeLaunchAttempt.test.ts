@@ -1577,6 +1577,36 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().cleanupState).toBe('incomplete')
   })
 
+  test('bounds a host acquired after the absolute deadline and retains incomplete replay state', async () => {
+    let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
+    let acquireEntered!: () => void
+    const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
+    const acquisition = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
+    const releaseInputs: Array<{ deadlineAtMs: number; signal: AbortSignal }> = []
+    const physicalRelease = new Promise<void>(() => undefined)
+    const subject = setup()
+    subject.ports.host.acquireOperationHost = async () => { acquireEntered(); return acquisition }
+    subject.ports.host.releaseOperationHost = async input => {
+      releaseInputs.push({ deadlineAtMs: input.deadlineAtMs, signal: input.signal })
+      return physicalRelease
+    }
+
+    const running = subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    await atAcquire
+    subject.setNow(10_000)
+    resolveAcquire(host)
+    await running.catch(() => undefined)
+    await Bun.sleep(0)
+
+    expect(releaseInputs).toHaveLength(1)
+    expect(releaseInputs[0]?.deadlineAtMs).toBe(10_000)
+    expect(releaseInputs[0]?.signal.aborted).toBe(true)
+    expect(subject.persistence.json().cleanupState).not.toBe('complete')
+    expect(subject.persistence.json().finalResponse).toBeUndefined()
+  })
+
   test('accepts an immediately resolved host synchronously and uses the normal one-shot release path', async () => {
     const cancellation = new AbortController()
     let acquireEntered!: () => void

@@ -536,6 +536,35 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     expect(manager.getHost(reference.handle.hostKey)).toBeNull()
   })
 
+  test.each([
+    ['live descendant', true, false],
+    ['unknown containment', null, false],
+    ['proven empty containment', false, true],
+  ] as const)('leader-gone durable receipt with %s clears only after proof', async (
+    _case, groupAlive, shouldComplete,
+  ) => {
+    const signals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+    const manager = new OpenCodeHostManager({
+      isProcessAlive: () => false,
+      isProcessGroupAlive: () => groupAlive,
+      killProcess: (pid, signal) => { signals.push({ pid, signal }) },
+      persistentRegistryPath: null,
+    })
+    const receipt = {
+      schemaVersion: 1 as const,
+      receiptId: '11111111-1111-4111-8111-111111111111',
+      hostKeyDigest: 'a'.repeat(64),
+      pid: 50_701,
+      processStartedAtMs: 12_345,
+      lifetime: 'persistent' as const,
+    }
+
+    const reconciliation = manager.reconcileHostReleaseReceipt(receipt)
+    if (shouldComplete) await expect(reconciliation).resolves.toBeUndefined()
+    else await expect(reconciliation).rejects.toThrow('cleanup remains incomplete')
+    expect(signals).toEqual([])
+  })
+
   test('persistent cleanup retains its receipt when leader exits but descendant 507 survives', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-persistent-descendant-'))
     const registryPath = path.join(tempDir, 'registry.json')
@@ -567,6 +596,51 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       expect(await pathExists(registryPath)).toBe(true)
       expect(signals).toEqual(['SIGTERM'])
       await expect(manager.releaseHostReference(reference)).rejects.toThrow()
+      expect(signals).toEqual(['SIGTERM'])
+      expect(await pathExists(registryPath)).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('force cleanup retains registry when the leader vanishes at the force identity read', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-force-identity-race-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(448)
+    const signals: NodeJS.Signals[] = []
+    let afterTerm = false
+    let afterTermLivenessReads = 0
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44116,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => {
+        if (pid !== 448) return false
+        if (!afterTerm) return true
+        afterTermLivenessReads += 1
+        // TERM observation and the outer force guard still see the leader;
+        // the exact identity read immediately inside the force branch does not.
+        return afterTermLivenessReads <= 2
+      },
+      isProcessGroupAlive: pid => pid === 448,
+      readProcessStartTimeMs: async pid => pid === 448 ? 12_345 : null,
+      killProcess: (_pid, signal) => {
+        signals.push(signal)
+        if (signal === 'SIGTERM') afterTerm = true
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+    })
+    try {
+      await manager.ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const result = await manager.reconcilePersistentHosts({ reason: 'shutdown', mode: 'force' })
+      expect(result.cleaned).toBe(0)
+      expect(result.remaining).toBe(1)
       expect(signals).toEqual(['SIGTERM'])
       expect(await pathExists(registryPath)).toBe(true)
     } finally {

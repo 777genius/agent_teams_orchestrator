@@ -168,7 +168,7 @@ type OpenCodeHostManagerDeps = {
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
   isProcessAlive?: (pid: number) => boolean
-  isProcessGroupAlive?: (leaderPid: number) => boolean
+  isProcessGroupAlive?: (leaderPid: number) => boolean | null
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
@@ -1848,7 +1848,7 @@ export class OpenCodeHostManager {
       await this.sleepMs(Math.min(timeoutMs, 250)).catch(() => undefined)
       if (this.isProcessAlive(pid)) return false
       return !requireStableContainment
-        || (this.deps.isProcessGroupAlive !== undefined && !this.deps.isProcessGroupAlive(pid))
+        || (this.deps.isProcessGroupAlive !== undefined && this.deps.isProcessGroupAlive(pid) === false)
     }
     const exited = await killProcessTreeAndWait(pid, signal, {
       timeoutMs,
@@ -1862,7 +1862,7 @@ export class OpenCodeHostManager {
   }
 
   private hasStableProcessContainmentExited(pid: number): boolean {
-    if (this.deps.isProcessGroupAlive) return !this.deps.isProcessGroupAlive(pid)
+    if (this.deps.isProcessGroupAlive) return this.deps.isProcessGroupAlive(pid) === false
     // A fake mutation hook without a matching strong observer is deliberately
     // unproven. Production POSIX cleanup observes the detached process group.
     if (this.deps.killProcess) return false
@@ -1870,7 +1870,7 @@ export class OpenCodeHostManager {
   }
 
   private persistentContainmentExited(pid: number): boolean {
-    if (this.deps.isProcessGroupAlive) return !this.deps.isProcessGroupAlive(pid)
+    if (this.deps.isProcessGroupAlive) return this.deps.isProcessGroupAlive(pid) === false
     return isProcessTreeContainmentAlive(pid) === false
   }
 
@@ -3028,7 +3028,7 @@ export class OpenCodeHostManager {
     this.assertCleanupAllowed(controls)
     let terminated = this.hasOwnedChildExited(child)
       && (!controls.requireStableContainment || (pid !== null && pid !== undefined
-        && this.deps.isProcessGroupAlive !== undefined && !this.deps.isProcessGroupAlive(pid)))
+        && this.deps.isProcessGroupAlive !== undefined && this.deps.isProcessGroupAlive(pid) === false))
     if (!terminated) {
       terminated = controls.requireStableContainment
         ? pid !== null && pid !== undefined && await this.killProcessAndWait(
@@ -3547,7 +3547,10 @@ export class OpenCodeHostManager {
       else await this.unlinkPersistentRegistryUnlocked()
     })
     if (registryReceiptFound) return
-    if (!this.isProcessAlive(receipt.pid)) return
+    if (!this.isProcessAlive(receipt.pid)) {
+      if (this.persistentContainmentExited(receipt.pid)) return
+      throw new Error('OpenCode durable host containment cleanup remains incomplete [redacted]')
+    }
     const observed = await this.readProcessStartTimeMs(receipt.pid).catch(() => null)
     if (observed !== receipt.processStartedAtMs) {
       throw new Error('OpenCode host release receipt process generation changed [redacted]')
@@ -3681,8 +3684,12 @@ export class OpenCodeHostManager {
     })
     if (processIdentity.state === 'gone') {
       // A gone exact leader invalidates its numeric PGID authority. Do not
-      // probe or signal the group after this point; retain the durable receipt.
-      terminated = options.requireStableContainment !== true
+      // probe or signal the group after this point. Cleanup completes
+      // only when the non-signalling containment observer proves it empty.
+      if (!this.persistentContainmentExited(pid)) {
+        throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
+      }
+      terminated = true
     } else if (processIdentity.state !== 'confirmed') {
       throw new Error(
         processIdentity.state === 'changed'
@@ -3711,6 +3718,9 @@ export class OpenCodeHostManager {
       const identityBeforeKill = await this.assertPersistentHostProcessIdentity(
         record, processIdentity.startedAtMs)
       if (identityBeforeKill === 'gone') {
+        if (!this.persistentContainmentExited(pid)) {
+          throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
+        }
         terminated = true
       } else if (entry?.child?.pid) {
         terminated = await this.killProcessAndWait(
@@ -3737,16 +3747,20 @@ export class OpenCodeHostManager {
     if (options.force && pid > 0 && !terminated && this.isProcessAlive(pid)) {
       const identityBeforeForceKill = await this.assertPersistentHostProcessIdentity(
         record, processIdentity.startedAtMs)
-      terminated =
-        identityBeforeForceKill === 'gone' ||
-        (await this.killProcessAndWait(
+      if (identityBeforeForceKill === 'gone') {
+        if (!this.persistentContainmentExited(pid)) {
+          throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
+        }
+        terminated = true
+      } else {
+        terminated = await this.killProcessAndWait(
           pid,
           'SIGKILL',
           OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
-          false,
-        ))
+        )
+      }
     }
 
     this.assertCleanupAllowed(options)
