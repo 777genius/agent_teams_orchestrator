@@ -536,6 +536,7 @@ describe('OpenCode production launch composition', () => {
       const exposure = new Promise<void>(resolve => { exposeReference = resolve })
       let referenceReady!: () => void
       const atReference = new Promise<void>(resolve => { referenceReady = resolve })
+      let lateCleanupSignal: AbortSignal | undefined
       const delayedManager = new Proxy(physicalManager, {
         get(target, property, receiver) {
           if (property === 'ensureScopedHostReference') return async (...input: Parameters<OpenCodeHostManager['ensureScopedHostReference']>) => {
@@ -543,6 +544,12 @@ describe('OpenCode production launch composition', () => {
             referenceReady()
             await exposure
             return reference
+          }
+          if (property === 'releaseHostReference') return async (
+            ...input: Parameters<OpenCodeHostManager['releaseHostReference']>
+          ) => {
+            lateCleanupSignal = input[1].signal
+            return target.releaseHostReference(...input)
           }
           const member = Reflect.get(target, property, receiver)
           return typeof member === 'function' ? member.bind(target) : member
@@ -562,6 +569,9 @@ describe('OpenCode production launch composition', () => {
         attemptId: lateValue.request.launchAttempt.attemptId,
         payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 })
       expect(lateReceipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
+      expect(lateCleanupSignal).toBeDefined()
+      expect(lateCleanupSignal).not.toBe(caller.signal)
+      expect(lateCleanupSignal!.aborted).toBe(false)
       const allPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n')
       expect(allPidLines).toHaveLength(4)

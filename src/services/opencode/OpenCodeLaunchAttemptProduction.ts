@@ -868,6 +868,27 @@ async function bounded<T>(operation: Promise<T>, deadlineAtMs: number, signal: A
   }
 }
 
+function absoluteCleanupContext(deadlineAtMs: number): Readonly<{
+  context: OpenCodeLaunchHostLedgerContext
+  close: () => void
+}> {
+  const controller = new AbortController()
+  const remainingMs = Math.max(0, deadlineAtMs - launchMonotonicNow())
+  let timer: ReturnType<typeof setTimeout> | undefined
+  if (remainingMs === 0) {
+    controller.abort(new DeadlineError('OpenCode launch cleanup deadline expired'))
+  } else {
+    timer = setTimeout(() => {
+      controller.abort(new DeadlineError('OpenCode launch cleanup deadline expired'))
+    }, remainingMs)
+    timer.unref?.()
+  }
+  return {
+    context: { deadlineAtMs, signal: controller.signal },
+    close: () => { if (timer) clearTimeout(timer) },
+  }
+}
+
 /** Concrete production adapter. */
 export type OpenCodeProductionLaunchRuntimeTestDependencies = Readonly<{
   clientFactory?: typeof globalThisOpenCodeClientFactory
@@ -1695,8 +1716,7 @@ class OpenCodeProductionLaunchRuntime {
                 receipt: OpenCodeLaunchHostReleaseRecord['receipt']
               } }).startupCleanupReceipt
               if (startup) {
-                const reserveController = new AbortController()
-                const reserveDeadlineAtMs = launchMonotonicNow() + 10_000
+                const cleanup = absoluteCleanupContext(productionDeadlineAtMs)
                 const hostKeyIdentity = opaque({ hostKey: startup.hostKey })
                 const startupRecordBase = {
                   schemaVersion: 4,
@@ -1713,9 +1733,8 @@ class OpenCodeProductionLaunchRuntime {
                 } as const
                 const startupRecord: OpenCodeLaunchHostReleaseRecord = { ...startupRecordBase,
                   receiptIdentityDigest: launchHostReceiptIdentityDigest(startupRecordBase) }
-                const published = await hostReleaseLedger.record(startupRecord,
-                  { deadlineAtMs: reserveDeadlineAtMs, signal: reserveController.signal })
-                  .then(() => true, () => false)
+                const published = await hostReleaseLedger.record(startupRecord, cleanup.context)
+                  .then(() => true, () => false).finally(cleanup.close)
                 if (published) {
                   hostAcquisitionObligations.set(obligation.obligationId, startupRecord)
                   throw new OpenCodeOperationHostAcquisitionCleanupError(error, {
@@ -1729,16 +1748,16 @@ class OpenCodeProductionLaunchRuntime {
             }
             // HostManager only rejects ordinarily after proving its exact
             // native containment empty. Durably clear the matching obligation
-            // with a private bounded reserve; cancellation of the launch
+            // within the existing absolute reserve; cancellation of the launch
             // envelope cannot turn a failed clear into cleanup-complete.
-            const clearController = new AbortController()
-            const clearDeadlineAtMs = launchMonotonicNow() + 10_000
+            const cleanup = absoluteCleanupContext(productionDeadlineAtMs)
             try {
-              await hostReleaseLedger.clearObligation(acquisitionObligation,
-                { deadlineAtMs: clearDeadlineAtMs, signal: clearController.signal })
+              await hostReleaseLedger.clearObligation(acquisitionObligation, cleanup.context)
+              hostAcquisitionObligations.delete(obligation.obligationId)
             } catch (clearError) {
-              clearController.abort(clearError)
               throw new OpenCodeOperationHostAcquisitionCleanupError(clearError)
+            } finally {
+              cleanup.close()
             }
             throw error
           }
@@ -1772,24 +1791,22 @@ class OpenCodeProductionLaunchRuntime {
             this.dependencies.crashBoundary?.('after_host_receipt_publication')
           } catch (error) {
             // Publication failure must not make cleanup depend on an already
-            // expired caller deadline. Start the physical release immediately
-            // with a private bounded reserve. Only the wait is caller-bounded;
+            // closed caller signal. Start the physical release immediately
+            // within the existing absolute reserve. Only the wait is caller-bounded;
             // settlement retains the durable obligation until release proof is
             // obtained and then token-clears that exact obligation.
-            const reserveSignal = new AbortController().signal
-            const reserveStartedAtMs = launchMonotonicNow()
-            const physicalReleaseDeadlineAtMs = reserveStartedAtMs + 5_000
-            const reserveDeadlineAtMs = reserveStartedAtMs + 10_000
+            const cleanup = absoluteCleanupContext(productionDeadlineAtMs)
             const completedReleaseRecord = { ...releaseRecord,
               disposition: 'dispose', releaseState: 'complete' } as const
             const physicalRelease = openCodeHostManager.releaseHostReference(reference, {
-              signal: reserveSignal,
-              remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()),
+              signal: cleanup.context.signal,
+              remainingMs: () => Math.max(0, productionDeadlineAtMs - launchMonotonicNow()),
             }).then(() => hostReleaseLedger.record(completedReleaseRecord, {
-                deadlineAtMs: reserveDeadlineAtMs, signal: reserveSignal,
+                deadlineAtMs: productionDeadlineAtMs, signal: cleanup.context.signal,
               })).then(() => {
                 hostAcquisitionObligations.set(obligation.obligationId, completedReleaseRecord)
               })
+            physicalRelease.then(cleanup.close, cleanup.close)
             // Retain a rejection handler even when the caller's wait expires;
             // the on-disk acquisition obligation remains the restart fence.
             physicalRelease.catch(() => undefined)
@@ -1825,70 +1842,77 @@ class OpenCodeProductionLaunchRuntime {
             receiptIdentityDigest: record.receiptIdentityDigest }
         },
         releaseOperationHost: async input => {
-          // Late physical settlement may use only the attempt's existing
-          // absolute cleanup reserve. Its independent signal is not aborted
-          // when the caller-facing reserve wait ends.
-          const settlementContext = { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
-          const physicalReleaseDeadlineAtMs = input.deadlineAtMs
-          if (!input.cleanupObligationId) {
-            throw new Error('OpenCode operation host release obligation is absent')
-          }
-          const releaseRecord = await hostReleaseLedger.readObligation({
-            attemptId: command.request.launchAttempt.attemptId,
-            payloadHash: command.request.launchAttempt.payloadHash,
-            generation: command.request.launchAttempt.generation,
-            obligationId: input.cleanupObligationId,
-          }, settlementContext)
-          if (!releaseRecord || releaseRecord.hostKeyIdentity !== input.host.hostKeyIdentity) {
-            throw new Error('OpenCode operation host release receipt is absent or mismatched')
-          }
-          const disposition = retainedSessionLeases.shouldKeepHostAlive() ? 'keep_alive' : 'dispose'
-          const intendedRelease = { ...releaseRecord, disposition } as OpenCodeLaunchHostReleaseRecord
-          // Commit intent before proof cleanup or host release effects. A crash
-          // can now distinguish keep-alive from disposal without guessing.
-          this.dependencies.crashBoundary?.('before_host_disposition_publication')
-          await hostReleaseLedger.record(intendedRelease,
-            settlementContext)
-          const reference = hostReferences.get(input.host.hostKeyIdentity)
-          if (reference && reference.handle !== hostFor(input.host)) {
-            throw new Error('OpenCode operation host release capability is mismatched')
-          }
-          const proofSession = proofSessions.get(input.host.hostKeyIdentity)
-          if (proofSession) {
-            let persisted = proofSession
-            if (proofSession.state !== 'absent' && proofSession.state !== 'deleted'
-              && proofSession.state !== 'foreign') {
-              const handle = hostFor(input.host)
-              const client = openCodeClientFactory.create(handle.baseUrl, {
+          // Settlement owns an absolute-deadline signal distinct from the
+          // caller-facing wait. Closing a phase can stop waiting, but cannot
+          // strand an exact capability before its durable receipt is complete.
+          const cleanup = absoluteCleanupContext(productionDeadlineAtMs)
+          const settlementContext = cleanup.context
+          const settlement = (async () => {
+            if (!input.cleanupObligationId) {
+              throw new Error('OpenCode operation host release obligation is absent')
+            }
+            const releaseRecord = await hostReleaseLedger.readObligation({
+              attemptId: command.request.launchAttempt.attemptId,
+              payloadHash: command.request.launchAttempt.payloadHash,
+              generation: command.request.launchAttempt.generation,
+              obligationId: input.cleanupObligationId,
+            }, settlementContext)
+            if (!releaseRecord || releaseRecord.hostKeyIdentity !== input.host.hostKeyIdentity) {
+              throw new Error('OpenCode operation host release receipt is absent or mismatched')
+            }
+            const disposition = retainedSessionLeases.shouldKeepHostAlive() ? 'keep_alive' : 'dispose'
+            const intendedRelease = { ...releaseRecord, disposition } as OpenCodeLaunchHostReleaseRecord
+            // Commit intent before proof cleanup or host release effects. A crash
+            // can now distinguish keep-alive from disposal without guessing.
+            this.dependencies.crashBoundary?.('before_host_disposition_publication')
+            await hostReleaseLedger.record(intendedRelease, settlementContext)
+            const reference = hostReferences.get(input.host.hostKeyIdentity)
+            if (reference && reference.handle !== hostFor(input.host)) {
+              throw new Error('OpenCode operation host release capability is mismatched')
+            }
+            const proofSession = proofSessions.get(input.host.hostKeyIdentity)
+            if (proofSession) {
+              let persisted = proofSession
+              if (proofSession.state !== 'absent' && proofSession.state !== 'deleted'
+                && proofSession.state !== 'foreign') {
+                const handle = hostFor(input.host)
+                const client = openCodeClientFactory.create(handle.baseUrl, {
+                  signal: settlementContext.signal,
+                  remainingMs: () => Math.max(0, productionDeadlineAtMs - launchMonotonicNow()),
+                })
+                const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
+                  authoritativeSessionId: proofSession.authoritativeSessionId,
+                  ownershipTitle: proofSession.ownershipTitle,
+                  getSession: id => client.getSession(id),
+                  deleteSession: id => client.deleteSession(id),
+                }).catch(() => 'unresolved' as const)
+                persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup,
+                  settlementContext)
+                  .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
+              }
+              proofSessions.set(input.host.hostKeyIdentity, persisted)
+              if (persisted.state === 'foreign' || persisted.state === 'unresolved'
+                || persisted.state === 'registered' || persisted.state === 'owned') {
+                throw new Error('OpenCode proof session cleanup could not prove absence')
+              }
+              proofSessions.delete(input.host.hostKeyIdentity)
+            }
+            await bounded(openCodeHostManager.reconcileHostReleaseReceipt(intendedRelease.receipt,
+              { obligationIdentity: intendedRelease,
+                keepPersistentAlive: disposition === 'keep_alive',
                 signal: settlementContext.signal,
-                remainingMs: () => Math.max(0, settlementContext.deadlineAtMs - launchMonotonicNow()),
-              })
-              const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
-                authoritativeSessionId: proofSession.authoritativeSessionId,
-                ownershipTitle: proofSession.ownershipTitle,
-                getSession: id => client.getSession(id),
-                deleteSession: id => client.deleteSession(id),
-              }).catch(() => 'unresolved' as const)
-              persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup,
-                settlementContext)
-                .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
-            }
-            proofSessions.set(input.host.hostKeyIdentity, persisted)
-            if (persisted.state === 'foreign' || persisted.state === 'unresolved'
-              || persisted.state === 'registered' || persisted.state === 'owned') {
-              throw new Error('OpenCode proof session cleanup could not prove absence')
-            }
-            proofSessions.delete(input.host.hostKeyIdentity)
-          }
-          await bounded(openCodeHostManager.reconcileHostReleaseReceipt(intendedRelease.receipt,
-            { obligationIdentity: intendedRelease,
-              keepPersistentAlive: disposition === 'keep_alive',
-              signal: settlementContext.signal,
-              remainingMs: () => Math.max(0, physicalReleaseDeadlineAtMs - launchMonotonicNow()) }),
-          settlementContext.deadlineAtMs, settlementContext.signal)
-          await hostReleaseLedger.record({ ...intendedRelease, releaseState: 'complete' },
-            settlementContext)
-          hostReferences.delete(input.host.hostKeyIdentity)
+                remainingMs: () => Math.max(0, productionDeadlineAtMs - launchMonotonicNow()) }),
+            productionDeadlineAtMs, settlementContext.signal)
+            await hostReleaseLedger.record({ ...intendedRelease, releaseState: 'complete' },
+              settlementContext)
+            hostReferences.delete(input.host.hostKeyIdentity)
+          })()
+          settlement.then(cleanup.close, cleanup.close)
+          // The settlement may outlive this wait. Always retain a rejection
+          // reaction so a caller abort never turns late failure into an
+          // unhandled rejection; the durable pending obligation is its fence.
+          settlement.catch(() => undefined)
+          return bounded(settlement, productionDeadlineAtMs, input.signal)
         },
         reconcileOperationHost: async input => {
           let proofCleanup: OpenCodeProofSessionCleanupRecord | null
