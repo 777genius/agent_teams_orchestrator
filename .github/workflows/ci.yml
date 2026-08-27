@@ -45,8 +45,11 @@ jobs:
           phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts
           phase0-opencode-tests/PortableOpenCodeAcceptance.e2e.test.ts
           phase0-opencode-tests/WorkflowContract.test.ts
-      - name: Build deterministic static OpenCode host child/grandchild fixture
-        run: cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
+      - name: Build deterministic native OpenCode catalog and host fixtures
+        run: |
+          cargo build --locked --manifest-path native/opencode-catalog-authority/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-catalog-launcher/Cargo.toml
+          cargo build --locked --manifest-path native/opencode-host-fixture/Cargo.toml
       - name: Test real Linux recycled-pid production cleanup across process restart
         run: >-
           sudo unshare --pid --fork --mount-proc

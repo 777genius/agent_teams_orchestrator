@@ -546,9 +546,10 @@ describe('OpenCode production launch composition', () => {
       const lateLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
         `${lateValue.request.launchAttempt.attemptId}.host-release.json`))
       let lateReceipt = null
-      // The production private settlement is bounded at five seconds. Observe
-      // that existing bound without changing any behavioral timeout.
-      for (let attempt = 0; attempt < 250; attempt += 1) {
+      // Physical release is bounded at five seconds, while the independent
+      // private settlement retains ten seconds to publish its durable receipt.
+      // Observe the full settlement bound without changing runtime behavior.
+      for (let attempt = 0; attempt < 500; attempt += 1) {
         lateReceipt = await lateLedger.read({ attemptId: lateValue.request.launchAttempt.attemptId,
           payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 }).catch(() => null)
         if (lateReceipt?.releaseState === 'complete') break
