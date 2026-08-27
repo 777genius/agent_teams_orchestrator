@@ -91,6 +91,8 @@ export type OpenCodeLaunchJournal = {
   acceptedProofResponse?: OpenCodeLaunchAttemptResponse
   /** Redacted, decoder-validated authoritative Desktop V1 projection for this generation. */
   finalResponse?: OpenCodeLaunchAttemptResponse
+  /** Additive schema-v1 physical cleanup truth. Missing legacy state decodes as unknown. */
+  cleanupState: 'unknown' | 'complete' | 'incomplete'
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -1286,6 +1288,8 @@ export type OpenCodeLaunchJournalLease = {
   readonly fence: number
   readonly acquisitionToken: string
   readonly continuationEligibleMemberIdentities: readonly OpenCodeOpaqueIdentity[]
+  /** True only for the exclusive invocation that created this generation. */
+  readonly beganGeneration: boolean
   bindProfile(binding: OpenCodeLaunchProfileBinding, context?: OpenCodeLaunchStoreContext): Promise<void>
   claim(memberIdentity: OpenCodeOpaqueIdentity, context?: OpenCodeLaunchStoreContext): Promise<string>
   append(event: OpenCodeLaunchJournalAppendEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
@@ -1298,6 +1302,7 @@ export type OpenCodeLaunchJournalLease = {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<void>
   commitFinalResponse(response: OpenCodeLaunchAttemptResponse, context?: OpenCodeLaunchStoreContext): Promise<void>
+  recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Re-reads both durable authorities immediately before an irreversible external commit. */
@@ -1363,6 +1368,7 @@ export class OpenCodeLaunchAttemptStore {
         effectiveContext = { ...context, deadlineAtMs: Math.min(context.deadlineAtMs, persistedDeadlineAtMs) }
         ensureContext(effectiveContext)
       }
+      let beganGeneration = false
       if (!journal) {
         if (mode !== 'begin') throw new OpenCodeLaunchJournalError('foreign', 'attempt journal does not exist')
         if (identity.generation !== undefined && identity.generation !== 1) {
@@ -1374,8 +1380,9 @@ export class OpenCodeLaunchAttemptStore {
           immutableDigest: identity.immutableDigest ?? identity.inputDigest ?? identity.payloadHash,
           startedAtMs: identity.startedAtMs ?? 0,
           totalBudgetMs: identity.totalBudgetMs ?? 300_000,
-          generation: 1, fence: 1, events: [],
+          generation: 1, fence: 1, cleanupState: 'unknown', events: [],
         }
+        beganGeneration = true
         assertSafeNonnegative(journal.startedAtMs, 'startedAtMs')
         assertSafePositive(journal.totalBudgetMs, 'totalBudgetMs')
         await this.persist(journal, context)
@@ -1412,11 +1419,13 @@ export class OpenCodeLaunchAttemptStore {
             authorizedMemberIdentities: consumedContinuationMembers,
             consumedContinuationToken: identity.continuationToken,
             acceptedProofResponse: undefined,
-            finalResponse: undefined }
+            finalResponse: undefined,
+            cleanupState: 'unknown' as const }
           assertSafePositive(candidate.generation, 'generation')
           assertSafePositive(candidate.fence, 'fence')
           await this.persist(candidate, effectiveContext)
           journal = candidate
+          beganGeneration = true
         }
       }
       const generation = journal.generation
@@ -1463,6 +1472,7 @@ export class OpenCodeLaunchAttemptStore {
         fence,
         acquisitionToken,
         continuationEligibleMemberIdentities,
+        beganGeneration,
         bindProfile: async (binding, bindingContext) => {
           validateProfileBinding(binding)
           await serializeMutation(async () => {
@@ -1610,6 +1620,24 @@ export class OpenCodeLaunchAttemptStore {
               throw persistenceError
             }
           }, responseContext)
+        },
+        recordCleanupState: async (state, cleanupContext) => {
+          if (state === 'complete' && !beganGeneration) {
+            throw new OpenCodeLaunchJournalError('fenced', 'only the generation creator may prove cleanup complete')
+          }
+          await serializeMutation(async () => {
+            const current = journal!.cleanupState ?? 'unknown'
+            if (current === state) return
+            if (current !== 'unknown') {
+              throw new OpenCodeLaunchJournalError('fenced', 'terminal cleanup state is immutable')
+            }
+            const candidate = { ...journal!, cleanupState: state }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, cleanupContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, cleanupContext)
         },
         reconcile: async (event, reconcileContext) => {
           if (!event.claimToken) {
@@ -1941,7 +1969,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     'startedAtMs', 'totalBudgetMs', 'generation', 'fence', 'events'] as const
   const allowedJournalKeys = new Set<string>([
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
-    'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse',
+    'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse', 'cleanupState',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -2017,6 +2045,12 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
       || decoded.value.response.launchAttempt.immutableDigest !== source.immutableDigest) {
       throw new OpenCodeLaunchJournalError('corrupt', 'invalid final response projection')
     }
+  }
+  if (source.cleanupState !== undefined
+    && source.cleanupState !== 'unknown'
+    && source.cleanupState !== 'complete'
+    && source.cleanupState !== 'incomplete') {
+    throw new OpenCodeLaunchJournalError('corrupt', 'invalid cleanup state')
   }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {
     throw new OpenCodeLaunchJournalError('corrupt', 'invalid journal event count')
@@ -2104,7 +2138,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     previousGeneration = candidate.generation
     previousFence = candidate.fence
   }
-  return source as OpenCodeLaunchJournal
+  return { ...source, cleanupState: source.cleanupState ?? 'unknown' } as OpenCodeLaunchJournal
 }
 
 function validateProfileBinding(value: unknown): asserts value is OpenCodeLaunchProfileBinding {

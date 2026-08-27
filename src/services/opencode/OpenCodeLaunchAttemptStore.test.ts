@@ -1440,6 +1440,40 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     await expect(store.inspect({ ...identity, inputDigest: 'b'.repeat(64) })).rejects.toMatchObject({ code: 'corrupt' })
   })
 
+  test('persists absorbing cleanup truth and permits completion only to the generation creator', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    await store.withGeneration(exact, 'begin', async lease => {
+      expect(lease.beganGeneration).toBe(true)
+      await lease.recordCleanupState('incomplete')
+      await expect(lease.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
+    })
+    await store.withGeneration(exact, 'begin', async replay => {
+      expect(replay.beganGeneration).toBe(false)
+      expect(replay.journal.cleanupState).toBe('incomplete')
+      await expect(replay.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
+    })
+    expect((await store.inspect(exact))?.cleanupState).toBe('incomplete')
+  })
+
+  test('resets cleanup truth only for an explicit new continuation generation', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const first = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
+    const token = await store.withGeneration(first, 'begin', async lease => {
+      await lease.recordCleanupState('incomplete')
+      return lease.issueContinuation([member])
+    })
+    const second = { ...first, inputDigest: 'd'.repeat(64), generation: 2, continuationToken: token }
+    await store.withGeneration(second, 'continue', async lease => {
+      expect(lease.beganGeneration).toBe(true)
+      expect(lease.journal.cleanupState).toBe('unknown')
+      await lease.recordCleanupState('complete')
+    })
+    expect((await store.inspect(second))?.cleanupState).toBe('complete')
+  })
+
   test('two processes fence duplicate begin writers and preserve the winning journal', async () => {
     const directory = await workspaceTemp('race')
     const path = join(directory, 'attempt.json')

@@ -48,6 +48,7 @@ import type {
   OpenCodeScopedPreparedProfile,
   OpenCodeSessionRecord,
 } from './types.js'
+import type { OpenCodeHostReferenceCapability } from './OpenCodeHostManager.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import {
   OpenCodeLaunchMutationLedger,
@@ -437,6 +438,7 @@ class OpenCodeProductionLaunchRuntime {
     if (!projectIdentity) throw new Error('OpenCode canonical launch project identity is absent')
     const profiles = new Map<OpenCodeOpaqueIdentity, OpenCodeScopedPreparedProfile>()
     const hosts = new Map<OpenCodeOpaqueIdentity, OpenCodeHostHandle>()
+    const hostReferences = new Map<OpenCodeOpaqueIdentity, OpenCodeHostReferenceCapability>()
     const records = new Map<OpenCodeOpaqueIdentity, OpenCodeSessionRecord>()
     const memberOwnershipTitles = new Map<OpenCodeOpaqueIdentity, string>()
     const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord>()
@@ -540,8 +542,9 @@ class OpenCodeProductionLaunchRuntime {
       }
     }
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
+    let recoveryReference: Promise<OpenCodeHostReferenceCapability> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
-      recoveryHost ??= (async () => {
+      recoveryReference ??= (async () => {
         const authorization = this.authorizedPlans.get(command)
         if (!authorization) throw new Error('OpenCode authorized recovery profile plan is absent')
         const prepared = await prepareAuthorizedOpenCodeLaunchScopedProfile(
@@ -549,11 +552,12 @@ class OpenCodeProductionLaunchRuntime {
           { ...authorization, input: { ...authorization.input, abortSignal: preflightSignal,
             deadlineAtMs: preflightDeadlineAtMs } },
         )
-        return openCodeHostManager.ensureScopedHost({ preparedProfile: prepared,
+        return openCodeHostManager.ensureScopedHostReference({ preparedProfile: prepared,
           expectedHostKey: prepared.plannedHostKey,
           healthTimeoutMs: Math.max(1, preflightDeadlineAtMs - launchMonotonicNow()),
           abortSignal: preflightSignal })
       })()
+      recoveryHost ??= recoveryReference.then(reference => reference.handle)
       return recoveryHost
     }
     const priorClaims = await Promise.all(command.members.map(async member => {
@@ -637,9 +641,11 @@ class OpenCodeProductionLaunchRuntime {
       return { member, claim, record, linkage, reconciliationError }
     }))
     if (recoveryHost) {
-      const host = await recoveryHost.catch(() => null)
-      if (host) await bounded(openCodeHostManager.releaseHost(host.hostKey, { keepPersistentAlive: true }),
-        preflightDeadlineAtMs, preflightSignal).catch(() => undefined)
+      const reference = await recoveryReference.catch(() => null)
+      if (reference) await bounded(openCodeHostManager.releaseHostReference(reference, {
+        keepPersistentAlive: true, signal: preflightSignal,
+        remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+      }), preflightDeadlineAtMs, preflightSignal).catch(() => undefined)
     }
     const uncertain = priorClaims.some(item => item.claim?.state === 'claimed' || item.claim?.state === 'unknown'
       || item.reconciliationError !== null)
@@ -708,9 +714,10 @@ class OpenCodeProductionLaunchRuntime {
       host: {
         acquireOperationHost: async input => {
           const prepared = profileFor(input.profile)
-          const handle = await openCodeHostManager.ensureScopedHost({ preparedProfile: prepared,
+          const reference = await openCodeHostManager.ensureScopedHostReference({ preparedProfile: prepared,
             expectedHostKey: prepared.plannedHostKey,
             healthTimeoutMs: Math.max(1, input.deadlineAtMs - launchMonotonicNow()), abortSignal: input.signal })
+          const handle = reference.handle
           if (!handle.processStartedAtMs) throw new Error('OpenCode retained host birth identity is unavailable')
           const identity: OpenCodeRetainedHostIdentity = {
             hostKeyIdentity: opaque({ hostKey: handle.hostKey }), processId: handle.pid,
@@ -718,6 +725,7 @@ class OpenCodeProductionLaunchRuntime {
             profileScopeIdentity: input.profile.profileIdentity,
           }
           hosts.set(identity.hostKeyIdentity, handle)
+          hostReferences.set(identity.hostKeyIdentity, reference)
           currentSnapshot = {
             detected: true, hostHealthy: handle.state === 'healthy', projectPath: handle.projectPath,
             profile: prepared, host: handle, config: null, configProviders: null, providers: null,
@@ -726,6 +734,10 @@ class OpenCodeProductionLaunchRuntime {
           return identity
         },
         releaseOperationHost: async input => {
+          const reference = hostReferences.get(input.host.hostKeyIdentity)
+          if (!reference || reference.handle !== hostFor(input.host)) {
+            throw new Error('OpenCode operation host release capability is absent or mismatched')
+          }
           const proofSession = proofSessions.get(input.host.hostKeyIdentity)
           if (proofSession) {
             let persisted = proofSession
@@ -753,9 +765,12 @@ class OpenCodeProductionLaunchRuntime {
             }
             proofSessions.delete(input.host.hostKeyIdentity)
           }
-          await bounded(openCodeHostManager.releaseHost(hostFor(input.host).hostKey,
-            { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive() }),
+          await bounded(openCodeHostManager.releaseHostReference(reference,
+            { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive(),
+              signal: input.attemptSignal ?? input.signal,
+              remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()) }),
           input.deadlineAtMs, input.signal)
+          hostReferences.delete(input.host.hostKeyIdentity)
         },
       },
       mcp: { verifyAppMcp: async input => {

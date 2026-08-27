@@ -955,7 +955,7 @@ async function productionRecoveryHarness() {
   const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: path.join(directory, 'data'),
     profileManager: profileManager as never, sessionStore: sessionStore as never,
     clientFactory: { create: () => client } as never,
-    hostManager: { ensureScopedHost: async () => host, releaseHost: async () => {},
+    hostManager: { ensureScopedHostReference: async () => ({ handle: host }), releaseHostReference: async () => {},
       retainHostLease: async () => {} } as never,
     mcpManager: { ensureAppMcp: async () => {
       mcpCheckCount += 1

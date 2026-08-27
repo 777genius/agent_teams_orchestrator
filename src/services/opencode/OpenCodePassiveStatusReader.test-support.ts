@@ -1,3 +1,5 @@
+import { types as nodeTypes } from 'node:util'
+
 import type {
   OpenCodePassiveClock,
   OpenCodePassiveReadResult,
@@ -79,4 +81,3 @@ export function fakePorts(clock: FakePassiveClock, overrides: Record<string, any
 export async function flushMicrotasks(turns = 8) {
   for (let index = 0; index < turns; index += 1) await Promise.resolve()
 }
-import { types as nodeTypes } from 'node:util'

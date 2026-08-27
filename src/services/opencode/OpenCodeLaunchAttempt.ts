@@ -94,6 +94,8 @@ export type OpenCodeLaunchAttemptPorts = {
       host: OpenCodeRetainedHostIdentity
       deadlineAtMs: number
       signal: AbortSignal
+      /** Original attempt cancellation remains authoritative during cleanup. */
+      attemptSignal?: AbortSignal
     }): Promise<void>
   }
   mcp: {
@@ -329,7 +331,9 @@ export class OpenCodeLaunchAttempt {
               profileBinding: lease.journal.profileBinding,
               members,
             })
-            return resultFromOpenCodeDurableFinal(lease.journal.finalResponse)
+            const replay = resultFromOpenCodeDurableFinal(lease.journal.finalResponse)
+            return { ...replay,
+              cleanup: lease.journal.cleanupState === 'complete' ? 'complete' : 'timed_out' }
           }
           const recovery = await this.reconcile(
             lease.journal.events, members, committed, lease.generation,
@@ -676,6 +680,7 @@ export class OpenCodeLaunchAttempt {
                   const releaseController = new AbortController()
                   const physicalRelease = this.ports.host.releaseOperationHost({
                     host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs, signal: releaseController.signal,
+                    attemptSignal: controller.signal,
                   })
                   try {
                     await this.ports.deadline.run(
@@ -901,6 +906,18 @@ export class OpenCodeLaunchAttempt {
     acceptedProofResponse?: OpenCodeLaunchAttemptResponse,
     currentOwned: readonly OpenCodeLaunchOwnedResources[] = [],
   ): Promise<OpenCodeLaunchAttemptResult> {
+    const persistedCleanup = lease.journal.cleanupState ?? 'unknown'
+    const cleanupState = persistedCleanup === 'complete' ? 'complete'
+      : persistedCleanup === 'incomplete' ? 'incomplete'
+        : cleanup === 'complete' && lease.beganGeneration ? 'complete' : 'incomplete'
+    if (persistedCleanup === 'unknown') {
+      await lease.recordCleanupState(cleanupState, {
+        deadlineAtMs: Number.MAX_SAFE_INTEGER,
+        signal: new AbortController().signal,
+        monotonicNow: () => this.ports.clock.monotonicNow(),
+      })
+    }
+    cleanup = cleanupState === 'complete' ? 'complete' : 'timed_out'
     // Preserve the actual member/contract taxonomy. A partial roster does not turn a
     // provider or policy failure into a deadline; only the deadline path authors that code.
     const aggregateFailure = failure

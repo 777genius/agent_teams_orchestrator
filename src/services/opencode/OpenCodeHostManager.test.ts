@@ -403,16 +403,116 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     })
     try {
       const profile = scopedProfile('execution-probe')
-      const handle = await manager.ensureScopedHost({
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile,
+        expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const handle = reference.handle
+      const sharedReference = await manager.ensureScopedHostReference({
         preparedProfile: profile,
         expectedHostKey: deriveOpenCodeScopedHostKey(profile),
       })
       expect(spawnCount).toBe(1)
       expect(await pathExists(registryPath)).toBe(false)
-      await manager.releaseHost(handle.hostKey)
+      await manager.releaseHostReference(reference)
+      expect(manager.getHost(handle.hostKey)).not.toBeNull()
+      await expect(manager.releaseHostReference({ handle } as never)).rejects.toThrow('invalid')
+      await expect(manager.releaseHostReference(reference)).rejects.toThrow('already consumed')
+      await expect(new OpenCodeHostManager({ persistentRegistryPath: null })
+        .releaseHostReference(reference)).rejects.toThrow('invalid')
+      await manager.releaseHostReference(sharedReference)
+      expect(manager.getHost(handle.hostKey)).toBeNull()
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
+  })
+
+  test('fails closed when TERM exits the exact leader but descendant 507 survives force cleanup', async () => {
+    const profile = scopedProfile('execution-probe')
+    const child = createMockChildProcess(443)
+    let leaderAlive = true
+    let descendant507Alive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44111,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`unexpected scoped host request ${url}`)
+      },
+      isProcessAlive: pid => pid === 443 && leaderAlive,
+      isProcessGroupAlive: pid => pid === 443 && (leaderAlive || descendant507Alive),
+      killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    const reference = await manager.ensureScopedHostReference({
+      preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+    })
+    await expect(manager.releaseHostReference(reference)).rejects.toThrow('did not exit')
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(descendant507Alive).toBe(true)
+  })
+
+  test('never sends a post-TERM SIGKILL after the attempt aborts during observation', async () => {
+    const profile = scopedProfile('execution-probe')
+    const child = createMockChildProcess(444)
+    const controller = new AbortController()
+    let leaderAlive = true
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44112,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`unexpected scoped host request ${url}`)
+      },
+      isProcessAlive: pid => pid === 444 && leaderAlive,
+      isProcessGroupAlive: pid => pid === 444,
+      killProcess: (_pid, signal) => {
+        signals.push(signal)
+        leaderAlive = false
+        if (signal === 'SIGTERM') controller.abort(new Error('hostile cancellation'))
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    const reference = await manager.ensureScopedHostReference({
+      preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+    })
+    await expect(manager.releaseHostReference(reference, {
+      signal: controller.signal, remainingMs: () => 1_000,
+    })).rejects.toThrow('hostile cancellation')
+    expect(signals).toEqual(['SIGTERM'])
+  })
+
+  test('treats a TERM observer crossing the absolute deadline as incomplete and never force mutates', async () => {
+    const profile = scopedProfile('execution-probe')
+    const child = createMockChildProcess(445)
+    let leaderAlive = true
+    let remainingReads = 0
+    const signals: NodeJS.Signals[] = []
+    const manager = new OpenCodeHostManager({
+      allocateLoopbackPort: async () => 44113,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 445 && leaderAlive,
+      isProcessGroupAlive: pid => pid === 445,
+      killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+    const reference = await manager.ensureScopedHostReference({
+      preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+    })
+    await expect(manager.releaseHostReference(reference, {
+      remainingMs: () => ++remainingReads < 5 ? 1 : 0,
+    })).rejects.toThrow('deadline expired')
+    expect(signals).toEqual(['SIGTERM'])
   })
 
   test('writes registry v2, structurally adopts it, and preserves v1 records without adoption', async () => {

@@ -600,6 +600,7 @@ describe('OpenCodeExecutionProbe', () => {
             getMcp: async () => { throw new Error('not used') },
             createSession: async () => ({ id: 'session-1' }),
             getSession: async () => ({ id: 'session-1' }),
+            deleteSession: async () => true,
             getSessionStatus: async () => {
               if (source === 'status') {
                 throw terminalError()
@@ -656,6 +657,7 @@ describe('OpenCodeExecutionProbe', () => {
           getMcp: async () => { throw new Error('not used') },
           createSession: async () => ({ id: 'session-cleanup-timeout' }),
           getSession: async () => ({ id: 'session-cleanup-timeout' }),
+          deleteSession: async () => true,
           getSessionStatus: async () => ({}),
           getSessionMessages: async () => [],
           getSessionMessage: async () => null,

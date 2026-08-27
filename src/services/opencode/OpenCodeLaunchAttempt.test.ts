@@ -1009,6 +1009,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().events.at(-1)).toMatchObject({
       type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
     })
+    expect(subject.persistence.json().cleanupState).toBe('incomplete')
     callerDeadlineExpired = false
     subject.setNow(2)
     const restarted = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
@@ -1110,6 +1111,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.persistence.json().events.at(-1)).toMatchObject({
       type: 'cleanup', memberIdentity: members[0], outcome: 'timed_out',
     })
+    expect(subject.persistence.json().cleanupState).toBe('incomplete')
     const restarted = new OpenCodeLaunchAttempt(new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports)
     const replay = await restarted.run({
       request: request(), members: [members[0]], requestedBudgetMs: 10_000,

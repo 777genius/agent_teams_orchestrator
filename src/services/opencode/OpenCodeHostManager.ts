@@ -11,6 +11,7 @@ import { sleep } from '../../utils/sleep.js'
 import {
   killProcessTree,
   killProcessTreeAndWait,
+  isProcessTreeContainmentAlive,
   readProcessCommandLine,
   readProcessStartTimeMs,
 } from '../../utils/processKill.js'
@@ -122,6 +123,19 @@ type ManagedHostEntry = {
   createdDisposalReceipt?: CreatedHostDisposalReceipt
 }
 
+declare const openCodeHostReferenceBrand: unique symbol
+/** Manager-minted, attempt-bound authority for exactly one acquired host reference. */
+export type OpenCodeHostReferenceCapability = Readonly<{
+  handle: OpenCodeHostHandle
+  [openCodeHostReferenceBrand]: never
+}>
+
+const hostReferenceCapabilities = new WeakMap<object, {
+  manager: OpenCodeHostManager
+  entry: ManagedHostEntry
+  released: boolean
+}>()
+
 type FetchJsonResult = {
   status: number
   data: unknown
@@ -137,6 +151,7 @@ type OpenCodeHostManagerDeps = {
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
   isProcessAlive?: (pid: number) => boolean
+  isProcessGroupAlive?: (leaderPid: number) => boolean
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
@@ -152,6 +167,12 @@ type OpenCodeHostManagerDeps = {
   scopedTransportOwnerKey?: Buffer
   platform?: NodeJS.Platform
   windowsOwnerKeyProtection?: OpenCodeWindowsOwnerKeyProtection
+}
+
+type OpenCodeHostCleanupControls = {
+  signal?: AbortSignal
+  remainingMs?: () => number
+  requireStableContainment?: boolean
 }
 
 export type OpenCodeWindowsOwnerKeyProtection = {
@@ -1800,13 +1821,28 @@ export class OpenCodeHostManager {
     signal: NodeJS.Signals,
     timeoutMs: number,
     expectedStartedAtMs?: number | null,
+    requireStableContainment = false,
   ): Promise<boolean> {
     if (this.deps.killProcess) {
       this.deps.killProcess(pid, signal)
       await this.sleepMs(Math.min(timeoutMs, 250)).catch(() => undefined)
-      return !this.isProcessAlive(pid)
+      if (this.isProcessAlive(pid)) return false
+      return !requireStableContainment
+        || (this.deps.isProcessGroupAlive !== undefined && !this.deps.isProcessGroupAlive(pid))
     }
-    return killProcessTreeAndWait(pid, signal, { timeoutMs, expectedStartedAtMs })
+    const exited = await killProcessTreeAndWait(
+      pid, signal, { timeoutMs, expectedStartedAtMs })
+    return !requireStableContainment || (
+      process.platform !== 'win32' && exited
+    )
+  }
+
+  private hasStableProcessContainmentExited(pid: number): boolean {
+    if (this.deps.isProcessGroupAlive) return !this.deps.isProcessGroupAlive(pid)
+    // A fake mutation hook without a matching strong observer is deliberately
+    // unproven. Production POSIX cleanup observes the detached process group.
+    if (this.deps.killProcess) return false
+    return isProcessTreeContainmentAlive(pid) === false
   }
 
   private now(): Date {
@@ -1819,6 +1855,13 @@ export class OpenCodeHostManager {
 
   private nowIso(): string {
     return this.now().toISOString()
+  }
+
+  private assertCleanupAllowed(controls: OpenCodeHostCleanupControls): void {
+    if (controls.signal?.aborted) throwOpenCodeAbortReason(controls.signal)
+    if (controls.remainingMs && controls.remainingMs() <= 0) {
+      throw new Error('OpenCode host cleanup absolute deadline expired')
+    }
   }
 
   private async readPersistentRegistry(): Promise<PersistentHostRegistryShape> {
@@ -2897,12 +2940,14 @@ export class OpenCodeHostManager {
   private async terminateOwnedProcessHostByReceipt(
     entry: ManagedHostEntry,
     receipt: CreatedHostDisposalReceipt,
+    controls: OpenCodeHostCleanupControls = {},
   ): Promise<void> {
     const child = entry.child
     if (!child) {
       throw new Error('Owned process-scoped OpenCode host has no child process handle')
     }
 
+    this.assertCleanupAllowed(controls)
     entry.handle.state = 'disposed'
     const pid = receipt.childPid
     try {
@@ -2915,21 +2960,28 @@ export class OpenCodeHostManager {
       // Best effort.
     }
 
+    this.assertCleanupAllowed(controls)
     let terminated = this.hasOwnedChildExited(child)
+      && (!controls.requireStableContainment || (pid !== null && pid !== undefined
+        && this.deps.isProcessGroupAlive !== undefined && !this.deps.isProcessGroupAlive(pid)))
     if (!terminated) {
-      terminated = await this.killOwnedChildAndWait(
-        child,
-        'SIGTERM',
-        OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
-      )
+      terminated = controls.requireStableContainment
+        ? pid !== null && pid !== undefined && await this.killProcessAndWait(
+          pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+          receipt.record.processStartedAtMs, true)
+        : await this.killOwnedChildAndWait(
+          child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
     }
+    this.assertCleanupAllowed(controls)
     if (!terminated) {
-      terminated = await this.killOwnedChildAndWait(
-        child,
-        'SIGKILL',
-        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
-      )
+      terminated = controls.requireStableContainment
+        ? pid !== null && pid !== undefined && await this.killProcessAndWait(
+          pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
+          receipt.record.processStartedAtMs, true)
+        : await this.killOwnedChildAndWait(
+          child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
     }
+    this.assertCleanupAllowed(controls)
     if (!terminated) {
       entry.handle.state = 'degraded'
       throw new Error(
@@ -3317,6 +3369,60 @@ export class OpenCodeHostManager {
     }
   }
 
+  /**
+   * Acquires and immediately binds a one-shot opaque release capability to the
+   * exact private entry returned by ensureScopedHost. No caller-supplied flag
+   * or reconstructed host key can authorize release.
+   */
+  async ensureScopedHostReference(params: Parameters<OpenCodeHostManager['ensureScopedHost']>[0]):
+  Promise<OpenCodeHostReferenceCapability> {
+    const handle = await this.ensureScopedHost(params)
+    const entry = this.hosts.get(handle.hostKey)
+    if (!entry || entry.handle.pid !== handle.pid
+      || entry.handle.processStartedAtMs !== handle.processStartedAtMs) {
+      throw new Error('OpenCode acquired host reference changed before binding [redacted]')
+    }
+    const capability = Object.freeze({ handle }) as OpenCodeHostReferenceCapability
+    hostReferenceCapabilities.set(capability, { manager: this, entry, released: false })
+    return capability
+  }
+
+  async releaseHostReference(
+    capability: OpenCodeHostReferenceCapability,
+    options: {
+      keepPersistentAlive?: boolean
+      signal?: AbortSignal
+      remainingMs?: () => number
+    } = {},
+  ): Promise<void> {
+    const authority = hostReferenceCapabilities.get(capability)
+    if (!authority || authority.manager !== this || authority.released) {
+      throw new Error('OpenCode host reference capability is invalid or already consumed [redacted]')
+    }
+    if (options.signal?.aborted || (options.remainingMs && options.remainingMs() <= 0)) {
+      throw options.signal?.reason ?? new Error('OpenCode host reference release deadline expired')
+    }
+    // Consume before any await: retries and concurrent cleanup cannot double-release.
+    authority.released = true
+    const entry = authority.entry
+    if (this.hosts.get(entry.handle.hostKey) !== entry) {
+      throw new Error('OpenCode host reference generation changed before release [redacted]')
+    }
+    entry.refCount = Math.max(0, entry.refCount - 1)
+    if (entry.refCount !== 0) return
+    if (entry.lifetime === 'persistent' && options.keepPersistentAlive) return
+    if (entry.ownedByProcess) {
+      await this.disposeHost(entry.handle.hostKey, {
+        restoreOnFailure: false,
+        signal: options.signal,
+        remainingMs: options.remainingMs,
+        requireStableContainment: true,
+      })
+    } else if (this.hosts.get(entry.handle.hostKey) === entry) {
+      this.hosts.delete(entry.handle.hostKey)
+    }
+  }
+
   getHost(hostKey: string): OpenCodeHostHandle | null {
     const handle = this.hosts.get(hostKey)?.handle
     return handle ? frozenPublicHostHandle(handle) : null
@@ -3342,7 +3448,8 @@ export class OpenCodeHostManager {
 
   private async terminatePersistentHostRecord(
     record: PersistentHostRegistryRecord,
-    options: { force: boolean; ignoreTrackedHandle?: boolean; cleanupTempPath?: string },
+    options: { force: boolean; ignoreTrackedHandle?: boolean; cleanupTempPath?: string }
+      & OpenCodeHostCleanupControls,
   ): Promise<void> {
     const entry = options.ignoreTrackedHandle ? undefined : this.hosts.get(record.hostKey)
     const baseUrl = entry?.handle.baseUrl ?? scopedRecordBaseUrl(
@@ -3351,6 +3458,8 @@ export class OpenCodeHostManager {
     )
     const pid = entry?.handle.pid ?? record.pid
     let terminated = false
+
+    this.assertCleanupAllowed(options)
 
     const processIdentity = await this.inspectPersistentHostProcessIdentity({
       ...record,
@@ -3367,6 +3476,7 @@ export class OpenCodeHostManager {
     }
 
     if (!terminated) {
+      this.assertCleanupAllowed(options)
       try {
         await this.fetchJsonWithTimeout(
           `${baseUrl}/global/dispose`,
@@ -3381,6 +3491,7 @@ export class OpenCodeHostManager {
     }
 
     if (!terminated && pid > 0 && this.isProcessAlive(pid)) {
+      this.assertCleanupAllowed(options)
       const identityBeforeKill = await this.assertPersistentHostProcessIdentity(
         record,
         processIdentity.startedAtMs,
@@ -3393,6 +3504,7 @@ export class OpenCodeHostManager {
           'SIGTERM',
           OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
           processIdentity.startedAtMs,
+          options.requireStableContainment === true,
         )
       } else {
         terminated = await this.killProcessAndWait(
@@ -3400,12 +3512,14 @@ export class OpenCodeHostManager {
           'SIGTERM',
           OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
           processIdentity.startedAtMs,
+          options.requireStableContainment === true,
         )
       }
     } else if (!terminated && entry?.child) {
       entry.child.kill('SIGTERM')
     }
 
+    this.assertCleanupAllowed(options)
     if (options.force && pid > 0 && !terminated && this.isProcessAlive(pid)) {
       const identityBeforeForceKill = await this.assertPersistentHostProcessIdentity(
         record,
@@ -3418,7 +3532,17 @@ export class OpenCodeHostManager {
           'SIGKILL',
           OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
           processIdentity.startedAtMs,
+          options.requireStableContainment === true,
         ))
+    }
+
+    this.assertCleanupAllowed(options)
+
+    if (options.requireStableContainment && pid > 0
+      && !this.hasStableProcessContainmentExited(pid)) {
+      throw new Error(
+        `OpenCode host pid ${pid} containment remained alive or unproven after cleanup`,
+      )
     }
 
     if (pid > 0 && !terminated && this.isProcessAlive(pid)) {
@@ -3518,6 +3642,7 @@ export class OpenCodeHostManager {
   private async disposeCreatedHost(
     hostKey: string,
     entry: ManagedHostEntry,
+    controls: OpenCodeHostCleanupControls = {},
   ): Promise<void> {
     const receipt = this.assertCreatedHostDisposalReceipt(hostKey, entry)
     if (
@@ -3525,7 +3650,7 @@ export class OpenCodeHostManager {
       && !Number.isFinite(receipt.record.processStartedAtMs)
       && receipt.registryReceipt === null
     ) {
-      await this.terminateOwnedProcessHostByReceipt(entry, receipt)
+      await this.terminateOwnedProcessHostByReceipt(entry, receipt, controls)
       return
     }
 
@@ -3537,6 +3662,7 @@ export class OpenCodeHostManager {
         force: true,
         ignoreTrackedHandle: true,
         cleanupTempPath: receipt.profileTmpPath,
+        ...controls,
       })
       entry.child?.stdout?.destroy()
       entry.child?.stderr?.destroy()
@@ -3587,7 +3713,7 @@ export class OpenCodeHostManager {
 
   async disposeHost(
     hostKey: string,
-    controls: { restoreOnFailure?: boolean } = {},
+    controls: OpenCodeHostCleanupControls & { restoreOnFailure?: boolean } = {},
   ): Promise<boolean> {
     const pending = this.pendingHosts.has(hostKey)
       || this.pendingHostGenerations.has(hostKey)
@@ -3619,12 +3745,13 @@ export class OpenCodeHostManager {
     const previousDisposal = this.disposalTails.get(hostKey)?.promise
     let disposal!: Promise<void>
     disposal = Promise.resolve(previousDisposal).catch(() => undefined).then(async () => {
+      this.assertCleanupAllowed(controls)
       if (!entry.ownedByProcess && entry.adoptedRegistryReceipt) {
         await this.disposeAdoptedPersistentHost(hostKey, entry)
         return
       }
       if (entry.ownedByProcess) {
-        await this.disposeCreatedHost(hostKey, entry)
+        await this.disposeCreatedHost(hostKey, entry, controls)
         return
       }
       throw new Error('OpenCode host disposal ownership receipt is unavailable [redacted]')

@@ -4,9 +4,9 @@ import { createOpenCodePassiveCapabilityVersions, decodeOpenCodePassiveCapabilit
 
 describe('OpenCode passive capability decoder', () => {
   test('accepts only the one supported integral version', () => {
-    expect(decodeOpenCodePassiveCapabilityVersions(createOpenCodePassiveCapabilityVersions(1, 1))).toEqual({ passiveStatusContract: 1, redactedSnapshot: 1 })
+    expect(decodeOpenCodePassiveCapabilityVersions(createOpenCodePassiveCapabilityVersions(1, 1))).toEqual({ passiveStatusContract: 1, redactedSnapshot: 1, execution: 'unsupported' })
     for (const bad of [undefined, null, -1, 0, 1.5, 2, Number.NaN, '1']) {
-      expect(decodeOpenCodePassiveCapabilityVersions(createOpenCodePassiveCapabilityVersions(bad, bad))).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+      expect(decodeOpenCodePassiveCapabilityVersions(createOpenCodePassiveCapabilityVersions(bad, bad))).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
     }
   })
 
@@ -18,8 +18,8 @@ describe('OpenCode passive capability decoder', () => {
       labels: { passiveStatusContract: 1 },
       passiveStatusContract: 99,
       redactedSnapshot: { version: 1 },
-    })).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
-    expect(decodeOpenCodePassiveCapabilityVersions('malformed')).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+    })).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
+    expect(decodeOpenCodePassiveCapabilityVersions('malformed')).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
   })
 
   test('accepts canonical identifiers but rejects path, traversal, control and credential-like identifiers', () => {
@@ -38,20 +38,20 @@ describe('OpenCode passive capability decoder', () => {
 
   test('requires plain records and own inert capability fields', () => {
     const inherited = Object.create({ passiveStatusContract: 1, redactedSnapshot: 1 })
-    expect(decodeOpenCodePassiveCapabilityVersions(inherited)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+    expect(decodeOpenCodePassiveCapabilityVersions(inherited)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
     const accessor = Object.create(null)
     Object.defineProperty(accessor, 'passiveStatusContract', { get: () => 1, enumerable: true })
     Object.defineProperty(accessor, 'redactedSnapshot', { get: () => 1, enumerable: true })
-    expect(decodeOpenCodePassiveCapabilityVersions(accessor)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+    expect(decodeOpenCodePassiveCapabilityVersions(accessor)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
     const hostile = new Proxy({}, { getPrototypeOf: () => { throw new Error('hostile') } })
-    expect(decodeOpenCodePassiveCapabilityVersions(hostile)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+    expect(decodeOpenCodePassiveCapabilityVersions(hostile)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
     let traps = 0
     const forgingProxy = new Proxy({}, {
       getPrototypeOf: () => Object.prototype,
       ownKeys: () => { traps += 1; return ['passiveStatusContract', 'redactedSnapshot'] },
       getOwnPropertyDescriptor: (_target, key) => ({ value: key === 'passiveStatusContract' ? 1 : 1, enumerable: true, configurable: true }),
     })
-    expect(decodeOpenCodePassiveCapabilityVersions(forgingProxy)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0 })
+    expect(decodeOpenCodePassiveCapabilityVersions(forgingProxy)).toEqual({ passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' })
     expect(traps).toBe(0)
   })
 

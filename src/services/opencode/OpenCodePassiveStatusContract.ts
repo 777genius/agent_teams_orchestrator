@@ -77,6 +77,8 @@ export type OpenCodePassiveStatusV1 = {
 export type OpenCodePassiveCapabilityVersions = {
   passiveStatusContract: number
   redactedSnapshot: number
+  /** Passive status never authorizes or advertises active model execution. */
+  execution: 'unsupported'
 }
 
 const capabilityRecords = new WeakSet<object>()
@@ -89,6 +91,7 @@ export function createOpenCodePassiveCapabilityVersions(
   const record = Object.freeze({
     passiveStatusContract: decodeVersion(passiveStatusContract),
     redactedSnapshot: decodeVersion(redactedSnapshot),
+    execution: 'unsupported' as const,
   })
   capabilityRecords.add(record)
   return record
@@ -96,13 +99,17 @@ export function createOpenCodePassiveCapabilityVersions(
 
 /** Fail-closed additive decoder. Legacy booleans/arrays are deliberately ignored. */
 export function decodeOpenCodePassiveCapabilityVersions(value: unknown): OpenCodePassiveCapabilityVersions {
-  if (value === null || typeof value !== 'object' || !capabilityRecords.has(value)) return { passiveStatusContract: 0, redactedSnapshot: 0 }
+  if (value === null || typeof value !== 'object' || !capabilityRecords.has(value)) return unsupportedPassiveCapabilities()
   try {
     const passive = Reflect.getOwnPropertyDescriptor(value, 'passiveStatusContract')
     const snapshot = Reflect.getOwnPropertyDescriptor(value, 'redactedSnapshot')
-    if (!passive || !snapshot || !('value' in passive) || !('value' in snapshot)) return { passiveStatusContract: 0, redactedSnapshot: 0 }
-    return { passiveStatusContract: decodeVersion(passive.value), redactedSnapshot: decodeVersion(snapshot.value) }
-  } catch { return { passiveStatusContract: 0, redactedSnapshot: 0 } }
+    if (!passive || !snapshot || !('value' in passive) || !('value' in snapshot)) return unsupportedPassiveCapabilities()
+    return { passiveStatusContract: decodeVersion(passive.value), redactedSnapshot: decodeVersion(snapshot.value), execution: 'unsupported' }
+  } catch { return unsupportedPassiveCapabilities() }
+}
+
+function unsupportedPassiveCapabilities(): OpenCodePassiveCapabilityVersions {
+  return { passiveStatusContract: 0, redactedSnapshot: 0, execution: 'unsupported' }
 }
 
 function decodeVersion(value: unknown): number {

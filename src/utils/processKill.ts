@@ -239,6 +239,38 @@ async function waitForProcessExit(
   return !isProcessAlive(pid)
 }
 
+function isPosixProcessGroupAlive(groupLeaderPid: number): boolean {
+  try {
+    process.kill(-groupLeaderPid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Returns whether the owned containment unit is alive, or null when this
+ * platform cannot strongly observe descendants after their leader exits.
+ */
+export function isProcessTreeContainmentAlive(groupLeaderPid: number): boolean | null {
+  if (!Number.isInteger(groupLeaderPid) || groupLeaderPid <= 0) return false
+  if (process.platform === 'win32') return null
+  return isPosixProcessGroupAlive(groupLeaderPid)
+}
+
+async function waitForPosixProcessGroupExit(
+  groupLeaderPid: number,
+  timeoutMs: number,
+  pollMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isPosixProcessGroupAlive(groupLeaderPid)) return true
+    await new Promise(resolve => setTimeout(resolve, pollMs))
+  }
+  return !isPosixProcessGroupAlive(groupLeaderPid)
+}
+
 export async function killProcessTreeAndWait(
   pid: number | undefined,
   signal: NodeJS.Signals = 'SIGTERM',
@@ -275,11 +307,18 @@ export async function killProcessTreeAndWait(
     return waitForProcessExit(pid, timeoutMs, pollMs)
   }
 
-  try {
-    process.kill(pid, signal)
-  } catch {
-    return !isProcessAlive(pid)
+  if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null) {
+    const currentStartedAtMs = await readProcessStartTimeMs(pid)
+    if (currentStartedAtMs !== options.expectedStartedAtMs) return false
   }
 
-  return waitForProcessExit(pid, timeoutMs, pollMs)
+  try {
+    // Managed POSIX hosts are detached process-group leaders. Observe the
+    // entire exact group; leader exit alone is never cleanup proof.
+    process.kill(-pid, signal)
+  } catch {
+    return !isPosixProcessGroupAlive(pid) && !isProcessAlive(pid)
+  }
+
+  return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs)
 }
