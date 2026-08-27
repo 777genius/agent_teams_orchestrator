@@ -101,6 +101,8 @@ export type OpenCodeLaunchAttemptPorts = {
     }): Promise<OpenCodeRetainedHostIdentity>
     releaseOperationHost(input: {
       host: OpenCodeRetainedHostIdentity
+      /** Exact acquisition obligation authorizing this release, even when a generation has predecessors. */
+      cleanupObligationId?: string
       deadlineAtMs: number
       signal: AbortSignal
       /** The acquisition settled after the caller envelope closed. Physical cleanup owns a private bound. */
@@ -502,6 +504,7 @@ export class OpenCodeLaunchAttempt {
                     const lateReleaseController = new AbortController()
                     const physicalRelease = this.ports.host.releaseOperationHost({
                       host: candidate,
+                      ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
                       deadlineAtMs: policy.absoluteDeadlineAtMs,
                       signal: lateReleaseController.signal,
                       lateSettlement: true,
@@ -804,7 +807,9 @@ export class OpenCodeLaunchAttempt {
                 releaseHostChain = (async () => {
                   const releaseController = new AbortController()
                   const physicalRelease = this.ports.host.releaseOperationHost({
-                    host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs, signal: releaseController.signal,
+                    host: host!,
+                    ...(hostCleanupObligationId ? { cleanupObligationId: hostCleanupObligationId } : {}),
+                    deadlineAtMs: policy.absoluteDeadlineAtMs, signal: releaseController.signal,
                   })
                   try {
                     await this.ports.deadline.run(

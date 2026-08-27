@@ -443,7 +443,9 @@ describe('OpenCode production launch composition', () => {
       const lateLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
         `${lateValue.request.launchAttempt.attemptId}.host-release.json`))
       let lateReceipt = null
-      for (let attempt = 0; attempt < 100; attempt += 1) {
+      // The production private settlement is bounded at five seconds. Observe
+      // that existing bound without changing any behavioral timeout.
+      for (let attempt = 0; attempt < 250; attempt += 1) {
         lateReceipt = await lateLedger.read({ attemptId: lateValue.request.launchAttempt.attemptId,
           payloadHash: lateValue.request.launchAttempt.payloadHash, generation: 1 }).catch(() => null)
         if (lateReceipt?.releaseState === 'complete') break
@@ -518,6 +520,9 @@ describe('OpenCode production launch composition', () => {
         .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
       const blockedReplay = await createBridge().execute(failedValue)
       expect(blockedReplay.data?.launchAttempt).toEqual(failed.data?.launchAttempt)
+      expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
+        payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
+        .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
       const failedPidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n').slice(6)
       expect(failedPidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
@@ -532,24 +537,108 @@ describe('OpenCode production launch composition', () => {
       expect(await failedLedger.read({ attemptId: failedValue.request.launchAttempt.attemptId,
         payloadHash: failedValue.request.launchAttempt.payloadHash, generation: 1 }))
         .toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
+
+      // Crash after a second real native acquisition publishes its receipt,
+      // then present a changed/recycled birth token to the restarted production
+      // bridge. The real HostManager must reject the changed generation before
+      // any containment mutation and leave the exact obligation pending.
+      await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
+      const changedValue = structuredClone(value)
+      changedValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee999999'
+      changedValue.request.launchAttempt.payloadHash = '9'.repeat(64)
+      changedValue.request.launchAttempt.proofNonce = 'BQUFBQUFBQUFBQUFBQUFBQ'
+      changedValue.request.launchAttempt.parent = {
+        sessionIdentity: identity('8'), messageIdentity: identity('9'),
+      }
+      changedValue.members = [{ name: 'changed-native', memberIdentity: identity('9') }]
+      changedValue.preconditions.idempotencyKey = changedValue.request.launchAttempt.attemptId
+      changedValue.preconditions.commandLeaseId = 'lease-changed-native'
+      changedValue.request.launchAttempt.requestCorrelationDigest =
+        computeOpenCodeLaunchRequestCorrelationDigest(changedValue)
+      const changedOwningManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      const crashingChangedManager = new Proxy(changedOwningManager, {
+        get(target, property, receiver) {
+          if (property === 'reconcileHostReleaseReceipt') return async () => {
+            throw new Error('deterministic crash before Linux containment release')
+          }
+          const member = Reflect.get(target, property, receiver)
+          return typeof member === 'function' ? member.bind(target) : member
+        },
+      })
+      const changedBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
+        profileManager, sessionStore, hostManager: crashingChangedManager,
+        mcpManager: disconnectedMcp as never })
+      const changedResult = await changedBridge.execute(changedValue)
+      const changedLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+        'launch-attempts', `${changedValue.request.launchAttempt.attemptId}.host-release.json`))
+      const originalChangedReceipt = await changedLedger.read({
+        attemptId: changedValue.request.launchAttempt.attemptId,
+        payloadHash: changedValue.request.launchAttempt.payloadHash, generation: 1,
+      })
+      expect(originalChangedReceipt).toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
+      const recycledReceipt = { ...originalChangedReceipt!, receipt: {
+        ...originalChangedReceipt!.receipt,
+        processBirthToken: 'linux:changed-recycled-native-generation',
+      } }
+      await changedLedger.record(recycledReceipt)
+      const changedReplay = await createBridge().execute(changedValue)
+      expect(changedReplay.data?.launchAttempt).toEqual(changedResult.data?.launchAttempt)
+      expect(await changedLedger.read({ attemptId: changedValue.request.launchAttempt.attemptId,
+        payloadHash: changedValue.request.launchAttempt.payloadHash, generation: 1 }))
+        .toMatchObject({ receipt: { processBirthToken: 'linux:changed-recycled-native-generation' },
+          releaseState: 'pending' })
+      await changedOwningManager.reconcileHostReleaseReceipt(originalChangedReceipt!.receipt)
       } else {
-        // The production bridge above proved the complete acquisition and
-        // native launcher chain. Now keep one real launcher/job receipt pending
-        // across a HostManager restart: without the owning handle, Windows
-        // must fail closed and issue no PID-only tree mutation.
+        // Crash at the exact boundary after the real production bridge has
+        // acquired through the native launcher/job and durably published its
+        // receipt/disposition, but before the owning manager closes the job.
+        // A restarted bridge/ledger/HostManager path has no owned handle and
+        // therefore must keep the receipt pending without PID-only taskkill.
         await writeFile(path.join(data, 'static-host-fixture.mode'), '\n')
-        const prepared = await profileManager.prepareScopedProfile(
-          current, profileManager.planScopedProfile(current),
-        )
+        const windowsValue = structuredClone(value)
+        windowsValue.request.launchAttempt.attemptId = '018f47a2-4a13-7c2f-8d44-c0ffee888888'
+        windowsValue.request.launchAttempt.payloadHash = '8'.repeat(64)
+        windowsValue.request.launchAttempt.proofNonce = 'BAQEBAQEBAQEBAQEBAQEBA'
+        windowsValue.request.launchAttempt.parent = {
+          sessionIdentity: identity('7'), messageIdentity: identity('8'),
+        }
+        windowsValue.members = [{ name: 'windows-restart', memberIdentity: identity('8') }]
+        windowsValue.preconditions.idempotencyKey = windowsValue.request.launchAttempt.attemptId
+        windowsValue.preconditions.commandLeaseId = 'lease-windows-restart'
+        windowsValue.request.launchAttempt.requestCorrelationDigest =
+          computeOpenCodeLaunchRequestCorrelationDigest(windowsValue)
         const owningManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
-        const reference = await owningManager.ensureScopedHostReference({
-          preparedProfile: prepared, expectedHostKey: prepared.plannedHostKey,
+        let crashBoundaryCalls = 0
+        const crashingManager = new Proxy(owningManager, {
+          get(target, property, receiver) {
+            if (property === 'reconcileHostReleaseReceipt') return async () => {
+              crashBoundaryCalls += 1
+              throw new Error('deterministic crash before native job close')
+            }
+            const member = Reflect.get(target, property, receiver)
+            return typeof member === 'function' ? member.bind(target) : member
+          },
         })
-        const restartReceipt = owningManager.hostReleaseReceipt(reference)
-        const restartedManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
-        await expect(restartedManager.reconcileHostReleaseReceipt(restartReceipt))
-          .rejects.toThrow('cleanup remains incomplete')
-        await owningManager.releaseHostReference(reference)
+        const crashedBridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: data,
+          profileManager, sessionStore, hostManager: crashingManager,
+          mcpManager: disconnectedMcp as never })
+        const crashed = await crashedBridge.execute(windowsValue)
+        expect(crashBoundaryCalls).toBe(1)
+        const windowsLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+          'launch-attempts', `${windowsValue.request.launchAttempt.attemptId}.host-release.json`))
+        const pending = await windowsLedger.read({
+          attemptId: windowsValue.request.launchAttempt.attemptId,
+          payloadHash: windowsValue.request.launchAttempt.payloadHash, generation: 1,
+        })
+        expect(pending).toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
+        const restarted = await createBridge().execute(windowsValue)
+        expect(restarted.data?.launchAttempt).toEqual(crashed.data?.launchAttempt)
+        expect(await windowsLedger.read({ attemptId: windowsValue.request.launchAttempt.attemptId,
+          payloadHash: windowsValue.request.launchAttempt.payloadHash, generation: 1 }))
+          .toMatchObject({ disposition: 'dispose', releaseState: 'pending' })
+        // Teardown retains the original owning manager solely to close the
+        // deterministic fixture job after the restart assertions.
+        await owningManager.reconcileHostReleaseReceipt(pending!.receipt)
       }
     } finally {
       restoreEnvironment()

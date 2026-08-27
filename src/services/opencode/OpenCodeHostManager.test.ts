@@ -1555,6 +1555,62 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     }
   })
 
+  test('retains a structurally valid foreign scoped tombstone until stable Linux containment is empty', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-foreign-tombstone-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const hostKey = deriveOpenCodeScopedHostKey(profile)
+    const ownerKey = Buffer.alloc(32, 7)
+    try {
+      const creator = new OpenCodeHostManager({
+        allocateLoopbackPort: async () => 44501,
+        spawnHostProcess: () => createMockChildProcess(44501).child,
+        fetchJson: async () => ({ status: 200, data: { healthy: true, version: 'static' } }),
+        isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => 1_000,
+        persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: ownerKey,
+      })
+      await creator.ensureScopedHost({ preparedProfile: profile, expectedHostKey: hostKey })
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { scopedIdentity: { providerFingerprint: string } }>
+      }
+      registry.hosts[hostKey]!.scopedIdentity.providerFingerprint = 'f'.repeat(64)
+      await writeFile(registryPath, `${JSON.stringify(registry)}\n`, { mode: 0o600 })
+      const foreignBytes = await readFile(registryPath, 'utf8')
+
+      let spawnCount = 0
+      const blocked = new OpenCodeHostManager({
+        platform: 'linux', persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: () => true, isProcessGroupAlive: () => true,
+        spawnHostProcess: () => { spawnCount += 1; return createMockChildProcess(44502).child },
+      })
+      await expect(blocked.ensureScopedHost({ preparedProfile: profile, expectedHostKey: hostKey }))
+        .rejects.toThrow('startup failed [redacted]')
+      expect(spawnCount).toBe(0)
+      expect(await readFile(registryPath, 'utf8')).toBe(foreignBytes)
+
+      const safeReplacement = new OpenCodeHostManager({
+        platform: 'linux', persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: () => false, isProcessGroupAlive: () => false,
+        allocateLoopbackPort: async () => 44502,
+        spawnHostProcess: () => { spawnCount += 1; return createMockChildProcess(44502).child },
+        fetchJson: async () => ({ status: 200, data: { healthy: true, version: 'static' } }),
+        readProcessStartTimeMs: async () => 2_000,
+      })
+      const replacement = await safeReplacement.ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })
+      expect(replacement.pid).toBe(44502)
+      expect(spawnCount).toBe(1)
+      const replaced = JSON.parse(await readFile(registryPath, 'utf8'))
+      expect(replaced.hosts[hostKey].scopedIdentity.providerFingerprint)
+        .toBe(buildOpenCodeScopedHostIdentity(profile).providerFingerprint)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('preserves null and primitive legacy records opaquely through v2 mutation', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-null-legacy-'))
     const registryPath = path.join(tempDir, 'registry.json')
@@ -2966,7 +3022,16 @@ describe('OpenCodeHostManager', () => {
     expect(manager.getHost(old.hostKey)?.pid).toBe(old.pid)
     expect(disposeUrls).toEqual(['http://127.0.0.1:43134/global/dispose'])
     expect(stuck.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    // A concurrent ensure after the rejected disposal must retain the original
+    // catalog/probe entry. It may add a reference, but it cannot manufacture a
+    // replacement generation and strand the original release authority.
+    const concurrent = await manager.ensureHost({ hostKey: old.hostKey, hostLifetime: 'process' })
+    expect(concurrent.pid).toBe(old.pid)
+    expect(spawnCount).toBe(1)
     Object.assign(stuck.child, { exitCode: 0 })
+    // Retry the original release, then release the concurrent reference. The
+    // physical retry must still target the exact original endpoint.
+    await manager.releaseHost(old.hostKey)
     await manager.releaseHost(old.hostKey)
     expect(disposeUrls).toEqual([
       'http://127.0.0.1:43134/global/dispose',

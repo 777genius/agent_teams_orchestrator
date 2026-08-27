@@ -121,6 +121,38 @@ test('attempt host release ledger preserves every generation and prepublished ac
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('attempt host release ledger updates only the exact obligation when one generation has multiple receipts', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-same-generation-'))
+  const file = path.join(directory, 'receipt.json')
+  const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
+    payloadHash: 'b'.repeat(64), generation: 1 }
+  try {
+    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const predecessor = await ledger.reserve({ ...expected, hostKeyIdentity: identity })
+    const current = await ledger.reserve({ ...expected, hostKeyIdentity: identity })
+    const predecessorReceipt = { ...predecessor, disposition: 'dispose' as const,
+      releaseState: 'complete' as const, receipt: { schemaVersion: 1 as const,
+        receiptId: '123e4567-e89b-42d3-a456-426614174451', hostKeyDigest: 'c'.repeat(64),
+        pid: 451, processStartedAtMs: 1_451, lifetime: 'process' as const } }
+    const currentReceipt = { ...current, receipt: { schemaVersion: 1 as const,
+      receiptId: '123e4567-e89b-42d3-a456-426614174452', hostKeyDigest: 'd'.repeat(64),
+      pid: 452, processStartedAtMs: 1_452, lifetime: 'process' as const } }
+    await ledger.record(predecessorReceipt)
+    await ledger.record(currentReceipt)
+
+    await expect(ledger.read(expected)).rejects.toThrow('ambiguous')
+    expect(await ledger.readObligation({ ...expected, obligationId: current.obligationId }))
+      .toEqual(currentReceipt)
+    const completedCurrent = { ...currentReceipt, disposition: 'dispose' as const,
+      releaseState: 'complete' as const }
+    await ledger.record(completedCurrent)
+    expect(await ledger.readObligation({ ...expected, obligationId: predecessor.obligationId }))
+      .toEqual(predecessorReceipt)
+    expect(await ledger.readObligation({ ...expected, obligationId: current.obligationId }))
+      .toEqual(completedCurrent)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('attempt host release ledger fences a foreign legacy slot before capability reconciliation', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-foreign-legacy-'))
   const file = path.join(directory, 'receipt.json')
@@ -261,8 +293,10 @@ test('production authority continues member 1 committed/member 2 proven failure 
     const firstDigest = 'd'.repeat(64)
     const secondDigest = 'e'.repeat(64)
     const secondMember = `sha256:${'5'.repeat(64)}` as OpenCodeOpaqueIdentity
+    // Keep the journal below its two mutable namespace levels so the retained
+    // authority root is this disposable fixture, never the filesystem root.
     const store = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(
-      path.join(directory, 'attempt.journal')))
+      path.join(directory, 'launch-attempts', 'attempt.journal')))
     const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
     const targetOne = OpenCodeLaunchMutationLedger.targetDigest({
       teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: identity,

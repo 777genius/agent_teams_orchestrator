@@ -264,6 +264,8 @@ type PersistentHostRegistryRecord = {
   coordinationProtectedUntil?: string
   leases?: Record<string, PersistentHostLeaseRecord>
   scopedIdentity?: OpenCodeScopedHostIdentity
+  /** Digest binding the complete scoped identity to this exact registry key. */
+  scopedIdentityBinding?: string
   scopedTransportToken?: string
 }
 
@@ -403,6 +405,22 @@ export type OpenCodeScopedHostIdentity = {
   policyFingerprint: string
   profileLayoutFingerprint: string
   generation: string
+}
+
+function scopedHostIdentityBinding(
+  hostKey: string,
+  identity: OpenCodeScopedHostIdentity,
+): string {
+  return hashText(canonicalSerializeOpenCodePolicyIdentity({
+    schema: 'opencode-scoped-registry-binding-v1',
+    hostKey,
+    identity,
+  }))
+}
+
+function hasExactScopedHostIdentityBinding(record: PersistentHostRegistryRecord): boolean {
+  return record.scopedIdentity !== undefined
+    && record.scopedIdentityBinding === scopedHostIdentityBinding(record.hostKey, record.scopedIdentity)
 }
 
 type PersistentHostProcessIdentity = {
@@ -888,7 +906,8 @@ function assertValidV2RegistryRecord(
     const allowedRecordKeys = [
       'coordinationProtectedUntil', 'hostKey', 'leases', 'managedConfigFingerprint',
       'pid', 'port', 'processBirthToken', 'processStartedAtMs', 'profileRootKey', 'projectBehaviorFingerprint',
-      'resolvedConfigFingerprint', 'scopedIdentity', 'scopedTransportToken', 'updatedAt', 'version',
+      'resolvedConfigFingerprint', 'scopedIdentity', 'scopedIdentityBinding', 'scopedTransportToken',
+      'updatedAt', 'version',
     ]
     if (Object.keys(record).some(key => !allowedRecordKeys.includes(key))) fail()
     const identity = record.scopedIdentity as unknown as Record<string, unknown>
@@ -921,6 +940,8 @@ function assertValidV2RegistryRecord(
       || record.projectPath !== undefined
       || record.baseUrl !== undefined
       || !isNonblankString(record.scopedTransportToken)
+      || (record.scopedIdentityBinding !== undefined
+        && !/^[a-f0-9]{64}$/.test(record.scopedIdentityBinding))
       || !Object.prototype.hasOwnProperty.call(record, 'processStartedAtMs')
       || !Object.prototype.hasOwnProperty.call(record, 'resolvedConfigFingerprint')
       || !Object.prototype.hasOwnProperty.call(record, 'coordinationProtectedUntil')
@@ -2195,6 +2216,9 @@ export class OpenCodeHostManager {
             handle.hostKey, handle.port, this.scopedTransportOwnerKey,
           ),
           scopedIdentity: buildOpenCodeScopedHostIdentity(handle.profile),
+          scopedIdentityBinding: scopedHostIdentityBinding(
+            handle.hostKey, buildOpenCodeScopedHostIdentity(handle.profile),
+          ),
         }
       : { ...common, projectPath: handle.projectPath, baseUrl: handle.baseUrl }
   }
@@ -2354,7 +2378,25 @@ export class OpenCodeHostManager {
         // run process-locally, but it must never normalize or migrate v1 bytes.
         return null
       }
-      const previous: PersistentHostRegistryRecord | undefined = registry.hosts[handle.hostKey]
+      let previous: PersistentHostRegistryRecord | undefined = registry.hosts[handle.hostKey]
+      const expectedScopedIdentity = isScopedPreparedProfile(handle.profile)
+        ? buildOpenCodeScopedHostIdentity(handle.profile) : null
+      if (previous && expectedScopedIdentity && (
+        !hasExactScopedHostIdentityBinding(previous)
+        || canonicalSerializeOpenCodePolicyIdentity(previous.scopedIdentity)
+          !== canonicalSerializeOpenCodePolicyIdentity(expectedScopedIdentity)
+      )) {
+        // A structurally valid record in this key slot is still foreign unless
+        // its complete identity is cryptographically bound to the key. Never
+        // overwrite the only durable containment tombstone. Linux may discard
+        // it solely after a complete stable containment scan proves emptiness;
+        // all other platforms and observer uncertainty fail closed.
+        if (!this.persistentContainmentExited(previous.pid)) {
+          throw new Error('OpenCode foreign scoped host tombstone containment is unresolved [redacted]')
+        }
+        delete registry.hosts[handle.hostKey]
+        previous = undefined
+      }
       if (generation) this.assertStartupCurrent(handle.hostKey, generation, abortSignal)
       const written = this.buildPersistentHostRecord(handle, previous)
       registry.hosts[handle.hostKey] = written
@@ -2625,16 +2667,6 @@ export class OpenCodeHostManager {
       if (registry.schemaVersion !== 2) return null
       const record = registry.hosts[hostKey]
       if (!record) return null
-      if (record.scopedIdentity
-        && record.resolvedConfigFingerprint !== record.scopedIdentity.managedConfigFingerprint) {
-        return null
-      }
-      if (isScopedPreparedProfile(profile) && (
-        !record.scopedIdentity ||
-        canonicalSerializeOpenCodePolicyIdentity(record.scopedIdentity)
-          !== canonicalSerializeOpenCodePolicyIdentity(buildOpenCodeScopedHostIdentity(profile))
-      )) return null
-
       const removeStaleRecord = async (): Promise<void> => {
         if (registry.hosts[hostKey] !== record) return
         delete registry.hosts[hostKey]
@@ -2644,13 +2676,29 @@ export class OpenCodeHostManager {
           await this.unlinkPersistentRegistryUnlocked().catch(() => undefined)
         }
       }
+      const rejectForeignUnlessContainmentEmpty = async (): Promise<null> => {
+        if (!this.persistentContainmentExited(record.pid)) {
+          throw new Error('OpenCode foreign scoped host tombstone containment is unresolved [redacted]')
+        }
+        await removeStaleRecord()
+        return null
+      }
+      if (record.scopedIdentity
+        && record.resolvedConfigFingerprint !== record.scopedIdentity.managedConfigFingerprint) {
+        return rejectForeignUnlessContainmentEmpty()
+      }
+      if (isScopedPreparedProfile(profile) && (
+        !record.scopedIdentity ||
+        !hasExactScopedHostIdentityBinding(record) ||
+        canonicalSerializeOpenCodePolicyIdentity(record.scopedIdentity)
+          !== canonicalSerializeOpenCodePolicyIdentity(buildOpenCodeScopedHostIdentity(profile))
+      )) return rejectForeignUnlessContainmentEmpty()
       if (
         record.profileRootKey !== profile.profileRootKey ||
         record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint ||
         record.managedConfigFingerprint !== profile.managedConfigFingerprint
       ) {
-        await removeStaleRecord()
-        return null
+        return rejectForeignUnlessContainmentEmpty()
       }
       if (!this.isProcessAlive(record.pid)) {
         if (!this.persistentContainmentExited(record.pid)) {
@@ -3331,7 +3379,9 @@ export class OpenCodeHostManager {
         'complete', error, undefined,
         abortSignal?.aborted && abortSignal.reason instanceof Error
           ? abortSignal.reason.message
-          : `${message}${diagnosticSuffix}`,
+          : isScopedPreparedProfile(profile)
+            ? 'OpenCode scoped host startup failed [redacted]'
+            : `${message}${diagnosticSuffix}`,
       )
     }
   }
@@ -4260,7 +4310,8 @@ export class OpenCodeHostManager {
       // compare-and-swap. Zero-ref release opts out: such an entry must never
       // become reusable after disposal has begun.
       if (controls.restoreOnFailure !== false
-        && !this.hosts.has(hostKey) && !this.pendingHosts.has(hostKey)) {
+        && (this.hosts.get(hostKey) === entry || !this.hosts.has(hostKey))
+        && !this.pendingHosts.has(hostKey)) {
         if (!Object.isFrozen(entry.handle)) entry.handle.state = previousState
         this.hosts.set(hostKey, entry)
       }

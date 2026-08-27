@@ -1504,10 +1504,14 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
   test('releases the exact acquired host with a live cleanup context after pre-proof MCP failure', async () => {
     const subject = setup()
     let released: OpenCodeRetainedHostIdentity | undefined
+    let releasedObligationId: string | undefined
     let cleanupSignal: AbortSignal | undefined
+    const exactObligationId = '77777777-7777-4777-8777-777777777777'
+    subject.ports.host.reserveOperationHostCleanup = async () => exactObligationId
     subject.ports.mcp.verifyAppMcp = async () => { throw new Error('fake MCP configuration failure') }
     subject.ports.host.releaseOperationHost = async input => {
       released = input.host
+      releasedObligationId = input.cleanupObligationId
       cleanupSignal = input.signal
       subject.calls.push('release')
     }
@@ -1516,6 +1520,7 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     })
     expect(result.status).toBe('failed')
     expect(released).toEqual(host)
+    expect(releasedObligationId).toBe(exactObligationId)
     expect(cleanupSignal?.aborted).toBe(false)
     expect(subject.calls.some(call => call.startsWith('create:'))).toBe(false)
   })

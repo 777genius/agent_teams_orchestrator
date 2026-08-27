@@ -209,6 +209,20 @@ export class OpenCodeLaunchHostReleaseLedger {
     return records[0] ?? null
   }
 
+  async readObligation(expected: Pick<OpenCodeLaunchHostReleaseRecord,
+  'attemptId' | 'payloadHash' | 'generation' | 'obligationId'>,
+  context?: OpenCodeLaunchHostLedgerContext): Promise<OpenCodeLaunchHostReleaseRecord | null> {
+    const records = await this.readAll(expected, context)
+    const exact = records.filter((record): record is OpenCodeLaunchHostReleaseRecord =>
+      record.generation === expected.generation
+      && record.obligationId === expected.obligationId
+      && record.receipt !== null)
+    if (exact.length > 1) {
+      throw new Error('OpenCode launch host release obligation conflicts [redacted]')
+    }
+    return exact[0] ?? null
+  }
+
   async readPending(expected: Pick<OpenCodeLaunchHostReleaseRecord, 'attemptId' | 'payloadHash'> & {
     currentGeneration: number
   }, context?: OpenCodeLaunchHostLedgerContext): Promise<OpenCodeLaunchHostReleaseRecord | null> {
@@ -1230,10 +1244,14 @@ class OpenCodeProductionLaunchRuntime {
             : { deadlineAtMs: input.deadlineAtMs, signal: input.signal }
           const physicalReleaseDeadlineAtMs = input.lateSettlement
             ? lateSettlementStartedAtMs! + 5_000 : settlementContext.deadlineAtMs
-          const releaseRecord = await hostReleaseLedger.read({
+          if (!input.cleanupObligationId) {
+            throw new Error('OpenCode operation host release obligation is absent')
+          }
+          const releaseRecord = await hostReleaseLedger.readObligation({
             attemptId: command.request.launchAttempt.attemptId,
             payloadHash: command.request.launchAttempt.payloadHash,
             generation: command.request.launchAttempt.generation,
+            obligationId: input.cleanupObligationId,
           }, settlementContext)
           if (!releaseRecord || releaseRecord.hostKeyIdentity !== input.host.hostKeyIdentity) {
             throw new Error('OpenCode operation host release receipt is absent or mismatched')
