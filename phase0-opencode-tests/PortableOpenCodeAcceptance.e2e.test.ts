@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -157,7 +157,7 @@ describe('portable fake evidence through production OpenCode composers', () => {
       import('../src/services/opencode/OpenCodeProjectIdentity.js'),
       import('../src/services/opencode/OpenCodePlanScopedProfile.js'),
     ])
-    const sandbox = await mkdtemp(path.join(os.tmpdir(), 'opencode-production-launch-'))
+    const sandbox = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-production-launch-')))
     const journal = new MemoryJournal()
     const calls: string[] = []
     let now = 0
@@ -379,6 +379,7 @@ describe('portable fake evidence through production OpenCode composers', () => {
         return { output: { snapshot, data: { launchAttempt: result } }, result }
       },
     }, { monotonicNow: () => now })
+    expect(sandbox).toBe(await realpath(sandbox))
     try {
       const first = await bridge.execute(command())
       if ((first.data as { launchAttempt: { status: string } }).launchAttempt.status !== 'succeeded') {
