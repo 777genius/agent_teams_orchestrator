@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { accessSync, constants as fsConstants } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { createConnection } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -39,8 +40,14 @@ const result: OpenCodeLaunchAttemptResult = {
   workDeadlineAtMs: 9_000,
 }
 const nativePidRecycleRequired = process.env.OPENCODE_REQUIRE_NATIVE_PID_RECYCLE === '1'
+const pidNamespaceSupervisorSocket = process.env.OPENCODE_PID_NAMESPACE_SUPERVISOR_SOCKET
+const nativePidRecycleHeaderLength = 16
+const maxNativePidRecycleDataHomeLength = 4096
 const canExerciseNativePidRecycle = process.platform !== 'linux' || (nativePidRecycleRequired && (() => {
-  try { accessSync('/proc/sys/kernel/ns_last_pid', fsConstants.W_OK); return true } catch { return false }
+  try {
+    accessSync('/proc/sys/kernel/ns_last_pid', fsConstants.W_OK)
+    return typeof pidNamespaceSupervisorSocket === 'string' && pidNamespaceSupervisorSocket.length > 0
+  } catch { return false }
 })())
 if (nativePidRecycleRequired && !canExerciseNativePidRecycle) {
   throw new Error('mandatory Linux native PID-recycle authority is unavailable')
@@ -48,6 +55,36 @@ if (nativePidRecycleRequired && !canExerciseNativePidRecycle) {
 let projectPath = ''
 beforeAll(async () => { projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-composition-')) })
 afterAll(async () => { await rm(projectPath, { recursive: true, force: true }) })
+
+function requestExactNativePidRecycle(leaderPid: number, grandchildPid: number,
+  dataHome: string): Promise<number> {
+  if (!pidNamespaceSupervisorSocket) throw new Error('PID namespace supervisor socket is absent')
+  const data = Buffer.from(dataHome)
+  if (data.length === 0 || data.length > maxNativePidRecycleDataHomeLength) {
+    throw new Error(`PID namespace supervisor data home has invalid byte length ${data.length}`)
+  }
+  const request = Buffer.allocUnsafe(nativePidRecycleHeaderLength + data.length)
+  request.write('OPCR', 0, 'ascii')
+  request.writeUInt32BE(leaderPid, 4)
+  request.writeUInt32BE(grandchildPid, 8)
+  request.writeUInt32BE(data.length, 12)
+  data.copy(request, nativePidRecycleHeaderLength)
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(pidNamespaceSupervisorSocket)
+    let response = ''
+    socket.setEncoding('utf8')
+    // Keep the readable side open: the supervisor replies and closes after it
+    // has read exactly the length-prefixed request, without waiting for EOF.
+    socket.on('connect', () => socket.write(request))
+    socket.on('data', chunk => { response += chunk })
+    socket.once('error', reject)
+    socket.once('end', () => {
+      const match = response.match(/^OK ([0-9]+)\n$/)
+      if (!match) reject(new Error(`PID namespace supervisor rejected recycle: ${response.trim()}`))
+      else resolve(Number(match[1]))
+    })
+  })
+}
 
 function command(): Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] {
   const value: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
@@ -746,7 +783,6 @@ describe('OpenCode production launch composition', () => {
       child.once('exit', code => code === 0 ? resolve()
         : reject(new Error(`restart fixture ${phase} exited ${code}: ${output}`)))
     })
-    let recycledLeader: ReturnType<typeof spawn> | null = null
     let recycledLeaderBirthToken: string | null = null
     try {
       await Promise.all([mkdir(project), mkdir(userHome)])
@@ -766,6 +802,7 @@ describe('OpenCode production launch composition', () => {
         .trim().split('\n')
       const leaderPid = Number(pidLines.find(line => line.startsWith('child:'))!.split(':')[1])
       const grandchildPid = Number(pidLines.find(line => line.startsWith('grandchild:'))!.split(':')[1])
+      expect(leaderPid).toBe(acquired.pid)
 
       if (process.platform === 'linux') {
         process.kill(leaderPid, 'SIGKILL')
@@ -776,16 +813,9 @@ describe('OpenCode production launch composition', () => {
         for (let attempt = 0; attempt < 200 && isProcessAlive(grandchildPid); attempt += 1) {
           await Bun.sleep(10)
         }
-        // This test runs inside the CI pid namespace. Setting ns_last_pid and
-        // spawning the static holder produces a real recycled kernel PID with
-        // a different /proc starttime; no receipt or registry bytes are edited.
-        await writeFile('/proc/sys/kernel/ns_last_pid', String(leaderPid - 1))
-        recycledLeader = spawn(fixtureBinary, ['--static-recycled-leader'], {
-          detached: true, stdio: 'ignore', env: { ...process.env,
-            CLAUDE_MULTIMODEL_DATA_HOME: data },
-        })
-        recycledLeader.unref()
-        expect(recycledLeader.pid).toBe(leaderPid)
+        // Namespace PID 1 reaps these exact adopted zombies, stops Bun's
+        // process group, and performs one receipt-bound recycled fork/exec.
+        expect(await requestExactNativePidRecycle(leaderPid, grandchildPid, data)).toBe(leaderPid)
         recycledLeaderBirthToken = readProcessBirthToken(leaderPid, 'linux')
         expect(recycledLeaderBirthToken).not.toBeNull()
         expect(recycledLeaderBirthToken).not.toBe(acquired.processBirthToken)
@@ -833,9 +863,6 @@ describe('OpenCode production launch composition', () => {
         expect(replayPidLines.some(line => line.startsWith('taskkill-mutation:'))).toBe(false)
       }
     } finally {
-      if (recycledLeader?.pid && isProcessAlive(recycledLeader.pid)) {
-        try { process.kill(recycledLeader.pid, 'SIGKILL') } catch {}
-      }
       const lines = await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8')
         .catch(() => '')
       for (const line of lines.trim().split('\n')) {

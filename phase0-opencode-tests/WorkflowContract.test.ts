@@ -132,6 +132,16 @@ test('portable fake and production-composition gates are one command under their
   )
   expectDefaultSingleCommand(
     posix!,
+    namedStep(posix!, 'Test real Linux recycled-pid production cleanup across process restart'),
+    'bash',
+    'sudo unshare --pid --fork --mount-proc ' +
+      'native/opencode-host-fixture/target/debug/opencode-host-fixture ' +
+      '--pid-namespace-supervisor env "PATH=$PATH" OPENCODE_REQUIRE_NATIVE_PID_RECYCLE=1 ' +
+      'bun test src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts ' +
+      '--test-name-pattern "native cleanup acquisition and replay use separate OS processes"',
+  )
+  expectDefaultSingleCommand(
+    posix!,
     namedStep(posix!, 'Test production launch cleanup composition and safety contracts'),
     'bash', command(linuxProductionFiles),
   )

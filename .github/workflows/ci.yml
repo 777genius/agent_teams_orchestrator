@@ -50,6 +50,8 @@ jobs:
       - name: Test real Linux recycled-pid production cleanup across process restart
         run: >-
           sudo unshare --pid --fork --mount-proc
+          native/opencode-host-fixture/target/debug/opencode-host-fixture
+          --pid-namespace-supervisor
           env "PATH=$PATH" OPENCODE_REQUIRE_NATIVE_PID_RECYCLE=1
           bun test
           src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts
