@@ -5,7 +5,8 @@ import path from 'node:path'
 import { launchOpenCodeNativeAuthority, resolveOpenCodeNativeAuthorityArtifacts,
   verifyOpenCodeNativeAuthorityArtifacts, type OpenCodeNativeAuthorityChild,
 } from './OpenCodeNativeAuthorityArtifacts.js'
-import { OpenCodeWindowsPublicationAuthorityClient } from './OpenCodeWindowsPublicationAuthorityClient.js'
+import { OpenCodeWindowsPublicationAuthorityClient,
+  type OpenCodeWindowsPublicationAuthorityOptions } from './OpenCodeWindowsPublicationAuthorityClient.js'
 
 const sandboxes: string[] = []
 afterAll(async () => {
@@ -21,14 +22,16 @@ describe('Windows production publication authority launcher round-trip', () => {
       const artifacts = resolveOpenCodeNativeAuthorityArtifacts()
       verifyOpenCodeNativeAuthorityArtifacts(artifacts)
       let child: OpenCodeNativeAuthorityChild | undefined
+      const deadline = Date.now() + 15_000
+      const launch: NonNullable<OpenCodeWindowsPublicationAuthorityOptions['launch']> = input => {
+        expect(input).toEqual({ ...artifacts, deadline, launch, argument: '--windows-publication-authority-v1' })
+        child = launchOpenCodeNativeAuthority(input)
+        return child
+      }
       const client = new OpenCodeWindowsPublicationAuthorityClient({
-        deadline: Date.now() + 15_000,
+        deadline,
         ...artifacts,
-        launch: input => {
-          expect(input).toEqual({ ...artifacts, argument: '--windows-publication-authority-v1' })
-          child = launchOpenCodeNativeAuthority(input)
-          return child
-        },
+        launch,
       })
       try {
         const opened = await client.openRoot(sandbox, false, false)
