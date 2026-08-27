@@ -584,6 +584,9 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         : { status: 200, data: {} },
       isProcessAlive: pid => pid === 446 && leaderAlive,
       isProcessGroupAlive: pid => pid === 446 && (leaderAlive || descendant507Alive),
+      readProcessStartTimeMs: async pid => pid === 446 && leaderAlive ? 12_345 : null,
+      readProcessBirthToken: pid => pid === 446 && leaderAlive
+        ? 'linux:11111111-2222-3333-4444-555555555555:446' : null,
       killProcess: (_pid, signal) => {
         signals.push(signal)
         leaderAlive = false
