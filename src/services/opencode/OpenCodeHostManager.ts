@@ -130,11 +130,27 @@ export type OpenCodeHostReferenceCapability = Readonly<{
   [openCodeHostReferenceBrand]: never
 }>
 
+export type OpenCodeHostReleaseReceipt = Readonly<{
+  schemaVersion: 1
+  receiptId: string
+  hostKeyDigest: string
+  pid: number
+  processStartedAtMs: number
+  lifetime: OpenCodeHostLifetime
+}>
+
 const hostReferenceCapabilities = new WeakMap<object, {
   manager: OpenCodeHostManager
   entry: ManagedHostEntry
+  receipt: OpenCodeHostReleaseReceipt
   state: 'available' | 'releasing' | 'released'
   release?: Promise<void>
+}>()
+const durableHostReferenceCapabilities = new Map<string, {
+  manager: OpenCodeHostManager
+  entry: ManagedHostEntry
+  capability: OpenCodeHostReferenceCapability
+  receipt: OpenCodeHostReleaseReceipt
 }>()
 
 type FetchJsonResult = {
@@ -174,8 +190,8 @@ type OpenCodeHostCleanupControls = {
   signal?: AbortSignal
   remainingMs?: () => number
   requireStableContainment?: boolean
-  /** Private operation capability captured while the exact group leader lived. */
-  containmentIdentityPrevalidated?: boolean
+  /** Compatibility release keeps its exact retry receipt reachable by key. */
+  retainExactEntryDuringDisposal?: boolean
 }
 
 export type OpenCodeWindowsOwnerKeyProtection = {
@@ -1825,9 +1841,9 @@ export class OpenCodeHostManager {
     timeoutMs: number,
     expectedStartedAtMs?: number | null,
     requireStableContainment = false,
-    containmentIdentityPrevalidated = false,
   ): Promise<boolean> {
     if (this.deps.killProcess) {
+      if (requireStableContainment && !this.isProcessAlive(pid)) return false
       this.deps.killProcess(pid, signal)
       await this.sleepMs(Math.min(timeoutMs, 250)).catch(() => undefined)
       if (this.isProcessAlive(pid)) return false
@@ -1836,7 +1852,9 @@ export class OpenCodeHostManager {
     }
     const exited = await killProcessTreeAndWait(pid, signal, {
       timeoutMs,
-      expectedStartedAtMs: containmentIdentityPrevalidated ? undefined : expectedStartedAtMs,
+      // Process birth is re-read immediately before every group mutation.
+      // Never carry a prior validation across TERM observation into SIGKILL.
+      expectedStartedAtMs,
       posixProcessGroupLeader: requireStableContainment,
       windowsTaskkillTreeAuthority: requireStableContainment,
     })
@@ -2997,9 +3015,6 @@ export class OpenCodeHostManager {
     this.assertCleanupAllowed(controls)
     entry.handle.state = 'disposed'
     const pid = receipt.childPid
-    const containmentIdentityPrevalidated = controls.requireStableContainment === true
-      && (controls.containmentIdentityPrevalidated === true
-        || (pid !== null && pid !== undefined && this.isProcessAlive(pid)))
     try {
       await this.fetchJsonWithTimeout(
         `${receipt.record.baseUrl}/global/dispose`,
@@ -3018,16 +3033,19 @@ export class OpenCodeHostManager {
       terminated = controls.requireStableContainment
         ? pid !== null && pid !== undefined && await this.killProcessAndWait(
           pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
-          receipt.record.processStartedAtMs, true, containmentIdentityPrevalidated)
+          receipt.record.processStartedAtMs, true)
         : await this.killOwnedChildAndWait(
           child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
     }
     this.assertCleanupAllowed(controls)
     if (!terminated) {
+      const forceContainmentAuthority = controls.requireStableContainment
+        ? await this.captureEntryContainmentAuthority(entry)
+        : true
       terminated = controls.requireStableContainment
-        ? pid !== null && pid !== undefined && await this.killProcessAndWait(
+        ? forceContainmentAuthority && pid !== null && pid !== undefined && await this.killProcessAndWait(
           pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
-          receipt.record.processStartedAtMs, true, containmentIdentityPrevalidated)
+          receipt.record.processStartedAtMs, true)
         : await this.killOwnedChildAndWait(
           child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
     }
@@ -3212,6 +3230,16 @@ export class OpenCodeHostManager {
     // Compatibility and scoped startup are health-only. Inventory/config
     // surfaces are available solely through refreshResolvedConfigFingerprint.
     const existing = this.hosts.get(hostKey)
+    if (existing?.handle.state === 'disposed') {
+      const disposal = this.disposingHosts.get(existing)
+      if (disposal) {
+        // A compatibility release retains this exact map entry as its retry
+        // receipt. Wait for that generation to settle before deciding whether
+        // it can be reused or a replacement may be created.
+        await disposal.catch(() => undefined)
+        return this.ensurePreparedHost(params)
+      }
+    }
     if (existing && existing.handle.state === 'healthy') {
       if (scopedProfile) {
         await revalidateOpenCodeScopedPreparedProfileInputs(profile)
@@ -3435,8 +3463,104 @@ export class OpenCodeHostManager {
       throw new Error('OpenCode acquired host reference changed before binding [redacted]')
     }
     const capability = Object.freeze({ handle }) as OpenCodeHostReferenceCapability
-    hostReferenceCapabilities.set(capability, { manager: this, entry, state: 'available' })
+    const receipt = Object.freeze({
+      schemaVersion: 1 as const,
+      receiptId: randomUUID(),
+      hostKeyDigest: createHash('sha256').update(handle.hostKey).digest('hex'),
+      pid: handle.pid,
+      processStartedAtMs: handle.processStartedAtMs ?? Number.NaN,
+      lifetime: entry.lifetime,
+    })
+    hostReferenceCapabilities.set(capability, { manager: this, entry, receipt, state: 'available' })
+    // Deliberately strong until physical cleanup succeeds. This is the local
+    // half of the durable attempt ledger and prevents a returned launch run
+    // from making its exact one-shot authority unreachable.
+    durableHostReferenceCapabilities.set(receipt.receiptId,
+      { manager: this, entry, capability, receipt })
     return capability
+  }
+
+  hostReleaseReceipt(capability: OpenCodeHostReferenceCapability): OpenCodeHostReleaseReceipt {
+    const authority = hostReferenceCapabilities.get(capability)
+    if (!authority || authority.manager !== this || authority.state === 'released') {
+      throw new Error('OpenCode host reference capability is invalid or already consumed [redacted]')
+    }
+    if (!Number.isFinite(authority.receipt.processStartedAtMs)) {
+      throw new Error('OpenCode host release receipt birth identity is unavailable [redacted]')
+    }
+    return Object.freeze({ ...authority.receipt })
+  }
+
+  async reconcileHostReleaseReceipt(
+    receipt: OpenCodeHostReleaseReceipt,
+    options: Parameters<OpenCodeHostManager['releaseHostReference']>[1] = {},
+  ): Promise<void> {
+    if (receipt.schemaVersion !== 1 || typeof receipt.receiptId !== 'string'
+      || !/^[0-9a-f-]{36}$/i.test(receipt.receiptId)
+      || typeof receipt.hostKeyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostKeyDigest)
+      || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
+      || !Number.isFinite(receipt.processStartedAtMs)
+      || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
+      throw new Error('OpenCode host release receipt is corrupt [redacted]')
+    }
+    const retained = durableHostReferenceCapabilities.get(receipt.receiptId)
+    if (retained) {
+      if (retained.manager !== this
+        || canonicalSerializeOpenCodePolicyIdentity(retained.receipt)
+          !== canonicalSerializeOpenCodePolicyIdentity(receipt)) {
+        throw new Error('OpenCode host release receipt is foreign [redacted]')
+      }
+      await this.releaseHostReference(retained.capability, options)
+      return
+    }
+    const entry = Array.from(this.hosts.values()).find(candidate =>
+      createHash('sha256').update(candidate.handle.hostKey).digest('hex') === receipt.hostKeyDigest
+      && candidate.handle.pid === receipt.pid
+      && candidate.handle.processStartedAtMs === receipt.processStartedAtMs)
+    if (entry) {
+      // A receipt id is generation authority. Never let a reconstructed or
+      // foreign receipt dispose a matching-looking live entry.
+      throw new Error('OpenCode host release receipt generation is foreign [redacted]')
+    }
+    let registryReceiptFound = false
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      if (registry.schemaVersion !== 2) return
+      const matched = Object.entries(registry.hosts).find(([hostKey]) =>
+        createHash('sha256').update(hostKey).digest('hex') === receipt.hostKeyDigest)
+      if (!matched) return
+      registryReceiptFound = true
+      const [hostKey, record] = matched
+      if (record.pid !== receipt.pid || record.processStartedAtMs !== receipt.processStartedAtMs) {
+        throw new Error('OpenCode host release receipt process generation changed [redacted]')
+      }
+      await this.terminatePersistentHostRecord(record, {
+        force: true,
+        ignoreTrackedHandle: true,
+        requireStableContainment: true,
+      })
+      if (registry.hosts[hostKey] !== record) {
+        throw new Error('OpenCode host release registry receipt changed [redacted]')
+      }
+      delete registry.hosts[hostKey]
+      if (registryHasAnyHosts(registry)) await this.writePersistentRegistryUnlocked(registry)
+      else await this.unlinkPersistentRegistryUnlocked()
+    })
+    if (registryReceiptFound) return
+    if (!this.isProcessAlive(receipt.pid)) return
+    const observed = await this.readProcessStartTimeMs(receipt.pid).catch(() => null)
+    if (observed !== receipt.processStartedAtMs) {
+      throw new Error('OpenCode host release receipt process generation changed [redacted]')
+    }
+    // After an actual process restart no in-memory child handle remains. Exact
+    // birth validation still authorizes one bounded containment attempt. The
+    // caller retains the durable receipt unless the whole containment unit is
+    // physically proven absent.
+    const disposed = await this.killProcessAndWait(receipt.pid, 'SIGTERM',
+      OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS, receipt.processStartedAtMs, true)
+      || await this.killProcessAndWait(receipt.pid, 'SIGKILL',
+        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS, receipt.processStartedAtMs, true)
+    if (!disposed) throw new Error('OpenCode durable host containment cleanup remains incomplete [redacted]')
   }
 
   async releaseHostReference(
@@ -3470,20 +3594,21 @@ export class OpenCodeHostManager {
       if (entry.refCount > 1) {
         entry.refCount -= 1
         authority.state = 'released'
+        durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
         return
       }
       if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
         entry.refCount = 0
         authority.state = 'released'
+        durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
         return
       }
       if (entry.ownedByProcess) {
         // This authority is deliberately scoped to this single TERM -> bounded
         // SIGKILL operation. A failed call must revalidate the exact live leader
         // on retry; leader exit can never leave reusable PGID authority behind.
-        const containmentIdentityPrevalidated =
-          await this.captureEntryContainmentAuthority(entry)
-        if (!containmentIdentityPrevalidated) {
+        const exactLeaderAvailable = await this.captureEntryContainmentAuthority(entry)
+        if (!exactLeaderAvailable) {
           throw new Error(
             `OpenCode host pid ${entry.handle.pid} exact leader is unavailable; ` +
             'retaining containment receipt for conservative reconciliation',
@@ -3494,13 +3619,13 @@ export class OpenCodeHostManager {
           signal: options.signal,
           remainingMs: options.remainingMs,
           requireStableContainment: true,
-          containmentIdentityPrevalidated,
         })
       } else if (this.hosts.get(entry.handle.hostKey) === entry) {
         this.hosts.delete(entry.handle.hostKey)
       }
       entry.refCount = 0
       authority.state = 'released'
+      durableHostReferenceCapabilities.delete(authority.receipt.receiptId)
     })()
     authority.release = release
     try {
@@ -3554,11 +3679,10 @@ export class OpenCodeHostManager {
       ...record,
       processStartedAtMs: entry?.handle.processStartedAtMs ?? record.processStartedAtMs,
     })
-    const containmentIdentityPrevalidated = options.requireStableContainment === true
-      && (options.containmentIdentityPrevalidated === true || processIdentity.state === 'confirmed')
     if (processIdentity.state === 'gone') {
+      // A gone exact leader invalidates its numeric PGID authority. Do not
+      // probe or signal the group after this point; retain the durable receipt.
       terminated = options.requireStableContainment !== true
-        || (pid > 0 && this.hasStableProcessContainmentExited(pid))
     } else if (processIdentity.state !== 'confirmed') {
       throw new Error(
         processIdentity.state === 'changed'
@@ -3582,12 +3706,10 @@ export class OpenCodeHostManager {
       }
     }
 
-    if (!terminated && pid > 0 && (this.isProcessAlive(pid)
-      || (containmentIdentityPrevalidated && !this.hasStableProcessContainmentExited(pid)))) {
+    if (!terminated && pid > 0 && this.isProcessAlive(pid)) {
       this.assertCleanupAllowed(options)
-      const identityBeforeKill = this.isProcessAlive(pid)
-        ? await this.assertPersistentHostProcessIdentity(record, processIdentity.startedAtMs)
-        : containmentIdentityPrevalidated ? 'confirmed' as const : 'gone' as const
+      const identityBeforeKill = await this.assertPersistentHostProcessIdentity(
+        record, processIdentity.startedAtMs)
       if (identityBeforeKill === 'gone') {
         terminated = true
       } else if (entry?.child?.pid) {
@@ -3597,7 +3719,6 @@ export class OpenCodeHostManager {
           OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
-          containmentIdentityPrevalidated,
         )
       } else {
         terminated = await this.killProcessAndWait(
@@ -3606,7 +3727,6 @@ export class OpenCodeHostManager {
           OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
-          containmentIdentityPrevalidated,
         )
       }
     } else if (!terminated && entry?.child) {
@@ -3614,11 +3734,9 @@ export class OpenCodeHostManager {
     }
 
     this.assertCleanupAllowed(options)
-    if (options.force && pid > 0 && !terminated && (this.isProcessAlive(pid)
-      || (containmentIdentityPrevalidated && !this.hasStableProcessContainmentExited(pid)))) {
-      const identityBeforeForceKill = this.isProcessAlive(pid)
-        ? await this.assertPersistentHostProcessIdentity(record, processIdentity.startedAtMs)
-        : containmentIdentityPrevalidated ? 'confirmed' as const : 'gone' as const
+    if (options.force && pid > 0 && !terminated && this.isProcessAlive(pid)) {
+      const identityBeforeForceKill = await this.assertPersistentHostProcessIdentity(
+        record, processIdentity.startedAtMs)
       terminated =
         identityBeforeForceKill === 'gone' ||
         (await this.killProcessAndWait(
@@ -3627,14 +3745,14 @@ export class OpenCodeHostManager {
           OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
-          containmentIdentityPrevalidated,
+          false,
         ))
     }
 
     this.assertCleanupAllowed(options)
 
-    if (options.requireStableContainment && pid > 0
-      && !this.hasStableProcessContainmentExited(pid)) {
+    if (options.requireStableContainment && pid > 0 && !terminated
+      && (!this.isProcessAlive(pid) || !this.hasStableProcessContainmentExited(pid))) {
       throw new Error(
         `OpenCode host pid ${pid} containment remained alive or unproven after cleanup`,
       )
@@ -3783,14 +3901,11 @@ export class OpenCodeHostManager {
           throw new Error('OpenCode created host registry compare-and-swap failed [redacted]')
         }
         const processIdentity = await this.inspectPersistentHostProcessIdentity(receipt.record)
-        const retainedContainmentAuthority = controls.containmentIdentityPrevalidated === true
-          && processIdentity.state === 'gone'
-        if (!retainedContainmentAuthority && (
-          processIdentity.state !== 'confirmed'
+        if (processIdentity.state !== 'confirmed'
           || (Number.isFinite(receipt.record.processStartedAtMs)
             ? processIdentity.startedAtMs !== receipt.record.processStartedAtMs
             : processIdentity.startedAtMs !== null)
-        )) {
+        ) {
           throw new Error('OpenCode created host process compare-and-swap failed [redacted]')
         }
 
@@ -3837,7 +3952,9 @@ export class OpenCodeHostManager {
     // ensure can now only create/adopt a fresh host; it cannot reacquire bytes
     // whose process is already committed to termination.
     const previousState = entry.handle.state
-    if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
+    if (!controls.retainExactEntryDuringDisposal && this.hosts.get(hostKey) === entry) {
+      this.hosts.delete(hostKey)
+    }
     if (!Object.isFrozen(entry.handle)) entry.handle.state = 'disposed'
     publicHostHandleSnapshots.delete(entry.handle)
     const previousDisposal = this.disposalTails.get(hostKey)?.promise
@@ -3865,6 +3982,7 @@ export class OpenCodeHostManager {
     this.disposalTails.set(hostKey, { entry, promise: disposal })
     try {
       await disposal
+      if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
     } catch (error) {
       // Explicit administrative disposal remains retryable after a failed
       // compare-and-swap. Zero-ref release opts out: such an entry must never
@@ -4286,18 +4404,31 @@ export class OpenCodeHostManager {
       return
     }
 
-    entry.refCount = Math.max(0, entry.refCount - 1)
-    if (entry.refCount === 0) {
+    if (entry.refCount <= 0) return
+    if (entry.refCount > 1) {
+      entry.refCount -= 1
+      return
+    }
+    if (entry.refCount === 1) {
       if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
+        entry.refCount = 0
         return
       }
       if (entry.ownedByProcess) {
-        await this.disposeHost(hostKey, { restoreOnFailure: false })
+        // Retain both the exact entry and its final reference until physical
+        // disposal succeeds. Catalog/probe compatibility callers can retry the
+        // same generation after any rejection instead of observing false
+        // absence from a prematurely removed map entry.
+        await this.disposeHost(hostKey, {
+          restoreOnFailure: true,
+          retainExactEntryDuringDisposal: true,
+        })
       } else {
         // Adopted entries are reusable only while referenced. Remove them
         // synchronously so a racing ensure must revalidate durable ownership.
         if (this.hosts.get(hostKey) === entry) this.hosts.delete(hostKey)
       }
+      entry.refCount = 0
     }
   }
 }

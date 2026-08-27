@@ -1309,6 +1309,8 @@ export type OpenCodeLaunchJournalLease = {
     context?: OpenCodeLaunchStoreContext,
   ): Promise<void>
   recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
+  /** Exact same-generation replay promotion after physical receipt reconciliation. */
+  reconcileCleanupComplete(context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
   reconcile(event: OpenCodeLaunchJournalReconciliationEvent, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Re-reads both durable authorities immediately before an irreversible external commit. */
@@ -1688,6 +1690,25 @@ export class OpenCodeLaunchAttemptStore {
               throw new OpenCodeLaunchJournalError('fenced', 'terminal cleanup state is immutable')
             }
             const candidate = { ...journal!, cleanupState: state }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, cleanupContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, cleanupContext)
+        },
+        reconcileCleanupComplete: async cleanupContext => {
+          if (beganGeneration) {
+            throw new OpenCodeLaunchJournalError('fenced',
+              'cleanup reconciliation requires exact same-generation replay')
+          }
+          await serializeMutation(async () => {
+            const current = journal!.cleanupState ?? 'unknown'
+            if (current === 'complete') return
+            if (current !== 'incomplete') {
+              throw new OpenCodeLaunchJournalError('fenced', 'cleanup reconciliation has no durable receipt')
+            }
+            const candidate = { ...journal!, cleanupState: 'complete' as const }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
             await this.persist(candidate, cleanupContext ?? effectiveContext)

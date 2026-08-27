@@ -95,6 +95,14 @@ export type OpenCodeLaunchAttemptPorts = {
       deadlineAtMs: number
       signal: AbortSignal
     }): Promise<void>
+    /** Reconcile an attempt-bound release receipt before replay can authorize cleanup. */
+    reconcileOperationHost?(input: {
+      attemptId: string
+      payloadHash: string
+      generation: number
+      deadlineAtMs: number
+      signal: AbortSignal
+    }): Promise<'complete' | 'incomplete'>
   }
   mcp: {
     verifyAppMcp(input: {
@@ -333,9 +341,29 @@ export class OpenCodeLaunchAttempt {
               profileBinding: lease.journal.profileBinding,
               members,
             })
+            let replayCleanup = lease.journal.cleanupState
+            if (replayCleanup !== 'complete'
+              && lease.journal.finalResponse.members.cleanupPending.length === 0
+              && this.ports.host.reconcileOperationHost) {
+              const reconciled = await this.ports.host.reconcileOperationHost({
+                attemptId: attempt.attemptId,
+                payloadHash: attempt.payloadHash,
+                generation: attempt.generation,
+                deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
+                signal: reserveController.signal,
+              }).catch(() => 'incomplete' as const)
+              if (reconciled === 'complete') {
+                await lease.reconcileCleanupComplete({
+                  deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
+                  signal: reserveController.signal,
+                  monotonicNow: () => this.ports.clock.monotonicNow(),
+                })
+                replayCleanup = 'complete'
+              }
+            }
             const replay = resultFromOpenCodeDurableFinal(lease.journal.finalResponse)
             return { ...replay,
-              cleanup: lease.journal.cleanupState === 'complete' ? 'complete' : 'timed_out' }
+              cleanup: replayCleanup === 'complete' ? 'complete' : 'timed_out' }
           }
           const recovery = await this.reconcile(
             lease.journal.events, members, committed, lease.generation,
@@ -374,6 +402,9 @@ export class OpenCodeLaunchAttempt {
             if (!existing) owned.push(deepFreeze(structuredClone(resource)))
           }
           let host: OpenCodeRetainedHostIdentity | undefined
+          let hostAcquisitionStarted = false
+          let hostAcquisitionCleanupComplete = false
+          let lateHostSettlement: Promise<void> | undefined
           let failure: OpenCodeLaunchFailureKind | undefined
           let cleanup: OpenCodeLaunchCleanupOutcome = 'complete'
           let ambiguousMember: OpenCodeOpaqueIdentity | undefined
@@ -408,9 +439,43 @@ export class OpenCodeLaunchAttempt {
               configIdentity: profile.configIdentity,
               binaryIdentity: profile.binaryIdentity,
             })
-            host = deepFreeze(await this.phase('retained_host_start', policy, controller.signal,
-              deadline => this.ports.host.acquireOperationHost({ profile, deadlineAtMs: deadline, signal: controller.signal })))
-            if (host.profileScopeIdentity !== profile.profileIdentity) throw new OpenCodeLaunchAttemptError('host.profileScopeIdentity')
+            let acquisitionOpen = true
+            try {
+              host = deepFreeze(await this.phase('retained_host_start', policy, controller.signal,
+                deadline => {
+                  hostAcquisitionStarted = true
+                  const physicalAcquisition = this.ports.host.acquireOperationHost({
+                    profile, deadlineAtMs: deadline, signal: controller.signal,
+                  })
+                  const acceptedAcquisition = physicalAcquisition.then(candidate => {
+                    if (!acquisitionOpen || controller.signal.aborted
+                      || this.ports.clock.monotonicNow() >= deadline) throw new DeadlineError()
+                    if (candidate.profileScopeIdentity !== profile.profileIdentity) {
+                      throw new OpenCodeLaunchAttemptError('host.profileScopeIdentity')
+                    }
+                    host = deepFreeze(candidate)
+                    return host
+                  })
+                  // This reaction is registered after the synchronous transfer reaction above.
+                  // If the outer deadline/abort already closed acquisition, the exact late host
+                  // is self-released and its physical settlement keeps the generation fenced.
+                  lateHostSettlement = physicalAcquisition.then(async candidate => {
+                    if (host === candidate) return
+                    const lateReleaseController = new AbortController()
+                    await this.ports.host.releaseOperationHost({
+                      host: candidate,
+                      deadlineAtMs: Number.MAX_SAFE_INTEGER,
+                      signal: lateReleaseController.signal,
+                    })
+                    hostAcquisitionCleanupComplete = true
+                  }, () => {
+                    hostAcquisitionCleanupComplete = true
+                  })
+                  return acceptedAcquisition
+                }))
+            } finally {
+              acquisitionOpen = false
+            }
 
             const mcp = await this.phase('provider_live_validate', policy, controller.signal,
               deadline => this.ports.mcp.verifyAppMcp({
@@ -674,6 +739,11 @@ export class OpenCodeLaunchAttempt {
               inFlightAmbiguous = undefined
             }
           } finally {
+            if (!host && hostAcquisitionStarted && !hostAcquisitionCleanupComplete && lateHostSettlement) {
+              cleanup = 'timed_out'
+              lease.retainUntilPhysicalSettlement(lateHostSettlement)
+              void lateHostSettlement.catch(() => undefined)
+            }
             if (host) {
               let cleanupHostChain: Promise<void> | undefined
               let releaseHostChain: Promise<void> | undefined

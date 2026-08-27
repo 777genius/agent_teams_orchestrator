@@ -32,6 +32,7 @@ import {
   deriveOpenCodeProductionProofOwnership,
   hasExactOpenCodeClaimReconciliationAuthority,
   inspectOpenCodeProductionGeneration,
+  OpenCodeLaunchHostReleaseLedger,
   createOpenCodeLaunchAttemptProductionTestBridge,
   reobserveOpenCodeProductionRetainedProof,
   resolveOpenCodeProductionRetainedProofRecord,
@@ -43,6 +44,35 @@ const productionContext = () => ({
   deadlineAtMs: Date.now() + 10_000,
   signal: new AbortController().signal,
   monotonicNow: Date.now,
+})
+
+test('attempt host release ledger survives restart, rejects foreign/corrupt receipts, and clears idempotently', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-ledger-'))
+  const file = path.join(directory, 'receipt.json')
+  const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
+    payloadHash: 'b'.repeat(64), generation: 3 }
+  const record = { schemaVersion: 1 as const, ...expected, hostKeyIdentity: identity,
+    receipt: { schemaVersion: 1 as const, receiptId: '123e4567-e89b-42d3-a456-426614174443',
+      hostKeyDigest: 'c'.repeat(64), pid: 443, processStartedAtMs: 12_345,
+      lifetime: 'process' as const } }
+  try {
+    const first = new OpenCodeLaunchHostReleaseLedger(file)
+    await first.record(record)
+    const raw = await readFile(file, 'utf8')
+    expect(raw).not.toContain('://')
+    expect(raw).not.toContain('auth')
+    const restarted = new OpenCodeLaunchHostReleaseLedger(file)
+    expect(await restarted.read(expected)).toEqual(record)
+    expect(await restarted.readPending({ attemptId: expected.attemptId,
+      payloadHash: expected.payloadHash, currentGeneration: 4 })).toEqual(record)
+    await expect(restarted.read({ ...expected, generation: 4 })).rejects.toThrow('foreign')
+    await restarted.clear(record)
+    await restarted.clear(record)
+    expect(await restarted.read(expected)).toBeNull()
+
+    await writeFile(file, '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')
+    await expect(restarted.read(expected)).rejects.toThrow('corrupt')
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test.each([
@@ -639,8 +669,7 @@ test('production preflight repairs an exact committed claim after commit-before-
   } finally { await fixture.dispose() }
 })
 
-test('production callback and preflight fail closed for stale or mismatched durable authority', async () => {
-  const cases = [
+const staleProductionAuthorityCases = [
     ['pending claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
       expect(await fixture.ledger.claim(fixture.target, seeded.authority, fixture.context)).toBe('claimed')
       fixture.remote.set(fixture.sessionId, { id: fixture.sessionId, title: seeded.title })
@@ -700,7 +729,9 @@ test('production callback and preflight fail closed for stale or mismatched dura
       await fixture.sessionStore.upsert(seeded.record)
     }],
   ] as const
-  for (const [name, arrange] of cases) {
+
+test.each(staleProductionAuthorityCases)(
+  'production callback and preflight fail closed for %s durable authority', async (name, arrange) => {
     const fixture = await productionRecoveryHarness()
     try {
       const seeded = await fixture.seedIntent({ acceptedProof: true, applied: true })
@@ -724,8 +755,7 @@ test('production callback and preflight fail closed for stale or mismatched dura
       expect(events, name).not.toContain('member_reconciled_applied')
       expect(events, `${name} exact recovery journal`).toEqual(['member_intent', 'member_applied'])
     } finally { await fixture.dispose() }
-  }
-}, 15_000)
+  })
 
 test('committed mutation crash failpoints rehydrate only the exact remote projection without create', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-commit-recovery-'))

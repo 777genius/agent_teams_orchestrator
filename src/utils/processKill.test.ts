@@ -72,8 +72,12 @@ describe('processKill', () => {
 
   it('signals a detached owned POSIX group only with explicit authority', async () => {
     const calls: number[] = []
-    const kill = spyOn(process, 'kill').mockImplementation(((pid: number) => {
+    let groupAlive = true
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
       calls.push(pid)
+      if (pid > 0) return true
+      if (signal !== 0) { groupAlive = false; return true }
+      if (groupAlive) return true
       const error = new Error('gone') as NodeJS.ErrnoException
       error.code = 'ESRCH'
       throw error
@@ -82,7 +86,34 @@ describe('processKill', () => {
       await expect(killProcessTreeAndWait(44_302, 'SIGKILL', {
         timeoutMs: 10, posixProcessGroupLeader: true,
       })).resolves.toBe(true)
-      expect(calls).toEqual([-44_302, -44_302, 44_302])
+      expect(calls).toEqual([44_302, -44_302, 44_302, -44_302])
+    } finally {
+      kill.mockRestore()
+    }
+  })
+
+  it('never touches a recycled process group after TERM removes the exact leader', async () => {
+    const calls: Array<[number, NodeJS.Signals | number | undefined]> = []
+    let leaderAlive = true
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      calls.push([pid, signal])
+      if (pid === -44_304 && signal === 'SIGTERM') {
+        leaderAlive = false
+        return true
+      }
+      if (pid === 44_304 && signal === 0 && !leaderAlive) {
+        const error = new Error('gone') as NodeJS.ErrnoException
+        error.code = 'ESRCH'
+        throw error
+      }
+      return true
+    }) as typeof process.kill)
+    try {
+      await expect(killProcessTreeAndWait(44_304, 'SIGTERM', {
+        timeoutMs: 10, pollMs: 1, posixProcessGroupLeader: true,
+      })).resolves.toBe(false)
+      const negativeCalls = calls.filter(([pid]) => pid < 0)
+      expect(negativeCalls).toEqual([[-44_304, 'SIGTERM']])
     } finally {
       kill.mockRestore()
     }

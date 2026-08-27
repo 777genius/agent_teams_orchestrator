@@ -460,10 +460,10 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
     })
     await expect(manager.releaseHostReference(reference)).rejects.toThrow('did not exit')
-    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(signals).toEqual(['SIGTERM'])
     expect(descendant507Alive).toBe(true)
     await expect(manager.releaseHostReference(reference)).rejects.toThrow()
-    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(signals).toEqual(['SIGTERM'])
     expect(manager.getHost(reference.handle.hostKey)).not.toBeNull()
     expect(descendant507Alive).toBe(true)
   })
@@ -513,6 +513,8 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         ? { status: 200, data: { healthy: true } }
         : { status: 200, data: {} },
       isProcessAlive: pid => pid === 447 && leaderAlive,
+      isProcessGroupAlive: () => false,
+      readProcessStartTimeMs: async pid => pid === 447 ? 12_345 : null,
       killProcess: (_pid, signal) => { signals.push(signal); leaderAlive = false },
       sleepMs: async () => {},
       persistentRegistryPath: null,
@@ -520,16 +522,17 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     const reference = await manager.ensureScopedHostReference({
       preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
     })
+    const receipt = manager.hostReleaseReceipt(reference)
 
     await expect(manager.releaseHostReference(reference, { remainingMs: () => 0 }))
       .rejects.toThrow('deadline expired')
     expect(manager.getHost(reference.handle.hostKey)).not.toBeNull()
     expect(signals).toEqual([])
 
-    const reaped = await manager.disposeUnregisteredOwnedHosts()
-    expect(reaped).toEqual({ disposed: 1, kept: 0, diagnostics: [] })
-    expect(signals).toEqual([])
-    expect(child.killedSignals).toEqual(['SIGTERM'])
+    await manager.reconcileHostReleaseReceipt(receipt)
+    expect(signals).toEqual(['SIGTERM'])
+    await expect(manager.reconcileHostReleaseReceipt(receipt)).resolves.toBeUndefined()
+    expect(signals).toEqual(['SIGTERM'])
     expect(manager.getHost(reference.handle.hostKey)).toBeNull()
   })
 
@@ -562,9 +565,9 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       })
       await expect(manager.releaseHostReference(reference)).rejects.toThrow('containment')
       expect(await pathExists(registryPath)).toBe(true)
-      expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(signals).toEqual(['SIGTERM'])
       await expect(manager.releaseHostReference(reference)).rejects.toThrow()
-      expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(signals).toEqual(['SIGTERM'])
       expect(await pathExists(registryPath)).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
@@ -2654,64 +2657,40 @@ describe('OpenCodeHostManager', () => {
     const old = await manager.ensureHost({ hostKey: 'raced-host', hostLifetime: 'process' })
     const releasingOld = manager.releaseHost(old.hostKey)
     await firstEntered
-    expect(manager.getHost(old.hostKey)).toBeNull()
+    expect(manager.getHost(old.hostKey)?.state).toBe('disposed')
 
-    const replacement = await manager.ensureHost({
+    let replacementSettled = false
+    const replacementPromise = manager.ensureHost({
       hostKey: old.hostKey,
       hostLifetime: 'process',
-    })
+    }).finally(() => { replacementSettled = true })
+    await Bun.sleep(0)
+    expect(replacementSettled).toBe(false)
+    allowFirstDisposal()
+    await releasingOld
+    const replacement = await replacementPromise
     expect(replacement.pid).not.toBe(old.pid)
     expect(replacement.state).toBe('healthy')
 
-    // B reaches zero while A is still disposing. It must be tombstoned before
-    // waiting for A, so a concurrent ensure creates C instead of reusing B.
+    // A later generation is likewise retained until its own disposal settles.
     const releasingReplacement = manager.releaseHost(replacement.hostKey)
-    expect(manager.getHost(replacement.hostKey)).toBeNull()
-    const current = await manager.ensureHost({
-      hostKey: replacement.hostKey,
-      hostLifetime: 'process',
-    })
-    expect(current.pid).not.toBe(replacement.pid)
-    expect(current.state).toBe('healthy')
-
-    allowFirstDisposal()
-    await releasingOld
     await secondEntered
-    expect(manager.getHost(old.hostKey)?.pid).toBe(current.pid)
+    expect(manager.getHost(replacement.hostKey)?.pid).toBe(replacement.pid)
     allowSecondDisposal()
     await releasingReplacement
-    expect(manager.getHost(old.hostKey)?.pid).toBe(current.pid)
-    expect(manager.getHost(old.hostKey)?.state).toBe('healthy')
-    const trackedHosts = (manager as unknown as {
-      hosts: Map<string, { refCount: number }>
-    }).hosts
-    expect(trackedHosts.get(old.hostKey)?.refCount).toBe(1)
     expect(disposeCount).toBe(2)
     expect(disposalUrls).toEqual([
       'http://127.0.0.1:43131/global/dispose',
       'http://127.0.0.1:43132/global/dispose',
     ])
 
-    // Concurrent releases for C remain single-flight and cannot affect a
-    // later generation under the same key.
-    expect((await manager.ensureHost({
-      hostKey: current.hostKey,
-      hostLifetime: 'process',
-    })).pid).toBe(current.pid)
-    await Promise.all([
-      manager.releaseHost(current.hostKey),
-      manager.releaseHost(current.hostKey),
-    ])
-    expect(disposeCount).toBe(3)
-    expect(new Set(disposalUrls).size).toBe(3)
-    expect(spawnCount).toBe(3)
+    expect(spawnCount).toBe(2)
     expect(manager.getHost(old.hostKey)).toBeNull()
   })
 
-  test('continues a replacement disposal after the prior generation fails', async () => {
+  test('legacy catalog-style release retains the exact generation after rejection and retries', async () => {
     const stuck = createMockChildProcess(43134, null)
-    const replacement = createMockChildProcess(43135)
-    const children = [stuck, replacement]
+    const children = [stuck]
     let spawnCount = 0
     let firstDisposalEntered!: () => void
     const firstEntered = new Promise<void>(resolve => { firstDisposalEntered = resolve })
@@ -2740,21 +2719,17 @@ describe('OpenCodeHostManager', () => {
     const old = await manager.ensureHost({ hostKey: 'failed-disposal', hostLifetime: 'process' })
     const releasingOld = manager.releaseHost(old.hostKey)
     await firstEntered
-    const next = await manager.ensureHost({
-      hostKey: old.hostKey,
-      hostLifetime: 'process',
-    })
-    const releasingNext = manager.releaseHost(next.hostKey)
-    expect(manager.getHost(next.hostKey)).toBeNull()
-
     await expect(releasingOld).rejects.toThrow('did not exit through its owned child handle')
-    await expect(releasingNext).resolves.toBeUndefined()
+    expect(manager.getHost(old.hostKey)?.pid).toBe(old.pid)
+    expect(disposeUrls).toEqual(['http://127.0.0.1:43134/global/dispose'])
+    expect(stuck.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    Object.assign(stuck.child, { exitCode: 0 })
+    await manager.releaseHost(old.hostKey)
     expect(disposeUrls).toEqual([
       'http://127.0.0.1:43134/global/dispose',
-      'http://127.0.0.1:43135/global/dispose',
+      'http://127.0.0.1:43134/global/dispose',
     ])
-    expect(stuck.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
-    expect(replacement.killedSignals).toEqual(['SIGTERM'])
+    expect(spawnCount).toBe(1)
     expect(manager.getHost(old.hostKey)).toBeNull()
   })
 

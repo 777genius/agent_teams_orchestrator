@@ -1461,7 +1461,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     await expect(store.inspect({ ...identity, inputDigest: 'b'.repeat(64) })).rejects.toMatchObject({ code: 'corrupt' })
   })
 
-  test('persists absorbing cleanup truth and permits completion only to the generation creator', async () => {
+  test('persists absorbing cleanup truth and promotes only through exact replay reconciliation', async () => {
     const persistence = new MemoryPersistence()
     const store = new OpenCodeLaunchAttemptStore(persistence)
     const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64) }
@@ -1474,8 +1474,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       expect(replay.beganGeneration).toBe(false)
       expect(replay.journal.cleanupState).toBe('incomplete')
       await expect(replay.recordCleanupState('complete')).rejects.toMatchObject({ code: 'fenced' })
+      await replay.reconcileCleanupComplete()
     })
-    expect((await store.inspect(exact))?.cleanupState).toBe('incomplete')
+    expect((await store.inspect(exact))?.cleanupState).toBe('complete')
   })
 
   test('carries incomplete cleanup truth across continuation and rejects a generation upgrade', async () => {

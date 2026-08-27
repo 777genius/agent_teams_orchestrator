@@ -1540,4 +1540,127 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     })).rejects.toMatchObject({ code: 'fenced' })
     expect(releaseCalls).toBe(1)
   })
+
+  test('self-releases a host acquired immediately after abort and never publishes false cleanup', async () => {
+    const cancellation = new AbortController()
+    let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
+    let acquireEntered!: () => void
+    const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
+    const physicalAcquire = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
+    let releaseEntered!: () => void
+    const atRelease = new Promise<void>(resolve => { releaseEntered = resolve })
+    let rejectRelease!: (error: Error) => void
+    const physicalRelease = new Promise<void>((_, reject) => { rejectRelease = reject })
+    const subject = setup()
+    subject.ports.host.acquireOperationHost = async () => { acquireEntered(); return physicalAcquire }
+    subject.ports.host.releaseOperationHost = async () => { releaseEntered(); return physicalRelease }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => Promise.race([
+      operation,
+      new Promise<never>((_, reject) => signal.addEventListener('abort',
+        () => reject(signal.reason), { once: true })),
+    ])
+
+    const running = subject.launch.run({ request: request(), members: [members[0]],
+      requestedBudgetMs: 10_000, signal: cancellation.signal })
+    await atAcquire
+    cancellation.abort(new Error('cancel immediately before acquisition resolution'))
+    resolveAcquire(host)
+    const result = await running
+    await atRelease
+    expect(result.cleanup).toBe('timed_out')
+    expect(subject.persistence.json().cleanupState).toBe('incomplete')
+    expect(subject.calls).not.toContain('mcp')
+
+    rejectRelease(new Error('late physical release rejected'))
+    await physicalRelease.catch(() => undefined)
+    await Bun.sleep(0)
+    expect(subject.persistence.json().cleanupState).toBe('incomplete')
+  })
+
+  test('accepts an immediately resolved host synchronously and uses the normal one-shot release path', async () => {
+    const cancellation = new AbortController()
+    let acquireEntered!: () => void
+    const atAcquire = new Promise<void>(resolve => { acquireEntered = resolve })
+    let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
+    const physicalAcquire = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
+    let mcpEntered!: () => void
+    const atMcp = new Promise<void>(resolve => { mcpEntered = resolve })
+    const subject = setup()
+    subject.ports.host.acquireOperationHost = async () => { acquireEntered(); return physicalAcquire }
+    subject.ports.mcp.verifyAppMcp = async () => {
+      mcpEntered()
+      await new Promise<never>((_, reject) => cancellation.signal.addEventListener('abort',
+        () => reject(cancellation.signal.reason), { once: true }))
+      return { host, observedTools: ['mcp__app__team'] }
+    }
+    subject.ports.deadline.run = async (operation, _deadline, signal) => Promise.race([
+      operation,
+      new Promise<never>((_, reject) => signal.addEventListener('abort',
+        () => reject(signal.reason), { once: true })),
+    ])
+
+    const running = subject.launch.run({ request: request(), members: [members[0]],
+      requestedBudgetMs: 10_000, signal: cancellation.signal })
+    await atAcquire
+    resolveAcquire(host)
+    await atMcp
+    cancellation.abort(new Error('cancel immediately after acquisition resolution'))
+    const result = await running
+    expect(result.cleanup).toBe('complete')
+    expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
+    expect(subject.persistence.json().cleanupState).toBe('complete')
+  })
+
+  test('self-releases when the deadline expires immediately before acquisition resolution', async () => {
+    let entered!: () => void
+    const atAcquire = new Promise<void>(resolve => { entered = resolve })
+    let resolveAcquire!: (value: OpenCodeRetainedHostIdentity) => void
+    const acquisition = new Promise<OpenCodeRetainedHostIdentity>(resolve => { resolveAcquire = resolve })
+    const subject = setup()
+    subject.ports.host.acquireOperationHost = async () => { entered(); return acquisition }
+    const running = subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    await atAcquire
+    subject.setNow(9_000)
+    resolveAcquire(host)
+    const result = await running
+    expect(result.status).toBe('failed')
+    expect(subject.calls).not.toContain('mcp')
+    expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
+    expect(subject.persistence.json().cleanupState).toBe('complete')
+  })
+
+  test('releases the accepted host when the deadline expires immediately after acquisition', async () => {
+    const subject = setup()
+    subject.ports.mcp.verifyAppMcp = async () => {
+      subject.setNow(9_000)
+      return { host, observedTools: ['mcp__app__team'] }
+    }
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(result.status).toBe('failed')
+    expect(subject.calls.filter(call => call === 'release')).toHaveLength(1)
+    expect(subject.persistence.json().cleanupState).toBe('complete')
+  })
+
+  test('promotes host-only incomplete cleanup only after exact replay reconciliation', async () => {
+    const subject = setup()
+    await subject.launch.run({ request: request(), members: [members[0]], requestedBudgetMs: 10_000 })
+    const journal = subject.persistence.json()
+    journal.cleanupState = 'incomplete'
+    subject.persistence.bytes = new TextEncoder().encode(JSON.stringify(journal))
+    let reconciliations = 0
+    subject.ports.host.reconcileOperationHost = async input => {
+      reconciliations += 1
+      expect(input).toMatchObject({ attemptId, payloadHash: hash, generation: 1 })
+      return 'complete'
+    }
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports).run({
+        request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+      })
+    expect(replay.cleanup).toBe('complete')
+    expect(reconciliations).toBe(1)
+    expect(subject.persistence.json().cleanupState).toBe('complete')
+  })
 })

@@ -43,6 +43,14 @@ jobs:
           src/services/opencode/OpenCodePassiveStatusSnapshotWriter.test.ts
           src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
           src/services/opencode/OpenCodeActiveStatusSnapshotPublisher.test.ts
+      - name: Test fake-only launch cleanup recovery
+        run: >-
+          bun test
+          src/services/opencode/OpenCodeLaunchAttempt.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts
+          src/services/opencode/OpenCodeLaunchAttemptStore.test.ts
+          src/services/opencode/OpenCodeHostManager.test.ts
+          src/utils/processKill.test.ts
 
   windows-passive-snapshot:
     name: Windows retained publication (${{ matrix.arch }})

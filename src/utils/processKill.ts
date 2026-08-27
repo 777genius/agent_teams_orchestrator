@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
@@ -255,19 +256,45 @@ function isPosixProcessGroupAlive(groupLeaderPid: number): boolean {
 export function isProcessTreeContainmentAlive(groupLeaderPid: number): boolean | null {
   if (!Number.isInteger(groupLeaderPid) || groupLeaderPid <= 0) return false
   if (process.platform === 'win32') return null
-  return isPosixProcessGroupAlive(groupLeaderPid)
+  if (process.platform !== 'linux') return null
+  try {
+    for (const entry of readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue
+      let stat: string
+      try { stat = readFileSync(`/proc/${entry}/stat`, 'utf8') }
+      catch { continue }
+      const commandEnd = stat.lastIndexOf(')')
+      if (commandEnd < 0) continue
+      const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
+      // proc_pid_stat fields after comm begin with state, ppid, pgrp.
+      if (Number(fields[2]) === groupLeaderPid) return true
+    }
+    return false
+  } catch {
+    return null
+  }
 }
 
 async function waitForPosixProcessGroupExit(
   groupLeaderPid: number,
   timeoutMs: number,
   pollMs: number,
+  expectedStartedAtMs?: number | null,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    // A process group id is only an authority while its exact leader is still
+    // alive.  Once the leader exits the numeric PGID can immediately be
+    // recycled, so even a signal-0 group probe would target unrelated work.
+    if (!isProcessAlive(groupLeaderPid)) return false
+    if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
+      && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
     if (!isPosixProcessGroupAlive(groupLeaderPid)) return true
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }
+  if (!isProcessAlive(groupLeaderPid)) return false
+  if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
+    && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
   return !isPosixProcessGroupAlive(groupLeaderPid)
 }
 
@@ -321,12 +348,17 @@ export async function killProcessTreeAndWait(
   }
 
   if (options.posixProcessGroupLeader === true) {
+    // Revalidate immediately before every group signal.  Callers may retry,
+    // but no successful validation is reusable across an await or retry.
+    if (!isProcessAlive(pid)) return false
+    if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null
+      && await readProcessStartTimeMs(pid) !== options.expectedStartedAtMs) return false
     try {
       process.kill(-pid, signal)
     } catch {
-      return !isPosixProcessGroupAlive(pid) && !isProcessAlive(pid)
+      return false
     }
-    return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs)
+    return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs, options.expectedStartedAtMs)
   }
   try {
     process.kill(pid, signal)
