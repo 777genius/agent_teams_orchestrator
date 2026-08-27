@@ -244,7 +244,10 @@ describe('portable fake evidence through production OpenCode composers', () => {
     }
     const policy = planScopedProfile(currentPlan)
     const profileManager = {
-      captureCurrentScopedProfilePlan: async () => currentPlan,
+      captureCurrentScopedProfilePlan: async () => {
+        calls.push('profile:capture')
+        return currentPlan
+      },
       planScopedProfile,
       prepareScopedProfile: async (_current: typeof currentPlan, expected: typeof policy) => ({
         scopeSchema: 'opencode-scoped-profile-v1' as const, purpose: expected.purpose,
@@ -334,9 +337,25 @@ describe('portable fake evidence through production OpenCode composers', () => {
       expectedRetainedHostIdentity: retainedHost, requiredMcpTools: ['agent-teams.message_send'],
     })
     if (!fixtureCorrelation.ok) throw new Error(`fixture correlation invalid: ${fixtureCorrelation.failure.field}`)
+    calls.length = 0
     const snapshot = { detected: false } as never
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      preflightAuthorization: async () => {
+        const effectsBefore = calls.filter(call =>
+          /^(profile:launch|windows-policy|host:|mcp:|proof:|member:|cleanup:)/.test(call))
+        const journalBefore = journal.bytes?.slice() ?? null
+        const authorizationBefore = authorizedProfile
+        const linkageBefore = authoritativeLinkage
+        calls.push('preflightAuthorization')
+        expect(calls.filter(call =>
+          /^(profile:launch|windows-policy|host:|mcp:|proof:|member:|cleanup:)/.test(call)))
+          .toEqual(effectsBefore)
+        expect(journal.bytes).toEqual(journalBefore)
+        expect(authorizedProfile).toBe(authorizationBefore)
+        expect(authoritativeLinkage).toBe(linkageBefore)
+      },
       authorize: async value => {
+        calls.push('authorize')
         authorizedProfile = await authorizeOpenCodeLaunchScopedProfile(profileManager, {
           purpose: 'launch', providerId: value.request.launchAttempt.providerId,
           modelId: value.selectedModel, runtimeInstanceId: value.request.launchAttempt.attemptId,
@@ -366,7 +385,29 @@ describe('portable fake evidence through production OpenCode composers', () => {
         throw new Error(JSON.stringify({ launch: (first.data as { launchAttempt: unknown }).launchAttempt, calls }))
       }
       expect((first.data as { launchAttempt: { status: string } }).launchAttempt.status).toBe('succeeded')
-      expect(calls.findIndex(call => call.startsWith('plan:'))).toBeLessThan(calls.indexOf('profile:launch:openrouter'))
+      expect(calls).toEqual([
+        'preflightAuthorization',
+        'authorize',
+        'profile:capture',
+        `plan:${authorizedProfile!.effectivePlanDigest}`,
+        'profile:launch:openrouter',
+        'windows-policy',
+        'host:acquire',
+        'mcp:verify',
+        'proof:fresh-exact:0',
+        'proof:revalidate-same-host',
+        'proof:revalidate-same-host',
+        'member:create',
+        'proof:revalidate-same-host',
+        'proof:revalidate-same-host',
+        'cleanup:bounded',
+        'host:release',
+      ])
+      const preflightIndex = calls.indexOf('preflightAuthorization')
+      const effectCalls = calls.filter(call => /^(profile:launch|windows-policy|host:|mcp:|proof:|member:|cleanup:)/.test(call))
+      for (const effect of effectCalls) {
+        expect(preflightIndex).toBeLessThan(calls.indexOf(effect))
+      }
       expect(calls.indexOf('windows-policy')).toBeLessThan(calls.indexOf('host:acquire'))
       expect(calls.findIndex(call => call.startsWith('proof:fresh-exact'))).toBeLessThan(calls.indexOf('member:create'))
       expect(calls.indexOf('proof:revalidate-same-host')).toBeLessThan(calls.indexOf('member:create'))
@@ -384,8 +425,15 @@ describe('portable fake evidence through production OpenCode composers', () => {
         .toEqual(['member_intent', 'member_applied'])
       const memberCreates = calls.filter(call => call === 'member:create').length
       const proofRuns = calls.filter(call => call.startsWith('proof:')).length
+      const callsBeforeReplay = calls.length
       const replay = await bridge.execute(command())
       expect((replay.data as { launchAttempt: { status: string } }).launchAttempt.status).toBe('succeeded')
+      expect(calls.slice(callsBeforeReplay)).toEqual([
+        'preflightAuthorization',
+        'authorize',
+        'profile:capture',
+        `plan:${authorizedProfile!.effectivePlanDigest}`,
+      ])
       expect(calls.filter(call => call === 'member:create')).toHaveLength(memberCreates)
       expect(calls.filter(call => call.startsWith('proof:'))).toHaveLength(proofRuns)
       expect(journal.bytes).toEqual(journalBeforeReplay)
