@@ -1775,6 +1775,60 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(subject.calls).not.toContain('host')
   })
 
+  test('preserves a domain rejection that wins exactly at the phase deadline', async () => {
+    const subject = setup()
+    const domainError = new Error('profile domain rejection at boundary')
+    let phaseDeadlineAtMs: number | undefined
+    let phaseSignal: AbortSignal | undefined
+    subject.ports.profile.createSelectedProviderProfile = async input => {
+      phaseDeadlineAtMs = input.deadlineAtMs
+      phaseSignal = input.signal
+      subject.setNow(input.deadlineAtMs)
+      throw domainError
+    }
+    subject.ports.deadline.run = async operation => operation
+
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 300_000,
+    })
+
+    expect(phaseDeadlineAtMs).toBe(30_000)
+    expect(phaseSignal?.aborted).toBe(true)
+    expect(phaseSignal?.reason).toBe(domainError)
+    expect(result).toMatchObject({
+      status: 'failed', failurePhase: 'profile_prepare', failureAtMs: 30_000,
+      failure: { kind: 'contract_violation' },
+      durableFinalResponse: { failure: { code: 'contract_violation', phase: 'profile_prepare' } },
+    })
+  })
+
+  test('preserves a genuine phase timeout as DeadlineError at the same fake-clock boundary', async () => {
+    const subject = setup()
+    let phaseSignal: AbortSignal | undefined
+    subject.ports.profile.createSelectedProviderProfile = input => {
+      phaseSignal = input.signal
+      return new Promise<never>((_, reject) => input.signal.addEventListener(
+        'abort', () => reject(input.signal.reason), { once: true },
+      ))
+    }
+    subject.ports.deadline.run = async (operation, deadlineAtMs) => {
+      subject.setNow(deadlineAtMs)
+      return Promise.race([operation, Promise.reject(new DeadlineError())])
+    }
+
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 300_000,
+    })
+
+    expect(phaseSignal?.aborted).toBe(true)
+    expect(phaseSignal?.reason).toBeInstanceOf(DeadlineError)
+    expect(result).toMatchObject({
+      status: 'failed', failurePhase: 'profile_prepare', failureAtMs: 30_000,
+      failure: { kind: 'deadline_before_partial' },
+      durableFinalResponse: { failure: { code: 'deadline_before_partial', phase: 'profile_prepare' } },
+    })
+  })
+
   test('registers the acquisition settlement fence before waiting for the host', async () => {
     let retained = false
     let acquireEntered!: () => void

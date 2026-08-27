@@ -1100,8 +1100,6 @@ export class OpenCodeLaunchAttempt {
       )
     } catch (error) {
       phaseController.abort(error)
-      if (error instanceof DeadlineError
-        || this.ports.clock.monotonicNow() >= budget.deadlineAtMs) throw new DeadlineError()
       throw error
     } finally {
       signal.removeEventListener('abort', abortPhase)
