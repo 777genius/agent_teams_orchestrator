@@ -121,6 +121,32 @@ export async function readProcessStartTimeMs(
   return output === null ? null : parseProcessStartTime(output)
 }
 
+/**
+ * Native process-generation identity used for destructive POSIX authority.
+ * Linux starttime is measured in boot ticks and is paired with the kernel boot
+ * id, so neither same-second PID reuse nor a reboot can alias a receipt.
+ */
+export function readProcessBirthToken(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  observation: { readFile?: (path: string) => string } = {},
+): string | null {
+  const normalizedPid = Math.trunc(pid)
+  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0 || platform !== 'linux') return null
+  const read = observation.readFile ?? (target => readFileSync(target, 'utf8'))
+  try {
+    const bootId = read('/proc/sys/kernel/random/boot_id').trim().toLowerCase()
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId)) return null
+    const stat = read(`/proc/${normalizedPid}/stat`)
+    const commandEnd = stat.lastIndexOf(')')
+    if (commandEnd < 0) return null
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
+    const starttime = fields[19]
+    if (!starttime || !/^\d+$/.test(starttime)) return null
+    return `linux:${bootId}:${starttime}`
+  } catch { return null }
+}
+
 export async function readProcessCommandLine(
   pid: number,
   platform: NodeJS.Platform = process.platform,
@@ -222,10 +248,10 @@ export function isProcessTreeContainmentAlive(
         let stat: string
         try { stat = readStat(`/proc/${entry}/stat`) }
         catch (error) {
-          // A process disappearing during enumeration is ordinary churn.  It
-          // may be ignored only if the repeated namespace snapshot proves the
-          // whole observation stable; every other read failure is unknown.
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          // ENOENT after enumeration is churn, not negative evidence. Even if
+          // the same numeric name appears in the next directory listing, it
+          // may be a different process generation. A complete scan is the
+          // minimum authority for proving containment empty.
           return null
         }
         const commandEnd = stat.lastIndexOf(')')
@@ -255,6 +281,9 @@ async function waitForPosixProcessGroupExit(
   timeoutMs: number,
   pollMs: number,
   expectedStartedAtMs?: number | null,
+  expectedBirthToken?: string | null,
+  platform: NodeJS.Platform = process.platform,
+  birthTokenReader: (pid: number, platform: NodeJS.Platform) => string | null = readProcessBirthToken,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -265,6 +294,8 @@ async function waitForPosixProcessGroupExit(
     if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
       && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
     if (!isProcessAlive(groupLeaderPid)) return false
+    if (platform === 'linux' && (!expectedBirthToken
+      || birthTokenReader(groupLeaderPid, 'linux') !== expectedBirthToken)) return false
     if (!isPosixProcessGroupAlive(groupLeaderPid)) return true
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }
@@ -272,6 +303,8 @@ async function waitForPosixProcessGroupExit(
   if (Number.isFinite(expectedStartedAtMs) && expectedStartedAtMs !== null
     && await readProcessStartTimeMs(groupLeaderPid) !== expectedStartedAtMs) return false
   if (!isProcessAlive(groupLeaderPid)) return false
+  if (platform === 'linux' && (!expectedBirthToken
+    || birthTokenReader(groupLeaderPid, 'linux') !== expectedBirthToken)) return false
   return !isPosixProcessGroupAlive(groupLeaderPid)
 }
 
@@ -284,6 +317,8 @@ export async function killProcessTreeAndWait(
     /** @deprecated Kept for call compatibility; PID-only taskkill is disabled. */
     taskkillTimeoutMs?: number
     expectedStartedAtMs?: number | null
+    /** Exact native birth authority; required for detached Linux group mutation. */
+    expectedBirthToken?: string | null
     /**
      * Explicit authority to signal a detached, manager-owned POSIX process
      * group whose leader is exactly `pid`. Ordinary children must omit this.
@@ -295,6 +330,8 @@ export async function killProcessTreeAndWait(
     windowsOwnedTreeRelease?: (signal: NodeJS.Signals) => Promise<boolean>
     /** Test-only platform selection; production omits it. */
     platform?: NodeJS.Platform
+    /** Test-only native birth observation; production omits it. */
+    birthTokenReader?: (pid: number, platform: NodeJS.Platform) => string | null
   } = {},
 ): Promise<boolean> {
   if (!pid || !Number.isFinite(pid) || pid <= 0) {
@@ -334,12 +371,22 @@ export async function killProcessTreeAndWait(
     if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null
       && await readProcessStartTimeMs(pid) !== options.expectedStartedAtMs) return false
     if (!isProcessAlive(pid)) return false
+    // Wall-clock process start timestamps (notably `ps lstart`) are not a
+    // generation token. Production group mutation requires Linux boot-id plus
+    // /proc starttime and re-reads it synchronously in the final syscall window.
+    if ((options.platform ?? process.platform) === 'linux') {
+      if (!options.expectedBirthToken
+        || (options.birthTokenReader ?? readProcessBirthToken)(pid, 'linux')
+          !== options.expectedBirthToken) return false
+    } else if (options.expectedBirthToken) return false
     try {
       process.kill(-pid, signal)
     } catch {
       return false
     }
-    return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs, options.expectedStartedAtMs)
+    return waitForPosixProcessGroupExit(pid, timeoutMs, pollMs,
+      options.expectedStartedAtMs, options.expectedBirthToken,
+      options.platform ?? process.platform, options.birthTokenReader)
   }
   try {
     process.kill(pid, signal)

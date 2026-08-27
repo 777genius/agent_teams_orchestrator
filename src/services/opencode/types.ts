@@ -251,6 +251,8 @@ export type OpenCodeHostHandle = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  /** Native process-generation authority (Linux boot id + /proc starttime). */
+  processBirthToken?: string | null
   version: string | null
   state: OpenCodeHostState
   profile: OpenCodePreparedProfile

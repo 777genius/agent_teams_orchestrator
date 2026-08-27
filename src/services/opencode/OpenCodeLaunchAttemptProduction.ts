@@ -251,12 +251,30 @@ export class OpenCodeLaunchHostReleaseLedger {
       else throw error
     }
     const records: OpenCodeLaunchHostCleanupRecord[] = []
+    const insert = (record: OpenCodeLaunchHostCleanupRecord): void => {
+      if (record.attemptId !== expected.attemptId || record.payloadHash !== expected.payloadHash
+        || (expected.generation !== undefined && record.generation > expected.generation)
+        || (expected.currentGeneration !== undefined && record.generation > expected.currentGeneration)) {
+        throw new Error('OpenCode launch host release receipt is foreign [redacted]')
+      }
+      const duplicate = records.find(candidate => candidate.obligationId === record.obligationId)
+      if (duplicate) {
+        if (JSON.stringify(duplicate) !== JSON.stringify(record)) {
+          throw new Error('OpenCode launch host release receipt conflicts [redacted]')
+        }
+        return
+      }
+      records.push(record)
+    }
     try {
       const metadata = await lstat(this.filePath)
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
         throw new Error('OpenCode launch host release receipt is not a regular file [redacted]')
       }
-      records.push(validateLaunchHostReleaseRecord(JSON.parse(await readFile(this.filePath, 'utf8'))))
+      // The legacy path is keyed only by the local attempt directory. Treat it
+      // as untrusted input and fence it before it can enter deduplication or
+      // reach HostManager capability reconciliation.
+      insert(validateLaunchHostReleaseRecord(JSON.parse(await readFile(this.filePath, 'utf8'))))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
@@ -273,14 +291,7 @@ export class OpenCodeLaunchHostReleaseLedger {
       try { decoded = JSON.parse(await readFile(target, 'utf8')) }
       catch { throw new Error('OpenCode launch host release receipt is corrupt [redacted]') }
       const record = validateLaunchHostCleanupRecord(decoded)
-      if (record.attemptId !== expected.attemptId || record.payloadHash !== expected.payloadHash
-        || (expected.generation !== undefined && record.generation > expected.generation)
-        || (expected.currentGeneration !== undefined && record.generation > expected.currentGeneration)) {
-        throw new Error('OpenCode launch host release receipt is foreign [redacted]')
-      }
-      const duplicate = records.findIndex(candidate => candidate.obligationId === record.obligationId)
-      if (duplicate >= 0) records.splice(duplicate, 1)
-      records.push(record)
+      insert(record)
     }
     return records.sort((left, right) => left.generation - right.generation
       || left.obligationId.localeCompare(right.obligationId))
@@ -345,11 +356,16 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }
   const receipt = record.receipt as Record<string, unknown>
-  if (Object.keys(receipt).sort().join(',')
-      !== 'hostKeyDigest,lifetime,pid,processStartedAtMs,receiptId,schemaVersion'
-    || receipt.schemaVersion !== 1 || typeof receipt.receiptId !== 'string'
+  const receiptKeys = Object.keys(receipt).sort().join(',')
+  const receiptV1 = receipt.schemaVersion === 1
+    && receiptKeys === 'hostKeyDigest,lifetime,pid,processStartedAtMs,receiptId,schemaVersion'
+  const receiptV2 = receipt.schemaVersion === 2
+    && receiptKeys === 'hostKeyDigest,lifetime,pid,processBirthToken,processStartedAtMs,receiptId,schemaVersion'
+  if ((!receiptV1 && !receiptV2) || typeof receipt.receiptId !== 'string'
     || typeof receipt.hostKeyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostKeyDigest)
     || !Number.isSafeInteger(receipt.pid) || !Number.isFinite(receipt.processStartedAtMs)
+    || (receiptV2 && (typeof receipt.processBirthToken !== 'string'
+      || !receipt.processBirthToken.startsWith('linux:')))
     || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }
@@ -823,7 +839,7 @@ class OpenCodeProductionLaunchRuntime {
       }) === 'replay'
     }
     if (journal?.finalResponse && exactCurrentGeneration
-      && (journal.cleanupState === 'complete' || inspectionOnly)) {
+      && journal.cleanupState === 'complete') {
       const final = journal.finalResponse
       validateOpenCodeDurableFinalResponse(command.request, final, {
         inputDigest,
@@ -1124,17 +1140,25 @@ class OpenCodeProductionLaunchRuntime {
             await hostReleaseLedger.record(releaseRecord,
               { deadlineAtMs: productionDeadlineAtMs, signal: input.signal })
           } catch (error) {
+            // Publication failure must not make cleanup depend on an already
+            // expired caller deadline. Start the physical release immediately
+            // with a private bounded reserve. Only the wait is caller-bounded;
+            // settlement retains the durable obligation until release proof is
+            // obtained and then token-clears that exact obligation.
             const reserveSignal = new AbortController().signal
+            const reserveDeadlineAtMs = launchMonotonicNow() + 5_000
+            const physicalRelease = openCodeHostManager.releaseHostReference(reference, {
+              signal: reserveSignal,
+              remainingMs: () => Math.max(0, reserveDeadlineAtMs - launchMonotonicNow()),
+            }).then(() => hostReleaseLedger.record({ ...releaseRecord,
+              disposition: 'dispose', releaseState: 'complete' }, {
+                deadlineAtMs: reserveDeadlineAtMs, signal: reserveSignal,
+              }))
+            // Retain a rejection handler even when the caller's wait expires;
+            // the on-disk acquisition obligation remains the restart fence.
+            physicalRelease.catch(() => undefined)
             try {
-              await openCodeHostManager.releaseHostReference(reference, {
-                signal: reserveSignal,
-                remainingMs: () => Math.max(0, productionDeadlineAtMs - launchMonotonicNow()),
-              })
-              const reserveContext = { deadlineAtMs: productionDeadlineAtMs, signal: reserveSignal }
-              const physicallyReleased = { ...releaseRecord, disposition: 'dispose' as const,
-                releaseState: 'complete' as const }
-              await hostReleaseLedger.record(physicallyReleased, reserveContext)
-              await hostReleaseLedger.clear(physicallyReleased, reserveContext)
+              await bounded(physicalRelease, productionDeadlineAtMs, input.signal)
             } catch (releaseError) {
               throw new OpenCodeOperationHostAcquisitionCleanupError(releaseError)
             }

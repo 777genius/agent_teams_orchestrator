@@ -22,6 +22,7 @@ import type { OpenCodeCurrentScopedProfilePlan, OpenCodeScopedPreparedProfile,
   OpenCodeSessionRecord } from './types.js'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
 import { planScopedProfile } from './OpenCodeOperationPolicy.js'
 import { computeOpenCodeLaunchCommandImmutableDigest, computeOpenCodeLaunchCommandInputDigest,
@@ -117,6 +118,26 @@ test('attempt host release ledger preserves every generation and prepublished ac
     await restarted.clear(second)
     expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
       .map(record => record.generation)).toEqual([1])
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('attempt host release ledger fences a foreign legacy slot before capability reconciliation', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-foreign-legacy-'))
+  const file = path.join(directory, 'receipt.json')
+  const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
+    payloadHash: 'b'.repeat(64), generation: 3 }
+  try {
+    await writeFile(file, JSON.stringify({ schemaVersion: 1,
+      attemptId: '123e4567-e89b-42d3-a456-426614174999',
+      payloadHash: 'f'.repeat(64), generation: 1, hostKeyIdentity: identity,
+      receipt: { schemaVersion: 1, receiptId: '123e4567-e89b-42d3-a456-426614174443',
+        hostKeyDigest: 'c'.repeat(64), pid: 443, processStartedAtMs: 12_345,
+        lifetime: 'process' } }))
+    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    await expect(ledger.read(expected)).rejects.toThrow('foreign')
+    await expect(ledger.readAllPending({ attemptId: expected.attemptId,
+      payloadHash: expected.payloadHash, currentGeneration: expected.generation }))
+      .rejects.toThrow('foreign')
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -933,7 +954,7 @@ test('committed projection recovery reports absent, mismatched and foreign remot
 type ProductionSeed = { record: OpenCodeSessionRecord; linkage: OpenCodeLaunchMemberLinkage;
   authority: OpenCodeLaunchMutationIdentity; title: string; text: string }
 
-async function productionRecoveryHarness() {
+async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManager) {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-recovery-e2e-'))
   const projectPath = path.join(directory, 'project')
   await mkdir(projectPath)
@@ -1011,6 +1032,7 @@ async function productionRecoveryHarness() {
   const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
   let memberCreateCount = 0
   let mcpCheckCount = 0
+  let hostReconcileCount = 0
   const remote = new Map<string, { id: string; title: string }>()
   const messages = new Map<string, { info: Record<string, unknown>; parts: Array<{ type: 'text'; text: string }> }>()
   const client = {
@@ -1030,8 +1052,10 @@ async function productionRecoveryHarness() {
   const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: path.join(directory, 'data'),
     profileManager: profileManager as never, sessionStore: sessionStore as never,
     clientFactory: { create: () => client } as never,
-    hostManager: { ensureScopedHostReference: async () => ({ handle: host }), releaseHostReference: async () => {},
-      retainHostLease: async () => {} } as never,
+    hostManager: hostManagerOverride ?? { ensureScopedHostReference: async () => ({ handle: host }), releaseHostReference: async () => {},
+      retainHostLease: async () => {}, reconcileHostReleaseReceipt: async () => {
+        hostReconcileCount += 1
+      } } as never,
     mcpManager: { ensureAppMcp: async () => {
       mcpCheckCount += 1
       throw new Error('MCP must not run before recovery settles')
@@ -1097,6 +1121,7 @@ async function productionRecoveryHarness() {
     return seeded
   }
   return { bridge, command: rawCommand, sessionStore, seedIntent, ledger, target, context,
+    store, acceptedProof, inputDigest, immutableDigest, launchDirectory,
     remote, messages, sessionId, memberIdentity,
     commitClaim: async (seeded: ProductionSeed) => {
       expect(await ledger.claim(target, seeded.authority, context)).toBe('claimed')
@@ -1112,11 +1137,80 @@ async function productionRecoveryHarness() {
     memberCreates: () => memberCreateCount,
     sessionReads: () => sessionReadCount,
     mcpChecks: () => mcpCheckCount,
+    hostReconciles: () => hostReconcileCount,
     dispose: () => rm(directory, { recursive: true, force: true }),
   }
 }
 
 function notFound(): Error { return new Error('request failed (404 Not Found)') }
+
+test('production composition routes an incomplete exact final through real HostManager reconciliation', async () => {
+  const managerDirectory = await mkdtemp(path.join(tmpdir(), 'opencode-production-real-manager-'))
+  const registryPath = path.join(managerDirectory, 'registry.json')
+  await writeFile(registryPath, JSON.stringify({ schemaVersion: 2, hosts: { host: {
+    hostKey: 'host', profileRootKey: 'profile', projectPath: '/static/project',
+    projectBehaviorFingerprint: '2'.repeat(64), baseUrl: 'http://127.0.0.1:44443',
+    port: 44443, pid: 443, processStartedAtMs: 1, version: null,
+    resolvedConfigFingerprint: null, updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
+  } } }))
+  let leaderAlive = true
+  let containmentAlive = true
+  const signals: NodeJS.Signals[] = []
+  const realHostManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+    platform: 'linux', isProcessAlive: () => leaderAlive,
+    isProcessGroupAlive: () => containmentAlive,
+    readProcessStartTimeMs: async () => 1,
+    killProcess: (_pid, signal) => {
+      signals.push(signal); leaderAlive = false; containmentAlive = false
+    },
+    sleepMs: async () => {},
+    fetchJson: async () => ({ status: 200, data: { ok: true } }) })
+  const harness = await productionRecoveryHarness(realHostManager)
+  try {
+    const obligationId = '77777777-7777-4777-8777-777777777777'
+    const failure = { code: 'contract_violation' as const, origin: 'session' as const,
+      retryDisposition: 'never' as const, retryable: false,
+      phase: 'member_materialize' as const, sideEffectsStarted: false }
+    const basis = harness.acceptedProof()
+    const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
+      members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+        pending: [], cleanupPending: [] }, failure }
+    await harness.store.withGeneration({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest,
+      generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000,
+    }, 'begin', async lease => {
+      await lease.commitAcceptedProofResponse(basis, harness.context)
+      await lease.bindHostCleanupObligation(obligationId, harness.context)
+      await lease.commitTerminalResponse(final, 'incomplete', harness.context)
+    }, harness.context)
+    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+      `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
+    await hostLedger.record({ schemaVersion: 3, obligationId,
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1,
+      hostKeyIdentity: final.launchAttempt.retainedHostIdentity!.hostKeyIdentity,
+      disposition: 'dispose', releaseState: 'pending', receipt: {
+        schemaVersion: 1, receiptId: '88888888-8888-4888-8888-888888888888',
+        hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+        pid: 443, processStartedAtMs: 1,
+        lifetime: 'persistent',
+      } }, harness.context)
+
+    await harness.bridge.execute(harness.command)
+    expect((await harness.inspectJournal())?.cleanupState).toBe('complete')
+    expect((await hostLedger.read({ attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash, generation: 1 },
+    harness.context))?.releaseState).toBe('complete')
+    await expect(readFile(registryPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(signals).toEqual(['SIGTERM'])
+  } finally {
+    await harness.dispose()
+    await rm(managerDirectory, { recursive: true, force: true })
+  }
+})
+
 function controlledProofDirectories() {
   const settlements: Array<() => void> = []
   const observedDeadlines: Array<number | undefined> = []

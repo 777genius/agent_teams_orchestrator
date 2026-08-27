@@ -119,9 +119,8 @@ jobs:
           bun test \
             src/services/opencode/OpenCodeLaunchAttemptProduction.test.ts \
             src/services/opencode/OpenCodeLaunchAttemptProductionComposition.test.ts \
+            src/services/opencode/OpenCodeHostManager.test.ts \
             src/utils/processKill.test.ts
-          bun test src/services/opencode/OpenCodeHostManager.test.ts \
-            --test-name-pattern "Windows|win32|restart receipt reconciliation"
       - name: Prove native NTFS handle retention
         timeout-minutes: 10
         run: bun test scripts/windows-publication-native.test.ts

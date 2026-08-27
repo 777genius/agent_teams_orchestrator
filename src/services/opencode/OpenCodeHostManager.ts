@@ -12,6 +12,7 @@ import {
   killProcessTree,
   killProcessTreeAndWait,
   isProcessTreeContainmentAlive,
+  readProcessBirthToken,
   readProcessCommandLine,
   readProcessStartTimeMs,
 } from '../../utils/processKill.js'
@@ -131,11 +132,12 @@ export type OpenCodeHostReferenceCapability = Readonly<{
 }>
 
 export type OpenCodeHostReleaseReceipt = Readonly<{
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   receiptId: string
   hostKeyDigest: string
   pid: number
   processStartedAtMs: number
+  processBirthToken?: string
   lifetime: OpenCodeHostLifetime
 }>
 
@@ -171,6 +173,7 @@ type OpenCodeHostManagerDeps = {
   isProcessGroupAlive?: (leaderPid: number) => boolean | null
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
+  readProcessBirthToken?: (pid: number) => string | null
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
   now?: () => Date
   persistentRegistryPath?: string | null
@@ -228,6 +231,7 @@ type PersistentHostRegistryRecord = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  processBirthToken?: string | null
   version: string | null
   resolvedConfigFingerprint: string | null
   updatedAt: string
@@ -378,6 +382,7 @@ export type OpenCodeScopedHostIdentity = {
 type PersistentHostProcessIdentity = {
   state: 'confirmed' | 'gone' | 'changed' | 'unverified'
   startedAtMs: number | null
+  birthToken: string | null
 }
 
 export type OpenCodePersistentHostReconcileOptions = {
@@ -809,6 +814,8 @@ function assertValidV2RegistryRecord(
     || !Number.isSafeInteger(record.pid) || record.pid! <= 0
     || (record.processStartedAtMs !== undefined && record.processStartedAtMs !== null
       && (!Number.isFinite(record.processStartedAtMs) || record.processStartedAtMs! <= 0))
+    || (record.processBirthToken !== undefined && record.processBirthToken !== null
+      && !isNonblankString(record.processBirthToken))
     || !isNonblankString(record.updatedAt) || !Number.isFinite(Date.parse(record.updatedAt!))
     || (record.resolvedConfigFingerprint !== null && typeof record.resolvedConfigFingerprint !== 'string')
   ) fail()
@@ -854,7 +861,7 @@ function assertValidV2RegistryRecord(
     }
     const allowedRecordKeys = [
       'coordinationProtectedUntil', 'hostKey', 'leases', 'managedConfigFingerprint',
-      'pid', 'port', 'processStartedAtMs', 'profileRootKey', 'projectBehaviorFingerprint',
+      'pid', 'port', 'processBirthToken', 'processStartedAtMs', 'profileRootKey', 'projectBehaviorFingerprint',
       'resolvedConfigFingerprint', 'scopedIdentity', 'scopedTransportToken', 'updatedAt', 'version',
     ]
     if (Object.keys(record).some(key => !allowedRecordKeys.includes(key))) fail()
@@ -901,7 +908,7 @@ function assertValidV2RegistryRecord(
   } else {
     const allowedRecordKeys = [
       'baseUrl', 'coordinationProtectedUntil', 'hostKey', 'leases', 'managedConfigFingerprint',
-      'pid', 'port', 'processStartedAtMs', 'profileRootKey', 'projectBehaviorFingerprint',
+      'pid', 'port', 'processBirthToken', 'processStartedAtMs', 'profileRootKey', 'projectBehaviorFingerprint',
       'projectPath', 'resolvedConfigFingerprint', 'updatedAt', 'version',
     ]
     if (Object.keys(record).some(key => !allowedRecordKeys.includes(key))) fail()
@@ -1707,6 +1714,21 @@ export class OpenCodeHostManager {
     return readProcessStartTimeMs(pid)
   }
 
+  private readProcessBirthToken(pid: number): string | null {
+    if (this.deps.readProcessBirthToken) return this.deps.readProcessBirthToken(pid)
+    // Synthetic process-control dependencies are test authority only. They do
+    // not cause production to manufacture a weak token from wall-clock time.
+    if (this.deps.spawnHostProcess) return null
+    return readProcessBirthToken(pid, this.deps.platform ?? process.platform)
+  }
+
+  private requiresNativeBirthToken(): boolean {
+    return (this.deps.platform ?? process.platform) === 'linux'
+      && (this.deps.readProcessBirthToken !== undefined
+        || (this.deps.spawnHostProcess === undefined
+          && this.deps.readProcessStartTimeMs === undefined))
+  }
+
   private async readProcessCommandLine(pid: number): Promise<string | null> {
     if (this.deps.readProcessCommandLine) {
       return this.deps.readProcessCommandLine(pid)
@@ -1778,13 +1800,13 @@ export class OpenCodeHostManager {
     record: PersistentHostRegistryRecord,
   ): Promise<PersistentHostProcessIdentity> {
     if (!this.isProcessAlive(record.pid)) {
-      return { state: 'gone', startedAtMs: null }
+      return { state: 'gone', startedAtMs: null, birthToken: null }
     }
 
     const startedAtMs = await this.readProcessStartTimeMs(record.pid).catch(() => null)
     if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
       if (!this.isProcessAlive(record.pid)) {
-        return { state: 'gone', startedAtMs: null }
+        return { state: 'gone', startedAtMs: null, birthToken: null }
       }
       // Unit tests commonly inject synthetic process control without creating a
       // real OS process. Production cleanup remains fail-closed when identity
@@ -1795,6 +1817,17 @@ export class OpenCodeHostManager {
       return {
         state: syntheticProcessControl ? 'confirmed' : 'unverified',
         startedAtMs: null,
+        birthToken: null,
+      }
+    }
+
+    const birthToken = this.readProcessBirthToken(record.pid)
+    if (this.requiresNativeBirthToken()) {
+      if (!birthToken || !record.processBirthToken) {
+        return { state: 'unverified', startedAtMs, birthToken }
+      }
+      if (birthToken !== record.processBirthToken) {
+        return { state: 'changed', startedAtMs, birthToken }
       }
     }
 
@@ -1805,13 +1838,13 @@ export class OpenCodeHostManager {
     ) {
       return {
         state: record.processStartedAtMs === startedAtMs ? 'confirmed' : 'changed',
-        startedAtMs,
+        startedAtMs, birthToken,
       }
     }
 
     // A legacy PID-only record has no immutable baseline. updatedAt is not a
     // safe substitute because lease refreshes can move it past a PID reuse.
-    return { state: 'unverified', startedAtMs }
+    return { state: 'unverified', startedAtMs, birthToken }
   }
 
   private async assertPersistentHostProcessIdentity(
@@ -1841,6 +1874,7 @@ export class OpenCodeHostManager {
     timeoutMs: number,
     expectedStartedAtMs?: number | null,
     requireStableContainment = false,
+    expectedBirthToken?: string | null,
   ): Promise<boolean> {
     if (this.deps.killProcess) {
       if (requireStableContainment && !this.isProcessAlive(pid)) return false
@@ -1855,6 +1889,8 @@ export class OpenCodeHostManager {
       // Process birth is re-read immediately before every group mutation.
       // Never carry a prior validation across TERM observation into SIGKILL.
       expectedStartedAtMs,
+      expectedBirthToken,
+      birthTokenReader: candidate => this.readProcessBirthToken(candidate),
       posixProcessGroupLeader: requireStableContainment,
       windowsTaskkillTreeAuthority: requireStableContainment,
       platform: this.deps.platform,
@@ -2106,6 +2142,7 @@ export class OpenCodeHostManager {
       port: handle.port,
       pid: handle.pid,
       processStartedAtMs: handle.processStartedAtMs,
+      processBirthToken: handle.processBirthToken,
       version: handle.version,
       resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
       updatedAt,
@@ -2142,6 +2179,7 @@ export class OpenCodeHostManager {
         port: handle.port,
         pid: handle.pid,
         processStartedAtMs: handle.processStartedAtMs,
+        processBirthToken: handle.processBirthToken,
         version: handle.version,
         resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
         updatedAt: this.nowIso(),
@@ -2654,6 +2692,7 @@ export class OpenCodeHostManager {
         ),
         pid: record.pid,
         processStartedAtMs: identityAfterHealth.startedAtMs ?? record.processStartedAtMs,
+        processBirthToken: record.processBirthToken,
         version: health.version ?? record.version,
         state: 'healthy',
         profile,
@@ -3036,7 +3075,7 @@ export class OpenCodeHostManager {
           ? await this.killOwnedChildAndWait(child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
           : pid !== null && pid !== undefined && await this.killProcessAndWait(
             pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
-            receipt.record.processStartedAtMs, true)
+            receipt.record.processStartedAtMs, true, receipt.record.processBirthToken)
         : await this.killOwnedChildAndWait(
           child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
     }
@@ -3050,7 +3089,7 @@ export class OpenCodeHostManager {
           ? await this.killOwnedChildAndWait(child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
           : forceContainmentAuthority && pid !== null && pid !== undefined && await this.killProcessAndWait(
             pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
-            receipt.record.processStartedAtMs, true)
+            receipt.record.processStartedAtMs, true, receipt.record.processBirthToken)
         : await this.killOwnedChildAndWait(
           child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
     }
@@ -3154,6 +3193,7 @@ export class OpenCodeHostManager {
       handle.resolvedConfigFingerprint = profile.managedConfigFingerprint
       handle.state = 'healthy'
       handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
+      handle.processBirthToken = this.readProcessBirthToken(handle.pid)
       if (
         handle.processStartedAtMs === null &&
         lifetime === 'persistent' &&
@@ -3162,6 +3202,9 @@ export class OpenCodeHostManager {
         throw new Error(
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
         )
+      }
+      if (this.requiresNativeBirthToken() && !handle.processBirthToken) {
+        throw new Error(`OpenCode host pid ${handle.pid} native birth identity could not be captured`)
       }
       if (handle.processStartedAtMs === null && lifetime === 'process') {
         diagnostics.push(
@@ -3469,11 +3512,12 @@ export class OpenCodeHostManager {
     }
     const capability = Object.freeze({ handle }) as OpenCodeHostReferenceCapability
     const receipt = Object.freeze({
-      schemaVersion: 1 as const,
+      schemaVersion: handle.processBirthToken ? 2 as const : 1 as const,
       receiptId: randomUUID(),
       hostKeyDigest: createHash('sha256').update(handle.hostKey).digest('hex'),
       pid: handle.pid,
       processStartedAtMs: handle.processStartedAtMs ?? Number.NaN,
+      ...(handle.processBirthToken ? { processBirthToken: handle.processBirthToken } : {}),
       lifetime: entry.lifetime,
     })
     hostReferenceCapabilities.set(capability, { manager: this, entry, receipt, state: 'available' })
@@ -3493,6 +3537,9 @@ export class OpenCodeHostManager {
     if (!Number.isFinite(authority.receipt.processStartedAtMs)) {
       throw new Error('OpenCode host release receipt birth identity is unavailable [redacted]')
     }
+    if (this.requiresNativeBirthToken() && !authority.receipt.processBirthToken) {
+      throw new Error('OpenCode host release receipt native birth identity is unavailable [redacted]')
+    }
     return Object.freeze({ ...authority.receipt })
   }
 
@@ -3500,11 +3547,13 @@ export class OpenCodeHostManager {
     receipt: OpenCodeHostReleaseReceipt,
     options: Parameters<OpenCodeHostManager['releaseHostReference']>[1] = {},
   ): Promise<void> {
-    if (receipt.schemaVersion !== 1 || typeof receipt.receiptId !== 'string'
+    if ((receipt.schemaVersion !== 1 && receipt.schemaVersion !== 2) || typeof receipt.receiptId !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(receipt.receiptId)
       || typeof receipt.hostKeyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostKeyDigest)
       || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
       || !Number.isFinite(receipt.processStartedAtMs)
+      || (receipt.schemaVersion === 2 && (typeof receipt.processBirthToken !== 'string'
+        || !receipt.processBirthToken.startsWith('linux:')))
       || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
       throw new Error('OpenCode host release receipt is corrupt [redacted]')
     }
@@ -3536,7 +3585,9 @@ export class OpenCodeHostManager {
       if (!matched) return
       registryReceiptFound = true
       const [hostKey, record] = matched
-      if (record.pid !== receipt.pid || record.processStartedAtMs !== receipt.processStartedAtMs) {
+      if (record.pid !== receipt.pid || record.processStartedAtMs !== receipt.processStartedAtMs
+        || (receipt.processBirthToken !== undefined
+          && record.processBirthToken !== receipt.processBirthToken)) {
         throw new Error('OpenCode host release receipt process generation changed [redacted]')
       }
       const durableLeases = normalizePersistentHostLeases(record.leases)
@@ -3568,14 +3619,21 @@ export class OpenCodeHostManager {
     if (observed !== receipt.processStartedAtMs) {
       throw new Error('OpenCode host release receipt process generation changed [redacted]')
     }
+    if (this.requiresNativeBirthToken()
+      && (!receipt.processBirthToken
+        || this.readProcessBirthToken(receipt.pid) !== receipt.processBirthToken)) {
+      throw new Error('OpenCode host release receipt native process generation changed [redacted]')
+    }
     // After an actual process restart no in-memory child handle remains. Exact
     // birth validation still authorizes one bounded containment attempt. The
     // caller retains the durable receipt unless the whole containment unit is
     // physically proven absent.
     const disposed = await this.killProcessAndWait(receipt.pid, 'SIGTERM',
-      OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS, receipt.processStartedAtMs, true)
+      OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS, receipt.processStartedAtMs, true,
+      receipt.processBirthToken)
       || await this.killProcessAndWait(receipt.pid, 'SIGKILL',
-        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS, receipt.processStartedAtMs, true)
+        OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS, receipt.processStartedAtMs, true,
+        receipt.processBirthToken)
     if (!disposed) throw new Error('OpenCode durable host containment cleanup remains incomplete [redacted]')
   }
 
@@ -3754,6 +3812,7 @@ export class OpenCodeHostManager {
             OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
             processIdentity.startedAtMs,
             options.requireStableContainment === true,
+            record.processBirthToken,
           )
       } else {
         terminated = await this.killProcessAndWait(
@@ -3762,6 +3821,7 @@ export class OpenCodeHostManager {
           OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
+          record.processBirthToken,
         )
       }
     } else if (!terminated && entry?.child) {
@@ -3788,6 +3848,7 @@ export class OpenCodeHostManager {
           OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
           processIdentity.startedAtMs,
           options.requireStableContainment === true,
+          record.processBirthToken,
           )
       }
     }

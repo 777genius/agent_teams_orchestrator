@@ -664,6 +664,37 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     } finally { await rm(tempDir, { recursive: true, force: true }) }
   })
 
+  test.skipIf(process.platform !== 'linux')('restart receipt refuses same-second recycled Linux generation', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-native-birth-reuse-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const hostKey = 'native-birth-host'
+    const oldToken = 'linux:11111111-2222-3333-4444-555555555555:100'
+    const newToken = 'linux:11111111-2222-3333-4444-555555555555:101'
+    let signals = 0
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 2, hosts: { [hostKey]: {
+        hostKey, profileRootKey: 'profile', projectPath: '/static/project',
+        projectBehaviorFingerprint: 'behavior', baseUrl: 'http://127.0.0.1:44443',
+        port: 44443, pid: 44443, processStartedAtMs: 1_000, processBirthToken: oldToken,
+        version: null, resolvedConfigFingerprint: null,
+        updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
+      } } }))
+      const manager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+        platform: 'linux', isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => 1_000,
+        readProcessBirthToken: () => newToken,
+        killProcess: () => { signals += 1 }, isProcessGroupAlive: () => true,
+        fetchJson: async () => ({ status: 200, data: {} }), sleepMs: async () => {} })
+      await expect(manager.reconcileHostReleaseReceipt({ schemaVersion: 2,
+        receiptId: '66666666-6666-4666-8666-666666666666',
+        hostKeyDigest: createHash('sha256').update(hostKey).digest('hex'),
+        pid: 44443, processStartedAtMs: 1_000, processBirthToken: oldToken,
+        lifetime: 'persistent' })).rejects.toThrow('identity changed')
+      expect(signals).toBe(0)
+      expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
   test('force cleanup retains registry when the leader vanishes at the force identity read', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-force-identity-race-'))
     const registryPath = path.join(tempDir, 'registry.json')

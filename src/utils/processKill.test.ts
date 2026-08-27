@@ -7,6 +7,7 @@ import {
   isProcessAlive,
   killProcessTreeAndWait,
   readProcessCommandLine,
+  readProcessBirthToken,
   readProcessStartTimeMs,
 } from './processKill.js'
 
@@ -86,6 +87,7 @@ describe('processKill', () => {
     try {
       await expect(killProcessTreeAndWait(44_302, 'SIGKILL', {
         timeoutMs: 10, posixProcessGroupLeader: true,
+        expectedBirthToken: 'linux:boot:42', birthTokenReader: () => 'linux:boot:42',
       })).resolves.toBe(true)
       expect(calls).toEqual([44_302, 44_302, -44_302, 44_302, 44_302, -44_302])
     } finally {
@@ -112,6 +114,7 @@ describe('processKill', () => {
     try {
       await expect(killProcessTreeAndWait(44_304, 'SIGTERM', {
         timeoutMs: 10, pollMs: 1, posixProcessGroupLeader: true,
+        expectedBirthToken: 'linux:boot:42', birthTokenReader: () => 'linux:boot:42',
       })).resolves.toBe(false)
       const negativeCalls = calls.filter(([pid]) => pid < 0)
       expect(negativeCalls).toEqual([[-44_304, 'SIGTERM']])
@@ -166,6 +169,36 @@ describe('processKill', () => {
       platform: 'linux', readdir: () => ['10'],
       readFile: () => stat('churn', identityRead++ === 0 ? 10 : 443, identityRead),
     })).toBeNull()
+  })
+
+  it('treats ENOENT during either complete proc scan as churn, never empty', () => {
+    const gone = new Error('gone') as NodeJS.ErrnoException
+    gone.code = 'ENOENT'
+    expect(isProcessTreeContainmentAlive(443, {
+      platform: 'linux', readdir: () => ['10'], readFile: () => { throw gone },
+    })).toBeNull()
+  })
+
+  it('binds Linux birth to boot id and native start ticks', () => {
+    const boot = '11111111-2222-3333-4444-555555555555'
+    const stat = `44 (same-second) S 1 44 ${Array(16).fill('0').join(' ')} 987654`
+    expect(readProcessBirthToken(44, 'linux', { readFile: target =>
+      target.endsWith('boot_id') ? boot : stat })).toBe(`linux:${boot}:987654`)
+  })
+
+  it('never signals a same-second recycled group when its native birth changes', async () => {
+    const calls: number[] = []
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number) => {
+      calls.push(pid); return true
+    }) as typeof process.kill)
+    try {
+      await expect(killProcessTreeAndWait(44_307, 'SIGTERM', {
+        timeoutMs: 10, posixProcessGroupLeader: true,
+        expectedStartedAtMs: 1_000, expectedBirthToken: 'linux:boot:old',
+        birthTokenReader: () => 'linux:boot:new',
+      })).resolves.toBe(false)
+      expect(calls.every(pid => pid >= 0)).toBe(true)
+    } finally { kill.mockRestore() }
   })
 
   it('fails closed for strict Windows PID-only cleanup and accepts owned job completion', async () => {
