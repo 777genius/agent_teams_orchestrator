@@ -24,6 +24,7 @@ import {
 export { resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeNativeAuthorityArtifacts.js'
 
 const COMMIT_RESOLVE_RESERVE_MS = 250
+const AUTHORITY_EXIT_WAIT_MS = 250
 type WithoutWait<T> = T extends unknown ? Omit<T, 'wait_ms'> : never
 type PendingAuthorityRequest = WithoutWait<OpenCodeCatalogAuthorityRequest>
 
@@ -217,6 +218,15 @@ export class OpenCodeCatalogAuthorityClient {
       }
     } catch { /* cleanup never changes an acknowledged commit */ }
     this.kill()
+    const exitWaitMs = Math.max(0, Math.min(AUTHORITY_EXIT_WAIT_MS,
+      this.#deadline - performance.now()))
+    await Promise.race([
+      this.#child.exited.then(() => undefined, () => undefined),
+      new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, exitWaitMs)
+        timer.unref?.()
+      }),
+    ])
   }
 
   kill(): void {
@@ -224,10 +234,6 @@ export class OpenCodeCatalogAuthorityClient {
     this.#closed = true
     try { this.#child.stdin.end() } catch {}
     try { this.#child.kill('SIGKILL') } catch {}
-    if (process.platform !== 'win32') {
-      // The native launcher makes the attempt a process group before exec.
-      try { process.kill(-this.#child.pid, 'SIGKILL') } catch {}
-    }
   }
 
   async #request(request: PendingAuthorityRequest,

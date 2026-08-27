@@ -1,8 +1,9 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import { resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeCatalogAuthorityClient.js'
+import { OpenCodeCatalogAuthorityClient,
+  resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeCatalogAuthorityClient.js'
 
 describe('native catalog cross-platform source contract', () => {
   test('source resolution prefers a complete release pair, falls back to debug, and reports missing', () => {
@@ -59,6 +60,36 @@ describe('native catalog cross-platform source contract', () => {
     expect(client).toContain('wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining))')
     expect(client).toContain("reply.error === 'DEADLINE'")
     expect(protocol).toContain('id: string; wait_ms: number')
+  })
+
+  test('catalog shutdown never probes or signals a negative process group', async () => {
+    const client = await readFile('src/services/opencode/OpenCodeCatalogAuthorityClient.ts', 'utf8')
+    expect(client).not.toMatch(/process\.kill\s*\(\s*-/)
+    expect(client).not.toMatch(/kill\s*\(\s*-this\.#child\.pid/)
+    expect(client).toContain("this.#child.kill('SIGKILL')")
+    expect(client).toContain('this.#child.exited.then')
+
+    const processKill = spyOn(process, 'kill').mockImplementation(() => true)
+    const childSignals: Array<NodeJS.Signals | number | undefined> = []
+    const child = {
+      pid: 443,
+      stdin: { write: () => 0, flush: () => 0, end: () => {} },
+      stdout: new ReadableStream<Uint8Array>(),
+      exited: Promise.resolve(0),
+      kill: (signal?: NodeJS.Signals | number) => { childSignals.push(signal) },
+      unref: () => {},
+    }
+    try {
+      const authority = new OpenCodeCatalogAuthorityClient({
+        deadline: performance.now() - 1,
+        signal: new AbortController().signal,
+        launcherPath: '/static/launcher', workerPath: '/static/worker',
+        launch: () => child,
+      })
+      await authority.close()
+      expect(childSignals).toEqual(['SIGKILL'])
+      expect(processKill).not.toHaveBeenCalled()
+    } finally { processKill.mockRestore() }
   })
 
   test('launcher enforces same-object Unix exec and locked Windows job launch', async () => {

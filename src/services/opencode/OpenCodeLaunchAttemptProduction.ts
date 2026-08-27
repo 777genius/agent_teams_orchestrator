@@ -1041,6 +1041,83 @@ class OpenCodeProductionLaunchRuntime {
           }])), launchAttempt: final },
       }
     }
+    if (journal?.finalResponse && exactCurrentGeneration
+      && journal.cleanupState === 'incomplete'
+      && journal.finalResponse.members.cleanupPending.length === 0) {
+      const releaseIdentity = {
+        attemptId: command.request.launchAttempt.attemptId,
+        payloadHash: command.request.launchAttempt.payloadHash,
+        currentGeneration: command.request.launchAttempt.generation,
+      }
+      const obligationIds = await hostReleaseLedger.listCleanupObligationIds(
+        releaseIdentity, preflightLedgerContext)
+      const boundObligations = journal.hostCleanupObligations
+      const releaseRecords = await hostReleaseLedger.readAllPending(
+        releaseIdentity, preflightLedgerContext)
+      const boundById = new Map(boundObligations?.map(item => [item.obligationId, item]) ?? [])
+      const hasExactObligationSet = boundObligations !== undefined
+        && JSON.stringify([...obligationIds].sort())
+          === JSON.stringify(boundObligations.map(item => item.obligationId).sort())
+        && releaseRecords.length > 0
+        && releaseRecords.every(record => {
+          const binding = boundById.get(record.obligationId)
+          return binding?.reservationDigest === record.reservationDigest
+            && binding.receiptIdentityDigest === record.receiptIdentityDigest
+        })
+        && !await hostReleaseLedger.hasUnresolvedAcquisition(releaseIdentity, preflightLedgerContext)
+      const legacyRecords = releaseRecords.filter(record => record.releaseState === 'pending'
+        && record.receipt.schemaVersion === 1)
+      if (!hasExactObligationSet || legacyRecords.length > 0) {
+        let legacyRecovered = hasExactObligationSet && legacyRecords.length > 0
+        if (legacyRecovered) {
+          // The terminal member projection is durable intent and is safe to
+          // inspect before recovery. Do not retain a lease, acquire/adopt a
+          // host, or consult the remote session merely to classify cleanup.
+          const keepPersistentAlive = journal.finalResponse.members.committed.length > 0
+          try {
+            for (const releaseRecord of legacyRecords) {
+              await openCodeHostManager.reconcileHostReleaseReceipt(releaseRecord.receipt, {
+                obligationIdentity: releaseRecord,
+                keepPersistentAlive,
+                signal: preflightSignal,
+                remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+              })
+              await hostReleaseLedger.record({ ...releaseRecord, releaseState: 'complete' },
+                preflightLedgerContext)
+            }
+          } catch { legacyRecovered = false }
+        }
+        if (!legacyRecovered) {
+          // In particular, a tokenless Linux v1 receipt without the exact live
+          // retained capability is fenced by HostManager before registry/PID
+          // observation. Project the durable incomplete final immediately,
+          // before priorClaims can retain/acquire/reconcile anything.
+          const final = journal.finalResponse
+          validateOpenCodeDurableFinalResponse(command.request, final, {
+            inputDigest,
+            immutableDigest,
+            generation: command.request.launchAttempt.generation,
+            acceptedProofResponse: journal.acceptedProofResponse,
+            profileBinding: journal.profileBinding,
+            members: command.members.map(member => member.memberIdentity),
+          })
+          const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
+          const failedIds = new Set(final.members.failed.map(item => item.memberIdentity))
+          return {
+            snapshot: { detected: false, hostHealthy: false, projectPath: command.projectPath,
+              profile: null, host: null, config: null, configProviders: null, providers: null,
+              providerAuth: null, agents: [], mcp: null, appMcp: null,
+              probeError: 'launch cleanup requires reconciliation', diagnostics: [] },
+            data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
+              members: Object.fromEntries(command.members.map(member => [member.name, {
+                launchState: committedIds.has(member.memberIdentity) ? 'created'
+                  : failedIds.has(member.memberIdentity) ? 'failed' : 'pending',
+                evidence: [], diagnostics: [],
+              }])), launchAttempt: final },
+          }
+        }
+      }
+    }
     let recoveryHost: Promise<OpenCodeHostHandle> | undefined
     let recoveryReference: Promise<OpenCodeHostReferenceCapability> | undefined
     const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {

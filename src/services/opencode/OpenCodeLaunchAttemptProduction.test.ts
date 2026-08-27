@@ -1310,7 +1310,8 @@ test('production composition routes an incomplete exact final through real HostM
   }
 })
 
-test('production replay keeps a legacy Linux receipt incomplete without touching a recycled host', async () => {
+test.each(['committed', 'claimed'] as const)(
+  'production replay fences a legacy Linux receipt before %s member recovery effects', async memberState => {
   const managerDirectory = await mkdtemp(path.join(tmpdir(), 'opencode-production-legacy-receipt-'))
   const registryPath = path.join(managerDirectory, 'registry.json')
   const registryBytes = JSON.stringify({ schemaVersion: 2, hosts: { host: {
@@ -1334,6 +1335,13 @@ test('production replay keeps a legacy Linux receipt incomplete without touching
     sleepMs: async () => {}, fetchJson: async () => ({ status: 200, data: { ok: true } }) })
   const harness = await productionRecoveryHarness(realHostManager)
   try {
+    const seeded = await harness.seedIntent({ acceptedProof: true, applied: memberState === 'committed' })
+    if (memberState === 'committed') {
+      await harness.commitClaim(seeded)
+      await harness.sessionStore.upsert(seeded.record)
+    } else {
+      expect(await harness.ledger.claim(harness.target, seeded.authority, harness.context)).toBe('claimed')
+    }
     const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
       `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
     const obligation = await hostLedger.reserve({
@@ -1346,9 +1354,13 @@ test('production replay keeps a legacy Linux receipt incomplete without touching
       retryDisposition: 'never' as const, retryable: false,
       phase: 'member_materialize' as const, sideEffectsStarted: false }
     const basis = harness.acceptedProof()
-    const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
-      members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
-        pending: [], cleanupPending: [] }, failure }
+    const final = { ...basis, launchAttempt: { ...basis.launchAttempt,
+      outcome: memberState === 'committed' ? 'succeeded' as const : 'failed' as const },
+      members: memberState === 'committed'
+        ? { committed: [seeded.linkage], failed: [], pending: [], cleanupPending: [] }
+        : { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+          pending: [], cleanupPending: [] },
+      ...(memberState === 'committed' ? {} : { failure }) }
     await hostLedger.record({ ...obligation,
       disposition: 'dispose', releaseState: 'pending', receipt: {
         schemaVersion: 1, receiptId: '99999999-9999-4999-8999-999999999999',
@@ -1364,15 +1376,15 @@ test('production replay keeps a legacy Linux receipt incomplete without touching
       payloadHash: harness.command.request.launchAttempt.payloadHash,
       inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest,
       generation: 1, startedAtMs: Date.now(), totalBudgetMs: 30_000,
-    }, 'begin', async lease => {
-      await lease.commitAcceptedProofResponse(basis, harness.context)
+    }, 'replay', async lease => {
       await lease.bindHostCleanupObligation({ obligationId: exact!.obligationId,
         reservationDigest: exact!.reservationDigest,
         receiptIdentityDigest: exact!.receiptIdentityDigest }, harness.context)
       await lease.commitTerminalResponse(final, 'incomplete', harness.context)
     }, harness.context)
 
-    await harness.bridge.execute(harness.command)
+    const replay = await harness.bridge.execute(harness.command)
+    expect(replay.data.launchAttempt).toEqual(final)
     expect((await harness.inspectJournal())?.cleanupState).toBe('incomplete')
     expect((await hostLedger.readObligation({ attemptId: obligation.attemptId,
       payloadHash: obligation.payloadHash, generation: 1,
@@ -1380,6 +1392,8 @@ test('production replay keeps a legacy Linux receipt incomplete without touching
     expect(await readFile(registryPath, 'utf8')).toBe(registryBytes)
     expect({ processProbes, containmentProbes, signals })
       .toEqual({ processProbes: 0, containmentProbes: 0, signals: 0 })
+    expect(harness.memberCreates()).toBe(0)
+    expect(harness.mcpChecks()).toBe(0)
   } finally {
     await harness.dispose()
     await rm(managerDirectory, { recursive: true, force: true })
