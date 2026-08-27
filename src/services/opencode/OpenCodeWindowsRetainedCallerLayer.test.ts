@@ -5,18 +5,17 @@ import path from 'node:path'
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 
 describe('OpenCode Windows retained caller layer', () => {
-  test('production Windows passive reads use only the out-of-process retained protocol', async () => {
+  test('production Windows passive reads use only the in-process retained authority', async () => {
     const [safe, store] = await Promise.all([
       readFile(new URL('./OpenCodeSafePublication.ts', import.meta.url), 'utf8'),
       readFile(new URL('./OpenCodePassiveSnapshotStore.ts', import.meta.url), 'utf8'),
     ])
     expect(store).toContain('OpenCodeSafePublicationDirectory.openReadOnly')
-    expect(safe).toContain('await authority.openRoot(resolved, false, false)')
-    expect(safe).toContain('namespaceList(this.#windowsKey)')
-    expect(safe).toContain("pinRegular(childName(name), denyWrites, this.#windowsKey)")
-    expect(safe).toContain("namespaceOpen(relative, 'read')")
-    expect(safe).toContain('namespaceRead(opened.token, Number(opened.size))')
-    expect(safe).not.toContain('OpenCodeWindowsPassiveReadAuthority')
+    expect(safe).toContain('OpenCodeWindowsPassiveReadAuthority.open(resolved')
+    expect(safe).toContain('this.#windowsPassiveAuthority.childNames()')
+    expect(safe).toContain('this.#windowsPassiveAuthority.pinRegular(childName(name))')
+    expect(safe).toContain('this.#windowsPassiveAuthority.readBounded(')
+    expect(safe).toContain('new OpenCodeWindowsPublicationAuthorityClient(input)')
     expect(safe).not.toContain('bun:ffi')
   })
 

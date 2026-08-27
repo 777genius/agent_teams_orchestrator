@@ -6,6 +6,7 @@ import {
   OpenCodeWindowsPublicationAuthorityClient,
   type OpenCodeWindowsPublicationAuthorityFactory,
 } from './OpenCodeWindowsPublicationAuthorityClient.js'
+import { OpenCodeWindowsPassiveReadAuthority } from './OpenCodeWindowsPassiveReadAuthority.js'
 import { validOpenCodePublicationLeaf,
   validOpenCodePublicationRoot } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
@@ -159,6 +160,7 @@ export class OpenCodeSafePublicationDirectory {
   readonly #root: string
   readonly #windowsIdentity: { dev: bigint; ino: bigint } | null
   readonly #windowsAuthority: OpenCodeWindowsPublicationAuthorityClient | null
+  readonly #windowsPassiveAuthority: OpenCodeWindowsPassiveReadAuthority | null
   readonly #windowsReadOnly: boolean
   readonly #windowsKey: string
   readonly #ownsWindowsAuthority: boolean
@@ -172,11 +174,13 @@ export class OpenCodeSafePublicationDirectory {
     windowsKey = '.',
     ownsWindowsAuthority = true,
     windowsReadOnly = false,
+    windowsPassiveAuthority: OpenCodeWindowsPassiveReadAuthority | null = null,
   ) {
     this.#handle = handle
     this.#root = root ?? descriptorRoot(handle!.fd)
     this.#windowsIdentity = windowsIdentity
     this.#windowsAuthority = windowsAuthority
+    this.#windowsPassiveAuthority = windowsPassiveAuthority
     this.#windowsKey = windowsKey
     this.#ownsWindowsAuthority = ownsWindowsAuthority
     this.#windowsReadOnly = windowsReadOnly
@@ -186,15 +190,16 @@ export class OpenCodeSafePublicationDirectory {
     if (process.platform !== 'win32') return this.open(directoryPath, options)
     if (!validOpenCodePublicationRoot(directoryPath)) fail()
     const resolved = path.resolve(directoryPath)
-    const authority = (options.windowsAuthorityFactory ?? (input => new OpenCodeWindowsPublicationAuthorityClient(input)))({
-      deadline: options.deadline ?? openCodeMonotonicNow() + 10_000, signal: options.abortSignal,
+    const authority = OpenCodeWindowsPassiveReadAuthority.open(resolved, {
+      deadline: options.deadline ?? openCodeMonotonicNow() + 10_000,
+      signal: options.abortSignal,
     })
     try {
-      const identity = await authority.openRoot(resolved, false, false)
-      return new OpenCodeSafePublicationDirectory(null, resolved, {
-        dev: BigInt(identity.volumeSerial), ino: BigInt(identity.fileId),
-      }, authority, '.', true, true)
-    } catch (error) { await authority.close(); throw error }
+      const identity = authority.stableIdentity()
+      return new OpenCodeSafePublicationDirectory(
+        null, resolved, identity, null, '.', true, true, authority,
+      )
+    } catch (error) { authority.close(); throw error }
   }
 
   static async open(directoryPath: string, options: OpenCodeSafePublicationOpenOptions = {}): Promise<OpenCodeSafePublicationDirectory> {
@@ -262,6 +267,10 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async #assertWindowsRoot(): Promise<void> {
+    if (this.#windowsPassiveAuthority) {
+      try { this.#windowsPassiveAuthority.validate() } catch { fail() }
+      return
+    }
     if (!this.#windowsAuthority) return
     await this.#windowsAuthority.validateRoot().catch(fail)
   }
@@ -273,6 +282,7 @@ export class OpenCodeSafePublicationDirectory {
 
   /** Stable identity captured by the opened directory, even when Windows uses its shared pathname. */
   async stableIdentity(): Promise<Readonly<{ dev: bigint; ino: bigint }>> {
+    if (this.#windowsPassiveAuthority) return this.#windowsPassiveAuthority.stableIdentity()
     if (this.#windowsIdentity) return this.#windowsIdentity
     const metadata = await this.#handle!.stat({ bigint: true }).catch(fail)
     if (!metadata.isDirectory()) fail()
@@ -288,6 +298,10 @@ export class OpenCodeSafePublicationDirectory {
   /** Retains the primary SQLite object without delete sharing until this directory closes. */
   async pinRegularFile(name: string, denyWrites = false): Promise<void> {
     if (this.#windowsReadOnly && !denyWrites) fail()
+    if (this.#windowsPassiveAuthority) {
+      try { this.#windowsPassiveAuthority.pinRegular(childName(name)) } catch { fail() }
+      return
+    }
     if (this.#windowsAuthority) await this.#windowsAuthority.pinRegular(childName(name), denyWrites, this.#windowsKey).catch(fail)
   }
 
@@ -295,6 +309,13 @@ export class OpenCodeSafePublicationDirectory {
     await this.#assertWindowsRoot()
     const child = this.child(name)
     if (process.platform === 'win32') {
+      if (this.#windowsPassiveAuthority) {
+        let authority: OpenCodeWindowsPassiveReadAuthority
+        try { authority = this.#windowsPassiveAuthority.openChild(childName(name)) } catch (error) { throw error }
+        return new OpenCodeSafePublicationDirectory(
+          null, child, authority.stableIdentity(), null, '.', true, true, authority,
+        )
+      }
       if (!this.#windowsAuthority) fail()
       const childKey = this.#windowsKey === '.' ? childName(name) : `${this.#windowsKey}/${childName(name)}`
       const identity = await this.#windowsAuthority.openChildDirectory(this.#windowsKey, childKey, childName(name)).catch(fail)
@@ -450,6 +471,9 @@ export class OpenCodeSafePublicationDirectory {
   }
 
   async childNames(): Promise<readonly string[]> {
+    if (this.#windowsPassiveAuthority) {
+      try { return this.#windowsPassiveAuthority.childNames() } catch { return fail() }
+    }
     if (this.#windowsAuthority) return this.#namespacePort().namespaceList(this.#windowsKey)
     await this.#assertWindowsRoot()
     const names = await readdir(this.#root)
@@ -494,6 +518,16 @@ export class OpenCodeSafePublicationDirectory {
     testHooks?: { afterPathIdentityCaptured?: () => void | Promise<void> },
   ): Promise<Uint8Array | null> {
     await this.#assertWindowsRoot()
+    if (this.#windowsPassiveAuthority) {
+      try {
+        return await this.#windowsPassiveAuthority.readBounded(
+          childName(name), maximumBytes, abortSignal, testHooks?.afterPathIdentityCaptured,
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        return fail()
+      }
+    }
     if (this.#windowsAuthority) {
       const relative = this.#relative(name)
       let metadata
@@ -964,7 +998,8 @@ export class OpenCodeSafePublicationDirectory {
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise
     this.#closePromise = (async () => {
-      if (this.#windowsAuthority && this.#ownsWindowsAuthority) await this.#windowsAuthority.close()
+      if (this.#windowsPassiveAuthority && this.#ownsWindowsAuthority) this.#windowsPassiveAuthority.close()
+      else if (this.#windowsAuthority && this.#ownsWindowsAuthority) await this.#windowsAuthority.close()
       else await this.#handle?.close()
     })()
     return this.#closePromise

@@ -25,6 +25,9 @@ const FILE_NON_DIRECTORY_FILE = 0x0000_0040
 const FILE_OPEN_REPARSE_POINT = 0x0020_0000
 const FILE_BOTH_DIRECTORY_INFORMATION = 3
 const STATUS_NO_MORE_FILES = -0x7fff_fffa
+const STATUS_NO_SUCH_FILE = -0x3fff_fff1
+const STATUS_OBJECT_NAME_NOT_FOUND = -0x3fff_ffcc
+const STATUS_OBJECT_PATH_NOT_FOUND = -0x3fff_ffc6
 const FILE_DEVICE_DISK = 7
 const FILE_REMOVABLE_MEDIA = 0x0000_0001
 const FILE_REMOTE_DEVICE = 0x0000_0010
@@ -55,6 +58,11 @@ function nt(): any {
 
 function wide(value: string): Buffer { return Buffer.from(`${value}\0`, 'utf16le') }
 function rejected(): Error { return new Error('OpenCode passive Windows authority is unavailable [redacted]') }
+function missing(): Error {
+  return Object.assign(new Error('OpenCode passive Windows publication is unavailable [redacted]'), {
+    code: 'ENOENT',
+  })
+}
 function address(buffer: Buffer): bigint { return BigInt(ptr(buffer) as unknown as number) }
 function closeHandle(handle: Handle): void { try { win32().CloseHandle(handle) } catch {} }
 
@@ -84,6 +92,8 @@ function openRelative(parent: Handle, name: string, directory: boolean): Handle 
     | (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE)
   const status = Number(nt().NtCreateFile(ptr(result), access, ptr(attributes), ptr(io), null, 0,
     FILE_SHARE_READ, 1, options, null, 0))
+  if (status === STATUS_NO_SUCH_FILE || status === STATUS_OBJECT_NAME_NOT_FOUND
+    || status === STATUS_OBJECT_PATH_NOT_FOUND) throw missing()
   if (status < 0) throw rejected()
   const handle = result.readBigUInt64LE(0)
   if (handle === INVALID_HANDLE || handle === 0n) throw rejected()
@@ -263,11 +273,19 @@ export class OpenCodeWindowsPassiveReadAuthority {
 
   pinRegular(name: string): Identity { return this.#pinRegular(name).value }
 
-  async readBounded(name: string, maximumBytes: number, signal?: AbortSignal): Promise<Uint8Array | null> {
+  async readBounded(
+    name: string,
+    maximumBytes: number,
+    signal?: AbortSignal,
+    afterIdentityCaptured?: () => void | Promise<void>,
+  ): Promise<Uint8Array | null> {
     guard(this.#options)
     if (signal?.aborted || !Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw rejected()
     const pinned = this.#pinRegular(name)
     if (pinned.value.size > BigInt(maximumBytes)) return null
+    await afterIdentityCaptured?.()
+    guard(this.#options)
+    if (signal?.aborted) throw rejected()
     const bytes = Buffer.alloc(maximumBytes + 1)
     const count = Buffer.alloc(4)
     if (!win32().ReadFile(pinned.handle, ptr(bytes), bytes.byteLength, ptr(count), null)) throw rejected()

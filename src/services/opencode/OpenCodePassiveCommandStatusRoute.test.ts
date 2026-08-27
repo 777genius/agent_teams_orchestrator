@@ -291,20 +291,19 @@ describe('OpenCode passive command-status production route', () => {
   })
 
   test('keeps the Windows passive contract native, retained, no-follow and replacement-resistant', async () => {
-    const [route, safePublication, client, protocol, native] = await Promise.all([
+    const [route, safePublication, passiveAuthority] = await Promise.all([
       readFile(import.meta.path.replace(/\.test\.ts$/, '.ts'), 'utf8'),
       readFile(new URL('./OpenCodeSafePublication.ts', import.meta.url), 'utf8'),
-      readFile(new URL('./OpenCodeWindowsPublicationAuthorityClient.ts', import.meta.url), 'utf8'),
-      readFile(new URL('./OpenCodeWindowsPublicationAuthorityProtocol.ts', import.meta.url), 'utf8'),
-      readFile(new URL('../../../native/opencode-catalog-authority/src/windows_publication.rs', import.meta.url), 'utf8'),
+      readFile(new URL('./OpenCodeWindowsPassiveReadAuthority.ts', import.meta.url), 'utf8'),
     ])
     expect(route).toContain('OpenCodeSafePublicationDirectory.openReadOnly')
     expect(route).toContain("root.pinRegularFile('command-outcomes.json', true)")
-    expect(safePublication).toContain('await this.#windowsAuthority.pinRegular')
-    expect(client).toContain("op: denyWrites ? 'PIN_REGULAR_READONLY' : 'PIN_REGULAR'")
-    expect(protocol).toContain("'PIN_REGULAR' | 'PIN_REGULAR_READONLY'")
-    expect(native).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
-    expect(native).toContain('pinned: Vec<std::fs::File>')
-    expect(native).not.toContain('FILE_SHARE_DELETE')
+    expect(safePublication).toContain('this.#windowsPassiveAuthority.pinRegular(childName(name))')
+    expect(safePublication).toContain('this.#windowsPassiveAuthority.readBounded(')
+    expect(passiveAuthority).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
+    expect(passiveAuthority).toContain('GetFileInformationByHandleEx')
+    expect(passiveAuthority).toContain('NtQueryInformationFile')
+    expect(passiveAuthority).toContain('FILE_SHARE_READ')
+    expect(passiveAuthority).not.toContain('FILE_SHARE_DELETE')
   })
 })
