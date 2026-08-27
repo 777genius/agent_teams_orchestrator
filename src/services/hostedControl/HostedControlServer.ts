@@ -267,7 +267,7 @@ export class HostedControlServer {
     }
   }
 
-  #handleConnection(socket: Socket, initialData = Buffer.alloc(0)): void {
+  #handleConnection(socket: Socket, initialData: Buffer = Buffer.alloc(0)): void {
     if (this.#stopping || !this.#server) { socket.destroy(); return }
     socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     let chunks: Buffer[] = []
@@ -657,6 +657,10 @@ export class HostedControlServer {
     } catch { socket.destroy(); return }
     this.#leaseConsumed = true
     this.#leaseSocket = socket
+    socket.once('end', () => {
+      if (this.#leaseSocket === socket) this.#leaseSocket = null
+      socket.destroy()
+    })
     socket.once('close', () => { if (this.#leaseSocket === socket) this.#leaseSocket = null })
     if (admission.protocol === 'legacy') {
       const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, ownerBinding }
@@ -1015,7 +1019,11 @@ async function proveSocketPathIsServerOwned(
   })
 }
 
-function consumePublicationProbe(socket: Socket, probe: PublicationProbe, initialData = Buffer.alloc(0)): void {
+function consumePublicationProbe(
+  socket: Socket,
+  probe: PublicationProbe,
+  initialData: Buffer = Buffer.alloc(0),
+): void {
   let bytes = Buffer.from(initialData)
   socket.setTimeout(HOSTED_CONTROL_READ_DEADLINE_MS, () => {
     socket.destroy()

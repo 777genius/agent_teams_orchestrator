@@ -52,6 +52,7 @@ const hostedActualOwnerLaunchPurpose =
   'agent-teams.hosted-actual-owner-acceptance.launch-descriptor/v1'
 const hostedActualOwnerBuildRecipePurpose =
   'agent-teams.hosted-actual-owner-acceptance.build-recipe/v1'
+const hostedControlBuiltOwnerPinFeature = 'HOSTED_CONTROL_BUILT_OWNER_PIN'
 const sanitizedBuildEnvironment = Object.freeze({
   LANG: 'C',
   LC_ALL: 'C',
@@ -1046,12 +1047,19 @@ for (let i = 0; i < args.length; i += 1) {
     continue
   }
   if (arg === '--feature' && args[i + 1]) {
+    if (args[i + 1] === hostedControlBuiltOwnerPinFeature) {
+      throw new Error('HOSTED_CONTROL_BUILT_OWNER_PIN is reserved for the final production build')
+    }
     featureSet.add(args[i + 1]!)
     i += 1
     continue
   }
   if (arg.startsWith('--feature=')) {
-    featureSet.add(arg.slice('--feature='.length))
+    const feature = arg.slice('--feature='.length)
+    if (feature === hostedControlBuiltOwnerPinFeature) {
+      throw new Error('HOSTED_CONTROL_BUILT_OWNER_PIN is reserved for the final production build')
+    }
+    featureSet.add(feature)
   }
 }
 for (const feature of productionFeatures) {
@@ -1343,6 +1351,10 @@ function extendBuildArgs(cmd: string[], includeExternals = true): string[] {
 }
 
 function runBuild(cmd: string[], cwd = repositoryRoot): void {
+  // Trusted-build supervisor invariant: this script invokes only synchronous,
+  // foreground Git/Bun/compiler work. These tools must not be launched detached,
+  // unrefed, through setsid, or otherwise instructed to escape the inherited
+  // process group; spawnSync remains responsible for waiting for each tool.
   const proc = Bun.spawnSync({
     cmd,
     cwd,
@@ -1746,7 +1758,7 @@ if (compile) {
       '--conditions',
       'bun',
     ])
-    runBuild(cliBuild)
+    if (!buildHostedActualOwner) runBuild(cliBuild)
 
     if (buildHostedActualOwner) {
       const committedBuildRoot = materializeCommittedBuildRoot(stagingOutdir)
@@ -1926,6 +1938,12 @@ if (compile) {
         JSON.stringify(finalWrapperIdentity) !== JSON.stringify(wrapperIdentity)) {
         throw new Error('Hosted actual-owner authenticated closure changed during build')
       }
+      runBuild(dev ? cliBuild : [
+        ...cliBuild,
+        `--feature=${hostedControlBuiltOwnerPinFeature}`,
+        '--define',
+        `HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST=${JSON.stringify(`sha256:${launcherIdentity.sha256}`)}`,
+      ])
       unlinkIfPresent(hostedActualOwnerMetafile)
       unlinkIfPresent(trustedBunSnapshot)
       rmSync(committedBuildRoot, { recursive: true, force: true })

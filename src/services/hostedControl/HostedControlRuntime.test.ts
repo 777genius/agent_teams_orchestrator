@@ -61,6 +61,7 @@ describe('HostedControlRuntime', () => {
         proofKeyId: createHash('sha256').update(activationSecret).digest('hex'),
       },
       approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
+      expectedOwnerArtifactDigest: `sha256:${'e'.repeat(64)}`,
       secret: activationSecret,
       guard: {
         lost: new Promise<void>(() => undefined),
@@ -168,6 +169,7 @@ describe('HostedControlRuntime', () => {
         proofKeyId: 'f'.repeat(64),
       },
       approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
+      expectedOwnerArtifactDigest: `sha256:${'e'.repeat(64)}`,
       secret: Buffer.alloc(32, 0xa5),
       guard: {
         lost,
@@ -238,6 +240,7 @@ describe('HostedControlRuntime', () => {
         proofKeyId: 'f'.repeat(64),
       },
       approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
+      expectedOwnerArtifactDigest: `sha256:${'e'.repeat(64)}`,
       secret,
       guard: {
         lost: new Promise<void>(() => undefined),

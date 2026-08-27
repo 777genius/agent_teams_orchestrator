@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
+import { dlopen, FFIType, ptr, read as ffiRead, type Pointer } from 'bun:ffi'
 import { close, fstat, read } from 'node:fs'
 import { createReadStream } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
@@ -6,13 +7,22 @@ import { promisify } from 'node:util'
 import type { HostedControlRuntimeConfig } from './HostedControlRuntimeConfig.js'
 
 export const HOSTED_CONTROL_BOOTSTRAP_FORMAT = 'agent-teams.hosted-control.bootstrap/v1'
+export const HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT = 'agent-teams.hosted-control.launcher-lease/v1'
 export const HOSTED_CONTROL_BOOTSTRAP_FD = 5
 export const HOSTED_CONTROL_LAUNCHER_LEASE_FD = 3
 export const HOSTED_CONTROL_LIVENESS_FD = 4
 export const HOSTED_CONTROL_BOOTSTRAP_DEADLINE_MS = 5_000
 export const HOSTED_CONTROL_BOOTSTRAP_MAX_HEADER_BYTES = 64 * 1024
-const MAX_LEASE_ARTIFACT_BYTES = 64 * 1024
+export const HOSTED_CONTROL_LAUNCHER_LEASE_MAX_BYTES = 64 * 1024
 const AUTHENTICATOR_BYTES = 32
+const F_GETFL = 3
+const F_SETFL = 4
+const F_GET_SEALS = 1034
+const O_NONBLOCK = 0x800
+const SOL_SOCKET = 1
+const SO_TYPE = 3
+const SOCK_STREAM = 1
+const REQUIRED_LEASE_SEALS = 0x000f // SEAL | SHRINK | GROW | WRITE
 
 // FD5 carries exactly one frame and then EOF:
 //   u32be(header length) || canonical UTF-8 JSON header || 32-byte key ||
@@ -27,7 +37,17 @@ export type HostedControlLeaseEvidence = {
   gid: number
   mode: number
   launcherLeaseId: string
-  launcherArtifactDigest: string
+  leaseArtifactDigest: string
+}
+
+export type HostedControlLauncherLeaseV1 = {
+  format: typeof HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT
+  launcherLeaseId: string
+  ownerArtifactDigest: `sha256:${string}`
+  bootstrapDigest: string
+  proofKeyId: string
+  ownerGeneration: number
+  ownerSessionId: string
 }
 
 export type HostedControlBootstrapBinding = {
@@ -81,6 +101,7 @@ export type HostedControlBootstrapAdmission = {
   config: Omit<HostedControlRuntimeConfig, 'secretFile'>
   bootstrapBinding: HostedControlBootstrapBinding
   approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
+  expectedOwnerArtifactDigest: `sha256:${string}`
   secret: Buffer
   guard: HostedControlDescriptorGuard
 }
@@ -104,7 +125,11 @@ const SIGNED_MANIFEST_KEYS = [
 ] as const
 const EVIDENCE_KEYS = [
   'device', 'inode', 'uid', 'gid', 'mode', 'launcherLeaseId',
-  'launcherArtifactDigest',
+  'leaseArtifactDigest',
+] as const
+const LEASE_KEYS = [
+  'format', 'launcherLeaseId', 'ownerArtifactDigest', 'bootstrapDigest',
+  'proofKeyId', 'ownerGeneration', 'ownerSessionId',
 ] as const
 
 /**
@@ -113,17 +138,21 @@ const EVIDENCE_KEYS = [
  * filesystem/runtime effects after the returned admission is available.
  */
 export async function readHostedControlBootstrap(options: {
+  expectedOwnerArtifactDigest: `sha256:${string}`
   bootstrapFd?: number
   launcherLeaseFd?: number
   livenessFd?: number
   deadlineMs?: number
-} = {}): Promise<HostedControlBootstrapAdmission> {
+  /** Test-only rejection injection after descriptor ownership transfers to the guard. */
+  afterGuardCreated?: () => void
+}): Promise<HostedControlBootstrapAdmission> {
   const bootstrapFd = options.bootstrapFd ?? HOSTED_CONTROL_BOOTSTRAP_FD
   const launcherLeaseFd = options.launcherLeaseFd ?? HOSTED_CONTROL_LAUNCHER_LEASE_FD
   const livenessFd = options.livenessFd ?? HOSTED_CONTROL_LIVENESS_FD
   const deadlineMs = options.deadlineMs ?? HOSTED_CONTROL_BOOTSTRAP_DEADLINE_MS
   let secret: Buffer | null = null
   let admitted = false
+  let guard: HostedControlDescriptorGuard | undefined
   const deadlineAt = Date.now() + deadlineMs
   try {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) fail()
@@ -132,7 +161,7 @@ export async function readHostedControlBootstrap(options: {
       checkedFstat(launcherLeaseFd), checkedFstat(livenessFd), checkedFstat(bootstrapFd),
     ])
     ensureBeforeDeadline(deadlineAt)
-    validateDescriptorKinds(descriptorStats)
+    validateDescriptorKinds(descriptorStats, livenessFd)
     const frame = await readOneUseFrame(bootstrapFd, deadlineAt)
     let header: HostedControlBootstrapHeader
     try {
@@ -152,12 +181,17 @@ export async function readHostedControlBootstrap(options: {
     } finally {
       frame.fill(0)
     }
-    await validateLeaseEvidence(launcherLeaseFd, descriptorStats[0], header.leaseEvidence)
+    const lease = await validateLeaseEvidence(
+      launcherLeaseFd, descriptorStats[0], header.leaseEvidence,
+    )
     validateBootstrapBinding(
-      header.bootstrapBinding, header.approvalActivationV2, header.leaseEvidence, secret,
+      header, lease, secret, options.expectedOwnerArtifactDigest,
     )
     ensureBeforeDeadline(deadlineAt)
-    const guard = createDescriptorGuard(launcherLeaseFd, livenessFd, header.leaseEvidence)
+    if (!(await descriptorHasLiveWriter(livenessFd))) fail()
+    guard = createDescriptorGuard(launcherLeaseFd, livenessFd, header.leaseEvidence)
+    options.afterGuardCreated?.()
+    ensureBeforeDeadline(deadlineAt)
     const config: Omit<HostedControlRuntimeConfig, 'secretFile'> = {
       socketPath: header.socketPath,
       claudeRoot: header.claudeRoot,
@@ -177,20 +211,27 @@ export async function readHostedControlBootstrap(options: {
       config,
       bootstrapBinding: header.bootstrapBinding,
       approvalActivationV2: header.approvalActivationV2,
+      expectedOwnerArtifactDigest: lease.ownerArtifactDigest,
       secret,
       guard,
     }
     admitted = true
     return result
   } catch {
-    fail()
+    await guard?.close().catch(() => undefined)
+    return fail()
   } finally {
     await closeAsync(bootstrapFd).catch(() => undefined)
     if (!admitted) {
       secret?.fill(0)
-      await Promise.all([...new Set([launcherLeaseFd, livenessFd])].map(fd =>
-        closeAsync(fd).catch(() => undefined),
-      ))
+      // After construction the guard exclusively owns FD3/FD4. Its close was
+      // awaited above; closing those raw numbers again could hit descriptors
+      // that were opened in the meantime and reused the same numbers.
+      if (guard === undefined) {
+        await Promise.all([...new Set([launcherLeaseFd, livenessFd])].map(fd =>
+          closeAsync(fd).catch(() => undefined),
+        ))
+      }
     }
   }
 }
@@ -246,7 +287,7 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
       uid: integer(evidence.uid, 0), gid: integer(evidence.gid, 0),
       mode: integer(evidence.mode, 0, 0o777),
       launcherLeaseId: exactString(evidence.launcherLeaseId, ID),
-      launcherArtifactDigest: exactString(evidence.launcherArtifactDigest, /^[0-9a-f]{64}$/),
+      leaseArtifactDigest: exactString(evidence.leaseArtifactDigest, /^[0-9a-f]{64}$/),
     },
   }
   if (header.format !== HOSTED_CONTROL_BOOTSTRAP_FORMAT || header.claudeRoot === header.socketPath) fail()
@@ -254,14 +295,22 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
 }
 
 function validateBootstrapBinding(
-  binding: HostedControlBootstrapBinding,
-  activation: HostedApprovalActivationV2BootstrapExpectation,
-  evidence: HostedControlLeaseEvidence,
+  header: HostedControlBootstrapHeader,
+  lease: HostedControlLauncherLeaseV1,
   secret: Buffer,
+  expectedOwnerArtifactDigest: unknown,
 ): void {
-  if (binding.ownerArtifactDigest !== `sha256:${evidence.launcherArtifactDigest}` ||
-    binding.proofKeyId !== createHash('sha256').update(secret).digest('hex') ||
-    activation.ownerArtifactDigest !== binding.ownerArtifactDigest) fail()
+  const { bootstrapBinding: binding, approvalActivationV2: activation } = header
+  if (exactString(expectedOwnerArtifactDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerArtifactDigest) fail()
+  if (lease.launcherLeaseId !== header.leaseEvidence.launcherLeaseId ||
+    lease.ownerArtifactDigest !== binding.ownerArtifactDigest ||
+    lease.ownerArtifactDigest !== activation.ownerArtifactDigest ||
+    lease.bootstrapDigest !== binding.bootstrapDigest ||
+    lease.proofKeyId !== binding.proofKeyId ||
+    lease.proofKeyId !== createHash('sha256').update(secret).digest('hex') ||
+    lease.ownerGeneration !== header.ownerGeneration ||
+    lease.ownerGeneration !== activation.admissionOwnerGeneration ||
+    lease.ownerSessionId !== header.ownerSessionId) fail()
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
@@ -297,24 +346,34 @@ async function checkedFstat(fd: number): Promise<BigIntStats> {
   } catch { fail() }
 }
 
-function validateDescriptorKinds([lease, liveness, bootstrap]: BigIntStats[]): void {
-  if (!lease.isFile() || (!liveness.isFIFO() && !liveness.isSocket()) ||
+function validateDescriptorKinds(
+  [lease, liveness, bootstrap]: BigIntStats[],
+  livenessFd: number,
+): void {
+  if (!lease.isFile() || !liveness.isSocket() || !descriptorIsStreamSocket(livenessFd) ||
     (!bootstrap.isFIFO() && !bootstrap.isSocket())) fail()
   const identities = [lease, liveness, bootstrap].map(stat => `${stat.dev}:${stat.ino}`)
   if (new Set(identities).size !== identities.length) fail()
 }
 
-async function validateLeaseEvidence(fd: number, stat: BigIntStats, evidence: HostedControlLeaseEvidence): Promise<void> {
+async function validateLeaseEvidence(
+  fd: number,
+  stat: BigIntStats,
+  evidence: HostedControlLeaseEvidence,
+): Promise<HostedControlLauncherLeaseV1> {
   const uid = safeStatNumber(stat.uid)
   const gid = safeStatNumber(stat.gid)
   const mode = safeStatNumber(stat.mode & 0o777n)
   const size = safeStatNumber(stat.size)
   if (String(stat.dev) !== evidence.device || String(stat.ino) !== evidence.inode ||
     uid !== evidence.uid || gid !== evidence.gid || mode !== evidence.mode ||
-    (stat.mode & 0o077n) !== 0n || (process.getuid?.() !== undefined && uid !== process.getuid?.()) ||
-    size < 1 || size > MAX_LEASE_ARTIFACT_BYTES) fail()
+    stat.nlink !== 0n || (stat.mode & 0o177n) !== 0n ||
+    (process.getuid?.() !== undefined && uid !== process.getuid?.()) ||
+    size < 2 || size > HOSTED_CONTROL_LAUNCHER_LEASE_MAX_BYTES ||
+    !hasRequiredLeaseSeals(fd)) fail()
   const artifact = Buffer.allocUnsafe(size)
   let digest: string | null = null
+  let lease: HostedControlLauncherLeaseV1 | null = null
   try {
     let offset = 0
     while (offset < artifact.length) {
@@ -324,12 +383,85 @@ async function validateLeaseEvidence(fd: number, stat: BigIntStats, evidence: Ho
     }
     const after = await checkedFstat(fd)
     if (after.dev !== stat.dev || after.ino !== stat.ino || after.uid !== stat.uid ||
-      after.gid !== stat.gid || after.mode !== stat.mode || after.size !== stat.size) fail()
+      after.gid !== stat.gid || after.mode !== stat.mode || after.size !== stat.size ||
+      after.nlink !== stat.nlink || !hasRequiredLeaseSeals(fd)) fail()
     digest = createHash('sha256').update(artifact).digest('hex')
+    lease = decodeCanonicalLease(artifact)
   } finally {
     artifact.fill(0)
   }
-  if (digest === null || digest !== evidence.launcherArtifactDigest) fail()
+  if (digest === null || digest !== evidence.leaseArtifactDigest || lease === null) fail()
+  return lease
+}
+
+function decodeCanonicalLease(bytes: Buffer): HostedControlLauncherLeaseV1 {
+  let text: string
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { fail() }
+  let unknown: unknown
+  try { unknown = JSON.parse(text) } catch { fail() }
+  const raw = exactRecord(unknown, LEASE_KEYS)
+  if (JSON.stringify(raw) !== text) fail()
+  return {
+    format: exactString(raw.format, /^agent-teams\.hosted-control\.launcher-lease\/v1$/) as typeof HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT,
+    launcherLeaseId: exactString(raw.launcherLeaseId, ID),
+    ownerArtifactDigest: exactString(raw.ownerArtifactDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+    bootstrapDigest: exactString(raw.bootstrapDigest, /^[0-9a-f]{64}$/),
+    proofKeyId: exactString(raw.proofKeyId, /^[0-9a-f]{64}$/),
+    ownerGeneration: integer(raw.ownerGeneration, 1),
+    ownerSessionId: exactString(raw.ownerSessionId, /^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/),
+  }
+}
+
+let leaseSealLibrary: ReturnType<typeof openLeaseSealLibrary> | undefined
+function openLeaseSealLibrary() {
+  if (process.platform !== 'linux') fail()
+  return dlopen('libc.so.6', {
+    fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    getsockopt: {
+      args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    read: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+    __errno_location: { args: [], returns: FFIType.ptr },
+  })
+}
+function descriptorIsStreamSocket(fd: number): boolean {
+  try {
+    leaseSealLibrary ??= openLeaseSealLibrary()
+    const socketType = new Int32Array(1)
+    const length = new Uint32Array([socketType.byteLength])
+    return leaseSealLibrary.symbols.getsockopt(
+      fd, SOL_SOCKET, SO_TYPE, ptr(socketType), ptr(length),
+    ) === 0 && length[0] === socketType.byteLength && socketType[0] === SOCK_STREAM
+  } catch { fail() }
+}
+function getDescriptorSeals(fd: number): number {
+  try {
+    leaseSealLibrary ??= openLeaseSealLibrary()
+    return leaseSealLibrary.symbols.fcntl(fd, F_GET_SEALS, 0)
+  } catch { fail() }
+}
+function hasRequiredLeaseSeals(fd: number): boolean {
+  const seals = getDescriptorSeals(fd)
+  return seals >= 0 && (seals & REQUIRED_LEASE_SEALS) === REQUIRED_LEASE_SEALS
+}
+
+function descriptorHasLiveWriter(fd: number): boolean {
+  leaseSealLibrary ??= openLeaseSealLibrary()
+  const flags = leaseSealLibrary.symbols.fcntl(fd, F_GETFL, 0)
+  if (flags < 0 || leaseSealLibrary.symbols.fcntl(fd, F_SETFL, flags | O_NONBLOCK) !== 0) fail()
+  const probe = Buffer.alloc(1)
+  try {
+    // On a validated pipe/socket with O_NONBLOCK, -1 means no bytes are
+    // available while a peer is still live. Zero is EOF; data is revocation.
+    const result = Number(leaseSealLibrary.symbols.read(fd, ptr(probe), 1))
+    if (result !== -1) return false
+    const errnoPointer = leaseSealLibrary.symbols.__errno_location()
+    return errnoPointer !== null && ffiRead.i32(errnoPointer as Pointer) === 11
+  } catch { return fail() } finally {
+    probe.fill(0)
+    if (leaseSealLibrary.symbols.fcntl(fd, F_SETFL, flags) !== 0) fail()
+  }
 }
 
 function safeStatNumber(value: bigint): number {

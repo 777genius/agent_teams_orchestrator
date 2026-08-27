@@ -1,7 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { closeSync, existsSync, openSync, realpathSync } from 'node:fs'
+import { createHash, createHmac } from 'node:crypto'
+import {
+  closeSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  openSync,
+  realpathSync,
+  writeSync,
+} from 'node:fs'
 import {
   chmod,
   cp,
@@ -18,14 +26,23 @@ import {
 } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { dlopen, FFIType, ptr } from 'bun:ffi'
 import {
   validateAcceptanceEvidence,
   type ActualOwnerAcceptanceEvidence,
 } from './e2e/hosted-actual-owner/evidence.js'
 import { assertActualOwnerProcessAnchorCurrent } from './e2e/hosted-actual-owner/process-anchor.js'
+import { superviseTrustedBuilds } from './process-group-supervisor.js'
 
 const repoRoot = resolve(import.meta.dir, '..')
 const buildScript = resolve(repoRoot, 'scripts/build.ts')
+const hostedControlFixtureLibc = dlopen('libc.so.6', {
+  memfd_create: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+  fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  socketpair: {
+    args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32,
+  },
+})
 
 function readBuildPlan(args: string[] = [], options: {
   cwd?: string
@@ -55,6 +72,32 @@ function readBuildPlan(args: string[] = [], options: {
 }
 
 describe('release build feature plan', () => {
+  test('builds the CLI only after verifying the owner and embeds that exact digest', async () => {
+    const source = await readFile(buildScript, 'utf8')
+    const verified = source.indexOf("'launcher after wrapper build'")
+    const embedded = source.indexOf('HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST=')
+    expect(verified).toBeGreaterThan(0)
+    expect(embedded).toBeGreaterThan(verified)
+    expect(source).toContain('if (!buildHostedActualOwner) runBuild(cliBuild)')
+    expect(source).toContain('`--feature=${hostedControlBuiltOwnerPinFeature}`')
+    expect(source).not.toContain('HOSTED_CONTROL_EXPECTED_OWNER_ARTIFACT_DIGEST')
+  })
+
+  test('reserves the built owner-pin feature from source and development build inputs', () => {
+    for (const featureArgs of [
+      ['--feature=HOSTED_CONTROL_BUILT_OWNER_PIN'],
+      ['--feature', 'HOSTED_CONTROL_BUILT_OWNER_PIN'],
+    ]) {
+      const result = spawnSync(process.execPath, [
+        'run', buildScript, '--dev', ...featureArgs, '--print-build-plan',
+      ], { cwd: repoRoot, encoding: 'utf8', env: process.env })
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toContain(
+        'HOSTED_CONTROL_BUILT_OWNER_PIN is reserved for the final production build',
+      )
+    }
+  })
+
   test('includes HOSTED_CONTROL and the exact packaged owner outputs by default', () => {
     const plan = readBuildPlan()
 
@@ -1324,6 +1367,133 @@ async function writeRuntimeManifest(input: {
   return { manifestPath, sandbox }
 }
 
+async function runBuiltCliWithForgedInBandOwnerPin(
+  cli: string,
+  forgedOwnerPin: `sha256:${string}`,
+): Promise<{ status: number | null; stderr: string }> {
+  const secret = Buffer.alloc(32, 0xa5)
+  const proofKeyId = createHash('sha256').update(secret).digest('hex')
+  const leaseStatement = {
+    format: 'agent-teams.hosted-control.launcher-lease/v1',
+    launcherLeaseId: 'launcher-lease-build-fixture',
+    ownerArtifactDigest: forgedOwnerPin,
+    bootstrapDigest: 'c'.repeat(64),
+    proofKeyId,
+    ownerGeneration: 11,
+    ownerSessionId: 'owner-session_build-fixture',
+  }
+  const leaseBytes = Buffer.from(JSON.stringify(leaseStatement))
+  const memfdName = Buffer.from('hosted-control-build-test-lease\0')
+  const leaseFd = hostedControlFixtureLibc.symbols.memfd_create(ptr(memfdName), 0x0002)
+  if (leaseFd < 0) throw new Error('build fixture memfd_create failed')
+  const sockets = new Int32Array(2)
+  let socketsCreated = false
+  try {
+    fchmodSync(leaseFd, 0o600)
+    let offset = 0
+    while (offset < leaseBytes.byteLength) {
+      offset += writeSync(leaseFd, leaseBytes, offset, leaseBytes.byteLength - offset)
+    }
+    if (hostedControlFixtureLibc.symbols.fcntl(leaseFd, 1033, 0x000f) !== 0) {
+      throw new Error('build fixture lease sealing failed')
+    }
+    if (hostedControlFixtureLibc.symbols.socketpair(1, 1, 0, ptr(sockets)) !== 0) {
+      throw new Error('build fixture socketpair failed')
+    }
+    socketsCreated = true
+    const stat = fstatSync(leaseFd)
+    const leaseArtifactDigest = createHash('sha256').update(leaseBytes).digest('hex')
+    const header = {
+      format: 'agent-teams.hosted-control.bootstrap/v1',
+      restoreGeneration: 2,
+      teamId: `team_${'a'.repeat(32)}`,
+      declaredRootHash: 'b'.repeat(64),
+      ownerAuthority: 'owner-authority_build-fixture',
+      ownerGeneration: 11,
+      ownerSessionId: 'owner-session_build-fixture',
+      claudeRoot: '/sandbox/claude',
+      socketPath: '/sandbox/control.sock',
+      legacyKey: 'legacy',
+      approvalActivationV2: {
+        approvalGeneration: 7,
+        admissionOwnerGeneration: 11,
+        approvalDigest: `sha256:${'d'.repeat(64)}`,
+        admissionDocumentDigest: `sha256:${'e'.repeat(64)}`,
+        ownerArtifactDigest: forgedOwnerPin,
+        wireCapabilityDigest: `sha256:${'f'.repeat(64)}`,
+        signedManifest: {
+          format: 'agent-teams.hosted-lifecycle-owner-admission/v4',
+          manifestDigest: `sha256:${'1'.repeat(64)}`,
+          releasePinDigest: `sha256:${'2'.repeat(64)}`,
+          launcherKeyId: '3'.repeat(64),
+        },
+      },
+      bootstrapBinding: {
+        deploymentId: 'deployment-build-fixture',
+        bootId: 'boot-build-fixture',
+        workspaceId: 'workspace-build-fixture',
+        mountGeneration: 3,
+        bootstrapDigest: 'c'.repeat(64),
+        ownerArtifactDigest: forgedOwnerPin,
+        proofKeyId,
+      },
+      leaseEvidence: {
+        device: String(stat.dev),
+        inode: String(stat.ino),
+        uid: stat.uid,
+        gid: stat.gid,
+        mode: stat.mode & 0o777,
+        launcherLeaseId: 'launcher-lease-build-fixture',
+        leaseArtifactDigest,
+      },
+    }
+    const headerBytes = Buffer.from(JSON.stringify(header))
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(headerBytes.byteLength)
+    const authenticated = Buffer.concat([prefix, headerBytes])
+    const authenticator = createHmac('sha256', secret)
+      .update('agent-teams.hosted-control.bootstrap/v1', 'utf8')
+      .update(Buffer.from([0]))
+      .update(authenticated)
+      .digest()
+    const frame = Buffer.concat([authenticated, secret, authenticator])
+    const child = spawn(cli, ['hosted-control'], {
+      stdio: ['ignore', 'ignore', 'pipe', leaseFd, sockets[0]!, 'pipe'],
+      env: {
+        ...process.env,
+        HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST: forgedOwnerPin,
+      },
+    })
+    closeSync(sockets[0]!)
+    sockets[0] = -1
+    let stderr = ''
+    child.stderr!.setEncoding('utf8')
+    child.stderr!.on('data', chunk => { stderr += chunk })
+    ;((child.stdio as unknown as NodeJS.WritableStream[])[5]!).end(frame)
+    const status = await new Promise<number | null>((resolveExit, rejectExit) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL')
+        rejectExit(new Error('built CLI pin-validation fixture timed out'))
+      }, 15_000)
+      child.once('error', error => {
+        clearTimeout(timeout)
+        rejectExit(error)
+      })
+      child.once('exit', code => {
+        clearTimeout(timeout)
+        resolveExit(code)
+      })
+    })
+    return { status, stderr }
+  } finally {
+    closeSync(leaseFd)
+    if (socketsCreated) {
+      if (sockets[0]! >= 0) closeSync(sockets[0]!)
+      closeSync(sockets[1]!)
+    }
+  }
+}
+
 describe('packaged hosted actual-owner build', () => {
   function spawnResultEvidence(result: ReturnType<typeof spawnSync>): string {
     return JSON.stringify({
@@ -1356,13 +1526,31 @@ describe('packaged hosted actual-owner build', () => {
       'scripts/e2e/hosted-actual-owner/secure-files.ts',
       'src/entrypoints/hostedActualOwnerAcceptance.ts',
       'src/entrypoints/hostedActualOwnerGeneratedIdentity.ts',
+      'src/services/hostedControl/HostedControlBootstrap.ts',
+      'src/services/hostedControl/HostedControlMain.ts',
     ]
     for (const path of ownedProductionPaths) {
       await cp(join(repoRoot, path), join(root, path))
     }
     const dependencies = join(repoRoot, 'node_modules')
     if (copyDependencies && existsSync(dependencies)) {
-      await cp(dependencies, join(root, 'node_modules'), { recursive: true })
+      const fixtureDependencies = join(root, 'node_modules')
+      const resolvedDependencies = realpathSync(dependencies)
+      if ((await lstat(dependencies)).isSymbolicLink()) {
+        // CI remediation may borrow a read-only dependency tree through a
+        // temporary top-level symlink. A hard-link snapshot is fast, remains
+        // path-contained in the clean fixture, and cannot retain that symlink.
+        await mkdir(fixtureDependencies)
+        const linked = spawnSync('/usr/bin/cp', [
+          '-a', '--link', `${resolvedDependencies}/.`, fixtureDependencies,
+        ], { encoding: 'utf8' })
+        if (linked.status !== 0) {
+          await rm(fixtureDependencies, { recursive: true, force: true })
+          await cp(resolvedDependencies, fixtureDependencies, { recursive: true })
+        }
+      } else {
+        await cp(resolvedDependencies, fixtureDependencies, { recursive: true })
+      }
     }
     const commit = spawnSync('/usr/bin/git', [
       '-C', root, '-c', 'user.name=Hosted Owner Test',
@@ -1422,6 +1610,37 @@ describe('packaged hosted actual-owner build', () => {
     expect(distEntries.some(entry => entry.includes('.staging-'))).toBe(false)
     expect(binEntries.some(entry => entry.includes('.staging-'))).toBe(false)
   })
+
+  test('built ./cli hosted-control ignores an inherited spoof and uses the embedded owner pin', async () => {
+    const root = await cleanPackagedBuildFixture()
+    expect(await readFile(join(root, 'src/services/hostedControl/HostedControlBootstrap.ts')))
+      .toEqual(await readFile(join(repoRoot, 'src/services/hostedControl/HostedControlBootstrap.ts')))
+    const build = spawnSync(process.execPath, ['run', './scripts/build.ts'], {
+      cwd: root,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      env: process.env,
+    })
+    expect(build.status, build.stderr).toBe(0)
+    const ownerNames = (await readdir(join(root, 'dist', 'local-cli'))).filter(name =>
+      /^hostedActualOwnerLauncher-[0-9a-f]{64}$/.test(name))
+    expect(ownerNames).toHaveLength(1)
+    const expectedPin = `sha256:${ownerNames[0]!.slice('hostedActualOwnerLauncher-'.length)}`
+    const cliBytes = await readFile(join(root, 'dist', 'local-cli', 'cli.js'))
+    expect(cliBytes.includes(Buffer.from(expectedPin))).toBe(true)
+    expect(cliBytes.includes(Buffer.from('HOSTED_CONTROL_EXPECTED_OWNER_ARTIFACT_DIGEST')))
+      .toBe(false)
+
+    const forgedPin = `sha256:${'0'.repeat(64)}` as const
+    expect(expectedPin).not.toBe(forgedPin)
+    const run = await runBuiltCliWithForgedInBandOwnerPin(join(root, 'cli'), forgedPin)
+    expect(run.status).not.toBe(0)
+    // Every descriptor-v2 field and authenticator agrees on forgedPin. Rejection
+    // therefore proves the independently embedded digest reached pin validation;
+    // the identically named inherited global did not select the accepted pin.
+    expect(run.stderr).toContain('Hosted control bootstrap was rejected')
+    expect(run.stderr).not.toContain('owner artifact digest pin was rejected')
+  }, 120_000)
 
   test('fails closed on generated identity tampering and removes every temporary input', async () => {
     const root = await cleanPackagedBuildFixture()
@@ -1782,6 +2001,9 @@ int main(int argc, char **argv) {
         const sealedEnvironment = (await readFile(`/proc/${sealedPid}/environ`, 'utf8'))
           .split('\0').filter(Boolean)
         expect(sealedEnvironment.some(entry =>
+          entry.startsWith('HOSTED_CONTROL_EXPECTED_OWNER_ARTIFACT_DIGEST='),
+        )).toBe(false)
+        expect(sealedEnvironment.some(entry =>
           /^(?:BUN_|NODE_|LD_|DYLD_|GLIBC_TUNABLES=|GIT_|ARBITRARY_CONFIG=)/.test(entry),
         )).toBe(false)
         const exitDeadline = Date.now() + 8000
@@ -1862,21 +2084,19 @@ int main(int argc, char **argv) {
 
       const unrelated = join(buildRoot, 'dist', 'local-cli', 'unrelated-preserved')
       await writeFile(unrelated, 'preserve-me')
-      const concurrentBuilds = ['ULTRAPLAN', 'TEAMMEM'].map(feature => Bun.spawn({
-        cmd: [process.execPath, 'run', './scripts/build.ts', `--feature=${feature}`],
-        cwd: buildRoot,
-        env: process.env,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      }))
-      const concurrentResults = await Promise.all(concurrentBuilds.map(async child => {
-        const [status, stdout, stderr] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ])
-        return { status, stdout: stdout.trim(), stderr }
-      }))
+      const concurrentBuildDeadlineMs = 90_000
+      const concurrentResults = await superviseTrustedBuilds(
+        ['ULTRAPLAN', 'TEAMMEM'].map(feature => ({
+          name: feature,
+          cmd: [process.execPath, 'run', './scripts/build.ts', `--feature=${feature}`],
+          cwd: buildRoot,
+          env: process.env,
+        })),
+        { deadlineMs: concurrentBuildDeadlineMs },
+      )
+      console.log('concurrent hosted-owner build timings', JSON.stringify(
+        concurrentResults.map(({ name, elapsedMs, pid }) => ({ name, elapsedMs, pid })),
+      ))
       expect(concurrentResults.map(result => result.status),
         JSON.stringify(concurrentResults)).toEqual([0, 0])
       const reportedPublications = concurrentResults.map(result =>
@@ -1901,6 +2121,10 @@ int main(int argc, char **argv) {
       const finalOwnerSha256 = sha256(finalOwnerBytes)
       const finalWrapperSha256 = sha256(finalWrapperBytes)
       expect(finalOwnerName).toBe(`hostedActualOwnerLauncher-${finalOwnerSha256}`)
+      const finalOwnerPin = `sha256:${finalOwnerSha256}`
+      const finalCliBytes = await readFile(join(buildRoot, 'dist', 'local-cli', 'cli.js'))
+      expect(finalCliBytes.includes(Buffer.from(finalOwnerPin))).toBe(true)
+      expect(finalCliBytes.toString().match(new RegExp(finalOwnerPin, 'g'))).toHaveLength(1)
       expect(finalOwnerBytes.subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
       expect(finalWrapperBytes.subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
       expect(finalOwnerBytes.includes(Buffer.from(finalWrapperSha256))).toBe(true)
