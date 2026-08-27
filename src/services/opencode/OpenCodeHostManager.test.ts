@@ -845,6 +845,8 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
 
     expect(manager.hasExactRetainedHostReleaseCapability({ ...receipt, pid: receipt.pid + 1 }))
       .toBe(false)
+    expect(manager.hasExactRetainedHostReleaseCapability({ ...receipt,
+      receiptId: '66666666-6666-4666-8666-666666666666' })).toBe(false)
     expect(manager.hasExactRetainedHostReleaseCapability(receipt)).toBe(true)
     await manager.reconcileHostReleaseReceipt(receipt, { keepPersistentAlive: true })
     expect(signals).toEqual([])

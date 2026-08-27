@@ -582,6 +582,28 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     expect(await store.inspect({ ...identity, inputDigest: 'b'.repeat(64) })).toMatchObject({ generation: 2 })
   })
 
+  test('read-only snapshot accepts journal-first anchor state without lease, repair, or publication', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    await store.withGeneration(identity, 'begin', async () => undefined)
+    const before = persistence.bytes!.slice()
+    persistence.fence = 0
+    let acquisitions = 0
+    let replacements = 0
+    let fenceWrites = 0
+    persistence.acquireExclusive = async () => {
+      acquisitions += 1
+      return async () => undefined
+    }
+    persistence.replaceAndSync = async () => { replacements += 1 }
+    persistence.compareAndSwapFence = async () => { fenceWrites += 1 }
+
+    expect(await store.snapshotReadOnly(identity)).toMatchObject({ generation: 1, fence: 1 })
+    expect({ acquisitions, replacements, fenceWrites, fence: persistence.fence })
+      .toEqual({ acquisitions: 0, replacements: 0, fenceWrites: 0, fence: 0 })
+    expect(persistence.bytes).toEqual(before)
+  })
+
   test('recovers a complete same-generation journal without consulting the fence CAS', async () => {
     const persistence = new MemoryPersistence()
     let releases = 0

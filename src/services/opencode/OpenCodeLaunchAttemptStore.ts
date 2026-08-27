@@ -138,6 +138,8 @@ export type OpenCodeLaunchJournalReconciliationEvent = Extract<OpenCodeLaunchJou
 
 export type OpenCodeLaunchJournalPersistence = {
   read(context?: OpenCodeLaunchStoreContext): Promise<Uint8Array | null>
+  /** Optional filesystem-native, non-publishing view used by effect-free recovery preflight. */
+  readOnlySnapshot?(context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournalPersistenceSnapshot>
   /** Implementations must replace atomically and fsync both the file and parent directory. */
   replaceAndSync(bytes: Uint8Array, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Independently durable monotonic fencing authority. */
@@ -146,6 +148,11 @@ export type OpenCodeLaunchJournalPersistence = {
   /** Cross-process exclusive lease. File persistence implements this with atomic mkdir. */
   acquireExclusive(context: OpenCodeLaunchStoreContext): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>>
 }
+
+export type OpenCodeLaunchJournalPersistenceSnapshot = Readonly<{
+  bytes: Uint8Array | null
+  fence: number | null
+}>
 
 export type OpenCodeLaunchStoreContext = { deadlineAtMs: number; signal: AbortSignal; monotonicNow(): number }
 
@@ -232,6 +239,87 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     }
+  }
+
+  /**
+   * Reads the already-published namespace without opening the normal retained
+   * namespace or lease path. In particular this must never create a missing
+   * directory, anchor, fence, marker, candidate, or lock. Two identical passes
+   * make a concurrently changing publication fail closed.
+   */
+  async readOnlySnapshot(context?: OpenCodeLaunchStoreContext):
+  Promise<OpenCodeLaunchJournalPersistenceSnapshot> {
+    ensureContext(context)
+    const paths = deriveOpenCodeLaunchNamespacePaths(this.filePath, path)
+    type ReadOnlyFile = Readonly<{ bytes: Uint8Array; identity: string }>
+    const readExisting = async (target: string, maxBytes: number): Promise<ReadOnlyFile | null> => {
+      let handle: Awaited<ReturnType<typeof open>>
+      try {
+        handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+      try {
+        const retained = await handle.stat()
+        const visible = await lstat(target)
+        if (!retained.isFile() || visible.isSymbolicLink()
+          || retained.dev !== visible.dev || retained.ino !== visible.ino) {
+          throw new OpenCodeLaunchJournalError('foreign', 'read-only durable record identity changed')
+        }
+        if (retained.size > maxBytes) {
+          throw new OpenCodeLaunchJournalError('corrupt', 'read-only durable record exceeds size limit')
+        }
+        const bytes = new Uint8Array(await handle.readFile())
+        const after = await handle.stat()
+        if (after.size !== retained.size || after.mtimeMs !== retained.mtimeMs
+          || after.ctimeMs !== retained.ctimeMs) {
+          throw new OpenCodeLaunchJournalError('fenced', 'read-only durable record changed while reading')
+        }
+        return { bytes, identity: [retained.dev, retained.ino, retained.size,
+          retained.mtimeMs, retained.ctimeMs].join(':') }
+      } finally { await handle.close() }
+    }
+    const capture = async (): Promise<{ snapshot: OpenCodeLaunchJournalPersistenceSnapshot;
+      coherence: string }> => {
+      const markerFile = await readExisting(paths.marker, 1024)
+      let bytes: Uint8Array | null = null
+      let slotFile: ReadOnlyFile | null = null
+      if (markerFile) {
+        let marker: unknown
+        try { marker = JSON.parse(new TextDecoder().decode(markerFile.bytes)) }
+        catch { throw new OpenCodeLaunchJournalError('corrupt', 'invalid commit marker') }
+        if (!validCommitMarker(marker)) throw new OpenCodeLaunchJournalError('corrupt', 'invalid commit marker')
+        slotFile = await readExisting(paths.slots[marker.slot], OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES)
+        bytes = slotFile?.bytes ?? null
+        if (!bytes || sha256(bytes) !== marker.digest) {
+          throw new OpenCodeLaunchJournalError('corrupt', 'read-only journal candidate is incomplete')
+        }
+      }
+      const fenceFile = await readExisting(paths.fence, 128)
+      let fence: number | null = null
+      if (fenceFile) {
+        let anchor: unknown
+        try { anchor = JSON.parse(new TextDecoder().decode(fenceFile.bytes)) }
+        catch { throw new OpenCodeLaunchJournalError('corrupt', 'invalid fence anchor') }
+        if (!validFenceAnchor(anchor)) throw new OpenCodeLaunchJournalError('corrupt', 'invalid fence anchor')
+        fence = anchor.fence
+      }
+      const fileIdentity = (file: ReadOnlyFile | null): string => file
+        ? `${file.identity}:${sha256(file.bytes)}` : 'absent'
+      return { snapshot: { bytes, fence }, coherence: [fileIdentity(markerFile),
+        fileIdentity(slotFile), fileIdentity(fenceFile)].join('|') }
+    }
+    const first = await capture()
+    ensureContext(context)
+    const second = await capture()
+    if (first.coherence !== second.coherence
+      || first.snapshot.fence !== second.snapshot.fence
+      || !nullableBytesEqual(first.snapshot.bytes, second.snapshot.bytes)) {
+      throw new OpenCodeLaunchJournalError('fenced', 'read-only launch namespace changed during snapshot')
+    }
+    ensureContext(context)
+    return first.snapshot
   }
 
   async replaceAndSync(bytes: Uint8Array, context?: OpenCodeLaunchStoreContext): Promise<void> {
@@ -1353,6 +1441,51 @@ export class OpenCodeLaunchAttemptStore {
     private readonly testHooks: OpenCodeLaunchAttemptStoreTestHooks = {},
   ) {}
 
+  /**
+   * Effect-free preflight view. Unlike inspect(), this never acquires the
+   * persistence lease and never repairs a journal-first fence publication.
+   */
+  async snapshotReadOnly(identity: OpenCodeLaunchJournalIdentity,
+    context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournal | null> {
+    validateIdentity(identity)
+    const effectiveContext = context ?? boundedDefaultContext()
+    const capture = async (): Promise<OpenCodeLaunchJournalPersistenceSnapshot> => {
+      if (this.persistence.readOnlySnapshot) {
+        return await awaitWithContext(this.persistence.readOnlySnapshot(effectiveContext), effectiveContext)
+      }
+      const bytes = await awaitWithContext(this.persistence.read(effectiveContext), effectiveContext)
+      const fence = await awaitWithContext(this.persistence.readFence(effectiveContext), effectiveContext)
+      return { bytes, fence }
+    }
+    const first = await capture()
+    let stable = first
+    if (!this.persistence.readOnlySnapshot) {
+      const second = await capture()
+      if (first.fence !== second.fence || !nullableBytesEqual(first.bytes, second.bytes)) {
+        throw new OpenCodeLaunchJournalError('fenced', 'launch journal changed during read-only snapshot')
+      }
+      stable = second
+    }
+    const anchor = stable.fence ?? 0
+    if (!stable.bytes) {
+      if (anchor !== 0) throw new OpenCodeLaunchJournalError('fenced', 'fence anchor has no committed journal')
+      return null
+    }
+    if (stable.bytes.byteLength > OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'journal exceeds size limit')
+    }
+    let value: unknown
+    try { value = JSON.parse(new TextDecoder().decode(stable.bytes)) }
+    catch { throw new OpenCodeLaunchJournalError('corrupt', 'journal is not valid JSON') }
+    const journal = validateJournal(value, identity)
+    const exact = journal.fence === anchor && journal.generation === anchor
+    const journalFirst = journal.fence === anchor + 1 && journal.generation === journal.fence
+    if (!exact && !journalFirst) {
+      throw new OpenCodeLaunchJournalError('fenced', 'journal does not match durable fence snapshot')
+    }
+    return journal
+  }
+
   async inspect(identity: OpenCodeLaunchJournalIdentity, context?: OpenCodeLaunchStoreContext): Promise<OpenCodeLaunchJournal | null> {
     const effectiveContext = context ?? boundedDefaultContext()
     return this.exclusive(async () => this.load(identity, effectiveContext), effectiveContext)
@@ -2069,6 +2202,10 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
     if (left[index] !== right[index]) return false
   }
   return true
+}
+
+function nullableBytesEqual(left: Uint8Array | null, right: Uint8Array | null): boolean {
+  return left === null ? right === null : right !== null && bytesEqual(left, right)
 }
 
 async function acquireWithLateReap(

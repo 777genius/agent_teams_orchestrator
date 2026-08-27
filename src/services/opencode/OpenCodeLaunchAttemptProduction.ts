@@ -330,6 +330,21 @@ export class OpenCodeLaunchHostReleaseLedger {
       record.receipt !== null)
   }
 
+  /** Non-locking coherent view for the effect-free tokenless-v1 preflight. */
+  async snapshotAll(expected: Pick<OpenCodeLaunchHostReleaseRecord, 'attemptId' | 'payloadHash'> & {
+    currentGeneration: number
+  }, context?: OpenCodeLaunchHostLedgerContext): Promise<OpenCodeLaunchHostCleanupRecord[]> {
+    const effective = hostLedgerContext(context)
+    return runHostLedgerOperation(effective, async () => {
+      const first = await this.readAllPhysical(expected)
+      const second = await this.readAllPhysical(expected)
+      if (JSON.stringify(first) !== JSON.stringify(second)) {
+        throw new Error('OpenCode launch host release namespace changed during read-only snapshot [redacted]')
+      }
+      return first
+    })
+  }
+
   async hasUnresolvedAcquisition(expected: Pick<OpenCodeLaunchHostReleaseRecord,
   'attemptId' | 'payloadHash'> & { currentGeneration: number }, context?: OpenCodeLaunchHostLedgerContext): Promise<boolean> {
     return (await this.readAll(expected, context)).some(record => record.receipt === null)
@@ -1000,14 +1015,17 @@ class OpenCodeProductionLaunchRuntime {
     const preflightSignal = command.signal ?? new AbortController().signal
     const preflightLedgerContext = { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal,
       monotonicNow: launchMonotonicNow }
-    const journal = await attemptStore.inspect({
+    const readOnlyIdentity = {
       attemptId: command.request.launchAttempt.attemptId,
       payloadHash: command.request.launchAttempt.payloadHash,
       immutableDigest,
-    }, { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal, monotonicNow: launchMonotonicNow })
-    let exactCurrentGeneration = false
-    if (journal) {
-      exactCurrentGeneration = inspectOpenCodeProductionGeneration(journal, {
+    }
+    const readOnlyContext = { deadlineAtMs: preflightDeadlineAtMs,
+      signal: preflightSignal, monotonicNow: launchMonotonicNow }
+    const readOnlyJournal = await attemptStore.snapshotReadOnly(readOnlyIdentity, readOnlyContext)
+    let readOnlyExactCurrentGeneration = false
+    if (readOnlyJournal) {
+      readOnlyExactCurrentGeneration = inspectOpenCodeProductionGeneration(readOnlyJournal, {
         generation: command.request.launchAttempt.generation,
         inputDigest,
         continuation: command.continuation,
@@ -1019,27 +1037,54 @@ class OpenCodeProductionLaunchRuntime {
     // A tokenless v1 receipt is actionable only while this exact manager still
     // retains its live receipt capability; reconstructed PID identity is never
     // sufficient authority on any platform.
-    const inspectedReleaseRecords = await hostReleaseLedger.readAllPending({
+    const inspectedHostObligations = await hostReleaseLedger.snapshotAll({
       attemptId: command.request.launchAttempt.attemptId,
       payloadHash: command.request.launchAttempt.payloadHash,
       currentGeneration: command.request.launchAttempt.generation,
     }, preflightLedgerContext)
-    const unretainedTokenlessObligation = inspectedReleaseRecords.find(record =>
-      record.releaseState === 'pending'
-      && record.receipt.schemaVersion === 1
-      && !openCodeHostManager.hasExactRetainedHostReleaseCapability(record.receipt))
-    if (unretainedTokenlessObligation) {
-      if (!journal?.finalResponse || !exactCurrentGeneration
-        || journal.cleanupState !== 'incomplete') {
+    const confirmedReadOnlyJournal = await attemptStore.snapshotReadOnly(readOnlyIdentity, readOnlyContext)
+    if (JSON.stringify(confirmedReadOnlyJournal) !== JSON.stringify(readOnlyJournal)) {
+      throw new Error('OpenCode launch journal changed during read-only host cleanup snapshot')
+    }
+    const inspectedReleaseRecords = inspectedHostObligations.filter(
+      (record): record is OpenCodeLaunchHostReleaseRecord => record.receipt !== null)
+    const snapshotHasExactBoundObligationSet = !!readOnlyJournal?.hostCleanupObligations
+      && inspectedHostObligations.length === readOnlyJournal.hostCleanupObligations.length
+      && inspectedHostObligations.every(record => {
+        if (!record.receipt || record.receiptIdentityDigest === null
+          || record.generation !== readOnlyJournal.generation) return false
+        const binding = readOnlyJournal.hostCleanupObligations!.find(
+          item => item.obligationId === record.obligationId)
+        return binding?.reservationDigest === record.reservationDigest
+          && binding.receiptIdentityDigest === record.receiptIdentityDigest
+      })
+    const unsafeTokenlessObligation = inspectedReleaseRecords.find(record => {
+      if (record.releaseState !== 'pending' || record.receipt.schemaVersion !== 1) return false
+      const binding = readOnlyJournal?.hostCleanupObligations?.find(
+        item => item.obligationId === record.obligationId)
+      const exactRetainedIncompleteCapability = !!readOnlyJournal?.finalResponse
+        && readOnlyExactCurrentGeneration
+        && readOnlyJournal.cleanupState === 'incomplete'
+        && readOnlyJournal.finalResponse.members.cleanupPending.length === 0
+        && snapshotHasExactBoundObligationSet
+        && record.generation === readOnlyJournal.generation
+        && binding?.reservationDigest === record.reservationDigest
+        && binding.receiptIdentityDigest === record.receiptIdentityDigest
+        && openCodeHostManager.hasExactRetainedHostReleaseCapability(record.receipt)
+      return !exactRetainedIncompleteCapability
+    })
+    if (unsafeTokenlessObligation) {
+      if (!readOnlyJournal?.finalResponse || !readOnlyExactCurrentGeneration
+        || readOnlyJournal.cleanupState !== 'incomplete') {
         throw new Error('OpenCode launch host cleanup requires exact retained generation authority')
       }
-      const final = journal.finalResponse
+      const final = readOnlyJournal.finalResponse
       validateOpenCodeDurableFinalResponse(command.request, final, {
         inputDigest,
         immutableDigest,
         generation: command.request.launchAttempt.generation,
-        acceptedProofResponse: journal.acceptedProofResponse,
-        profileBinding: journal.profileBinding,
+        acceptedProofResponse: readOnlyJournal.acceptedProofResponse,
+        profileBinding: readOnlyJournal.profileBinding,
         members: command.members.map(member => member.memberIdentity),
       })
       const committedIds = new Set(final.members.committed.map(item => item.memberIdentity))
@@ -1056,6 +1101,16 @@ class OpenCodeProductionLaunchRuntime {
             evidence: [], diagnostics: [],
           }])), launchAttempt: final },
       }
+    }
+    const journal = await attemptStore.inspect(readOnlyIdentity, readOnlyContext)
+    let exactCurrentGeneration = false
+    if (journal) {
+      exactCurrentGeneration = inspectOpenCodeProductionGeneration(journal, {
+        generation: command.request.launchAttempt.generation,
+        inputDigest,
+        continuation: command.continuation,
+        continuationToken: command.request.launchAttempt.continuationToken,
+      }) === 'replay'
     }
     if (journal?.finalResponse && exactCurrentGeneration
       && journal.cleanupState === 'complete') {
