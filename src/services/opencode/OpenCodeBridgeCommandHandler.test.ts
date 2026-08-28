@@ -10,6 +10,7 @@ import {
 } from './OpenCodeBridgeContractV2.js'
 import {
   __OPEN_CODE_LEGACY_LAUNCH_FIXTURE,
+  __buildCommandStatusReadOnlySnapshotForTests,
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
   executeOpenCodeBridgeCommandEnvelope as executeStrictOpenCodeBridgeCommandEnvelope,
@@ -1295,6 +1296,33 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(result.data.status).toBe('unknown')
     expect(probeCalls).toEqual([])
+  })
+
+  test('passes the requested project path to the command-status passive reader', async () => {
+    const requests: unknown[] = []
+    await __buildCommandStatusReadOnlySnapshotForTests('/tmp/requested-project', {
+      reader: {
+        read: async request => {
+          requests.push(request)
+          return {
+            contractVersion: 1,
+            projectScope: null,
+            binary: { authority: 'unknown', freshness: 'unknown', condition: 'unknown',
+              issueCode: 'read_failed', observedAt: null, validUntil: null,
+              value: { presence: 'unknown', version: null } },
+            providers: [],
+            authorization: 'unknown',
+            launchReadiness: 'not_authorized',
+            completedAt: 0,
+          } as never
+        },
+      },
+    })
+    expect(requests).toEqual([{
+      projectPath: '/tmp/requested-project',
+      providerIds: expect.any(Array),
+      timeoutMs: 250,
+    }])
   })
 
   test('compatibility mode without execution probe still rejects unknown raw model ids', async () => {

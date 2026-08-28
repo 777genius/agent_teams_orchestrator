@@ -995,7 +995,7 @@ describe('OpenCodeSessionBridge', () => {
         get: async () => buildRecord(),
         publishSuccessorIfExact: async (successor, oldSessionId, oldRunId) => {
           publications.push({ successor, oldSessionId, oldRunId })
-          return { status: 'applied' as const, record: successor }
+          return { status: 'replaced' as const, record: successor }
         },
       },
       hostManager: {
@@ -1088,7 +1088,7 @@ describe('OpenCodeSessionBridge', () => {
     expect(upserts[0]?.projectBehaviorFingerprint).toBe('behavior-v2')
   })
 
-  test('releases a fresh host lease when session persistence fails', async () => {
+  test('releases only the fresh host when publication fails before lease retention', async () => {
     const retainedLeases: unknown[] = []
     const releasedLeases: unknown[] = []
     let releaseHostCalls = 0
@@ -1157,24 +1157,8 @@ describe('OpenCodeSessionBridge', () => {
       }),
     ).rejects.toThrow('disk write failed')
 
-    expect(retainedLeases).toEqual([
-      {
-        teamId: 'team-a',
-        laneId: 'primary',
-        memberName: 'alice',
-        runId: 'run-1',
-        sessionId: 'session-new',
-      },
-    ])
-    expect(releasedLeases).toEqual([
-      {
-        teamId: 'team-a',
-        laneId: 'primary',
-        memberName: 'alice',
-        runId: 'run-1',
-        sessionId: 'session-new',
-      },
-    ])
+    expect(retainedLeases).toEqual([])
+    expect(releasedLeases).toEqual([])
     expect(releaseHostCalls).toBe(1)
   })
 
@@ -1259,7 +1243,7 @@ describe('OpenCodeSessionBridge', () => {
       sessionStore: {
         get: async () => original,
         publishSuccessorIfExact: async () => ({
-          status: 'foreign', record: replacement,
+          status: 'conflict', record: replacement,
         }),
         upsertIfSessionMatches: async () => ({ status: 'foreign', record: replacement }),
       },
@@ -1295,7 +1279,7 @@ describe('OpenCodeSessionBridge', () => {
       sessionStore: {
         get: async () => old,
         publishSuccessorIfExact: async () => ({
-          status: 'foreign' as const,
+          status: 'conflict' as const,
           record: buildRecord({ opencodeSessionId: 'session-foreign', runId: 'run-foreign' }),
         }),
       },
@@ -1320,6 +1304,237 @@ describe('OpenCodeSessionBridge', () => {
     expect({ releasedLease, releasedHost }).toEqual({ releasedLease: 0, releasedHost: 0 })
   })
 
+  test('retries uncertain cleanup through the original client before creating again', async () => {
+    const old = buildRecord({ runId: 'run-old' })
+    let createCalls = 0
+    let deleteCalls = 0
+    let releasedHosts = 0
+    const firstClient = {
+      createSession: async () => ({ id: `session-new-${++createCalls}` }),
+      deleteSession: async () => {
+        deleteCalls += 1
+        if (deleteCalls === 1) throw new Error('cleanup outcome unknown')
+        return true
+      },
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => old,
+        publishSuccessorIfExact: async () => ({ status: 'absent' }),
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releasedHosts += 1 },
+      },
+      clientFactory: { create: () => firstClient as never },
+    })
+    const input = {
+      teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+      selectedModel: old.selectedModel, projectPath: old.projectPath, runId: 'run-new',
+    }
+
+    await expect(bridge.ensureSession(input)).rejects.toThrow('cleanup remains required')
+    expect({ createCalls, deleteCalls, releasedHosts }).toEqual({
+      createCalls: 1, deleteCalls: 1, releasedHosts: 0,
+    })
+    await expect(bridge.ensureSession(input)).rejects.toThrow('ownership changed')
+    expect({ createCalls, deleteCalls, releasedHosts }).toEqual({
+      createCalls: 2, deleteCalls: 3, releasedHosts: 2,
+    })
+  })
+
+  test('preserves the predecessor for conflict, reservation conflict, absence, and thrown publication', async () => {
+    const old = buildRecord({ runId: 'run-old' })
+    const outcomes = [
+      { status: 'conflict' as const, record: buildRecord({
+        opencodeSessionId: 'session-foreign', runId: 'run-foreign',
+      }) },
+      { status: 'conflict' as const, reservation: {
+        version: 1 as const,
+        logicalMemberKey: 'logical',
+        reservationIdentity: 'reservation',
+        expectedOpencodeSessionId: 'reserved-session',
+        createdAt: old.createdAt,
+        teamId: old.teamId,
+        laneId: old.laneId,
+        projectIdentity: old.projectIdentity,
+        memberName: old.memberName,
+      } },
+      { status: 'absent' as const },
+      new Error('publication write failed'),
+    ]
+
+    for (const outcome of outcomes) {
+      const deleted: string[] = []
+      let releasedHost = 0
+      let retainedLease = 0
+      let releasedLease = 0
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        sessionStore: {
+          get: async () => old,
+          publishSuccessorIfExact: async () => {
+            if (outcome instanceof Error) throw outcome
+            return outcome
+          },
+        },
+        hostManager: {
+          ensureHost: async () => host,
+          releaseHost: async () => { releasedHost += 1 },
+          retainHostLease: async () => { retainedLease += 1 },
+          releaseHostLease: async () => { releasedLease += 1; return 'applied' as const },
+        },
+        clientFactory: { create: () => ({
+          createSession: async () => ({ id: 'session-new' }),
+          deleteSession: async id => { deleted.push(id); return true },
+        } as never) },
+      })
+
+      await expect(bridge.ensureSession({
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: old.selectedModel, projectPath: old.projectPath,
+        runId: 'run-new',
+      })).rejects.toThrow(outcome instanceof Error ? outcome.message : 'ownership changed')
+      expect({ deleted, releasedHost, retainedLease, releasedLease }).toEqual({
+        deleted: ['session-new'], releasedHost: 1, retainedLease: 0, releasedLease: 0,
+      })
+      expect(old).toMatchObject({ opencodeSessionId: 'session-1', runId: 'run-old' })
+    }
+  })
+
+  test('never deletes a protected deterministic session id owned by another run', async () => {
+    const old = buildRecord({ runId: 'run-old' })
+    let deletes = 0
+    let releasedHost = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => old,
+        publishSuccessorIfExact: async () => ({
+          status: 'conflict',
+          record: buildRecord({ opencodeSessionId: old.opencodeSessionId, runId: 'run-foreign' }),
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releasedHost += 1 },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: old.opencodeSessionId }),
+        deleteSession: async () => { deletes += 1; return true },
+      } as never) },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+      selectedModel: old.selectedModel, projectPath: old.projectPath, runId: 'run-new',
+    })).rejects.toThrow('ownership changed')
+    expect({ deletes, releasedHost }).toEqual({ deletes: 0, releasedHost: 1 })
+  })
+
+  test('retries a published successor lease before releasing the predecessor lease', async () => {
+    let current = buildRecord({ runId: 'run-old' })
+    let creates = 0
+    let deletes = 0
+    let retainAttempts = 0
+    const events: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => current,
+        publishSuccessorIfExact: async successor => {
+          events.push('publish-successor')
+          current = successor
+          return { status: 'replaced', record: successor }
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { events.push('release-host') },
+        retainHostLease: async () => {
+          retainAttempts += 1
+          events.push(retainAttempts === 1 ? 'retain-failed' : 'retain-successor')
+          if (retainAttempts === 1) throw new Error('lease store unavailable')
+        },
+        releaseHostLease: async (_key, owner) => {
+          events.push(`release-old:${owner.sessionId}`)
+          return 'foreign'
+        },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: `session-new-${++creates}` }),
+        deleteSession: async () => { deletes += 1; return true },
+      } as never) },
+    })
+    const input = {
+      teamId: current.teamId, laneId: current.laneId, memberName: current.memberName,
+      selectedModel: current.selectedModel, projectPath: current.projectPath,
+      runId: 'run-new', fresh: true,
+    }
+
+    await expect(bridge.ensureSession(input)).rejects.toThrow(
+      /published but successor host lease retention failed.*lease store unavailable/,
+    )
+    expect(current).toMatchObject({ opencodeSessionId: 'session-new-1', runId: 'run-new' })
+    expect(events).toEqual(['publish-successor', 'retain-failed'])
+    expect({ creates, deletes }).toEqual({ creates: 1, deletes: 0 })
+
+    const retried = await bridge.ensureSession(input)
+    expect(retried).toMatchObject({ opencodeSessionId: 'session-new-1', runId: 'run-new' })
+    expect(events).toEqual([
+      'publish-successor', 'retain-failed', 'retain-successor', 'release-old:session-1',
+    ])
+    expect({ creates, deletes }).toEqual({ creates: 1, deletes: 0 })
+  })
+
+  test('a restarted bridge reuses the durable successor after lease retention failure', async () => {
+    let current = buildRecord({ runId: 'run-old' })
+    let creates = 0
+    const store = {
+      get: async () => current,
+      publishSuccessorIfExact: async (successor: OpenCodeSessionRecord) => {
+        current = successor
+        return { status: 'replaced' as const, record: successor }
+      },
+    }
+    const clientFactory = { create: () => ({
+      createSession: async () => ({ id: `session-new-${++creates}` }),
+      deleteSession: async () => true,
+    } as never) }
+    const first = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => { throw new Error('lease write failed') },
+        releaseHostLease: async () => 'applied',
+      },
+      clientFactory,
+    })
+    const input = {
+      teamId: current.teamId, laneId: current.laneId, memberName: current.memberName,
+      selectedModel: current.selectedModel, projectPath: current.projectPath, runId: 'run-new',
+    }
+    await expect(first.ensureSession(input)).rejects.toThrow('lease retention failed')
+
+    const restarted = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+        releaseHostLease: async () => 'foreign',
+      },
+      clientFactory,
+    })
+    const recovered = await restarted.ensureSession(input)
+    expect(recovered).toMatchObject({ opencodeSessionId: 'session-new-1', runId: 'run-new' })
+    expect(creates).toBe(1)
+  })
+
   test('successor CAS distinguishes the same deterministic session id under a different run', async () => {
     const old = buildRecord({ runId: 'run-old' })
     const expected: unknown[] = []
@@ -1329,7 +1544,7 @@ describe('OpenCodeSessionBridge', () => {
         get: async () => old,
         publishSuccessorIfExact: async (successor, sessionId, runId) => {
           expected.push({ successorRunId: successor.runId, sessionId, runId })
-          return { status: 'applied' as const, record: successor }
+          return { status: 'replaced' as const, record: successor }
         },
       },
       hostManager: {
@@ -1361,7 +1576,7 @@ describe('OpenCodeSessionBridge', () => {
         get: async () => current,
         publishSuccessorIfExact: async successor => {
           current = successor
-          return { status: 'applied' as const, record: successor }
+          return { status: 'exact' as const, record: successor }
         },
       },
       hostManager: {

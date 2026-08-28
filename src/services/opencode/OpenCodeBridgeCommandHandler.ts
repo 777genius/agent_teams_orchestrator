@@ -535,10 +535,13 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
   }
 }
 
-async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<OpenCodeProvisioningSnapshot> {
-  const passiveReader = new OpenCodePassiveStatusProductionReader()
+async function buildCommandStatusReadOnlySnapshot(
+  projectPath: string,
+  passiveReader: Pick<OpenCodePassiveStatusProductionReader, 'reader'>
+    = new OpenCodePassiveStatusProductionReader(),
+): Promise<OpenCodeProvisioningSnapshot> {
   const passive = await passiveReader.reader.read({
-    projectPath: projectIdentity,
+    projectPath,
     providerIds: OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS,
     timeoutMs: OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
   })
@@ -560,6 +563,13 @@ async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<
     probeError: passive.projectScope === null ? 'passive_scope_unavailable' : null,
     diagnostics: ['OpenCode command status used passive redacted status; active runtime state was not probed.'],
   }
+}
+
+export async function __buildCommandStatusReadOnlySnapshotForTests(
+  projectPath: string,
+  passiveReader: Pick<OpenCodePassiveStatusProductionReader, 'reader'>,
+): Promise<OpenCodeProvisioningSnapshot> {
+  return buildCommandStatusReadOnlySnapshot(projectPath, passiveReader)
 }
 
 function buildSendMessageStoredSessionSnapshot(
