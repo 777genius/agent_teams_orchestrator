@@ -55,6 +55,7 @@ import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './ant
 import {
   type AnthropicRuntimeBackendInfo,
   buildAnthropicRuntimeStatus,
+  getAnthropicStatusCheckContract,
   isAnthropicSubscriptionAuthMethod,
 } from './anthropicStatus.js'
 import {
@@ -524,6 +525,7 @@ async function buildAnthropicSummaryStatus(
           authMethodDetail: backend.authMethodDetail,
         }
       : null,
+    ...getAnthropicStatusCheckContract(null, backend),
   }
 }
 
@@ -639,6 +641,9 @@ async function buildOpenCodeStatus(
     buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
   const authenticated =
     hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
+  const statusCheck = getOpenCodeActiveStatusContract(snapshot, authenticated)
+  const authoritative = statusCheck.statusCheckOutcome === 'authoritative'
+  const effectiveAuthenticated = authoritative && authenticated
   const fetchedAt = new Date()
   const defaultModel =
     agentModels.find((model) => model === 'opencode/big-pickle') ??
@@ -709,22 +714,26 @@ async function buildOpenCodeStatus(
     providerId: 'opencode',
     displayName: 'OpenCode (75+ LLM providers)',
     supported: snapshot.detected,
-    authenticated,
-    authMethod: hasConnectedProvider
-      ? 'opencode_managed'
-      : hasBuiltinFreeModel
-        ? 'opencode_builtin_free'
-        : hasConfiguredAuthlessModel
-          ? 'opencode_configured_local'
-          : null,
+    authenticated: effectiveAuthenticated,
+    authMethod: !effectiveAuthenticated
+      ? null
+      : hasConnectedProvider
+        ? 'opencode_managed'
+        : hasBuiltinFreeModel
+          ? 'opencode_builtin_free'
+          : hasConfiguredAuthlessModel
+            ? 'opencode_configured_local'
+            : null,
     verificationState: !snapshot.detected
       ? 'offline'
-      : snapshot.probeError && snapshot.models.length === 0 && !authenticated
-        ? 'error'
+      : !authoritative
+        ? statusCheck.statusCheckOutcome === 'transient_error'
+          ? 'error'
+          : 'unknown'
         : 'verified',
     canLoginFromUi: false,
     capabilities: {
-      teamLaunch: snapshot.detected && authenticated,
+      teamLaunch: snapshot.detected && effectiveAuthenticated,
       oneShot: false,
       extensions: buildExtensionCapabilities({
         plugins: {
@@ -753,7 +762,9 @@ async function buildOpenCodeStatus(
         },
       }),
     },
-    statusMessage: authenticated ? null : buildOpenCodeStatusMessage(snapshot),
+    statusMessage: effectiveAuthenticated
+      ? null
+      : buildOpenCodeStatusMessage(snapshot),
     detailMessage: buildOpenCodeDetailMessage(snapshot),
     selectedBackendId: null,
     resolvedBackendId: null,
@@ -780,16 +791,18 @@ async function buildOpenCodeStatus(
       ? {
           kind: 'opencode-cli',
           label: 'OpenCode CLI',
-          authMethodDetail: hasConnectedProvider
-            ? (snapshot.profile?.authState ?? null)
-            : hasBuiltinFreeModel
-              ? 'built-in free models'
-              : hasConfiguredAuthlessModel
-                ? 'configured local OpenCode model'
-                : (snapshot.profile?.authState ?? null),
+          authMethodDetail: !effectiveAuthenticated
+            ? null
+            : hasConnectedProvider
+              ? (snapshot.profile?.authState ?? null)
+              : hasBuiltinFreeModel
+                ? 'built-in free models'
+                : hasConfiguredAuthlessModel
+                  ? 'configured local OpenCode model'
+                  : (snapshot.profile?.authState ?? null),
         }
       : null,
-    ...getOpenCodeActiveStatusContract(snapshot, authenticated),
+    ...statusCheck,
   }
 
   provider.modelCatalog = modelCatalog
@@ -827,6 +840,8 @@ async function buildGeminiStatuses(): Promise<{
   detailMessage: string | null
   canLoginFromUi: boolean
   backend: RuntimeProviderStatus['backend']
+  statusCheckOutcome: RuntimeProviderStatus['statusCheckOutcome']
+  statusCheckErrorCode: RuntimeProviderStatus['statusCheckErrorCode']
 }> {
   const selectedBackendId = getGeminiRuntimeBackendPreference()
   const apiStatus = await geminiApiBackend.validate()
@@ -891,6 +906,11 @@ async function buildGeminiStatuses(): Promise<{
           : selectedBackendId === 'cli-sdk'
             ? cliStatus
             : null
+  const validationFailed =
+    !resolvedBackendId &&
+    (selectedBackendId === 'auto'
+      ? apiStatus.authMethod !== 'none' || cliStatus.authMethod !== 'none'
+      : preferredStatus?.authMethod !== 'none')
 
   return {
     selectedBackendId,
@@ -942,6 +962,8 @@ async function buildGeminiStatuses(): Promise<{
                   : null,
             }
           : null,
+    statusCheckOutcome: validationFailed ? 'transient_error' : 'authoritative',
+    statusCheckErrorCode: validationFailed ? 'unavailable' : null,
   }
 }
 
@@ -956,6 +978,8 @@ function buildCodexStatuses(): {
   detailMessage: string | null
   canLoginFromUi: boolean
   backend: RuntimeProviderStatus['backend']
+  statusCheckOutcome: RuntimeProviderStatus['statusCheckOutcome']
+  statusCheckErrorCode: RuntimeProviderStatus['statusCheckErrorCode']
 } {
   const resolution = resolveCodexRuntimeSelection()
   const codexNativeAvailable = resolution.resolvedBackendId === 'codex-native'
@@ -973,6 +997,20 @@ function buildCodexStatuses(): {
       : !resolution.nativeApiKeyConfigured
         ? 'Authentication required'
         : 'Degraded'
+  const statusCheck = codexNativeState === 'runtime-missing'
+    ? {
+        statusCheckOutcome: 'transient_error' as const,
+        statusCheckErrorCode: 'runtime_missing' as const,
+      }
+    : codexNativeState === 'degraded'
+      ? {
+          statusCheckOutcome: 'transient_error' as const,
+          statusCheckErrorCode: 'unavailable' as const,
+        }
+      : {
+          statusCheckOutcome: 'authoritative' as const,
+          statusCheckErrorCode: null,
+        }
 
   return {
     selectedBackendId: resolution.selectedBackendId,
@@ -1004,6 +1042,7 @@ function buildCodexStatuses(): {
             authMethodDetail: resolution.authMethod,
           }
         : null,
+    ...statusCheck,
   }
 }
 
@@ -1064,6 +1103,8 @@ export async function getUnifiedRuntimeStatusPayload(
           },
         },
         backend: codex.backend,
+        statusCheckOutcome: codex.statusCheckOutcome,
+        statusCheckErrorCode: codex.statusCheckErrorCode,
       }
     } else {
       const modelCatalog = filterCodexModelCatalog(
@@ -1073,6 +1114,20 @@ export async function getUnifiedRuntimeStatusPayload(
       const modelCatalogDynamic =
         modelCatalog.source === 'app-server' &&
         (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
+      const catalogStatusCheck = modelCatalog.status === 'unavailable'
+        ? {
+            statusCheckOutcome: 'transient_error' as const,
+            statusCheckErrorCode: 'unavailable' as const,
+          }
+        : modelCatalog.status === 'stale' || modelCatalog.status === 'degraded'
+          ? {
+              statusCheckOutcome: 'pending' as const,
+              statusCheckErrorCode: 'partial_response' as const,
+            }
+          : {
+              statusCheckOutcome: 'authoritative' as const,
+              statusCheckErrorCode: null,
+            }
       providers.codex = {
         providerId: 'codex',
         displayName: 'Codex',
@@ -1113,6 +1168,12 @@ export async function getUnifiedRuntimeStatusPayload(
           },
         },
         backend: codex.backend,
+        ...(codex.statusCheckOutcome === 'authoritative'
+          ? catalogStatusCheck
+          : {
+              statusCheckOutcome: codex.statusCheckOutcome,
+              statusCheckErrorCode: codex.statusCheckErrorCode,
+            }),
       }
     }
   }
@@ -1149,6 +1210,8 @@ export async function getUnifiedRuntimeStatusPayload(
       ],
       models: getGeminiModels(),
       backend: gemini.backend,
+      statusCheckOutcome: gemini.statusCheckOutcome,
+      statusCheckErrorCode: gemini.statusCheckErrorCode,
     }
   }
 

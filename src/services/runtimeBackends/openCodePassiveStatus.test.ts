@@ -147,6 +147,8 @@ describe('OpenCode passive runtime status', () => {
       models: ['openai/gpt-5'],
       statusCheckOutcome: 'model_only',
     })
+    expect(payload.providers.opencode).not.toHaveProperty('modelCatalog')
+    expect(payload.providers.opencode).not.toHaveProperty('capabilitiesInfo')
   })
 })
 
@@ -154,48 +156,93 @@ describe('OpenCode active runtime status contract', () => {
   test.each([
     {
       name: 'complete response',
-      snapshot: inventory(),
-      outcome: 'authoritative',
-      errorCode: null,
-    },
-    {
-      name: 'partial response',
       snapshot: inventory({
         connectedProviders: [
           { id: 'openai', authHint: 'api', source: 'credentials' },
         ],
+        models: ['openai/gpt-5'],
+      }),
+      outcome: 'authoritative',
+      errorCode: null,
+      authorizes: true,
+    },
+    {
+      name: 'partial response with retained provider and model data',
+      snapshot: inventory({
+        connectedProviders: [
+          { id: 'openai', authHint: 'api', source: 'credentials' },
+        ],
+        models: ['openai/gpt-5'],
         probeError: 'provider response ended early',
       }),
       outcome: 'pending',
       errorCode: 'partial_response',
+      authorizes: false,
     },
     {
-      name: 'timeout',
+      name: 'timeout with retained provider and model data',
       snapshot: inventory({
+        connectedProviders: [
+          { id: 'openai', authHint: 'api', source: 'credentials' },
+        ],
+        models: ['openai/gpt-5'],
         probeError: 'OpenCode inventory probe timed out after 10ms',
       }),
       outcome: 'transient_error',
       errorCode: 'timeout',
+      authorizes: false,
     },
     {
-      name: 'unavailable response',
+      name: 'unavailable error with retained provider and model data',
+      snapshot: inventory({
+        connectedProviders: [
+          { id: 'openai', authHint: 'api', source: 'credentials' },
+        ],
+        models: ['openai/gpt-5'],
+        probeError: 'OpenCode inventory unavailable',
+      }),
+      outcome: 'pending',
+      errorCode: 'partial_response',
+      authorizes: false,
+    },
+    {
+      name: 'unavailable response without retained data',
       snapshot: inventory({ probeError: 'OpenCode inventory unavailable' }),
       outcome: 'transient_error',
       errorCode: 'unavailable',
+      authorizes: false,
     },
     {
       name: 'missing runtime',
       snapshot: inventory({ detected: false, binaryPath: null }),
       outcome: 'transient_error',
       errorCode: 'runtime_missing',
+      authorizes: false,
     },
-  ])('$name emits $outcome/$errorCode', async ({ snapshot, outcome, errorCode }) => {
+  ])('$name emits the expected status contract', async ({
+    snapshot,
+    outcome,
+    errorCode,
+    authorizes,
+  }) => {
     const payload = await getUnifiedRuntimeStatusPayload('opencode', {
       getOpenCodeInventorySnapshot: async () => snapshot,
     })
+    const opencode = payload.providers.opencode
 
-    expect(payload.providers.opencode?.statusCheckOutcome).toBe(outcome)
-    expect(payload.providers.opencode?.statusCheckErrorCode).toBe(errorCode)
+    expect(opencode?.statusCheckOutcome).toBe(outcome)
+    expect(opencode?.statusCheckErrorCode).toBe(errorCode)
+    expect(opencode?.authenticated).toBe(authorizes)
+    expect(opencode?.authMethod).toBe(authorizes ? 'opencode_managed' : null)
+    expect(opencode?.capabilities.teamLaunch).toBe(authorizes)
+    expect(opencode?.verificationState).toBe(
+      authorizes
+        ? 'verified'
+        : snapshot.detected
+          ? outcome === 'pending' ? 'unknown' : 'error'
+          : 'offline',
+    )
+    if (!authorizes) expect(opencode?.backend?.authMethodDetail ?? null).toBeNull()
   })
 })
 
