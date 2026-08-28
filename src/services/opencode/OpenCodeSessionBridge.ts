@@ -42,7 +42,17 @@ type OpenCodeSessionBridgeDeps = {
     & Partial<Pick<typeof openCodeSessionStore,
       'getByLogicalMember' | 'upsertIfSessionMatches' | 'publishIfAbsentOrExact'
       | 'markStaleIfSessionMatchesLogicalMember' | 'upsert' | 'markStaleByLogicalMember'
-      | 'markStale'>>
+      | 'markStale'>> & {
+        publishSuccessorIfExact?: (
+          successor: OpenCodeSessionRecord,
+          expectedOldSessionId: string,
+          expectedOldRunId: string | null,
+        ) => Promise<
+          | { status: 'applied' | 'already-satisfied'; record: OpenCodeSessionRecord }
+          | { status: 'absent' }
+          | { status: 'foreign'; record: OpenCodeSessionRecord }
+        >
+      }
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -228,6 +238,8 @@ function isTransientOpenCodeCreateSessionError(error: unknown): boolean {
 
 export class OpenCodeSessionBridge {
   private readonly retainedSessionHosts = new Map<string, string>()
+  private readonly publishedSuccessors = new Map<string, Pick<OpenCodeSessionRecord,
+    'opencodeSessionId' | 'runId'>>()
 
   constructor(private readonly deps: OpenCodeSessionBridgeDeps = {}) {}
 
@@ -430,7 +442,12 @@ export class OpenCodeSessionBridge {
     title?: string | null
     runId?: string | null
     toolApprovalMode?: OpenCodeToolApprovalMode
-  }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
+    retainLease?: boolean
+  }): Promise<{
+    record: OpenCodeSessionRecord
+    retainedHostKey: string
+    client: OpenCodeClient
+  }> {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
@@ -494,15 +511,18 @@ export class OpenCodeSessionBridge {
         createdAt: now,
         updatedAt: now,
       }
-      await this.hostManager.retainHostLease?.(host.hostKey, {
-        teamId: params.identity.teamId,
-        laneId: params.identity.laneId,
-        memberName: params.identity.memberName,
-        runId: params.runId ?? null,
-        sessionId: session.id,
-      }).catch(() => undefined)
+      if (params.retainLease !== false) {
+        await this.hostManager.retainHostLease?.(host.hostKey, {
+          teamId: params.identity.teamId,
+          laneId: params.identity.laneId,
+          memberName: params.identity.memberName,
+          runId: params.runId ?? null,
+          sessionId: session.id,
+        }).catch(() => undefined)
+      }
 
       return {
+        client,
         retainedHostKey: host.hostKey,
         record,
       }
@@ -646,6 +666,7 @@ export class OpenCodeSessionBridge {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      runId: record.runId,
       sessionId: record.opencodeSessionId,
     }).catch(() => undefined)
 
@@ -849,6 +870,21 @@ export class OpenCodeSessionBridge {
             toolApprovalMode: 'auto',
           }
     const profile = requestedProfile.profile
+    const refreshDecisionKey = JSON.stringify([
+      projectIdentity, params.teamId, laneId, params.memberName,
+      params.runId ?? null, params.selectedModel, selectedVariant ?? null,
+      profile.projectBehaviorFingerprint, profile.managedAuthFingerprint,
+      profile.managedConfigFingerprint,
+    ])
+    const knownSuccessor = this.publishedSuccessors.get(refreshDecisionKey)
+    if (
+      existing && knownSuccessor
+      && existing.opencodeSessionId === knownSuccessor.opencodeSessionId
+      && existing.runId === knownSuccessor.runId
+    ) {
+      const retained = await this.retainSessionHost(existing, existing.runId, profile)
+      return retained?.pid && retained.pid > 0 ? { ...existing, runtimePid: retained.pid } : existing
+    }
     const existingManagedConfigFingerprint = existing
       ? getRecordManagedConfigFingerprint(existing)
       : null
@@ -892,8 +928,10 @@ export class OpenCodeSessionBridge {
                   ? 'managed_auth_changed'
                   : existing.staleReason ?? 'session_refresh_required'
 
-      await this.markProjectSessionStale(existing, staleReason)
-      await this.releaseSession(existing)
+      // The reason is computed before the provider effect so this invocation has
+      // an attempt-local refresh decision. The durable old owner remains intact
+      // until the successor CAS below succeeds.
+      void staleReason
     }
 
     const created = await this.createFreshSessionRecord({
@@ -908,28 +946,87 @@ export class OpenCodeSessionBridge {
       title: params.title,
       runId: params.runId ?? null,
       toolApprovalMode: requestedProfile.toolApprovalMode,
+      retainLease: !existing,
     })
+    let protectedRemoteSessionId = existing?.opencodeSessionId ?? null
     try {
-      let publication = await this.sessionStore.publishIfAbsentOrExact?.(created.record)
-      if (!publication && this.deps.sessionStore && this.sessionStore.upsert) {
+      let publication = existing
+        ? await this.sessionStore.publishSuccessorIfExact?.(
+          created.record,
+          existing.opencodeSessionId,
+          existing.runId,
+        )
+        : await this.sessionStore.publishIfAbsentOrExact?.(created.record)
+      if (!existing && !publication && this.deps.sessionStore && this.sessionStore.upsert) {
         await this.sessionStore.upsert(created.record)
         publication = { status: 'inserted', record: created.record }
       }
-      if (!publication || publication.status === 'conflict') {
+      if (publication && 'record' in publication
+        && (publication.status === 'foreign' || publication.status === 'conflict')) {
+        protectedRemoteSessionId = publication.record.opencodeSessionId
+      }
+      if (!publication || publication.status === 'conflict'
+        || publication.status === 'foreign' || publication.status === 'absent') {
         throw new Error('OpenCode session ownership changed before publication')
       }
       this.retainedSessionHosts.set(
         this.buildSessionKey(created.record),
         created.retainedHostKey,
       )
+      if (existing) {
+        await this.hostManager.retainHostLease?.(created.retainedHostKey, {
+          teamId: created.record.teamId,
+          laneId: created.record.laneId,
+          memberName: created.record.memberName,
+          runId: created.record.runId,
+          sessionId: created.record.opencodeSessionId,
+        }).catch(() => undefined)
+        this.publishedSuccessors.set(refreshDecisionKey, {
+          opencodeSessionId: created.record.opencodeSessionId,
+          runId: created.record.runId,
+        })
+        const oldSessionKey = this.buildSessionKey(existing)
+        const oldRetainedHost = this.retainedSessionHosts.get(oldSessionKey)
+        const oldLeaseOutcome = await this.hostManager.releaseHostLease?.(existing.hostKey, {
+          teamId: existing.teamId,
+          laneId: existing.laneId,
+          memberName: existing.memberName,
+          runId: existing.runId,
+          sessionId: existing.opencodeSessionId,
+        }).catch(() => undefined)
+        if (oldRetainedHost === existing.hostKey) {
+          this.retainedSessionHosts.delete(oldSessionKey)
+          await this.hostManager.releaseHost(oldRetainedHost).catch(() => undefined)
+        } else if (oldLeaseOutcome === 'applied') {
+          await this.hostManager.releaseHost(existing.hostKey).catch(() => undefined)
+        }
+      }
     } catch (error) {
-      const releaseOutcome = await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
-        teamId: created.record.teamId,
-        laneId: created.record.laneId,
-        memberName: created.record.memberName,
-        runId: created.record.runId,
-        sessionId: created.record.opencodeSessionId,
-      }).catch(() => undefined)
+      let remoteCleanupError: unknown = null
+      if (created.record.opencodeSessionId !== protectedRemoteSessionId) {
+        try {
+          const deleted = await created.client.deleteSession(created.record.opencodeSessionId)
+          if (!deleted) {
+            remoteCleanupError = new Error('OpenCode remote session deletion was not confirmed')
+          }
+        } catch (cleanupError) {
+          remoteCleanupError = cleanupError
+        }
+      }
+      if (remoteCleanupError) {
+        throw new Error(
+          `OpenCode successor publication failed and remote cleanup remains required for ${created.record.opencodeSessionId} on ${created.retainedHostKey}: ${remoteCleanupError instanceof Error ? remoteCleanupError.message : String(remoteCleanupError)}`,
+          { cause: error },
+        )
+      }
+      const releaseOutcome = existing ? 'absent' : await this.hostManager.releaseHostLease?.(
+        created.retainedHostKey, {
+          teamId: created.record.teamId,
+          laneId: created.record.laneId,
+          memberName: created.record.memberName,
+          runId: created.record.runId,
+          sessionId: created.record.opencodeSessionId,
+        }).catch(() => undefined)
       if (releaseOutcome !== 'foreign') {
         await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
       }
