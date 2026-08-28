@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import {
   OpenCodeWindowsPassiveReadAuthority,
   testRetainWindowsPassiveRoot,
+  testWindowsPassiveReadOwnerLifetime,
 } from './OpenCodeWindowsPassiveReadAuthority.js'
 
 type Identity = Readonly<{ volumeSerial: bigint; fileId: bigint; size: bigint; directory: boolean }>
@@ -45,6 +46,23 @@ function fake(input: Readonly<{
 }
 
 describe('OpenCode Windows passive retained traversal contract', () => {
+  test.each([
+    ['success', 1, true],
+    ['EOF', 0, true],
+    ['error', 0, false],
+  ] as const)('retains passive ReadFile owners through forced GC on %s', (_outcome, bytesRead, succeeds) => {
+    let pressureCalls = 0
+    const invoke = () => testWindowsPassiveReadOwnerLifetime(8, bytesRead, succeeds, () => {
+      const pressure = Array.from({ length: 128 }, (_, index) => Buffer.alloc(2048, index))
+      Bun.gc(true)
+      expect(pressure[bytesRead]![0]).toBe(bytesRead)
+      pressureCalls += 1
+    })
+    if (succeeds) expect(invoke()).toHaveLength(bytesRead)
+    else expect(invoke).toThrow()
+    expect(pressureCalls).toBe(1)
+  })
+
   test('uses handle-bound filesystem, device, identity, and no-follow APIs on x64 and ARM64', async () => {
     const source = await Bun.file(new URL('./OpenCodeWindowsPassiveReadAuthority.ts', import.meta.url)).text()
     for (const api of ['GetVolumeInformationByHandleW', 'NtQueryVolumeInformationFile',
@@ -124,10 +142,19 @@ describe('OpenCode Windows passive native integration', () => {
     const intermediate = path.join(parent, 'intermediate')
     const final = path.join(parent, 'final')
     await Promise.all([mkdir(path.join(owned, 'nested'), { recursive: true }), mkdir(path.join(target, 'nested'), { recursive: true })])
+    await writeFile(path.join(owned, 'nested', 'publication.json'), 'retained')
     await Promise.all([symlink(target, intermediate, 'junction'), symlink(target, final, 'junction')])
     try {
-      const authority = OpenCodeWindowsPassiveReadAuthority.open(path.join(owned, 'nested'))
+      const authority = OpenCodeWindowsPassiveReadAuthority.open(path.join(owned, 'nested'), {
+        beforeNativeCall: () => {
+          const pressure = Array.from({ length: 64 }, () => Buffer.alloc(1024))
+          Bun.gc(true)
+          expect(pressure).toHaveLength(64)
+        },
+      })
       authority.validate()
+      expect(authority.childNames()).toContain('publication.json')
+      expect(new TextDecoder().decode((await authority.readBounded('publication.json', 64))!)).toBe('retained')
       authority.close()
       expect(() => OpenCodeWindowsPassiveReadAuthority.open(path.join(intermediate, 'nested'))).toThrow()
       expect(() => OpenCodeWindowsPassiveReadAuthority.open(final)).toThrow()

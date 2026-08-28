@@ -12,6 +12,7 @@ import {
   OpenCodeLaunchFileJournalPersistence,
   OpenCodeLaunchJournalError,
   OpenCodeLaunchPoisonedLeaseError,
+  testNativeJournalReadOwnerLifetime,
   type OpenCodeLaunchJournalPersistence,
   type OpenCodeLaunchJournalLease,
   type OpenCodeLaunchStoreContext,
@@ -154,6 +155,23 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
 }
 
 describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
+  test.each([
+    ['success and EOF', [1, 0] as const, false],
+    ['EOF', [0] as const, false],
+    ['error', [-1] as const, true],
+  ] as const)('retains native read destinations through forced GC on %s', (_outcome, results, rejects) => {
+    let pressureCalls = 0
+    const invoke = () => testNativeJournalReadOwnerLifetime(results, () => {
+      const pressure = Array.from({ length: 128 }, (_, index) => Buffer.alloc(2048, index))
+      Bun.gc(true)
+      expect(pressure[pressureCalls]![0]).toBe(pressureCalls)
+      pressureCalls += 1
+    })
+    if (rejects) expect(invoke).toThrow('native read failed')
+    else expect(invoke()).toHaveLength(results[0] === 1 ? 1 : 0)
+    expect(pressureCalls).toBe(results.length)
+  })
+
   test('classifies native Windows directory durability errors without treating access denial as success', () => {
     expect(classifyOpenCodeDirectoryDurabilityError('win32', 'EINVAL')).toBe('explicitly_unsupported')
     expect(classifyOpenCodeDirectoryDurabilityError('win32', 'ENOTSUP')).toBe('explicitly_unsupported')
@@ -214,6 +232,11 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
         const pressure = Array.from({ length: 128 }, (_, index) => Buffer.alloc(2048, index))
         Bun.gc(true)
         pressureChecksum ^= pressure[operation.length]![0]!
+      },
+      beforeNativeReadCall: () => {
+        const pressure = Array.from({ length: 128 }, () => Buffer.alloc(2048))
+        Bun.gc(true)
+        pressureChecksum ^= pressure[0]![0]!
       },
       beforeAtomicRename: async temporary => {
         if (!removeTemporary) return

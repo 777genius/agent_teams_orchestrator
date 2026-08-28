@@ -267,6 +267,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       /** Test-only synchronous pressure point after native path buffers are allocated. */
       beforeNativePathOperation?:
         (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void
+      /** Test-only pressure point after a native read destination pointer is captured. */
+      beforeNativeReadCall?: () => void
       /** Test-only platform selection; production always uses process.platform. */
       platform?: NodeJS.Platform
       windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
@@ -662,10 +664,12 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     let authorityBackend: NamespaceBackend
     if (retained) {
       backend = await RetainedDirectoryBackend.create(directory, identity, true,
-        this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation)
+        this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation,
+        this.testHooks.beforeNativeReadCall)
       try {
         authorityBackend = await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false,
-          this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation)
+          this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation,
+          this.testHooks.beforeNativeReadCall)
       } catch (error) {
         await backend.close?.().catch(() => undefined)
         throw error
@@ -1129,6 +1133,35 @@ function retainNativeBuffers(...buffers: Buffer[]): void {
   }
 }
 
+function nativeReadFile(
+  fd: number, beforeCall: (() => void) | undefined,
+  call: (fd: number, destination: ReturnType<typeof ptr>, length: number) => number,
+  failure: () => Error,
+): Uint8Array {
+  const chunks: Buffer[] = []
+  while (true) {
+    const chunk = Buffer.alloc(64 * 1024)
+    const destination = ptr(chunk)
+    beforeCall?.()
+    const count = Number(call(fd, destination, chunk.length))
+    // Keep the writable destination alive on success, EOF, and error before inspecting status.
+    retainNativeBuffers(chunk)
+    if (count < 0) throw failure()
+    if (count === 0) break
+    if (count > chunk.length) throw failure()
+    chunks.push(chunk.subarray(0, count))
+  }
+  return new Uint8Array(Buffer.concat(chunks))
+}
+
+/** Linux-safe deterministic seam for native read success, EOF, and error lifetime tests. */
+export function testNativeJournalReadOwnerLifetime(
+  results: readonly number[], beforeCall: () => void,
+): Uint8Array {
+  let index = 0
+  return nativeReadFile(1, beforeCall, () => results[index++] ?? 0, () => new Error('native read failed'))
+}
+
 class RetainedDirectoryBackend implements NamespaceBackend {
   readonly kind = 'retained-directory' as const
   private closePromise?: Promise<void>
@@ -1140,6 +1173,7 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     private readonly afterHandleClosed?: (root: string) => Promise<void>,
     private readonly beforeNativePathOperation?:
       (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void,
+    private readonly beforeNativeReadCall?: () => void,
   ) {}
   static async create(
     root: string,
@@ -1148,6 +1182,7 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     afterHandleClosed?: (root: string) => Promise<void>,
     beforeNativePathOperation?:
       (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void,
+    beforeNativeReadCall?: () => void,
   ): Promise<RetainedDirectoryBackend> {
     const handle = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
     try {
@@ -1157,7 +1192,7 @@ class RetainedDirectoryBackend implements NamespaceBackend {
       }
       unixSymbols()
       return new RetainedDirectoryBackend(root, handle, expected, logicalNamespace, afterHandleClosed,
-        beforeNativePathOperation)
+        beforeNativePathOperation, beforeNativeReadCall)
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error
@@ -1185,7 +1220,12 @@ class RetainedDirectoryBackend implements NamespaceBackend {
   }
   private result(value: number | bigint, operation: string): number { const numeric = Number(value); if (numeric < 0) throw nativeError(operation); return numeric }
   private async fdStat(fd: number): Promise<NamespaceStat> {
-    const buffer = Buffer.alloc(256); this.result((unixSymbols().symbols as any).fstat(fd, ptr(buffer)), 'fstat'); return decodeNativeStat(buffer)
+    const buffer = Buffer.alloc(256)
+    const bufferPointer = ptr(buffer)
+    const result = (unixSymbols().symbols as any).fstat(fd, bufferPointer)
+    retainNativeBuffers(buffer)
+    this.result(result, 'fstat')
+    return decodeNativeStat(buffer)
   }
   async lstat(name: string) { return this.statAt(name, process.platform === 'darwin' ? 0x20 : 0x100) }
   async stat(name: string) { return this.statAt(name, 0) }
@@ -1248,6 +1288,11 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     finally { await handle?.close() }
   }
   statFd(fd: number) { return this.fdStat(fd) }
+  nativeRead(fd: number): Uint8Array {
+    return nativeReadFile(fd, this.beforeNativeReadCall,
+      (nativeFd, destination, length) => Number((unixSymbols().symbols as any).read(nativeFd, destination, length)),
+      () => nativeError('read'))
+  }
   close(): Promise<void> {
     return this.closePromise ??= (async () => {
       await this.rootHandle.close()
@@ -1271,12 +1316,7 @@ class NativeNamespaceHandle implements NamespaceHandle {
     }
   }
   async readFile() {
-    const chunks: Buffer[] = []
-    while (true) {
-      const chunk = Buffer.alloc(64 * 1024); const count = Number((unixSymbols().symbols as any).read(this.fd, ptr(chunk), chunk.length))
-      if (count < 0) throw nativeError('read'); if (count === 0) break; chunks.push(chunk.subarray(0, count))
-    }
-    return new Uint8Array(Buffer.concat(chunks))
+    return this.backend.nativeRead(this.fd)
   }
   async sync() { if ((unixSymbols().symbols as any).fsync(this.fd) < 0) throw nativeError('fsync') }
   async close() {
