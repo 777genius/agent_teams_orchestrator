@@ -15,10 +15,10 @@ const ownerBinding: HostedControlOwnerBinding = {
   socketIdentity: { device: '1', inode: '2', uid: 501, gid: 20, mode: 0o600 },
 }
 const authority: HostedControlStableAuthority = {
-  deploymentId: 'deployment-a',
-  bootId: 'boot-a',
+  deploymentId: `deployment_${'3'.repeat(32)}`,
+  bootId: `boot_${'4'.repeat(32)}`,
   restoreGeneration: 0,
-  workspaceId: 'workspace-a',
+  workspaceId: `workspace_${'1'.repeat(32)}`,
   mountBinding: { mountGeneration: 1, declaredRootHash: 'a'.repeat(64) },
   teamId: `team_${'b'.repeat(32)}`,
 }
@@ -158,11 +158,27 @@ describe('HostedControlDispatcher response decoding', () => {
     }).dispatch(signedLifecycleRequest('get_status'))).resolves.toMatchObject({ operation: 'get_status', payload: { kind: 'status' } })
   })
 
+  test('pins the recent commands golden to the Desktop identifier contract', async () => {
+    const bytes = await readFile(new URL(
+      './fixtures/hosted-lifecycle-recent-commands-v1.json', import.meta.url,
+    ))
+    expect(bytes.byteLength).toBe(739)
+    expect(createHash('sha256').update(bytes).digest('hex'))
+      .toBe('4a94e072a308173fb921f8644ebdc7ea94e3cd9e8d3e40cb1084da5b256b11b5')
+    const golden = JSON.parse(bytes.toString('utf8'))
+    expect(golden).toMatchObject({ schemaVersion: 1, contract: 'hosted-lifecycle-recent-commands-v1' })
+    expect(authority.deploymentId).toMatch(/^deployment_[0-9a-f]{32}$/)
+    expect(authority.bootId).toMatch(/^boot_[0-9a-f]{32}$/)
+    for (const command of golden.recentCommands) {
+      expect(command.result.workspaceId).toMatch(/^workspace_[0-9a-f]{32}$/)
+      if ('runId' in command.result) expect(command.result.runId).toMatch(/^run_[0-9a-f]{32}$/)
+    }
+  })
+
   test('accepts the versioned recent commands golden', async () => {
     const golden = JSON.parse(await readFile(new URL(
       './fixtures/hosted-lifecycle-recent-commands-v1.json', import.meta.url,
     ), 'utf8'))
-    expect(golden).toMatchObject({ schemaVersion: 1, contract: 'hosted-lifecycle-recent-commands-v1' })
     await expect(lifecycleDispatcher(statusResponse(golden.recentCommands))
       .dispatch(signedLifecycleRequest('get_status'))).resolves.toMatchObject({
       payload: { recentCommands: golden.recentCommands },
