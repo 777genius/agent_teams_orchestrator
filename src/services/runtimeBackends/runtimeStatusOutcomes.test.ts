@@ -84,6 +84,36 @@ describe('runtime status outcome completeness', () => {
     })
   })
 
+  test('Codex configured CLI nonzero status fails closed in summary and full', async () => {
+    delete process.env.CODEX_API_KEY
+    delete process.env.OPENAI_API_KEY
+    process.env.CODEX_CLI_PATH = '/bin/false'
+    process.env.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD = 'chatgpt'
+
+    for (const detailLevel of ['summary', 'full'] as const) {
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'codex',
+        detailLevel === 'full'
+          ? { getCodexModelCatalog: async () => catalog('ready', 'codex') }
+          : undefined,
+        { detailLevel },
+      )
+      expect(payload.providers.codex).toMatchObject({
+        authenticated: false,
+        authMethod: null,
+        verificationState: 'error',
+        resolvedBackendId: null,
+        capabilities: { teamLaunch: false },
+        statusCheckOutcome: 'transient_error',
+        statusCheckErrorCode: 'unavailable',
+      })
+      expect(payload.providers.codex?.detailMessage).toContain(
+        'binary=configured-env:/bin/false',
+      )
+      expect(payload.providers.codex?.detailMessage).toContain('login=unknown')
+    }
+  })
+
   test('Gemini summary and full current statuses are explicitly authoritative', async () => {
     geminiApiBackend.validate = async () => ({
       ok: true,
@@ -121,6 +151,52 @@ describe('runtime status outcome completeness', () => {
       statusCheckOutcome: 'transient_error',
       statusCheckErrorCode: 'unavailable',
     })
+
+    geminiApiBackend.validate = async () => ({
+      ok: false,
+      backend: 'api',
+      authMethod: 'api_key',
+      endpointLabel: 'test-api',
+      message: 'Invalid API key',
+      validationError: 'invalid_credentials',
+    })
+    const invalid = await getUnifiedRuntimeStatusPayload('gemini')
+    expect(invalid.providers.gemini).toMatchObject({
+      authenticated: false,
+      capabilities: { teamLaunch: false },
+      statusCheckOutcome: 'authoritative',
+      statusCheckErrorCode: null,
+    })
+  })
+
+  test('Gemini permission-denied validation fails closed in summary and full', async () => {
+    geminiApiBackend.validate = async () => ({
+      ok: false,
+      backend: 'api',
+      authMethod: 'none',
+      endpointLabel: 'test-api',
+      message: 'Not configured',
+    })
+    geminiCliBackend.validate = async () => {
+      const error = new Error('permission denied reading Gemini credential store')
+      Object.assign(error, { code: 'EACCES' })
+      throw error
+    }
+
+    for (const detailLevel of ['summary', 'full'] as const) {
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'gemini', undefined, { detailLevel },
+      )
+      expect(payload.providers.gemini).toMatchObject({
+        authenticated: false,
+        authMethod: null,
+        verificationState: 'error',
+        resolvedBackendId: null,
+        capabilities: { teamLaunch: false },
+        statusCheckOutcome: 'transient_error',
+        statusCheckErrorCode: 'unavailable',
+      })
+    }
   })
 })
 

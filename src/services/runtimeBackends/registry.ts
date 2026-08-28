@@ -844,8 +844,25 @@ async function buildGeminiStatuses(): Promise<{
   statusCheckErrorCode: RuntimeProviderStatus['statusCheckErrorCode']
 }> {
   const selectedBackendId = getGeminiRuntimeBackendPreference()
-  const apiStatus = await geminiApiBackend.validate()
-  const cliStatus = await geminiCliBackend.validate()
+  const validate = async (
+    backend: typeof geminiApiBackend,
+    endpointLabel: string,
+  ): Promise<GeminiBackendStatus> => {
+    try {
+      return await backend.validate()
+    } catch (error) {
+      return {
+        ok: false,
+        backend: backend.kind,
+        authMethod: 'none',
+        endpointLabel,
+        message: error instanceof Error ? error.message : String(error),
+        validationError: 'operational',
+      }
+    }
+  }
+  const apiStatus = await validate(geminiApiBackend, 'Gemini API')
+  const cliStatus = await validate(geminiCliBackend, 'Gemini CLI SDK')
 
   const apiOption = buildGeminiOptionStatus(
     'api',
@@ -909,23 +926,32 @@ async function buildGeminiStatuses(): Promise<{
   const validationFailed =
     !resolvedBackendId &&
     (selectedBackendId === 'auto'
-      ? apiStatus.authMethod !== 'none' || cliStatus.authMethod !== 'none'
-      : preferredStatus?.authMethod !== 'none')
+      ? [apiStatus, cliStatus].some(status =>
+          status.authMethod !== 'none' &&
+          status.validationError !== 'invalid_credentials')
+      : preferredStatus?.authMethod !== 'none' &&
+        preferredStatus.validationError !== 'invalid_credentials')
+  const validationUnavailable =
+    apiStatus.validationError === 'operational' ||
+    cliStatus.validationError === 'operational'
+  const effectiveResolvedBackendId = validationUnavailable ? null : resolvedBackendId
 
   return {
     selectedBackendId,
-    resolvedBackendId,
+    resolvedBackendId: effectiveResolvedBackendId,
     availableBackends: [autoOption, apiOption, cliOption],
-    authenticated: resolvedBackendId !== null,
+    authenticated: effectiveResolvedBackendId !== null,
     authMethod:
       preferredStatus?.authMethod && preferredStatus.authMethod !== 'none'
         ? preferredStatus.authMethod
         : null,
-    verificationState: resolvedBackendId ? 'verified' : 'unknown',
+    verificationState: validationUnavailable
+      ? 'error'
+      : effectiveResolvedBackendId ? 'verified' : 'unknown',
     statusMessage:
-      resolvedBackendId !== null
+      effectiveResolvedBackendId !== null
         ? selectedBackendId === 'auto'
-          ? `Resolved to ${GEMINI_BACKEND_LABELS[resolvedBackendId]}`
+          ? `Resolved to ${GEMINI_BACKEND_LABELS[effectiveResolvedBackendId]}`
           : `${GEMINI_BACKEND_LABELS[selectedBackendId]} ready`
         : selectedBackendId === 'api'
           ? 'Gemini API not ready'
@@ -935,7 +961,7 @@ async function buildGeminiStatuses(): Promise<{
     detailMessage: preferredStatus?.message ?? autoStatusDetail,
     canLoginFromUi: selectedBackendId !== 'api',
     backend:
-      resolvedBackendId === 'api'
+      effectiveResolvedBackendId === 'api'
         ? {
             kind: 'api',
             label: 'Gemini API',
@@ -949,7 +975,7 @@ async function buildGeminiStatuses(): Promise<{
                 ? preferredStatus.authMethod
                 : null,
           }
-        : resolvedBackendId === 'cli-sdk'
+        : effectiveResolvedBackendId === 'cli-sdk'
           ? {
               kind: 'cli-sdk',
               label: 'Gemini CLI SDK',
@@ -962,8 +988,12 @@ async function buildGeminiStatuses(): Promise<{
                   : null,
             }
           : null,
-    statusCheckOutcome: validationFailed ? 'transient_error' : 'authoritative',
-    statusCheckErrorCode: validationFailed ? 'unavailable' : null,
+    statusCheckOutcome: validationUnavailable
+      ? resolvedBackendId ? 'pending' : 'transient_error'
+      : validationFailed ? 'transient_error' : 'authoritative',
+    statusCheckErrorCode: validationUnavailable
+      ? resolvedBackendId ? 'partial_response' : 'unavailable'
+      : validationFailed ? 'unavailable' : null,
   }
 }
 
@@ -997,7 +1027,12 @@ function buildCodexStatuses(): {
       : !resolution.nativeApiKeyConfigured
         ? 'Authentication required'
         : 'Degraded'
-  const statusCheck = codexNativeState === 'runtime-missing'
+  const statusCheck = resolution.authCheckIndeterminate
+    ? {
+        statusCheckOutcome: 'transient_error' as const,
+        statusCheckErrorCode: 'unavailable' as const,
+      }
+    : codexNativeState === 'runtime-missing'
     ? {
         statusCheckOutcome: 'transient_error' as const,
         statusCheckErrorCode: 'runtime_missing' as const,
@@ -1029,7 +1064,9 @@ function buildCodexStatuses(): {
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
-    verificationState: resolution.authenticated ? 'verified' : 'unknown',
+    verificationState: resolution.authCheckIndeterminate
+      ? 'error'
+      : resolution.authenticated ? 'verified' : 'unknown',
     statusMessage: resolution.statusMessage,
     detailMessage: resolution.detailMessage,
     canLoginFromUi: resolution.canLoginFromUi,
@@ -1073,7 +1110,8 @@ export async function getUnifiedRuntimeStatusPayload(
         verificationState: codex.verificationState,
         canLoginFromUi: codex.canLoginFromUi,
         capabilities: {
-          teamLaunch: true,
+          teamLaunch:
+            codex.authenticated && codex.statusCheckOutcome === 'authoritative',
           oneShot: true,
           extensions: buildExtensionCapabilities({
             plugins: {
@@ -1137,7 +1175,8 @@ export async function getUnifiedRuntimeStatusPayload(
         verificationState: codex.verificationState,
         canLoginFromUi: codex.canLoginFromUi,
         capabilities: {
-          teamLaunch: true,
+          teamLaunch:
+            codex.authenticated && codex.statusCheckOutcome === 'authoritative',
           oneShot: true,
           extensions: buildExtensionCapabilities({
             plugins: {
@@ -1189,7 +1228,8 @@ export async function getUnifiedRuntimeStatusPayload(
       verificationState: gemini.verificationState,
       canLoginFromUi: gemini.canLoginFromUi,
       capabilities: {
-        teamLaunch: true,
+        teamLaunch:
+          gemini.authenticated && gemini.statusCheckOutcome === 'authoritative',
         oneShot: true,
         extensions: buildExtensionCapabilities({
           plugins: {

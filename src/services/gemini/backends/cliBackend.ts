@@ -94,6 +94,8 @@ async function validateCliAuth(): Promise<GeminiBackendStatus> {
       endpointLabel: CODE_ASSIST_ENDPOINT_LABEL,
     }
   } catch (error) {
+    const missingLogin =
+      error instanceof Error && error.message.includes('Manual authorization is required')
     return {
       ok: false,
       backend: 'cli',
@@ -101,6 +103,7 @@ async function validateCliAuth(): Promise<GeminiBackendStatus> {
       endpointLabel: CODE_ASSIST_ENDPOINT_LABEL,
       message: toCliErrorMessage(error),
       hint: 'Run the installed gemini CLI login flow first if you want to use the CLI backend.',
+      ...(missingLogin ? {} : { validationError: 'operational' as const }),
     }
   }
 }

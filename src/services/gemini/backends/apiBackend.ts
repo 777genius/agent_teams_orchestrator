@@ -49,6 +49,8 @@ async function validateApiAuth(): Promise<GeminiBackendStatus> {
         projectId: auth.projectId,
         endpointLabel: getApiEndpointLabel(),
         message: `Gemini API auth validation failed (${response.status}): ${body}`,
+        validationError:
+          response.status === 401 ? 'invalid_credentials' : 'operational',
       }
     }
     return {
@@ -66,6 +68,7 @@ async function validateApiAuth(): Promise<GeminiBackendStatus> {
       projectId: auth.projectId,
       endpointLabel: getApiEndpointLabel(),
       message: error instanceof Error ? error.message : String(error),
+      validationError: 'operational',
     }
   }
 }
