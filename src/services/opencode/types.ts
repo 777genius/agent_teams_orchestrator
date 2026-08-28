@@ -834,13 +834,18 @@ export type OpenCodeSessionPreviewSummary = {
 }
 
 export type OpenCodeSessionRecord = {
+  version: 2
   teamId: string
   laneId?: string
   memberName: string
   providerId: 'opencode'
   selectedModel: string
   selectedVariant?: string
+  /** Canonical, persisted authority identity. It must equal projectPath. */
+  projectIdentity: string
   projectPath: string
+  /** Exact launch owner. Null is reserved for explicitly migrated legacy records. */
+  runId: string | null
   profileRootKey: string
   hostKey: string
   toolApprovalMode?: OpenCodeToolApprovalMode

@@ -13,12 +13,15 @@ import type {
 
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: 'team-a',
     laneId: 'primary',
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openrouter/qwen/qwen3-coder',
+    projectIdentity: overrides.projectIdentity ?? overrides.projectPath ?? '/tmp/project',
     projectPath: '/tmp/project',
+    runId: null,
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'resolved-fingerprint',

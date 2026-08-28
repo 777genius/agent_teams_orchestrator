@@ -149,12 +149,15 @@ const executeOpenCodeBridgeCommandEnvelope = (input: unknown) =>
 
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: 'team-a',
     laneId: 'primary',
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openrouter/minimax-m2.5-free',
+    projectIdentity: overrides.projectIdentity ?? overrides.projectPath ?? '/tmp/project',
     projectPath: '/tmp/project',
+    runId: null,
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'resolved-fingerprint',
@@ -427,10 +430,13 @@ const originalList = openCodeSessionStore.list
 const originalGet = openCodeSessionStore.get
 const originalGetByLogicalMember = openCodeSessionStore.getByLogicalMember
 const originalUpsert = openCodeSessionStore.upsert
+const originalUpsertIfSessionMatches = openCodeSessionStore.upsertIfSessionMatches
 const originalMarkStale = openCodeSessionStore.markStale
 const originalMarkStaleByLogicalMember = openCodeSessionStore.markStaleByLogicalMember
+const originalMarkStaleIfSessionMatchesLogicalMember = openCodeSessionStore.markStaleIfSessionMatchesLogicalMember
 const originalDelete = openCodeSessionStore.delete
 const originalDeleteByLogicalMember = openCodeSessionStore.deleteByLogicalMember
+const originalDeleteIfSessionMatchesLogicalMember = openCodeSessionStore.deleteIfSessionMatchesLogicalMember
 const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
 const originalOutcomeQuery = openCodeCommandOutcomeStore.query
 const originalOutcomePrune = openCodeCommandOutcomeStore.prune
@@ -470,12 +476,40 @@ beforeEach(async () => {
   delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
   delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   __resetAppMcpToolProofCacheForTests()
-  openCodeSessionStore.getByLogicalMember = (async logical =>
-    openCodeSessionStore.get(logical.teamId, logical.laneId, logical.memberName)) as typeof openCodeSessionStore.getByLogicalMember
+  openCodeSessionStore.getByLogicalMember = (async logical => {
+    const listed = (await openCodeSessionStore.list()).find(record =>
+      record.teamId === logical.teamId && (record.laneId ?? 'primary') === logical.laneId
+      && record.memberName === logical.memberName && record.projectIdentity === logical.projectIdentity)
+    return listed ?? openCodeSessionStore.get(logical.teamId, logical.laneId, logical.memberName)
+  }) as typeof openCodeSessionStore.getByLogicalMember
   openCodeSessionStore.markStaleByLogicalMember = (async (logical, reason) =>
     openCodeSessionStore.markStale(logical.teamId, logical.laneId, logical.memberName, reason)) as typeof openCodeSessionStore.markStaleByLogicalMember
   openCodeSessionStore.deleteByLogicalMember = (async logical =>
     openCodeSessionStore.delete(logical.teamId, logical.laneId, logical.memberName)) as typeof openCodeSessionStore.deleteByLogicalMember
+  openCodeSessionStore.markStaleIfSessionMatchesLogicalMember = (async (
+    logical, sessionId, reason, runId,
+  ) => {
+    const marked = await openCodeSessionStore.markStale(
+      logical.teamId, logical.laneId, logical.memberName, reason)
+    return { status: 'applied', record: marked ?? buildRecord({
+      teamId: logical.teamId, laneId: logical.laneId, memberName: logical.memberName,
+      projectIdentity: logical.projectIdentity, projectPath: logical.projectIdentity,
+      opencodeSessionId: sessionId, runId: runId ?? null, staleReason: reason,
+    }) }
+  }) as typeof openCodeSessionStore.markStaleIfSessionMatchesLogicalMember
+  openCodeSessionStore.deleteIfSessionMatchesLogicalMember = (async (
+    logical, sessionId, runId,
+  ) => (await openCodeSessionStore.delete(logical.teamId, logical.laneId, logical.memberName))
+    ? { status: 'applied', record: buildRecord({
+      teamId: logical.teamId, laneId: logical.laneId, memberName: logical.memberName,
+      projectIdentity: logical.projectIdentity, projectPath: logical.projectIdentity,
+      opencodeSessionId: sessionId, runId: runId ?? null,
+    }) }
+    : { status: 'absent' }) as typeof openCodeSessionStore.deleteIfSessionMatchesLogicalMember
+  openCodeSessionStore.upsertIfSessionMatches = (async record => {
+    await openCodeSessionStore.upsert(record)
+    return { status: 'applied', record }
+  }) as typeof openCodeSessionStore.upsertIfSessionMatches
   openCodeCommandOutcomeStore.upsert = (async patch => ({
     schemaVersion: 1,
     command: 'opencode.sendMessage',
@@ -675,10 +709,13 @@ afterEach(async () => {
   openCodeSessionStore.get = originalGet
   openCodeSessionStore.getByLogicalMember = originalGetByLogicalMember
   openCodeSessionStore.upsert = originalUpsert
+  openCodeSessionStore.upsertIfSessionMatches = originalUpsertIfSessionMatches
   openCodeSessionStore.markStale = originalMarkStale
   openCodeSessionStore.markStaleByLogicalMember = originalMarkStaleByLogicalMember
+  openCodeSessionStore.markStaleIfSessionMatchesLogicalMember = originalMarkStaleIfSessionMatchesLogicalMember
   openCodeSessionStore.delete = originalDelete
   openCodeSessionStore.deleteByLogicalMember = originalDeleteByLogicalMember
+  openCodeSessionStore.deleteIfSessionMatchesLogicalMember = originalDeleteIfSessionMatchesLogicalMember
   openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
   openCodeCommandOutcomeStore.query = originalOutcomeQuery
   openCodeCommandOutcomeStore.prune = originalOutcomePrune
@@ -6357,6 +6394,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
       buildRecord({ laneId: 'secondary:opencode:bob', memberName: 'bob', opencodeSessionId: 'session-bob' }),
+      buildRecord({
+        laneId: 'secondary:opencode:alice', memberName: 'alice',
+        projectPath: '/tmp/project-b', opencodeSessionId: 'session-project-b',
+      }),
     ]) as typeof openCodeSessionStore.list
     openCodeSessionBridge.abort = (async record => {
       abortedMembers.push(record.memberName)
@@ -8114,6 +8155,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('marks the lane ready after answering permission when bootstrap confirmation is already present', async () => {
+    const reconciledSessions: string[] = []
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.get = (async () =>
       buildRecord({
@@ -8125,17 +8167,22 @@ describe('OpenCodeBridgeCommandHandler', () => {
         laneId: 'secondary:opencode:alice',
         memberName: 'alice',
       }),
+      buildRecord({
+        laneId: 'secondary:opencode:alice', memberName: 'alice',
+        projectPath: '/tmp/project-b', opencodeSessionId: 'session-project-b',
+      }),
     ]) as typeof openCodeSessionStore.list
     const answered: Array<{ requestId: string; decision: string }> = []
     openCodeSessionBridge.answerPermission = (async (_record, input) => {
       answered.push(input)
     }) as typeof openCodeSessionBridge.answerPermission
-    openCodeSessionBridge.reconcileSession = (async record => ({
-      summary: buildReconcileSummary({
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledSessions.push(record.opencodeSessionId)
+      return { summary: buildReconcileSummary({
         sessionId: record.opencodeSessionId,
         pendingPermissionRequestIds: [],
-      }),
-    })) as typeof openCodeSessionBridge.reconcileSession
+      }) }
+    }) as typeof openCodeSessionBridge.reconcileSession
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.answerPermission', {
@@ -8154,6 +8201,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(answered).toEqual([{ requestId: 'perm-1', decision: 'allow' }])
+    expect(reconciledSessions).toEqual(['session-1'])
     expect(result.data.teamLaunchState).toBe('ready')
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.alice?.runtimePid).toBe(123)
@@ -8404,6 +8452,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('aggregates runtime permissions across all sessions in the addressed lane', async () => {
+    const reconciledSessions: string[] = []
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.list = (async () => [
       buildRecord({
@@ -8416,9 +8465,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
         memberName: 'bob',
         opencodeSessionId: 'session-bob',
       }),
+      buildRecord({
+        laneId: 'primary', memberName: 'alice', projectPath: '/tmp/project-b',
+        opencodeSessionId: 'session-project-b',
+      }),
     ]) as typeof openCodeSessionStore.list
-    openCodeSessionBridge.reconcileSession = (async record => ({
-      summary:
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledSessions.push(record.opencodeSessionId)
+      return { summary:
         record.opencodeSessionId === 'session-alice'
           ? buildReconcileSummary({
             sessionId: record.opencodeSessionId,
@@ -8459,8 +8513,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
                 },
               },
             ],
-          }),
-    })) as typeof openCodeSessionBridge.reconcileSession
+          }) }
+    }) as typeof openCodeSessionBridge.reconcileSession
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.listRuntimePermissions', {
@@ -8478,6 +8532,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       'perm-1',
       'perm-2',
     ])
+    expect(reconciledSessions).toEqual(['session-alice', 'session-bob'])
     expect(result.data.permissions).toMatchObject([
       {
         requestId: 'perm-1',

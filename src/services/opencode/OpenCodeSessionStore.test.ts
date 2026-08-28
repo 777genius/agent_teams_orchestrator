@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -6,14 +6,18 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { openCodeLogicalMemberKey } from './OpenCodeLogicalMemberKey.js'
 
 const baseRecord = {
+  version: 2 as const,
   teamId: 'team-a',
   laneId: 'primary',
   memberName: 'alice',
   providerId: 'opencode' as const,
   selectedModel: 'openai/gpt-5.4',
+  projectIdentity: '/tmp/project',
   projectPath: '/tmp/project',
+  runId: null,
   profileRootKey: 'profile-root',
   hostKey: 'host-key',
   resolvedBehaviorFingerprint: null,
@@ -27,6 +31,11 @@ const baseRecord = {
   staleReason: null,
   createdAt: '2026-04-21T00:00:00.000Z',
   updatedAt: '2026-04-21T00:00:00.000Z',
+}
+
+function asLegacyRecord(record: typeof baseRecord = baseRecord) {
+  const { version: _version, projectIdentity: _projectIdentity, runId: _runId, ...legacy } = record
+  return legacy
 }
 
 let tempDir = ''
@@ -54,7 +63,8 @@ describe('OpenCodeSessionStore', () => {
     const filePath = path.join(tempDir, 'session-store.json')
     const first = new OpenCodeSessionStore(filePath)
     const second = new OpenCodeSessionStore(filePath)
-    const contender = { ...baseRecord, memberName: 'Alice', projectPath: '/tmp/other/../project',
+    const contender = { ...baseRecord, memberName: 'Alice', projectIdentity: '/tmp/project',
+      projectPath: '/tmp/project',
       opencodeSessionId: 'session-2' }
     const outcomes = await Promise.all([
       first.publishIfAbsentOrExact(baseRecord),
@@ -68,7 +78,7 @@ describe('OpenCodeSessionStore', () => {
   test('uses normalized member lookup consistently for legacy Alice versus alice records', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
     await writeFile(filePath, JSON.stringify({ schemaVersion: 1, records: {
-      'team-a::primary::Alice': { ...baseRecord, memberName: 'Alice' },
+      'team-a::primary::Alice': { ...asLegacyRecord(), memberName: 'Alice' },
     } }))
     const store = new OpenCodeSessionStore(filePath)
     expect(await store.get('team-a', 'primary', 'alice')).toMatchObject({ memberName: 'Alice' })
@@ -107,14 +117,14 @@ describe('OpenCodeSessionStore', () => {
     expect(await restarted.get('team-a', 'primary', 'ALICE')).toEqual(baseRecord)
     const persisted = JSON.parse(await readFile(filePath, 'utf8')) as { schemaVersion: number;
       reservations: Record<string, unknown> }
-    expect(persisted.schemaVersion).toBe(2)
+    expect(persisted.schemaVersion).toBe(3)
     expect(persisted.reservations).toEqual({})
   })
 
   test('concurrent projects reserve and publish the same team lane member without overwrite or ABA', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
-    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
-    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    const projectA = { ...baseRecord, projectIdentity: '/tmp/project-a', projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectIdentity: '/tmp/project-b', projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
     const first = new OpenCodeSessionStore(filePath)
     const second = new OpenCodeSessionStore(filePath)
 
@@ -158,8 +168,8 @@ describe('OpenCodeSessionStore', () => {
 
   test('project-qualified stale and delete mutations isolate ambiguous legacy members', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
-    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
-    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    const projectA = { ...baseRecord, projectIdentity: '/tmp/project-a', projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectIdentity: '/tmp/project-b', projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
     await store.upsert(projectA)
     await store.upsert(projectB)
 
@@ -179,11 +189,13 @@ describe('OpenCodeSessionStore', () => {
 
   test('restart migrates colliding legacy record keys into project-scoped projections', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
-    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
-    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    const projectA = { ...baseRecord, projectIdentity: '/tmp/project-a', projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectIdentity: '/tmp/project-b', projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
     await writeFile(filePath, JSON.stringify({ schemaVersion: 2, records: {
-      'legacy-a': projectA,
-      'legacy-b': projectB,
+      [openCodeLogicalMemberKey({ teamId: projectA.teamId, laneId: projectA.laneId,
+        projectIdentity: projectA.projectIdentity, memberName: projectA.memberName })]: asLegacyRecord(projectA),
+      [openCodeLogicalMemberKey({ teamId: projectB.teamId, laneId: projectB.laneId,
+        projectIdentity: projectB.projectIdentity, memberName: projectB.memberName })]: asLegacyRecord(projectB),
     }, reservations: {} }))
 
     const restarted = new OpenCodeSessionStore(filePath)
@@ -205,8 +217,10 @@ describe('OpenCodeSessionStore', () => {
     const store = new OpenCodeSessionStore(filePath)
     await store.reserveLogicalMember(logical, 'reservation-a', 'session-1')
     const persisted = JSON.parse(await readFile(filePath, 'utf8')) as {
-      schemaVersion: 2; records: Record<string, typeof baseRecord>; reservations: Record<string, unknown> }
-    persisted.records['team-a::primary::alice'] = { ...baseRecord, opencodeSessionId: 'foreign-session' }
+      schemaVersion: 3; records: Record<string, typeof baseRecord>; reservations: Record<string, unknown> }
+    persisted.records[openCodeLogicalMemberKey(logical)] = {
+      ...baseRecord, opencodeSessionId: 'foreign-session',
+    }
     await writeFile(filePath, JSON.stringify(persisted))
     expect((await store.publishReserved(baseRecord, 'reservation-a')).status).toBe('conflict')
     const after = JSON.parse(await readFile(filePath, 'utf8')) as { reservations: Record<string, unknown> }
@@ -381,7 +395,7 @@ describe('OpenCodeSessionStore', () => {
       JSON.stringify({
         schemaVersion: 1,
         records: {
-          [`${baseRecord.teamId}::${baseRecord.laneId}::${baseRecord.memberName}`]: replacement,
+          [`${baseRecord.teamId}::${baseRecord.laneId}::${baseRecord.memberName}`]: asLegacyRecord(replacement),
         },
       }),
     )
@@ -426,5 +440,62 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.get(baseRecord.teamId, secondary.laneId, baseRecord.memberName)).toEqual(
       secondary,
     )
+  })
+
+  test('fails closed for tampered persisted keys and project identities', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const logicalKey = openCodeLogicalMemberKey({
+      teamId: baseRecord.teamId, laneId: baseRecord.laneId,
+      projectIdentity: baseRecord.projectIdentity, memberName: baseRecord.memberName,
+    })
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 3, records: {
+      [logicalKey]: { ...baseRecord, projectIdentity: '/tmp/other-project' },
+    }, reservations: {} }))
+    await expect(new OpenCodeSessionStore(filePath).list()).rejects.toThrow('project identity mismatch')
+
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 3, records: {
+      tampered: baseRecord,
+    }, reservations: {} }))
+    await expect(new OpenCodeSessionStore(filePath).list()).rejects.toThrow('record key mismatch')
+  })
+
+  test('stale metadata updates cannot overwrite a replacement run or session', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const original = { ...baseRecord, runId: 'run-old' }
+    const replacement = {
+      ...baseRecord, runId: 'run-new', opencodeSessionId: 'session-replacement',
+    }
+    await store.upsert(original)
+    await store.upsert(replacement)
+    const staleProjection = { ...original, lastKnownRawStatus: 'busy', updatedAt: new Date().toISOString() }
+
+    expect(await store.upsertIfSessionMatches(
+      staleProjection, original.opencodeSessionId, original.runId,
+    )).toEqual({ status: 'foreign', record: replacement })
+    expect(await store.markStaleIfSessionMatchesLogicalMember({
+      teamId: original.teamId, laneId: original.laneId,
+      projectIdentity: original.projectIdentity, memberName: original.memberName,
+    }, original.opencodeSessionId, 'old-cleanup', original.runId)).toEqual({
+      status: 'foreign', record: replacement,
+    })
+    expect(await store.list()).toEqual([replacement])
+  })
+
+  test('canonicalizes a symlink alias before lookup and mutation', async () => {
+    const project = path.join(tempDir, 'project')
+    const alias = path.join(tempDir, 'alias')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    const record = { ...baseRecord, projectIdentity: project, projectPath: project }
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    await store.upsert(record)
+    const logicalAlias = {
+      teamId: record.teamId, laneId: record.laneId,
+      projectIdentity: alias, memberName: record.memberName,
+    }
+    expect(await store.getByLogicalMember(logicalAlias)).toEqual(record)
+    expect(await store.markStaleIfSessionMatchesLogicalMember(
+      logicalAlias, record.opencodeSessionId, 'alias-cleanup', record.runId,
+    )).toMatchObject({ status: 'applied', record: { staleReason: 'alias-cleanup' } })
   })
 })

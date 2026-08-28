@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -13,6 +13,7 @@ import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   OPEN_CODE_PROBE_TIMEOUT_MS,
+  OpenCodeInventoryService,
   isOpenCodeBuiltinFreeModelId,
   isOpenCodeInventoryTimeoutSnapshot,
   parseOpenCodeAgentListOutput,
@@ -63,6 +64,20 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('publishes one canonical project identity for a symlink alias', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'opencode-inventory-canonical-'))
+    try {
+      const project = path.join(root, 'project')
+      const alias = path.join(root, 'alias')
+      await mkdir(project)
+      await symlink(project, alias, 'dir')
+      const snapshot = await new OpenCodeInventoryService().probe(alias, { mode: 'summary' })
+      expect(snapshot.projectPath).toBe(await realpath(project))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('requires an OpenCode version with native SuperGrok OAuth support', () => {
     expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
     expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)

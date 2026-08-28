@@ -57,12 +57,15 @@ const host: OpenCodeHostHandle = {
 
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: 'team-a',
     laneId: 'primary',
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openai/gpt-5.4-mini',
+    projectIdentity: overrides.projectIdentity ?? overrides.projectPath ?? '/tmp/project',
     projectPath: '/tmp/project',
+    runId: null,
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'resolved-fingerprint',
@@ -161,7 +164,7 @@ describe('OpenCodeSessionBridge', () => {
     let createSessionCalls = 0
     let prepareProfileCalls = 0
     const retainedLeases: unknown[] = []
-    const existing = buildRecord()
+    const existing = buildRecord({ runId: 'run-1' })
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => {
         prepareProfileCalls += 1
@@ -241,7 +244,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('reuses only the project-qualified session when two projects share a logical member', async () => {
     const projectA = buildRecord({ projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' })
-    const projectB = buildRecord({ projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' })
+    const projectB = buildRecord({ projectPath: '/tmp/project-b', opencodeSessionId: 'session-b', runId: 'run-b' })
     const projectBProfile = { ...profile, projectPath: projectB.projectPath }
     const lookups: string[] = []
     const bridge = new OpenCodeSessionBridge({
@@ -519,6 +522,7 @@ describe('OpenCodeSessionBridge', () => {
       hostKey: manualHost.hostKey,
       managedConfigFingerprint: undefined,
       toolApprovalMode: undefined,
+      runId: 'run-1',
     })
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async (_projectPath, options) => {
@@ -777,6 +781,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: null,
         sessionId: 'session-1',
       },
     ])
@@ -1164,6 +1169,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: 'run-1',
         sessionId: 'session-new',
       },
     ])
@@ -1236,6 +1242,70 @@ describe('OpenCodeSessionBridge', () => {
         parts: [{ type: 'text', text: 'Reply with exactly: pong' }],
       },
     ])
+  })
+
+  test('fails closed when stale or metadata CAS observes a replacement owner', async () => {
+    const original = buildRecord({ runId: 'run-old' })
+    const replacement = buildRecord({
+      runId: 'run-new', opencodeSessionId: 'session-replacement',
+    })
+    let releaseCalls = 0
+    let createCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => original,
+        markStaleIfSessionMatchesLogicalMember: async () => ({
+          status: 'foreign', record: replacement,
+        }),
+        upsertIfSessionMatches: async () => ({ status: 'foreign', record: replacement }),
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releaseCalls += 1 },
+        refreshResolvedConfigFingerprint: async () => 'replacement-fingerprint',
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => { createCalls += 1; return { id: 'session-new' } },
+      } as never) },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: original.teamId, laneId: original.laneId, memberName: original.memberName,
+      selectedModel: 'openai/gpt-5.4', projectPath: original.projectPath,
+      runId: original.runId,
+    })).rejects.toThrow('ownership changed')
+    expect({ releaseCalls, createCalls }).toEqual({ releaseCalls: 0, createCalls: 0 })
+    await expect(bridge.refreshSessionEnvironment(original)).rejects.toThrow('ownership changed')
+  })
+
+  test('foreign lease CAS preserves the exact retained project run session owner', async () => {
+    let releaseHostCalls = 0
+    const created = buildRecord({ runId: 'run-new' })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        publishIfAbsentOrExact: async record => ({ status: 'inserted', record }),
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releaseHostCalls += 1 },
+        retainHostLease: async () => {},
+        releaseHostLease: async () => 'foreign',
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: created.opencodeSessionId }),
+      } as never) },
+    })
+    const retained = await bridge.ensureSession({
+      teamId: created.teamId, laneId: created.laneId, memberName: created.memberName,
+      selectedModel: created.selectedModel, projectPath: created.projectPath,
+      preparedProfile: profile, runId: created.runId,
+    })
+
+    await expect(bridge.releaseSession(retained)).rejects.toThrow('replacement session')
+    expect(releaseHostCalls).toBe(0)
   })
 
   test('fans out a rotated xAI OAuth credential after a runtime prompt', async () => {
@@ -1718,7 +1788,7 @@ describe('OpenCodeSessionBridge', () => {
               parts: [],
             },
             {
-              info: { id: 'msg_0d008f4f44e4481a8e3b0bbe848d519c', role: 'user' },
+              info: { id: 'msg_00008f4f44e4481a8e3b0bbe848d519c', role: 'user' },
               parts: [],
             },
           ],

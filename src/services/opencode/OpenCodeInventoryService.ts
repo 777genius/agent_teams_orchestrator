@@ -36,6 +36,7 @@ import {
   openCodeActiveStatusSnapshotPublisher,
   type OpenCodeActiveStatusPublisherPort,
 } from './OpenCodeActiveStatusSnapshotPublisher.js'
+import { canonicalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 
 import type {
   OpenCodeAgentMode,
@@ -589,10 +590,12 @@ export function isOpenCodeInventoryTimeoutSnapshot(snapshot: OpenCodeInventorySn
 
 export function buildOpenCodeInventoryTimeoutSnapshot(input: {
   projectPath?: string | null
+  canonicalProjectPath?: string
   timeoutMs: number
   progress?: OpenCodeInventoryProbeProgressSnapshot | null
 }): OpenCodeInventorySnapshot {
-  const resolvedProjectPath = path.resolve(input.projectPath?.trim() || getCwd())
+  const resolvedProjectPath = input.canonicalProjectPath
+    ?? path.resolve(input.projectPath?.trim() || getCwd())
   const binaryPath = resolveOpenCodeBinaryPath()
   const currentStep = input.progress?.currentStep?.trim() || null
   const message = currentStep
@@ -653,6 +656,8 @@ export async function withOpenCodeInventoryProbeTimeout(
     onTimeout?: () => void
   },
 ): Promise<OpenCodeInventorySnapshot> {
+  const canonicalProjectPath = await canonicalizeOpenCodeProjectIdentity(
+    input.projectPath?.trim() || getCwd(), { allowMissing: true })
   let timeout: ReturnType<typeof setTimeout> | null = null
   try {
     return await Promise.race([
@@ -663,6 +668,7 @@ export async function withOpenCodeInventoryProbeTimeout(
           resolve(
             buildOpenCodeInventoryTimeoutSnapshot({
               projectPath: input.projectPath,
+              canonicalProjectPath,
               timeoutMs: input.timeoutMs,
               progress: input.progress?.snapshot() ?? null,
             }),
@@ -1030,7 +1036,8 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectIdentity(
+      projectPath?.trim() || getCwd(), { signal: options.abortSignal, allowMissing: true })
     // Summary is a passive status boundary. It must never prepare a profile,
     // reserve a port, spawn OpenCode, or enumerate providers/models/agents.
     // Rich passive status is served by OpenCodePassiveStatusProductionReader;
@@ -1102,6 +1109,9 @@ export class OpenCodeInventoryService {
       .finally(() => {
         leaveProfileStep?.()
       })
+    if (profile.projectPath !== resolvedProjectPath) {
+      throw new Error('OpenCode prepared profile project identity mismatch')
+    }
     const probePreparedProfile = () => this.probePreparedProfile({
       mode,
       resolvedProjectPath,

@@ -516,8 +516,10 @@ test('production authority continues member 1 committed/member 2 proven failure 
     })
     const now = new Date().toISOString()
     const record: OpenCodeSessionRecord = {
+      version: 2,
       teamId: 'team', laneId: 'primary', memberName: 'alice', providerId: 'opencode',
-      selectedModel: 'openrouter/model', projectPath: '/fake/project', profileRootKey: 'profile', hostKey: 'host',
+      selectedModel: 'openrouter/model', projectIdentity: '/fake/project', projectPath: '/fake/project',
+      runId: null, profileRootKey: 'profile', hostKey: 'host',
       resolvedBehaviorFingerprint: null, opencodeSessionId: OpenCodeLaunchMutationLedger.idempotencyIdentity(targetOne),
       lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
       sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior',
@@ -662,8 +664,10 @@ test('migrated V1 known-failure restart uses one durable identity for lookup, ef
 
     const now = new Date().toISOString()
     const record: OpenCodeSessionRecord = {
+      version: 2,
       teamId: 'team', laneId: 'primary', memberName: 'alice', providerId: 'opencode',
-      selectedModel: 'openrouter/model', projectPath: '/fake/project', profileRootKey: 'profile', hostKey: 'host',
+      selectedModel: 'openrouter/model', projectIdentity: '/fake/project', projectPath: '/fake/project',
+      runId: null, profileRootKey: 'profile', hostKey: 'host',
       resolvedBehaviorFingerprint: null, opencodeSessionId: durableSessionId,
       lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
       sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior',
@@ -1171,8 +1175,9 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     const text = '<bootstrap-exact>'
     const messageID = 'msg_exact'
     const now = new Date().toISOString()
-    const record: OpenCodeSessionRecord = { teamId: 'team', laneId: 'primary', memberName: 'alice',
-      providerId: 'opencode', selectedModel: 'openrouter/model', projectPath: '/fake/project',
+    const record: OpenCodeSessionRecord = { version: 2, teamId: 'team', laneId: 'primary', memberName: 'alice',
+      providerId: 'opencode', selectedModel: 'openrouter/model', projectIdentity: '/fake/project',
+      projectPath: '/fake/project', runId: null,
       profileRootKey: 'profile', hostKey: 'host', resolvedBehaviorFingerprint: null,
       opencodeSessionId: sessionId, lastCanonicalCursor: null, lastKnownRawStatus: null,
       lastKnownDurableState: null, sourceAuthFingerprint: null, managedAuthFingerprint: null,
@@ -1452,8 +1457,9 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
         'Join OpenCode team team as alice. Wait for app MCP task delivery.',
         '</agent_teams_app_managed_bootstrap>'].join('\n')
       const now = new Date().toISOString()
-      const record: OpenCodeSessionRecord = { teamId: 'team', laneId: 'primary', memberName: 'alice',
-        providerId: 'opencode', selectedModel: 'openrouter/model', projectPath, profileRootKey: 'profile',
+      const record: OpenCodeSessionRecord = { version: 2, teamId: 'team', laneId: 'primary', memberName: 'alice',
+        providerId: 'opencode', selectedModel: 'openrouter/model', projectIdentity: projectPath,
+        projectPath, runId: 'run', profileRootKey: 'profile',
         hostKey: 'host', resolvedBehaviorFingerprint: null, opencodeSessionId: sessionId,
         lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
         sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: hash('2'),

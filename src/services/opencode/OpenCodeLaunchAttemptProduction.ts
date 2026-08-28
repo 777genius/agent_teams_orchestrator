@@ -1994,10 +1994,12 @@ class OpenCodeProductionLaunchRuntime {
           memberOwnershipTitles.set(input.memberIdentity, ownershipTitle)
           const now = new Date().toISOString()
           let record: OpenCodeSessionRecord = {
+            version: 2,
             teamId: command.teamId, laneId: command.laneId, memberName: member.name,
             providerId: 'opencode', selectedModel: command.selectedModel,
             ...(member.effort ? { selectedVariant: member.effort } : {}),
-            projectPath: handle.projectPath, profileRootKey: handle.profileRootKey,
+            projectIdentity: handle.projectPath, projectPath: handle.projectPath,
+            runId: command.runId, profileRootKey: handle.profileRootKey,
             hostKey: handle.hostKey, toolApprovalMode: command.toolApprovalMode,
             runtimePid: handle.pid, resolvedBehaviorFingerprint: handle.resolvedConfigFingerprint,
             opencodeSessionId: authoritativeSessionId, lastCanonicalCursor: null,

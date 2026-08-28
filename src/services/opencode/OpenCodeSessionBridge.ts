@@ -12,7 +12,6 @@ import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
@@ -39,8 +38,11 @@ type OpenCodeSessionBridgeDeps = {
       typeof openCodeHostManager,
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
     >>
-  sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
-    & Partial<Pick<typeof openCodeSessionStore, 'getByLogicalMember' | 'markStaleByLogicalMember'>>
+  sessionStore?: Pick<typeof openCodeSessionStore, 'get'>
+    & Partial<Pick<typeof openCodeSessionStore,
+      'getByLogicalMember' | 'upsertIfSessionMatches' | 'publishIfAbsentOrExact'
+      | 'markStaleIfSessionMatchesLogicalMember' | 'upsert' | 'markStaleByLogicalMember'
+      | 'markStale'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -243,14 +245,44 @@ export class OpenCodeSessionBridge {
       ?? this.sessionStore.get(teamId, laneId, memberName)
   }
 
-  private markProjectSessionStale(record: Pick<OpenCodeSessionRecord,
-    'teamId' | 'laneId' | 'memberName' | 'projectPath'>,
-  staleReason: string): Promise<OpenCodeSessionRecord | null> {
-    return this.sessionStore.markStaleByLogicalMember?.({
+  private async markProjectSessionStale(record: Pick<OpenCodeSessionRecord,
+    'teamId' | 'laneId' | 'memberName' | 'projectIdentity' | 'opencodeSessionId' | 'runId'>,
+  staleReason: string): Promise<OpenCodeSessionRecord> {
+    const logicalMember = {
       teamId: record.teamId, laneId: record.laneId ?? 'primary',
-      projectIdentity: record.projectPath, memberName: record.memberName,
-    }, staleReason) ?? this.sessionStore.markStale(
-      record.teamId, record.laneId ?? 'primary', record.memberName, staleReason)
+      projectIdentity: record.projectIdentity, memberName: record.memberName,
+    }
+    const result = await this.sessionStore.markStaleIfSessionMatchesLogicalMember?.(
+      logicalMember, record.opencodeSessionId, staleReason, record.runId)
+    // Compatibility is limited to explicitly injected legacy test adapters;
+    // the production store always exposes the fenced transition above.
+    if (!result && this.deps.sessionStore) {
+      const legacy = await this.sessionStore.markStaleByLogicalMember?.(logicalMember, staleReason)
+        ?? await this.sessionStore.markStale?.(
+          record.teamId, record.laneId ?? 'primary', record.memberName, staleReason)
+      if (legacy) return legacy
+    }
+    if (!result || result.status === 'absent' || result.status === 'foreign') {
+      throw new Error('OpenCode session ownership changed before stale transition')
+    }
+    return result.record
+  }
+
+  private async persistExactUpdate(
+    previous: OpenCodeSessionRecord,
+    next: OpenCodeSessionRecord,
+  ): Promise<OpenCodeSessionRecord> {
+    const result = await this.sessionStore.upsertIfSessionMatches?.(
+      next, previous.opencodeSessionId, previous.runId)
+    // See markProjectSessionStale: production never takes this adapter seam.
+    if (!result && this.deps.sessionStore && this.sessionStore.upsert) {
+      await this.sessionStore.upsert(next)
+      return next
+    }
+    if (!result || result.status === 'absent' || result.status === 'foreign') {
+      throw new Error('OpenCode session ownership changed before metadata transition')
+    }
+    return result.record
   }
 
   private get clientFactory() {
@@ -433,13 +465,16 @@ export class OpenCodeSessionBridge {
       }
       const now = buildNowIso()
       const record: OpenCodeSessionRecord = {
+        version: 2,
         teamId: params.identity.teamId,
         laneId: params.identity.laneId,
         memberName: params.identity.memberName,
         providerId: 'opencode',
         selectedModel: params.selectedModel,
         ...(params.selectedVariant ? { selectedVariant: params.selectedVariant } : {}),
+        projectIdentity: host.projectPath,
         projectPath: host.projectPath,
+        runId: params.runId ?? null,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
         toolApprovalMode: params.toolApprovalMode ?? 'auto',
@@ -478,9 +513,13 @@ export class OpenCodeSessionBridge {
   }
 
   private buildSessionKey(
-    identity: Pick<SessionIdentity, 'teamId' | 'memberName'> & { laneId?: string | null },
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'memberName' | 'projectIdentity'
+      | 'opencodeSessionId' | 'runId'> & { laneId?: string | null },
   ): string {
-    return `${identity.teamId}::${identity.laneId?.trim() || 'primary'}::${identity.memberName}`
+    return JSON.stringify([
+      identity.projectIdentity, identity.teamId, identity.laneId?.trim() || 'primary',
+      identity.memberName, identity.runId, identity.opencodeSessionId,
+    ])
   }
 
   private async retainSessionHost(
@@ -523,19 +562,27 @@ export class OpenCodeSessionBridge {
   }
 
   async releaseSession(record: Pick<OpenCodeSessionRecord,
-    'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
+    'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'
+    | 'projectIdentity' | 'runId'>): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
-    await this.hostManager.releaseHostLease?.(record.hostKey, {
+    const leaseOutcome = await this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      runId: record.runId,
       sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
+    })
+    if (leaseOutcome === 'foreign') {
+      throw new Error('OpenCode host lease is owned by a replacement session')
+    }
     if (!retainedHostKey) {
       return
     }
 
+    if (retainedHostKey !== record.hostKey) {
+      throw new Error('OpenCode retained host ownership changed before release')
+    }
     this.retainedSessionHosts.delete(sessionKey)
     await this.hostManager.releaseHost(retainedHostKey)
   }
@@ -762,8 +809,13 @@ export class OpenCodeSessionBridge {
   }): Promise<OpenCodeSessionRecord> {
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
-    const projectIdentity = normalizeOpenCodeProjectIdentity(
-      params.preparedProfile?.projectPath ?? params.projectPath ?? process.cwd())
+    // Profile preparation owns filesystem canonicalization. Never consult the
+    // durable store using a caller's lexical alias first.
+    const initialProfile = params.preparedProfile
+      ?? await this.prepareProfile(params.projectPath, {
+        toolApprovalMode: params.toolApprovalMode ?? 'auto',
+      })
+    const projectIdentity = initialProfile.projectPath
     const existing = await this.getProjectSession(
       params.teamId, laneId, params.memberName, projectIdentity)
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
@@ -775,15 +827,25 @@ export class OpenCodeSessionBridge {
       }
       : params.toolApprovalMode
         ? {
-          profile: await this.prepareProfile(params.projectPath, {
-            toolApprovalMode: params.toolApprovalMode,
-          }),
+          profile: initialProfile,
           toolApprovalMode: params.toolApprovalMode,
         }
         : existing
-          ? await this.prepareProfileForSessionRecord(existing, params.projectPath)
+          ? existing.toolApprovalMode === 'auto'
+            ? { profile: initialProfile, toolApprovalMode: 'auto' }
+            : existing.toolApprovalMode === 'manual'
+              ? {
+                profile: await this.prepareProfile(params.projectPath, { toolApprovalMode: 'manual' }),
+                toolApprovalMode: 'manual',
+              }
+              : this.sessionProfileMatchesStoredConfig(existing, initialProfile)
+                ? { profile: initialProfile, toolApprovalMode: 'auto' }
+                : {
+                  profile: await this.prepareProfile(params.projectPath, { toolApprovalMode: 'manual' }),
+                  toolApprovalMode: 'manual',
+                }
           : {
-            profile: await this.prepareProfile(params.projectPath, { toolApprovalMode: 'auto' }),
+            profile: initialProfile,
             toolApprovalMode: 'auto',
           }
     const profile = requestedProfile.profile
@@ -798,13 +860,14 @@ export class OpenCodeSessionBridge {
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
       (!existingManagedConfigFingerprint || existingManagedConfigFingerprint === profile.managedConfigFingerprint) &&
+      existing.runId === (params.runId ?? null) &&
       params.fresh !== true &&
       !existing.staleReason
     ) {
       const host = await this.retainSessionHost(existing, params.runId, profile)
       const cleanRecord = this.withSessionProfileMetadata(existing, requestedProfile)
       if (cleanRecord !== existing) {
-        await this.sessionStore.upsert(cleanRecord)
+        await this.persistExactUpdate(existing, cleanRecord)
       }
       return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
     }
@@ -817,6 +880,8 @@ export class OpenCodeSessionBridge {
           ? `model_changed:${existing.selectedModel}->${params.selectedModel}`
           : existing.selectedVariant !== selectedVariant
             ? `variant_changed:${existing.selectedVariant ?? 'default'}->${selectedVariant ?? 'default'}`
+          : existing.runId !== (params.runId ?? null)
+            ? 'run_owner_changed'
           : existing.projectPath !== profile.projectPath
             ? 'project_path_changed'
             : existing.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
@@ -845,19 +910,29 @@ export class OpenCodeSessionBridge {
       toolApprovalMode: requestedProfile.toolApprovalMode,
     })
     try {
-      await this.sessionStore.upsert(created.record)
+      let publication = await this.sessionStore.publishIfAbsentOrExact?.(created.record)
+      if (!publication && this.deps.sessionStore && this.sessionStore.upsert) {
+        await this.sessionStore.upsert(created.record)
+        publication = { status: 'inserted', record: created.record }
+      }
+      if (!publication || publication.status === 'conflict') {
+        throw new Error('OpenCode session ownership changed before publication')
+      }
       this.retainedSessionHosts.set(
         this.buildSessionKey(created.record),
         created.retainedHostKey,
       )
     } catch (error) {
-      await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
+      const releaseOutcome = await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
         teamId: created.record.teamId,
         laneId: created.record.laneId,
         memberName: created.record.memberName,
+        runId: created.record.runId,
         sessionId: created.record.opencodeSessionId,
       }).catch(() => undefined)
-      await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
+      if (releaseOutcome !== 'foreign') {
+        await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
+      }
       throw error
     }
     return created.record
@@ -891,8 +966,7 @@ export class OpenCodeSessionBridge {
     }
 
     next.updatedAt = buildNowIso()
-    await this.sessionStore.upsert(next)
-    return next
+    return this.persistExactUpdate(record, next)
   }
 
   async listMessages(
@@ -1443,7 +1517,7 @@ export class OpenCodeSessionBridge {
           || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
-        await this.sessionStore.upsert(nextRecord)
+        await this.persistExactUpdate(record, nextRecord)
       }
 
       const reconciledRecord = isCurrentSession ? nextRecord : activeRecord
