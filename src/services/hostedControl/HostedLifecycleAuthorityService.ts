@@ -94,9 +94,13 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       if (owner.kind === 'not_found') return { schemaVersion: 1, kind: 'not_found' }
       if (owner.kind === 'unavailable') return unavailablePublic()
       const snapshot = this.#snapshot(owner)
-      const recentCommands = [...state.commands.values()].filter(entry =>
-        entry.authorization.deploymentId === input.authority.deploymentId &&
-        entry.authorization.actorId === input.authority.actorId).slice(-16).reverse().map(entry => ({
+      const seenCommandIds = new Set<string>()
+      const recentCommands = [...state.commands.values()].reverse().filter(entry => {
+        if (entry.authorization.deploymentId !== input.authority.deploymentId ||
+          entry.authorization.actorId !== input.authority.actorId || seenCommandIds.has(entry.command.commandId)) return false
+        seenCommandIds.add(entry.command.commandId)
+        return true
+      }).slice(0, 16).map(entry => ({
         action: entry.command.action,
         commandId: entry.command.commandId,
         result: entry.kind === 'completed' ? entry.result : {

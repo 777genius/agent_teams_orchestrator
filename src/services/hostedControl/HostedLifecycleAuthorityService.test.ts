@@ -263,6 +263,41 @@ describe('HostedLifecycleAuthorityService', () => {
         `lifecycle-command_command${String(17 - index).padStart(2, '0')}`))
   })
 
+  test('projects only the newest duplicate command ID after WAL restart', async () => {
+    const { root, service, provider } = await fixture()
+    const launch = launchCommand(provider); const launchAuthority = authority(provider)
+    const launchAdmission = await service.authorize({ command: launch, context, authority: launchAuthority })
+    if (launchAdmission.kind !== 'authorized') throw new Error('expected authorization')
+    const launched = await service.execute({
+      command: launch, authorization: launchAdmission.authorization,
+      durableCommand: durableCommand(launch, launchAdmission.authorization), context, authority: launchAuthority,
+    })
+    if (launched.kind !== 'settled') throw new Error('expected completion')
+    const stopAuthority = authority(provider)
+    const stop = { ...launchCommand(provider, {
+      action: 'stop', commandId: launch.commandId, idempotencyKey: 'idempotency_command02', runId: 'run_test01',
+    }), action: 'stop' as const, runId: 'run_test01' }
+    const stopAdmission = await service.authorize({ command: stop, context, authority: stopAuthority })
+    if (stopAdmission.kind !== 'authorized') throw new Error('expected authorization')
+    const stopped = await service.execute({
+      command: stop, authorization: stopAdmission.authorization,
+      durableCommand: durableCommand(stop, stopAdmission.authorization), context, authority: stopAuthority,
+    })
+    if (stopped.kind !== 'settled') throw new Error('expected completion')
+
+    const restarted = new HostedLifecycleAuthorityService({
+      ...incarnation, wal: new HostedLifecycleAuthorityWal(root, teamId),
+      providers: new HostedLifecycleProviderRegistry([provider]),
+    })
+    const status = await restarted.getProvisioningStatus({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
+      context, authority: authority(provider),
+    })
+    expect(status.recentCommands).toEqual([
+      { action: 'stop', commandId: stop.commandId, result: stopped.result },
+    ])
+  })
+
   test('keeps a non-launch receipt bound to the commanded run when provider state advances to another run', async () => {
     const provider = new MutableProvider()
     provider.snapshot = {
