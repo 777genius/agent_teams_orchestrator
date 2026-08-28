@@ -660,6 +660,16 @@ export async function withOpenCodeInventoryProbeTimeout(
   const lexicalProjectPath = path.resolve(input.projectPath?.trim() || getCwd())
   const canonicalizeProjectPath = input.canonicalizeProjectPath
     ?? canonicalizeOpenCodeProjectIdentity
+  // The caller starts the probe before entering this helper. Observe both of
+  // its possible outcomes immediately so an already-rejected (notably
+  // cancelled) probe cannot become an unhandled rejection while project
+  // canonicalization is still pending. The outcome wrapper never rejects;
+  // its recorded rejection is propagated only after canonicalization grants
+  // authority to use the probe result.
+  const observedProbe = probe.then(
+    value => ({ status: 'fulfilled' as const, value }),
+    reason => ({ status: 'rejected' as const, reason }),
+  )
   let timeout: ReturnType<typeof setTimeout> | null = null
   try {
     const deadline = new Promise<OpenCodeInventorySnapshot>(resolve => {
@@ -682,7 +692,11 @@ export async function withOpenCodeInventoryProbeTimeout(
     const canonicalProbe = canonicalizeProjectPath(
       lexicalProjectPath,
       { allowMissing: true },
-    ).then(() => probe)
+    ).then(async () => {
+      const outcome = await observedProbe
+      if (outcome.status === 'rejected') throw outcome.reason
+      return outcome.value
+    })
     return await Promise.race([canonicalProbe, deadline])
   } finally {
     if (timeout) clearTimeout(timeout)

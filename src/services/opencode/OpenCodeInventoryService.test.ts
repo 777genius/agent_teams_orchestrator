@@ -295,6 +295,79 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(result.projectPath).toBe(path.resolve('./project'))
   })
 
+  test('observes an already-rejected cancellation while canonicalization remains pending', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const cancellation = new DOMException('inventory cancelled', 'AbortError')
+      const result = await withOpenCodeInventoryProbeTimeout(Promise.reject(cancellation), {
+        projectPath: '/tmp/project',
+        timeoutMs: 1,
+        canonicalizeProjectPath: async () => new Promise<string>(() => {}),
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(true)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  test('propagates a synchronously rejected probe after canonicalization', async () => {
+    const probeError = new DOMException('inventory cancelled', 'AbortError')
+    const probe = new Promise<OpenCodeInventorySnapshot>((_resolve, reject) => {
+      reject(probeError)
+    })
+
+    await expect(withOpenCodeInventoryProbeTimeout(probe, {
+      projectPath: '/tmp/project',
+      timeoutMs: 50,
+      canonicalizeProjectPath: async projectPath => projectPath,
+    })).rejects.toBe(probeError)
+  })
+
+  test('keeps canonicalization rejection authoritative over an observed probe rejection', async () => {
+    const probeError = new Error('probe failed')
+    const canonicalizationError = new Error('canonicalization failed')
+
+    await expect(withOpenCodeInventoryProbeTimeout(Promise.reject(probeError), {
+      projectPath: '/tmp/project',
+      timeoutMs: 50,
+      canonicalizeProjectPath: async () => {
+        throw canonicalizationError
+      },
+    })).rejects.toBe(canonicalizationError)
+  })
+
+  test('observes a probe rejection that settles after the timeout', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      let rejectProbe: (reason: unknown) => void = () => {}
+      const probe = new Promise<OpenCodeInventorySnapshot>((_resolve, reject) => {
+        rejectProbe = reject
+      })
+      const result = await withOpenCodeInventoryProbeTimeout(probe, {
+        projectPath: '/tmp/project',
+        timeoutMs: 1,
+      })
+
+      rejectProbe(new DOMException('late inventory cancellation', 'AbortError'))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(true)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   test('keeps the completed inventory snapshot when probing finishes before the timeout', async () => {
     let timedOut = false
     const completed = inventorySnapshot({
