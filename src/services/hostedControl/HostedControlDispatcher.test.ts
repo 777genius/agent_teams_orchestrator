@@ -169,6 +169,19 @@ describe('HostedControlDispatcher response decoding', () => {
     })
   })
 
+  test('rejects operator_required as a settled execute or replay result', async () => {
+    for (const operation of ['execute', 'replay_lookup'] as const) {
+      const response = lifecycleExecutionResponse()
+      response.payload.result = {
+        schemaVersion: 1, kind: 'operator_required', action: 'launch',
+        commandId: 'lifecycle-command_command01', workspaceId: lifecycleAuthority.workspaceId,
+        teamId: lifecycleAuthority.teamId,
+      }
+      await expect(lifecycleDispatcher(response)
+        .dispatch(signedDurableRequest(operation))).rejects.toThrow('result kind')
+    }
+  })
+
   test('rejects duplicate IDs, non-exact keys, and recent result correlation mismatches', async () => {
     const base = recentCommand()
     const invalid = [

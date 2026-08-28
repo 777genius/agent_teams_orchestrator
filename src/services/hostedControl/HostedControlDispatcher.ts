@@ -618,6 +618,7 @@ function decodeLifecyclePublicResult(
   correlation: { action: unknown; commandId: unknown; workspaceId: unknown; teamId: unknown },
   command?: Record<string, unknown>,
   authorization?: Record<string, unknown>,
+  options: { allowOperatorRequired?: boolean } = {},
 ): void {
   const result = record(value, 'lifecycle public result')
   if (result.schemaVersion !== 1 || typeof result.kind !== 'string') throw new Error('Invalid lifecycle public result')
@@ -638,7 +639,8 @@ function decodeLifecyclePublicResult(
       throw new Error('Invalid lifecycle public conflict reason')
     }
     nullableRevision(result.currentRevision)
-  } else if (result.kind === 'not_found' || result.kind === 'operator_required') {
+  } else if (result.kind === 'not_found' ||
+    (options.allowOperatorRequired === true && result.kind === 'operator_required')) {
     exactKeys(result, common, 'lifecycle not found result')
   } else {
     throw new Error('Invalid lifecycle public result kind')
@@ -717,7 +719,7 @@ function decodeRecentCommands(value: unknown, authority: HostedLifecycleAuthorit
       commandId: entry.commandId,
       workspaceId: authority.workspaceId,
       teamId: authority.teamId,
-    })
+    }, undefined, undefined, { allowOperatorRequired: true })
     if (result.action !== entry.action || result.commandId !== entry.commandId ||
       result.workspaceId !== authority.workspaceId || result.teamId !== authority.teamId) {
       throw new Error('Invalid lifecycle recent command correlation')
