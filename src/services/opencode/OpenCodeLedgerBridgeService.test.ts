@@ -39,12 +39,15 @@ afterEach(async () => {
 
 function sessionRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: 'team-a',
     laneId: 'primary',
     memberName: 'bob',
     providerId: 'opencode',
     selectedModel: 'openai/gpt-5.4',
+    projectIdentity: overrides.projectIdentity ?? overrides.projectPath ?? workspaceRoot,
     projectPath: workspaceRoot,
+    runId: null,
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'behavior-v1',

@@ -311,12 +311,15 @@ function sessionRecord(input: {
   workspaceRoot: string
 }): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: TEAM_NAME,
     laneId: LANE_ID,
     memberName: MEMBER_NAME,
     providerId: 'opencode',
     selectedModel: LIVE_MODEL,
+    projectIdentity: input.workspaceRoot,
     projectPath: input.workspaceRoot,
+    runId: null,
     profileRootKey: 'live-opencode-profile',
     hostKey: 'live-opencode-host',
     resolvedBehaviorFingerprint: 'live',

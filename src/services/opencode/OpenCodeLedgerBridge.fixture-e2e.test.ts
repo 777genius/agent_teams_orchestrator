@@ -64,12 +64,15 @@ function sessionRecord(input: {
   workspaceRoot: string
 }): OpenCodeSessionRecord {
   return {
+    version: 2,
     teamId: 'fixture-team',
     laneId: `secondary:opencode:${input.memberName}`,
     memberName: input.memberName,
     providerId: 'opencode',
     selectedModel: 'openai/gpt-5.4',
+    projectIdentity: input.workspaceRoot,
     projectPath: input.workspaceRoot,
+    runId: null,
     profileRootKey: 'fixture-profile',
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'behavior-v1',
