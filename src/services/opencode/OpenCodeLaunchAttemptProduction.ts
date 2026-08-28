@@ -63,9 +63,12 @@ import {
 } from './OpenCodeLaunchMutationLedger.js'
 import { normalizeOpenCodeLogicalMemberIdentity } from './OpenCodeLogicalMemberKey.js'
 import {
+  assertOpenCodeRetainedHostLeaseOutcome,
   hydrateOpenCodeRecoveredSessionLease,
   OpenCodeLaunchRetainedHostLeases,
+  OpenCodeRetainedHostLeaseForeignError,
   readOpenCodeExactMessageText,
+  type OpenCodeRetainedHostLeaseOutcome,
 } from './OpenCodeLaunchProductionGuards.js'
 import {
   createOpenCodeOwnedMemberSession,
@@ -135,6 +138,25 @@ export async function resolveOpenCodeProductionRetainedProofRecord(input: Readon
     throw new Error('OpenCode retained proof is unavailable')
   }
   return retainedProof
+}
+
+/** Transfers cleanup authority only after this attempt wins durable host custody. */
+export async function retainOpenCodeProductionOwnedHostLease<T>(input: Readonly<{
+  owned: T
+  registerOwned(owned: T): void
+  retainHostLease(): Promise<OpenCodeRetainedHostLeaseOutcome>
+}>): Promise<Exclude<OpenCodeRetainedHostLeaseOutcome, 'foreign'>> {
+  try {
+    const outcome = assertOpenCodeRetainedHostLeaseOutcome(await input.retainHostLease())
+    input.registerOwned(input.owned)
+    return outcome
+  } catch (error) {
+    // A non-CAS failure still leaves an attempt-owned provider session that
+    // generic exactly-once cleanup must reconcile. A foreign CAS proves that
+    // cleanup authority is shared/foreign, so registering it would be unsafe.
+    if (!(error instanceof OpenCodeRetainedHostLeaseForeignError)) input.registerOwned(input.owned)
+    throw error
+  }
 }
 
 export function deriveOpenCodeProductionProofOwnership(input: Readonly<{
@@ -685,6 +707,19 @@ class OpenCodeProductionLaunchRuntime {
     // reconciled. A restart must not dispose a persistent host which already
     // serves a committed durable member.
     const retainedSessionLeases = new OpenCodeLaunchRetainedHostLeases()
+    let retainedHostLeaseFailure: OpenCodeRetainedHostLeaseForeignError | undefined
+    const retainAttemptHostLease = async (
+      hostKey: string,
+      owner: Parameters<typeof openCodeHostManager.retainHostLease>[1],
+    ) => {
+      const outcome = await openCodeHostManager.retainHostLease(hostKey, owner)
+      try { assertOpenCodeRetainedHostLeaseOutcome(outcome) }
+      catch (error) {
+        if (error instanceof OpenCodeRetainedHostLeaseForeignError) retainedHostLeaseFailure = error
+        throw error
+      }
+      return outcome
+    }
     const linkageFor = (memberIdentity: OpenCodeOpaqueIdentity, record: OpenCodeSessionRecord):
     OpenCodeLaunchMemberLinkage | null => {
       const messageID = record.appManagedBootstrap?.messageID
@@ -963,7 +998,7 @@ class OpenCodeProductionLaunchRuntime {
           record, memberIdentity: member.memberIdentity, runId: command.runId,
           leases: retainedSessionLeases,
           retainHostLease: async (hostKey, owner) => {
-            await openCodeHostManager.retainHostLease(hostKey, owner)
+            return retainAttemptHostLease(hostKey, owner)
           },
         })
       }
@@ -1945,7 +1980,7 @@ class OpenCodeProductionLaunchRuntime {
             record, memberIdentity: input.memberIdentity, runId: command.runId,
             leases: retainedSessionLeases,
             retainHostLease: async (hostKey, owner) => {
-              await openCodeHostManager.retainHostLease(hostKey, owner)
+              return retainAttemptHostLease(hostKey, owner)
             },
           })
           return linkage
@@ -2036,22 +2071,39 @@ class OpenCodeProductionLaunchRuntime {
           } catch (error) {
             if (!isNotFound(error)) throw error
           }
-          const { session, owned } = await createOpenCodeOwnedMemberSession({
-            memberIdentity: input.memberIdentity,
-            authoritativeSessionId,
-            registerRecord: () => { records.set(input.memberIdentity, record) },
-            registerOwned: input.registerOwned,
-            createSession: () => runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
-              () => client.createSession({ id: authoritativeSessionId, title: ownershipTitle })),
-          })
+          let createdOwned: Parameters<typeof input.registerOwned>[0] | undefined
+          let session: Awaited<ReturnType<typeof client.createSession>>
+          try {
+            const created = await createOpenCodeOwnedMemberSession({
+              memberIdentity: input.memberIdentity,
+              authoritativeSessionId,
+              registerRecord: () => { records.set(input.memberIdentity, record) },
+              // Custody must commit before generic attempt cleanup can treat this
+              // provider session as exclusively owned. A foreign lease winner is
+              // shared authority and must never be deleted by the stale attempt.
+              registerOwned: owned => { createdOwned = owned },
+              createSession: () => runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+                () => client.createSession({ id: authoritativeSessionId, title: ownershipTitle })),
+            })
+            session = created.session
+          } catch (error) {
+            if (createdOwned) input.registerOwned(createdOwned)
+            throw error
+          }
+          const owned = createdOwned!
           if (session.id !== authoritativeSessionId || session.title !== ownershipTitle) {
+            input.registerOwned(owned)
             return { outcome: 'unknown_transport', owned }
           }
-          await runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
-            () => openCodeHostManager.retainHostLease(handle.hostKey, {
-              teamId: command.teamId, laneId: command.laneId, memberName: member.name,
-              runId: command.runId, sessionId: session.id,
-            }))
+          await retainOpenCodeProductionOwnedHostLease({
+            owned,
+            registerOwned: input.registerOwned,
+            retainHostLease: () => runOpenCodeMutationWithFreshProof(input.revalidateBeforeCommit,
+              () => retainAttemptHostLease(handle.hostKey, {
+                teamId: command.teamId, laneId: command.laneId, memberName: member.name,
+                runId: command.runId, sessionId: session.id,
+              })),
+          })
           const text = bootstrapText(command, member.name, record.opencodeSessionId, member.prompt)
           const contextHash = createHash('sha256').update(text).digest('hex')
           const briefingHash = createHash('sha256').update(member.prompt ?? '').digest('hex')
@@ -2153,6 +2205,7 @@ class OpenCodeProductionLaunchRuntime {
       signal: command.signal,
       commandInputDigest: computeOpenCodeLaunchCommandInputDigest(command),
       commandImmutableDigest: computeOpenCodeLaunchCommandImmutableDigest(command) })
+    if (retainedHostLeaseFailure) throw retainedHostLeaseFailure
     // Completed receipt tombstones remain durable. Clearing here would run
     // after the attempt lease is released and could race a successor. A later
     // exact reconciliation may compact them only while holding that lease.

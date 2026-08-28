@@ -9,6 +9,7 @@ import {
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeRetainedHostLeaseForeignError } from './OpenCodeLaunchProductionGuards.js'
 import {
   buildManagedConfigFingerprint,
   fingerprintOpenCodeCompleteEnvironment,
@@ -388,6 +389,43 @@ describe('OpenCodeSessionBridge', () => {
     expect(record).toEqual({ ...existing, runtimePid: 123 })
     expect(prepareProfileCalls).toBe(0)
     expect(createSessionCalls).toBe(0)
+  })
+
+  test('normal reuse releases a stale loser once and an exact successor retry is reusable', async () => {
+    const existing = buildRecord({ runId: 'run-shared' })
+    const outcomes = ['foreign', 'exact'] as const
+    let retainCalls = 0
+    let ensureCalls = 0
+    let releaseCalls = 0
+    let providerEffects = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: { get: async () => existing },
+      hostManager: {
+        ensureHost: async () => { ensureCalls += 1; return host },
+        releaseHost: async () => { releaseCalls += 1 },
+        retainHostLease: async () => outcomes[retainCalls++],
+      },
+      clientFactory: { create: () => { providerEffects += 1; throw new Error('must not contact provider') } },
+    })
+    const input = {
+      teamId: existing.teamId, laneId: existing.laneId, memberName: existing.memberName,
+      selectedModel: existing.selectedModel, projectPath: existing.projectPath,
+      preparedProfile: profile, runId: existing.runId,
+    }
+
+    let failure: unknown
+    try { await bridge.ensureSession(input) } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(OpenCodeRetainedHostLeaseForeignError)
+    expect((failure as OpenCodeRetainedHostLeaseForeignError).outcome).toBe('foreign')
+    expect({ retainCalls, ensureCalls, releaseCalls, providerEffects })
+      .toEqual({ retainCalls: 1, ensureCalls: 1, releaseCalls: 1, providerEffects: 0 })
+
+    await expect(bridge.ensureSession(input)).resolves.toMatchObject({
+      opencodeSessionId: existing.opencodeSessionId,
+    })
+    expect({ retainCalls, ensureCalls, releaseCalls, providerEffects })
+      .toEqual({ retainCalls: 2, ensureCalls: 2, releaseCalls: 1, providerEffects: 0 })
   })
 
   test('persists manual tool approval mode in fresh session records', async () => {
@@ -886,6 +924,26 @@ describe('OpenCodeSessionBridge', () => {
     }])
     expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }])
     expect(releaseHostCalls).toBe(1)
+  })
+
+  test('foreign normal-use lease blocks MCP effects and releases only the local reference', async () => {
+    let releaseHostCalls = 0
+    let mcpEffects = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releaseHostCalls += 1; throw new Error('local release failed') },
+        retainHostLease: async () => 'foreign',
+      },
+      mcpManager: {
+        ensureAppMcp: async () => { mcpEffects += 1; throw new Error('must not run') },
+      },
+    })
+
+    await expect(bridge.ensureSessionAppMcpReady(buildRecord()))
+      .rejects.toBeInstanceOf(OpenCodeRetainedHostLeaseForeignError)
+    expect({ releaseHostCalls, mcpEffects }).toEqual({ releaseHostCalls: 1, mcpEffects: 0 })
   })
 
   test('ensureSessionAppMcpReady returns blocking state when app MCP cannot attach', async () => {
@@ -2358,7 +2416,7 @@ describe('OpenCodeSessionBridge', () => {
       })
       expect(publishedB.runId).toBe('run-b')
       releaseDelayedRead()
-      await expect(delayed).rejects.toThrow('owned by a newer session')
+      await expect(delayed).rejects.toThrow('custody changed [redacted]')
       expect(currentLease).toEqual({ runId: 'run-b', sessionId: 'session-b-1' })
       expect(localReferences).toEqual([0, 1])
       expect((await store.getByLogicalMember(old))?.runId).toBe('run-b')
@@ -2584,6 +2642,46 @@ describe('OpenCodeSessionBridge', () => {
     expect(second.opencodeSessionId).toBe('session-first-2')
     expect(reused.opencodeSessionId).toBe(second.opencodeSessionId)
     expect(creates).toBe(2)
+  })
+
+  test('published stale loser stops after foreign lease CAS and releases its local host once', async () => {
+    let published: OpenCodeSessionRecord | null = null
+    let creates = 0
+    let localReleases = 0
+    let durableReleases = 0
+    let deletes = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        publishIfAbsentOrExact: async record => {
+          published = record
+          return { status: 'inserted' as const, record }
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { localReleases += 1 },
+        retainHostLease: async () => 'foreign',
+        releaseHostLease: async () => { durableReleases += 1; return 'applied' },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: `stale-loser-${++creates}` }),
+        deleteSession: async () => { deletes += 1; return true },
+      } as never) },
+    })
+
+    let failure: unknown
+    try {
+      await bridge.ensureSession({
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        selectedModel: 'openai/gpt-5.4-mini', projectPath: '/tmp/project', runId: 'stale-run',
+      })
+    } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(OpenCodeRetainedHostLeaseForeignError)
+    expect(published).toMatchObject({ opencodeSessionId: 'stale-loser-1', runId: 'stale-run' })
+    expect({ creates, localReleases, durableReleases, deletes })
+      .toEqual({ creates: 1, localReleases: 1, durableReleases: 0, deletes: 0 })
   })
 
   test('foreign lease CAS preserves the exact retained project run session owner', async () => {

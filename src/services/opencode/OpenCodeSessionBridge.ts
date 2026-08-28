@@ -19,6 +19,11 @@ import {
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 import { canonicalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import {
+  assertOpenCodeRetainedHostLeaseOutcome,
+  OpenCodeRetainedHostLeaseForeignError,
+  type OpenCodeRetainedHostLeaseOutcome,
+} from './OpenCodeLaunchProductionGuards.js'
 
 import type {
   OpenCodeAuthState,
@@ -811,10 +816,6 @@ export class OpenCodeSessionBridge {
               sessionId: transition.predecessorOpencodeSessionId }
             : null)
         if (retention.host?.pid && retention.host.pid > 0) runtimePid = retention.host.pid
-        if (retention.outcome === 'foreign') {
-          await this.releaseContendingSessionHostReference(record, false)
-          throw new Error('OpenCode durable successor lease is owned by a newer session')
-        }
         let advancement: Awaited<ReturnType<typeof this.advanceDurableSuccessorTransition>>
         try {
           advancement = await this.advanceDurableSuccessorTransition(
@@ -976,18 +977,27 @@ export class OpenCodeSessionBridge {
     runId?: string | null,
     profile?: OpenCodePreparedProfile,
     expected?: { runId: string | null; sessionId: string | null } | null,
-  ): Promise<{ host: OpenCodeHostHandle | null; outcome: 'applied' | 'exact' | 'foreign' }> {
+  ): Promise<{ host: OpenCodeHostHandle | null; outcome: Exclude<OpenCodeRetainedHostLeaseOutcome, 'foreign'> }> {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
-      const outcome = await this.hostManager.retainHostLease?.(record.hostKey, {
-        teamId: record.teamId,
-        laneId: record.laneId,
-        memberName: record.memberName,
-        runId: runId ?? null,
-        sessionId: record.opencodeSessionId,
-        expected,
-      })
-      return { host: null, outcome: outcome ?? 'applied' }
+      try {
+        const outcome = assertOpenCodeRetainedHostLeaseOutcome(
+          await this.hostManager.retainHostLease?.(record.hostKey, {
+            teamId: record.teamId,
+            laneId: record.laneId,
+            memberName: record.memberName,
+            runId: runId ?? null,
+            sessionId: record.opencodeSessionId,
+            expected,
+          }))
+        return { host: null, outcome }
+      } catch (error) {
+        if (error instanceof OpenCodeRetainedHostLeaseForeignError) {
+          this.retainedSessionHosts.delete(sessionKey)
+          await this.hostManager.releaseHost(record.hostKey).catch(() => undefined)
+        }
+        throw error
+      }
     }
 
     const sessionProfile = profile
@@ -1001,23 +1011,24 @@ export class OpenCodeSessionBridge {
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
     })
-    let retentionOutcome: 'applied' | 'exact' | 'foreign' = 'applied'
     try {
-      const outcome = await this.hostManager.retainHostLease?.(record.hostKey, {
-        teamId: record.teamId,
-        laneId: record.laneId,
-        memberName: record.memberName,
-        runId: runId ?? null,
-        sessionId: record.opencodeSessionId,
-        expected,
-      })
-      retentionOutcome = outcome ?? 'applied'
+      const retentionOutcome = assertOpenCodeRetainedHostLeaseOutcome(
+        await this.hostManager.retainHostLease?.(record.hostKey, {
+          teamId: record.teamId,
+          laneId: record.laneId,
+          memberName: record.memberName,
+          runId: runId ?? null,
+          sessionId: record.opencodeSessionId,
+          expected,
+        }))
+      this.retainedSessionHosts.set(sessionKey, record.hostKey)
+      return { host, outcome: retentionOutcome }
     } catch (error) {
-      await this.hostManager.releaseHost(record.hostKey)
+      await this.hostManager.releaseHost(record.hostKey).catch(releaseError => {
+        if (!(error instanceof OpenCodeRetainedHostLeaseForeignError)) throw releaseError
+      })
       throw error
     }
-    this.retainedSessionHosts.set(sessionKey, record.hostKey)
-    return { host, outcome: retentionOutcome }
   }
 
   async releaseSession(record: Pick<OpenCodeSessionRecord,
@@ -1101,13 +1112,19 @@ export class OpenCodeSessionBridge {
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
     })
-    await this.hostManager.retainHostLease?.(record.hostKey, {
-      teamId: record.teamId,
-      laneId: record.laneId,
-      memberName: record.memberName,
-      runId: record.runId,
-      sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
+    try {
+      assertOpenCodeRetainedHostLeaseOutcome(await this.hostManager.retainHostLease?.(
+        record.hostKey, {
+          teamId: record.teamId,
+          laneId: record.laneId,
+          memberName: record.memberName,
+          runId: record.runId,
+          sessionId: record.opencodeSessionId,
+        }))
+    } catch (error) {
+      await this.hostManager.releaseHost(host.hostKey).catch(() => undefined)
+      throw error
+    }
 
     try {
       return await callback({
@@ -1497,6 +1514,7 @@ export class OpenCodeSessionBridge {
           ? { ...completed.record, runtimePid: completed.runtimePid }
           : completed.record
       } catch (error) {
+        if (error instanceof OpenCodeRetainedHostLeaseForeignError) throw error
         throw new Error(
           `OpenCode successor session ${created.record.opencodeSessionId} has a recoverable durable lease transition: ${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
@@ -1512,14 +1530,20 @@ export class OpenCodeSessionBridge {
       this.pendingLeaseTransitions.set(refreshDecisionKey, existing)
     }
     try {
-      await this.hostManager.retainHostLease?.(created.retainedHostKey, {
-        teamId: created.record.teamId,
-        laneId: created.record.laneId,
-        memberName: created.record.memberName,
-        runId: created.record.runId,
-        sessionId: created.record.opencodeSessionId,
-      })
+      assertOpenCodeRetainedHostLeaseOutcome(await this.hostManager.retainHostLease?.(
+        created.retainedHostKey, {
+          teamId: created.record.teamId,
+          laneId: created.record.laneId,
+          memberName: created.record.memberName,
+          runId: created.record.runId,
+          sessionId: created.record.opencodeSessionId,
+        }))
     } catch (error) {
+      if (error instanceof OpenCodeRetainedHostLeaseForeignError) {
+        this.retainedSessionHosts.delete(this.buildSessionKey(created.record))
+        await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
+        throw error
+      }
       throw new Error(
         `OpenCode session ${created.record.opencodeSessionId} was published but successor host lease retention failed on ${created.retainedHostKey}: ${error instanceof Error ? error.message : String(error)}`,
         { cause: error },

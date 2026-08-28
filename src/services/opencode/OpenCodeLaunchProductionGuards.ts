@@ -1,4 +1,26 @@
 import type { OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
+import type { OpenCodeHostLeaseRetentionOutcome } from './OpenCodeHostManager.js'
+
+export type OpenCodeRetainedHostLeaseOutcome = OpenCodeHostLeaseRetentionOutcome
+
+/** A durable lease CAS proved that this caller no longer owns host custody. */
+export class OpenCodeRetainedHostLeaseForeignError extends Error {
+  readonly code = 'OPENCODE_RETAINED_HOST_LEASE_FOREIGN'
+  readonly outcome = 'foreign' as const
+
+  constructor() {
+    super('OpenCode retained host lease custody changed [redacted]')
+    this.name = 'OpenCodeRetainedHostLeaseForeignError'
+  }
+}
+
+export function assertOpenCodeRetainedHostLeaseOutcome(
+  outcome: OpenCodeRetainedHostLeaseOutcome | void,
+): Exclude<OpenCodeRetainedHostLeaseOutcome, 'foreign'> {
+  const exactOutcome = outcome ?? 'applied'
+  if (exactOutcome === 'foreign') throw new OpenCodeRetainedHostLeaseForeignError()
+  return exactOutcome
+}
 
 /** Joins exactly as received. In particular, whitespace is proof data. */
 export function readOpenCodeExactMessageText(message: { parts?: Array<{ text?: unknown }> }): string {
@@ -34,15 +56,16 @@ export async function hydrateOpenCodeRecoveredSessionLease(input: {
     memberName: string
     runId: string
     sessionId: string
-  }): Promise<void>
-}): Promise<void> {
+  }): Promise<OpenCodeRetainedHostLeaseOutcome | void>
+}): Promise<Exclude<OpenCodeRetainedHostLeaseOutcome, 'foreign'>> {
   const { record } = input
-  await input.retainHostLease(record.hostKey, {
+  const outcome = assertOpenCodeRetainedHostLeaseOutcome(await input.retainHostLease(record.hostKey, {
     teamId: record.teamId,
     laneId: record.laneId,
     memberName: record.memberName,
     runId: input.runId,
     sessionId: record.opencodeSessionId,
-  })
+  }))
   input.leases.commit(input.memberIdentity)
+  return outcome
 }

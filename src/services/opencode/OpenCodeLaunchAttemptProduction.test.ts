@@ -27,6 +27,7 @@ import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeProfileManager } from './OpenCodeProfileManager.js'
+import { OpenCodeRetainedHostLeaseForeignError } from './OpenCodeLaunchProductionGuards.js'
 import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
 import { planScopedProfile } from './OpenCodeOperationPolicy.js'
 import { computeOpenCodeLaunchCommandImmutableDigest, computeOpenCodeLaunchCommandInputDigest,
@@ -42,6 +43,7 @@ import {
   readOpenCodeProductionMemberClaim,
   reobserveOpenCodeProductionRetainedProof,
   reconcileOpenCodeMemberCleanupObligations,
+  retainOpenCodeProductionOwnedHostLease,
   resolveOpenCodeProductionRetainedProofRecord,
   transitionOpenCodeProductionMemberClaim,
 } from './OpenCodeLaunchAttemptProduction.js'
@@ -51,6 +53,27 @@ const productionContext = () => ({
   deadlineAtMs: Date.now() + 10_000,
   signal: new AbortController().signal,
   monotonicNow: Date.now,
+})
+
+test('production lease transfer withholds cleanup and downstream effects from a foreign loser', async () => {
+  const owned = { memberIdentity: identity }
+  const registered: typeof owned[] = []
+  let downstreamEffects = 0
+  const loser = retainOpenCodeProductionOwnedHostLease({
+    owned,
+    registerOwned: resource => { registered.push(resource) },
+    retainHostLease: async () => 'foreign',
+  }).then(() => { downstreamEffects += 1 })
+
+  await expect(loser).rejects.toBeInstanceOf(OpenCodeRetainedHostLeaseForeignError)
+  expect({ registered, downstreamEffects }).toEqual({ registered: [], downstreamEffects: 0 })
+
+  await expect(retainOpenCodeProductionOwnedHostLease({
+    owned,
+    registerOwned: resource => { registered.push(resource) },
+    retainHostLease: async () => 'exact',
+  })).resolves.toBe('exact')
+  expect(registered).toEqual([owned])
 })
 
 const cleanupObligation = (phase: OpenCodeMemberCleanupPhase = 'remote'):
@@ -1138,6 +1161,34 @@ test('production preflight repairs an exact committed claim after commit-before-
       .toContain('member_reconciled_applied')
   } finally { await fixture.dispose() }
 })
+
+test('production recovery fails closed when a successor wins retained-host lease CAS', async () => {
+  let retains = 0
+  let localReleases = 0
+  const manager = {
+    ensureScopedHostReference: async () => { throw new Error('must not provision during recovery') },
+    releaseHostReference: async () => { localReleases += 1 },
+    hasExactRetainedHostReleaseCapability: () => false,
+    retainHostLease: async () => { retains += 1; return 'foreign' as const },
+    reconcileHostReleaseReceipt: async () => {},
+  } as unknown as OpenCodeHostManager
+  const fixture = await productionRecoveryHarness(manager)
+  try {
+    const seeded = await fixture.seedIntent({ acceptedProof: true })
+    await fixture.commitClaim(seeded)
+    await fixture.sessionStore.upsert(seeded.record)
+
+    let failure: unknown
+    try { await fixture.bridge.execute(fixture.command) } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(OpenCodeRetainedHostLeaseForeignError)
+    expect((failure as OpenCodeRetainedHostLeaseForeignError).code)
+      .toBe('OPENCODE_RETAINED_HOST_LEASE_FOREIGN')
+    expect((failure as Error).message).toBe('OpenCode retained host lease custody changed [redacted]')
+    expect({ retains, localReleases, creates: fixture.memberCreates(), mcp: fixture.mcpChecks() })
+      .toEqual({ retains: 1, localReleases: 0, creates: 0, mcp: 0 })
+    expect(await fixture.readSessionProjection()).toEqual(seeded.record)
+  } finally { await fixture.dispose() }
+}, 15_000)
 
 const staleProductionAuthorityCases = [
     ['pending claim', async (fixture: Awaited<ReturnType<typeof productionRecoveryHarness>>, seeded: ProductionSeed) => {
