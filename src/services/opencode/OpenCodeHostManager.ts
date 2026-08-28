@@ -381,8 +381,13 @@ function persistentHostLifecycleIdentity(
     coordinationProtectedUntil: _protected,
     leases: _leases,
     scopedTransportToken: _transportCapability,
+    scopedIdentityBinding: _lifecycleBinding,
     ...identity
   } = record
+  // Adoption refreshes coordinationProtectedUntil and consequently its
+  // authenticated binding. Callers validate each binding before comparing
+  // the remaining immutable process identity, so a retained host remains the
+  // exact generation owned by the original disposal receipt.
   return {
     ...identity,
     transportPort: scopedRecordPort(record, scopedTransportOwnerKey),
@@ -3137,7 +3142,11 @@ export class OpenCodeHostManager {
         lastError: error instanceof Error ? error.message : String(error) })
       return false
     })
-      .finally(() => { this.exitCleanupTasks.delete(hostKey) })
+      .finally(() => {
+        if (this.exitCleanupTasks.get(hostKey) === task) {
+          this.exitCleanupTasks.delete(hostKey)
+        }
+      })
     this.exitCleanupTasks.set(hostKey, task)
   }
 
@@ -3173,10 +3182,23 @@ export class OpenCodeHostManager {
     cleaned: number; pending: number; diagnostics: readonly string[]
   }>> {
     let cleaned = 0
+    // Exit notification owns a task before durable cleanup can yield. Observe
+    // those tasks directly rather than discovering them only through the
+    // pending-failure map: successful cleanup removes that entry, and an
+    // immediate reconciliation must still synchronize with the in-flight
+    // lifecycle work. Drain tasks registered while an earlier one is awaited.
+    const observedTasks = new Set<Promise<boolean>>()
+    while (true) {
+      const tasks = Array.from(this.exitCleanupTasks.values())
+        .filter(task => !observedTasks.has(task))
+      if (tasks.length === 0) break
+      for (const task of tasks) {
+        observedTasks.add(task)
+        if (await task) cleaned += 1
+      }
+    }
     for (const hostKey of Array.from(this.pendingExitCleanups.keys())) {
-      const existing = this.exitCleanupTasks.get(hostKey)
-      if (existing && await existing) cleaned += 1
-      else if (this.pendingExitCleanups.has(hostKey)
+      if (this.pendingExitCleanups.has(hostKey)
         && await this.retryPersistentExitCleanup(hostKey, 3)) cleaned += 1
     }
     return Object.freeze({
