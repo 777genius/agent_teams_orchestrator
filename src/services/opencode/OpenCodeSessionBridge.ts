@@ -45,7 +45,7 @@ type OpenCodeSessionBridgeDeps = {
   sessionStore?: Pick<typeof openCodeSessionStore, 'get'>
     & Partial<Pick<typeof openCodeSessionStore,
       'getByLogicalMember' | 'upsertIfSessionMatches' | 'publishIfAbsentOrExact'
-      | 'publishSuccessorIfExact'
+      | 'publishSuccessorIfExact' | 'advanceSuccessorTransitionIfExact'
       | 'markStaleIfSessionMatchesLogicalMember' | 'upsert' | 'markStaleByLogicalMember'
       | 'markStale'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
@@ -594,6 +594,95 @@ export class OpenCodeSessionBridge {
     this.pendingLeaseTransitions.delete(refreshDecisionKey)
   }
 
+  private async advanceDurableSuccessorTransition(
+    record: OpenCodeSessionRecord,
+    expectedPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'],
+    nextPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'] | null,
+  ): Promise<OpenCodeSessionRecord> {
+    const transition = record.successorTransition
+    if (!transition || transition.phase !== expectedPhase) {
+      throw new Error('OpenCode durable successor transition changed before advancement')
+    }
+    const result = await this.sessionStore.advanceSuccessorTransitionIfExact?.(
+      {
+        teamId: record.teamId,
+        laneId: record.laneId ?? 'primary',
+        projectIdentity: record.projectIdentity,
+        memberName: record.memberName,
+      },
+      record.opencodeSessionId,
+      record.runId,
+      transition.attemptIdentity,
+      expectedPhase,
+      nextPhase,
+    )
+    if (!result || result.status === 'absent' || result.status === 'foreign') {
+      throw new Error('OpenCode durable successor transition ownership changed')
+    }
+    const observed = result.record.successorTransition
+    if (nextPhase === null) {
+      if (observed) {
+        throw new Error('OpenCode durable successor transition clear lost its exact fence')
+      }
+    } else if (!observed || observed.attemptIdentity !== transition.attemptIdentity) {
+      throw new Error('OpenCode durable successor transition attempt changed')
+    }
+    return result.record
+  }
+
+  private async completeDurableSuccessorTransition(
+    initial: OpenCodeSessionRecord,
+    profile: OpenCodePreparedProfile,
+  ): Promise<{ record: OpenCodeSessionRecord; runtimePid?: number }> {
+    let record = initial
+    let runtimePid: number | undefined
+    while (record.successorTransition) {
+      const transition = record.successorTransition
+      if (transition.phase === 'successor_lease_pending') {
+        const retained = await this.retainSessionHost(record, record.runId, profile)
+        if (retained?.pid && retained.pid > 0) runtimePid = retained.pid
+        record = await this.advanceDurableSuccessorTransition(
+          record, 'successor_lease_pending', 'predecessor_release_pending')
+        continue
+      }
+      if (transition.phase === 'predecessor_release_pending') {
+        const predecessor = {
+          teamId: record.teamId,
+          laneId: record.laneId,
+          memberName: record.memberName,
+          projectIdentity: record.projectIdentity,
+          hostKey: transition.predecessorHostKey,
+          opencodeSessionId: transition.predecessorOpencodeSessionId,
+          runId: transition.predecessorRunId,
+        }
+        const oldSessionKey = this.buildSessionKey(predecessor)
+        const oldRetainedHost = this.retainedSessionHosts.get(oldSessionKey)
+        const outcome = await this.hostManager.releaseHostLease?.(
+          transition.predecessorHostKey,
+          {
+            teamId: record.teamId,
+            laneId: record.laneId,
+            memberName: record.memberName,
+            runId: transition.predecessorRunId,
+            sessionId: transition.predecessorOpencodeSessionId,
+          },
+        )
+        if (oldRetainedHost === transition.predecessorHostKey) {
+          await this.hostManager.releaseHost(oldRetainedHost)
+          this.retainedSessionHosts.delete(oldSessionKey)
+        } else if (outcome === 'applied') {
+          await this.hostManager.releaseHost(transition.predecessorHostKey)
+        }
+        record = await this.advanceDurableSuccessorTransition(
+          record, 'predecessor_release_pending', 'transition_complete')
+        continue
+      }
+      record = await this.advanceDurableSuccessorTransition(
+        record, 'transition_complete', null)
+    }
+    return { record, ...(runtimePid ? { runtimePid } : {}) }
+  }
+
   private async rejectUnpublishedSuccessor(
     refreshDecisionKey: string,
     created: {
@@ -972,6 +1061,12 @@ export class OpenCodeSessionBridge {
       refreshDecisionKey,
       existing?.opencodeSessionId ?? null,
     )
+    if (existing?.successorTransition) {
+      const recovered = await this.completeDurableSuccessorTransition(existing, profile)
+      return recovered.runtimePid
+        ? { ...recovered.record, runtimePid: recovered.runtimePid }
+        : recovered.record
+    }
     const knownSuccessor = this.publishedSuccessors.get(refreshDecisionKey)
     if (
       existing && knownSuccessor
@@ -1051,6 +1146,24 @@ export class OpenCodeSessionBridge {
       | OpenCodeSessionSuccessorPublicationResult
       | undefined
     try {
+      if (existing && this.sessionStore.advanceSuccessorTransitionIfExact) {
+        created.record = {
+          ...created.record,
+          successorTransition: {
+            version: 1,
+            attemptIdentity: createHash('sha256').update(JSON.stringify({
+              schema: 'opencode-session-successor-attempt-v1',
+              refreshDecisionKey,
+              predecessorOpencodeSessionId: existing.opencodeSessionId,
+              predecessorRunId: existing.runId,
+            })).digest('hex'),
+            phase: 'successor_lease_pending',
+            predecessorHostKey: existing.hostKey,
+            predecessorOpencodeSessionId: existing.opencodeSessionId,
+            predecessorRunId: existing.runId,
+          },
+        }
+      }
       publication = existing
         ? await this.sessionStore.publishSuccessorIfExact?.(
           created.record,
@@ -1083,6 +1196,20 @@ export class OpenCodeSessionBridge {
       this.buildSessionKey(created.record),
       created.retainedHostKey,
     )
+    if (created.record.successorTransition) {
+      try {
+        const completed = await this.completeDurableSuccessorTransition(created.record, profile)
+        return completed.runtimePid
+          ? { ...completed.record, runtimePid: completed.runtimePid }
+          : completed.record
+      } catch (error) {
+        throw new Error(
+          `OpenCode successor session ${created.record.opencodeSessionId} has a recoverable durable lease transition: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        )
+      }
+    }
+
     this.publishedSuccessors.set(refreshDecisionKey, {
       opencodeSessionId: created.record.opencodeSessionId,
       runId: created.record.runId,

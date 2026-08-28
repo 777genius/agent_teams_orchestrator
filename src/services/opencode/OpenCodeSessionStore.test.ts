@@ -103,6 +103,78 @@ describe('OpenCodeSessionStore', () => {
       'session-1', 'run-old')).toEqual({ status: 'conflict', record: successor })
   })
 
+  test('persists and exactly fences every durable successor transition phase across restart', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const predecessor = { ...baseRecord, runId: 'run-old' }
+    const attemptIdentity = 'a'.repeat(64)
+    const successor = {
+      ...baseRecord,
+      opencodeSessionId: 'session-2',
+      runId: 'run-new',
+      updatedAt: '2026-04-21T01:00:00.000Z',
+      successorTransition: {
+        version: 1 as const,
+        attemptIdentity,
+        phase: 'successor_lease_pending' as const,
+        predecessorHostKey: predecessor.hostKey,
+        predecessorOpencodeSessionId: predecessor.opencodeSessionId,
+        predecessorRunId: predecessor.runId,
+      },
+    }
+    const first = new OpenCodeSessionStore(filePath)
+    await first.upsert(predecessor)
+    expect(await first.publishSuccessorIfExact(successor, 'session-1', 'run-old'))
+      .toEqual({ status: 'replaced', record: successor })
+
+    const logical = { teamId: successor.teamId, laneId: successor.laneId,
+      projectIdentity: successor.projectIdentity, memberName: successor.memberName }
+    const restarted = new OpenCodeSessionStore(filePath)
+    expect(await restarted.getByLogicalMember(logical)).toEqual(successor)
+    const predecessorPending = await restarted.advanceSuccessorTransitionIfExact(
+      logical, 'session-2', 'run-new', attemptIdentity,
+      'successor_lease_pending', 'predecessor_release_pending')
+    expect(predecessorPending).toMatchObject({ status: 'applied', record: {
+      successorTransition: { phase: 'predecessor_release_pending' },
+    } })
+    const complete = await restarted.advanceSuccessorTransitionIfExact(
+      logical, 'session-2', 'run-new', attemptIdentity,
+      'predecessor_release_pending', 'transition_complete')
+    expect(complete).toMatchObject({ status: 'applied', record: {
+      successorTransition: { phase: 'transition_complete' },
+    } })
+    const cleared = await restarted.advanceSuccessorTransitionIfExact(
+      logical, 'session-2', 'run-new', attemptIdentity,
+      'transition_complete', null)
+    expect(cleared).toMatchObject({ status: 'applied' })
+    expect(cleared.status === 'applied' && cleared.record.successorTransition).toBeUndefined()
+    expect((await new OpenCodeSessionStore(filePath).getByLogicalMember(logical))
+      ?.successorTransition).toBeUndefined()
+  })
+
+  test('foreign successor owners and attempts cannot advance or clear a transition', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const store = new OpenCodeSessionStore(filePath)
+    const transition = {
+      version: 1 as const,
+      attemptIdentity: 'b'.repeat(64),
+      phase: 'transition_complete' as const,
+      predecessorHostKey: 'old-host',
+      predecessorOpencodeSessionId: 'old-session',
+      predecessorRunId: 'old-run',
+    }
+    const successor = { ...baseRecord, opencodeSessionId: 'session-2', runId: 'run-new',
+      successorTransition: transition }
+    await store.upsert(successor)
+    const logical = { teamId: successor.teamId, laneId: successor.laneId,
+      projectIdentity: successor.projectIdentity, memberName: successor.memberName }
+
+    expect((await store.advanceSuccessorTransitionIfExact(logical, 'foreign-session',
+      'run-new', transition.attemptIdentity, 'transition_complete', null)).status).toBe('foreign')
+    expect((await store.advanceSuccessorTransitionIfExact(logical, 'session-2',
+      'run-new', 'c'.repeat(64), 'transition_complete', null)).status).toBe('foreign')
+    expect((await store.getByLogicalMember(logical))?.successorTransition).toEqual(transition)
+  })
+
   test('successor publication returns absent and rejects the same deterministic session from another run', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const successor = { ...baseRecord, runId: 'run-new', updatedAt: '2026-04-21T01:00:00.000Z' }

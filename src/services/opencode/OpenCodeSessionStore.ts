@@ -51,6 +51,11 @@ export type OpenCodeSessionSuccessorPublicationResult =
   | { status: 'absent' }
   | { status: 'conflict'; record?: OpenCodeSessionRecord; reservation?: OpenCodeSessionReservation }
 
+export type OpenCodeSessionSuccessorTransitionResult =
+  | { status: 'applied' | 'already-satisfied'; record: OpenCodeSessionRecord }
+  | { status: 'absent' }
+  | { status: 'foreign'; record: OpenCodeSessionRecord }
+
 export type ConditionalMarkStaleResult =
   | { status: 'applied'; record: OpenCodeSessionRecord }
   | { status: 'already-satisfied'; record: OpenCodeSessionRecord }
@@ -331,6 +336,48 @@ export class OpenCodeSessionStore {
     })
   }
 
+  /** Advances or clears one exact published successor hand-off. */
+  async advanceSuccessorTransitionIfExact(
+    logicalMember: OpenCodeLogicalMemberIdentity,
+    expectedOpencodeSessionId: string,
+    expectedRunId: string | null,
+    attemptIdentity: string,
+    expectedPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'],
+    nextPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'] | null,
+  ): Promise<OpenCodeSessionSuccessorTransitionResult> {
+    requiredString(expectedOpencodeSessionId, 'expectedOpencodeSessionId')
+    if (expectedRunId !== null) requiredString(expectedRunId, 'expectedRunId')
+    requiredTransitionIdentity(attemptIdentity)
+    if (nextPhase === null && expectedPhase !== 'transition_complete') {
+      throw new Error('OpenCode successor transition may clear only after completion')
+    }
+    const canonicalLogicalMember = await canonicalizeLogicalMember(logicalMember)
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const existing = recordForLogicalMember(store, canonicalLogicalMember)
+      if (!existing) return { status: 'absent' }
+      if (!hasExpectedOwner(existing, expectedOpencodeSessionId, expectedRunId)) {
+        return { status: 'foreign', record: existing }
+      }
+      const transition = existing.successorTransition
+      if (!transition || transition.attemptIdentity !== attemptIdentity) {
+        return { status: 'foreign', record: existing }
+      }
+      if (transition.phase !== expectedPhase) {
+        return { status: 'already-satisfied', record: existing }
+      }
+      const next: OpenCodeSessionRecord = nextPhase === null
+        ? (() => {
+          const { successorTransition: _transition, ...record } = existing
+          return record
+        })()
+        : { ...existing, successorTransition: { ...transition, phase: nextPhase } }
+      store.records[buildRecordKey(next)] = next
+      await this.writeStore(store)
+      return { status: 'applied', record: next }
+    })
+  }
+
   /**
    * Reserves the normalized logical member under the same durable store lock as
    * publication. This transition must complete before provider/session effects.
@@ -600,7 +647,7 @@ const RECORD_REQUIRED_KEYS = [
 ] as const
 const RECORD_OPTIONAL_KEYS = [
   'appManagedBootstrap', 'bootstrapEvidenceSource', 'bootstrapMode', 'laneId', 'managedConfigFingerprint',
-  'opencodeVersion', 'runtimePid', 'selectedVariant', 'toolApprovalMode',
+  'opencodeVersion', 'runtimePid', 'selectedVariant', 'successorTransition', 'toolApprovalMode',
 ] as const
 const RECORD_ALLOWED_KEYS = new Set<string>([...RECORD_REQUIRED_KEYS, ...RECORD_OPTIONAL_KEYS])
 const LEGACY_RECORD_ALLOWED_KEYS = new Set<string>([
@@ -720,10 +767,37 @@ function validateRecordForWrite(value: OpenCodeSessionRecord): OpenCodeSessionRe
     throw new Error('invalid OpenCode session record lastKnownDurableState')
   }
   if (value.appManagedBootstrap !== undefined) validateAppManagedBootstrap(value.appManagedBootstrap)
+  if (value.successorTransition !== undefined) validateSuccessorTransition(value.successorTransition)
   if (!Number.isFinite(Date.parse(value.createdAt)) || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw new Error('invalid OpenCode session record timestamp')
   }
   return value
+}
+
+function requiredTransitionIdentity(value: unknown): string {
+  const identity = requiredString(value, 'successorTransition.attemptIdentity')
+  if (!/^[a-f0-9]{64}$/u.test(identity)) {
+    throw new Error('invalid OpenCode successor transition identity')
+  }
+  return identity
+}
+
+function validateSuccessorTransition(value: unknown): void {
+  if (!isRecordMap(value)) throw new Error('invalid OpenCode successor transition')
+  const allowed = ['attemptIdentity', 'phase', 'predecessorHostKey',
+    'predecessorOpencodeSessionId', 'predecessorRunId', 'version']
+  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 1
+    || !['successor_lease_pending', 'predecessor_release_pending', 'transition_complete']
+      .includes(String(value.phase))) {
+    throw new Error('invalid OpenCode successor transition')
+  }
+  requiredTransitionIdentity(value.attemptIdentity)
+  requiredString(value.predecessorHostKey, 'successorTransition.predecessorHostKey')
+  requiredString(value.predecessorOpencodeSessionId,
+    'successorTransition.predecessorOpencodeSessionId')
+  if (value.predecessorRunId !== null) {
+    requiredString(value.predecessorRunId, 'successorTransition.predecessorRunId')
+  }
 }
 
 async function validateCanonicalRecordForWrite(

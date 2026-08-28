@@ -863,7 +863,22 @@ export type OpenCodeSessionRecord = {
   bootstrapMode?: OpenCodeBootstrapMode
   bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource
   appManagedBootstrap?: OpenCodeAppManagedBootstrapRecord
+  /**
+   * Durable refresh hand-off. Publication installs this atomically with the
+   * successor; only exact successor/attempt CAS operations may advance or
+   * remove it.
+   */
+  successorTransition?: OpenCodeSessionSuccessorTransition
   staleReason: string | null
   createdAt: string
   updatedAt: string
+}
+
+export type OpenCodeSessionSuccessorTransition = {
+  version: 1
+  attemptIdentity: string
+  phase: 'successor_lease_pending' | 'predecessor_release_pending' | 'transition_complete'
+  predecessorHostKey: string
+  predecessorOpencodeSessionId: string
+  predecessorRunId: string | null
 }

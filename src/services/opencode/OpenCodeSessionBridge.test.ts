@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 import type {
   OpenCodeHostHandle,
@@ -1560,6 +1564,28 @@ describe('OpenCodeSessionBridge', () => {
         current = successor
         return { status: 'replaced' as const, record: successor }
       },
+      advanceSuccessorTransitionIfExact: async (
+        _logical: unknown, sessionId: string, runId: string | null, attemptIdentity: string,
+        expectedPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'],
+        nextPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'] | null,
+      ) => {
+        if (current.opencodeSessionId !== sessionId || current.runId !== runId
+          || current.successorTransition?.attemptIdentity !== attemptIdentity) {
+          return { status: 'foreign' as const, record: current }
+        }
+        if (current.successorTransition.phase !== expectedPhase) {
+          return { status: 'already-satisfied' as const, record: current }
+        }
+        if (nextPhase) {
+          current = { ...current, successorTransition: {
+            ...current.successorTransition, phase: nextPhase,
+          } }
+        } else {
+          const { successorTransition: _transition, ...cleared } = current
+          current = cleared
+        }
+        return { status: 'applied' as const, record: current }
+      },
     }
     const clientFactory = { create: () => ({
       createSession: async () => ({ id: `session-new-${++creates}` }),
@@ -1580,7 +1606,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: current.teamId, laneId: current.laneId, memberName: current.memberName,
       selectedModel: current.selectedModel, projectPath: current.projectPath, runId: 'run-new',
     }
-    await expect(first.ensureSession(input)).rejects.toThrow('lease retention failed')
+    await expect(first.ensureSession(input)).rejects.toThrow('recoverable durable lease transition')
 
     const restarted = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -1595,7 +1621,126 @@ describe('OpenCodeSessionBridge', () => {
     })
     const recovered = await restarted.ensureSession(input)
     expect(recovered).toMatchObject({ opencodeSessionId: 'session-new-1', runId: 'run-new' })
+    expect(recovered.successorTransition).toBeUndefined()
     expect(creates).toBe(1)
+
+    const next = await restarted.ensureSession({ ...input, fresh: true })
+    expect(next.opencodeSessionId).toBe('session-new-2')
+    const reused = await restarted.ensureSession({ ...input, fresh: false })
+    expect(reused.opencodeSessionId).toBe('session-new-2')
+    expect(creates).toBe(2)
+  })
+
+  test('fresh false on restart finishes predecessor release before returning the successor', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-bridge-'))
+    try {
+      const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+      const old = buildRecord({ runId: 'run-old' })
+      await store.upsert(old)
+      let creates = 0
+      let releases = 0
+      const clientFactory = { create: () => ({
+        createSession: async () => ({ id: `session-new-${++creates}` }),
+        deleteSession: async () => true,
+      } as never) }
+      const input = {
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: old.selectedModel, projectPath: old.projectPath,
+        runId: 'run-new', fresh: true,
+      }
+      const first = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async () => host, releaseHost: async () => {},
+          retainHostLease: async () => {},
+          releaseHostLease: async () => {
+            releases += 1
+            throw new Error('predecessor lease unavailable')
+          },
+        },
+        clientFactory,
+      })
+      await expect(first.ensureSession(input)).rejects.toThrow('recoverable durable lease transition')
+      expect((await store.getByLogicalMember(old))?.successorTransition?.phase)
+        .toBe('predecessor_release_pending')
+
+      const restarted = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async () => host, releaseHost: async () => {},
+          retainHostLease: async () => {},
+          releaseHostLease: async () => { releases += 1; return 'absent' },
+        },
+        clientFactory,
+      })
+      const recovered = await restarted.ensureSession({ ...input, fresh: false })
+      expect(recovered.opencodeSessionId).toBe('session-new-1')
+      expect(recovered.successorTransition).toBeUndefined()
+      expect({ creates, releases }).toEqual({ creates: 1, releases: 2 })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('restart after predecessor release observes complete phase and does not release twice', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-clear-'))
+    try {
+      const durableStore = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+      const old = buildRecord({ runId: 'run-old' })
+      await durableStore.upsert(old)
+      let creates = 0
+      let releases = 0
+      let failAfterComplete = true
+      const store = {
+        get: durableStore.get.bind(durableStore),
+        getByLogicalMember: durableStore.getByLogicalMember.bind(durableStore),
+        publishSuccessorIfExact: durableStore.publishSuccessorIfExact.bind(durableStore),
+        advanceSuccessorTransitionIfExact: async (
+          ...args: Parameters<OpenCodeSessionStore['advanceSuccessorTransitionIfExact']>
+        ) => {
+          const result = await durableStore.advanceSuccessorTransitionIfExact(...args)
+          if (args[4] === 'predecessor_release_pending' && failAfterComplete) {
+            failAfterComplete = false
+            throw new Error('simulated crash after complete phase persistence')
+          }
+          return result
+        },
+      }
+      const clientFactory = { create: () => ({
+        createSession: async () => ({ id: `session-new-${++creates}` }),
+        deleteSession: async () => true,
+      } as never) }
+      const hostManager = {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+        releaseHostLease: async () => { releases += 1; return 'absent' as const },
+      }
+      const input = {
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: old.selectedModel, projectPath: old.projectPath,
+        runId: 'run-new', fresh: true,
+      }
+      const first = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile, sessionStore: store, hostManager, clientFactory,
+      })
+      await expect(first.ensureSession(input)).rejects.toThrow('simulated crash')
+      expect((await durableStore.getByLogicalMember(old))?.successorTransition?.phase)
+        .toBe('transition_complete')
+      expect(releases).toBe(1)
+
+      const restarted = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile, sessionStore: durableStore, hostManager, clientFactory,
+      })
+      const recovered = await restarted.ensureSession(input)
+      expect(recovered.opencodeSessionId).toBe('session-new-1')
+      expect(recovered.successorTransition).toBeUndefined()
+      expect({ creates, releases }).toEqual({ creates: 1, releases: 1 })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   test('successor CAS distinguishes the same deterministic session id under a different run', async () => {
