@@ -13,6 +13,7 @@ import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinat
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import {
   buildManagedConfigFingerprint,
+  fingerprintOpenCodeScopedInheritedEnvironment,
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -27,6 +28,7 @@ import type {
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionRecord,
+  OpenCodeSessionSuccessorRecoveryProfile,
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionReconcileSummary,
   OpenCodeSessionStatus,
@@ -44,8 +46,11 @@ type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
-      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
-    >>
+      'refreshResolvedConfigFingerprint' | 'releaseHostLease'
+    >> & { retainHostLease?: (
+      hostKey: string,
+      input: Parameters<typeof openCodeHostManager.retainHostLease>[1],
+    ) => Promise<Awaited<ReturnType<typeof openCodeHostManager.retainHostLease>> | void> }
   sessionStore?: Pick<typeof openCodeSessionStore, 'get'>
     & Partial<Pick<typeof openCodeSessionStore,
       'getByLogicalMember' | 'upsertIfSessionMatches' | 'publishIfAbsentOrExact'
@@ -172,6 +177,33 @@ function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function buildSuccessorRecoveryIdentity(
+  profile: OpenCodePreparedProfile,
+  toolApprovalMode: OpenCodeToolApprovalMode,
+): OpenCodeSessionSuccessorRecoveryProfile {
+  const providerEnvironmentFingerprint = fingerprintOpenCodeScopedInheritedEnvironment(profile.env)
+  const identity = {
+    version: 2 as const,
+    recipe: { toolApprovalMode },
+    projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+    behaviorSourcesFingerprint: hashText(JSON.stringify([...profile.behaviorSources].sort())),
+    providerEnvironmentFingerprint,
+    managedConfigFingerprint: buildManagedConfigFingerprint(profile.managedConfig),
+    managedAuthFingerprint: profile.managedAuthFingerprint,
+    sourceAuthFingerprint: profile.sourceAuthFingerprint,
+    authState: profile.authState,
+  }
+  return { ...identity, identityDigest: hashText(JSON.stringify(identity)) }
+}
+
+function hasExactSuccessorRecoveryIdentity(
+  expected: OpenCodeSessionSuccessorRecoveryProfile,
+  observed: OpenCodeSessionSuccessorRecoveryProfile,
+): boolean {
+  return expected.identityDigest === observed.identityDigest
+    && JSON.stringify(expected) === JSON.stringify(observed)
 }
 
 function extractManagedConfigFingerprintFromHostKey(hostKey: string | null | undefined): string | null {
@@ -422,17 +454,16 @@ export class OpenCodeSessionBridge {
         'OpenCode legacy durable successor transition has no immutable recovery authority; recovery refused',
       )
     }
+    if (authority.version !== 2) {
+      throw new Error(
+        'OpenCode legacy durable successor transition has no exact protected recovery recipe; recovery refused',
+      )
+    }
     const authorityDecisionKey = JSON.stringify([
       record.projectIdentity, record.teamId, record.laneId ?? 'primary', record.memberName,
       record.runId, record.selectedModel, record.selectedVariant ?? null,
-      authority.projectBehaviorFingerprint, authority.managedAuthFingerprint,
-      authority.managedConfigFingerprint,
+      authority.identityDigest,
     ])
-    if (/^[a-f0-9]{64}$/u.test(authority.managedConfigFingerprint)
-      && buildManagedConfigFingerprint(authority.managedConfig)
-        !== authority.managedConfigFingerprint) {
-      throw new Error('OpenCode durable successor recovery config authority is invalid')
-    }
     if (transition.attemptIdentity !== buildDurableSuccessorAttemptIdentity(
       authorityDecisionKey,
       {
@@ -442,37 +473,20 @@ export class OpenCodeSessionBridge {
     )) {
       throw new Error('OpenCode durable successor recovery profile authority is invalid')
     }
-    return {
-      projectPath: record.projectPath,
-      profileRootKey: record.profileRootKey,
-      profileRootPath: authority.profileRootPath,
-      projectBehaviorFingerprint: authority.projectBehaviorFingerprint,
-      behaviorSources: authority.behaviorSources,
-      managedConfig: authority.managedConfig,
-      managedConfigFingerprint: authority.managedConfigFingerprint,
-      homePath: authority.homePath,
-      tmpPath: authority.tmpPath,
-      xdgConfigHome: authority.xdgConfigHome,
-      xdgDataHome: authority.xdgDataHome,
-      xdgCacheHome: authority.xdgCacheHome,
-      managedAuthPath: authority.managedAuthPath,
-      sourceAuthPath: authority.sourceAuthPath,
-      sourceAuthFingerprint: authority.sourceAuthFingerprint,
-      managedAuthFingerprint: authority.managedAuthFingerprint,
-      authState: authority.authState,
-      env: {
-        ...process.env,
-        HOME: authority.homePath,
-        USERPROFILE: authority.homePath,
-        TMPDIR: authority.tmpPath,
-        TMP: authority.tmpPath,
-        TEMP: authority.tmpPath,
-        XDG_CONFIG_HOME: authority.xdgConfigHome,
-        XDG_DATA_HOME: authority.xdgDataHome,
-        XDG_CACHE_HOME: authority.xdgCacheHome,
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(authority.managedConfig),
-      },
+    const rederived = await this.prepareProfile(record.projectPath, {
+      toolApprovalMode: authority.recipe.toolApprovalMode,
+    })
+    const observed = buildSuccessorRecoveryIdentity(
+      rederived, authority.recipe.toolApprovalMode)
+    if (!hasExactSuccessorRecoveryIdentity(authority, observed)) {
+      throw new Error(
+        'OpenCode durable successor recovery protected inputs changed; recovery refused before host effects',
+      )
     }
+    if (rederived.profileRootKey !== record.profileRootKey) {
+      throw new Error('OpenCode durable successor recovery profile root identity changed')
+    }
+    return rederived
   }
 
   private buildSessionProfileStaleReason(
@@ -737,18 +751,49 @@ export class OpenCodeSessionBridge {
     while (record.successorTransition) {
       const transition = record.successorTransition
       if (transition.phase === 'successor_lease_pending') {
-        const retained = await this.retainSessionHost(record, record.runId, profile)
-        if (retained?.pid && retained.pid > 0) runtimePid = retained.pid
+        const retention = await this.retainSessionHost(record, record.runId, profile,
+          record.hostKey === transition.predecessorHostKey
+            ? { runId: transition.predecessorRunId,
+              sessionId: transition.predecessorOpencodeSessionId }
+            : null)
+        if (retention.host?.pid && retention.host.pid > 0) runtimePid = retention.host.pid
+        if (retention.outcome === 'foreign') {
+          await this.releaseContendingSessionHostReference(record, false)
+          throw new Error('OpenCode durable successor lease is owned by a newer session')
+        }
         let advancement: Awaited<ReturnType<typeof this.advanceDurableSuccessorTransition>>
         try {
           advancement = await this.advanceDurableSuccessorTransition(
             record, 'successor_lease_pending', 'predecessor_release_pending')
         } catch (error) {
-          if (retained) await this.releaseContendingSessionHostReference(record)
+          let inspected = false
+          let observed: OpenCodeSessionRecord | null = null
+          try {
+            if (this.sessionStore.getByLogicalMember) {
+              observed = await this.sessionStore.getByLogicalMember({
+                teamId: record.teamId, laneId: record.laneId ?? 'primary',
+                projectIdentity: record.projectIdentity, memberName: record.memberName,
+              })
+              inspected = true
+            }
+          } catch {
+            // An uncertain store write must retain the lease conservatively;
+            // restart recovery will resolve whether the CAS committed.
+          }
+          const observedTransition = observed?.successorTransition
+          const installedLeaseIsStale = inspected && (!observed
+            || observed.opencodeSessionId !== record.opencodeSessionId
+            || observed.runId !== record.runId
+            || observedTransition?.attemptIdentity !== transition.attemptIdentity)
+          await this.releaseContendingSessionHostReference(record,
+            retention.outcome === 'applied' && installedLeaseIsStale)
           throw error
         }
-        if (!advancement.applied && retained) {
-          await this.releaseContendingSessionHostReference(record)
+        if (!advancement.applied) {
+          // Another contender bound this exact run/session lease to the same
+          // attempt. Only this process's local reference is surplus; the
+          // durable lease is no longer stale even if this process installed it.
+          await this.releaseContendingSessionHostReference(record, false)
           runtimePid = undefined
         }
         record = advancement.record
@@ -792,7 +837,16 @@ export class OpenCodeSessionBridge {
     return { record, ...(runtimePid ? { runtimePid } : {}) }
   }
 
-  private async releaseContendingSessionHostReference(record: OpenCodeSessionRecord): Promise<void> {
+  private async releaseContendingSessionHostReference(
+    record: OpenCodeSessionRecord,
+    releaseInstalledLease: boolean,
+  ): Promise<void> {
+    if (releaseInstalledLease) {
+      await this.hostManager.releaseHostLease?.(record.hostKey, {
+        teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+        runId: record.runId, sessionId: record.opencodeSessionId,
+      })
+    }
     await this.hostManager.releaseHost(record.hostKey)
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
@@ -867,17 +921,19 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     runId?: string | null,
     profile?: OpenCodePreparedProfile,
-  ) {
+    expected?: { runId: string | null; sessionId: string | null } | null,
+  ): Promise<{ host: OpenCodeHostHandle | null; outcome: 'applied' | 'exact' | 'foreign' }> {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
-      await this.hostManager.retainHostLease?.(record.hostKey, {
+      const outcome = await this.hostManager.retainHostLease?.(record.hostKey, {
         teamId: record.teamId,
         laneId: record.laneId,
         memberName: record.memberName,
         runId: runId ?? null,
         sessionId: record.opencodeSessionId,
+        expected,
       })
-      return null
+      return { host: null, outcome: outcome ?? 'applied' }
     }
 
     const sessionProfile = profile
@@ -891,20 +947,23 @@ export class OpenCodeSessionBridge {
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
     })
+    let retentionOutcome: 'applied' | 'exact' | 'foreign' = 'applied'
     try {
-      await this.hostManager.retainHostLease?.(record.hostKey, {
+      const outcome = await this.hostManager.retainHostLease?.(record.hostKey, {
         teamId: record.teamId,
         laneId: record.laneId,
         memberName: record.memberName,
         runId: runId ?? null,
         sessionId: record.opencodeSessionId,
+        expected,
       })
+      retentionOutcome = outcome ?? 'applied'
     } catch (error) {
       await this.hostManager.releaseHost(record.hostKey)
       throw error
     }
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
-    return host
+    return { host, outcome: retentionOutcome }
   }
 
   async releaseSession(record: Pick<OpenCodeSessionRecord,
@@ -1214,11 +1273,12 @@ export class OpenCodeSessionBridge {
             toolApprovalMode: 'auto',
           }
     const profile = requestedProfile.profile
+    const recoveryIdentity = buildSuccessorRecoveryIdentity(
+      profile, requestedProfile.toolApprovalMode)
     const refreshDecisionKey = JSON.stringify([
       projectIdentity, params.teamId, laneId, params.memberName,
       params.runId ?? null, params.selectedModel, selectedVariant ?? null,
-      profile.projectBehaviorFingerprint, profile.managedAuthFingerprint,
-      profile.managedConfigFingerprint,
+      recoveryIdentity.identityDigest,
     ])
     await this.retryPendingSuccessorCleanup(
       refreshDecisionKey,
@@ -1257,7 +1317,8 @@ export class OpenCodeSessionBridge {
       await this.completePendingLeaseTransition(refreshDecisionKey)
       this.publishedSuccessors.delete(refreshDecisionKey)
       this.pendingLeaseTransitions.delete(refreshDecisionKey)
-      return retained?.pid && retained.pid > 0 ? { ...existing, runtimePid: retained.pid } : existing
+      return retained.host?.pid && retained.host.pid > 0
+        ? { ...existing, runtimePid: retained.host.pid } : existing
     }
     const existingManagedConfigFingerprint = existing
       ? getRecordManagedConfigFingerprint(existing)
@@ -1279,7 +1340,8 @@ export class OpenCodeSessionBridge {
       if (cleanRecord !== existing) {
         await this.persistExactUpdate(existing, cleanRecord)
       }
-      return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
+      return host.host?.pid && host.host.pid > 0
+        ? { ...cleanRecord, runtimePid: host.host.pid } : cleanRecord
     }
 
     if (existing) {
@@ -1337,24 +1399,7 @@ export class OpenCodeSessionBridge {
             predecessorHostKey: existing.hostKey,
             predecessorOpencodeSessionId: existing.opencodeSessionId,
             predecessorRunId: existing.runId,
-            recoveryProfile: {
-              version: 1,
-              profileRootPath: profile.profileRootPath,
-              projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
-              behaviorSources: profile.behaviorSources,
-              managedConfigFingerprint: profile.managedConfigFingerprint,
-              managedAuthFingerprint: profile.managedAuthFingerprint,
-              managedConfig: profile.managedConfig,
-              homePath: profile.homePath,
-              tmpPath: profile.tmpPath,
-              xdgConfigHome: profile.xdgConfigHome,
-              xdgDataHome: profile.xdgDataHome,
-              xdgCacheHome: profile.xdgCacheHome,
-              managedAuthPath: profile.managedAuthPath,
-              sourceAuthPath: profile.sourceAuthPath,
-              sourceAuthFingerprint: profile.sourceAuthFingerprint,
-              authState: profile.authState,
-            },
+            recoveryProfile: recoveryIdentity,
           },
         }
       }

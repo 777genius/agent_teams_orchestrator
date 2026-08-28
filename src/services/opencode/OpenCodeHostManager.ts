@@ -267,9 +267,12 @@ export type OpenCodeHostLeaseInput = {
   memberName: string
   runId?: string | null
   sessionId?: string | null
+  /** Exact current durable identity required before installing this lease. */
+  expected?: Readonly<{ runId: string | null; sessionId: string | null }> | null
 }
 
 export type OpenCodeHostLeaseReleaseOutcome = 'applied' | 'absent' | 'foreign'
+export type OpenCodeHostLeaseRetentionOutcome = 'applied' | 'exact' | 'foreign'
 
 type PersistentHostLeaseRecord = {
   leaseKey: string
@@ -2626,32 +2629,35 @@ export class OpenCodeHostManager {
     })
   }
 
-  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+  async retainHostLease(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput,
+  ): Promise<OpenCodeHostLeaseRetentionOutcome> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
-      return
+      return 'applied'
     }
 
-    await this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
-      if (registry.schemaVersion === 1) return
+      if (registry.schemaVersion === 1) return 'foreign'
       let record = registry.hosts[hostKey]
       if (!record) {
         const entry = this.hosts.get(hostKey)
         if (!entry) {
-          return
+          return 'foreign'
         }
         if (entry.lifetime !== 'persistent') {
-          return
+          return 'foreign'
         }
         if (entry.ownedByProcess) {
           const receipt = this.assertCreatedHostDisposalReceipt(hostKey, entry)
-          if (!receipt.registryReceipt) return
+          if (!receipt.registryReceipt) return 'foreign'
           record = canonicalPersistentHostRegistryRecord(receipt.registryReceipt)
         } else if (entry.adoptedRegistryReceipt) {
           record = canonicalPersistentHostRegistryRecord(entry.adoptedRegistryReceipt)
         } else {
-          return
+          return 'foreign'
         }
         registry.hosts[hostKey] = record
       }
@@ -2671,16 +2677,26 @@ export class OpenCodeHostManager {
       const sessionId = requestedSessionId
         ? opaque ? opaqueLeaseValue(requestedSessionId) : requestedSessionId
         : previous?.sessionId ?? null
+      const expected = input.expected
+      const expectedRunId = expected === undefined
+        ? null
+        : expected === null
+          ? null
+          : expectedLeaseIdentityValue(expected.runId, opaque) ?? null
+      const expectedSessionId = expected === undefined
+        ? null
+        : expected === null
+          ? null
+          : expectedLeaseIdentityValue(expected.sessionId, opaque) ?? null
+      const exact = previous?.runId === runId && previous.sessionId === sessionId
       const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
-      if (
-        previous &&
-        previous.runId === runId &&
-        previous.sessionId === sessionId &&
-        Number.isFinite(previousUpdatedAtMs) &&
-        nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
-      ) {
-        return
-      }
+      if (exact && Number.isFinite(previousUpdatedAtMs)
+        && nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS) return 'exact'
+      const predecessorMatches = previous
+        ? exact || expected !== undefined && expected !== null
+          && previous.runId === expectedRunId && previous.sessionId === expectedSessionId
+        : expected === undefined || expected === null
+      if (!predecessorMatches) return 'foreign'
       leases[leaseKey] = {
         leaseKey,
         teamId: opaque ? opaqueLeaseValue(input.teamId.trim()) : input.teamId.trim(),
@@ -2710,6 +2726,7 @@ export class OpenCodeHostManager {
           registryReceipt: nextRecord,
         })
       }
+      return exact ? 'exact' : 'applied'
     })
   }
 

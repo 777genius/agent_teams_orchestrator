@@ -891,22 +891,20 @@ export type OpenCodeSessionSuccessorTransition = {
 }
 
 export type OpenCodeSessionSuccessorRecoveryProfile = {
-  version: 1
-  profileRootPath: string
+  version: 2
+  /** Bounded, credential-free instructions for rederiving protected inputs. */
+  recipe: {
+    toolApprovalMode: OpenCodeToolApprovalMode
+  }
   projectBehaviorFingerprint: string
-  behaviorSources: string[]
+  behaviorSourcesFingerprint: string
+  providerEnvironmentFingerprint: string
   managedConfigFingerprint: string
   managedAuthFingerprint: string | null
-  managedConfig: Record<string, unknown>
-  homePath: string
-  tmpPath: string
-  xdgConfigHome: string
-  xdgDataHome: string
-  xdgCacheHome: string
-  managedAuthPath: string
-  sourceAuthPath: string | null
   sourceAuthFingerprint: string | null
   authState: OpenCodeAuthState
+  /** Digest of every preceding immutable identity, bound into attemptIdentity. */
+  identityDigest: string
 }
 
 /** Bounded receipt for the most recently completed exact hand-off. */

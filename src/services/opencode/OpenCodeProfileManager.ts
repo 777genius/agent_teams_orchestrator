@@ -5166,6 +5166,7 @@ export class OpenCodeProfileManager {
       ...managedRuntimePreferences.modelLimitOverrides,
     }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
+    const providerEnvironmentFingerprint = fingerprintOpenCodeScopedInheritedEnvironment(process.env)
     const importedConfigDefaultModelId =
       typeof importedRuntimeConfig.model === 'string'
         ? importedRuntimeConfig.model.trim() || null
@@ -5347,6 +5348,7 @@ export class OpenCodeProfileManager {
       behaviorSources,
       managedConfig,
       managedConfigFingerprint,
+      providerEnvironmentFingerprint,
       homePath,
       tmpPath,
       xdgConfigHome,

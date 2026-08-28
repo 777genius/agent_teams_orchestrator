@@ -75,7 +75,6 @@ const LOCK_OPTIONS = {
   },
 }
 const RESERVATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/
-const MAX_SUCCESSOR_RECOVERY_CONFIG_BYTES = 1024 * 1024
 
 function buildRecordKey(
   record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'projectIdentity'>,
@@ -836,32 +835,21 @@ function validateSuccessorTransition(
 
 function validateSuccessorRecoveryProfile(value: unknown): void {
   if (!isRecordMap(value)) throw new Error('invalid OpenCode successor recovery profile')
-  const allowed = ['authState', 'behaviorSources', 'homePath', 'managedAuthFingerprint',
-    'managedAuthPath', 'managedConfig', 'managedConfigFingerprint', 'profileRootPath',
-    'projectBehaviorFingerprint', 'sourceAuthFingerprint', 'sourceAuthPath', 'tmpPath',
-    'version', 'xdgCacheHome', 'xdgConfigHome', 'xdgDataHome']
-  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 1
-    || !isRecordMap(value.managedConfig)
-    || Buffer.byteLength(JSON.stringify(value.managedConfig), 'utf8')
-      > MAX_SUCCESSOR_RECOVERY_CONFIG_BYTES) {
+  const allowed = ['authState', 'behaviorSourcesFingerprint', 'identityDigest',
+    'managedAuthFingerprint', 'managedConfigFingerprint', 'projectBehaviorFingerprint',
+    'providerEnvironmentFingerprint', 'recipe', 'sourceAuthFingerprint', 'version']
+  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 2
+    || !isRecordMap(value.recipe)
+    || Object.keys(value.recipe).join(',') !== 'toolApprovalMode'
+    || (value.recipe.toolApprovalMode !== 'auto' && value.recipe.toolApprovalMode !== 'manual')) {
     throw new Error('invalid OpenCode successor recovery profile')
   }
-  requiredString(value.projectBehaviorFingerprint,
-    'successorTransition.recoveryProfile.projectBehaviorFingerprint')
-  for (const field of ['profileRootPath', 'homePath', 'tmpPath', 'xdgConfigHome',
-    'xdgDataHome', 'xdgCacheHome', 'managedAuthPath'] as const) {
+  for (const field of ['projectBehaviorFingerprint', 'behaviorSourcesFingerprint',
+    'providerEnvironmentFingerprint', 'managedConfigFingerprint', 'identityDigest'] as const) {
     requiredString(value[field], `successorTransition.recoveryProfile.${field}`)
   }
-  if (!Array.isArray(value.behaviorSources)
-    || value.behaviorSources.some(source => typeof source !== 'string')) {
-    throw new Error('invalid OpenCode successor recovery behavior sources')
-  }
-  requiredString(value.managedConfigFingerprint,
-    'successorTransition.recoveryProfile.managedConfigFingerprint')
   validateNullableString(value.managedAuthFingerprint,
     'successorTransition.recoveryProfile.managedAuthFingerprint')
-  validateNullableString(value.sourceAuthPath,
-    'successorTransition.recoveryProfile.sourceAuthPath')
   validateNullableString(value.sourceAuthFingerprint,
     'successorTransition.recoveryProfile.sourceAuthFingerprint')
   if (value.authState !== 'ok' && value.authState !== 'missing' && value.authState !== 'stale') {

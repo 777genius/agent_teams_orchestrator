@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -9,6 +9,10 @@ import {
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import {
+  buildManagedConfigFingerprint,
+  fingerprintOpenCodeScopedInheritedEnvironment,
+} from './OpenCodeProfileManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 import type {
@@ -31,6 +35,7 @@ const profile: OpenCodePreparedProfile = {
     snapshot: true,
   },
   managedConfigFingerprint: 'managed-config-v1',
+  providerEnvironmentFingerprint: 'provider-environment-v1',
   homePath: '/tmp/profile-root/home',
   tmpPath: '/tmp/profile-root/tmp',
   xdgConfigHome: '/tmp/profile-root/config',
@@ -42,6 +47,26 @@ const profile: OpenCodePreparedProfile = {
   managedAuthFingerprint: 'managed-auth',
   authState: 'ok',
   env: {},
+}
+
+function recoveryIdentityFor(
+  value: OpenCodePreparedProfile,
+  toolApprovalMode: 'auto' | 'manual' = 'auto',
+) {
+  const identity = {
+    version: 2 as const,
+    recipe: { toolApprovalMode },
+    projectBehaviorFingerprint: value.projectBehaviorFingerprint,
+    behaviorSourcesFingerprint: createHash('sha256')
+      .update(JSON.stringify([...value.behaviorSources].sort())).digest('hex'),
+    providerEnvironmentFingerprint: fingerprintOpenCodeScopedInheritedEnvironment(value.env),
+    managedConfigFingerprint: buildManagedConfigFingerprint(value.managedConfig),
+    managedAuthFingerprint: value.managedAuthFingerprint,
+    sourceAuthFingerprint: value.sourceAuthFingerprint,
+    authState: value.authState,
+  }
+  return { ...identity, identityDigest: createHash('sha256')
+    .update(JSON.stringify(identity)).digest('hex') }
 }
 
 const host: OpenCodeHostHandle = {
@@ -1641,6 +1666,11 @@ describe('OpenCodeSessionBridge', () => {
         ...profile,
         projectBehaviorFingerprint: 'behavior-a',
         managedAuthFingerprint: 'managed-auth-a',
+        managedConfig: {
+          provider: { openai: { apiKey: 'provider-api-key-sentinel',
+            headers: { Authorization: 'Bearer authorization-sentinel' } } },
+          mcp: { app: { environment: { TOKEN: 'mcp-env-secret-sentinel' } } },
+        },
         managedConfigFingerprint: 'managed-config-a',
       }
       const profileB: OpenCodePreparedProfile = {
@@ -1688,10 +1718,9 @@ describe('OpenCodeSessionBridge', () => {
 
       const events: string[] = []
       const restarted = new OpenCodeSessionBridge({
-        prepareProfile: async (_projectPath, options) => {
-          events.push(`prepare-stored:${options?.toolApprovalMode ?? 'missing'}`)
-          return profileB
-        },
+        // Protected sources still rederive exact A; the caller separately asks
+        // for already-prepared B after recovery completes.
+        prepareProfile: async () => profileA,
         sessionStore: store,
         hostManager: {
           ensureHost: async input => {
@@ -1752,6 +1781,11 @@ describe('OpenCodeSessionBridge', () => {
         ...profile,
         projectBehaviorFingerprint: 'behavior-a',
         managedAuthFingerprint: 'managed-auth-a',
+        managedConfig: {
+          provider: { openai: { apiKey: 'provider-api-key-sentinel',
+            headers: { Authorization: 'Bearer authorization-sentinel' } } },
+          mcp: { app: { environment: { TOKEN: 'mcp-env-secret-sentinel' } } },
+        },
         managedConfigFingerprint: 'managed-config-a',
       }
       const hostA: OpenCodeHostHandle = {
@@ -1781,6 +1815,10 @@ describe('OpenCodeSessionBridge', () => {
       await expect(first.ensureSession(input)).rejects.toThrow(
         'recoverable durable lease transition',
       )
+      const persistedBytes = await readFile(path.join(directory, 'sessions.json'), 'utf8')
+      expect(persistedBytes).not.toContain('provider-api-key-sentinel')
+      expect(persistedBytes).not.toContain('authorization-sentinel')
+      expect(persistedBytes).not.toContain('mcp-env-secret-sentinel')
 
       const ensuredProfiles: OpenCodePreparedProfile[] = []
       const restarted = new OpenCodeSessionBridge({
@@ -1814,7 +1852,7 @@ describe('OpenCodeSessionBridge', () => {
     }
   })
 
-  test('auth-only drift recovers the exact authenticated profile A before requesting B', async () => {
+  test('auth-only drift fails closed before host effects instead of labeling B as A', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-auth-recovery-'))
     try {
       const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
@@ -1861,17 +1899,11 @@ describe('OpenCodeSessionBridge', () => {
         },
         clientFactory,
       })
-      const returned = await restarted.ensureSession({
+      await expect(restarted.ensureSession({
         ...attemptA, preparedProfile: profileB, selectedModel: 'openai/model-b', runId: 'run-b',
-      })
-
-      expect(returned).toMatchObject({ opencodeSessionId: 'session-b', runId: 'run-b',
-        managedAuthFingerprint: 'managed-auth-b' })
-      expect(ensured).toEqual([
-        { hostKey: 'host-a', auth: 'managed-auth-a' },
-        { hostKey: undefined, auth: 'managed-auth-b' },
-      ])
-      expect(creates).toBe(2)
+      })).rejects.toThrow('protected inputs changed; recovery refused before host effects')
+      expect(ensured).toEqual([])
+      expect(creates).toBe(1)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -1940,11 +1972,11 @@ describe('OpenCodeSessionBridge', () => {
       const storePath = path.join(directory, 'sessions.json')
       const store = new OpenCodeSessionStore(storePath)
       const old = buildRecord({ hostKey: 'host-old', runId: 'run-old' })
+      const successorRecoveryIdentity = recoveryIdentityFor(profile)
       const successorDecisionKey = JSON.stringify([
         old.projectIdentity, old.teamId, old.laneId, old.memberName,
         'run-new', old.selectedModel, null,
-        profile.projectBehaviorFingerprint, profile.managedAuthFingerprint,
-        profile.managedConfigFingerprint,
+        successorRecoveryIdentity.identityDigest,
       ])
       const attemptIdentity = createHash('sha256').update(JSON.stringify({
         schema: 'opencode-session-successor-attempt-v1',
@@ -1959,24 +1991,7 @@ describe('OpenCodeSessionBridge', () => {
           predecessorHostKey: old.hostKey,
           predecessorOpencodeSessionId: old.opencodeSessionId,
           predecessorRunId: old.runId,
-          recoveryProfile: {
-            version: 1,
-            profileRootPath: profile.profileRootPath,
-            projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
-            behaviorSources: profile.behaviorSources,
-            managedConfigFingerprint: profile.managedConfigFingerprint,
-            managedAuthFingerprint: profile.managedAuthFingerprint,
-            managedConfig: profile.managedConfig,
-            homePath: profile.homePath,
-            tmpPath: profile.tmpPath,
-            xdgConfigHome: profile.xdgConfigHome,
-            xdgDataHome: profile.xdgDataHome,
-            xdgCacheHome: profile.xdgCacheHome,
-            managedAuthPath: profile.managedAuthPath,
-            sourceAuthPath: profile.sourceAuthPath,
-            sourceAuthFingerprint: profile.sourceAuthFingerprint,
-            authState: profile.authState,
-          },
+          recoveryProfile: successorRecoveryIdentity,
         },
       })
       await store.upsert(successor)
@@ -2036,11 +2051,14 @@ describe('OpenCodeSessionBridge', () => {
             if (count > 0) references.set(hostKey, count - 1)
           },
           retainHostLease: async (hostKey, lease) => {
+            const outcome = durableLeases.get(hostKey) === lease.sessionId
+              ? 'exact' as const : 'applied' as const
             durableLeases.set(hostKey, lease.sessionId)
             successorRetains += 1
             if (successorRetains === 1) firstRetainEntered()
             if (successorRetains === 2) bothRetainsEntered()
             await retainBarrier
+            return outcome
           },
           releaseHostLease: async (hostKey, lease) => {
             predecessorReleaseAttempts += 1
@@ -2108,6 +2126,131 @@ describe('OpenCodeSessionBridge', () => {
       expect(retried.opencodeSessionId).toBe(successor.opencodeSessionId)
       expect(retryReferences.get(successor.hostKey)).toBe(1)
       expect(providerCreates).toBe(0)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('delayed recovery cannot replace B with A after an independent bridge publishes B', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-delayed-recovery-b-'))
+    try {
+      const storePath = path.join(directory, 'sessions.json')
+      const store = new OpenCodeSessionStore(storePath)
+      const old = buildRecord({ hostKey: 'shared-host', runId: 'run-old' })
+      const profileA = { ...profile, managedConfig: { generation: 'a' },
+        managedConfigFingerprint: 'config-a' }
+      const profileB = { ...profile, managedConfig: { generation: 'b' },
+        managedConfigFingerprint: 'config-b' }
+      const recoveryA = recoveryIdentityFor(profileA)
+      const decisionA = JSON.stringify([
+        old.projectIdentity, old.teamId, old.laneId, old.memberName,
+        'run-a', old.selectedModel, null, recoveryA.identityDigest,
+      ])
+      const attemptA = createHash('sha256').update(JSON.stringify({
+        schema: 'opencode-session-successor-attempt-v1',
+        refreshDecisionKey: decisionA,
+        predecessorOpencodeSessionId: old.opencodeSessionId,
+        predecessorRunId: old.runId,
+      })).digest('hex')
+      const successorA = buildRecord({
+        hostKey: 'shared-host', opencodeSessionId: 'session-a', runId: 'run-a',
+        managedConfigFingerprint: profileA.managedConfigFingerprint,
+        successorTransition: {
+          version: 1, attemptIdentity: attemptA, phase: 'successor_lease_pending',
+          predecessorHostKey: old.hostKey,
+          predecessorOpencodeSessionId: old.opencodeSessionId,
+          predecessorRunId: old.runId,
+          recoveryProfile: recoveryA,
+        },
+      })
+      await store.upsert(successorA)
+
+      let releaseDelayedRead!: () => void
+      const delayedRead = new Promise<void>(resolve => { releaseDelayedRead = resolve })
+      let delayedReadEntered!: () => void
+      const readEntered = new Promise<void>(resolve => { delayedReadEntered = resolve })
+      const delayedStore = new OpenCodeSessionStore(storePath)
+      let firstRead = true
+      const delayedStorePort = {
+        get: delayedStore.get.bind(delayedStore),
+        getByLogicalMember: async (
+          logical: Parameters<OpenCodeSessionStore['getByLogicalMember']>[0],
+        ) => {
+          const value = await delayedStore.getByLogicalMember(logical)
+          if (firstRead) {
+            firstRead = false
+            delayedReadEntered()
+            await delayedRead
+          }
+          return value
+        },
+        advanceSuccessorTransitionIfExact:
+          delayedStore.advanceSuccessorTransitionIfExact.bind(delayedStore),
+      }
+      const durableLease = { runId: old.runId, sessionId: old.opencodeSessionId }
+      let currentLease = { ...durableLease }
+      const localReferences = [0, 0]
+      const hostManager = (index: number) => ({
+        ensureHost: async (input: { preparedProfile: OpenCodePreparedProfile }) => {
+          localReferences[index] += 1
+          return { ...host, hostKey: 'shared-host', profile: input.preparedProfile }
+        },
+        releaseHost: async () => { localReferences[index] -= 1 },
+        retainHostLease: async (_hostKey: string, input: {
+          runId?: string | null; sessionId?: string | null
+          expected?: { runId: string | null; sessionId: string | null } | null
+        }) => {
+          const desired = { runId: input.runId ?? null, sessionId: input.sessionId ?? null }
+          if (JSON.stringify(currentLease) === JSON.stringify(desired)) return 'exact' as const
+          const expected = input.expected ?? null
+          if (JSON.stringify(currentLease) !== JSON.stringify(expected)) return 'foreign' as const
+          currentLease = desired
+          return 'applied' as const
+        },
+        releaseHostLease: async (_hostKey: string, input: {
+          runId?: string | null; sessionId?: string | null
+        }) => {
+          const expected = { runId: input.runId ?? null, sessionId: input.sessionId ?? null }
+          if (JSON.stringify(currentLease) !== JSON.stringify(expected)) return 'foreign' as const
+          currentLease = { runId: null, sessionId: null }
+          return 'applied' as const
+        },
+      })
+      const delayedBridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => profileA,
+        sessionStore: delayedStorePort,
+        hostManager: hostManager(0),
+        clientFactory: { create: () => ({
+          createSession: async () => { throw new Error('delayed recovery must not create') },
+        } as never) },
+      })
+      let creates = 0
+      const publisher = new OpenCodeSessionBridge({
+        prepareProfile: async () => profileA,
+        sessionStore: new OpenCodeSessionStore(storePath),
+        hostManager: hostManager(1),
+        clientFactory: { create: () => ({
+          createSession: async () => ({ id: `session-b-${++creates}` }),
+          deleteSession: async () => true,
+        } as never) },
+      })
+      const delayed = delayedBridge.ensureSession({
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: old.selectedModel, projectPath: old.projectPath,
+        preparedProfile: profileA, runId: 'run-a', fresh: false,
+      })
+      await readEntered
+      const publishedB = await publisher.ensureSession({
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: old.selectedModel, projectPath: old.projectPath,
+        preparedProfile: profileB, runId: 'run-b', fresh: true,
+      })
+      expect(publishedB.runId).toBe('run-b')
+      releaseDelayedRead()
+      await expect(delayed).rejects.toThrow('owned by a newer session')
+      expect(currentLease).toEqual({ runId: 'run-b', sessionId: 'session-b-1' })
+      expect(localReferences).toEqual([0, 1])
+      expect((await store.getByLogicalMember(old))?.runId).toBe('run-b')
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

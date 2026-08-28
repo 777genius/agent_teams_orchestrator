@@ -861,13 +861,31 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
 
         // The old cleanup is paused while a new generation commits the same
         // logical member lease. Its replay happens in a fresh manager process.
+        await expect(manager.retainHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'deterministic-session',
+        })).resolves.toBe('foreign')
         await manager.retainHostLease(handle.hostKey, {
           ...identity, runId: 'run-new', sessionId: 'deterministic-session',
+          expected: { runId: 'run-old', sessionId: 'deterministic-session' },
         })
         const restarted = new OpenCodeHostManager({
           persistentRegistryPath: registryPath,
           ...(scoped ? { scopedTransportOwnerKey: ownerKey } : {}),
         })
+        // A second process publishes B. A delayed first process that had read
+        // the old predecessor must not restore A over B.
+        await expect(restarted.retainHostLease(handle.hostKey, {
+          ...identity, runId: 'run-b', sessionId: 'session-b',
+          expected: { runId: 'run-new', sessionId: 'deterministic-session' },
+        })).resolves.toBe('applied')
+        const delayed = new OpenCodeHostManager({
+          persistentRegistryPath: registryPath,
+          ...(scoped ? { scopedTransportOwnerKey: ownerKey } : {}),
+        })
+        await expect(delayed.retainHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'deterministic-session',
+          expected: { runId: 'run-old', sessionId: 'deterministic-session' },
+        })).resolves.toBe('foreign')
         await expect(restarted.releaseHostLease(handle.hostKey, {
           ...identity, runId: 'run-old', sessionId: 'deterministic-session',
         })).resolves.toBe('foreign')
@@ -878,12 +896,15 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
           ...identity, runId: 'run-new', sessionId: 'foreign-session',
         })).resolves.toBe('foreign')
 
-        await expect(manager.disposeHost(handle.hostKey)).rejects.toThrow('durable lease')
+        await expect(manager.disposeHost(handle.hostKey)).rejects.toThrow('compare-and-swap failed')
         expect(endpointMutations).toBe(0)
         expect(alive).toBe(true)
 
         await expect(manager.releaseHostLease(handle.hostKey, {
           ...identity, runId: 'run-new', sessionId: 'deterministic-session',
+        })).resolves.toBe('foreign')
+        await expect(manager.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-b', sessionId: 'session-b',
         })).resolves.toBe('applied')
         await expect(manager.releaseHostLease(handle.hostKey, {
           ...identity, runId: 'run-new', sessionId: 'deterministic-session',

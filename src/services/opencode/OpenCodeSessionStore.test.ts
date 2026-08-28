@@ -34,22 +34,16 @@ const baseRecord = {
 }
 
 const successorRecoveryProfile = {
-  version: 1 as const,
-  profileRootPath: '/tmp/profile-root',
+  version: 2 as const,
+  recipe: { toolApprovalMode: 'auto' as const },
   projectBehaviorFingerprint: 'behavior-v1',
-  behaviorSources: [] as string[],
+  behaviorSourcesFingerprint: 'behavior-sources-v1',
+  providerEnvironmentFingerprint: 'provider-environment-v1',
   managedConfigFingerprint: 'managed-config-v1',
   managedAuthFingerprint: null,
-  managedConfig: {},
-  homePath: '/tmp/profile-root/home',
-  tmpPath: '/tmp/profile-root/tmp',
-  xdgConfigHome: '/tmp/profile-root/config',
-  xdgDataHome: '/tmp/profile-root/data',
-  xdgCacheHome: '/tmp/profile-root/cache',
-  managedAuthPath: '/tmp/profile-root/data/opencode/auth.json',
-  sourceAuthPath: null,
   sourceAuthFingerprint: null,
   authState: 'ok' as const,
+  identityDigest: 'recovery-identity-v1',
 }
 
 function asLegacyRecord(record: typeof baseRecord = baseRecord) {
@@ -239,7 +233,7 @@ describe('OpenCodeSessionStore', () => {
     expect((await store.getByLogicalMember(logical))?.successorTransition).toEqual(transition)
   })
 
-  test('bounds immutable successor recovery config persistence', async () => {
+  test('rejects persisted recovery payload fields that could carry credentials', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'bounded-successor-store.json'))
     const successor = {
       ...baseRecord,
@@ -251,29 +245,14 @@ describe('OpenCodeSessionStore', () => {
         predecessorOpencodeSessionId: 'session-old',
         predecessorRunId: 'run-old',
         recoveryProfile: {
-          version: 1 as const,
-          profileRootPath: '/tmp/profile-root',
-          projectBehaviorFingerprint: 'behavior-v1',
-          behaviorSources: [],
-          managedConfigFingerprint: 'managed-config-v1',
-          managedAuthFingerprint: 'managed-auth-v1',
-          managedConfig: { oversized: 'x'.repeat(1024 * 1024) },
-          homePath: '/tmp/profile-root/home',
-          tmpPath: '/tmp/profile-root/tmp',
-          xdgConfigHome: '/tmp/profile-root/config',
-          xdgDataHome: '/tmp/profile-root/data',
-          xdgCacheHome: '/tmp/profile-root/cache',
-          managedAuthPath: '/tmp/profile-root/data/opencode/auth.json',
-          sourceAuthPath: null,
-          sourceAuthFingerprint: null,
-          authState: 'ok' as const,
+          ...successorRecoveryProfile,
+          managedConfig: { Authorization: 'Bearer sentinel-secret' },
         },
       },
     }
 
-    await expect(store.upsert(successor)).rejects.toThrow(
-      'invalid OpenCode successor recovery profile',
-    )
+    await expect(store.upsert(successor as never)).rejects.toThrow(
+      'invalid OpenCode successor recovery profile')
   })
 
   test('successor publication returns absent and rejects the same deterministic session from another run', async () => {
