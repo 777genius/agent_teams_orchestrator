@@ -26,6 +26,7 @@ import {
   classifyOpenCodeLaunchFailure,
   type OpenCodeLaunchFailureKind,
 } from './OpenCodeLaunchAttemptPolicy.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 
 export const OPEN_CODE_LAUNCH_JOURNAL_VERSION = 1 as const
 export const OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES = 1_048_576
@@ -63,6 +64,8 @@ export type OpenCodeMemberCleanupObligation = Readonly<{
   memberName: string
   teamId: string
   laneId: string
+  /** Canonical project authority; absent V1 obligations use fail-closed legacy replay. */
+  projectIdentity?: string
   /** Exact launch run lease identity; absent legacy obligations fail closed at lease release. */
   runId?: string
   sessionId: string
@@ -2468,7 +2471,7 @@ const MEMBER_CLEANUP_PHASES = new Set<OpenCodeMemberCleanupPhase>([
 
 function memberCleanupKey(obligation: OpenCodeMemberCleanupObligation): string {
   return JSON.stringify([obligation.attemptId, obligation.generation, obligation.hostKey,
-    obligation.memberIdentity, obligation.runId, obligation.sessionId])
+    obligation.memberIdentity, obligation.runId, obligation.sessionId, obligation.projectIdentity])
 }
 
 function sameMemberCleanupKey(
@@ -2489,6 +2492,7 @@ function sameMemberCleanupIdentity(
     && left.hostProcessBirthToken === right.hostProcessBirthToken
     && left.memberIdentity === right.memberIdentity && left.memberName === right.memberName
     && left.teamId === right.teamId && left.laneId === right.laneId
+    && left.projectIdentity === right.projectIdentity
     && left.runId === right.runId && left.sessionId === right.sessionId
     && left.sessionIdentity === right.sessionIdentity
     && left.ownershipTitle === right.ownershipTitle
@@ -2502,7 +2506,7 @@ function validateMemberCleanupObligation(
   const requiredKeys = ['attemptId', 'payloadHash', 'generation', 'hostKey', 'memberIdentity',
     'memberName', 'teamId', 'laneId', 'sessionId', 'sessionIdentity', 'ownershipTitle', 'phase']
   const allowedKeys = new Set([...requiredKeys, 'hostProcessId', 'hostProcessStartedAtMs',
-    'hostProcessBirthToken', 'runId'])
+    'hostProcessBirthToken', 'runId', 'projectIdentity'])
   if (!source || !requiredKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedKeys.has(key))
     || source.attemptId !== journal.attemptId || source.payloadHash !== journal.payloadHash
@@ -2520,6 +2524,10 @@ function validateMemberCleanupObligation(
     || typeof source.memberName !== 'string' || source.memberName.length === 0 || source.memberName.length > 512
     || typeof source.teamId !== 'string' || source.teamId.length === 0 || source.teamId.length > 512
     || typeof source.laneId !== 'string' || source.laneId.length === 0 || source.laneId.length > 512
+    || (source.projectIdentity !== undefined
+      && (typeof source.projectIdentity !== 'string' || source.projectIdentity.length === 0
+        || source.projectIdentity.length > 4_096
+        || normalizeOpenCodeProjectIdentity(source.projectIdentity) !== source.projectIdentity))
     || (source.runId !== undefined
       && (typeof source.runId !== 'string' || source.runId.length === 0 || source.runId.length > 4_096))
     || typeof source.sessionId !== 'string' || source.sessionId.length === 0 || source.sessionId.length > 4_096

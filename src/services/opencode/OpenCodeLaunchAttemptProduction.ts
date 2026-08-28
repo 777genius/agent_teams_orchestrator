@@ -942,10 +942,12 @@ class OpenCodeProductionLaunchRuntime {
         // The canonical logical-member claim belongs to another authorized
         // envelope. This is durable reconciliation evidence, not permission
         // to retry under the contender's different opaque identity.
-        const record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
+        const record = await openCodeSessionStore.getByLogicalMember(
+          logicalMemberByIdentity.get(member.memberIdentity)!)
         return { member, claim, record, linkage: null, reconciliationError: 'authority' }
       }
-      let record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
+      let record = await openCodeSessionStore.getByLogicalMember(
+        logicalMemberByIdentity.get(member.memberIdentity)!)
       let linkage = record ? linkageFor(member.memberIdentity, record) : null
       if (claim.state === 'committed' && record && linkage) {
         await hydrateOpenCodeRecoveredSessionLease({
@@ -1310,15 +1312,34 @@ class OpenCodeProductionLaunchRuntime {
           : recovered.status === 'absent' ? 'absent' : 'unresolved'
       },
       readProjection: async obligation => {
-        const projection = await openCodeSessionStore.get(
-          obligation.teamId, obligation.laneId, obligation.memberName)
+        const projection = obligation.projectIdentity
+          ? await openCodeSessionStore.getByLogicalMember({
+            teamId: obligation.teamId, laneId: obligation.laneId,
+            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
+          })
+          : await (async () => {
+            const candidates = (await openCodeSessionStore.list()).filter(record =>
+              record.teamId.trim() === obligation.teamId.trim()
+              && (record.laneId ?? 'primary').trim() === obligation.laneId.trim()
+              && record.memberName.trim().toLowerCase() === obligation.memberName.trim().toLowerCase())
+            if (candidates.length > 1) throw new Error('legacy OpenCode cleanup project authority is ambiguous')
+            return candidates[0] ?? null
+          })()
         return projection ? { sessionId: projection.opencodeSessionId } : null
       },
       // The read is only an optimization. The store mutation itself performs
       // the exact-session CAS, closing the replacement race between read/effect.
-      markProjectionStale: async obligation => { await openCodeSessionStore.markStaleIfSessionMatches(
-        obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId,
-        'launch_attempt_cleanup') },
+      markProjectionStale: async obligation => {
+        const result = obligation.projectIdentity
+          ? await openCodeSessionStore.markStaleIfSessionMatchesLogicalMember({
+            teamId: obligation.teamId, laneId: obligation.laneId,
+            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
+          }, obligation.sessionId, 'launch_attempt_cleanup')
+          : await openCodeSessionStore.markStaleIfSessionMatches(
+            obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId,
+            'launch_attempt_cleanup')
+        if (result.status === 'foreign') throw new Error('OpenCode cleanup projection authority changed')
+      },
       releaseLease: async obligation => {
         // Legacy journals lack the run half of the lease CAS. Session ids are
         // deterministic and may be rebound by a later run, so such an
@@ -1333,8 +1354,16 @@ class OpenCodeProductionLaunchRuntime {
           sessionId: obligation.sessionId,
         })
       },
-      deleteProjection: async obligation => { await openCodeSessionStore.deleteIfSessionMatches(
-        obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId) },
+      deleteProjection: async obligation => {
+        const result = obligation.projectIdentity
+          ? await openCodeSessionStore.deleteIfSessionMatchesLogicalMember({
+            teamId: obligation.teamId, laneId: obligation.laneId,
+            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
+          }, obligation.sessionId)
+          : await openCodeSessionStore.deleteIfSessionMatches(
+            obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId)
+        if (result.status === 'foreign') throw new Error('OpenCode cleanup projection authority changed')
+      },
       advance: input.advanceCleanupObligation,
       completed: obligation => retainedSessionLeases.remove(obligation.memberIdentity),
     })
@@ -1886,7 +1915,8 @@ class OpenCodeProductionLaunchRuntime {
           const durableClaim = await mutationLedger.read(target, {
             deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow,
           })
-          const record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
+          const record = await openCodeSessionStore.getByLogicalMember(
+            logicalMemberByIdentity.get(input.memberIdentity)!)
           const linkage = recoverOpenCodeCommittedMemberLinkage({
             claim: durableClaim, record,
             attemptId: input.attemptId, payloadHash: input.payloadHash,
@@ -1929,7 +1959,8 @@ class OpenCodeProductionLaunchRuntime {
         createBootstrapAndCommit: async input => {
           const member = memberByIdentity.get(input.memberIdentity)
           if (!member) return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
-          if (await openCodeSessionStore.get(command.teamId, command.laneId, member.name)) {
+          if (await openCodeSessionStore.getByLogicalMember(
+            logicalMemberByIdentity.get(input.memberIdentity)!)) {
             return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
           }
           const target = targetByMember.get(input.memberIdentity)!
@@ -2079,6 +2110,7 @@ class OpenCodeProductionLaunchRuntime {
             ...(handle.processBirthToken ? { hostProcessBirthToken: handle.processBirthToken } : {}),
             memberIdentity: input.resource.memberIdentity, memberName: record.memberName,
             teamId: record.teamId, laneId: record.laneId ?? 'primary',
+            projectIdentity: record.projectPath,
             runId: command.runId, sessionId: record.opencodeSessionId,
             sessionIdentity: input.resource.sessionIdentity,
             ownershipTitle, phase: 'remote',

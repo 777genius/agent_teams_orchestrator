@@ -80,6 +80,19 @@ function recordsForLegacyLookup(store: SessionStoreShape, teamId: string, laneId
     sameLookupIdentity(record, teamId, laneId, memberName))
 }
 
+function recordForLogicalMember(store: SessionStoreShape,
+  logicalMember: OpenCodeLogicalMemberIdentity): OpenCodeSessionRecord | undefined {
+  const logicalKey = openCodeLogicalMemberKey(logicalMember)
+  return store.records[logicalKey]
+    ?? Object.values(store.records).find(record => logicalKeyForRecord(record) === logicalKey)
+}
+
+function unambiguousLegacyRecord(store: SessionStoreShape, teamId: string, laneId: string,
+  memberName: string): OpenCodeSessionRecord | undefined {
+  const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
+  return candidates.length === 1 ? candidates[0] : undefined
+}
+
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await stat(filePath)
@@ -170,8 +183,17 @@ export class OpenCodeSessionStore {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
     const store = await this.readStore()
-    return Object.values(store.records).find(record =>
-      sameLookupIdentity(record, teamId, laneId, normalizedMemberName)) ?? null
+    // Compatibility lookup is intentionally usable only while its old
+    // team/lane/member identity identifies one project. Returning an arbitrary
+    // candidate here would cross the project authority boundary.
+    return unambiguousLegacyRecord(store, teamId, laneId, normalizedMemberName) ?? null
+  }
+
+  async getByLogicalMember(
+    logicalMember: OpenCodeLogicalMemberIdentity,
+  ): Promise<OpenCodeSessionRecord | null> {
+    const store = await this.readStore()
+    return recordForLogicalMember(store, logicalMember) ?? null
   }
 
   async upsert(record: OpenCodeSessionRecord): Promise<UpsertResult> {
@@ -305,7 +327,7 @@ export class OpenCodeSessionStore {
     const staleReason = staleReasonMaybe ?? memberNameOrStaleReason
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const previous = recordsForLegacyLookup(store, teamId, laneId, memberName)[0]
+      const previous = unambiguousLegacyRecord(store, teamId, laneId, memberName)
       if (!previous) {
         return null
       }
@@ -327,6 +349,22 @@ export class OpenCodeSessionStore {
     })
   }
 
+  async markStaleByLogicalMember(
+    logicalMember: OpenCodeLogicalMemberIdentity,
+    staleReason: string,
+  ): Promise<OpenCodeSessionRecord | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const previous = recordForLogicalMember(store, logicalMember)
+      if (!previous) return null
+      if (previous.staleReason === staleReason) return previous
+      const next = { ...previous, staleReason, updatedAt: new Date().toISOString() }
+      store.records[buildRecordKey(previous)] = next
+      await this.writeStore(store)
+      return next
+    })
+  }
+
   async markStaleIfSessionMatches(
     teamId: string,
     laneId: string,
@@ -337,14 +375,13 @@ export class OpenCodeSessionStore {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
-      const previous = candidates.find(record =>
-        record.opencodeSessionId === expectedOpencodeSessionId)
-      if (!previous && candidates.length === 0) {
+      if (candidates.length > 1) throw new Error('ambiguous OpenCode legacy session mutation')
+      const previous = candidates[0]
+      if (!previous) {
         return { status: 'absent' }
       }
-
-      if (!previous) {
-        return { status: 'foreign', record: candidates[0]! }
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
       }
 
       const key = buildRecordKey(previous)
@@ -365,16 +402,49 @@ export class OpenCodeSessionStore {
     })
   }
 
+  async markStaleIfSessionMatchesLogicalMember(
+    logicalMember: OpenCodeLogicalMemberIdentity,
+    expectedOpencodeSessionId: string,
+    staleReason: string,
+  ): Promise<ConditionalMarkStaleResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const previous = recordForLogicalMember(store, logicalMember)
+      if (!previous) return { status: 'absent' }
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
+      }
+      if (previous.staleReason === staleReason) {
+        return { status: 'already-satisfied', record: previous }
+      }
+      const next = { ...previous, staleReason, updatedAt: new Date().toISOString() }
+      store.records[buildRecordKey(previous)] = next
+      await this.writeStore(store)
+      return { status: 'applied', record: next }
+    })
+  }
+
   async delete(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<boolean> {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const previous = recordsForLegacyLookup(store, teamId, laneId, normalizedMemberName)[0]
+      const previous = unambiguousLegacyRecord(store, teamId, laneId, normalizedMemberName)
       if (!previous) {
         return false
       }
 
+      delete store.records[buildRecordKey(previous)]
+      await this.writeStore(store)
+      return true
+    })
+  }
+
+  async deleteByLogicalMember(logicalMember: OpenCodeLogicalMemberIdentity): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const previous = recordForLogicalMember(store, logicalMember)
+      if (!previous) return false
       delete store.records[buildRecordKey(previous)]
       await this.writeStore(store)
       return true
@@ -397,16 +467,32 @@ export class OpenCodeSessionStore {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
-      const previous = candidates.find(record =>
-        record.opencodeSessionId === expectedOpencodeSessionId)
-      if (!previous && candidates.length === 0) {
+      if (candidates.length > 1) throw new Error('ambiguous OpenCode legacy session mutation')
+      const previous = candidates[0]
+      if (!previous) {
         return { status: 'absent' }
       }
-
-      if (!previous) {
-        return { status: 'foreign', record: candidates[0]! }
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
       }
 
+      delete store.records[buildRecordKey(previous)]
+      await this.writeStore(store)
+      return { status: 'applied', record: previous }
+    })
+  }
+
+  async deleteIfSessionMatchesLogicalMember(
+    logicalMember: OpenCodeLogicalMemberIdentity,
+    expectedOpencodeSessionId: string,
+  ): Promise<ConditionalDeleteResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const previous = recordForLogicalMember(store, logicalMember)
+      if (!previous) return { status: 'absent' }
+      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
+        return { status: 'foreign', record: previous }
+      }
       delete store.records[buildRecordKey(previous)]
       await this.writeStore(store)
       return { status: 'applied', record: previous }

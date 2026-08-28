@@ -239,6 +239,38 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('reuses only the project-qualified session when two projects share a logical member', async () => {
+    const projectA = buildRecord({ projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' })
+    const projectB = buildRecord({ projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' })
+    const projectBProfile = { ...profile, projectPath: projectB.projectPath }
+    const lookups: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => projectBProfile,
+      sessionStore: {
+        get: async () => projectA,
+        getByLogicalMember: async logical => {
+          lookups.push(logical.projectIdentity)
+          return logical.projectIdentity === projectB.projectPath ? projectB : projectA
+        },
+        upsert: async () => 'unchanged',
+        markStale: async () => projectA,
+      },
+      hostManager: {
+        ensureHost: async () => ({ ...host, projectPath: projectB.projectPath, profile: projectBProfile }),
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: projectB.teamId, laneId: projectB.laneId, memberName: projectB.memberName,
+      selectedModel: projectB.selectedModel, projectPath: projectB.projectPath, runId: 'run-b',
+    })
+
+    expect(lookups).toEqual(['/tmp/project-b'])
+    expect(record.opencodeSessionId).toBe('session-b')
+  })
+
   test('uses a caller-provided prepared profile without preparing it again', async () => {
     let prepareProfileCalls = 0
     let createSessionCalls = 0

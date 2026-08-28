@@ -12,6 +12,7 @@ import { hasExactOpenCodeMessageOwnership } from './OpenCodeMessageOwnership.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
@@ -39,6 +40,7 @@ type OpenCodeSessionBridgeDeps = {
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
+    & Partial<Pick<typeof openCodeSessionStore, 'getByLogicalMember' | 'markStaleByLogicalMember'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -233,6 +235,22 @@ export class OpenCodeSessionBridge {
 
   private get sessionStore() {
     return this.deps.sessionStore ?? openCodeSessionStore
+  }
+
+  private getProjectSession(teamId: string, laneId: string, memberName: string,
+    projectIdentity: string): Promise<OpenCodeSessionRecord | null> {
+    return this.sessionStore.getByLogicalMember?.({ teamId, laneId, memberName, projectIdentity })
+      ?? this.sessionStore.get(teamId, laneId, memberName)
+  }
+
+  private markProjectSessionStale(record: Pick<OpenCodeSessionRecord,
+    'teamId' | 'laneId' | 'memberName' | 'projectPath'>,
+  staleReason: string): Promise<OpenCodeSessionRecord | null> {
+    return this.sessionStore.markStaleByLogicalMember?.({
+      teamId: record.teamId, laneId: record.laneId ?? 'primary',
+      projectIdentity: record.projectPath, memberName: record.memberName,
+    }, staleReason) ?? this.sessionStore.markStale(
+      record.teamId, record.laneId ?? 'primary', record.memberName, staleReason)
   }
 
   private get clientFactory() {
@@ -651,12 +669,7 @@ export class OpenCodeSessionBridge {
     const nextRecord =
       params.record.staleReason === params.staleReason
         ? params.record
-        : (await this.sessionStore.markStale(
-            params.record.teamId,
-            params.record.laneId ?? 'primary',
-            params.record.memberName,
-            params.staleReason,
-          )) ?? {
+        : (await this.markProjectSessionStale(params.record, params.staleReason)) ?? {
             ...params.record,
             staleReason: params.staleReason,
             updatedAt: buildNowIso(),
@@ -702,12 +715,7 @@ export class OpenCodeSessionBridge {
     const nextRecord =
       params.record.staleReason === params.staleReason
         ? params.record
-        : (await this.sessionStore.markStale(
-            params.record.teamId,
-            params.record.laneId ?? 'primary',
-            params.record.memberName,
-            params.staleReason,
-          )) ?? {
+        : (await this.markProjectSessionStale(params.record, params.staleReason)) ?? {
             ...params.record,
             staleReason: params.staleReason,
             updatedAt: buildNowIso(),
@@ -754,7 +762,10 @@ export class OpenCodeSessionBridge {
   }): Promise<OpenCodeSessionRecord> {
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
-    const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const projectIdentity = normalizeOpenCodeProjectIdentity(
+      params.preparedProfile?.projectPath ?? params.projectPath ?? process.cwd())
+    const existing = await this.getProjectSession(
+      params.teamId, laneId, params.memberName, projectIdentity)
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
         profile: params.preparedProfile,
@@ -816,12 +827,7 @@ export class OpenCodeSessionBridge {
                   ? 'managed_auth_changed'
                   : existing.staleReason ?? 'session_refresh_required'
 
-      await this.sessionStore.markStale(
-        params.teamId,
-        laneId,
-        params.memberName,
-        staleReason,
-      )
+      await this.markProjectSessionStale(existing, staleReason)
       await this.releaseSession(existing)
     }
 

@@ -425,9 +425,12 @@ const originalAnswerPermission = openCodeSessionBridge.answerPermission
 const originalProjectLogMessages = openCodeSessionBridge.projectLogMessages
 const originalList = openCodeSessionStore.list
 const originalGet = openCodeSessionStore.get
+const originalGetByLogicalMember = openCodeSessionStore.getByLogicalMember
 const originalUpsert = openCodeSessionStore.upsert
 const originalMarkStale = openCodeSessionStore.markStale
+const originalMarkStaleByLogicalMember = openCodeSessionStore.markStaleByLogicalMember
 const originalDelete = openCodeSessionStore.delete
+const originalDeleteByLogicalMember = openCodeSessionStore.deleteByLogicalMember
 const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
 const originalOutcomeQuery = openCodeCommandOutcomeStore.query
 const originalOutcomePrune = openCodeCommandOutcomeStore.prune
@@ -467,6 +470,12 @@ beforeEach(async () => {
   delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
   delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   __resetAppMcpToolProofCacheForTests()
+  openCodeSessionStore.getByLogicalMember = (async logical =>
+    openCodeSessionStore.get(logical.teamId, logical.laneId, logical.memberName)) as typeof openCodeSessionStore.getByLogicalMember
+  openCodeSessionStore.markStaleByLogicalMember = (async (logical, reason) =>
+    openCodeSessionStore.markStale(logical.teamId, logical.laneId, logical.memberName, reason)) as typeof openCodeSessionStore.markStaleByLogicalMember
+  openCodeSessionStore.deleteByLogicalMember = (async logical =>
+    openCodeSessionStore.delete(logical.teamId, logical.laneId, logical.memberName)) as typeof openCodeSessionStore.deleteByLogicalMember
   openCodeCommandOutcomeStore.upsert = (async patch => ({
     schemaVersion: 1,
     command: 'opencode.sendMessage',
@@ -664,9 +673,12 @@ afterEach(async () => {
   openCodeSessionBridge.projectLogMessages = originalProjectLogMessages
   openCodeSessionStore.list = originalList
   openCodeSessionStore.get = originalGet
+  openCodeSessionStore.getByLogicalMember = originalGetByLogicalMember
   openCodeSessionStore.upsert = originalUpsert
   openCodeSessionStore.markStale = originalMarkStale
+  openCodeSessionStore.markStaleByLogicalMember = originalMarkStaleByLogicalMember
   openCodeSessionStore.delete = originalDelete
+  openCodeSessionStore.deleteByLogicalMember = originalDeleteByLogicalMember
   openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
   openCodeCommandOutcomeStore.query = originalOutcomeQuery
   openCodeCommandOutcomeStore.prune = originalOutcomePrune
@@ -6586,6 +6598,34 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.accepted).toBe(true)
     expect(result.data.sessionId).toBe('session-bob')
     expect(result.data.runtimePid).toBe(789)
+  })
+
+  test('qualifies message delivery by canonical project when two projects share a logical member', async () => {
+    const projectA = buildRecord({ projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' })
+    const projectB = buildRecord({ projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' })
+    const lookups: string[] = []
+    const prompted: string[] = []
+    openCodeSessionStore.get = (async () => projectA) as typeof openCodeSessionStore.get
+    openCodeSessionStore.getByLogicalMember = (async logical => {
+      lookups.push(logical.projectIdentity)
+      return logical.projectIdentity === '/tmp/project-b' ? projectB : projectA
+    }) as typeof openCodeSessionStore.getByLogicalMember
+    openCodeSessionBridge.promptAsync = (async record => { prompted.push(record.opencodeSessionId) }) as (
+      typeof openCodeSessionBridge.promptAsync)
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record, summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: projectB.teamId, laneId: projectB.laneId, memberName: projectB.memberName,
+        projectPath: projectB.projectPath, text: 'project-b only',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(lookups).toEqual(['/tmp/project-b'])
+    expect(prompted).toEqual(['session-b'])
   })
 
   test.each([

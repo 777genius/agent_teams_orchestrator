@@ -137,16 +137,44 @@ describe('OpenCodeSessionStore', () => {
     const restarted = new OpenCodeSessionStore(filePath)
     expect(await restarted.list()).toEqual(expect.arrayContaining([projectA, projectB]))
     expect(await restarted.list()).toHaveLength(2)
+    expect(await restarted.get(projectA.teamId, projectA.laneId, projectA.memberName)).toBeNull()
+    expect(await restarted.getByLogicalMember({ teamId: projectA.teamId, laneId: projectA.laneId,
+      projectIdentity: projectA.projectPath, memberName: projectA.memberName })).toEqual(projectA)
+    expect(await restarted.getByLogicalMember({ teamId: projectB.teamId, laneId: projectB.laneId,
+      projectIdentity: projectB.projectPath, memberName: projectB.memberName })).toEqual(projectB)
 
     // A delayed cleanup for A must select A by its session fence. It cannot
     // observe B as a replacement or erase B merely because their legacy
     // team/lane/member lookup identity is the same.
-    expect(await restarted.deleteIfSessionMatches(projectA.teamId, projectA.laneId,
-      projectA.memberName, projectA.opencodeSessionId)).toEqual({ status: 'applied', record: projectA })
+    expect(await restarted.deleteIfSessionMatchesLogicalMember({ teamId: projectA.teamId,
+      laneId: projectA.laneId, projectIdentity: projectA.projectPath, memberName: projectA.memberName },
+    projectA.opencodeSessionId)).toEqual({ status: 'applied', record: projectA })
     expect(await restarted.list()).toEqual([projectB])
-    expect(await restarted.deleteIfSessionMatches(projectA.teamId, projectA.laneId,
-      projectA.memberName, projectA.opencodeSessionId)).toEqual({ status: 'foreign', record: projectB })
+    expect(await restarted.deleteIfSessionMatchesLogicalMember({ teamId: projectA.teamId,
+      laneId: projectA.laneId, projectIdentity: projectA.projectPath, memberName: projectA.memberName },
+    projectA.opencodeSessionId)).toEqual({ status: 'absent' })
     expect(await restarted.list()).toEqual([projectB])
+  })
+
+  test('project-qualified stale and delete mutations isolate ambiguous legacy members', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    await store.upsert(projectA)
+    await store.upsert(projectB)
+
+    expect(await store.markStale(projectA.teamId, projectA.laneId, projectA.memberName,
+      'legacy-stale')).toBeNull()
+    await expect(store.markStaleIfSessionMatches(projectA.teamId, projectA.laneId,
+      projectA.memberName, projectA.opencodeSessionId, 'legacy-stale')).rejects.toThrow('ambiguous')
+    expect(await store.markStaleIfSessionMatchesLogicalMember({ teamId: projectA.teamId,
+      laneId: projectA.laneId, projectIdentity: projectA.projectPath, memberName: projectA.memberName },
+    projectA.opencodeSessionId, 'project-a-stale')).toMatchObject({ status: 'applied' })
+    expect(await store.getByLogicalMember({ teamId: projectB.teamId, laneId: projectB.laneId,
+      projectIdentity: projectB.projectPath, memberName: projectB.memberName })).toEqual(projectB)
+    expect(await store.delete(projectA.teamId, projectA.laneId, projectA.memberName)).toBe(false)
+    await expect(store.deleteIfSessionMatches(projectA.teamId, projectA.laneId,
+      projectA.memberName, projectA.opencodeSessionId)).rejects.toThrow('ambiguous')
   })
 
   test('restart migrates colliding legacy record keys into project-scoped projections', async () => {

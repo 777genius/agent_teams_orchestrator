@@ -57,7 +57,8 @@ const cleanupObligation = (phase: OpenCodeMemberCleanupPhase = 'remote'):
 OpenCodeMemberCleanupObligation => ({
   attemptId: '123e4567-e89b-42d3-a456-426614174099', payloadHash: 'a'.repeat(64),
   generation: 1, hostKey: 'host', memberIdentity: identity, memberName: 'alice',
-  teamId: 'team', laneId: 'primary', runId: 'run-owned', sessionId: 'session-owned',
+  teamId: 'team', laneId: 'primary', projectIdentity: '/tmp/project-a',
+  runId: 'run-owned', sessionId: 'session-owned',
   sessionIdentity: `sha256:${'b'.repeat(64)}` as OpenCodeOpaqueIdentity,
   ownershipTitle: 'agent-teams-launch:owned', phase,
 })
@@ -154,6 +155,22 @@ async () => {
   })).toBe('complete')
   expect({ stale, deleted, released, phase: durable.phase })
     .toEqual({ stale: 0, deleted: 0, released: 1, phase: 'complete' })
+})
+
+test('member cleanup does not complete while project projection authority is unresolved', async () => {
+  let durable = cleanupObligation('projection_stale')
+  let advanced = 0
+  expect(await reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
+    monotonicNow: () => 0, reconcileRemote: async () => 'absent',
+    readProjection: async () => { throw new Error('project authority unresolved') },
+    markProjectionStale: async () => {}, releaseLease: async () => {},
+    deleteProjection: async () => {},
+    advance: async (_obligation, phase) => { advanced += 1; durable = { ...durable, phase } },
+    completed: () => {},
+  })).toBe('timed_out')
+  expect(durable.phase).toBe('projection_stale')
+  expect(advanced).toBe(0)
 })
 
 test('attempt host release ledger survives restart, rejects foreign/corrupt receipts, and clears idempotently', async () => {
@@ -1287,8 +1304,8 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
   await mkdir(projectPath)
   const sessionStore = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
   let sessionReadCount = 0
-  const originalSessionGet = sessionStore.get.bind(sessionStore)
-  sessionStore.get = async (...input: Parameters<OpenCodeSessionStore['get']>) => {
+  const originalSessionGet = sessionStore.getByLogicalMember.bind(sessionStore)
+  sessionStore.getByLogicalMember = async (...input: Parameters<OpenCodeSessionStore['getByLogicalMember']>) => {
     sessionReadCount += 1
     return originalSessionGet(...input)
   }
@@ -1473,7 +1490,9 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
     },
     inspectJournal: () => store.inspect({ attemptId, payloadHash: rawCommand.request.launchAttempt.payloadHash,
       inputDigest, immutableDigest }),
-    readSessionProjection: () => originalSessionGet('team', 'primary', 'alice'),
+    readSessionProjection: () => originalSessionGet({
+      teamId: 'team', laneId: 'primary', projectIdentity: projectPath, memberName: 'alice',
+    }),
     memberCreates: () => memberCreateCount,
     remoteReads: () => remoteReadCount,
     sessionReads: () => sessionReadCount,

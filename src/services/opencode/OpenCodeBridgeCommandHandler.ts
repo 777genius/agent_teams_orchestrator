@@ -457,11 +457,10 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
   diagnostics: string[]
 }> {
   const diagnostics: string[] = []
-  const sessionRecord = await openCodeSessionStore.get(
-    input.record.teamId,
-    input.record.laneId,
-    input.record.memberName,
-  )
+  const sessionRecord = await openCodeSessionStore.getByLogicalMember({
+    teamId: input.record.teamId, laneId: input.record.laneId ?? 'primary',
+    projectIdentity: input.record.projectPath, memberName: input.record.memberName,
+  })
   if (!sessionRecord) {
     return {
       accepted: false,
@@ -2060,12 +2059,10 @@ async function recreateSessionAfterBootstrapMcpFailure(params: {
   }
 
   params.diagnostics.push(bootstrapFailure)
-  await openCodeSessionStore.markStale(
-    params.record.teamId,
-    params.record.laneId ?? 'primary',
-    params.record.memberName,
-    'bootstrap_app_mcp_unavailable',
-  )
+  await openCodeSessionStore.markStaleByLogicalMember({
+    teamId: params.record.teamId, laneId: params.record.laneId ?? 'primary',
+    projectIdentity: params.record.projectPath, memberName: params.record.memberName,
+  }, 'bootstrap_app_mcp_unavailable')
   const recreated = await openCodeSessionBridge.ensureSession({
     teamId: params.record.teamId,
     laneId: params.record.laneId,
@@ -2757,12 +2754,10 @@ async function cleanupFailedLaunchSession(
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
   try {
-    await openCodeSessionStore.markStale(
-      record.teamId,
-      record.laneId,
-      record.memberName,
-      'launch_failed',
-    )
+    await openCodeSessionStore.markStaleByLogicalMember({
+      teamId: record.teamId, laneId: record.laneId ?? 'primary',
+      projectIdentity: record.projectPath, memberName: record.memberName,
+    }, 'launch_failed')
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_mark_stale_failed',
@@ -2782,7 +2777,10 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionStore.delete(record.teamId, record.laneId, record.memberName)
+    await openCodeSessionStore.deleteByLogicalMember({
+      teamId: record.teamId, laneId: record.laneId ?? 'primary',
+      projectIdentity: record.projectPath, memberName: record.memberName,
+    })
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_delete_failed',
@@ -2800,12 +2798,10 @@ async function markStaleAndReleaseSession(
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
   try {
-    await openCodeSessionStore.markStale(
-      record.teamId,
-      record.laneId,
-      record.memberName,
-      staleReason,
-    )
+    await openCodeSessionStore.markStaleByLogicalMember({
+      teamId: record.teamId, laneId: record.laneId ?? 'primary',
+      projectIdentity: record.projectPath, memberName: record.memberName,
+    }, staleReason)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       `${diagnosticPrefix}_mark_stale_failed`,
@@ -3065,12 +3061,9 @@ async function runLaunchWithProvisioningSnapshot(
         // If MCP was attached after the session was created, the existing
         // OpenCode session may not see the new tools. Recreate once before
         // injecting app-managed bootstrap context to avoid a hidden bad session.
-        await openCodeSessionStore.markStale(
-          teamId,
-          laneId,
-          name,
-          'app_mcp_attached_after_session_create',
-        ).catch(error => {
+        await openCodeSessionStore.markStaleByLogicalMember({
+          teamId, laneId, projectIdentity: snapshot.projectPath, memberName: name,
+        }, 'app_mcp_attached_after_session_create').catch(error => {
           diagnostics.push(teamDiagnostic(
             'opencode_launch_mcp_recreate_mark_stale_failed',
             `${name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -3281,7 +3274,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
     const member = asRecord(item)
     const name = asString(member?.name)
     if (!name) continue
-    const record = await openCodeSessionStore.get(teamId, laneId, name)
+    const record = await openCodeSessionStore.getByLogicalMember({
+      teamId, laneId, projectIdentity: snapshot.projectPath, memberName: name,
+    })
     if (!record) {
       diagnostics.push(teamDiagnostic('member_session_missing', `No stored OpenCode session for ${teamId}/${name}`, 'warning'))
       continue
@@ -3487,6 +3482,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     throw new Error('opencode.sendMessage requires teamId/teamName, laneId, memberName and text')
   }
   const projectPath = asString(body.projectPath) ?? envelope.cwd
+  const projectIdentity = normalizeOpenCodeProjectIdentity(projectPath)
   const runId = asString(body.runId)
   const forceSessionRefreshReason = asString(body.forceSessionRefreshReason)?.trim()
   const outcomeBase: SendMessageOutcomeBase = {
@@ -3510,7 +3506,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   await markSendMessageOutcome(outcomeBase, {
     status: 'preconditions_checked',
   })
-  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
+  const record = await openCodeSessionStore.getByLogicalMember({
+    teamId, laneId, projectIdentity, memberName,
+  })
   if (!record) {
     await markSendMessageOutcome(outcomeBase, {
       status: 'failed_before_accept',
@@ -3527,7 +3525,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   const staleReason = record.staleReason ?? compatibilityStaleReason
   if (staleReason) {
     if (!record.staleReason) {
-      await openCodeSessionStore.markStale(teamId, laneId, memberName, staleReason).catch(error => {
+      await openCodeSessionStore.markStaleByLogicalMember({
+        teamId, laneId, projectIdentity, memberName,
+      }, staleReason).catch(error => {
         mcpDiagnostics.push(
           teamDiagnostic(
             'opencode_send_session_compatibility_mark_stale_failed',
@@ -3556,7 +3556,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       ),
     )
   } else if (forceSessionRefreshReason) {
-    await openCodeSessionStore.markStale(teamId, laneId, memberName, forceSessionRefreshReason)
+    await openCodeSessionStore.markStaleByLogicalMember({
+      teamId, laneId, projectIdentity, memberName,
+    }, forceSessionRefreshReason)
     deliveryRecord = await openCodeSessionBridge.ensureSession({
       teamId,
       laneId,
@@ -3628,7 +3630,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         'warning',
       ),
     )
-    await openCodeSessionStore.markStale(teamId, laneId, memberName, 'app_mcp_unavailable')
+    await openCodeSessionStore.markStaleByLogicalMember({
+      teamId, laneId, projectIdentity, memberName,
+    }, 'app_mcp_unavailable')
     deliveryRecord = await openCodeSessionBridge.ensureSession({
       teamId,
       laneId,
@@ -4084,12 +4088,16 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
     )
   }
 
-  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
+  const projectIdentity = normalizeOpenCodeProjectIdentity(
+    asString(body.projectPath) ?? envelope.cwd)
+  const record = await openCodeSessionStore.getByLogicalMember({
+    teamId, laneId, projectIdentity, memberName,
+  })
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
   const snapshot = await openCodeProvisioningProbe.probe(
-    asString(body.projectPath) ?? record.projectPath,
+    projectIdentity,
     { toolApprovalMode: record.toolApprovalMode },
   )
   validateOpenCodeBridgeStateChangingPreconditions({
@@ -4222,13 +4230,17 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   const candidates = memberName
     ? (
       laneId
-        ? [await openCodeSessionStore.get(teamId, laneId, memberName)]
+        ? [await openCodeSessionStore.getByLogicalMember({
+          teamId, laneId, projectIdentity: snapshot.projectPath, memberName,
+        })]
         : (await openCodeSessionStore.list()).filter(
-          record => record.teamId === teamId && record.memberName === memberName,
+          record => record.teamId === teamId && record.memberName === memberName
+            && normalizeOpenCodeProjectIdentity(record.projectPath) === snapshot.projectPath,
         )
     )
     : (await openCodeSessionStore.list()).filter(
-      record => record.teamId === teamId && (!laneId || record.laneId === laneId),
+      record => record.teamId === teamId && (!laneId || record.laneId === laneId)
+        && normalizeOpenCodeProjectIdentity(record.projectPath) === snapshot.projectPath,
     )
   if (!laneId && candidates.filter((candidate): candidate is OpenCodeSessionRecord => candidate !== null).length > 1) {
     throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
@@ -4379,10 +4391,16 @@ async function runTranscript(envelope: BridgeEnvelope) {
   }
   const matchesSession = (candidate: OpenCodeSessionRecord): boolean =>
     !sessionId || candidate.opencodeSessionId === sessionId
+  const projectIdentity = normalizeOpenCodeProjectIdentity(
+    asString(body.projectPath) ?? envelope.cwd)
   const record = laneId
-    ? await openCodeSessionStore.get(teamId, laneId, memberName)
+    ? await openCodeSessionStore.getByLogicalMember({
+      teamId, laneId, projectIdentity, memberName,
+    })
     : (await openCodeSessionStore.list()).find(
-      candidate => candidate.teamId === teamId && candidate.memberName === memberName && matchesSession(candidate),
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName
+        && normalizeOpenCodeProjectIdentity(candidate.projectPath) === projectIdentity
+        && matchesSession(candidate),
     ) ?? null
   if (laneId && record && !matchesSession(record)) {
     throw new Error(
@@ -4391,7 +4409,9 @@ async function runTranscript(envelope: BridgeEnvelope) {
   }
   if (!laneId) {
     const candidateCount = (await openCodeSessionStore.list()).filter(
-      candidate => candidate.teamId === teamId && candidate.memberName === memberName && matchesSession(candidate),
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName
+        && normalizeOpenCodeProjectIdentity(candidate.projectPath) === projectIdentity
+        && matchesSession(candidate),
     ).length
     if (sessionId && candidateCount === 0) {
       throw new Error(`No stored OpenCode session record for ${teamId}/${memberName} with session ${sessionId}`)
