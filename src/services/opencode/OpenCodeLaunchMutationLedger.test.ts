@@ -253,6 +253,87 @@ describe('OpenCodeLaunchMutationLedger', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test('two conflicting committed predecessors fence an installed canonical record instead of selecting one', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-conflict-'))
+    const directory = join(root, 'claims')
+    try {
+      const first = await writePredecessorFixture(directory, 'committed', oid('8'))
+      const second = await writePredecessorFixture(directory, 'committed', oid('9'), true, logicalMember, true)
+      expect(first.idempotencyIdentity).not.toBe(second.idempotencyIdentity)
+      expect(first.linkage.sessionIdentity).not.toBe(second.linkage.sessionIdentity)
+
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const contender = { ...identity('123e4567-e89b-42d3-a456-426614174026', 'claim-conflict'),
+        memberIdentity: oid('a') }
+      expect(await ledger.claim(target, contender, context())).toBe('reconciliation_required')
+      await expect(ledger.read(target, context())).rejects.toThrow(
+        'unresolved predecessor launch mutation authority requires reconciliation')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('a predecessor discovered after canonical creation fences claim, read, and settlement retries', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-canonical-first-'))
+    const directory = join(root, 'claims')
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const owner = identity('123e4567-e89b-42d3-a456-426614174027', 'claim-canonical-first')
+      expect(await ledger.claim(target, owner, context())).toBe('claimed')
+      const durableIdentity = (await ledger.read(target, context()))?.idempotencyIdentity
+
+      await writePredecessorFixture(directory, 'committed', oid('8'))
+      expect(await ledger.claim(target, owner, context())).toBe('reconciliation_required')
+      await expect(ledger.read(target, context())).rejects.toThrow(
+        'unresolved predecessor launch mutation authority requires reconciliation')
+      expect(await ledger.transition(target, owner, 'commit', linkage, context(), recovery)).toBe('fenced')
+
+      const restarted = new OpenCodeLaunchMutationLedger(directory)
+      expect(await restarted.claim(target, owner, context())).toBe('reconciliation_required')
+      expect(durableIdentity).toBe(OpenCodeLaunchMutationLedger.idempotencyIdentity(target))
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('one identical indexed predecessor remains reconciled across retry, read, and settlement', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-identical-'))
+    const directory = join(root, 'claims')
+    try {
+      const legacy = await writePredecessorFixture(directory, 'known_failure', memberIdentity)
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const retry = { ...identity(legacy.attemptId, 'claim-identical-retry'), payloadHash: legacy.payloadHash,
+        inputDigest: legacy.inputDigest, immutableDigest: legacy.immutableDigest }
+      expect(await ledger.claim(target, retry, context())).toBe('claimed')
+      const durable = await ledger.read(target, context())
+      expect(durable?.idempotencyIdentity).toBe(legacy.idempotencyIdentity)
+      expect(await ledger.transition(target, retry, 'commit', linkage, context(), {
+        ...recovery, sessionRecord: { ...recovery.sessionRecord,
+          opencodeSessionId: legacy.idempotencyIdentity },
+      })).toBe('committed')
+      expect((await ledger.read(target, context()))?.idempotencyIdentity).toBe(legacy.idempotencyIdentity)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('late known-failure predecessors preserve canonical committed compatibility', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-known-compatible-'))
+    const directory = join(root, 'claims')
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const owner = identity('123e4567-e89b-42d3-a456-426614174028', 'claim-known-compatible')
+      expect(await ledger.claim(target, owner, context())).toBe('claimed')
+      expect(await ledger.transition(target, owner, 'commit', linkage, context(), recovery)).toBe('committed')
+      await writePredecessorFixture(directory, 'known_failure', memberIdentity)
+
+      expect(await ledger.claim(target, owner, context())).toBe('already_committed')
+      expect((await ledger.read(target, context()))?.state).toBe('committed')
+      expect(await ledger.transition(target, owner, 'commit', linkage, context(), recovery)).toBe('committed')
+
+      // V1 reused the same predecessor path while advancing its state. A
+      // name-only migration cache must not hide that newly authoritative effect.
+      await writePredecessorFixture(directory, 'committed', memberIdentity)
+      expect(await ledger.claim(target, owner, context())).toBe('reconciliation_required')
+      await expect(ledger.read(target, context())).rejects.toThrow(
+        'unresolved predecessor launch mutation authority requires reconciliation')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   test('migrated predecessor known failure preserves exact-authority retry semantics', async () => {
     const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-known-failure-'))
     const directory = join(root, 'claims')
@@ -294,12 +375,14 @@ describe('OpenCodeLaunchMutationLedger', () => {
 
 async function writePredecessorFixture(directory: string,
   state: 'claimed' | 'known_failure' | 'unknown' | 'committed', legacyMemberIdentity: OpenCodeOpaqueIdentity,
-  includeRecovery = true, digestLogicalMember = logicalMember) {
+  includeRecovery = true, digestLogicalMember = logicalMember, distinctEffect = false) {
   const targetDigest = createHash('sha256').update(JSON.stringify({ teamId: digestLogicalMember.teamId,
     laneId: digestLogicalMember.laneId, projectIdentity: digestLogicalMember.projectIdentity,
     memberIdentity: legacyMemberIdentity })).digest('hex')
   const idempotencyIdentity = `ses_${targetDigest.slice(0, 26)}`
-  const legacyLinkage = { ...linkage, memberIdentity: legacyMemberIdentity }
+  const legacyLinkage = { ...linkage, memberIdentity: legacyMemberIdentity,
+    ...(distinctEffect ? { sessionIdentity: oid('5'), bootstrapMessageIdentity: oid('6'),
+      commitIdentity: oid('7') } : {}) }
   const legacyRecovery = { ...recovery, sessionRecord: { ...recovery.sessionRecord,
     opencodeSessionId: idempotencyIdentity } }
   const record = {

@@ -77,9 +77,6 @@ type MigrationIndex = {
  * authorize creation of the same team/lane/member session.
  */
 export class OpenCodeLaunchMutationLedger {
-  private migrationCache?: MigrationIndex
-  private migrationClaimNames?: string
-
   constructor(
     private readonly directory: string,
     private readonly persistenceFactory: (filePath: string) => OpenCodeLaunchFileJournalPersistence =
@@ -114,6 +111,9 @@ export class OpenCodeLaunchMutationLedger {
     return this.withDirectoryLock(context, async () => {
       const migration = await this.migrateLegacyClaims(context, identity)
       return this.withClaimLock(targetDigest, context, async persistence => {
+      const unresolved = unresolvedPredecessors(migration)
+      if (unresolved.some(entry => entry.state === 'unknown')) return 'unknown'
+      if (unresolved.length > 0) return 'reconciliation_required'
       const current = await this.readUnlocked(persistence, targetDigest, context)
       if (current) {
         if (current.state === 'committed') return 'already_committed'
@@ -135,10 +135,6 @@ export class OpenCodeLaunchMutationLedger {
         // resume only through reconciliation, not by issuing create again.
         return current.state === 'unknown' ? 'unknown' : 'reconciliation_required'
       }
-      const unresolved = Object.values(migration.entries).filter(entry => !entry.migrated
-        && entry.state !== 'known_failure')
-      if (unresolved.some(entry => entry.state === 'unknown')) return 'unknown'
-      if (unresolved.length > 0) return 'reconciliation_required'
       const record: ClaimRecord = {
         version: 2, targetDigest, logicalMemberKey: openCodeLogicalMemberKey(identity.logicalMember),
         idempotencyIdentity: OpenCodeLaunchMutationLedger.idempotencyIdentity(targetDigest),
@@ -160,7 +156,8 @@ export class OpenCodeLaunchMutationLedger {
     recovery?: OpenCodeLaunchMemberRecovery,
   ): Promise<'committed' | 'cancelled' | 'fenced' | 'unknown'> {
     return this.withDirectoryLock(context, async () => {
-      await this.migrateLegacyClaims(context, identity)
+      const migration = await this.migrateLegacyClaims(context, identity)
+      if (unresolvedPredecessors(migration).length > 0) return 'fenced'
       return this.withClaimLock(targetDigest, context, async persistence => {
       const current = await this.readUnlocked(persistence, targetDigest, context)
       if (!current || !sameAuthority(current, identity)) return 'fenced'
@@ -193,15 +190,13 @@ export class OpenCodeLaunchMutationLedger {
 
   private async readCanonicalOrFence(targetDigest: string, context: OpenCodeLaunchStoreContext,
     migration: MigrationIndex): Promise<ClaimRecord | null> {
-    const current = await this.withClaimLock(targetDigest, context,
-      async persistence => this.readUnlocked(persistence, targetDigest, context))
-    if (current) return current
-    const unresolved = Object.values(migration.entries).filter(entry => !entry.migrated
-      && entry.state !== 'known_failure')
-    if (unresolved.length > 0) {
+    if (unresolvedPredecessors(migration).length > 0) {
       throw new OpenCodeLaunchJournalError('fenced',
         'unresolved predecessor launch mutation authority requires reconciliation')
     }
+    const current = await this.withClaimLock(targetDigest, context,
+      async persistence => this.readUnlocked(persistence, targetDigest, context))
+    if (current) return current
     return null
   }
 
@@ -223,11 +218,6 @@ export class OpenCodeLaunchMutationLedger {
   private async migrateLegacyClaims(context: OpenCodeLaunchStoreContext,
     identity?: OpenCodeLaunchMutationIdentity): Promise<MigrationIndex> {
     const names = (await readdir(this.directory)).filter(name => LEGACY_CLAIM_NAME.test(name)).sort()
-    const claimNames = names.join('\n')
-    const unresolvedCached = this.migrationCache && Object.values(this.migrationCache.entries)
-      .some(entry => !entry.migrated && entry.state !== 'known_failure')
-    if (this.migrationCache && this.migrationClaimNames === claimNames
-      && (!identity || !unresolvedCached)) return this.migrationCache
     const indexPersistence = this.persistenceFactory(join(this.directory, INDEX_FILE))
     const previous = await readMigrationIndex(indexPersistence, context)
     const entries = { ...previous.entries }
@@ -262,6 +252,22 @@ export class OpenCodeLaunchMutationLedger {
           logicalMemberKey: null, migrated: false }
         continue
       }
+      const previousEntry = previous.entries[legacyTargetDigest]
+      if (previousEntry?.migrated === true && previousEntry.recordDigest === recordDigest
+        && previousEntry.logicalMemberKey) {
+        const canonicalPersistence = this.persistence(previousEntry.logicalMemberKey)
+        const release = await canonicalPersistence.acquireExclusive(context)
+        let reconciled = false
+        try {
+          const existing = await this.readUnlocked(
+            canonicalPersistence, previousEntry.logicalMemberKey, context)
+          reconciled = existing?.legacyTargetDigest === legacyTargetDigest
+            && existing.logicalMemberKey === previousEntry.logicalMemberKey
+        } finally { await release(context) }
+        entries[legacyTargetDigest] = { recordDigest, state: legacy.state,
+          logicalMemberKey: previousEntry.logicalMemberKey, migrated: reconciled }
+        continue
+      }
       const logicalMember = logicalMemberForLegacy(legacy, identity, legacyTargetDigest)
       if (!logicalMember) {
         entries[legacyTargetDigest] = { recordDigest, state: legacy.state,
@@ -284,6 +290,7 @@ export class OpenCodeLaunchMutationLedger {
         } else {
           installed = existing.legacyTargetDigest === legacyTargetDigest
             && existing.logicalMemberKey === logicalMemberKey
+            && sameMigratedAuthority(existing, migrated)
         }
       } finally { await release(context) }
       entries[legacyTargetDigest] = { recordDigest, state: legacy.state,
@@ -293,8 +300,6 @@ export class OpenCodeLaunchMutationLedger {
     if (JSON.stringify(next) !== JSON.stringify(previous)) {
       await indexPersistence.replaceAndSync(new TextEncoder().encode(JSON.stringify(next)), context)
     }
-    this.migrationCache = next
-    this.migrationClaimNames = claimNames
     return next
   }
 
@@ -439,6 +444,24 @@ function sameAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity)
     && left.fence === right.fence && left.acquisitionToken === right.acquisitionToken
     && left.claimToken === right.claimToken && left.memberIdentity === right.memberIdentity
     && left.logicalMemberKey === openCodeLogicalMemberKey(right.logicalMember)
+}
+
+function sameMigratedAuthority(left: ClaimRecord, right: ClaimRecord): boolean {
+  return left.targetDigest === right.targetDigest
+    && left.legacyTargetDigest === right.legacyTargetDigest
+    && left.idempotencyIdentity === right.idempotencyIdentity
+    && left.state === right.state
+    && left.immutableDigest === right.immutableDigest
+    && sameAuthority(left, right)
+    && (left.linkage === undefined
+      ? right.linkage === undefined
+      : right.linkage !== undefined && sameLinkage(left.linkage, right.linkage))
+    && JSON.stringify(left.recovery) === JSON.stringify(right.recovery)
+}
+
+function unresolvedPredecessors(migration: MigrationIndex): MigrationIndex['entries'][string][] {
+  return Object.values(migration.entries).filter(entry => !entry.migrated
+    && entry.state !== 'known_failure')
 }
 
 function sameImmutableAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity): boolean {
