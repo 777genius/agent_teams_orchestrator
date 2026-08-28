@@ -167,7 +167,10 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(publication).toContain('fn different_owned_roots_share_common_ancestors_without_losing_custody()')
     expect(publication).toContain('fn immutable_publication_uses_aligned_link_and_directory_barrier()')
     expect(identity).not.toContain('FlushFileBuffers')
-    expect(publication.match(/windows_identity::flush_directory/g)).toHaveLength(39)
+    // Namespace mutation barriers are now retained in pending settlements and
+    // flushed by the deterministic settlement path, replacing three inline
+    // flushes from the predecessor implementation.
+    expect(publication.match(/windows_identity::flush_directory/g)).toHaveLength(36)
     expect(publication).not.toMatch(/(?:parent|source_parent|destination_parent|directory)\.sync_all\(/)
     expect(publication).not.toMatch(/\.handle\s*\.sync_all\(/)
     expect(publication).toContain('recovery.sync_all().map_err')
@@ -180,10 +183,12 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(identity).not.toContain('symlink_metadata')
   })
 
-  test('retains the identical namespace authority until rename, unlink, and tree removal succeed', async () => {
-    const [publication, identity] = await Promise.all([
+  test('rekeys committed namespace custody before fallible durability settlement', async () => {
+    const [publication, identity, client, wire] = await Promise.all([
       readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
       readFile(identityPath, 'utf8'),
+      readFile('src/services/opencode/OpenCodeWindowsPublicationAuthorityClient.ts', 'utf8'),
+      readFile('src/services/opencode/OpenCodeWindowsPublicationAuthorityProtocol.ts', 'utf8'),
     ])
     const rename = publication.slice(
       publication.indexOf('fn namespace_rename'),
@@ -199,15 +204,23 @@ describe('OpenCode catalog Windows authority security contract', () => {
     )
 
     expect(rename).toContain('.try_clone()')
-    expect(rename).not.toContain('namespace_directories.remove(')
     expect(rename.indexOf('rename_relative(')).toBeLessThan(
-      rename.indexOf('self.namespace_directories[index].0 = to.to_string()'),
+      rename.indexOf('for (index, key) in rewritten_handles'),
     )
+    expect(rename.indexOf('for (index, key) in rewritten_directories')).toBeLessThan(
+      rename.indexOf('fail_namespace_mutation_boundary("rename_after_transition")'),
+    )
+    expect(rename).toContain('fail_namespace_mutation_boundary("rename_after_transition")')
+    expect(rename).toContain('NamespaceFlushBoundary::RenameSource')
+    expect(rename).toContain('NamespaceFlushBoundary::RenameDestination')
     expect(unlink).toContain('.try_clone()')
-    expect(unlink).not.toContain('namespace_directories.remove(')
     expect(unlink.indexOf('delete_on_close(&file)')).toBeLessThan(
-      unlink.indexOf('self.namespace_directories\n            .retain('),
+      unlink.indexOf('self.detach_namespace_matching_into('),
     )
+    expect(unlink.indexOf('self.detach_namespace_matching_into(')).toBeLessThan(
+      unlink.indexOf('fail_namespace_mutation_boundary("unlink_after_transition")'),
+    )
+    expect(unlink).toContain('NamespaceFlushBoundary::UnlinkParent')
     expect(removeTree.indexOf('collect_tree_removals(&parent')).toBeLessThan(
       removeTree.indexOf('fail_namespace_mutation_boundary("remove_tree_before_transition")'),
     )
@@ -215,13 +228,31 @@ describe('OpenCode catalog Windows authority security contract', () => {
       removeTree.indexOf('fail_namespace_mutation_boundary("remove_tree_before_transition")'),
     ).toBeLessThan(removeTree.indexOf('delete_on_close(&removal.file)'))
     expect(removeTree.indexOf('delete_on_close(&removal.file)')).toBeLessThan(
-      removeTree.indexOf('self.namespace_handles\n                .retain('),
+      removeTree.indexOf('self.detach_namespace_key_into(&key'),
     )
+    expect(removeTree.indexOf('self.detach_namespace_key_into(&key')).toBeLessThan(
+      removeTree.indexOf('fail_namespace_mutation_boundary("remove_tree_after_transition")'),
+    )
+    expect(publication).toContain('"committed":true,"namespace":"complete","durability":"unknown"')
+    expect(publication).toContain('"committed":true,"namespace":"partial","durability":"unknown"')
+    expect(wire).toContain("namespace: 'complete' | 'partial'")
+    expect(wire).toContain("durability: 'settled' | 'unknown'")
+    expect(client).toContain("if (result.namespace === 'complete') return")
+    expect(client).toContain("value.namespace === 'partial' && value.durability !== 'unknown'")
+    for (const boundary of [
+      'rename_before_source_parent_flush', 'rename_after_source_parent_flush',
+      'rename_before_destination_parent_flush', 'rename_after_destination_parent_flush',
+      'unlink_before_parent_flush', 'unlink_after_parent_flush',
+      'remove_tree_before_parent_flush', 'remove_tree_after_parent_flush',
+    ]) expect(publication).toContain(`"${boundary}"`)
     expect(identity).toContain('pub(super) fn open_relative_directory_for_mutation(')
     for (const fixture of [
       'namespace_rename_collision_retains_exact_custody_through_rollback',
       'namespace_unlink_failure_retains_exact_custody_through_rollback',
       'namespace_remove_tree_failure_retains_exact_custody_and_retry_cleans_up',
+      'namespace_rename_across_parents_rekeys_nested_custody_before_durability_failures',
+      'namespace_unlink_committed_unknown_retains_exact_object_until_retry',
+      'namespace_remove_tree_nested_transitions_retain_custody_through_parent_flush_retry',
       'namespace_mutation_success_paths_release_only_after_transition',
     ]) {
       expect(publication).toContain(`fn ${fixture}()`)

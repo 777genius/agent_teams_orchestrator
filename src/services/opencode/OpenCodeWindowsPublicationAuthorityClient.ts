@@ -6,6 +6,7 @@ import {
 import { decodeOpenCodeWindowsPublicationReply, OpenCodeWindowsPublicationRejectedError, OPEN_CODE_WINDOWS_PUBLICATION_MAX_WIRE_BYTES,
   validOpenCodePublicationLeaf, validOpenCodePublicationMaterializationKey, validOpenCodePublicationRoot,
   validOpenCodePublicationRelativePath,
+  type OpenCodeWindowsNamespaceMutationReply,
   type OpenCodeWindowsPublicationRequest } from './OpenCodeWindowsPublicationAuthorityProtocol.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 import { drainOpenCodeNativeLauncherStderr, openCodeNativeAuthorityExitError,
@@ -43,6 +44,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   readonly #cancelled: Promise<void>
   #cancel!: () => void
   #pending = ''; #pendingBytes = 0; #closed = false; #retained = false
+  #namespaceDurabilityUnknown = false
   #queue: Promise<void> = Promise.resolve()
   #closePromise: Promise<void> | undefined
   #callerDeadline: ReturnType<typeof setTimeout> | undefined
@@ -232,15 +234,15 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async namespaceRename(from: string, to: string): Promise<void> {
     if (![from, to].every(validOpenCodePublicationRelativePath) || from === '.' || to === '.') throw unavailable()
-    await this.#request({ id: randomUUID(), op: 'NS_RENAME', from, to })
+    if ((await this.#namespaceMutation({ id: randomUUID(), op: 'NS_RENAME', from, to })).namespace !== 'complete') throw unavailable()
   }
   async namespaceUnlink(relativePath: string, directory: boolean): Promise<void> {
     if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
-    await this.#request({ id: randomUUID(), op: 'NS_UNLINK', path: relativePath, directory })
+    if ((await this.#namespaceMutation({ id: randomUUID(), op: 'NS_UNLINK', path: relativePath, directory })).namespace !== 'complete') throw unavailable()
   }
   async namespaceSyncDirectory(relativePath = '.'): Promise<void> {
     if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
-    await this.#request({ id: randomUUID(), op: 'NS_SYNC_DIRECTORY', path: relativePath })
+    if ((await this.#namespaceMutation({ id: randomUUID(), op: 'NS_SYNC_DIRECTORY', path: relativePath })).namespace !== 'complete') throw unavailable()
   }
   async namespaceList(relativePath = '.'): Promise<readonly string[]> {
     if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
@@ -269,7 +271,19 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   }
   async namespaceRemoveTree(relativePath: string): Promise<void> {
     if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
-    await this.#request({ id: randomUUID(), op: 'NS_REMOVE_TREE', path: relativePath })
+    for (;;) {
+      const result = await this.#namespaceMutation({ id: randomUUID(), op: 'NS_REMOVE_TREE', path: relativePath })
+      if (result.namespace === 'complete') return
+    }
+  }
+  get namespaceDurabilityUnknown(): boolean { return this.#namespaceDurabilityUnknown }
+  async #namespaceMutation(request: Extract<Pending, { op: 'NS_RENAME' | 'NS_UNLINK' | 'NS_SYNC_DIRECTORY' | 'NS_REMOVE_TREE' }>): Promise<OpenCodeWindowsNamespaceMutationReply> {
+    const value = await this.#request(request) as Partial<OpenCodeWindowsNamespaceMutationReply>
+    if (value?.committed !== true || (value?.namespace !== 'complete' && value?.namespace !== 'partial')
+      || (value?.durability !== 'settled' && value?.durability !== 'unknown')
+      || (value.namespace === 'partial' && value.durability !== 'unknown')) throw unavailable()
+    this.#namespaceDurabilityUnknown = value.durability === 'unknown'
+    return value as OpenCodeWindowsNamespaceMutationReply
   }
   async namespaceAcquireLock(relativePath: string,
     options: Readonly<{ stale: number; update: number; retries: Readonly<{ retries: number; minTimeout: number; maxTimeout: number }> }>,

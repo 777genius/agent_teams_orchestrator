@@ -996,7 +996,13 @@ class OpenCodeProductionLaunchRuntime {
                 getSession: id => client.getSession(id),
                 getSessionMessage: (id, messageId) => client.getSessionMessage!(id, messageId),
                 upsert: async value => {
-                  const publication = await openCodeSessionStore.publishIfAbsentOrExact(value)
+                  const reservationIdentity = openCodeSessionReservationIdentity(claim)
+                  const reservation = await openCodeSessionStore.reserveLogicalMember(
+                    claim.logicalMember, reservationIdentity, value.opencodeSessionId)
+                  if (reservation.status === 'conflict') {
+                    throw new Error('OpenCode logical member reservation is already owned')
+                  }
+                  const publication = await openCodeSessionStore.publishReserved(value, reservationIdentity)
                   if (publication.status === 'conflict') {
                     throw new Error('OpenCode logical member projection is already owned by another session')
                   }
@@ -1295,10 +1301,14 @@ class OpenCodeProductionLaunchRuntime {
       markProjectionStale: async obligation => { await openCodeSessionStore.markStaleIfSessionMatches(
         obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId,
         'launch_attempt_cleanup') },
-      releaseLease: obligation => openCodeHostManager.releaseHostLease(obligation.hostKey, {
-        teamId: obligation.teamId, laneId: obligation.laneId,
-        memberName: obligation.memberName, sessionId: obligation.sessionId,
-      }),
+      releaseLease: async obligation => {
+        // `foreign` is a successful stale-replay disposition: the old cleanup
+        // advances without deleting the replacement lease.
+        await openCodeHostManager.releaseHostLease(obligation.hostKey, {
+          teamId: obligation.teamId, laneId: obligation.laneId,
+          memberName: obligation.memberName, sessionId: obligation.sessionId,
+        })
+      },
       deleteProjection: async obligation => { await openCodeSessionStore.deleteIfSessionMatches(
         obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId) },
       advance: input.advanceCleanupObligation,
@@ -1861,7 +1871,7 @@ class OpenCodeProductionLaunchRuntime {
             memberIdentity: input.memberIdentity, teamId: command.teamId, laneId: command.laneId,
             memberName: member.name, selectedModel: command.selectedModel,
             expectedBootstrapText: bootstrapText(command, member.name,
-              OpenCodeLaunchMutationLedger.idempotencyIdentity(target), member.prompt),
+              durableClaim?.idempotencyIdentity ?? OpenCodeLaunchMutationLedger.idempotencyIdentity(target), member.prompt),
           })
           if (!linkage || !record) return null
           records.set(input.memberIdentity, record)
@@ -1898,13 +1908,20 @@ class OpenCodeProductionLaunchRuntime {
           if (await openCodeSessionStore.get(command.teamId, command.laneId, member.name)) {
             return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
           }
+          const target = targetByMember.get(input.memberIdentity)!
+          const authoritativeSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
+          const reservationIdentity = openCodeSessionReservationIdentity({ ...input,
+            logicalMember: logicalMemberByIdentity.get(input.memberIdentity)! })
+          const reservation = await openCodeSessionStore.reserveLogicalMember(
+            logicalMemberByIdentity.get(input.memberIdentity)!, reservationIdentity, authoritativeSessionId)
+          if (reservation.status === 'conflict') {
+            return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
+          }
           await input.revalidateBeforeCommit()
           const handle = hostFor(input.host)
           const client = openCodeClientFactory.create(handle.baseUrl, {
             signal: input.signal, remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
           })
-          const target = targetByMember.get(input.memberIdentity)!
-          const authoritativeSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
           const memberOwnershipToken = createHash('sha256').update(input.claimToken).digest('hex')
           const ownershipTitle = `agent-teams-launch:${command.request.launchAttempt.attemptId}:${input.memberIdentity}:${memberOwnershipToken}`
           memberOwnershipTitles.set(input.memberIdentity, ownershipTitle)
@@ -1989,7 +2006,7 @@ class OpenCodeProductionLaunchRuntime {
             commit: () => input.commitIfClaimLive(linkage, { ownershipTitle, sessionRecord: record }),
             onCommitted: () => retainedSessionLeases.commit(input.memberIdentity),
             upsert: async () => {
-              const publication = await openCodeSessionStore.publishIfAbsentOrExact(record)
+              const publication = await openCodeSessionStore.publishReserved(record, reservationIdentity)
               if (publication.status === 'conflict') {
                 throw new Error('OpenCode logical member projection is already owned by another session')
               }
@@ -2078,6 +2095,13 @@ class OpenCodeProductionLaunchRuntime {
     }, data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
       members, ...(launchAttempt === undefined ? {} : { launchAttempt }) } }
   }
+}
+
+function openCodeSessionReservationIdentity(input: Pick<OpenCodeLaunchMutationIdentity,
+  'attemptId' | 'payloadHash' | 'immutableDigest' | 'memberIdentity'>): string {
+  return createHash('sha256').update(JSON.stringify({ domain: 'agent-teams/opencode-session-reservation/v1',
+    attemptId: input.attemptId, payloadHash: input.payloadHash, immutableDigest: input.immutableDigest,
+    memberIdentity: input.memberIdentity })).digest('hex')
 }
 
 const productionRuntime = new OpenCodeProductionLaunchRuntime()

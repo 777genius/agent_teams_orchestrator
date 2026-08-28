@@ -504,13 +504,15 @@ export class OpenCodeSessionBridge {
     return host
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
+  async releaseSession(record: Pick<OpenCodeSessionRecord,
+    'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
     await this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      sessionId: record.opencodeSessionId,
     }).catch(() => undefined)
     if (!retainedHostKey) {
       return
@@ -847,6 +849,7 @@ export class OpenCodeSessionBridge {
         teamId: created.record.teamId,
         laneId: created.record.laneId,
         memberName: created.record.memberName,
+        sessionId: created.record.opencodeSessionId,
       }).catch(() => undefined)
       await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
       throw error

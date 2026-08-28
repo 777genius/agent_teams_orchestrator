@@ -7,12 +7,29 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
-import { openCodeLogicalMemberKey } from './OpenCodeLogicalMemberKey.js'
+import {
+  normalizeOpenCodeLogicalMemberIdentity,
+  openCodeLogicalMemberKey,
+  type OpenCodeLogicalMemberIdentity,
+} from './OpenCodeLogicalMemberKey.js'
 
 type SessionStoreShape = {
-  schemaVersion: 1
+  schemaVersion: 2
   records: Record<string, OpenCodeSessionRecord>
+  reservations: Record<string, OpenCodeSessionReservation>
 }
+
+export type OpenCodeSessionReservation = OpenCodeLogicalMemberIdentity & {
+  version: 1
+  logicalMemberKey: string
+  reservationIdentity: string
+  expectedOpencodeSessionId: string
+  createdAt: string
+}
+
+export type OpenCodeSessionReservationResult =
+  | { status: 'reserved' | 'exact'; reservation: OpenCodeSessionReservation }
+  | { status: 'conflict'; reservation?: OpenCodeSessionReservation; record?: OpenCodeSessionRecord }
 
 type UpsertResult = 'created' | 'updated' | 'unchanged'
 
@@ -38,9 +55,15 @@ const LOCK_OPTIONS = {
     maxTimeout: 100,
   },
 }
+const RESERVATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
-  return `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}`
+  return `${record.teamId.trim()}::${(record.laneId ?? 'primary').trim()}::${record.memberName.trim().toLowerCase()}`
+}
+
+function sameLookupIdentity(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+  teamId: string, laneId: string, memberName: string): boolean {
+  return buildRecordKey(record) === buildRecordKey({ teamId, laneId, memberName })
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -88,21 +111,36 @@ export class OpenCodeSessionStore {
   private async readStore(): Promise<SessionStoreShape> {
     if (!(await fileExists(this.filePath))) {
       return {
-        schemaVersion: 1,
+        schemaVersion: 2,
         records: {},
+        reservations: {},
       }
     }
 
     const content = await readFile(this.filePath, 'utf8')
-    const parsed = JSON.parse(content) as SessionStoreShape
-    if (parsed.schemaVersion !== 1 || typeof parsed.records !== 'object' || parsed.records === null) {
-      return {
-        schemaVersion: 1,
-        records: {},
-      }
+    const parsed = JSON.parse(content) as SessionStoreShape | { schemaVersion: 1;
+      records: Record<string, OpenCodeSessionRecord> }
+    if (![1, 2].includes(parsed.schemaVersion) || typeof parsed.records !== 'object' || parsed.records === null) {
+      throw new Error('invalid OpenCode session store')
     }
-
-    return parsed
+    const records: Record<string, OpenCodeSessionRecord> = {}
+    for (const record of Object.values(parsed.records)) {
+      if (!record || typeof record !== 'object') throw new Error('invalid OpenCode session record')
+      const key = buildRecordKey(record)
+      if (records[key] && jsonStringify(records[key]) !== jsonStringify(record)) {
+        throw new Error('conflicting normalized OpenCode session records')
+      }
+      records[key] = record
+    }
+    if (parsed.schemaVersion === 2 && (typeof parsed.reservations !== 'object'
+      || parsed.reservations === null || Array.isArray(parsed.reservations))) {
+      throw new Error('invalid OpenCode session reservations')
+    }
+    const reservations = parsed.schemaVersion === 2 ? parsed.reservations : {}
+    for (const [key, reservation] of Object.entries(reservations)) {
+      validateReservation(key, reservation)
+    }
+    return { schemaVersion: 2, records, reservations }
   }
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
@@ -118,7 +156,8 @@ export class OpenCodeSessionStore {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
     const store = await this.readStore()
-    return store.records[buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })] ?? null
+    return Object.values(store.records).find(record =>
+      sameLookupIdentity(record, teamId, laneId, normalizedMemberName)) ?? null
   }
 
   async upsert(record: OpenCodeSessionRecord): Promise<UpsertResult> {
@@ -126,6 +165,12 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
+
+      const logicalKey = logicalKeyForRecord(record)
+      const reservation = store.reservations[logicalKey]
+      if (!previous && reservation) {
+        throw new Error('OpenCode logical member requires its durable reservation authority')
+      }
 
       if (previous && jsonStringify(previous) === jsonStringify(record)) {
         return 'unchanged'
@@ -148,6 +193,12 @@ export class OpenCodeSessionStore {
         projectIdentity: record.projectPath,
         memberName: record.memberName,
       })
+      const reservation = store.reservations[logicalKey]
+      if (reservation) {
+        const reservedRecord = Object.values(store.records).find(candidate =>
+          logicalKeyForRecord(candidate) === logicalKey)
+        return { status: 'conflict', record: reservedRecord ?? record }
+      }
       const existing = Object.values(store.records).find(candidate =>
         openCodeLogicalMemberKey({
           teamId: candidate.teamId,
@@ -164,6 +215,68 @@ export class OpenCodeSessionStore {
       store.records[key] = record
       await this.writeStore(store)
       return { status: 'inserted', record }
+    })
+  }
+
+  /**
+   * Reserves the normalized logical member under the same durable store lock as
+   * publication. This transition must complete before provider/session effects.
+   */
+  async reserveLogicalMember(logicalMember: OpenCodeLogicalMemberIdentity,
+    reservationIdentity: string, expectedOpencodeSessionId: string): Promise<OpenCodeSessionReservationResult> {
+    if (!RESERVATION_TOKEN.test(reservationIdentity)
+      || !RESERVATION_TOKEN.test(expectedOpencodeSessionId)) {
+      throw new TypeError('invalid OpenCode session reservation identity')
+    }
+    const normalized = normalizeOpenCodeLogicalMemberIdentity(logicalMember)
+    const logicalMemberKey = openCodeLogicalMemberKey(normalized)
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const record = Object.values(store.records).find(candidate => logicalKeyForRecord(candidate) === logicalMemberKey)
+      if (record) {
+        return record.opencodeSessionId === expectedOpencodeSessionId
+          ? { status: 'exact', reservation: store.reservations[logicalMemberKey] ?? {
+            version: 1, logicalMemberKey, ...normalized, reservationIdentity,
+            expectedOpencodeSessionId, createdAt: record.createdAt,
+          } }
+          : { status: 'conflict', record }
+      }
+      const previous = store.reservations[logicalMemberKey]
+      if (previous) {
+        return previous.reservationIdentity === reservationIdentity
+          && previous.expectedOpencodeSessionId === expectedOpencodeSessionId
+          ? { status: 'exact', reservation: previous }
+          : { status: 'conflict', reservation: previous }
+      }
+      const reservation: OpenCodeSessionReservation = {
+        version: 1, logicalMemberKey, ...normalized, reservationIdentity,
+        expectedOpencodeSessionId, createdAt: new Date().toISOString(),
+      }
+      store.reservations[logicalMemberKey] = reservation
+      await this.writeStore(store)
+      return { status: 'reserved', reservation }
+    })
+  }
+
+  /** Publish only through the exact durable reservation and consume it atomically. */
+  async publishReserved(record: OpenCodeSessionRecord,
+    reservationIdentity: string): Promise<OpenCodeSessionPublicationResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const logicalKey = logicalKeyForRecord(record)
+      const reservation = store.reservations[logicalKey]
+      const existing = Object.values(store.records).find(candidate => logicalKeyForRecord(candidate) === logicalKey)
+      if (!reservation || reservation.reservationIdentity !== reservationIdentity
+        || reservation.expectedOpencodeSessionId !== record.opencodeSessionId) {
+        return { status: 'conflict', record: existing ?? record }
+      }
+      if (existing && jsonStringify(existing) !== jsonStringify(record)) {
+        return { status: 'conflict', record: existing }
+      }
+      if (!existing) store.records[buildRecordKey(record)] = record
+      delete store.reservations[logicalKey]
+      await this.writeStore(store)
+      return { status: existing ? 'exact' : 'inserted', record: existing ?? record }
     })
   }
 
@@ -284,3 +397,31 @@ export class OpenCodeSessionStore {
 }
 
 export const openCodeSessionStore = new OpenCodeSessionStore()
+
+function logicalKeyForRecord(record: OpenCodeSessionRecord): string {
+  return openCodeLogicalMemberKey({ teamId: record.teamId, laneId: record.laneId ?? 'primary',
+    projectIdentity: record.projectPath, memberName: record.memberName })
+}
+
+function validateReservation(key: string, value: unknown): asserts value is OpenCodeSessionReservation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid OpenCode session reservation')
+  }
+  const reservation = value as Record<string, unknown>
+  const allowed = ['createdAt', 'expectedOpencodeSessionId', 'laneId', 'logicalMemberKey', 'memberName',
+    'projectIdentity', 'reservationIdentity', 'teamId', 'version']
+  if (Object.keys(reservation).sort().join(',') !== allowed.sort().join(',') || reservation.version !== 1
+    || reservation.logicalMemberKey !== key
+    || !RESERVATION_TOKEN.test(String(reservation.reservationIdentity))
+    || !RESERVATION_TOKEN.test(String(reservation.expectedOpencodeSessionId))
+    || typeof reservation.createdAt !== 'string') {
+    throw new Error('invalid OpenCode session reservation')
+  }
+  const logical = normalizeOpenCodeLogicalMemberIdentity({
+    teamId: String(reservation.teamId), laneId: String(reservation.laneId),
+    projectIdentity: String(reservation.projectIdentity), memberName: String(reservation.memberName),
+  })
+  if (JSON.stringify(logical) !== JSON.stringify({ teamId: reservation.teamId, laneId: reservation.laneId,
+    projectIdentity: reservation.projectIdentity, memberName: reservation.memberName })
+    || openCodeLogicalMemberKey(logical) !== key) throw new Error('invalid OpenCode session reservation')
+}

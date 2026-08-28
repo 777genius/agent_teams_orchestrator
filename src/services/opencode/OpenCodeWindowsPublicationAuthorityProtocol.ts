@@ -3,6 +3,13 @@ export class OpenCodeWindowsPublicationRejectedError extends Error {
   constructor(readonly authorityCode: string) { super('OpenCode Windows publication authority failed [redacted]') }
 }
 
+/** A namespace transition can be committed even when NTFS cannot confirm its directory barrier. */
+export type OpenCodeWindowsNamespaceMutationReply = Readonly<{
+  committed: true
+  namespace: 'complete' | 'partial'
+  durability: 'settled' | 'unknown'
+}>
+
 export type OpenCodeWindowsPublicationRequest =
   | { version: 1; id: string; op: 'OPEN_ROOT'; wait_ms: number; root_path: string; create_missing: boolean; durable_ancestors: boolean }
   | { version: 1; id: string; op: 'VALIDATE_ROOT' | 'SYNC_ROOT' | 'CLOSE'; wait_ms: number }

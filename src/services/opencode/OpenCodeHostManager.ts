@@ -262,6 +262,8 @@ export type OpenCodeHostLeaseInput = {
   sessionId?: string | null
 }
 
+export type OpenCodeHostLeaseReleaseOutcome = 'applied' | 'absent' | 'foreign'
+
 type PersistentHostLeaseRecord = {
   leaseKey: string
   teamId: string
@@ -1492,6 +1494,15 @@ function buildLeaseKey(input: OpenCodeHostLeaseInput, opaque = false): string {
   return opaque ? opaqueLeaseValue(key) : key
 }
 
+function expectedLeaseIdentityValue(
+  value: string | null | undefined,
+  opaque: boolean,
+): string | null | undefined {
+  if (value === undefined) return undefined
+  const normalized = value?.trim() || null
+  return normalized && opaque ? opaqueLeaseValue(normalized) : normalized
+}
+
 function normalizeOpenCodeHostHealthTimeoutMs(timeoutMs?: number | null): number {
   if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
     return OPEN_CODE_HOST_HEALTH_TIMEOUT_MS
@@ -2688,23 +2699,34 @@ export class OpenCodeHostManager {
     })
   }
 
-  async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+  async releaseHostLease(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput,
+  ): Promise<OpenCodeHostLeaseReleaseOutcome> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
-      return
+      return 'absent'
     }
 
-    await this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
-      if (registry.schemaVersion === 1) return
+      if (registry.schemaVersion === 1) return 'absent'
       const record = registry.hosts[hostKey]
       if (!record) {
-        return
+        return 'absent'
       }
-      const leaseKey = buildLeaseKey(input, Boolean(record.scopedIdentity))
+      const opaque = Boolean(record.scopedIdentity)
+      const leaseKey = buildLeaseKey(input, opaque)
       const leases = normalizePersistentHostLeases(record.leases)
-      if (!leases[leaseKey]) {
-        return
+      const lease = leases[leaseKey]
+      if (!lease) {
+        return 'absent'
+      }
+      const expectedRunId = expectedLeaseIdentityValue(input.runId, opaque)
+      const expectedSessionId = expectedLeaseIdentityValue(input.sessionId, opaque)
+      if ((expectedRunId !== undefined && lease.runId !== expectedRunId)
+        || (expectedSessionId !== undefined && lease.sessionId !== expectedSessionId)) {
+        return 'foreign'
       }
       delete leases[leaseKey]
       const nextRecord = canonicalPersistentHostRegistryRecord({
@@ -2724,6 +2746,7 @@ export class OpenCodeHostManager {
           registryReceipt: nextRecord,
         })
       }
+      return 'applied'
     })
   }
 
@@ -3264,14 +3287,17 @@ export class OpenCodeHostManager {
     this.assertCleanupAllowed(controls)
     entry.handle.state = 'disposed'
     const pid = receipt.childPid
-    try {
-      await this.fetchJsonWithTimeout(
-        `${receipt.record.baseUrl}/global/dispose`,
-        OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS,
-        { method: 'POST' },
-      )
-    } catch {
-      // Best effort.
+    const platform = this.deps.platform ?? process.platform
+    if (!(controls.requireStableContainment && platform === 'win32')) {
+      try {
+        await this.fetchJsonWithTimeout(
+          `${receipt.record.baseUrl}/global/dispose`,
+          OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS,
+          { method: 'POST' },
+        )
+      } catch {
+        // POSIX and compatibility cleanup retain best-effort endpoint disposal.
+      }
     }
 
     this.assertCleanupAllowed(controls)
@@ -3280,7 +3306,7 @@ export class OpenCodeHostManager {
         && this.deps.isProcessGroupAlive !== undefined && this.deps.isProcessGroupAlive(pid) === false))
     if (!terminated) {
       terminated = controls.requireStableContainment
-        ? (this.deps.platform ?? process.platform) === 'win32'
+        ? platform === 'win32'
           ? await this.killOwnedChildAndWait(child, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
           : pid !== null && pid !== undefined && await this.killProcessAndWait(
             pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
@@ -3294,7 +3320,7 @@ export class OpenCodeHostManager {
         ? await this.captureEntryContainmentAuthority(entry)
         : true
       terminated = controls.requireStableContainment
-        ? (this.deps.platform ?? process.platform) === 'win32'
+        ? platform === 'win32'
           ? await this.killOwnedChildAndWait(child, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
           : forceContainmentAuthority && pid !== null && pid !== undefined && await this.killProcessAndWait(
             pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS,
@@ -4221,7 +4247,8 @@ export class OpenCodeHostManager {
       throw new Error(`OpenCode host pid ${pid} identity could not be verified; refusing unsafe termination`)
     }
 
-    if (!terminated) {
+    const platform = this.deps.platform ?? process.platform
+    if (!terminated && !(options.requireStableContainment === true && platform === 'win32')) {
       this.assertCleanupAllowed(options)
       try {
         await this.fetchJsonWithTimeout(
@@ -4232,7 +4259,7 @@ export class OpenCodeHostManager {
           },
         )
       } catch {
-        // Best effort.
+        // POSIX and compatibility cleanup retain best-effort endpoint disposal.
       }
     }
 
@@ -4247,7 +4274,7 @@ export class OpenCodeHostManager {
         terminated = true
       } else if (entry?.child?.pid) {
         terminated = options.requireStableContainment === true
-          && (this.deps.platform ?? process.platform) === 'win32'
+          && platform === 'win32'
           ? await this.killOwnedChildAndWait(entry.child, 'SIGTERM',
             OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)
           : await this.killProcessAndWait(
@@ -4283,7 +4310,7 @@ export class OpenCodeHostManager {
         terminated = true
       } else {
         terminated = entry?.child && options.requireStableContainment === true
-          && (this.deps.platform ?? process.platform) === 'win32'
+          && platform === 'win32'
           ? await this.killOwnedChildAndWait(entry.child, 'SIGKILL',
             OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
           : await this.killProcessAndWait(

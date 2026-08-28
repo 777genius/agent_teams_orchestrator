@@ -228,6 +228,7 @@ describe('OpenCodeExecutionProbe', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseHostCount += 1
@@ -2153,6 +2154,7 @@ describe('OpenCodeExecutionProbe', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseHostCount += 1
@@ -2236,7 +2238,7 @@ describe('OpenCodeExecutionProbe', () => {
           return host
         },
         retainHostLease: async () => {},
-        releaseHostLease: async () => {},
+        releaseHostLease: async () => 'applied' as const,
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -2322,6 +2324,7 @@ describe('OpenCodeExecutionProbe', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseHostCount += 1

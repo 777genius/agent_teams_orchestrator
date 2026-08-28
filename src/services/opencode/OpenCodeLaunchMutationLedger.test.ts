@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -64,7 +65,11 @@ describe('OpenCodeLaunchMutationLedger', () => {
         return new OpenCodeLaunchFileJournalPersistence(filePath)
       })
       await ledger.read(target, context())
-      expect(paths).toEqual([join(directory, `${target}.claim`)])
+      expect(paths).toEqual([
+        join(directory, '.logical-member-index-v2'),
+        join(directory, '.logical-member-index-v2'),
+        join(directory, `${target}.claim`),
+      ])
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
@@ -182,4 +187,138 @@ describe('OpenCodeLaunchMutationLedger', () => {
       expect(await ledger.claim(target, next, context())).toBe('claimed')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+
+  test('migrates exact predecessor claimed fixture and fences crash/restart with a distinct claim identity', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-claimed-'))
+    const directory = join(root, 'claims')
+    try {
+      const legacy = await writePredecessorFixture(directory, 'claimed', oid('8'))
+      const contender = { ...identity('123e4567-e89b-42d3-a456-426614174021', 'claim-new'),
+        memberIdentity: oid('9') }
+      const firstRestart = new OpenCodeLaunchMutationLedger(directory)
+      expect(await firstRestart.claim(target, contender, context())).toBe('reconciliation_required')
+      await expect(firstRestart.read(target, context())).rejects.toThrow(
+        'unresolved predecessor launch mutation authority requires reconciliation')
+      const secondRestart = new OpenCodeLaunchMutationLedger(directory)
+      expect(await secondRestart.claim(target, contender, context())).toBe('reconciliation_required')
+      expect(legacy.targetDigest).not.toBe(target)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('a predecessor claim appearing after an initial scan is indexed under lock before a new claim', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-late-'))
+    const directory = join(root, 'claims')
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      expect(await ledger.read(target, context())).toBeNull()
+      await writePredecessorBytes(directory, 'f'.repeat(64), new TextEncoder().encode('{broken'))
+      expect(await ledger.claim(target, identity(
+        '123e4567-e89b-42d3-a456-426614174025', 'claim-after-scan'), context()))
+        .toBe('reconciliation_required')
+      await expect(ledger.read(target, context())).rejects.toThrow(
+        'unresolved predecessor launch mutation authority requires reconciliation')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('migrates exact predecessor claimed and unknown fixtures for the matching old claim identity', async () => {
+    for (const state of ['claimed', 'unknown'] as const) {
+      const root = await mkdtemp(join(process.cwd(), `src/services/opencode/.launch-legacy-${state}-`))
+      const directory = join(root, 'claims')
+      try {
+        const legacy = await writePredecessorFixture(directory, state, memberIdentity)
+        const ledger = new OpenCodeLaunchMutationLedger(directory)
+        const result = await ledger.claim(target, identity(
+          '123e4567-e89b-42d3-a456-426614174022', 'claim-current'), context())
+        expect(result).toBe(state === 'unknown' ? 'unknown' : 'reconciliation_required')
+        expect(await ledger.read(target, context())).toMatchObject({
+          version: 2, targetDigest: target, legacyTargetDigest: legacy.targetDigest, state,
+        })
+      } finally { await rm(root, { recursive: true, force: true }) }
+    }
+  })
+
+  test('reconciles exact predecessor committed fixture by recovery metadata for a distinct current claim identity', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-committed-'))
+    const directory = join(root, 'claims')
+    try {
+      const legacy = await writePredecessorFixture(directory, 'committed', oid('8'))
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const contender = { ...identity('123e4567-e89b-42d3-a456-426614174023', 'claim-current'),
+        memberIdentity: oid('9') }
+      expect(await ledger.claim(target, contender, context())).toBe('already_committed')
+      expect(await ledger.read(target, context())).toMatchObject({
+        version: 2, targetDigest: target, legacyTargetDigest: legacy.targetDigest,
+        idempotencyIdentity: legacy.idempotencyIdentity, state: 'committed',
+      })
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('migrated predecessor known failure preserves exact-authority retry semantics', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-legacy-known-failure-'))
+    const directory = join(root, 'claims')
+    try {
+      const legacy = await writePredecessorFixture(directory, 'known_failure', memberIdentity)
+      const ledger = new OpenCodeLaunchMutationLedger(directory)
+      const retry = { ...identity(legacy.attemptId, 'claim-retry'), payloadHash: legacy.payloadHash,
+        inputDigest: legacy.inputDigest, immutableDigest: legacy.immutableDigest }
+      expect(await ledger.claim(target, retry, context())).toBe('claimed')
+      expect(await ledger.read(target, context())).toMatchObject({
+        version: 2, state: 'claimed', legacyTargetDigest: legacy.targetDigest,
+        claimToken: 'claim-retry',
+      })
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('corrupt and unclassifiable exact predecessor fixtures remain durable global fences', async () => {
+    for (const fixture of ['corrupt', 'committed-without-recovery'] as const) {
+      const root = await mkdtemp(join(process.cwd(), `src/services/opencode/.launch-legacy-${fixture}-`))
+      const directory = join(root, 'claims')
+      try {
+        if (fixture === 'corrupt') {
+          await writePredecessorBytes(directory, 'f'.repeat(64), new TextEncoder().encode('{broken'))
+        } else {
+          const bob = { ...logicalMember, memberName: 'bob' }
+          const legacyIdentity = oid('8')
+          await writePredecessorFixture(directory, 'committed', legacyIdentity, false, bob)
+        }
+        const ledger = new OpenCodeLaunchMutationLedger(directory)
+        expect(await ledger.claim(target, { ...identity(
+          '123e4567-e89b-42d3-a456-426614174024', 'claim-current'), memberIdentity: oid('9') }, context()))
+          .toBe('reconciliation_required')
+        await expect(ledger.read(target, context())).rejects.toThrow(
+          'unresolved predecessor launch mutation authority requires reconciliation')
+      } finally { await rm(root, { recursive: true, force: true }) }
+    }
+  })
 })
+
+async function writePredecessorFixture(directory: string,
+  state: 'claimed' | 'known_failure' | 'unknown' | 'committed', legacyMemberIdentity: OpenCodeOpaqueIdentity,
+  includeRecovery = true, digestLogicalMember = logicalMember) {
+  const targetDigest = createHash('sha256').update(JSON.stringify({ teamId: digestLogicalMember.teamId,
+    laneId: digestLogicalMember.laneId, projectIdentity: digestLogicalMember.projectIdentity,
+    memberIdentity: legacyMemberIdentity })).digest('hex')
+  const idempotencyIdentity = `ses_${targetDigest.slice(0, 26)}`
+  const legacyLinkage = { ...linkage, memberIdentity: legacyMemberIdentity }
+  const legacyRecovery = { ...recovery, sessionRecord: { ...recovery.sessionRecord,
+    opencodeSessionId: idempotencyIdentity } }
+  const record = {
+    version: 1 as const, targetDigest, idempotencyIdentity, state,
+    attemptId: '123e4567-e89b-42d3-a456-426614174020', payloadHash: 'a'.repeat(64),
+    inputDigest: 'b'.repeat(64), immutableDigest: 'c'.repeat(64), generation: 1, fence: 1,
+    acquisitionToken: 'acquisition-legacy', claimToken: 'claim-legacy',
+    memberIdentity: legacyMemberIdentity,
+    ...(state === 'committed' ? { linkage: legacyLinkage,
+      ...(includeRecovery ? { recovery: legacyRecovery } : {}) } : {}),
+  }
+  await writePredecessorBytes(directory, targetDigest,
+    new TextEncoder().encode(JSON.stringify(record)))
+  return record
+}
+
+async function writePredecessorBytes(directory: string, targetDigest: string, bytes: Uint8Array): Promise<void> {
+  const persistence = new OpenCodeLaunchFileJournalPersistence(join(directory, `${targetDigest}.claim`))
+  const fixtureContext = context()
+  const release = await persistence.acquireExclusive(fixtureContext)
+  try { await persistence.replaceAndSync(bytes, fixtureContext) } finally { await release(fixtureContext) }
+}

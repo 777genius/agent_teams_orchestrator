@@ -733,6 +733,7 @@ describe('OpenCodeSessionBridge', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeases.push(input)
+          return 'applied' as const
         },
       },
     })
@@ -744,6 +745,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        sessionId: 'session-1',
       },
     ])
     expect(releaseHostCalls).toBe(0)
@@ -1071,6 +1073,7 @@ describe('OpenCodeSessionBridge', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeases.push(input)
+          return 'applied' as const
         },
       },
       clientFactory: {
@@ -1129,6 +1132,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        sessionId: 'session-new',
       },
     ])
     expect(releaseHostCalls).toBe(1)
@@ -1137,6 +1141,7 @@ describe('OpenCodeSessionBridge', () => {
   test('sends provider-scoped model data when posting a message', async () => {
     const sentBodies: unknown[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1470,6 +1475,7 @@ describe('OpenCodeSessionBridge', () => {
     const observationMarks: string[] = []
     let promptCalls = 0
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1562,6 +1568,7 @@ describe('OpenCodeSessionBridge', () => {
     const promptBodies: unknown[] = []
     const hookEvents: string[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1645,6 +1652,7 @@ describe('OpenCodeSessionBridge', () => {
     })
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1705,6 +1713,7 @@ describe('OpenCodeSessionBridge', () => {
   test('continues prompt_async delivery when prompt id lower-bound fetch fails', async () => {
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1764,6 +1773,7 @@ describe('OpenCodeSessionBridge', () => {
     })
     let promptCalls = 0
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1816,6 +1826,7 @@ describe('OpenCodeSessionBridge', () => {
   test('fails before prompt_async when a high legacy msg id would poison OpenCode ordering', async () => {
     let promptCalls = 0
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},

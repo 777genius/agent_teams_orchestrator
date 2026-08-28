@@ -236,6 +236,7 @@ describe('OpenCodeProvisioningProbe', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseCalls += 1
@@ -350,6 +351,7 @@ describe('OpenCodeProvisioningProbe', () => {
         retainHostLease: async () => {},
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseCalls += 1
@@ -459,6 +461,7 @@ describe('OpenCodeProvisioningProbe', () => {
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
+          return 'applied' as const
         },
         releaseHost: async () => {
           releaseCalls += 1

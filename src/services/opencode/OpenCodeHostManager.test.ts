@@ -807,6 +807,156 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     } finally { await rm(tempDir, { recursive: true, force: true }) }
   })
 
+  test.each([
+    ['clear', false],
+    ['scoped/opaque', true],
+  ] as const)(
+    '%s registry fences a paused stale lease cleanup after replacement and process restart',
+    async (_registryKind, scoped) => {
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-lease-replacement-'))
+      const registryPath = path.join(tempDir, 'registry.json')
+      const ownerKey = Buffer.alloc(32, 12)
+      const pid = scoped ? 45_450 : 45_449
+      const port = scoped ? 44_450 : 44_449
+      const birthToken = `linux:11111111-2222-3333-4444-555555555555:${pid}`
+      const child = createMockChildProcess(pid)
+      let alive = true
+      let endpointMutations = 0
+      const manager = new OpenCodeHostManager({
+        allocateLoopbackPort: async () => port,
+        spawnHostProcess: () => child.child,
+        fetchJson: async url => {
+          if (url.endsWith('/global/health')) {
+            return { status: 200, data: { healthy: true } }
+          }
+          endpointMutations += 1
+          return { status: 200, data: {} }
+        },
+        isProcessAlive: candidate => candidate === pid && alive,
+        isProcessGroupAlive: candidate => candidate === pid && alive,
+        readProcessStartTimeMs: async candidate => candidate === pid && alive ? 12_345 : null,
+        readProcessBirthToken: candidate => candidate === pid && alive ? birthToken : null,
+        killProcess: () => { alive = false },
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+        ...(scoped ? { scopedTransportOwnerKey: ownerKey } : {}),
+      })
+      try {
+        const preparedScopedProfile = scoped
+          ? scopedProfile('launch', { projectPath: tempDir })
+          : null
+        const handle = scoped
+          ? await manager.ensureScopedHost({
+            preparedProfile: preparedScopedProfile!,
+            expectedHostKey: deriveOpenCodeScopedHostKey(preparedScopedProfile!),
+          })
+          : await manager.ensureHost({
+            hostKey: 'clear-host',
+            preparedProfile: { ...baseProfile, projectPath: tempDir },
+          })
+        const identity = { teamId: 'team', laneId: 'lane', memberName: 'member' }
+        await manager.retainHostLease(handle.hostKey, {
+          ...identity, runId: 'run-old', sessionId: 'session-old',
+        })
+
+        // The old cleanup is paused while a new generation commits the same
+        // logical member lease. Its replay happens in a fresh manager process.
+        await manager.retainHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'session-new',
+        })
+        const restarted = new OpenCodeHostManager({
+          persistentRegistryPath: registryPath,
+          ...(scoped ? { scopedTransportOwnerKey: ownerKey } : {}),
+        })
+        await expect(restarted.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-old', sessionId: 'session-old',
+        })).resolves.toBe('foreign')
+        await expect(restarted.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-old', sessionId: 'session-new',
+        })).resolves.toBe('foreign')
+        await expect(restarted.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'session-old',
+        })).resolves.toBe('foreign')
+
+        await expect(manager.disposeHost(handle.hostKey)).rejects.toThrow('durable lease')
+        expect(endpointMutations).toBe(0)
+        expect(alive).toBe(true)
+
+        await expect(manager.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'session-new',
+        })).resolves.toBe('applied')
+        await expect(manager.releaseHostLease(handle.hostKey, {
+          ...identity, runId: 'run-new', sessionId: 'session-new',
+        })).resolves.toBe('absent')
+        await expect(manager.disposeHost(handle.hostKey)).resolves.toBe(true)
+      } finally {
+        await rm(tempDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('Windows stable cleanup never posts dispose across an exit-and-endpoint-rebind window', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-no-dispose-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_451)
+    const ownerKey = Buffer.alloc(32, 13)
+    const birthToken = 'windows:0000000000000125:01d9abcd00000044'
+    let alive = true
+    let endpointOwner: 'owned' | 'foreign' = 'owned'
+    let endpointMutations = 0
+    let nativeTerminations = 0
+    try {
+      const owner = new OpenCodeHostManager({
+        platform: 'win32', allocateLoopbackPort: async () => 44_451,
+        spawnHostProcess: () => child.child,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+        isProcessAlive: candidate => candidate === 45_451 && alive,
+        readProcessStartTimeMs: async candidate => candidate === 45_451 ? 12_349 : null,
+        readProcessBirthToken: candidate => candidate === 45_451 && alive ? birthToken : null,
+        persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+      })
+      const reference = await owner.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const record = JSON.parse(await readFile(registryPath, 'utf8'))
+        .hosts[reference.handle.hostKey]
+      const restarted = new OpenCodeHostManager({
+        platform: 'win32', persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: candidate => candidate === record.pid && alive,
+        readProcessStartTimeMs: async candidate => candidate === record.pid
+          ? record.processStartedAtMs : null,
+        readProcessBirthToken: candidate => candidate === record.pid && alive ? birthToken : null,
+        terminateWindowsProcessGeneration: async () => {
+          nativeTerminations += 1
+          alive = false
+          endpointOwner = 'foreign'
+          return true
+        },
+        fetchJson: async url => {
+          if (url.endsWith('/global/dispose')) {
+            // Deterministically place the old vulnerable request after the
+            // owned generation exited and a foreign server rebound the port.
+            alive = false
+            endpointOwner = 'foreign'
+            endpointMutations += 1
+          }
+          return { status: 200, data: {} }
+        },
+      })
+      await restarted.reconcileHostReleaseReceipt({
+        ...owner.hostReleaseReceipt(reference),
+        receiptId: '47474747-4747-4747-8747-474747474747',
+      })
+      expect(nativeTerminations).toBe(1)
+      expect(endpointOwner).toBe('foreign')
+      expect(endpointMutations).toBe(0)
+      expect(await pathExists(registryPath)).toBe(false)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
   test('every final persistent reference release consumes only the operation reference when a durable member lease exists', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-leased-live-release-'))
     const registryPath = path.join(tempDir, 'registry.json')

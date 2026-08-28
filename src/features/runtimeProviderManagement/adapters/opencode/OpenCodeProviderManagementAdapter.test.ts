@@ -1088,6 +1088,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         releaseHostLease: async (hostKey, lease) => {
           releasedHostLeases.push({ hostKey, lease })
+          return 'applied' as const
         },
         reconcilePersistentHosts: async options => {
           reconcileCalls.push(options)
@@ -1192,6 +1193,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         releaseHostLease: async (_hostKey, lease) => {
           released.push(lease)
+          return 'applied' as const
         },
         reconcilePersistentHosts: async () => {
           throw new Error('registry temporarily unavailable')

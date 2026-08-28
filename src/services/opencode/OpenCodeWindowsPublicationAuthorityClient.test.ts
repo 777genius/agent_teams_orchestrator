@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { OpenCodeWindowsPublicationAuthorityClient } from './OpenCodeWindowsPublicationAuthorityClient.js'
 
-function fake(rejectLockAttempts = 0, exitOnKill = true) {
+function fake(rejectLockAttempts = 0, exitOnKill = true, unknownOperation?: string,
+  partialRemoveAttempts = 0) {
   let controller!: ReadableStreamDefaultController<Uint8Array>; let kills = 0; let closes = 0; const operations: string[] = []; const requests: Record<string, unknown>[] = []
   const materializations = new Set<string>()
   let resolveExit!: (code: number) => void; let exited = false
@@ -10,7 +11,10 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
   const child = { pid: 123, stdout, exited: new Promise<number>(resolve => { resolveExit = resolve }), unref() {},
     kill() { kills += 1; if (exitOnKill) exit(-1) },
     stdin: { end() { closes += 1 }, flush() { return 0 }, write(line: string) {
-      const request = JSON.parse(line); requests.push(request); operations.push(request.op); const value = request.op === 'OPEN_ROOT'
+      const request = JSON.parse(line); requests.push(request); operations.push(request.op)
+      const partialRemove = request.op === 'NS_REMOVE_TREE' && partialRemoveAttempts > 0
+      if (partialRemove) partialRemoveAttempts -= 1
+      const value = request.op === 'OPEN_ROOT'
         ? { volumeSerial: '1', fileId: '2', createdPaths: [] }
         : request.op === 'PIN_REGULAR' || request.op === 'PIN_REGULAR_READONLY'
           ? { volumeSerial: '1', fileId: '3', size: '4' }
@@ -37,6 +41,13 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
                           ? { modifiedAt: 1234 }
                           : request.op === 'NS_RECOVER_ATOMIC'
                             ? { result: 'recovered' }
+                            : request.op === 'NS_RENAME' || request.op === 'NS_UNLINK'
+                              || request.op === 'NS_SYNC_DIRECTORY' || request.op === 'NS_REMOVE_TREE'
+                              ? { committed: true,
+                                  namespace: partialRemove ? 'partial' : 'complete',
+                                  durability: request.op === unknownOperation || partialRemove ? 'unknown' : 'settled' }
+                            : request.op === 'CLOSE'
+                              ? { closed: true, durability: 'settled' }
                             : request.op === 'NS_ACQUIRE_LOCK'
                               ? { token: request.token }
               : request.op === 'WRITE_CHILD_FILE'
@@ -547,6 +558,27 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(process.operations).toEqual(['OPEN_ROOT', 'NS_LIST', 'NS_MODIFIED_AT', 'NS_RECOVER_ATOMIC',
       'NS_PUBLISH_IMMUTABLE', 'NS_REMOVE_TREE', 'NS_ACQUIRE_LOCK', 'NS_RELEASE_LOCK', 'CLOSE'])
     expect(process.requests[4]).toMatchObject({ path: 'nested/evidence.json', content_base64: 'AQID' })
+  })
+  test('treats committed durability-unknown as committed and clears it after a later barrier', async () => {
+    const process = fake(0, true, 'NS_RENAME'); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: Date.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.namespaceRename('old', 'new')).resolves.toBeUndefined()
+    expect(client.namespaceDurabilityUnknown).toBe(true)
+    await expect(client.namespaceSyncDirectory('.')).resolves.toBeUndefined()
+    expect(client.namespaceDurabilityUnknown).toBe(false)
+    await client.close()
+  })
+  test('continues a committed partial tree transition at the retained old root', async () => {
+    const process = fake(0, true, undefined, 2); const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: Date.now() + 5_000, launch: () => process.child,
+    })
+    await client.openRoot('C:\\safe', false, false)
+    await expect(client.namespaceRemoveTree('nested/retired')).resolves.toBeUndefined()
+    expect(process.operations).toEqual(['OPEN_ROOT', 'NS_REMOVE_TREE', 'NS_REMOVE_TREE', 'NS_REMOVE_TREE'])
+    expect(client.namespaceDurabilityUnknown).toBe(false)
+    await client.close()
   })
   test('rejects malformed retained namespace paths without writing protocol frames', async () => {
     const process = fake(); const client = new OpenCodeWindowsPublicationAuthorityClient({

@@ -390,7 +390,7 @@ export function recoverOpenCodeCommittedMemberLinkage(
     || claim.generation !== input.generation || claim.fence !== input.fence
     || claim.claimToken !== input.claimToken || claim.memberIdentity !== input.memberIdentity
     || !claim.claimToken.startsWith(`${claim.acquisitionToken}.`)
-    || claim.idempotencyIdentity !== deterministicSessionId(claim.targetDigest)) return null
+    || claim.idempotencyIdentity !== deterministicSessionId(claim.legacyTargetDigest ?? claim.targetDigest)) return null
 
   const expectedTitle = deterministicOwnershipTitle(claim)
   const committedRecord = claim.recovery.sessionRecord

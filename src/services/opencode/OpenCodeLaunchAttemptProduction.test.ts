@@ -930,15 +930,16 @@ test('restart migrates the exact-head proof record and refuses reconciliation th
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('production wiring rejects a durable member intent backed only by a same-name projection', async () => {
+test('production wiring uses normalized Alice lookup and rejects intent without exact mutation authority before effects', async () => {
   const fixture = await productionRecoveryHarness()
   try {
     const seeded = await fixture.seedIntent()
-    await fixture.sessionStore.upsert(seeded.record)
+    const caseVariant = { ...seeded.record, memberName: 'Alice' }
+    await fixture.sessionStore.upsert(caseVariant)
 
     await expect(fixture.bridge.execute(fixture.command)).rejects.toThrow('explicit reconciliation')
     expect(fixture.memberCreates()).toBe(0)
-    expect(await fixture.sessionStore.get('team', 'primary', 'alice')).toEqual(seeded.record)
+    expect(await fixture.sessionStore.get('team', 'primary', 'alice')).toEqual(caseVariant)
     const journal = await fixture.inspectJournal()
     expect(journal?.events.map(event => event.type)).not.toContain('member_reconciled_applied')
   } finally { await fixture.dispose() }
@@ -1153,6 +1154,18 @@ test('projection failpoints preserve authoritative ordering before and after the
     expect(order.includes('projection')).toBe(point === 'after_projection')
     if (point === 'after_projection') expect(order.at(-2)).toBe('projection')
   }
+})
+
+test('post-commit normalized projection conflict never returns committed success and retains durable authority', async () => {
+  const order: string[] = []
+  let durableCommitted = false
+  await expect(commitOpenCodeMemberProjection({
+    commit: async () => { order.push('commit'); durableCommitted = true; return 'committed' },
+    onCommitted: () => { order.push('durable-authority') },
+    upsert: async () => { order.push('projection-conflict'); throw new Error('normalized projection conflict') },
+  })).rejects.toThrow('normalized projection conflict')
+  expect(order).toEqual(['commit', 'durable-authority', 'projection-conflict'])
+  expect(durableCommitted).toBe(true)
 })
 
 test('committed projection recovery reports absent, mismatched and foreign remote truth without adoption', async () => {
@@ -1387,23 +1400,32 @@ test('member cleanup replay uses only journaled host identity and never starts f
 async () => {
   let ensured = 0
   let recovered = 0
+  let released = 0
   let recoveredBirthToken: string | undefined
+  let retainedAccess: 'unresolved' | 'absent' = 'unresolved'
   const manager = {
     ensureScopedHostReference: async () => { ensured += 1; throw new Error('must not provision') },
     releaseHostReference: async () => {},
     hasExactRetainedHostReleaseCapability: () => false,
     retainHostLease: async () => {},
-    releaseHostLease: async () => {},
+    releaseHostLease: async () => { released += 1; return 'foreign' as const },
     reconcileHostReleaseReceipt: async () => {},
     withRetainedHostAccess: async (identity: { processBirthToken?: string }) => {
       recovered += 1
       recoveredBirthToken = identity.processBirthToken
-      return { status: 'unresolved' as const }
+      return { status: retainedAccess }
     },
   } as unknown as OpenCodeHostManager
   const harness = await productionRecoveryHarness(manager)
   try {
-    await harness.seedIntent({ acceptedProof: true })
+    const seeded = await harness.seedIntent({ acceptedProof: true })
+    const reservationIdentity = 'union-cleanup-reservation'
+    expect((await harness.sessionStore.reserveLogicalMember({
+      teamId: 'team', laneId: 'primary', projectIdentity: harness.command.projectPath,
+      memberName: 'Alice',
+    }, reservationIdentity, harness.sessionId)).status).toBe('reserved')
+    expect((await harness.sessionStore.publishReserved(
+      seeded.record, reservationIdentity)).status).toBe('inserted')
     const basis = harness.acceptedProof()
     const failure = { code: 'pre_side_effect_transport' as const, origin: 'session' as const,
       retryDisposition: 'automatic' as const, retryable: true,
@@ -1437,14 +1459,30 @@ async () => {
       .launchAttempt
     expect(launchAttempt?.members.cleanupPending).toEqual([harness.memberIdentity])
     expect({ ensured, recovered, remoteReads: harness.remoteReads(),
-      memberCreates: harness.memberCreates(), recoveredBirthToken })
-      .toEqual({ ensured: 0, recovered: 1, remoteReads: 0, memberCreates: 0,
+      memberCreates: harness.memberCreates(), recoveredBirthToken, released })
+      .toEqual({ ensured: 0, recovered: 1, remoteReads: 0, memberCreates: 0, released: 0,
         recoveredBirthToken: 'windows:0000000000000123:01d9abcd000001bb' })
     expect(await harness.inspectJournal()).toMatchObject({ cleanupState: 'incomplete',
       memberCleanupObligations: [{ memberIdentity: harness.memberIdentity, phase: 'remote' }],
       finalResponse: { members: { cleanupPending: [harness.memberIdentity] } } })
+
+    // A later restart can prove the exact remote is absent. The normalized
+    // reserved projection is then removed, while a foreign replacement lease
+    // disposition is terminal and advances the durable cleanup obligation.
+    retainedAccess = 'absent'
+    await harness.bridge.execute(harness.command)
+    expect({ ensured, recovered, released, projection:
+      await harness.sessionStore.get('team', 'primary', 'ALICE') })
+      .toEqual({ ensured: 0, recovered: 2, released: 1, projection: null })
+    expect(await harness.inspectJournal()).toMatchObject({
+      // Member cleanup is durably complete even though the independent host
+      // receipt remains unavailable, so aggregate cleanup stays incomplete.
+      cleanupState: 'incomplete',
+      memberCleanupObligations: [{ memberIdentity: harness.memberIdentity, phase: 'complete' }],
+      acceptedProofResponse: { members: { cleanupPending: [] } },
+    })
   } finally { await harness.dispose() }
-})
+}, 15_000)
 
 test.each(['kiro', 'cursor-acp'] as const)(
   'production-composed %s authorization and native exec stay behind every unsafe tokenless-v1 state',
@@ -2043,7 +2081,7 @@ async function committedRecoveryFixture() {
       injectionVerifiedAt: now, model: 'openrouter/model', agent: 'teammate-bootstrap' }, createdAt: now, updatedAt: now }
   const linkage = linkageForTest(memberIdentity, record)
   const logicalMember = { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' }
-  const claim = { version: 1 as const, targetDigest, logicalMemberKey: targetDigest, logicalMember,
+  const claim = { version: 2 as const, targetDigest, logicalMemberKey: targetDigest, logicalMember,
     idempotencyIdentity: sessionId,
     state: 'committed' as const, attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
     immutableDigest: 'c'.repeat(64),

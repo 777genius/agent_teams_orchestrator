@@ -188,12 +188,35 @@ struct RetainedWindowsRoot {
         std::fs::File,
         crate::windows_identity::FileIdentity,
     )>,
+    pending_namespace_settlements: Vec<PendingNamespaceSettlement>,
 }
 
 struct NamespaceTreeRemoval {
     key: String,
     file: std::fs::File,
     parent: std::fs::File,
+}
+
+#[derive(Clone, Copy)]
+enum NamespaceFlushBoundary {
+    RenameSource,
+    RenameDestination,
+    UnlinkParent,
+    RemoveTreeParent,
+}
+
+struct PendingNamespaceBarrier {
+    directory: std::fs::File,
+    boundary: NamespaceFlushBoundary,
+}
+
+/// A kernel namespace transition is irreversible even when its durability
+/// barrier subsequently fails. Keep the exact transitioned objects and every
+/// directory barrier alive until a later request (or CLOSE) settles them.
+struct PendingNamespaceSettlement {
+    custody: Vec<std::fs::File>,
+    barriers: Vec<PendingNamespaceBarrier>,
+    next_barrier: usize,
 }
 
 struct AtomicPublication {
@@ -253,18 +276,38 @@ thread_local! {
     static NAMESPACE_MUTATION_FAILPOINT: std::cell::RefCell<Option<&'static str>> = const {
         std::cell::RefCell::new(None)
     };
+    static NAMESPACE_MUTATION_FAILPOINT_SKIP: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
 fn fail_namespace_mutation_boundary(boundary: &'static str) -> Result<(), &'static str> {
     NAMESPACE_MUTATION_FAILPOINT.with(|point| {
         if point.borrow().as_ref() == Some(&boundary) {
+            if NAMESPACE_MUTATION_FAILPOINT_SKIP.with(|skip| {
+                let remaining = skip.get();
+                if remaining > 0 {
+                    skip.set(remaining - 1);
+                    true
+                } else {
+                    false
+                }
+            }) {
+                return Ok(());
+            }
             point.replace(None);
             Err("INJECTED_NAMESPACE_FAILURE")
         } else {
             Ok(())
         }
     })
+}
+
+#[cfg(test)]
+fn set_namespace_mutation_failpoint(boundary: &'static str, skip: usize) {
+    NAMESPACE_MUTATION_FAILPOINT.with(|point| point.replace(Some(boundary)));
+    NAMESPACE_MUTATION_FAILPOINT_SKIP.with(|remaining| remaining.set(skip));
 }
 
 #[cfg(not(test))]
@@ -700,6 +743,90 @@ impl RetainedWindowsRoot {
         Ok(json!({}))
     }
 
+    fn settle_pending_namespace_durability(&mut self) -> bool {
+        while let Some(settlement) = self.pending_namespace_settlements.first_mut() {
+            while settlement.next_barrier < settlement.barriers.len() {
+                let barrier = &settlement.barriers[settlement.next_barrier];
+                let (before, after) = match barrier.boundary {
+                    NamespaceFlushBoundary::RenameSource => (
+                        "rename_before_source_parent_flush",
+                        "rename_after_source_parent_flush",
+                    ),
+                    NamespaceFlushBoundary::RenameDestination => (
+                        "rename_before_destination_parent_flush",
+                        "rename_after_destination_parent_flush",
+                    ),
+                    NamespaceFlushBoundary::UnlinkParent => {
+                        ("unlink_before_parent_flush", "unlink_after_parent_flush")
+                    }
+                    NamespaceFlushBoundary::RemoveTreeParent => (
+                        "remove_tree_before_parent_flush",
+                        "remove_tree_after_parent_flush",
+                    ),
+                };
+                if fail_namespace_mutation_boundary(before).is_err()
+                    || crate::windows_identity::flush_directory(&barrier.directory).is_err()
+                    || fail_namespace_mutation_boundary(after).is_err()
+                {
+                    return false;
+                }
+                settlement.next_barrier += 1;
+            }
+            // Removal is non-fallible. Dropping exact transitioned objects is
+            // permitted only after all of their directory barriers settled.
+            self.pending_namespace_settlements.remove(0);
+        }
+        true
+    }
+
+    fn namespace_commit_result(&mut self, complete: bool) -> Result<Value, &'static str> {
+        Ok(
+            json!({"committed":true,"namespace":if complete { "complete" } else { "partial" },"durability":
+                if complete && self.settle_pending_namespace_durability() { "settled" } else { "unknown" }
+            }),
+        )
+    }
+
+    fn detach_namespace_key_into(&mut self, key: &str, custody: &mut Vec<std::fs::File>) {
+        self.detach_namespace_matching_into(key, "", custody);
+    }
+
+    fn detach_namespace_matching_into(
+        &mut self,
+        key: &str,
+        descendant_prefix: &str,
+        custody: &mut Vec<std::fs::File>,
+    ) {
+        let mut index = 0;
+        while index < self.namespace_handles.len() {
+            if self.namespace_handles[index].1 == key
+                || (!descendant_prefix.is_empty()
+                    && self.namespace_handles[index]
+                        .1
+                        .starts_with(descendant_prefix))
+            {
+                let (_, _, file, _, _) = self.namespace_handles.swap_remove(index);
+                custody.push(file);
+            } else {
+                index += 1;
+            }
+        }
+        let mut index = 0;
+        while index < self.namespace_directories.len() {
+            if self.namespace_directories[index].0 == key
+                || (!descendant_prefix.is_empty()
+                    && self.namespace_directories[index]
+                        .0
+                        .starts_with(descendant_prefix))
+            {
+                let (_, file, _) = self.namespace_directories.swap_remove(index);
+                custody.push(file);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn namespace_rename(&mut self, from: &str, to: &str) -> Result<Value, &'static str> {
         let (from_parent, from_name) = Self::namespace_parent(from)?;
         let (to_parent, to_name) = Self::namespace_parent(to)?;
@@ -757,38 +884,78 @@ impl RetainedWindowsRoot {
         {
             return Err("NS_EXISTS");
         }
+        // Every allocation and handle duplication needed by the committed
+        // state is completed before SetFileInformationByHandle changes the
+        // namespace. Applying these prepared values below cannot fail.
+        let descendant_prefix = format!("{from}/");
+        let mut rewritten_handles = Vec::new();
+        let mut rewritten_directories = Vec::new();
+        for (index, (_, key, _, _, _)) in self.namespace_handles.iter().enumerate() {
+            if key == from {
+                rewritten_handles.push((index, to.to_string()));
+            } else if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
+                rewritten_handles.push((index, format!("{to}/{suffix}")));
+            }
+        }
+        for (index, (key, _, _)) in self.namespace_directories.iter().enumerate() {
+            if key == from {
+                rewritten_directories.push((index, to.to_string()));
+            } else if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
+                rewritten_directories.push((index, format!("{to}/{suffix}")));
+            }
+        }
+        let new_directory_key = if retained_index.is_none() && source_is_directory {
+            Some(to.to_string())
+        } else {
+            None
+        };
+        let custody = source.try_clone().map_err(|_| "FILE_REJECTED")?;
+        let mut settlement = PendingNamespaceSettlement {
+            custody: Vec::with_capacity(1),
+            barriers: Vec::with_capacity(if from_parent == to_parent { 1 } else { 2 }),
+            next_barrier: 0,
+        };
+        settlement.custody.push(custody);
+        settlement.barriers.push(PendingNamespaceBarrier {
+            directory: source_parent,
+            boundary: NamespaceFlushBoundary::RenameSource,
+        });
+        if from_parent != to_parent {
+            settlement.barriers.push(PendingNamespaceBarrier {
+                directory: destination_parent,
+                boundary: NamespaceFlushBoundary::RenameDestination,
+            });
+        }
+        self.pending_namespace_settlements.reserve(1);
+        if new_directory_key.is_some() {
+            self.namespace_directories.reserve(1);
+        }
         crate::windows_identity::rename_relative(
             &source,
-            &destination_parent,
+            &settlement
+                .barriers
+                .last()
+                .expect("rename has a destination parent")
+                .directory,
             Path::new(to_name),
             !source_is_directory,
         )
         .map_err(|_| "FILE_REJECTED")?;
-        if let Some(index) = retained_index {
-            self.namespace_directories[index].0 = to.to_string();
-        } else if source_is_directory {
+        for (index, key) in rewritten_handles {
+            self.namespace_handles[index].1 = key;
+        }
+        for (index, key) in rewritten_directories {
+            self.namespace_directories[index].0 = key;
+        }
+        if let Some(key) = new_directory_key {
             self.namespace_directories
-                .push((to.to_string(), source, source_identity));
+                .push((key, source, source_identity));
         }
-        crate::windows_identity::flush_directory(&source_parent).map_err(|_| "FILE_REJECTED")?;
-        if from_parent != to_parent {
-            crate::windows_identity::flush_directory(&destination_parent)
-                .map_err(|_| "FILE_REJECTED")?;
+        self.pending_namespace_settlements.push(settlement);
+        if fail_namespace_mutation_boundary("rename_after_transition").is_err() {
+            return Ok(json!({"committed":true,"namespace":"complete","durability":"unknown"}));
         }
-        let descendant_prefix = format!("{from}/");
-        for (_, key, _, _, _) in &mut self.namespace_handles {
-            if key == from {
-                *key = to.to_string();
-            } else if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
-                *key = format!("{to}/{suffix}");
-            }
-        }
-        for (key, _, _) in &mut self.namespace_directories {
-            if let Some(suffix) = key.strip_prefix(&descendant_prefix) {
-                *key = format!("{to}/{suffix}");
-            }
-        }
-        Ok(json!({}))
+        self.namespace_commit_result(true)
     }
 
     fn namespace_unlink(&mut self, path: &str, directory: bool) -> Result<Value, &'static str> {
@@ -820,6 +987,28 @@ impl RetainedWindowsRoot {
             crate::windows_identity::open_relative_file(&parent, Path::new(name))
                 .map_err(|_| "FILE_REJECTED")?
         };
+        let descendant_prefix = format!("{path}/");
+        let custody_capacity = 1
+            + self
+                .namespace_handles
+                .iter()
+                .filter(|(_, key, _, _, _)| key == path || key.starts_with(&descendant_prefix))
+                .count()
+            + self
+                .namespace_directories
+                .iter()
+                .filter(|(key, _, _)| key == path || key.starts_with(&descendant_prefix))
+                .count();
+        let mut settlement = PendingNamespaceSettlement {
+            custody: Vec::with_capacity(custody_capacity),
+            barriers: Vec::with_capacity(1),
+            next_barrier: 0,
+        };
+        settlement.barriers.push(PendingNamespaceBarrier {
+            directory: parent,
+            boundary: NamespaceFlushBoundary::UnlinkParent,
+        });
+        self.pending_namespace_settlements.reserve(1);
         crate::windows_identity::delete_on_close(&file).map_err(|_| {
             if directory {
                 "NS_NOT_EMPTY"
@@ -827,18 +1016,25 @@ impl RetainedWindowsRoot {
                 "FILE_REJECTED"
             }
         })?;
-        self.namespace_directories
-            .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
-        drop(file);
-        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
-        Ok(json!({}))
+        // SetFileInformationByHandle has committed. From here to the reply all
+        // state changes are capacity-prepared moves with no fallible syscall.
+        settlement.custody.push(file);
+        self.detach_namespace_matching_into(path, &descendant_prefix, &mut settlement.custody);
+        self.pending_namespace_settlements.push(settlement);
+        if fail_namespace_mutation_boundary("unlink_after_transition").is_err() {
+            return Ok(json!({"committed":true,"namespace":"complete","durability":"unknown"}));
+        }
+        self.namespace_commit_result(true)
     }
 
     fn namespace_sync_directory(&mut self, path: &str) -> Result<Value, &'static str> {
+        if !self.settle_pending_namespace_durability() {
+            return Ok(json!({"committed":true,"namespace":"complete","durability":"unknown"}));
+        }
         let (directory, identity) = self.namespace_directory(path)?;
         validate_retained_directory(&directory, identity)?;
         crate::windows_identity::flush_directory(&directory).map_err(|_| "FILE_REJECTED")?;
-        Ok(json!({}))
+        Ok(json!({"committed":true,"namespace":"complete","durability":"settled"}))
     }
 
     fn namespace_list(&mut self, path: &str) -> Result<Value, &'static str> {
@@ -1030,22 +1226,47 @@ impl RetainedWindowsRoot {
         let mut removals = Vec::new();
         self.collect_tree_removals(&parent, name, path, 0, &mut removals)?;
         fail_namespace_mutation_boundary("remove_tree_before_transition")?;
-        // Postorder means every child transition is confirmed before its
-        // parent is attempted. The exact retained file object stays in the
-        // authority vectors until its own delete disposition succeeds; the
-        // still-retained tree root continues denying competing writers across
-        // any descendant failure.
-        for removal in removals {
-            crate::windows_identity::delete_on_close(&removal.file).map_err(|_| "FILE_REJECTED")?;
-            self.namespace_handles
-                .retain(|(_, key, _, _, _)| key != &removal.key);
-            self.namespace_directories
-                .retain(|(key, _, _)| key != &removal.key);
-            drop(removal.file);
-            crate::windows_identity::flush_directory(&removal.parent)
-                .map_err(|_| "FILE_REJECTED")?;
+        let custody_capacity =
+            removals.len() + self.namespace_handles.len() + self.namespace_directories.len();
+        let mut settlement = PendingNamespaceSettlement {
+            custody: Vec::with_capacity(custody_capacity),
+            barriers: Vec::with_capacity(removals.len()),
+            next_barrier: 0,
+        };
+        self.pending_namespace_settlements.reserve(1);
+        let mut committed = false;
+        // Postorder confirms each child before its parent. After every kernel
+        // transition, the exact objects leave the visible maps and enter the
+        // prepared settlement custody before any failpoint or flush can fail.
+        let mut removals = removals.into_iter().peekable();
+        while let Some(removal) = removals.next() {
+            if crate::windows_identity::delete_on_close(&removal.file).is_err() {
+                if committed {
+                    self.pending_namespace_settlements.push(settlement);
+                    return Ok(
+                        json!({"committed":true,"namespace":"partial","durability":"unknown"}),
+                    );
+                }
+                return Err("FILE_REJECTED");
+            }
+            committed = true;
+            let key = removal.key;
+            settlement.custody.push(removal.file);
+            self.detach_namespace_key_into(&key, &mut settlement.custody);
+            settlement.barriers.push(PendingNamespaceBarrier {
+                directory: removal.parent,
+                boundary: NamespaceFlushBoundary::RemoveTreeParent,
+            });
+            if fail_namespace_mutation_boundary("remove_tree_after_transition").is_err() {
+                let complete = removals.peek().is_none();
+                self.pending_namespace_settlements.push(settlement);
+                return Ok(
+                    json!({"committed":true,"namespace":if complete { "complete" } else { "partial" },"durability":"unknown"}),
+                );
+            }
         }
-        Ok(json!({}))
+        self.pending_namespace_settlements.push(settlement);
+        self.namespace_commit_result(true)
     }
 
     fn namespace_acquire_lock(
@@ -1193,6 +1414,7 @@ impl RetainedWindowsRoot {
             namespace_directories: Vec::new(),
             namespace_handles: Vec::new(),
             namespace_locks: Vec::new(),
+            pending_namespace_settlements: Vec::new(),
         };
         for recovery_name in recovery_names {
             if !valid_leaf(&recovery_name) {
@@ -1310,6 +1532,7 @@ impl RetainedWindowsRoot {
             namespace_directories: Vec::new(),
             namespace_handles: Vec::new(),
             namespace_locks: Vec::new(),
+            pending_namespace_settlements: Vec::new(),
         };
         root.validate()?;
         Ok((root, created))
@@ -3318,13 +3541,26 @@ pub fn run() {
                 false,
             ),
             Request::CLOSE { .. } => match root.as_mut().ok_or("ROOT_REQUIRED").and_then(|value| {
+                // Retry committed namespace barriers before any unrelated
+                // close cleanup can fail. Exact custody remains held if a
+                // later cleanup rejects and the authority stays alive.
+                let durable = value.settle_pending_namespace_durability();
                 value
                     .mark_recovery_required()
                     .and_then(|_| value.release_all_namespace_locks())
+                    .map(|_| durable)
             }) {
-                Ok(_) => {
+                Ok(durable) => {
+                    // CLOSE is the deterministic final custody boundary. It
+                    // retries pending barriers once, reports any remaining
+                    // uncertainty distinctly, then drops all exact handles.
                     root.take();
-                    (Ok(json!({"closed":true})), true)
+                    (
+                        Ok(json!({"closed":true,"durability":
+                            if durable { "settled" } else { "unknown" }
+                        })),
+                        true,
+                    )
                 }
                 Err(error) => (Err(error), false),
             },
@@ -3507,8 +3743,7 @@ mod protocol_tests {
         authority.namespace_mkdir("staging/owned-child").unwrap();
         let retained = retained_directory_raw_handle(&authority, "staging");
 
-        NAMESPACE_MUTATION_FAILPOINT
-            .with(|point| point.replace(Some("remove_tree_before_transition")));
+        set_namespace_mutation_failpoint("remove_tree_before_transition", 0);
         assert_eq!(
             authority.namespace_remove_tree("staging"),
             Err("INJECTED_NAMESPACE_FAILURE")
@@ -3524,6 +3759,167 @@ mod protocol_tests {
         assert_namespace_path_released(&authority, "staging");
         drop(authority);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespace_rename_across_parents_rekeys_nested_custody_before_durability_failures() {
+        for boundary in [
+            "rename_after_transition",
+            "rename_before_source_parent_flush",
+            "rename_after_source_parent_flush",
+            "rename_before_destination_parent_flush",
+            "rename_after_destination_parent_flush",
+        ] {
+            let root = fixture_root(&format!("namespace-rename-committed-{boundary}"));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority.namespace_mkdir("source-parent").unwrap();
+            authority.namespace_mkdir("destination-parent").unwrap();
+            authority.namespace_mkdir("source-parent/tree").unwrap();
+            authority
+                .namespace_mkdir("source-parent/tree/nested")
+                .unwrap();
+            authority
+                .namespace_open(
+                    "source-parent/tree/nested",
+                    "00000000-0000-4000-8000-000000000443",
+                    "directory",
+                )
+                .unwrap();
+
+            set_namespace_mutation_failpoint(boundary, 0);
+            assert_eq!(
+                authority
+                    .namespace_rename("source-parent/tree", "destination-parent/moved")
+                    .unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":"unknown"})
+            );
+            assert!(!root.join("source-parent/tree").exists());
+            assert!(root.join("destination-parent/moved/nested").is_dir());
+            assert_namespace_path_released(&authority, "source-parent/tree");
+            assert!(authority
+                .namespace_directories
+                .iter()
+                .any(|(key, _, _)| key == "destination-parent/moved/nested"));
+            assert!(authority
+                .namespace_handles
+                .iter()
+                .any(|(_, key, _, _, _)| key == "destination-parent/moved/nested"));
+            assert_eq!(authority.pending_namespace_settlements.len(), 1);
+            assert!(!authority.pending_namespace_settlements[0]
+                .custody
+                .is_empty());
+
+            assert_eq!(
+                authority.namespace_sync_directory(".").unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":"settled"})
+            );
+            assert!(authority.pending_namespace_settlements.is_empty());
+            authority
+                .namespace_remove_tree("destination-parent/moved")
+                .unwrap();
+            authority.namespace_unlink("source-parent", true).unwrap();
+            authority
+                .namespace_unlink("destination-parent", true)
+                .unwrap();
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_unlink_committed_unknown_retains_exact_object_until_retry() {
+        for boundary in [
+            "unlink_after_transition",
+            "unlink_before_parent_flush",
+            "unlink_after_parent_flush",
+        ] {
+            let root = fixture_root(&format!("namespace-unlink-committed-{boundary}"));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority
+                .namespace_open(
+                    "victim",
+                    "00000000-0000-4000-8000-000000000444",
+                    "create_file",
+                )
+                .unwrap();
+            let retained = authority.namespace_handles[0].3;
+            authority
+                .namespace_close_handle("00000000-0000-4000-8000-000000000444")
+                .unwrap();
+
+            set_namespace_mutation_failpoint(boundary, 0);
+            assert_eq!(
+                authority.namespace_unlink("victim", false).unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":"unknown"})
+            );
+            assert!(!root.join("victim").exists());
+            assert_namespace_path_released(&authority, "victim");
+            assert!(authority.pending_namespace_settlements[0]
+                .custody
+                .iter()
+                .any(|file| crate::windows_identity::file_identity(file).unwrap() == retained));
+
+            assert_eq!(
+                authority.namespace_sync_directory(".").unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":"settled"})
+            );
+            assert!(authority.pending_namespace_settlements.is_empty());
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_remove_tree_nested_transitions_retain_custody_through_parent_flush_retry() {
+        for (boundary, skip) in [
+            "remove_tree_after_transition",
+            "remove_tree_before_parent_flush",
+            "remove_tree_after_parent_flush",
+        ]
+        .into_iter()
+        .flat_map(|boundary| (0..3).map(move |skip| (boundary, skip)))
+        {
+            let root = fixture_root(&format!(
+                "namespace-remove-tree-committed-{boundary}-{skip}"
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority.namespace_mkdir("tree").unwrap();
+            authority.namespace_mkdir("tree/child").unwrap();
+            authority.namespace_mkdir("tree/child/grandchild").unwrap();
+
+            set_namespace_mutation_failpoint(boundary, skip);
+            assert_eq!(
+                authority.namespace_remove_tree("tree").unwrap(),
+                json!({"committed":true,"namespace":
+                    if boundary == "remove_tree_after_transition" && skip < 2 {
+                        "partial"
+                    } else {
+                        "complete"
+                    },"durability":"unknown"})
+            );
+            assert_eq!(authority.pending_namespace_settlements.len(), 1);
+            assert!(!authority.pending_namespace_settlements[0]
+                .custody
+                .is_empty());
+
+            if root.join("tree").exists() {
+                // An immediate child failpoint makes remove_tree a committed
+                // partial transition. Retry uses the still-retained old root.
+                authority.namespace_remove_tree("tree").unwrap();
+            }
+            assert!(!root.join("tree").exists());
+            assert_namespace_path_released(&authority, "tree");
+            assert_eq!(
+                authority.namespace_sync_directory(".").unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":"settled"})
+            );
+            assert!(authority.pending_namespace_settlements.is_empty());
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

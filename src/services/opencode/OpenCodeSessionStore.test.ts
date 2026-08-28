@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -63,6 +63,80 @@ describe('OpenCodeSessionStore', () => {
     expect(outcomes.filter(outcome => outcome.status === 'inserted')).toHaveLength(1)
     expect(outcomes.filter(outcome => outcome.status === 'conflict')).toHaveLength(1)
     expect(await first.list()).toHaveLength(1)
+  })
+
+  test('uses normalized member lookup consistently for legacy Alice versus alice records', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 1, records: {
+      'team-a::primary::Alice': { ...baseRecord, memberName: 'Alice' },
+    } }))
+    const store = new OpenCodeSessionStore(filePath)
+    expect(await store.get('team-a', 'primary', 'alice')).toMatchObject({ memberName: 'Alice' })
+    expect(await store.get('team-a', 'primary', ' ALICE ')).toMatchObject({ memberName: 'Alice' })
+  })
+
+  test('atomically reserves normalized logical member before effects and fences a restart contender', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const first = new OpenCodeSessionStore(filePath)
+    const second = new OpenCodeSessionStore(filePath)
+    const alice = { teamId: 'team-a', laneId: 'primary', projectIdentity: '/tmp/project', memberName: 'Alice' }
+    const normalized = { ...alice, memberName: ' alice ', projectIdentity: '/tmp/other/../project' }
+    const outcomes = await Promise.all([
+      first.reserveLogicalMember(alice, 'reservation-a', 'session-a'),
+      second.reserveLogicalMember(normalized, 'reservation-b', 'session-b'),
+    ])
+    expect(outcomes.filter(outcome => outcome.status === 'reserved')).toHaveLength(1)
+    expect(outcomes.filter(outcome => outcome.status === 'conflict')).toHaveLength(1)
+    const winner = outcomes.find(outcome => outcome.status === 'reserved')!
+    const restarted = new OpenCodeSessionStore(filePath)
+    expect((await restarted.reserveLogicalMember(normalized, 'reservation-c', 'session-c')).status)
+      .toBe('conflict')
+    expect(await restarted.list()).toEqual([])
+    expect(winner.status).toBe('reserved')
+  })
+
+  test('crash after remote effect reuses exact reservation and publishes only its exact session', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const logical = { teamId: 'team-a', laneId: 'primary', projectIdentity: '/tmp/project', memberName: 'Alice' }
+    const beforeCrash = new OpenCodeSessionStore(filePath)
+    expect((await beforeCrash.reserveLogicalMember(logical, 'reservation-a', 'session-1')).status).toBe('reserved')
+    const restarted = new OpenCodeSessionStore(filePath)
+    expect((await restarted.reserveLogicalMember({ ...logical, memberName: 'alice' },
+      'reservation-a', 'session-1')).status).toBe('exact')
+    expect((await restarted.publishReserved(baseRecord, 'reservation-a')).status).toBe('inserted')
+    expect(await restarted.get('team-a', 'primary', 'ALICE')).toEqual(baseRecord)
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as { schemaVersion: number;
+      reservations: Record<string, unknown> }
+    expect(persisted.schemaVersion).toBe(2)
+    expect(persisted.reservations).toEqual({})
+  })
+
+  test('post-effect publication conflict stays reserved for durable reconciliation authority', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const logical = { teamId: 'team-a', laneId: 'primary', projectIdentity: '/tmp/project', memberName: 'alice' }
+    const store = new OpenCodeSessionStore(filePath)
+    await store.reserveLogicalMember(logical, 'reservation-a', 'session-1')
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as {
+      schemaVersion: 2; records: Record<string, typeof baseRecord>; reservations: Record<string, unknown> }
+    persisted.records['team-a::primary::alice'] = { ...baseRecord, opencodeSessionId: 'foreign-session' }
+    await writeFile(filePath, JSON.stringify(persisted))
+    expect((await store.publishReserved(baseRecord, 'reservation-a')).status).toBe('conflict')
+    const after = JSON.parse(await readFile(filePath, 'utf8')) as { reservations: Record<string, unknown> }
+    expect(Object.keys(after.reservations)).toHaveLength(1)
+    expect((await store.reserveLogicalMember(logical, 'reservation-b', 'session-2')).status).toBe('conflict')
+  })
+
+  test('corrupt persisted reservation fails closed instead of becoming apparent absence', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 2, records: {}, reservations: {
+      bad: { version: 1, logicalMemberKey: 'bad' },
+    } }))
+    const store = new OpenCodeSessionStore(filePath)
+    await expect(store.get('team-a', 'primary', 'alice')).rejects.toThrow(
+      'invalid OpenCode session reservation')
+    await expect(store.reserveLogicalMember({ teamId: 'team-a', laneId: 'primary',
+      projectIdentity: '/tmp/project', memberName: 'alice' }, 'reservation', 'session')).rejects.toThrow(
+      'invalid OpenCode session reservation')
   })
 
   test('returns unchanged for identical record and marks stale explicitly', async () => {
