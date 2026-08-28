@@ -654,28 +654,36 @@ export async function withOpenCodeInventoryProbeTimeout(
     timeoutMs: number
     progress?: OpenCodeInventoryProbeProgressTracker | null
     onTimeout?: () => void
+    canonicalizeProjectPath?: typeof canonicalizeOpenCodeProjectIdentity
   },
 ): Promise<OpenCodeInventorySnapshot> {
-  const canonicalProjectPath = await canonicalizeOpenCodeProjectIdentity(
-    input.projectPath?.trim() || getCwd(), { allowMissing: true })
+  const lexicalProjectPath = path.resolve(input.projectPath?.trim() || getCwd())
+  const canonicalizeProjectPath = input.canonicalizeProjectPath
+    ?? canonicalizeOpenCodeProjectIdentity
   let timeout: ReturnType<typeof setTimeout> | null = null
   try {
-    return await Promise.race([
-      probe,
-      new Promise<OpenCodeInventorySnapshot>(resolve => {
-        timeout = setTimeout(() => {
-          input.onTimeout?.()
-          resolve(
-            buildOpenCodeInventoryTimeoutSnapshot({
-              projectPath: input.projectPath,
-              canonicalProjectPath,
-              timeoutMs: input.timeoutMs,
-              progress: input.progress?.snapshot() ?? null,
-            }),
-          )
-        }, input.timeoutMs)
-      }),
-    ])
+    const deadline = new Promise<OpenCodeInventorySnapshot>(resolve => {
+      timeout = setTimeout(() => {
+        input.onTimeout?.()
+        resolve(
+          buildOpenCodeInventoryTimeoutSnapshot({
+            projectPath: input.projectPath,
+            // A timeout snapshot is passive diagnostic state, not durable
+            // launch authority. Lexical normalization is therefore enough.
+            canonicalProjectPath: lexicalProjectPath,
+            timeoutMs: input.timeoutMs,
+            progress: input.progress?.snapshot() ?? null,
+          }),
+        )
+      }, input.timeoutMs)
+    })
+    // Canonicalization is authority-bearing filesystem I/O, so it must share
+    // the same absolute deadline as the probe instead of delaying the timer.
+    const canonicalProbe = canonicalizeProjectPath(
+      lexicalProjectPath,
+      { allowMissing: true },
+    ).then(() => probe)
+    return await Promise.race([canonicalProbe, deadline])
   } finally {
     if (timeout) clearTimeout(timeout)
   }
@@ -1036,18 +1044,18 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    const resolvedProjectPath = await canonicalizeOpenCodeProjectIdentity(
-      projectPath?.trim() || getCwd(), { signal: options.abortSignal, allowMissing: true })
     // Summary is a passive status boundary. It must never prepare a profile,
-    // reserve a port, spawn OpenCode, or enumerate providers/models/agents.
+    // perform authority-bearing filesystem canonicalization, reserve a port,
+    // spawn OpenCode, or enumerate providers/models/agents.
     // Rich passive status is served by OpenCodePassiveStatusProductionReader;
     // this compatibility snapshot intentionally carries no active authority.
     if (mode === 'summary') {
+      const lexicalProjectPath = path.resolve(projectPath?.trim() || getCwd())
       return {
         detected: false,
         binaryPath: null,
         version: null,
-        projectPath: resolvedProjectPath,
+        projectPath: lexicalProjectPath,
         profile: null,
         connectedProviders: [],
         availableProviders: [],
@@ -1060,6 +1068,8 @@ export class OpenCodeInventoryService {
         completeness: skippedInventoryCompleteness(),
       }
     }
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectIdentity(
+      projectPath?.trim() || getCwd(), { signal: options.abortSignal, allowMissing: true })
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
     const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
     const cached = this.cache.get(cacheKey)

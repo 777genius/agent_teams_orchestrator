@@ -64,15 +64,25 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
-  test('publishes one canonical project identity for a symlink alias', async () => {
+  test('publishes lexical project scope for passive summary without resolving symlinks', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'opencode-inventory-canonical-'))
     try {
       const project = path.join(root, 'project')
       const alias = path.join(root, 'alias')
       await mkdir(project)
       await symlink(project, alias, 'dir')
-      const snapshot = await new OpenCodeInventoryService().probe(alias, { mode: 'summary' })
-      expect(snapshot.projectPath).toBe(await realpath(project))
+      const snapshot = await Promise.race([
+        new OpenCodeInventoryService().probe(alias, { mode: 'summary' }),
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error('passive summary did not settle immediately')),
+          20,
+        )),
+      ])
+      expect(snapshot.projectPath).toBe(path.resolve(alias))
+      expect(snapshot.projectPath).not.toBe(await realpath(project))
+      expect(snapshot.diagnostics).toContain(
+        'Passive OpenCode summary has no active inventory authority',
+      )
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -260,6 +270,29 @@ describe('OpenCodeInventoryService parsers', () => {
       'Agent Teams runtime stayed alive, but OpenCode did not finish inventory probing before the UI timeout budget.',
     )
     expect(result.diagnostics.join('\n')).toContain('Common causes:')
+  })
+
+  test('starts the absolute timeout before project canonicalization', async () => {
+    let canonicalizationStarted = false
+    let timedOut = false
+    const completed = inventorySnapshot()
+
+    const result = await withOpenCodeInventoryProbeTimeout(Promise.resolve(completed), {
+      projectPath: './lexical/../project',
+      timeoutMs: 1,
+      canonicalizeProjectPath: async () => {
+        canonicalizationStarted = true
+        return new Promise<string>(() => {})
+      },
+      onTimeout: () => {
+        timedOut = true
+      },
+    })
+
+    expect(canonicalizationStarted).toBe(true)
+    expect(timedOut).toBe(true)
+    expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(true)
+    expect(result.projectPath).toBe(path.resolve('./project'))
   })
 
   test('keeps the completed inventory snapshot when probing finishes before the timeout', async () => {
