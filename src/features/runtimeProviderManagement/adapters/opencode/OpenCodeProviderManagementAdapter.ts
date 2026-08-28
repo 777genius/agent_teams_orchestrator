@@ -44,9 +44,11 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import {
+  canonicalizeOpenCodeProjectPath,
   openCodeProfileManager,
   resolveOpenCodeProfileScope,
 } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { resolveOpenCodeBinaryPath } from '../../../../services/opencode/OpenCodeBinaryResolver.js'
 import {
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
@@ -62,7 +64,6 @@ import {
   type OpenCodeManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
-import { getCwd } from '../../../../utils/cwd.js'
 import type {
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
@@ -193,6 +194,14 @@ type OpenCodeProviderManagementAdapterDeps = {
   }
   profileManager?: {
     listManagedAuthPaths(): Promise<string[]>
+    readCatalogSelectedAuthIdentity?(input: {
+      projectPath?: string | null
+      profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
+    }): Promise<{
+      source: 'absent' | 'error' | `known:${string}`
+      managed: 'absent' | 'error' | `known:${string}`
+      preferences: 'absent' | 'error' | `known:${string}`
+    }>
   }
   executionProbe?: {
     probeModel(input: {
@@ -217,6 +226,8 @@ type OpenCodeProviderManagementAdapterDeps = {
     ): Promise<unknown>
   }
   inventoryTimeoutMs?: number
+  resolveBinaryPath?: () => string | null
+  resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
   catalogTimeoutMs?: number
 }
 
@@ -389,6 +400,7 @@ const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 const CONNECT_EXECUTION_PROOF_MAX_CANDIDATES = 3
 const CONNECT_EXECUTION_PROOF_CANDIDATE_TIMEOUT_MS = 45_000
+const CATALOG_IDENTITY_RECHECK_TIMEOUT_MS = 250
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -403,6 +415,22 @@ type ProviderCatalogCacheEntry = {
   providers: OpenCodeProviderResponse | null
   managedModelLimitOverrides?: OpenCodeManagedRuntimePreferences['modelLimitOverrides']
   diagnostics: string[]
+}
+
+type CatalogIdentityComponent =
+  | { state: 'known'; value: string }
+  | { state: 'absent' }
+  | { state: 'error' }
+
+type CatalogIdentity = {
+  key: string
+  reusable: boolean
+}
+
+function catalogIdentityComponent(value: string | null | undefined): CatalogIdentityComponent {
+  if (value === 'error') return { state: 'error' }
+  if (!value || value === 'absent') return { state: 'absent' }
+  return { state: 'known', value }
 }
 
 type OpenCodeProviderManagementCapabilities = {
@@ -3013,6 +3041,80 @@ export class OpenCodeProviderManagementAdapter
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
 
+  private async readCatalogIdentity(input: {
+    projectPath?: string | null
+    providerId: string
+    expectedScope?: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
+    expectedBinaryPath?: string | null
+  }): Promise<CatalogIdentity> {
+    const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
+    let config: CatalogIdentityComponent
+    try {
+      profileScope = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'catalog',
+        selectedModel: `${input.providerId}/catalog`,
+      })
+      config = input.expectedScope
+        && input.expectedScope.configFingerprint !== profileScope.configFingerprint
+        ? { state: 'error' }
+        : { state: 'known', value: profileScope.configFingerprint }
+    } catch {
+      profileScope = input.expectedScope ?? {
+        purpose: 'catalog',
+        providerId: input.providerId,
+        configFingerprint: 'identity-read-error',
+      }
+      config = { state: 'error' }
+    }
+
+    let binary: CatalogIdentityComponent
+    try {
+      const binaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+      if (input.expectedBinaryPath !== undefined && binaryPath !== input.expectedBinaryPath) {
+        binary = { state: 'error' }
+      } else if (!binaryPath) {
+        binary = { state: 'absent' }
+      } else {
+        const resolveIdentity = this.deps.resolveBinaryIdentity ?? resolveOpenCodeBinaryHostIdentity
+        binary = { state: 'known', value: `${binaryPath}:${await resolveIdentity(binaryPath)}` }
+      }
+    } catch {
+      binary = { state: 'error' }
+    }
+
+    let sourceAuth: CatalogIdentityComponent = { state: 'error' }
+    let managedSelectedAuth: CatalogIdentityComponent = { state: 'error' }
+    let preferences: CatalogIdentityComponent = { state: 'error' }
+    try {
+      const reader = this.deps.profileManager?.readCatalogSelectedAuthIdentity
+        ? this.deps.profileManager.readCatalogSelectedAuthIdentity.bind(this.deps.profileManager)
+        : openCodeProfileManager.readCatalogSelectedAuthIdentity.bind(openCodeProfileManager)
+      const auth = await reader({ projectPath, profileScope })
+      sourceAuth = catalogIdentityComponent(auth.source)
+      managedSelectedAuth = catalogIdentityComponent(auth.managed)
+      preferences = catalogIdentityComponent(auth.preferences)
+    } catch {
+      // An identity read error must fail closed for stale evidence.
+    }
+    const components = {
+      projectPath,
+      providerId: input.providerId,
+      binary,
+      config,
+      preferences,
+      sourceAuth,
+      managedSelectedAuth,
+      generation: 'catalog-generation-v3',
+    }
+    return {
+      key: JSON.stringify(components),
+      reusable: Object.values(components).every(value =>
+        !value || typeof value !== 'object' || !('state' in value) || value.state !== 'error'),
+    }
+  }
+
   private async retainProviderManagementHost(
     hostManager: OpenCodeHostManagerLike,
     host: OpenCodeHostHandle,
@@ -3104,6 +3206,7 @@ export class OpenCodeProviderManagementAdapter
     projectPath?: string | null,
     options?: Parameters<typeof openCodeInventoryService.probe>[1],
   ): Promise<OpenCodeInventorySnapshot> {
+    const canonicalProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const abortController = new AbortController()
     const progress = createOpenCodeInventoryProbeProgressTracker()
     const abortFromCaller = () => abortController.abort(options?.abortSignal?.reason)
@@ -3111,14 +3214,14 @@ export class OpenCodeProviderManagementAdapter
     if (options?.abortSignal?.aborted) abortFromCaller()
     try {
       return await withOpenCodeInventoryProbeTimeout(
-        inventoryService.probe(projectPath, {
+        inventoryService.probe(canonicalProjectPath, {
           ...options,
           includeAppMcp: false,
           abortSignal: abortController.signal,
           progress,
         }),
         {
-          projectPath,
+          projectPath: canonicalProjectPath,
           timeoutMs:
             this.deps.inventoryTimeoutMs ??
             (options?.mode === 'summary'
@@ -3472,22 +3575,6 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, projectPath, {
-      mode: options.inventoryMode ?? 'full',
-      profileScope: options.profileScope,
-      abortSignal: options.abortSignal,
-    })
-
-    if (!inventory.detected) {
-      return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
-    }
-    if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
-      return providerManagementError(
-        'runtime-unhealthy',
-        inventory.probeError ?? 'OpenCode inventory probe timed out',
-      )
-    }
-
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
@@ -3495,6 +3582,20 @@ export class OpenCodeProviderManagementAdapter
     let hostLease: OpenCodeHostLeaseInput | null = null
 
     try {
+      const inventory = await this.probeInventory(inventoryService, projectPath, {
+        mode: options.inventoryMode ?? 'full',
+        profileScope: options.profileScope,
+        abortSignal: options.abortSignal,
+      })
+      if (!inventory.detected) {
+        return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
+      }
+      if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
+        return providerManagementError(
+          'runtime-unhealthy',
+          inventory.probeError ?? 'OpenCode inventory probe timed out',
+        )
+      }
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
@@ -3911,13 +4012,23 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
-    const profileScope = await resolveOpenCodeProfileScope({
-      projectPath: input.projectPath,
-      purpose: 'catalog',
-      selectedModel: `${providerId}/catalog`,
-    })
+    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
+    let canonicalProjectPath: string
+    try {
+      canonicalProjectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+      profileScope = await resolveOpenCodeProfileScope({
+        projectPath: canonicalProjectPath,
+        purpose: 'catalog',
+        selectedModel: `${providerId}/catalog`,
+      })
+    } catch (error) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        error instanceof Error ? error.message : String(error),
+      )
+    }
     const scopeKey = [
-      path.resolve(input.projectPath?.trim() || getCwd()),
+      canonicalProjectPath,
       providerId,
       profileScope.configFingerprint,
     ].join('|')
@@ -3941,24 +4052,14 @@ export class OpenCodeProviderManagementAdapter
     const operation = this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, host, client }) => {
-        const binaryFingerprint = inventory.binaryPath
-          ? await resolveOpenCodeBinaryHostIdentity(inventory.binaryPath)
-          : 'missing-binary'
-        const identity = [
-          inventory.projectPath,
+      async ({ inventory, client }) => {
+        const identity = await this.readCatalogIdentity({
+          projectPath: inventory.projectPath,
           providerId,
-          binaryFingerprint,
-          host.version ?? inventory.version ?? 'unknown-version',
-          host.hostKey,
-          profileScope.configFingerprint,
-          host.profile.managedConfigFingerprint,
-          host.resolvedConfigFingerprint ?? 'unresolved-config',
-          host.profile.sourceAuthFingerprint ?? 'missing-source-auth',
-          host.profile.managedAuthFingerprint ?? 'missing-auth',
-          'catalog-generation-v2',
-        ].join('|')
-        currentIdentity = identity
+          expectedScope: profileScope,
+          expectedBinaryPath: inventory.binaryPath,
+        })
+        currentIdentity = identity.reusable ? identity.key : null
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
@@ -3973,7 +4074,7 @@ export class OpenCodeProviderManagementAdapter
           ...safeReadDiagnostics(providersResult),
         ]
         const entry: ProviderCatalogCacheEntry = {
-          identity,
+          identity: identity.key,
           inventory,
           configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
           providers: providersResult.ok ? providersResult.value : null,
@@ -4005,7 +4106,7 @@ export class OpenCodeProviderManagementAdapter
             'OpenCode catalog response was superseded by a newer provider request',
           )
         }
-        this.catalogCache.set(entry.identity, entry)
+        if (identity.reusable) this.catalogCache.set(entry.identity, entry)
         return {
           ok: true,
           value: modelsView,
@@ -4030,13 +4131,28 @@ export class OpenCodeProviderManagementAdapter
           if (this.catalogGenerationByScope.get(scopeKey) === generation) {
             this.catalogGenerationByScope.set(scopeKey, generation + 1)
           }
+          let identityTimeout: ReturnType<typeof setTimeout> | undefined
+          const timeoutIdentity = await Promise.race([
+            this.readCatalogIdentity({
+              projectPath: canonicalProjectPath,
+              providerId,
+            }).catch(() => null),
+            new Promise<null>(resolve => {
+              identityTimeout = setTimeout(() => resolve(null), CATALOG_IDENTITY_RECHECK_TIMEOUT_MS)
+            }),
+          ])
+          if (identityTimeout) clearTimeout(identityTimeout)
           let cleanupTimeout: ReturnType<typeof setTimeout> | undefined
           await Promise.race([
             operation.then(() => undefined),
             new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
           ])
           if (cleanupTimeout) clearTimeout(cleanupTimeout)
-          const cached = currentIdentity ? this.catalogCache.get(currentIdentity) : undefined
+          const cached = currentIdentity
+            && timeoutIdentity?.reusable
+            && timeoutIdentity.key === currentIdentity
+            ? this.catalogCache.get(currentIdentity)
+            : undefined
           resolve(cached
             ? {
                 ok: true,

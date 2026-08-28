@@ -20,6 +20,7 @@ import {
 } from './OpenCodeCuratedSubscriptionCatalog.js'
 import {
   areOpenCodeManagedPluginCachesReady,
+  canonicalizeOpenCodeProjectPath,
   openCodeProfileManager,
   repairEmptyOpenCodeManagedPluginCaches,
 } from './OpenCodeProfileManager.js'
@@ -938,7 +939,7 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
     const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
     const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`

@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -189,6 +189,133 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     ])
     expect(secretProfile.profileRootPath).toBe(firstProfile.profileRootPath)
     expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
+  })
+
+  test('fingerprints query, limit, header, and non-secret env behavior while redacting credentials', async () => {
+    const projectPath = path.join(tempDir, 'identity-project')
+    await mkdir(projectPath, { recursive: true })
+    const scope = (input: {
+      baseURL?: string
+      limit?: number
+      route?: string
+      authorization?: string
+      cookie?: string
+      apiKey?: string
+      env?: NodeJS.ProcessEnv
+    }) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'custom/model',
+      env: {
+        ...input.env,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: {
+            custom: {
+              options: {
+                baseURL: input.baseURL ?? '{env:CUSTOM_BASE_URL}',
+                headers: {
+                  'X-Route': input.route ?? 'blue',
+                  Authorization: input.authorization ?? 'Bearer one',
+                  Cookie: input.cookie ?? 'session=one',
+                },
+                apiKey: input.apiKey ?? 'key-one',
+              },
+              models: { model: { limit: { context: input.limit ?? 1000, output: 100 } } },
+            },
+          },
+        }),
+      },
+    })
+    const base = await scope({ env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one&api_key=one' } })
+    const credentialOnly = await scope({
+      authorization: 'Bearer two', cookie: 'session=two', apiKey: 'key-two',
+      env: { CUSTOM_BASE_URL: 'https://example.test/v1?api_key=two&region=one' },
+    })
+    const query = await scope({ env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=two&api_key=one' } })
+    const limit = await scope({ limit: 2000, env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
+    const header = await scope({ route: 'green', env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
+
+    expect(credentialOnly.configFingerprint).toBe(base.configFingerprint)
+    expect(query.configFingerprint).not.toBe(base.configFingerprint)
+    expect(limit.configFingerprint).not.toBe(base.configFingerprint)
+    expect(header.configFingerprint).not.toBe(base.configFingerprint)
+  })
+
+  test('prepares the immutable effective-config snapshot in its matching root', async () => {
+    const projectPath = path.join(tempDir, 'snapshot-project')
+    await mkdir(projectPath, { recursive: true })
+    const configPath = path.join(projectPath, 'opencode.json')
+    await writeFile(configPath, JSON.stringify({
+      provider: { custom: { options: { baseURL: 'https://one.test/v1?route=one' } } },
+    }))
+    const firstScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    await writeFile(configPath, JSON.stringify({
+      provider: { custom: { options: { baseURL: 'https://two.test/v1?route=two' } } },
+    }))
+    const manager = new OpenCodeProfileManager()
+    const firstProfile = await manager.prepareProfile(projectPath, { profileScope: firstScope })
+    expect(firstProfile.managedConfig).toMatchObject({
+      provider: { custom: { options: { baseURL: 'https://one.test/v1?route=one' } } },
+    })
+    const secondScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const secondProfile = await manager.prepareProfile(projectPath, { profileScope: secondScope })
+    expect(secondProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
+  })
+
+  test('materializes only the selected catalog credential with local source precedence', async () => {
+    const projectPath = path.join(tempDir, 'selected-auth-project')
+    await mkdir(projectPath, { recursive: true })
+    const manager = new OpenCodeProfileManager()
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(path.dirname(globalAuthPath), { recursive: true }),
+      mkdir(path.dirname(sourceAuthPath), { recursive: true }),
+    ])
+    await writeFile(globalAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'global-selected' },
+      unrelated: { type: 'api', key: 'global-unrelated' },
+    }))
+    await writeFile(sourceAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'local-selected' },
+      another: { type: 'oauth', access: 'local-unrelated' },
+    }))
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const profile = await manager.prepareProfile(projectPath, { profileScope })
+    expect(JSON.parse(await readFile(profile.managedAuthPath, 'utf8'))).toEqual({
+      custom: { type: 'api', key: 'local-selected' },
+    })
+    expect(profile.selectedSourceAuthIdentity).toStartWith('known:')
+    expect(profile.selectedManagedAuthIdentity).toBe(profile.selectedSourceAuthIdentity)
+  })
+
+  test('canonicalizes symlink retargets into distinct profile roots', async () => {
+    if (process.platform === 'win32') return
+    const projectA = path.join(tempDir, 'project-a')
+    const projectB = path.join(tempDir, 'project-b')
+    const projectLink = path.join(tempDir, 'project-link')
+    await Promise.all([mkdir(projectA), mkdir(projectB)])
+    await symlink(projectA, projectLink, 'dir')
+    const manager = new OpenCodeProfileManager()
+    const firstScope = await resolveOpenCodeProfileScope({
+      projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const first = await manager.prepareProfile(projectLink, { profileScope: firstScope })
+    await rm(projectLink)
+    await symlink(projectB, projectLink, 'dir')
+    const secondScope = await resolveOpenCodeProfileScope({
+      projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const second = await manager.prepareProfile(projectLink, { profileScope: secondScope })
+    expect(first.projectPath).toBe(projectA)
+    expect(second.projectPath).toBe(projectB)
+    expect(second.profileRootPath).not.toBe(first.profileRootPath)
   })
 
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {

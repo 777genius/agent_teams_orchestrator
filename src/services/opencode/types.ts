@@ -55,6 +55,8 @@ export type OpenCodePreparedProfile = {
   sourceAuthPath: string | null
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
+  selectedSourceAuthIdentity?: 'absent' | 'error' | `known:${string}`
+  selectedManagedAuthIdentity?: 'absent' | 'error' | `known:${string}`
   authState: OpenCodeAuthState
   env: NodeJS.ProcessEnv
 }

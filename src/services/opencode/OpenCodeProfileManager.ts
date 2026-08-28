@@ -9,6 +9,7 @@ import {
   readlink,
   readdir,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -35,6 +36,7 @@ import {
 import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
+  materializeOpenCodeSelectedAuthCredential,
   mergeOpenCodeManagedAuthSources,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
@@ -186,6 +188,20 @@ function hashString(value: string): string {
 
 function hashBuffer(value: Buffer): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+export async function canonicalizeOpenCodeProjectPath(
+  projectPath?: string | null,
+): Promise<string> {
+  const resolved = path.normalize(path.resolve(projectPath?.trim() || getCwd()))
+  try {
+    return path.normalize(await realpath(resolved))
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') {
+      return resolved
+    }
+    throw error
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -1261,30 +1277,82 @@ async function readProjectOpenCodeRuntimeConfig(projectPath: string): Promise<Re
   return config
 }
 
-function redactConfigIdentity(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactConfigIdentity)
-  if (typeof value === 'string' && /^https?:\/\//i.test(value)) {
+const SECRET_IDENTITY_KEY = /(?:^|[-_.])(api[-_.]?key|token|secret|password|authorization|proxy[-_.]?authorization|credential|cookie|set[-_.]?cookie|auth)(?:$|[-_.])/i
+const ENV_REFERENCE = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g
+
+function isClassifiedIdentityKey(key: string): boolean {
+  return SECRET_IDENTITY_KEY.test(key)
+}
+
+function resolveIdentityEnvironment(value: string, env: NodeJS.ProcessEnv): string {
+  return value.replace(ENV_REFERENCE, (reference, bracedName: string, shellName: string) => {
+    const name = bracedName || shellName
+    if (isClassifiedIdentityKey(name)) return '[redacted-env]'
+    return env[name] ?? reference
+  })
+}
+
+function redactConfigIdentity(
+  value: unknown,
+  env: NodeJS.ProcessEnv,
+  classified = false,
+): unknown {
+  if (classified) return '[redacted]'
+  if (Array.isArray(value)) return value.map(item => redactConfigIdentity(item, env))
+  if (typeof value === 'string') {
+    const resolved = resolveIdentityEnvironment(value, env)
+    if (!/^https?:\/\//i.test(resolved)) return resolved
     try {
-      const url = new URL(value)
-      url.username = ''
-      url.password = ''
-      const queryKeys = Array.from(url.searchParams.keys()).sort()
-      url.search = queryKeys.length > 0 ? `?${queryKeys.join('&')}` : ''
+      const url = new URL(resolved)
+      if (url.username) url.username = '[redacted]'
+      if (url.password) url.password = '[redacted]'
+      const query = Array.from(url.searchParams.entries())
+        .map(([key, queryValue]) => [
+          key,
+          isClassifiedIdentityKey(key)
+            ? '[redacted]'
+            : resolveIdentityEnvironment(queryValue, env),
+        ] as const)
+        .sort(([leftKey, leftValue], [rightKey, rightValue]) =>
+          leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue))
+      url.search = ''
+      for (const [key, queryValue] of query) url.searchParams.append(key, queryValue)
       url.hash = ''
       return url.toString()
     } catch {
-      return value
+      return resolved
     }
   }
   if (!value || typeof value !== 'object') return value
   return Object.keys(value as Record<string, unknown>).sort().reduce<Record<string, unknown>>(
     (result, key) => {
-      if (/api.?key|token|secret|password|authorization|credential/i.test(key)) return result
-      result[key] = redactConfigIdentity((value as Record<string, unknown>)[key])
+      result[key] = redactConfigIdentity(
+        (value as Record<string, unknown>)[key],
+        env,
+        isClassifiedIdentityKey(key),
+      )
       return result
     },
     {},
   )
+}
+
+type OpenCodeEffectiveConfigSnapshot = Readonly<{
+  projectPath: string
+  importedRuntimeConfig: Readonly<Record<string, unknown>>
+}>
+
+const openCodeEffectiveConfigSnapshots = new WeakMap<
+  OpenCodeProfileScope,
+  OpenCodeEffectiveConfigSnapshot
+>()
+
+function freezeConfigSnapshot<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) freezeConfigSnapshot(child)
+    Object.freeze(value)
+  }
+  return value
 }
 
 export async function resolveOpenCodeProfileScope(input: {
@@ -1297,23 +1365,31 @@ export async function resolveOpenCodeProfileScope(input: {
   if (!providerId) {
     throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
   }
-  const projectPath = path.resolve(input.projectPath?.trim() || getCwd())
-  const imported = await readSafeOpenCodeRuntimeConfigImport(input.env ?? process.env)
+  const env = input.env ?? process.env
+  const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+  const imported = await readSafeOpenCodeRuntimeConfigImport(env)
   const project = await readProjectOpenCodeRuntimeConfig(projectPath)
+  const importedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
   const effective = deepMergeOpenCodeConfig(
-    deepMergeOpenCodeConfig(imported, project),
+    importedRuntimeConfig,
     buildManagedConfig(null, { managedProviderId: providerId }),
   )
   const identity = redactConfigIdentity({
     provider: asRecord(effective.provider)[providerId] ?? null,
     model: effective.model ?? null,
     small_model: effective.small_model ?? null,
-  })
-  return {
+    plugin: effective.plugin ?? null,
+  }, env)
+  const scope: OpenCodeProfileScope = {
     purpose: input.purpose,
     providerId,
     configFingerprint: hashString(JSON.stringify(identity)),
   }
+  openCodeEffectiveConfigSnapshots.set(scope, freezeConfigSnapshot({
+    projectPath,
+    importedRuntimeConfig,
+  }))
+  return scope
 }
 
 function applyManagedPathEnvironmentToMcpConfig(
@@ -1392,6 +1468,50 @@ export function orderOpenCodeAuthSyncSources(input: {
   return sources
 }
 
+type OpenCodeIdentityComponent = 'absent' | 'error' | `known:${string}`
+
+function authCredentialIdentity(credential: unknown): OpenCodeIdentityComponent {
+  return credential === null
+    ? 'absent'
+    : `known:${hashString(JSON.stringify(credential))}`
+}
+
+async function readSelectedAuthFromSources(input: {
+  providerId: string
+  sourcePaths: readonly string[]
+}): Promise<{
+  credential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
+  identity: OpenCodeIdentityComponent
+}> {
+  let selected: Awaited<ReturnType<typeof readOpenCodeAuthCredential>> = null
+  try {
+    for (const authPath of input.sourcePaths) {
+      const credential = await readOpenCodeAuthCredential({
+        authPath,
+        providerId: input.providerId,
+      })
+      if (credential) selected = credential
+    }
+    return { credential: selected, identity: authCredentialIdentity(selected) }
+  } catch {
+    return { credential: null, identity: 'error' }
+  }
+}
+
+async function readSelectedManagedAuthIdentity(
+  managedAuthPath: string,
+  providerId: string,
+): Promise<OpenCodeIdentityComponent> {
+  try {
+    return authCredentialIdentity(await readOpenCodeAuthCredential({
+      authPath: managedAuthPath,
+      providerId,
+    }))
+  } catch {
+    return 'error'
+  }
+}
+
 export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
@@ -1439,8 +1559,39 @@ export class OpenCodeProfileManager {
     })
   }
 
-  private getProjectPath(projectPath?: string | null): string {
-    return path.resolve(projectPath?.trim() || getCwd())
+  async readCatalogSelectedAuthIdentity(input: {
+    projectPath?: string | null
+    profileScope: OpenCodeProfileScope
+  }): Promise<{
+    source: OpenCodeIdentityComponent
+    managed: OpenCodeIdentityComponent
+    preferences: OpenCodeIdentityComponent
+  }> {
+    const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+    const policy = planOpenCodeProfilePolicy(input.profileScope)
+    const profileRootKey = hashString(JSON.stringify({ projectPath, ...policy.scope })).slice(0, 16)
+    const managedAuthPath = path.join(
+      this.paths.data,
+      'opencode',
+      'profiles',
+      profileRootKey,
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const sourcePaths = Array.from(new Set([
+      this.getGlobalAuthPath(),
+      ...this.getSourceAuthPaths(),
+    ]))
+    const [source, managed, preferences] = await Promise.all([
+      readSelectedAuthFromSources({ providerId: policy.scope.providerId, sourcePaths }),
+      readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId),
+      Promise.all([
+        readOpenCodeManagedRuntimePreferences(path.dirname(path.dirname(path.dirname(managedAuthPath)))),
+        readOpenCodeGlobalManagedRuntimePreferences(this.paths.data),
+      ]).then(value => `known:${hashString(JSON.stringify(value))}` as const).catch(() => 'error' as const),
+    ])
+    return { source: source.identity, managed, preferences }
   }
 
   private getProfileRootKey(projectPath: string): string {
@@ -1499,7 +1650,11 @@ export class OpenCodeProfileManager {
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
-    const resolvedProjectPath = this.getProjectPath(projectPath)
+    const configSnapshot = options.profileScope
+      ? openCodeEffectiveConfigSnapshots.get(options.profileScope)
+      : undefined
+    const resolvedProjectPath = configSnapshot?.projectPath
+      ?? await canonicalizeOpenCodeProjectPath(projectPath)
     const policy = options.profileScope
       ? planOpenCodeProfilePolicy(options.profileScope)
       : null
@@ -1531,12 +1686,14 @@ export class OpenCodeProfileManager {
       ...globalRuntimePreferences.modelLimitOverrides,
       ...managedRuntimePreferences.modelLimitOverrides,
     }
-    const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
-    if (policy) {
-      importedRuntimeConfig.plugin = deepMergeOpenCodeConfig(
+    const importedRuntimeConfig = configSnapshot
+      ? deepMergeOpenCodeConfig({}, configSnapshot.importedRuntimeConfig as Record<string, unknown>)
+      : await readSafeOpenCodeRuntimeConfigImport(process.env)
+    if (policy && !configSnapshot) {
+      Object.assign(importedRuntimeConfig, deepMergeOpenCodeConfig(
         importedRuntimeConfig,
         await readProjectOpenCodeRuntimeConfig(resolvedProjectPath),
-      ).plugin
+      ))
     }
     if (!policy) {
       // Keep the legacy inline overlay unchanged. Scoped profiles preserve user
@@ -1636,7 +1793,19 @@ export class OpenCodeProfileManager {
       globalAuthFingerprint,
       sourceAuthSources,
     })
-    if (policy?.reconcileAuth !== false) {
+    let selectedSourceAuthIdentity: OpenCodeIdentityComponent | undefined
+    if (policy?.scope.purpose === 'catalog') {
+      const selected = await readSelectedAuthFromSources({
+        providerId: policy.scope.providerId,
+        sourcePaths: Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()])),
+      })
+      selectedSourceAuthIdentity = selected.identity
+      await materializeOpenCodeSelectedAuthCredential({
+        authPath: managedAuthPath,
+        providerId: policy.scope.providerId,
+        credential: selected.credential,
+      })
+    } else if (policy?.reconcileAuth !== false) {
       await reconcileOpenCodeManagedAuthStores({
         sourceAuthPaths: authSourcePaths,
         globalAuthPath,
@@ -1662,7 +1831,13 @@ export class OpenCodeProfileManager {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
+    const selectedManagedAuthIdentity = policy
+      ? await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
+      : undefined
     const authState = await (async () => {
+      if (policy?.scope.purpose === 'catalog') {
+        return selectedSourceAuthIdentity === selectedManagedAuthIdentity ? 'ok' as const : 'stale' as const
+      }
       if (!managedAuthFingerprint) {
         return 'missing' as const
       }
@@ -1742,6 +1917,8 @@ export class OpenCodeProfileManager {
       sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
       sourceAuthFingerprint,
       managedAuthFingerprint,
+      selectedSourceAuthIdentity,
+      selectedManagedAuthIdentity,
       authState,
       env: applyOpenCodeAutoUpdatePolicy(env),
     }
