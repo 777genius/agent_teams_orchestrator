@@ -86,11 +86,6 @@ type PreparedSessionProfile = {
   toolApprovalMode: OpenCodeToolApprovalMode
 }
 
-const durableSuccessorCompletions = new Map<string, Promise<{
-  record: OpenCodeSessionRecord
-  runtimePid?: number
-}>>()
-
 export type OpenCodePromptPart =
   | { type: 'text'; text: string }
   | { type: 'file'; mime: string; url: string; filename: string }
@@ -263,6 +258,10 @@ export class OpenCodeSessionBridge {
     leaseRetained: boolean
   }>()
   private readonly pendingLeaseTransitions = new Map<string, OpenCodeSessionRecord>()
+  private readonly durableSuccessorCompletions = new Map<string, Promise<{
+    record: OpenCodeSessionRecord
+    runtimePid?: number
+  }>>()
 
   constructor(private readonly deps: OpenCodeSessionBridgeDeps = {}) {}
 
@@ -418,6 +417,11 @@ export class OpenCodeSessionBridge {
     const transition = record.successorTransition
     if (!transition) throw new Error('OpenCode durable successor transition is unavailable')
     const authority = transition.recoveryProfile
+    if (!authority) {
+      throw new Error(
+        'OpenCode legacy durable successor transition has no immutable recovery authority; recovery refused',
+      )
+    }
     const authorityDecisionKey = JSON.stringify([
       record.projectIdentity, record.teamId, record.laneId ?? 'primary', record.memberName,
       record.runId, record.selectedModel, record.selectedVariant ?? null,
@@ -678,7 +682,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     expectedPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'],
     nextPhase: NonNullable<OpenCodeSessionRecord['successorTransition']>['phase'] | null,
-  ): Promise<OpenCodeSessionRecord> {
+  ): Promise<{ record: OpenCodeSessionRecord; applied: boolean }> {
     const transition = record.successorTransition
     if (!transition || transition.phase !== expectedPhase) {
       throw new Error('OpenCode durable successor transition changed before advancement')
@@ -700,14 +704,28 @@ export class OpenCodeSessionBridge {
       throw new Error('OpenCode durable successor transition ownership changed')
     }
     const observed = result.record.successorTransition
-    if (nextPhase === null) {
-      if (observed) {
-        throw new Error('OpenCode durable successor transition clear lost its exact fence')
+    if (result.status === 'applied') {
+      if (nextPhase === null) {
+        if (observed) {
+          throw new Error('OpenCode durable successor transition clear lost its exact fence')
+        }
+      } else if (!observed || observed.attemptIdentity !== transition.attemptIdentity
+        || observed.phase !== nextPhase) {
+        throw new Error('OpenCode durable successor transition attempt changed')
       }
-    } else if (!observed || observed.attemptIdentity !== transition.attemptIdentity) {
-      throw new Error('OpenCode durable successor transition attempt changed')
+      return { record: result.record, applied: true }
     }
-    return result.record
+
+    const phases = ['successor_lease_pending', 'predecessor_release_pending',
+      'transition_complete'] as const
+    const advancedTransition = observed?.attemptIdentity === transition.attemptIdentity
+      && phases.indexOf(observed.phase) > phases.indexOf(expectedPhase)
+    const completed = !observed
+      && result.record.successorCompletionReceipt?.attemptIdentity === transition.attemptIdentity
+    if (!advancedTransition && !completed) {
+      throw new Error('OpenCode durable successor transition lost its exact advancement fence')
+    }
+    return { record: result.record, applied: false }
   }
 
   private async completeDurableSuccessorTransition(
@@ -721,8 +739,19 @@ export class OpenCodeSessionBridge {
       if (transition.phase === 'successor_lease_pending') {
         const retained = await this.retainSessionHost(record, record.runId, profile)
         if (retained?.pid && retained.pid > 0) runtimePid = retained.pid
-        record = await this.advanceDurableSuccessorTransition(
-          record, 'successor_lease_pending', 'predecessor_release_pending')
+        let advancement: Awaited<ReturnType<typeof this.advanceDurableSuccessorTransition>>
+        try {
+          advancement = await this.advanceDurableSuccessorTransition(
+            record, 'successor_lease_pending', 'predecessor_release_pending')
+        } catch (error) {
+          if (retained) await this.releaseContendingSessionHostReference(record)
+          throw error
+        }
+        if (!advancement.applied && retained) {
+          await this.releaseContendingSessionHostReference(record)
+          runtimePid = undefined
+        }
+        record = advancement.record
         continue
       }
       if (transition.phase === 'predecessor_release_pending') {
@@ -753,17 +782,26 @@ export class OpenCodeSessionBridge {
         } else if (outcome === 'applied') {
           await this.hostManager.releaseHost(transition.predecessorHostKey)
         }
-        record = await this.advanceDurableSuccessorTransition(
-          record, 'predecessor_release_pending', 'transition_complete')
+        record = (await this.advanceDurableSuccessorTransition(
+          record, 'predecessor_release_pending', 'transition_complete')).record
         continue
       }
-      record = await this.advanceDurableSuccessorTransition(
-        record, 'transition_complete', null)
+      record = (await this.advanceDurableSuccessorTransition(
+        record, 'transition_complete', null)).record
     }
     return { record, ...(runtimePid ? { runtimePid } : {}) }
   }
 
-  private completeDurableSuccessorTransitionSingleFlight(
+  private async releaseContendingSessionHostReference(record: OpenCodeSessionRecord): Promise<void> {
+    await this.hostManager.releaseHost(record.hostKey)
+    const sessionKey = this.buildSessionKey(record)
+    if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
+      this.retainedSessionHosts.delete(sessionKey)
+    }
+  }
+
+  /** Coalesces only callers sharing this bridge's process-local host references. */
+  private completeDurableSuccessorTransitionLocally(
     initial: OpenCodeSessionRecord,
     profile: OpenCodePreparedProfile,
   ): Promise<{ record: OpenCodeSessionRecord; runtimePid?: number }> {
@@ -773,15 +811,15 @@ export class OpenCodeSessionBridge {
       initial.projectIdentity, initial.teamId, initial.laneId ?? 'primary', initial.memberName,
       initial.opencodeSessionId, initial.runId, transition.attemptIdentity,
     ])
-    const pending = durableSuccessorCompletions.get(key)
+    const pending = this.durableSuccessorCompletions.get(key)
     if (pending) return pending
     const completion = this.completeDurableSuccessorTransition(initial, profile)
       .finally(() => {
-        if (durableSuccessorCompletions.get(key) === completion) {
-          durableSuccessorCompletions.delete(key)
+        if (this.durableSuccessorCompletions.get(key) === completion) {
+          this.durableSuccessorCompletions.delete(key)
         }
       })
-    durableSuccessorCompletions.set(key, completion)
+    this.durableSuccessorCompletions.set(key, completion)
     return completion
   }
 
@@ -853,13 +891,18 @@ export class OpenCodeSessionBridge {
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
     })
-    await this.hostManager.retainHostLease?.(record.hostKey, {
-      teamId: record.teamId,
-      laneId: record.laneId,
-      memberName: record.memberName,
-      runId: runId ?? null,
-      sessionId: record.opencodeSessionId,
-    })
+    try {
+      await this.hostManager.retainHostLease?.(record.hostKey, {
+        teamId: record.teamId,
+        laneId: record.laneId,
+        memberName: record.memberName,
+        runId: runId ?? null,
+        sessionId: record.opencodeSessionId,
+      })
+    } catch (error) {
+      await this.hostManager.releaseHost(record.hostKey)
+      throw error
+    }
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
     return host
   }
@@ -1125,7 +1168,7 @@ export class OpenCodeSessionBridge {
     if (existing?.successorTransition) {
       recoveredAttempt = existing.successorTransition
       const recoveryProfile = await this.prepareRecoveryProfileForSuccessor(existing)
-      recoveredTransition = await this.completeDurableSuccessorTransitionSingleFlight(
+      recoveredTransition = await this.completeDurableSuccessorTransitionLocally(
         existing, recoveryProfile)
       existing = recoveredTransition.record
     }
@@ -1349,7 +1392,7 @@ export class OpenCodeSessionBridge {
     )
     if (created.record.successorTransition) {
       try {
-        const completed = await this.completeDurableSuccessorTransitionSingleFlight(
+        const completed = await this.completeDurableSuccessorTransitionLocally(
           created.record, profile)
         return completed.runtimePid
           ? { ...completed.record, runtimePid: completed.runtimePid }

@@ -679,7 +679,9 @@ async function migrateAndValidateRecord(
 ): Promise<OpenCodeSessionRecord> {
   if (!isRecordMap(value)) throw new Error('invalid OpenCode session record')
   if (value.version === 2) {
-    const record = validateRecordForWrite(value as OpenCodeSessionRecord)
+    const record = validateRecordForWrite(value as OpenCodeSessionRecord, {
+      allowLegacySuccessorWithoutRecoveryProfile: true,
+    })
     if (persistedKey !== logicalKeyForRecord(record)) {
       throw new Error('OpenCode session record key mismatch')
     }
@@ -725,7 +727,10 @@ async function migrateAndValidateRecord(
   return migrated
 }
 
-function validateRecordForWrite(value: OpenCodeSessionRecord): OpenCodeSessionRecord {
+function validateRecordForWrite(
+  value: OpenCodeSessionRecord,
+  options: { allowLegacySuccessorWithoutRecoveryProfile?: boolean } = {},
+): OpenCodeSessionRecord {
   if (!isRecordMap(value)) throw new Error('invalid OpenCode session record')
   for (const key of Object.keys(value)) {
     if (!RECORD_ALLOWED_KEYS.has(key)) throw new Error('invalid OpenCode session record shape')
@@ -780,7 +785,12 @@ function validateRecordForWrite(value: OpenCodeSessionRecord): OpenCodeSessionRe
     throw new Error('invalid OpenCode session record lastKnownDurableState')
   }
   if (value.appManagedBootstrap !== undefined) validateAppManagedBootstrap(value.appManagedBootstrap)
-  if (value.successorTransition !== undefined) validateSuccessorTransition(value.successorTransition)
+  if (value.successorTransition !== undefined) {
+    validateSuccessorTransition(
+      value.successorTransition,
+      options.allowLegacySuccessorWithoutRecoveryProfile === true,
+    )
+  }
   if (value.successorCompletionReceipt !== undefined) {
     validateSuccessorCompletionReceipt(value.successorCompletionReceipt)
   }
@@ -798,13 +808,18 @@ function requiredTransitionIdentity(value: unknown): string {
   return identity
 }
 
-function validateSuccessorTransition(value: unknown): void {
+function validateSuccessorTransition(
+  value: unknown,
+  allowLegacyWithoutRecoveryProfile = false,
+): void {
   if (!isRecordMap(value)) throw new Error('invalid OpenCode successor transition')
   const required = ['attemptIdentity', 'phase', 'predecessorHostKey',
-    'predecessorOpencodeSessionId', 'predecessorRunId', 'recoveryProfile', 'version']
-  const allowed = required
+    'predecessorOpencodeSessionId', 'predecessorRunId', 'version']
+  const allowed = [...required, 'recoveryProfile']
   if (Object.keys(value).some(key => !allowed.includes(key))
-    || required.some(key => !(key in value)) || value.version !== 1
+    || required.some(key => !(key in value))
+    || (!allowLegacyWithoutRecoveryProfile && !('recoveryProfile' in value))
+    || value.version !== 1
     || !['successor_lease_pending', 'predecessor_release_pending', 'transition_complete']
       .includes(String(value.phase))) {
     throw new Error('invalid OpenCode successor transition')
@@ -816,7 +831,7 @@ function validateSuccessorTransition(value: unknown): void {
   if (value.predecessorRunId !== null) {
     requiredString(value.predecessorRunId, 'successorTransition.predecessorRunId')
   }
-  validateSuccessorRecoveryProfile(value.recoveryProfile)
+  if ('recoveryProfile' in value) validateSuccessorRecoveryProfile(value.recoveryProfile)
 }
 
 function validateSuccessorRecoveryProfile(value: unknown): void {

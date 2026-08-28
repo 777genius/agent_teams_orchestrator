@@ -1877,10 +1877,68 @@ describe('OpenCodeSessionBridge', () => {
     }
   })
 
-  test('concurrent exact recovery single-flights lease effects and returns one completed successor', async () => {
+  test('legacy recovery without immutable profile authority fails before host or provider effects', async () => {
+    const profileB = {
+      ...profile,
+      projectBehaviorFingerprint: 'behavior-authority-b',
+      managedAuthFingerprint: 'auth-authority-b',
+      managedConfigFingerprint: 'config-authority-b',
+    }
+    const legacySuccessor = buildRecord({
+      hostKey: 'host-authority-a',
+      opencodeSessionId: 'session-authority-a',
+      runId: 'run-authority-a',
+      projectBehaviorFingerprint: 'behavior-authority-a',
+      managedAuthFingerprint: 'auth-authority-a',
+      managedConfigFingerprint: 'config-authority-a',
+      successorTransition: {
+        version: 1,
+        attemptIdentity: 'd'.repeat(64),
+        phase: 'successor_lease_pending',
+        predecessorHostKey: 'host-old',
+        predecessorOpencodeSessionId: 'session-old',
+        predecessorRunId: 'run-old',
+      },
+    })
+    const effects: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => { effects.push('prepare-current-profile'); return profile },
+      sessionStore: {
+        get: async () => legacySuccessor,
+        getByLogicalMember: async () => legacySuccessor,
+      },
+      hostManager: {
+        ensureHost: async () => { effects.push('ensure-host'); return host },
+        releaseHost: async () => { effects.push('release-host') },
+        retainHostLease: async () => { effects.push('retain-lease') },
+        releaseHostLease: async () => { effects.push('release-lease'); return 'applied' },
+      },
+      clientFactory: { create: () => {
+        effects.push('create-provider-client')
+        throw new Error('provider client must not be created')
+      } },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: legacySuccessor.teamId,
+      laneId: legacySuccessor.laneId,
+      memberName: legacySuccessor.memberName,
+      selectedModel: 'openai/profile-b',
+      projectPath: legacySuccessor.projectPath,
+      preparedProfile: profileB,
+      runId: 'run-profile-b',
+      fresh: false,
+    })).rejects.toThrow(
+      'legacy durable successor transition has no immutable recovery authority; recovery refused',
+    )
+    expect(effects).toEqual([])
+  })
+
+  test('independent bridges compensate the local reference that loses durable recovery CAS', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-concurrent-recovery-'))
     try {
-      const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+      const storePath = path.join(directory, 'sessions.json')
+      const store = new OpenCodeSessionStore(storePath)
       const old = buildRecord({ hostKey: 'host-old', runId: 'run-old' })
       const successorDecisionKey = JSON.stringify([
         old.projectIdentity, old.teamId, old.laneId, old.memberName,
@@ -1922,24 +1980,32 @@ describe('OpenCodeSessionBridge', () => {
         },
       })
       await store.upsert(successor)
-      let retainCalls = 0
-      let releaseLeaseCalls = 0
-      let ensureCalls = 0
+      const stores = [new OpenCodeSessionStore(storePath), new OpenCodeSessionStore(storePath)]
+      const durableLeases = new Map([[old.hostKey, old.opencodeSessionId]])
+      let successorRetains = 0
+      let predecessorReleaseAttempts = 0
+      let predecessorReleaseEffects = 0
+      let bothPredecessorReleasesEntered!: () => void
+      const predecessorReleaseBarrier = new Promise<void>(resolve => {
+        bothPredecessorReleasesEntered = resolve
+      })
       let releaseRetain!: () => void
       const retainBarrier = new Promise<void>(resolve => { releaseRetain = resolve })
-      let retainEntered!: () => void
-      const retainEnteredBarrier = new Promise<void>(resolve => { retainEntered = resolve })
+      let firstRetainEntered!: () => void
+      const firstRetainEnteredBarrier = new Promise<void>(resolve => { firstRetainEntered = resolve })
+      let bothRetainsEntered!: () => void
+      const bothRetainsEnteredBarrier = new Promise<void>(resolve => { bothRetainsEntered = resolve })
       let releaseFirstRead!: () => void
       const firstReadBarrier = new Promise<void>(resolve => { releaseFirstRead = resolve })
       let firstReadEntered!: () => void
       const firstReadEnteredBarrier = new Promise<void>(resolve => { firstReadEntered = resolve })
       let reads = 0
-      const concurrentStore = {
-        get: store.get.bind(store),
+      const concurrentStore = (durableStore: OpenCodeSessionStore) => ({
+        get: durableStore.get.bind(durableStore),
         getByLogicalMember: async (
           logical: Parameters<OpenCodeSessionStore['getByLogicalMember']>[0],
         ) => {
-          const record = await store.getByLogicalMember(logical)
+          const record = await durableStore.getByLogicalMember(logical)
           reads += 1
           if (reads === 1) {
             firstReadEntered()
@@ -1948,50 +2014,100 @@ describe('OpenCodeSessionBridge', () => {
           return record
         },
         advanceSuccessorTransitionIfExact:
-          store.advanceSuccessorTransitionIfExact.bind(store),
-      }
-      const makeBridge = () => new OpenCodeSessionBridge({
+          durableStore.advanceSuccessorTransitionIfExact.bind(durableStore),
+      })
+      const localReferences = [new Map<string, number>(), new Map<string, number>()]
+      const releasedHosts: string[] = []
+      let providerCreates = 0
+      const makeBridge = (index: number) => new OpenCodeSessionBridge({
         prepareProfile: async () => profile,
-        sessionStore: concurrentStore,
+        sessionStore: concurrentStore(stores[index]!),
         hostManager: {
           ensureHost: async input => {
-            ensureCalls += 1
-            return { ...host, hostKey: input.hostKey ?? 'unexpected', profile: input.preparedProfile }
+            const hostKey = input.hostKey ?? 'unexpected'
+            const references = localReferences[index]!
+            references.set(hostKey, (references.get(hostKey) ?? 0) + 1)
+            return { ...host, hostKey, profile: input.preparedProfile }
           },
-          releaseHost: async () => {},
-          retainHostLease: async () => {
-            retainCalls += 1
-            retainEntered()
+          releaseHost: async hostKey => {
+            releasedHosts.push(hostKey)
+            const references = localReferences[index]!
+            const count = references.get(hostKey) ?? 0
+            if (count > 0) references.set(hostKey, count - 1)
+          },
+          retainHostLease: async (hostKey, lease) => {
+            durableLeases.set(hostKey, lease.sessionId)
+            successorRetains += 1
+            if (successorRetains === 1) firstRetainEntered()
+            if (successorRetains === 2) bothRetainsEntered()
             await retainBarrier
           },
-          releaseHostLease: async () => { releaseLeaseCalls += 1; return 'applied' },
+          releaseHostLease: async (hostKey, lease) => {
+            predecessorReleaseAttempts += 1
+            if (predecessorReleaseAttempts === 2) bothPredecessorReleasesEntered()
+            await predecessorReleaseBarrier
+            if (durableLeases.get(hostKey) !== lease.sessionId) return 'absent' as const
+            durableLeases.delete(hostKey)
+            predecessorReleaseEffects += 1
+            return 'applied' as const
+          },
         },
-        clientFactory: { create: () => ({
+        clientFactory: { create: () => { providerCreates += 1; return ({
           createSession: async () => { throw new Error('must not create another successor') },
-        } as never) },
+        } as never) } },
       })
       const input = {
         teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
         selectedModel: successor.selectedModel, projectPath: old.projectPath,
         preparedProfile: profile, runId: successor.runId, fresh: false,
       }
-      const first = makeBridge().ensureSession(input)
+      const bridges = [makeBridge(0), makeBridge(1)]
+      const first = bridges[0]!.ensureSession(input)
       await firstReadEnteredBarrier
-      const second = makeBridge().ensureSession(input)
-      await retainEnteredBarrier
+      const second = bridges[1]!.ensureSession(input)
+      await firstRetainEnteredBarrier
       releaseFirstRead()
-      await Promise.resolve()
-      await Promise.resolve()
+      await bothRetainsEnteredBarrier
       releaseRetain()
       const records = await Promise.all([first, second])
 
       expect(records.map(record => record.opencodeSessionId)).toEqual(['session-new', 'session-new'])
       expect(records.every(record => !record.successorTransition)).toBe(true)
-      expect({ ensureCalls, retainCalls, releaseLeaseCalls }).toEqual({
-        ensureCalls: 1, retainCalls: 1, releaseLeaseCalls: 1,
+      expect(successorRetains).toBe(2)
+      expect(durableLeases.get(successor.hostKey)).toBe(successor.opencodeSessionId)
+      expect({ predecessorReleaseAttempts, predecessorReleaseEffects }).toEqual({
+        predecessorReleaseAttempts: 2,
+        predecessorReleaseEffects: 1,
       })
+      expect(releasedHosts.filter(hostKey => hostKey === old.hostKey)).toHaveLength(1)
+      expect(releasedHosts.filter(hostKey => hostKey === successor.hostKey)).toHaveLength(1)
+      expect(localReferences.map(references => references.get(successor.hostKey) ?? 0).sort())
+        .toEqual([0, 1])
       expect((await store.getByLogicalMember(old))?.successorCompletionReceipt)
         .toMatchObject({ attemptIdentity })
+
+      const retryReferences = new Map<string, number>()
+      const retryBridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        sessionStore: new OpenCodeSessionStore(storePath),
+        hostManager: {
+          ensureHost: async input => {
+            const hostKey = input.hostKey ?? 'unexpected'
+            retryReferences.set(hostKey, (retryReferences.get(hostKey) ?? 0) + 1)
+            return { ...host, hostKey, profile: input.preparedProfile }
+          },
+          releaseHost: async () => {},
+          retainHostLease: async (hostKey, lease) => {
+            durableLeases.set(hostKey, lease.sessionId)
+          },
+          releaseHostLease: async () => 'absent',
+        },
+        clientFactory: { create: () => { providerCreates += 1; throw new Error('must not create') } },
+      })
+      const retried = await retryBridge.ensureSession(input)
+      expect(retried.opencodeSessionId).toBe(successor.opencodeSessionId)
+      expect(retryReferences.get(successor.hostKey)).toBe(1)
+      expect(providerCreates).toBe(0)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

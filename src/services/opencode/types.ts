@@ -882,8 +882,12 @@ export type OpenCodeSessionSuccessorTransition = {
   predecessorHostKey: string
   predecessorOpencodeSessionId: string
   predecessorRunId: string | null
-  /** Immutable recovery authority authenticated by attemptIdentity. */
-  recoveryProfile: OpenCodeSessionSuccessorRecoveryProfile
+  /**
+   * Immutable recovery authority authenticated by attemptIdentity. Optional
+   * only so pre-authority persisted transitions remain readable; new writes
+   * require it and recovery without it fails closed.
+   */
+  recoveryProfile?: OpenCodeSessionSuccessorRecoveryProfile
 }
 
 export type OpenCodeSessionSuccessorRecoveryProfile = {

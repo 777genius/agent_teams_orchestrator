@@ -178,6 +178,42 @@ describe('OpenCodeSessionStore', () => {
       ?.successorTransition).toBeUndefined()
   })
 
+  test('reads a legacy successor transition without authority but rejects republishing it', async () => {
+    const filePath = path.join(tempDir, 'legacy-successor-store.json')
+    const logicalKey = openCodeLogicalMemberKey({
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      projectIdentity: baseRecord.projectIdentity,
+      memberName: baseRecord.memberName,
+    })
+    const legacySuccessor = {
+      ...baseRecord,
+      opencodeSessionId: 'session-legacy-successor',
+      runId: 'run-legacy-successor',
+      successorTransition: {
+        version: 1,
+        attemptIdentity: 'd'.repeat(64),
+        phase: 'successor_lease_pending',
+        predecessorHostKey: 'host-old',
+        predecessorOpencodeSessionId: 'session-old',
+        predecessorRunId: 'run-old',
+      },
+    }
+    await writeFile(filePath, JSON.stringify({
+      schemaVersion: 3,
+      records: { [logicalKey]: legacySuccessor },
+      reservations: {},
+    }))
+
+    const store = new OpenCodeSessionStore(filePath)
+    const readable = await store.getByLogicalMember(baseRecord)
+    expect(readable).toEqual(legacySuccessor)
+    expect(await store.list()).toEqual([legacySuccessor])
+    await expect(store.upsert(readable!)).rejects.toThrow(
+      'invalid OpenCode successor transition',
+    )
+  })
+
   test('foreign successor owners and attempts cannot advance or clear a transition', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
     const store = new OpenCodeSessionStore(filePath)
