@@ -55,6 +55,7 @@ import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   buildCursorAgentResourceExhaustedPreloadScript,
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
@@ -556,20 +557,27 @@ export function buildManagedConfig(
   options: {
     allowAutoUpdate?: boolean
     defaultModelId?: string | null
+    managedProviderId?: string | null
     modelOutputLimitOverrides?: OpenCodePrepareProfileOptions['modelOutputLimitOverrides']
     toolApprovalMode?: OpenCodeToolApprovalMode
   } = {},
 ): Record<string, unknown> {
+  const managedProviders: Record<string, unknown> = {
+    [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
+    [GITHUB_COPILOT_PROVIDER_ID]: GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG,
+    ...getOpenCodeCuratedSubscriptionProviderConfigs(),
+  }
+  const selectedManagedProviderId = options.managedProviderId?.trim()
   const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     default_agent: OPEN_CODE_TEAMMATE_AGENT_NAME,
     share: 'disabled',
     snapshot: true,
-    provider: {
-      [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
-      [GITHUB_COPILOT_PROVIDER_ID]: GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG,
-      ...getOpenCodeCuratedSubscriptionProviderConfigs(),
-    },
+    provider: selectedManagedProviderId
+      ? (managedProviders[selectedManagedProviderId]
+        ? { [selectedManagedProviderId]: managedProviders[selectedManagedProviderId] }
+        : {})
+      : managedProviders,
     agent: {
       [OPEN_CODE_TEAMMATE_AGENT_NAME]: {
         mode: 'primary',
@@ -669,6 +677,13 @@ function deepMergeOpenCodeConfig(
   const merged: Record<string, unknown> = { ...base }
   for (const [key, value] of Object.entries(override)) {
     const existing = merged[key]
+    if (key === 'plugin' && Array.isArray(value)) {
+      merged[key] = Array.from(new Set([
+        ...(Array.isArray(existing) ? existing : []),
+        ...value,
+      ]))
+      continue
+    }
     if (
       value
       && typeof value === 'object'
@@ -690,6 +705,7 @@ function deepMergeOpenCodeConfig(
 
 export function applyOpenCodeManagedSubscriptionPlugins(
   config: Record<string, unknown>,
+  managedPlugins = getOpenCodeManagedSubscriptionPluginPackages(),
 ): void {
   const configuredPlugins = Array.isArray(config.plugin)
     ? config.plugin.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -697,7 +713,7 @@ export function applyOpenCodeManagedSubscriptionPlugins(
   config.plugin = [
     ...new Set([
       ...configuredPlugins,
-      ...getOpenCodeManagedSubscriptionPluginPackages(),
+      ...managedPlugins,
     ]),
   ]
 }
@@ -1162,6 +1178,14 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
     safe.small_model = smallModel
   }
 
+  const plugins = Array.isArray(source.plugin)
+    ? source.plugin.filter((plugin): plugin is string =>
+        typeof plugin === 'string' && plugin.trim().length > 0)
+    : []
+  if (plugins.length > 0) {
+    safe.plugin = plugins
+  }
+
   return safe
 }
 
@@ -1396,7 +1420,12 @@ export class OpenCodeProfileManager {
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
     const resolvedProjectPath = this.getProjectPath(projectPath)
-    const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
+    const policy = options.profileScope
+      ? planOpenCodeProfilePolicy(options.profileScope)
+      : null
+    const profileRootKey = policy
+      ? hashString(JSON.stringify({ projectPath: resolvedProjectPath, ...policy.scope })).slice(0, 16)
+      : this.getProfileRootKey(resolvedProjectPath)
     return this.withProfilePreparationLock(profileRootKey, async () => {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const profileRootPath = path.join(
@@ -1423,12 +1452,17 @@ export class OpenCodeProfileManager {
       ...managedRuntimePreferences.modelLimitOverrides,
     }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
+    if (!policy) {
+      // Keep the legacy inline overlay unchanged. Scoped profiles preserve user
+      // plugin entries before adding only the selected provider's managed plugin.
+      delete importedRuntimeConfig.plugin
+    }
     const importedConfigDefaultModelId =
       typeof importedRuntimeConfig.model === 'string'
         ? importedRuntimeConfig.model.trim() || null
         : null
     const appMcpConfig =
-      options.includeAppMcp === false
+      (policy ? !policy.includeAppMcp : options.includeAppMcp === false)
         ? null
         : await this.resolveManagedAppMcpConfig()
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
@@ -1445,12 +1479,17 @@ export class OpenCodeProfileManager {
       buildManagedConfig(appMcpConfig, {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
         defaultModelId: effectiveManagedDefaultModelId,
+        managedProviderId: policy?.scope.providerId,
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
     applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
-    if (options.includeManagedSubscriptionPlugins !== false) {
-      applyOpenCodeManagedSubscriptionPlugins(managedConfig)
+    const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
+      ?? (options.includeManagedSubscriptionPlugins === false
+        ? []
+        : getOpenCodeManagedSubscriptionPluginPackages())
+    if (managedSubscriptionPlugins.length > 0) {
+      applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
@@ -1489,7 +1528,7 @@ export class OpenCodeProfileManager {
       mkdir(sharedToolCachePath, { recursive: true }),
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
-    if (options.includeManagedSubscriptionPlugins !== false) {
+    if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath)
     }
@@ -1511,13 +1550,15 @@ export class OpenCodeProfileManager {
       globalAuthFingerprint,
       sourceAuthSources,
     })
-    await reconcileOpenCodeManagedAuthStores({
-      sourceAuthPaths: authSourcePaths,
-      globalAuthPath,
-      managedAuthPath,
-      peerManagedAuthPaths: await this.listManagedAuthPaths(),
-      abortSignal: options.abortSignal,
-    })
+    if (policy?.reconcileAuth !== false) {
+      await reconcileOpenCodeManagedAuthStores({
+        sourceAuthPaths: authSourcePaths,
+        globalAuthPath,
+        managedAuthPath,
+        peerManagedAuthPaths: await this.listManagedAuthPaths(),
+        abortSignal: options.abortSignal,
+      })
+    }
     if (nativeCliCredentialBridge) {
       await Promise.all([
         ensureOpenCodeCursorPluginAuthCredential({

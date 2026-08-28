@@ -330,6 +330,7 @@ export type RuntimeProviderModelsView = {
   models: readonly RuntimeProviderModel[]
   defaultModelId: string | null
   diagnostics: readonly string[]
+  catalogState: 'fresh' | 'stale'
 }
 
 export type ProjectScopedProviderManagementInput = {

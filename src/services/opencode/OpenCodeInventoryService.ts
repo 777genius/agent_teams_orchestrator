@@ -36,6 +36,7 @@ import type {
   OpenCodeInventorySnapshot,
   OpenCodeModelMetadata,
   OpenCodePreparedProfile,
+  OpenCodeProfileScope,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
@@ -142,6 +143,7 @@ type OpenCodeInventoryProbeOptions = {
   toolApprovalMode?: OpenCodeToolApprovalMode
   abortSignal?: AbortSignal
   progress?: OpenCodeInventoryProbeProgressTracker
+  profileScope?: OpenCodeProfileScope
 }
 
 export type OpenCodeCommandResult = {
@@ -938,7 +940,8 @@ export class OpenCodeInventoryService {
     const mode = options.mode ?? 'full'
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
-    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
+    const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
+    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
@@ -978,6 +981,7 @@ export class OpenCodeInventoryService {
         includeAppMcp: options.includeAppMcp !== false,
         includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
+        profileScope: options.profileScope,
       }),
       options.abortSignal,
     )

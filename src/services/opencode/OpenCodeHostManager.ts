@@ -1403,6 +1403,7 @@ export class OpenCodeHostManager {
       healthTimeoutMs?: number | null
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
+      prewarmManagedSubscriptionPlugins?: boolean
       abortSignal?: AbortSignal
     } = {},
   ): Promise<OpenCodeHostHandle> {
@@ -1417,7 +1418,7 @@ export class OpenCodeHostManager {
       params.abortSignal,
     )
     const binaryPath = resolveOpenCodeBinaryPath()
-    if (binaryPath) {
+    if (binaryPath && params.prewarmManagedSubscriptionPlugins !== false) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
         profile,

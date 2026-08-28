@@ -108,6 +108,35 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     await rm(tempDir, { recursive: true, force: true })
   })
 
+  test('isolates scoped profile roots by normalized project, purpose, provider, and config', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'project')
+    await mkdir(projectPath, { recursive: true })
+    const prepare = (purpose: 'catalog' | 'execution_probe', providerId: string, configFingerprint: string) =>
+      manager.prepareProfile(path.join(projectPath, '.'), {
+        profileScope: { purpose, providerId, configFingerprint },
+      })
+
+    const catalog = await prepare('catalog', 'DeepInfra', 'config-a')
+    const sameCatalog = await prepare('catalog', 'deepinfra', 'config-a')
+    const probe = await prepare('execution_probe', 'deepinfra', 'config-a')
+    const provider = await prepare('catalog', 'openrouter', 'config-a')
+    const config = await prepare('catalog', 'deepinfra', 'config-b')
+    const legacy = await manager.prepareProfile(projectPath, {
+      includeAppMcp: false,
+      includeManagedSubscriptionPlugins: false,
+    })
+
+    expect(sameCatalog.profileRootPath).toBe(catalog.profileRootPath)
+    expect(new Set([
+      catalog.profileRootPath,
+      probe.profileRootPath,
+      provider.profileRootPath,
+      config.profileRootPath,
+      legacy.profileRootPath,
+    ]).size).toBe(5)
+  })
+
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
     expect(isKiroCliWhoamiAuthenticated({
       stdout: '{"accountType":"IamIdentityCenter","email":"user@example.com"}\n\nProfile:\nKiroProfile',
@@ -1118,6 +1147,45 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
       expect(managedConfig.plugin).toEqual([
         'opencode-kiro@0.4.0',
+        '@rama_nigg/open-cursor@2.5.2',
+      ])
+      const scopedProfile = await manager.prepareProfile(
+        path.join(tempDir, 'project-config-import'),
+        {
+          profileScope: {
+            purpose: 'catalog',
+            providerId: 'deepinfra',
+            configFingerprint: 'catalog-v1',
+          },
+        },
+      )
+      expect(scopedProfile.managedConfig.plugin).toEqual(['unsafe-plugin'])
+      const kiroProfile = await manager.prepareProfile(
+        path.join(tempDir, 'project-config-import'),
+        {
+          profileScope: {
+            purpose: 'catalog',
+            providerId: 'kiro',
+            configFingerprint: 'catalog-v1',
+          },
+        },
+      )
+      expect(kiroProfile.managedConfig.plugin).toEqual([
+        'unsafe-plugin',
+        'opencode-kiro@0.4.0',
+      ])
+      const cursorProfile = await manager.prepareProfile(
+        path.join(tempDir, 'project-config-import'),
+        {
+          profileScope: {
+            purpose: 'catalog',
+            providerId: 'cursor-acp',
+            configFingerprint: 'catalog-v1',
+          },
+        },
+      )
+      expect(cursorProfile.managedConfig.plugin).toEqual([
+        'unsafe-plugin',
         '@rama_nigg/open-cursor@2.5.2',
       ])
       expect(managedConfig).not.toHaveProperty('permission')

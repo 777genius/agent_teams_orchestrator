@@ -393,7 +393,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         projectPath: '/tmp/project',
         hostLifetime: 'persistent',
         healthTimeoutMs: undefined,
-        preparedProfile: false,
+        preparedProfile: true,
         includeAppMcp: undefined,
       },
     ])
@@ -7387,6 +7387,123 @@ describe('OpenCodeProviderManagementAdapter', () => {
       managedContextTokens: 128_000,
       managedOutputTokens: 16_000,
       managedUpdatedAt: '2026-07-12T12:00:00.000Z',
+    })
+  })
+
+  test('loads catalog through a selected-provider profile without broad discovery calls', async () => {
+    let probeOptions: Record<string, unknown> | undefined
+    let ensureOptions: Record<string, unknown> | undefined
+    let providerAuthCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          probeOptions = options as Record<string, unknown>
+          return inventory({ models: [], availableProviders: [] })
+        },
+      },
+      hostManager: {
+        ensureHost: async options => {
+          ensureOptions = options as Record<string, unknown>
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'kiro', name: 'Kiro', models: { auto: {} } }], default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'kiro', name: 'Kiro', models: { auto: {} } }],
+            connected: [], default: {},
+          }),
+          getProviderAuth: async () => {
+            providerAuthCalls += 1
+            return {}
+          },
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode', providerId: 'Amazon Q Developer / Kiro', projectPath: '/tmp/project',
+    })
+
+    if (!result.ok) {
+      throw new Error(JSON.stringify(result.error))
+    }
+    expect(result.value).toMatchObject({
+      providerId: 'kiro', catalogState: 'fresh',
+    })
+    expect(probeOptions).toMatchObject({
+      mode: 'profile',
+      includeAppMcp: false,
+      profileScope: {
+        purpose: 'catalog', providerId: 'kiro', configFingerprint: 'selected-provider-catalog-v1',
+      },
+    })
+    expect(ensureOptions).toMatchObject({
+      prewarmManagedSubscriptionPlugins: false, resolveConfigFingerprint: false,
+    })
+    expect(providerAuthCalls).toBe(0)
+  })
+
+  test('retains timed-out catalog evidence as stale and rejects its late generation', async () => {
+    type ProviderResult = {
+      all: Array<{ id: string; name: string; models: Record<string, unknown> }>
+      connected: string[]
+      default: Record<string, string>
+    }
+    let mode: 'initial' | 'slow' | 'new' = 'initial'
+    let resolveSlow!: (value: ProviderResult) => void
+    const slowProviders = new Promise<ProviderResult>(resolve => {
+      resolveSlow = resolve
+    })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogTimeoutMs: 50,
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => {
+            if (mode === 'slow') return slowProviders
+            const modelId = mode === 'initial' ? 'initial' : 'new-generation'
+            return {
+              all: [{ id: 'local', name: 'Local', models: { [modelId]: {} } }],
+              connected: [], default: {},
+            }
+          },
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+
+    const initial = await adapter.loadModels(input)
+    expect(initial.ok && initial.value.models.map(model => model.modelId)).toEqual(['local/initial'])
+    mode = 'slow'
+    const stale = await adapter.loadModels(input)
+    expect(stale.ok).toBe(true)
+    if (!stale.ok) return
+    expect(stale.value).toMatchObject({ catalogState: 'stale' })
+    expect(stale.value.models.map(model => model.modelId)).toEqual(['local/initial'])
+
+    mode = 'new'
+    const current = await adapter.loadModels(input)
+    expect(current.ok && current.value.models.map(model => model.modelId)).toEqual([
+      'local/new-generation',
+    ])
+    resolveSlow({
+      all: [{ id: 'local', name: 'Local', models: { late: {} } }], connected: [], default: {},
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const cache = (adapter as unknown as {
+      catalogCache: Map<string, { providers: { all: Array<{ models?: Record<string, unknown> }> } }>
+    }).catalogCache
+    expect(Array.from(cache.values()).at(-1)?.providers.all[0]?.models).toEqual({
+      'new-generation': {},
     })
   })
 })

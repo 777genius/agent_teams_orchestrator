@@ -20,6 +20,15 @@ export type OpenCodePrepareProfileOptions = {
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
+  profileScope?: OpenCodeProfileScope
+}
+
+export type OpenCodeProfilePurpose = 'catalog' | 'execution_probe' | 'launch_runtime'
+
+export type OpenCodeProfileScope = {
+  purpose: OpenCodeProfilePurpose
+  providerId: string
+  configFingerprint: string
 }
 
 export type OpenCodePreparedProfile = {

@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
@@ -19,6 +21,7 @@ import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenC
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   openCodeHostManager,
+  resolveOpenCodeBinaryHostIdentity,
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
@@ -34,6 +37,7 @@ import {
   withOpenCodeInventoryProbeTimeout,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
+import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
 import {
   buildOpenCodeModelRouteMetadata,
   evaluateOpenCodeModelAccess,
@@ -52,6 +56,7 @@ import {
   type OpenCodeManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
+import { getCwd } from '../../../../utils/cwd.js'
 import type {
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
@@ -66,6 +71,7 @@ import type {
   OpenCodeProviderOAuthCallbackInput,
   OpenCodeProviderListEntry,
   OpenCodeProviderResponse,
+  OpenCodePrepareProfileOptions,
   OpenCodeServerDocResponse,
 } from '../../../../services/opencode/types.js'
 import { isRecommendedProvider, sortProviderConnections } from '../../domain/providerOrdering.js'
@@ -205,6 +211,7 @@ type OpenCodeProviderManagementAdapterDeps = {
     ): Promise<unknown>
   }
   inventoryTimeoutMs?: number
+  catalogTimeoutMs?: number
 }
 
 type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
@@ -381,6 +388,15 @@ type ProviderDirectoryCacheEntry = {
   expiresAt: number
   value: ProviderDirectoryView
   modelIdsByProviderId: Record<string, string[]>
+}
+
+type ProviderCatalogCacheEntry = {
+  identity: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+  managedModelLimitOverrides?: OpenCodeManagedRuntimePreferences['modelLimitOverrides']
+  diagnostics: string[]
 }
 
 type OpenCodeProviderManagementCapabilities = {
@@ -2825,6 +2841,7 @@ function buildProviderModelsView(input: {
     models,
     defaultModelId,
     diagnostics: input.diagnostics ?? [],
+    catalogState: 'fresh',
   }
 }
 
@@ -2984,6 +3001,9 @@ export class OpenCodeProviderManagementAdapter
     ProviderManagementCommandPort
 {
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
+  private readonly catalogCache = new Map<string, ProviderCatalogCacheEntry>()
+  private readonly latestCatalogIdentityByScope = new Map<string, string>()
+  private readonly catalogGenerationByScope = new Map<string, number>()
   private hostLeaseSequence = 0
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
@@ -3426,6 +3446,8 @@ export class OpenCodeProviderManagementAdapter
       secretToRedact?: string | null
       inventoryMode?: 'full' | 'summary' | 'profile'
       hostLifetime?: 'persistent' | 'process'
+      profileScope?: OpenCodePrepareProfileOptions['profileScope']
+      prewarmManagedSubscriptionPlugins?: boolean
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3439,6 +3461,7 @@ export class OpenCodeProviderManagementAdapter
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, projectPath, {
       mode: options.inventoryMode ?? 'full',
+      profileScope: options.profileScope,
     })
 
     if (!inventory.detected) {
@@ -3460,8 +3483,11 @@ export class OpenCodeProviderManagementAdapter
     try {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
+        preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
+        profileOptions: options.profileScope ? { profileScope: options.profileScope } : undefined,
         hostLifetime,
         resolveConfigFingerprint: false,
+        prewarmManagedSubscriptionPlugins: options.prewarmManagedSubscriptionPlugins,
       })
       if (hostLifetime === 'persistent') {
         hostLease = await this.retainProviderManagementHost(hostManager, host)
@@ -3862,15 +3888,36 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
-    const providerId = normalizeProviderId(input.providerId)
+    const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
     if (!providerId) {
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
-    return this.withManagedOpenCodeClient(
+    const scopeKey = `${path.resolve(input.projectPath?.trim() || getCwd())}|${providerId}`
+    const generation = (this.catalogGenerationByScope.get(scopeKey) ?? 0) + 1
+    this.catalogGenerationByScope.set(scopeKey, generation)
+    const profileScope = {
+      purpose: 'catalog' as const,
+      providerId,
+      configFingerprint: 'selected-provider-catalog-v1',
+    }
+    const render = (entry: ProviderCatalogCacheEntry, stale: boolean) => buildProviderModelsView({
+      providerId,
+      inventory: entry.inventory,
+      configProviders: entry.configProviders,
+      providers: entry.providers,
+      query: input.query,
+      limit: input.limit,
+      cursor: input.cursor,
+      diagnostics: stale
+        ? [...entry.diagnostics, 'OpenCode catalog refresh timed out; showing stale selectable evidence.']
+        : entry.diagnostics,
+      managedModelLimitOverrides: entry.managedModelLimitOverrides,
+    })
+    const operation = this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, client }) => {
+      async ({ inventory, host, client }) => {
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
@@ -3884,20 +3931,31 @@ export class OpenCodeProviderManagementAdapter
           ...safeReadDiagnostics(configProvidersResult),
           ...safeReadDiagnostics(providersResult),
         ]
-        const modelsView = buildProviderModelsView({
-          providerId,
+        const binaryFingerprint = inventory.binaryPath
+          ? await resolveOpenCodeBinaryHostIdentity(inventory.binaryPath)
+          : 'missing-binary'
+        const entry: ProviderCatalogCacheEntry = {
+          identity: [
+            inventory.projectPath,
+            providerId,
+            binaryFingerprint,
+            host.version ?? inventory.version ?? 'unknown-version',
+            host.hostKey,
+            host.profile.managedConfigFingerprint,
+            host.resolvedConfigFingerprint ?? 'unresolved-config',
+            host.profile.managedAuthFingerprint ?? 'missing-auth',
+            'catalog-generation-v1',
+          ].join('|'),
           inventory,
           configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
           providers: providersResult.ok ? providersResult.value : null,
-          query: input.query,
-          limit: input.limit,
-          cursor: input.cursor,
           diagnostics,
           managedModelLimitOverrides:
             preferencesResult.ok && preferencesResult.value
               ? preferencesResult.value.modelLimitOverrides
               : undefined,
-        })
+        }
+        const modelsView = render(entry, false)
 
         if (modelsView.models.length === 0) {
           const knownProviderIds = getKnownProviderIds({
@@ -3913,9 +3971,53 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
-        return { ok: true, value: modelsView }
+        if (this.catalogGenerationByScope.get(scopeKey) !== generation) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode catalog response was superseded by a newer provider request',
+          )
+        }
+        this.catalogCache.set(entry.identity, entry)
+        this.latestCatalogIdentityByScope.set(scopeKey, entry.identity)
+        return {
+          ok: true,
+          value: modelsView,
+        }
+      },
+      {
+        inventoryMode: 'profile',
+        profileScope,
+        prewarmManagedSubscriptionPlugins: false,
       },
     )
+    const timeoutMs = this.deps.catalogTimeoutMs ?? 15_000
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const result = await Promise.race([
+      operation,
+      new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(resolve => {
+        timeout = setTimeout(() => {
+          if (this.catalogGenerationByScope.get(scopeKey) === generation) {
+            this.catalogGenerationByScope.set(scopeKey, generation + 1)
+          }
+          const identity = this.latestCatalogIdentityByScope.get(scopeKey)
+          const cached = identity ? this.catalogCache.get(identity) : undefined
+          resolve(cached
+            ? {
+                ok: true,
+                value: {
+                  ...render(cached, true),
+                  catalogState: 'stale',
+                },
+              }
+            : providerManagementError(
+                'runtime-unhealthy',
+                `OpenCode catalog refresh timed out after ${timeoutMs}ms`,
+              ))
+        }, timeoutMs)
+      }),
+    ])
+    if (timeout) clearTimeout(timeout)
+    return result
   }
 
   async connectWithApiKey(
