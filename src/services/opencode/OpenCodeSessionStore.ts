@@ -75,6 +75,7 @@ const LOCK_OPTIONS = {
   },
 }
 const RESERVATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/
+const MAX_SUCCESSOR_RECOVERY_CONFIG_BYTES = 1024 * 1024
 
 function buildRecordKey(
   record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'projectIdentity'>,
@@ -360,7 +361,12 @@ export class OpenCodeSessionStore {
         return { status: 'foreign', record: existing }
       }
       const transition = existing.successorTransition
-      if (!transition || transition.attemptIdentity !== attemptIdentity) {
+      if (!transition) {
+        return existing.successorCompletionReceipt?.attemptIdentity === attemptIdentity
+          ? { status: 'already-satisfied', record: existing }
+          : { status: 'foreign', record: existing }
+      }
+      if (transition.attemptIdentity !== attemptIdentity) {
         return { status: 'foreign', record: existing }
       }
       if (transition.phase !== expectedPhase) {
@@ -369,7 +375,13 @@ export class OpenCodeSessionStore {
       const next: OpenCodeSessionRecord = nextPhase === null
         ? (() => {
           const { successorTransition: _transition, ...record } = existing
-          return record
+          return { ...record, successorCompletionReceipt: {
+            version: 1,
+            attemptIdentity: transition.attemptIdentity,
+            predecessorHostKey: transition.predecessorHostKey,
+            predecessorOpencodeSessionId: transition.predecessorOpencodeSessionId,
+            predecessorRunId: transition.predecessorRunId,
+          } }
         })()
         : { ...existing, successorTransition: { ...transition, phase: nextPhase } }
       store.records[buildRecordKey(next)] = next
@@ -647,7 +659,8 @@ const RECORD_REQUIRED_KEYS = [
 ] as const
 const RECORD_OPTIONAL_KEYS = [
   'appManagedBootstrap', 'bootstrapEvidenceSource', 'bootstrapMode', 'laneId', 'managedConfigFingerprint',
-  'opencodeVersion', 'runtimePid', 'selectedVariant', 'successorTransition', 'toolApprovalMode',
+  'opencodeVersion', 'runtimePid', 'selectedVariant', 'successorCompletionReceipt',
+  'successorTransition', 'toolApprovalMode',
 ] as const
 const RECORD_ALLOWED_KEYS = new Set<string>([...RECORD_REQUIRED_KEYS, ...RECORD_OPTIONAL_KEYS])
 const LEGACY_RECORD_ALLOWED_KEYS = new Set<string>([
@@ -768,6 +781,9 @@ function validateRecordForWrite(value: OpenCodeSessionRecord): OpenCodeSessionRe
   }
   if (value.appManagedBootstrap !== undefined) validateAppManagedBootstrap(value.appManagedBootstrap)
   if (value.successorTransition !== undefined) validateSuccessorTransition(value.successorTransition)
+  if (value.successorCompletionReceipt !== undefined) {
+    validateSuccessorCompletionReceipt(value.successorCompletionReceipt)
+  }
   if (!Number.isFinite(Date.parse(value.createdAt)) || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw new Error('invalid OpenCode session record timestamp')
   }
@@ -784,9 +800,11 @@ function requiredTransitionIdentity(value: unknown): string {
 
 function validateSuccessorTransition(value: unknown): void {
   if (!isRecordMap(value)) throw new Error('invalid OpenCode successor transition')
-  const allowed = ['attemptIdentity', 'phase', 'predecessorHostKey',
-    'predecessorOpencodeSessionId', 'predecessorRunId', 'version']
-  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 1
+  const required = ['attemptIdentity', 'phase', 'predecessorHostKey',
+    'predecessorOpencodeSessionId', 'predecessorRunId', 'recoveryProfile', 'version']
+  const allowed = required
+  if (Object.keys(value).some(key => !allowed.includes(key))
+    || required.some(key => !(key in value)) || value.version !== 1
     || !['successor_lease_pending', 'predecessor_release_pending', 'transition_complete']
       .includes(String(value.phase))) {
     throw new Error('invalid OpenCode successor transition')
@@ -797,6 +815,58 @@ function validateSuccessorTransition(value: unknown): void {
     'successorTransition.predecessorOpencodeSessionId')
   if (value.predecessorRunId !== null) {
     requiredString(value.predecessorRunId, 'successorTransition.predecessorRunId')
+  }
+  validateSuccessorRecoveryProfile(value.recoveryProfile)
+}
+
+function validateSuccessorRecoveryProfile(value: unknown): void {
+  if (!isRecordMap(value)) throw new Error('invalid OpenCode successor recovery profile')
+  const allowed = ['authState', 'behaviorSources', 'homePath', 'managedAuthFingerprint',
+    'managedAuthPath', 'managedConfig', 'managedConfigFingerprint', 'profileRootPath',
+    'projectBehaviorFingerprint', 'sourceAuthFingerprint', 'sourceAuthPath', 'tmpPath',
+    'version', 'xdgCacheHome', 'xdgConfigHome', 'xdgDataHome']
+  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 1
+    || !isRecordMap(value.managedConfig)
+    || Buffer.byteLength(JSON.stringify(value.managedConfig), 'utf8')
+      > MAX_SUCCESSOR_RECOVERY_CONFIG_BYTES) {
+    throw new Error('invalid OpenCode successor recovery profile')
+  }
+  requiredString(value.projectBehaviorFingerprint,
+    'successorTransition.recoveryProfile.projectBehaviorFingerprint')
+  for (const field of ['profileRootPath', 'homePath', 'tmpPath', 'xdgConfigHome',
+    'xdgDataHome', 'xdgCacheHome', 'managedAuthPath'] as const) {
+    requiredString(value[field], `successorTransition.recoveryProfile.${field}`)
+  }
+  if (!Array.isArray(value.behaviorSources)
+    || value.behaviorSources.some(source => typeof source !== 'string')) {
+    throw new Error('invalid OpenCode successor recovery behavior sources')
+  }
+  requiredString(value.managedConfigFingerprint,
+    'successorTransition.recoveryProfile.managedConfigFingerprint')
+  validateNullableString(value.managedAuthFingerprint,
+    'successorTransition.recoveryProfile.managedAuthFingerprint')
+  validateNullableString(value.sourceAuthPath,
+    'successorTransition.recoveryProfile.sourceAuthPath')
+  validateNullableString(value.sourceAuthFingerprint,
+    'successorTransition.recoveryProfile.sourceAuthFingerprint')
+  if (value.authState !== 'ok' && value.authState !== 'missing' && value.authState !== 'stale') {
+    throw new Error('invalid OpenCode successor recovery auth state')
+  }
+}
+
+function validateSuccessorCompletionReceipt(value: unknown): void {
+  if (!isRecordMap(value)) throw new Error('invalid OpenCode successor completion receipt')
+  const allowed = ['attemptIdentity', 'predecessorHostKey', 'predecessorOpencodeSessionId',
+    'predecessorRunId', 'version']
+  if (Object.keys(value).sort().join(',') !== allowed.sort().join(',') || value.version !== 1) {
+    throw new Error('invalid OpenCode successor completion receipt')
+  }
+  requiredTransitionIdentity(value.attemptIdentity)
+  requiredString(value.predecessorHostKey, 'successorCompletionReceipt.predecessorHostKey')
+  requiredString(value.predecessorOpencodeSessionId,
+    'successorCompletionReceipt.predecessorOpencodeSessionId')
+  if (value.predecessorRunId !== null) {
+    requiredString(value.predecessorRunId, 'successorCompletionReceipt.predecessorRunId')
   }
 }
 

@@ -869,6 +869,7 @@ export type OpenCodeSessionRecord = {
    * remove it.
    */
   successorTransition?: OpenCodeSessionSuccessorTransition
+  successorCompletionReceipt?: OpenCodeSessionSuccessorCompletionReceipt
   staleReason: string | null
   createdAt: string
   updatedAt: string
@@ -878,6 +879,36 @@ export type OpenCodeSessionSuccessorTransition = {
   version: 1
   attemptIdentity: string
   phase: 'successor_lease_pending' | 'predecessor_release_pending' | 'transition_complete'
+  predecessorHostKey: string
+  predecessorOpencodeSessionId: string
+  predecessorRunId: string | null
+  /** Immutable recovery authority authenticated by attemptIdentity. */
+  recoveryProfile: OpenCodeSessionSuccessorRecoveryProfile
+}
+
+export type OpenCodeSessionSuccessorRecoveryProfile = {
+  version: 1
+  profileRootPath: string
+  projectBehaviorFingerprint: string
+  behaviorSources: string[]
+  managedConfigFingerprint: string
+  managedAuthFingerprint: string | null
+  managedConfig: Record<string, unknown>
+  homePath: string
+  tmpPath: string
+  xdgConfigHome: string
+  xdgDataHome: string
+  xdgCacheHome: string
+  managedAuthPath: string
+  sourceAuthPath: string | null
+  sourceAuthFingerprint: string | null
+  authState: OpenCodeAuthState
+}
+
+/** Bounded receipt for the most recently completed exact hand-off. */
+export type OpenCodeSessionSuccessorCompletionReceipt = {
+  version: 1
+  attemptIdentity: string
   predecessorHostKey: string
   predecessorOpencodeSessionId: string
   predecessorRunId: string | null
