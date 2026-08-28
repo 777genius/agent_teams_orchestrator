@@ -264,6 +264,9 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       afterNamespaceAnchored?: () => Promise<void>
       /** Test-only boundary immediately before a verified temporary leaf is published. */
       beforeAtomicRename?: (temporaryPath: string, targetPath: string) => Promise<void>
+      /** Test-only synchronous pressure point after native path buffers are allocated. */
+      beforeNativePathOperation?:
+        (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void
       /** Test-only platform selection; production always uses process.platform. */
       platform?: NodeJS.Platform
       windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
@@ -656,10 +659,10 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     let authorityBackend: NamespaceBackend
     if (retained) {
       backend = await RetainedDirectoryBackend.create(directory, identity, true,
-        this.testHooks.afterRetainedDirectoryHandleClosed)
+        this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation)
       try {
         authorityBackend = await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false,
-          this.testHooks.afterRetainedDirectoryHandleClosed)
+          this.testHooks.afterRetainedDirectoryHandleClosed, this.testHooks.beforeNativePathOperation)
       } catch (error) {
         await backend.close?.().catch(() => undefined)
         throw error
@@ -1115,6 +1118,14 @@ function cPath(name: string): Buffer {
   return Buffer.from(`${name}\0`)
 }
 
+function retainNativeBuffers(...buffers: Buffer[]): void {
+  // Calling this only after synchronous FFI returns makes every owner an observable argument
+  // through the native call. A zero-length pointer owner is never valid for these operations.
+  if (buffers.some(buffer => buffer.byteLength === 0)) {
+    throw new OpenCodeLaunchJournalError('foreign', 'invalid native operation buffer')
+  }
+}
+
 class RetainedDirectoryBackend implements NamespaceBackend {
   readonly kind = 'retained-directory' as const
   private closePromise?: Promise<void>
@@ -1124,12 +1135,16 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     private readonly expected: { dev: number | bigint; ino: number | bigint },
     private readonly logicalNamespace: boolean,
     private readonly afterHandleClosed?: (root: string) => Promise<void>,
+    private readonly beforeNativePathOperation?:
+      (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void,
   ) {}
   static async create(
     root: string,
     expected: { dev: number | bigint; ino: number | bigint },
     logicalNamespace: boolean,
     afterHandleClosed?: (root: string) => Promise<void>,
+    beforeNativePathOperation?:
+      (operation: 'fstatat' | 'mkdirat' | 'openat' | 'renameat' | 'unlinkat' | 'rmdir') => void,
   ): Promise<RetainedDirectoryBackend> {
     const handle = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
     try {
@@ -1138,7 +1153,8 @@ class RetainedDirectoryBackend implements NamespaceBackend {
         throw new OpenCodeLaunchJournalError('foreign', 'journal root changed while retaining descriptor')
       }
       unixSymbols()
-      return new RetainedDirectoryBackend(root, handle, expected, logicalNamespace, afterHandleClosed)
+      return new RetainedDirectoryBackend(root, handle, expected, logicalNamespace, afterHandleClosed,
+        beforeNativePathOperation)
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error
@@ -1171,11 +1187,28 @@ class RetainedDirectoryBackend implements NamespaceBackend {
   async lstat(name: string) { return this.statAt(name, process.platform === 'darwin' ? 0x20 : 0x100) }
   async stat(name: string) { return this.statAt(name, 0) }
   private async statAt(name: string, flags: number): Promise<NamespaceStat> {
-    const buffer = Buffer.alloc(256); this.result((unixSymbols().symbols as any).fstatat(this.rootHandle.fd, ptr(cPath(name)), ptr(buffer), flags), 'fstatat'); return decodeNativeStat(buffer)
+    const path = cPath(name)
+    const buffer = Buffer.alloc(256)
+    this.beforeNativePathOperation?.('fstatat')
+    const result = (unixSymbols().symbols as any).fstatat(
+      this.rootHandle.fd, ptr(path), ptr(buffer), flags)
+    retainNativeBuffers(path, buffer)
+    this.result(result, 'fstatat')
+    return decodeNativeStat(buffer)
   }
-  async mkdir(name: string, mode: number) { this.result((unixSymbols().symbols as any).mkdirat(this.rootHandle.fd, ptr(cPath(name)), mode), 'mkdirat') }
+  async mkdir(name: string, mode: number) {
+    const path = cPath(name)
+    this.beforeNativePathOperation?.('mkdirat')
+    const result = (unixSymbols().symbols as any).mkdirat(this.rootHandle.fd, ptr(path), mode)
+    retainNativeBuffers(path)
+    this.result(result, 'mkdirat')
+  }
   async open(name: string, flags: number, mode = 0): Promise<NamespaceHandle> {
-    const fd = this.result((unixSymbols().symbols as any).openat(this.rootHandle.fd, ptr(cPath(name)), flags, mode), 'openat')
+    const path = cPath(name)
+    this.beforeNativePathOperation?.('openat')
+    const result = (unixSymbols().symbols as any).openat(this.rootHandle.fd, ptr(path), flags, mode)
+    retainNativeBuffers(path)
+    const fd = this.result(result, 'openat')
     return new NativeNamespaceHandle(fd, this)
   }
   async rename(from: string, to: string) {
@@ -1184,16 +1217,23 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     // inline cPath() result can make an existing source intermittently look like ENOENT.
     const fromPath = cPath(from)
     const toPath = cPath(to)
+    this.beforeNativePathOperation?.('renameat')
     const result = (unixSymbols().symbols as any).renameat(
       this.rootHandle.fd, ptr(fromPath), this.rootHandle.fd, ptr(toPath))
-    // Observe both owners after the FFI call so the runtime cannot shorten their lifetime.
-    if (fromPath.byteLength === 0 || toPath.byteLength === 0) {
-      throw new OpenCodeLaunchJournalError('foreign', 'invalid descriptor-relative rename path')
-    }
+    retainNativeBuffers(fromPath, toPath)
     this.result(result, 'renameat')
   }
-  async unlink(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), 0), 'unlinkat') }
-  async rmdir(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), process.platform === 'darwin' ? 0x80 : 0x200), 'unlinkat') }
+  private unlinkAt(name: string, flags: number, operation: 'unlinkat' | 'rmdir') {
+    const path = cPath(name)
+    this.beforeNativePathOperation?.(operation)
+    const result = (unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(path), flags)
+    retainNativeBuffers(path)
+    this.result(result, 'unlinkat')
+  }
+  async unlink(name: string) { this.unlinkAt(name, 0, 'unlinkat') }
+  async rmdir(name: string) {
+    this.unlinkAt(name, process.platform === 'darwin' ? 0x80 : 0x200, 'rmdir')
+  }
   async syncDirectory(name = '.') {
     const handle = name === '.' ? undefined : await this.open(name, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
     const fd = handle ? (handle as NativeNamespaceHandle).fd : this.rootHandle.fd
@@ -1221,7 +1261,9 @@ class NativeNamespaceHandle implements NamespaceHandle {
     const bytes = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data)
     let offset = 0
     while (offset < bytes.length) {
-      const count = Number((unixSymbols().symbols as any).write(this.fd, ptr(bytes.subarray(offset)), bytes.length - offset))
+      const remaining = bytes.subarray(offset)
+      const count = Number((unixSymbols().symbols as any).write(this.fd, ptr(remaining), remaining.length))
+      retainNativeBuffers(remaining)
       if (count < 0) throw nativeError('write'); offset += count
     }
   }

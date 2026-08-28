@@ -201,6 +201,51 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test.skipIf(process.platform === 'win32')('retains every native path buffer across forced GC pressure', async () => {
+    const directory = await workspaceTemp('native-path-buffer-lifetime')
+    const path = join(directory, 'attempt.json')
+    const operations = new Set<string>()
+    let pressureChecksum = 0
+    let removeTemporary = false
+    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+      beforeNativePathOperation: operation => {
+        if (operations.has(operation)) return
+        operations.add(operation)
+        const pressure = Array.from({ length: 128 }, (_, index) => Buffer.alloc(2048, index))
+        Bun.gc(true)
+        pressureChecksum ^= pressure[operation.length]![0]!
+      },
+      beforeAtomicRename: async temporary => {
+        if (!removeTemporary) return
+        removeTemporary = false
+        await unlink(temporary)
+      },
+    })
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    try {
+      // Missing paths remain ordinary absence before publication, even when fstatat/openat run
+      // immediately after a full collection and substantial allocator churn.
+      expect(await persistence.read(context)).toBeNull()
+      await persistence.replaceAndSync(new TextEncoder().encode('{"version":1}'), context)
+      expect(new TextDecoder().decode((await persistence.read(context))!)).toBe('{"version":1}')
+
+      const release = await persistence.acquireExclusive(context)
+      await release(context)
+      expect(operations).toEqual(new Set([
+        'fstatat', 'mkdirat', 'openat', 'renameat', 'unlinkat', 'rmdir',
+      ]))
+
+      removeTemporary = true
+      await expect(persistence.replaceAndSync(new TextEncoder().encode('{"version":2}'), context))
+        .rejects.toMatchObject({
+        code: 'foreign', message: 'temporary durable record disappeared before publication',
+      })
+      expect(new TextDecoder().decode((await persistence.read(context))!)).toBe('{"version":1}')
+      expect(Number.isInteger(pressureChecksum)).toBe(true)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
   test('never loads a generation-1 candidate that completes after the generation-2 marker', async () => {
     const directory = await workspaceTemp('late-candidate')
     const path = join(directory, 'attempt.json')
