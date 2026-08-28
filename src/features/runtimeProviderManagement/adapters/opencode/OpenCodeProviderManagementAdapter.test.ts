@@ -62,7 +62,7 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
   }
 }
 
-function host(): OpenCodeHostHandle {
+function host(overrides: Partial<OpenCodeHostHandle> = {}): OpenCodeHostHandle {
   return {
     hostKey: 'host-key',
     profileRootKey: 'profile-key',
@@ -76,6 +76,7 @@ function host(): OpenCodeHostHandle {
     profile: inventory().profile!,
     resolvedConfigFingerprint: 'config',
     diagnostics: [],
+    ...overrides,
   }
 }
 
@@ -7439,7 +7440,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       mode: 'profile',
       includeAppMcp: false,
       profileScope: {
-        purpose: 'catalog', providerId: 'kiro', configFingerprint: 'selected-provider-catalog-v1',
+        purpose: 'catalog', providerId: 'kiro', configFingerprint: expect.any(String),
       },
     })
     expect(ensureOptions).toMatchObject({
@@ -7456,15 +7457,22 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
     let mode: 'initial' | 'slow' | 'new' = 'initial'
     let resolveSlow!: (value: ProviderResult) => void
+    let releaseCount = 0
+    let requestSignal: AbortSignal | undefined
     const slowProviders = new Promise<ProviderResult>(resolve => {
       resolveSlow = resolve
     })
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 50,
       inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
-      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => { releaseCount += 1 },
+      },
       clientFactory: {
-        create: () => ({
+        create: (_baseUrl, options) => {
+          requestSignal = options?.signal
+          return {
           getConfigProviders: async () => ({ providers: [], default: {} }),
           getProviders: async () => {
             if (mode === 'slow') return slowProviders
@@ -7475,7 +7483,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
             }
           },
           getProviderAuth: async () => ({}),
-        }),
+          }
+        },
       },
     })
     const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
@@ -7488,6 +7497,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!stale.ok) return
     expect(stale.value).toMatchObject({ catalogState: 'stale' })
     expect(stale.value.models.map(model => model.modelId)).toEqual(['local/initial'])
+    expect(requestSignal?.aborted).toBe(true)
+    expect(releaseCount).toBe(2)
 
     mode = 'new'
     const current = await adapter.loadModels(input)
@@ -7505,5 +7516,81 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(Array.from(cache.values()).at(-1)?.providers.all[0]?.models).toEqual({
       'new-generation': {},
     })
+  })
+
+  test('does not reuse stale catalog evidence across source-auth or effective config changes', async () => {
+    const previousConfig = process.env.OPENCODE_CONFIG_CONTENT
+    let sourceAuthFingerprint = 'auth-a'
+    let slow = false
+    const never = new Promise<never>(() => {})
+    const currentProfile = () => ({
+      ...inventory().profile!,
+      sourceAuthFingerprint,
+    })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogTimeoutMs: 200,
+      inventoryService: {
+        probe: async () => inventory({ profile: currentProfile(), models: [], availableProviders: [] }),
+      },
+      hostManager: {
+        ensureHost: async () => host({ profile: currentProfile() }),
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => slow
+          ? never
+          : { all: [{ id: 'local', name: 'Local', models: { initial: {} } }], connected: [], default: {} },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+    try {
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        provider: { local: { options: { baseURL: 'http://one.invalid/v1' } } },
+      })
+      expect((await adapter.loadModels(input)).ok).toBe(true)
+      slow = true
+      sourceAuthFingerprint = 'auth-b'
+      expect((await adapter.loadModels(input)).ok).toBe(false)
+
+      sourceAuthFingerprint = 'auth-a'
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        provider: { local: { options: { baseURL: 'http://two.invalid/v1' } } },
+      })
+      expect((await adapter.loadModels(input)).ok).toBe(false)
+    } finally {
+      if (previousConfig === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+      else process.env.OPENCODE_CONFIG_CONTENT = previousConfig
+    }
+  })
+
+  test('returns timeout instead of stale evidence when current identity cannot be proven', async () => {
+    let hangInventory = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogTimeoutMs: 200,
+      inventoryTimeoutMs: 5_000,
+      inventoryService: {
+        probe: async () => hangInventory
+          ? new Promise<OpenCodeInventorySnapshot>(() => {})
+          : inventory({ models: [], availableProviders: [] }),
+      },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({
+          all: [{ id: 'local', name: 'Local', models: { initial: {} } }], connected: [], default: {},
+        }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+    expect((await adapter.loadModels(input)).ok).toBe(true)
+    hangInventory = true
+
+    const timedOut = await adapter.loadModels(input)
+
+    expect(timedOut.ok).toBe(false)
+    if (!timedOut.ok) expect(timedOut.error.message).toContain('timed out')
   })
 })

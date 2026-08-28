@@ -10,7 +10,10 @@ import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import {
+  openCodeProfileManager,
+  resolveOpenCodeProfileScope,
+} from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
@@ -306,19 +309,27 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     projectPath: string | null | undefined = record.projectPath,
   ): Promise<PreparedSessionProfile> {
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: record.selectedModel,
+    })
     if (record.toolApprovalMode) {
       return {
-        profile: await this.prepareProfile(projectPath, { toolApprovalMode: record.toolApprovalMode }),
+        profile: await this.prepareProfile(projectPath, {
+          toolApprovalMode: record.toolApprovalMode,
+          profileScope,
+        }),
         toolApprovalMode: record.toolApprovalMode,
       }
     }
 
-    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto' })
+    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto', profileScope })
     if (this.sessionProfileMatchesStoredConfig(record, autoProfile)) {
       return { profile: autoProfile, toolApprovalMode: 'auto' }
     }
 
-    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual' })
+    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual', profileScope })
     if (this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
       return { profile: manualProfile, toolApprovalMode: 'manual' }
     }
@@ -752,9 +763,17 @@ export class OpenCodeSessionBridge {
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
-    const requestedProfile: PreparedSessionProfile = params.preparedProfile
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: params.projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: params.selectedModel,
+    })
+    const suppliedProfileIsScoped = params.preparedProfile && (
+      JSON.stringify(params.preparedProfile.profileScope) === JSON.stringify(profileScope)
+    )
+    const requestedProfile: PreparedSessionProfile = suppliedProfileIsScoped
       ? {
-        profile: params.preparedProfile,
+        profile: params.preparedProfile!,
         toolApprovalMode: params.toolApprovalMode
           ?? existing?.toolApprovalMode
           ?? inferToolApprovalModeFromPreparedProfile(params.preparedProfile),
@@ -763,13 +782,17 @@ export class OpenCodeSessionBridge {
         ? {
           profile: await this.prepareProfile(params.projectPath, {
             toolApprovalMode: params.toolApprovalMode,
+            profileScope,
           }),
           toolApprovalMode: params.toolApprovalMode,
         }
         : existing
           ? await this.prepareProfileForSessionRecord(existing, params.projectPath)
           : {
-            profile: await this.prepareProfile(params.projectPath, { toolApprovalMode: 'auto' }),
+            profile: await this.prepareProfile(params.projectPath, {
+              toolApprovalMode: 'auto',
+              profileScope,
+            }),
             toolApprovalMode: 'auto',
           }
     const profile = requestedProfile.profile

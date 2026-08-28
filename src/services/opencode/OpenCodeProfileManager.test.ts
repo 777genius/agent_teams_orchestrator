@@ -16,6 +16,7 @@ import {
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
+  resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -99,20 +100,40 @@ async function runCommandCapture(
 
 describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
+  const isolatedEnvKeys = [
+    'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+    CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  ] as const
+  const originalEnv = Object.fromEntries(isolatedEnvKeys.map(key => [key, process.env[key]]))
 
   beforeEach(async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-profile-'))
+    process.env.HOME = path.join(tempDir, 'home')
+    process.env.USERPROFILE = process.env.HOME
+    process.env.XDG_CONFIG_HOME = path.join(tempDir, 'xdg-config')
+    process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg-data')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(tempDir, 'app-data')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(tempDir, 'app-cache')
   })
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
+    for (const key of isolatedEnvKeys) {
+      const value = originalEnv[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
   })
 
   test('isolates scoped profile roots by normalized project, purpose, provider, and config', async () => {
     const manager = new OpenCodeProfileManager()
     const projectPath = path.join(tempDir, 'project')
     await mkdir(projectPath, { recursive: true })
-    const prepare = (purpose: 'catalog' | 'execution_probe', providerId: string, configFingerprint: string) =>
+    const prepare = (
+      purpose: 'catalog' | 'execution_probe' | 'launch_runtime',
+      providerId: string,
+      configFingerprint: string,
+    ) =>
       manager.prepareProfile(path.join(projectPath, '.'), {
         profileScope: { purpose, providerId, configFingerprint },
       })
@@ -122,6 +143,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const probe = await prepare('execution_probe', 'deepinfra', 'config-a')
     const provider = await prepare('catalog', 'openrouter', 'config-a')
     const config = await prepare('catalog', 'deepinfra', 'config-b')
+    const kiroLaunch = await prepare('launch_runtime', 'kiro', 'config-a')
+    const cursorProbe = await prepare('execution_probe', 'cursor-acp', 'config-a')
+    const customCatalog = await prepare('catalog', 'custom-provider', 'config-a')
     const legacy = await manager.prepareProfile(projectPath, {
       includeAppMcp: false,
       includeManagedSubscriptionPlugins: false,
@@ -133,8 +157,38 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       probe.profileRootPath,
       provider.profileRootPath,
       config.profileRootPath,
+      kiroLaunch.profileRootPath,
+      cursorProbe.profileRootPath,
+      customCatalog.profileRootPath,
       legacy.profileRootPath,
-    ]).size).toBe(5)
+    ]).size).toBe(8)
+  })
+
+  test('fingerprints effective selected-provider endpoints without secret material', async () => {
+    const projectPath = path.join(tempDir, 'fingerprint-project')
+    await mkdir(projectPath, { recursive: true })
+    const scope = (baseURL: string, apiKey: string) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'custom/model',
+      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        provider: { custom: { options: { baseURL, apiKey } } },
+      }) },
+    })
+    const first = await scope('https://one.example/v1', 'secret-one')
+    const secretChanged = await scope('https://one.example/v1', 'secret-two')
+    const endpointChanged = await scope('https://two.example/v1', 'secret-one')
+
+    expect(secretChanged.configFingerprint).toBe(first.configFingerprint)
+    expect(endpointChanged.configFingerprint).not.toBe(first.configFingerprint)
+    const manager = new OpenCodeProfileManager()
+    const [firstProfile, secretProfile, endpointProfile] = await Promise.all([
+      manager.prepareProfile(projectPath, { profileScope: first }),
+      manager.prepareProfile(projectPath, { profileScope: secretChanged }),
+      manager.prepareProfile(projectPath, { profileScope: endpointChanged }),
+    ])
+    expect(secretProfile.profileRootPath).toBe(firstProfile.profileRootPath)
+    expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
@@ -1074,7 +1128,12 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const appCacheHome = path.join(tempDir, 'app-cache-config-import')
     const xdgConfigHome = path.join(tempDir, 'real-xdg-config')
     const customConfigPath = path.join(tempDir, 'custom-opencode.jsonc')
+    const projectPath = path.join(tempDir, 'project-config-import')
     await mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+    await mkdir(projectPath, { recursive: true })
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
+      plugin: ['project-user-plugin', 'opencode-kiro@0.4.0', '@rama_nigg/open-cursor@2.5.2'],
+    }))
     await writeFile(
       path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
       `{
@@ -1126,7 +1185,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
     try {
       const manager = new OpenCodeProfileManager()
-      const profile = await manager.prepareProfile(path.join(tempDir, 'project-config-import'))
+      const profile = await manager.prepareProfile(projectPath)
       const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
       const providers = managedConfig.provider as Record<string, unknown>
       const agents = managedConfig.agent as Record<string, unknown>
@@ -1150,7 +1209,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         '@rama_nigg/open-cursor@2.5.2',
       ])
       const scopedProfile = await manager.prepareProfile(
-        path.join(tempDir, 'project-config-import'),
+        projectPath,
         {
           profileScope: {
             purpose: 'catalog',
@@ -1159,9 +1218,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           },
         },
       )
-      expect(scopedProfile.managedConfig.plugin).toEqual(['unsafe-plugin'])
+      expect(scopedProfile.managedConfig.plugin).toEqual(['unsafe-plugin', 'project-user-plugin'])
       const kiroProfile = await manager.prepareProfile(
-        path.join(tempDir, 'project-config-import'),
+        projectPath,
         {
           profileScope: {
             purpose: 'catalog',
@@ -1172,10 +1231,11 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       )
       expect(kiroProfile.managedConfig.plugin).toEqual([
         'unsafe-plugin',
+        'project-user-plugin',
         'opencode-kiro@0.4.0',
       ])
       const cursorProfile = await manager.prepareProfile(
-        path.join(tempDir, 'project-config-import'),
+        projectPath,
         {
           profileScope: {
             purpose: 'catalog',
@@ -1186,6 +1246,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       )
       expect(cursorProfile.managedConfig.plugin).toEqual([
         'unsafe-plugin',
+        'project-user-plugin',
         '@rama_nigg/open-cursor@2.5.2',
       ])
       expect(managedConfig).not.toHaveProperty('permission')

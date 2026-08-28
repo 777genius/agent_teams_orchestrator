@@ -56,6 +56,7 @@ import {
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import {
   buildCursorAgentResourceExhaustedPreloadScript,
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
@@ -64,6 +65,8 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeProfilePurpose,
+  OpenCodeProfileScope,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
@@ -712,7 +715,9 @@ export function applyOpenCodeManagedSubscriptionPlugins(
     : []
   config.plugin = [
     ...new Set([
-      ...configuredPlugins,
+      ...configuredPlugins.filter(plugin =>
+        !getOpenCodeManagedSubscriptionPluginPackages().includes(plugin)
+        || managedPlugins.includes(plugin)),
       ...managedPlugins,
     ]),
   ]
@@ -1223,10 +1228,13 @@ async function readSafeOpenCodeRuntimeConfigImport(
   env: NodeJS.ProcessEnv,
 ): Promise<Record<string, unknown>> {
   let importedConfig: Record<string, unknown> = {}
-  for (const configPath of getOpenCodeConfigImportPaths(env)) {
+  const importedFiles = await Promise.all(
+    getOpenCodeConfigImportPaths(env).map(readSafeOpenCodeRuntimeConfigFile),
+  )
+  for (const importedFile of importedFiles) {
     importedConfig = deepMergeOpenCodeConfig(
       importedConfig,
-      await readSafeOpenCodeRuntimeConfigFile(configPath),
+      importedFile,
     )
   }
 
@@ -1236,6 +1244,76 @@ async function readSafeOpenCodeRuntimeConfigImport(
   )
 
   return importedConfig
+}
+
+async function readProjectOpenCodeRuntimeConfig(projectPath: string): Promise<Record<string, unknown>> {
+  let config: Record<string, unknown> = {}
+  const configs = await Promise.all(
+    ['opencode.json', 'opencode.jsonc'].map(name =>
+      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name))),
+  )
+  for (const projectConfig of configs) {
+    config = deepMergeOpenCodeConfig(
+      config,
+      projectConfig,
+    )
+  }
+  return config
+}
+
+function redactConfigIdentity(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactConfigIdentity)
+  if (typeof value === 'string' && /^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value)
+      url.username = ''
+      url.password = ''
+      const queryKeys = Array.from(url.searchParams.keys()).sort()
+      url.search = queryKeys.length > 0 ? `?${queryKeys.join('&')}` : ''
+      url.hash = ''
+      return url.toString()
+    } catch {
+      return value
+    }
+  }
+  if (!value || typeof value !== 'object') return value
+  return Object.keys(value as Record<string, unknown>).sort().reduce<Record<string, unknown>>(
+    (result, key) => {
+      if (/api.?key|token|secret|password|authorization|credential/i.test(key)) return result
+      result[key] = redactConfigIdentity((value as Record<string, unknown>)[key])
+      return result
+    },
+    {},
+  )
+}
+
+export async function resolveOpenCodeProfileScope(input: {
+  projectPath?: string | null
+  purpose: OpenCodeProfilePurpose
+  selectedModel: string
+  env?: NodeJS.ProcessEnv
+}): Promise<OpenCodeProfileScope> {
+  const providerId = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '')
+  if (!providerId) {
+    throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
+  }
+  const projectPath = path.resolve(input.projectPath?.trim() || getCwd())
+  const imported = await readSafeOpenCodeRuntimeConfigImport(input.env ?? process.env)
+  const project = await readProjectOpenCodeRuntimeConfig(projectPath)
+  const effective = deepMergeOpenCodeConfig(
+    deepMergeOpenCodeConfig(imported, project),
+    buildManagedConfig(null, { managedProviderId: providerId }),
+  )
+  const identity = redactConfigIdentity({
+    provider: asRecord(effective.provider)[providerId] ?? null,
+    model: effective.model ?? null,
+    small_model: effective.small_model ?? null,
+  })
+  return {
+    purpose: input.purpose,
+    providerId,
+    configFingerprint: hashString(JSON.stringify(identity)),
+  }
 }
 
 function applyManagedPathEnvironmentToMcpConfig(
@@ -1317,7 +1395,9 @@ export function orderOpenCodeAuthSyncSources(input: {
 export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
-  private readonly paths = resolveClaudeMultimodelPaths()
+  private get paths() {
+    return resolveClaudeMultimodelPaths()
+  }
 
   private getSourceAuthPaths(): string[] {
     const xdgDataHome =
@@ -1452,6 +1532,12 @@ export class OpenCodeProfileManager {
       ...managedRuntimePreferences.modelLimitOverrides,
     }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
+    if (policy) {
+      importedRuntimeConfig.plugin = deepMergeOpenCodeConfig(
+        importedRuntimeConfig,
+        await readProjectOpenCodeRuntimeConfig(resolvedProjectPath),
+      ).plugin
+    }
     if (!policy) {
       // Keep the legacy inline overlay unchanged. Scoped profiles preserve user
       // plugin entries before adding only the selected provider's managed plugin.
@@ -1488,7 +1574,7 @@ export class OpenCodeProfileManager {
       ?? (options.includeManagedSubscriptionPlugins === false
         ? []
         : getOpenCodeManagedSubscriptionPluginPackages())
-    if (managedSubscriptionPlugins.length > 0) {
+    if (policy || managedSubscriptionPlugins.length > 0) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
@@ -1636,6 +1722,7 @@ export class OpenCodeProfileManager {
       projectPath: resolvedProjectPath,
       profileRootKey,
       profileRootPath,
+      profileScope: policy?.scope ?? null,
       projectDefaultModelId: managedRuntimePreferences.defaultModelId,
       allProjectsDefaultModelId: globalRuntimePreferences.defaultModelId,
       importedConfigDefaultModelId,

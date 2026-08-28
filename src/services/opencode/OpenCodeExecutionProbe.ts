@@ -24,6 +24,7 @@ import {
   ensureOpenCodeNativeCliCredentialBridge,
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
+  resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import {
   type OpenCodePhaseContext,
@@ -696,6 +697,11 @@ export class OpenCodeExecutionProbe {
         },
       ],
       ...(context ? { abortSignal: context.signal } : {}),
+      profileScope: await resolveOpenCodeProfileScope({
+        projectPath: params.projectPath,
+        purpose: 'execution_probe',
+        selectedModel: params.selectedModel,
+      }),
     }
     return this.deps.prepareProfile
       ? this.deps.prepareProfile(params.projectPath, options)
@@ -1094,6 +1100,11 @@ export class OpenCodeExecutionProbe {
                     resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
                 },
               ],
+              profileScope: await resolveOpenCodeProfileScope({
+                projectPath: params.projectPath,
+                purpose: 'execution_probe',
+                selectedModel: params.selectedModel,
+              }),
             },
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
             ...(context ? { abortSignal: context.signal } : {}),

@@ -1,13 +1,23 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
+import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+} from './OpenCodeManagedPaths.js'
 
 import type {
   OpenCodeHostHandle,
+  OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionRecord,
@@ -102,8 +112,36 @@ function buildPreviewSummary(
 }
 
 describe('OpenCodeSessionBridge', () => {
-  beforeEach(() => {
+  let isolatedRoot: string
+  const originalDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+  const originalCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+  const originalHome = process.env.HOME
+  const originalXdgDataHome = process.env.XDG_DATA_HOME
+
+  beforeEach(async () => {
     resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
+    isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-bridge-'))
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(isolatedRoot, 'data')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(isolatedRoot, 'cache')
+    process.env.HOME = path.join(isolatedRoot, 'home')
+    process.env.XDG_DATA_HOME = path.join(isolatedRoot, 'xdg-data')
+    profile.profileScope = await resolveOpenCodeProfileScope({
+      projectPath: profile.projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
+  })
+
+  afterEach(async () => {
+    await rm(isolatedRoot, { recursive: true, force: true })
+    if (originalDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = originalDataHome
+    if (originalCacheHome === undefined) delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    else process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = originalCacheHome
+    if (originalHome === undefined) delete process.env.HOME
+    else process.env.HOME = originalHome
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = originalXdgDataHome
   })
 
   test('reuses an existing clean session record', async () => {
@@ -417,6 +455,7 @@ describe('OpenCodeSessionBridge', () => {
     const upserts: OpenCodeSessionRecord[] = []
     const staleReasons: string[] = []
     const prepareProfileModes: Array<string | undefined> = []
+    const prepareProfileScopes: Array<OpenCodePrepareProfileOptions['profileScope']> = []
     const ensuredProfileFingerprints: string[] = []
     let createSessionCalls = 0
     const manualProfile: OpenCodePreparedProfile = {
@@ -440,6 +479,7 @@ describe('OpenCodeSessionBridge', () => {
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async (_projectPath, options) => {
         prepareProfileModes.push(options?.toolApprovalMode)
+        prepareProfileScopes.push(options?.profileScope)
         return options?.toolApprovalMode === 'manual' ? manualProfile : autoProfile
       },
       sessionStore: {
@@ -506,6 +546,10 @@ describe('OpenCodeSessionBridge', () => {
     })
 
     expect(prepareProfileModes).toEqual(['auto', 'manual'])
+    expect(prepareProfileScopes).toEqual([
+      expect.objectContaining({ purpose: 'launch_runtime', providerId: 'openai' }),
+      expect.objectContaining({ purpose: 'launch_runtime', providerId: 'openai' }),
+    ])
     expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
     expect(createSessionCalls).toBe(0)
     expect(staleReasons).toEqual([])

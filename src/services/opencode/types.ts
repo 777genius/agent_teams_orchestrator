@@ -35,6 +35,7 @@ export type OpenCodePreparedProfile = {
   projectPath: string
   profileRootKey: string
   profileRootPath: string
+  profileScope?: OpenCodeProfileScope | null
   projectDefaultModelId?: string | null
   allProjectsDefaultModelId?: string | null
   importedConfigDefaultModelId?: string | null

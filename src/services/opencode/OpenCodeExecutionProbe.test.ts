@@ -216,7 +216,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releaseHostCount).toBe(1)
-    expect(ensureHostInput).toEqual({
+    expect(ensureHostInput).toMatchObject({
       projectPath: '/tmp/project',
       profileOptions: {
         includeAppMcp: false,
@@ -1685,6 +1685,11 @@ describe('OpenCodeExecutionProbe', () => {
       prepareProfile: async (_projectPath, options) => {
         prepareProfileCalls += 1
         expect(options?.includeAppMcp).toBe(false)
+        expect(options?.profileScope).toMatchObject({
+          purpose: 'execution_probe',
+          providerId: 'cursor-acp',
+        })
+        expect(options?.profileScope?.configFingerprint).not.toContain('placeholder')
         return profile
       },
       hostManager: {
