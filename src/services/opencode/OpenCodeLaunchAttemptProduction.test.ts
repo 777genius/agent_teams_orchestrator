@@ -73,7 +73,9 @@ test.each([
 async (_name, initialFaults) => {
   let durable = cleanupObligation()
   let remotePresent = true
-  let projection: { sessionId: string; stale?: boolean } | null = { sessionId: durable.sessionId }
+  let projection: { sessionId: string; runId: string; stale?: boolean } | null = {
+    sessionId: durable.sessionId, runId: durable.runId!,
+  }
   let faults = new Set<string>(initialFaults)
   const counts = { remoteReads: 0, remoteDeletes: 0, mark: 0, release: 0, delete: 0 }
   const run = () => reconcileOpenCodeMemberCleanupObligations({
@@ -89,6 +91,7 @@ async (_name, initialFaults) => {
       counts.mark += 1
       if (faults.has('mark')) throw new Error('mark fault')
       if (projection) projection = { ...projection, stale: true }
+      return 'satisfied'
     },
     releaseLease: async () => {
       counts.release += 1
@@ -98,6 +101,7 @@ async (_name, initialFaults) => {
       counts.delete += 1
       if (faults.has('delete')) throw new Error('delete fault')
       projection = null
+      return 'satisfied'
     },
     advance: async (_obligation, phase) => { durable = { ...durable, phase } },
     completed: () => {},
@@ -131,9 +135,9 @@ async () => {
       monotonicNow: () => boundary === 'expired' ? 10 : 0,
       reconcileRemote: async () => { effects += 1; return 'deleted' },
       readProjection: async () => { effects += 1; return null },
-      markProjectionStale: async () => { effects += 1 },
+      markProjectionStale: async () => { effects += 1; return 'satisfied' },
       releaseLease: async () => { effects += 1 },
-      deleteProjection: async () => { effects += 1 },
+      deleteProjection: async () => { effects += 1; return 'satisfied' },
       advance: async (_obligation, phase) => { durable = { ...durable, phase } },
       completed: () => { effects += 1 },
     })).toBe('timed_out')
@@ -146,10 +150,10 @@ async () => {
   expect(await reconcileOpenCodeMemberCleanupObligations({
     obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
     monotonicNow: () => 0, reconcileRemote: async () => 'absent',
-    readProjection: async () => ({ sessionId: 'foreign-replacement' }),
-    markProjectionStale: async () => { stale += 1 },
+    readProjection: async () => ({ sessionId: 'foreign-replacement', runId: 'foreign-run' }),
+    markProjectionStale: async () => { stale += 1; return 'satisfied' },
     releaseLease: async () => { released += 1 },
-    deleteProjection: async () => { deleted += 1 },
+    deleteProjection: async () => { deleted += 1; return 'satisfied' },
     advance: async (_obligation, phase) => { durable = { ...durable, phase } },
     completed: () => {},
   })).toBe('complete')
@@ -164,13 +168,77 @@ test('member cleanup does not complete while project projection authority is unr
     obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
     monotonicNow: () => 0, reconcileRemote: async () => 'absent',
     readProjection: async () => { throw new Error('project authority unresolved') },
-    markProjectionStale: async () => {}, releaseLease: async () => {},
-    deleteProjection: async () => {},
+    markProjectionStale: async () => 'satisfied', releaseLease: async () => {},
+    deleteProjection: async () => 'satisfied',
     advance: async (_obligation, phase) => { advanced += 1; durable = { ...durable, phase } },
     completed: () => {},
   })).toBe('timed_out')
   expect(durable.phase).toBe('projection_stale')
   expect(advanced).toBe(0)
+})
+
+test('member cleanup leaves a missing-run legacy obligation wholly unresolved', async () => {
+  const durable = { ...cleanupObligation(), runId: undefined }
+  let effects = 0
+  expect(await reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
+    monotonicNow: () => 0,
+    reconcileRemote: async () => { effects += 1; return 'deleted' },
+    readProjection: async () => {
+      effects += 1
+      return { sessionId: durable.sessionId, runId: 'replacement-run' }
+    },
+    markProjectionStale: async () => { effects += 1; return 'satisfied' },
+    releaseLease: async () => { effects += 1 },
+    deleteProjection: async () => { effects += 1; return 'satisfied' },
+    advance: async () => { effects += 1 }, completed: () => { effects += 1 },
+  })).toBe('timed_out')
+  expect({ effects, phase: durable.phase }).toEqual({ effects: 0, phase: 'remote' })
+})
+
+test('member cleanup treats a same-session foreign run as a non-mutating stale replay', async () => {
+  let durable = cleanupObligation('projection_stale')
+  const calls = { reads: 0, marks: 0, releases: 0, deletes: 0 }
+  expect(await reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
+    monotonicNow: () => 0, reconcileRemote: async () => 'absent',
+    readProjection: async () => {
+      calls.reads += 1
+      return { sessionId: durable.sessionId, runId: 'replacement-run' }
+    },
+    markProjectionStale: async () => { calls.marks += 1; return 'foreign' },
+    releaseLease: async () => { calls.releases += 1 },
+    deleteProjection: async () => { calls.deletes += 1; return 'foreign' },
+    advance: async (_obligation, phase) => { durable = { ...durable, phase } },
+    completed: () => {},
+  })).toBe('complete')
+  expect({ ...calls, phase: durable.phase })
+    .toEqual({ reads: 2, marks: 1, releases: 1, deletes: 1, phase: 'complete' })
+})
+
+test('member cleanup exact-owner delete is applied once across an idempotent replay', async () => {
+  let durable = cleanupObligation('projection_delete')
+  let projection: { sessionId: string; runId: string } | null = {
+    sessionId: durable.sessionId, runId: durable.runId!,
+  }
+  let deletes = 0
+  let failAdvance = true
+  const run = () => reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
+    monotonicNow: () => 0, reconcileRemote: async () => 'absent',
+    readProjection: async () => projection,
+    markProjectionStale: async () => 'satisfied', releaseLease: async () => {},
+    deleteProjection: async () => { deletes += 1; projection = null; return 'satisfied' },
+    advance: async (_obligation, phase) => {
+      if (failAdvance) { failAdvance = false; throw new Error('journal fault') }
+      durable = { ...durable, phase }
+    },
+    completed: () => {},
+  })
+  expect(await run()).toBe('timed_out')
+  expect(await run()).toBe('complete')
+  expect({ deletes, projection, phase: durable.phase })
+    .toEqual({ deletes: 1, projection: null, phase: 'complete' })
 })
 
 test('attempt host release ledger survives restart, rejects foreign/corrupt receipts, and clears idempotently', async () => {
@@ -1588,16 +1656,20 @@ async () => {
       finalResponse: { members: { cleanupPending: [harness.memberIdentity] } } })
 
     // A later restart can prove the exact remote is absent. The normalized
-    // reserved projection is then removed, while a foreign replacement lease
-    // disposition is terminal and advances the durable cleanup obligation.
+    // projection and lease have meanwhile been rebound to a replacement run
+    // using the same deterministic session id. Both foreign dispositions are
+    // terminal for stale replay, without mutating either replacement owner.
     retainedAccess = 'absent'
+    const replacementProjection = { ...seeded.record, runId: replacementLease.runId }
+    expect(await harness.sessionStore.upsert(replacementProjection)).toBe('updated')
     await harness.restartBridge().execute(harness.command)
     expect({ ensured, recovered, released, releasedLease, replacementLease, projection:
       await harness.sessionStore.get('team', 'primary', 'ALICE') })
       .toEqual({ ensured: 0, recovered: 2, released: 1,
         releasedLease: { teamId: 'team', laneId: 'primary', memberName: 'alice',
           runId: harness.command.runId, sessionId: harness.sessionId },
-        replacementLease: { runId: 'replacement-run', sessionId: harness.sessionId }, projection: null })
+        replacementLease: { runId: 'replacement-run', sessionId: harness.sessionId },
+        projection: replacementProjection })
     expect(await harness.inspectJournal()).toMatchObject({
       // Member cleanup is durably complete even though the independent host
       // receipt remains unavailable, so aggregate cleanup stays incomplete.

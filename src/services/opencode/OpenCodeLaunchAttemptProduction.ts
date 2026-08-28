@@ -403,10 +403,11 @@ export async function reconcileOpenCodeMemberCleanupObligations(input: Readonly<
   monotonicNow(): number
   reconcileRemote(obligation: OpenCodeMemberCleanupObligation):
     Promise<OpenCodeOwnedSessionReconciliation>
-  readProjection(obligation: OpenCodeMemberCleanupObligation): Promise<{ sessionId: string } | null>
-  markProjectionStale(obligation: OpenCodeMemberCleanupObligation): Promise<void>
+  readProjection(obligation: OpenCodeMemberCleanupObligation):
+    Promise<{ sessionId: string; runId: string | null } | null>
+  markProjectionStale(obligation: OpenCodeMemberCleanupObligation): Promise<'satisfied' | 'foreign'>
   releaseLease(obligation: OpenCodeMemberCleanupObligation): Promise<void>
-  deleteProjection(obligation: OpenCodeMemberCleanupObligation): Promise<void>
+  deleteProjection(obligation: OpenCodeMemberCleanupObligation): Promise<'satisfied' | 'foreign'>
   advance(obligation: OpenCodeMemberCleanupObligation, phase: OpenCodeMemberCleanupPhase): Promise<void>
   completed(obligation: OpenCodeMemberCleanupObligation): void
 }>): Promise<'complete' | 'timed_out'> {
@@ -417,6 +418,11 @@ export async function reconcileOpenCodeMemberCleanupObligations(input: Readonly<
       obligation = { ...obligation, phase }
     }
     try {
+      // A legacy obligation without the run half of the owner capability is
+      // not safe to replay. Session ids are deterministic, so every cleanup
+      // effect (including remote deletion) must remain pending until the exact
+      // run is known rather than acting on a replacement run's session.
+      if (!obligation.runId) return 'timed_out'
       while (obligation.phase !== 'complete') {
         if (input.signal.aborted || input.monotonicNow() >= input.deadlineAtMs) return 'timed_out'
         if (obligation.phase === 'remote') {
@@ -433,9 +439,12 @@ export async function reconcileOpenCodeMemberCleanupObligations(input: Readonly<
         } else if (obligation.phase === 'projection_delete') {
           const projection = await input.readProjection(obligation)
           if (projection?.sessionId === obligation.sessionId) {
-            await input.deleteProjection(obligation)
-            const retained = await input.readProjection(obligation)
-            if (retained?.sessionId === obligation.sessionId) return 'timed_out'
+            const disposition = await input.deleteProjection(obligation)
+            if (disposition === 'satisfied') {
+              const retained = await input.readProjection(obligation)
+              if (retained?.sessionId === obligation.sessionId
+                && retained.runId === obligation.runId) return 'timed_out'
+            }
           }
           await advance('obligation_complete')
         } else {
@@ -1272,6 +1281,22 @@ class OpenCodeProductionLaunchRuntime {
       return handle
     }
     const memberByIdentity = new Map(command.members.map(member => [member.memberIdentity, member]))
+    const cleanupLogicalMember = async (obligation: OpenCodeMemberCleanupObligation) => {
+      if (obligation.projectIdentity) return {
+        teamId: obligation.teamId, laneId: obligation.laneId,
+        projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
+      }
+      const candidates = (await openCodeSessionStore.list()).filter(record =>
+        record.teamId.trim() === obligation.teamId.trim()
+        && (record.laneId ?? 'primary').trim() === obligation.laneId.trim()
+        && record.memberName.trim().toLowerCase() === obligation.memberName.trim().toLowerCase())
+      if (candidates.length > 1) throw new Error('legacy OpenCode cleanup project authority is ambiguous')
+      const candidate = candidates[0]
+      return candidate ? {
+        teamId: obligation.teamId, laneId: obligation.laneId,
+        projectIdentity: candidate.projectIdentity, memberName: obligation.memberName,
+      } : null
+    }
     const runMemberCleanupObligations = async (input: {
       cleanupObligations: readonly OpenCodeMemberCleanupObligation[]
       advanceCleanupObligation(obligation: OpenCodeMemberCleanupObligation,
@@ -1312,33 +1337,20 @@ class OpenCodeProductionLaunchRuntime {
           : recovered.status === 'absent' ? 'absent' : 'unresolved'
       },
       readProjection: async obligation => {
-        const projection = obligation.projectIdentity
-          ? await openCodeSessionStore.getByLogicalMember({
-            teamId: obligation.teamId, laneId: obligation.laneId,
-            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
-          })
-          : await (async () => {
-            const candidates = (await openCodeSessionStore.list()).filter(record =>
-              record.teamId.trim() === obligation.teamId.trim()
-              && (record.laneId ?? 'primary').trim() === obligation.laneId.trim()
-              && record.memberName.trim().toLowerCase() === obligation.memberName.trim().toLowerCase())
-            if (candidates.length > 1) throw new Error('legacy OpenCode cleanup project authority is ambiguous')
-            return candidates[0] ?? null
-          })()
-        return projection ? { sessionId: projection.opencodeSessionId } : null
+        const logicalMember = await cleanupLogicalMember(obligation)
+        const projection = logicalMember
+          ? await openCodeSessionStore.getByLogicalMember(logicalMember) : null
+        return projection
+          ? { sessionId: projection.opencodeSessionId, runId: projection.runId } : null
       },
       // The read is only an optimization. The store mutation itself performs
-      // the exact-session CAS, closing the replacement race between read/effect.
+      // the exact project/run/session CAS, closing the replacement race between read/effect.
       markProjectionStale: async obligation => {
-        const result = obligation.projectIdentity
-          ? await openCodeSessionStore.markStaleIfSessionMatchesLogicalMember({
-            teamId: obligation.teamId, laneId: obligation.laneId,
-            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
-          }, obligation.sessionId, 'launch_attempt_cleanup')
-          : await openCodeSessionStore.markStaleIfSessionMatches(
-            obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId,
-            'launch_attempt_cleanup')
-        if (result.status === 'foreign') throw new Error('OpenCode cleanup projection authority changed')
+        const logicalMember = await cleanupLogicalMember(obligation)
+        if (!logicalMember) return 'satisfied'
+        const result = await openCodeSessionStore.markStaleIfSessionMatchesLogicalMember(
+          logicalMember, obligation.sessionId, 'launch_attempt_cleanup', obligation.runId)
+        return result.status === 'foreign' ? 'foreign' : 'satisfied'
       },
       releaseLease: async obligation => {
         // Legacy journals lack the run half of the lease CAS. Session ids are
@@ -1355,14 +1367,11 @@ class OpenCodeProductionLaunchRuntime {
         })
       },
       deleteProjection: async obligation => {
-        const result = obligation.projectIdentity
-          ? await openCodeSessionStore.deleteIfSessionMatchesLogicalMember({
-            teamId: obligation.teamId, laneId: obligation.laneId,
-            projectIdentity: obligation.projectIdentity, memberName: obligation.memberName,
-          }, obligation.sessionId)
-          : await openCodeSessionStore.deleteIfSessionMatches(
-            obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId)
-        if (result.status === 'foreign') throw new Error('OpenCode cleanup projection authority changed')
+        const logicalMember = await cleanupLogicalMember(obligation)
+        if (!logicalMember) return 'satisfied'
+        const result = await openCodeSessionStore.deleteIfSessionMatchesLogicalMember(
+          logicalMember, obligation.sessionId, obligation.runId)
+        return result.status === 'foreign' ? 'foreign' : 'satisfied'
       },
       advance: input.advanceCleanupObligation,
       completed: obligation => retainedSessionLeases.remove(obligation.memberIdentity),
