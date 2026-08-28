@@ -1226,6 +1226,23 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
+  test('post-publication expiry reaps the acquired lease without leaking an ENOENT cleanup error', async () => {
+    const directory = await workspaceTemp('owner-post-publication-expiry')
+    const path = join(directory, 'attempt.json')
+    let now = 1
+    const context = { deadlineAtMs: 2, monotonicNow: () => now,
+      signal: new AbortController().signal }
+    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+      syncLeaseDirectory: async handle => { await handle.sync(); now = 2 },
+    })
+    try {
+      await expect(persistence.acquireExclusive(context)).rejects.toMatchObject({
+        code: 'fenced', message: 'store deadline exceeded',
+      })
+      await expect(stat(leasePath(path))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
   test('refuses to release a lock whose durable ownership token changed', async () => {
     const directory = await workspaceTemp('owner-token')
     const path = join(directory, 'attempt.json')

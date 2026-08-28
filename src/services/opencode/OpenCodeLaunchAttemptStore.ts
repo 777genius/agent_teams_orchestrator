@@ -556,8 +556,11 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
           }
         }
       } catch (error) {
-        if (published && ownerHandle) {
-          await releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle, await authority.stat(lock),
+        if (published && ownerHandle && stagingIdentity) {
+          // The post-publication deadline path may already have reaped this exact lease. Reuse the
+          // retained acquisition identity so an expected disappearance is contained by cleanup;
+          // an eager stat here used to escape before the cleanup catch and mask the deadline.
+          await releaseOwnedLock(namespace, authority, lock, ownerRecord!, ownerHandle, stagingIdentity,
             this.testHooks.beforeLeaseDirectoryRemove, undefined, this.testHooks.afterLeaseOwnerClose).catch(() => undefined)
         }
         if (!published && ownerHandle && stagingIdentity) {

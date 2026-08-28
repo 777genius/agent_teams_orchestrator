@@ -9,14 +9,17 @@ import {
   type OpenCodeLaunchHostLedgerContext,
   type OpenCodeLaunchHostLedgerPersistence,
 } from './OpenCodeLaunchHostReleaseLedger.js'
-import { OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
+import {
+  OpenCodeLaunchFileJournalPersistence,
+  OpenCodeLaunchJournalError,
+} from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
 
 const attemptId = '123e4567-e89b-42d3-a456-426614174000'
 const payloadHash = 'b'.repeat(64)
 const hostKeyIdentity = `sha256:${'a'.repeat(64)}` as OpenCodeOpaqueIdentity
-const context = (): OpenCodeLaunchHostLedgerContext => ({
-  deadlineAtMs: Date.now() + 10_000,
+const context = (budgetMs = 10_000): OpenCodeLaunchHostLedgerContext => ({
+  deadlineAtMs: Date.now() + budgetMs,
   signal: new AbortController().signal,
 })
 
@@ -120,19 +123,23 @@ describe('durable retained host-release ledger', () => {
 
   test('legacy migration fails closed and remains restartable when its verified temporary disappears', async () => {
     let removeNextTemporary = true
+    const interrupted = new AbortController()
     const item = await fixture('legacy-temporary-disappears', {
       beforeAtomicRename: async temporary => {
         if (!removeNextTemporary) return
         removeNextTemporary = false
         await unlink(temporary)
+        interrupted.abort(new Error('cancel after verified temporary removal'))
       },
     })
     const legacy = { schemaVersion: 1 as const, attemptId, payloadHash, generation: 1,
       hostKeyIdentity, receipt: receipt() }
     try {
       await writeFile(item.file, `${JSON.stringify(legacy)}\n`)
-      const migrated = await item.ledger.read({ attemptId, payloadHash, generation: 1 }, context())
-      await expect(item.ledger.record(migrated, context())).rejects.toMatchObject({
+      const migrated = await item.ledger.read({ attemptId, payloadHash, generation: 1 }, context(120_000))
+      await expect(item.ledger.record(migrated, {
+        deadlineAtMs: Date.now() + 10_000, signal: interrupted.signal,
+      })).rejects.toMatchObject({
         code: 'foreign',
         message: expect.stringContaining('temporary durable record disappeared'),
       })
@@ -140,10 +147,54 @@ describe('durable retained host-release ledger', () => {
 
       const restarted = OpenCodeLaunchHostReleaseLedger.production(
         new OpenCodeLaunchFileJournalPersistence(item.file))
-      await restarted.record(migrated, context())
-      expect(await restarted.read({ attemptId, payloadHash, generation: 1 }, context()))
+      await restarted.record(migrated, context(120_000))
+      expect(await restarted.read({ attemptId, payloadHash, generation: 1 }, context(120_000)))
         .toEqual(migrated)
     } finally { await rm(item.root, { recursive: true, force: true }) }
+  })
+
+  test('reader retries a verified framed marker that replaces legacy during fallback', async () => {
+    const item = await fixture('legacy-reader-transition')
+    const legacy = { schemaVersion: 1 as const, attemptId, payloadHash, generation: 1,
+      hostKeyIdentity, receipt: receipt() }
+    try {
+      await writeFile(item.file, `${JSON.stringify(legacy)}\n`)
+      const expected = await item.ledger.read({ attemptId, payloadHash, generation: 1 }, context())
+      const encoded = new TextEncoder().encode(`${JSON.stringify({
+        schemaVersion: 1, records: [expected],
+      })}\n`)
+      let transition = true
+      const transitioning: OpenCodeLaunchHostLedgerPersistence = {
+        read: (...args) => item.persistence.read(...args),
+        acquireExclusive: (...args) => item.persistence.acquireExclusive(...args),
+        replaceAndSync: (...args) => item.persistence.replaceAndSync(...args),
+        replaceUnframedLegacyAndSync: (...args) => item.persistence.replaceUnframedLegacyAndSync(...args),
+        readUnframedLegacy: async (...args) => {
+          if (transition) {
+            transition = false
+            await item.persistence.replaceUnframedLegacyAndSync(encoded, args[0])
+          }
+          return item.persistence.readUnframedLegacy(...args)
+        },
+      }
+      const reader = OpenCodeLaunchHostReleaseLedger.production(transitioning)
+      expect(await reader.read({ attemptId, payloadHash, generation: 1 }, context())).toEqual(expected)
+      expect(transition).toBe(false)
+    } finally { await rm(item.root, { recursive: true, force: true }) }
+  })
+
+  test('legacy fallback preserves a bounded wait failure instead of misreporting corruption', async () => {
+    const deadline = new OpenCodeLaunchJournalError('fenced', 'store deadline exceeded')
+    const persistence: OpenCodeLaunchHostLedgerPersistence = {
+      read: async () => { throw new OpenCodeLaunchJournalError('corrupt', 'invalid commit marker') },
+      readUnframedLegacy: async () => { throw deadline },
+      acquireExclusive: async () => async () => undefined,
+      replaceAndSync: async () => undefined,
+      replaceUnframedLegacyAndSync: async () => undefined,
+    }
+    const ledger = OpenCodeLaunchHostReleaseLedger.production(persistence)
+    await expect(ledger.read({ attemptId, payloadHash, generation: 1 }, context()))
+      .rejects.toBe(deadline)
   })
 
   for (const stage of ['reservation', 'receipt', 'disposition', 'completion', 'clear'] as const) {

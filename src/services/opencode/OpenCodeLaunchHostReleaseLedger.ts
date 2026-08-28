@@ -124,6 +124,17 @@ function throwLedgerReadError(error: unknown): never {
   throw error
 }
 
+function isFramedMarker(bytes: Uint8Array): boolean {
+  let value: unknown
+  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) }
+  catch { return false }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const marker = value as Record<string, unknown>
+  return Object.keys(marker).sort().join(',') === 'digest,slot,version'
+    && marker.version === 1 && (marker.slot === 0 || marker.slot === 1)
+    && typeof marker.digest === 'string' && /^[0-9a-f]{64}$/.test(marker.digest)
+}
+
 /**
  * Durable host cleanup authority. All publication, reads, and locking are delegated to the
  * launch journal's retained relative-persistence backend; this class never resolves a pathname.
@@ -204,6 +215,7 @@ export class OpenCodeLaunchHostReleaseLedger {
     ensureContext(context)
     const persistenceContext = storeContext(context)
     const release = await this.persistence.acquireExclusive(persistenceContext)
+    let bodyFailure: unknown
     try {
       ensureContext(context)
       let legacy = false
@@ -214,7 +226,12 @@ export class OpenCodeLaunchHostReleaseLedger {
       } catch (error) {
         let legacyBytes: Uint8Array | null
         try { legacyBytes = await this.persistence.readUnframedLegacy(persistenceContext) }
-        catch { throwLedgerReadError(error) }
+        catch (legacyError) {
+          if (legacyError instanceof OpenCodeLaunchJournalError && legacyError.code === 'corrupt') {
+            throwLedgerReadError(error)
+          }
+          throw legacyError
+        }
         if (!legacyBytes) throwLedgerReadError(error)
         let value: unknown
         try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(legacyBytes)) }
@@ -228,8 +245,14 @@ export class OpenCodeLaunchHostReleaseLedger {
       const encoded = encode(next)
       if (legacy) await this.persistence.replaceUnframedLegacyAndSync(encoded, persistenceContext)
       else await this.persistence.replaceAndSync(encoded, persistenceContext)
+    } catch (error) {
+      bodyFailure = error
+      throw error
     } finally {
-      await release(persistenceContext)
+      // Release starts physical reaping before its bounded, cancellation-aware wait. Preserve an
+      // earlier fail-closed publication error while a timed-out reaper settles in background.
+      try { await release(persistenceContext) }
+      catch (error) { if (bodyFailure === undefined) throw error }
     }
   }
 
@@ -243,8 +266,22 @@ export class OpenCodeLaunchHostReleaseLedger {
       if (!allowLegacy) throw error
       let legacyBytes: Uint8Array | null
       try { legacyBytes = await this.persistence.readUnframedLegacy(persistenceContext) }
-      catch { throwLedgerReadError(error) }
+      catch (legacyError) {
+        if (legacyError instanceof OpenCodeLaunchJournalError && legacyError.code === 'corrupt') {
+          throwLedgerReadError(error)
+        }
+        throw legacyError
+      }
       if (!legacyBytes) throwLedgerReadError(error)
+      // A migration atomically replaces the verified legacy leaf with its framed marker. If that
+      // exact transition wins between the framed read and legacy fallback, retry only after
+      // recognizing the complete marker shape; arbitrary malformed/foreign bytes still fail shut.
+      if (error instanceof OpenCodeLaunchJournalError && error.code === 'corrupt'
+        && isFramedMarker(legacyBytes)) {
+        const transitioned = await this.persistence.read(persistenceContext)
+        if (!transitioned) throwLedgerReadError(error)
+        return decode(transitioned)
+      }
       let legacy: unknown
       try { legacy = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(legacyBytes)) }
       catch { throwLedgerReadError(error) }
