@@ -198,6 +198,71 @@ describe('HostedLifecycleAuthorityService', () => {
     expect(provider.executions).toBe(1)
   })
 
+  test('exposes exact completed results and synthesizes correlated operator-required results', async () => {
+    const { service, provider } = await fixture()
+    const launch = launchCommand(provider); const launchAuthority = authority(provider)
+    const admitted = await service.authorize({ command: launch, context, authority: launchAuthority })
+    if (admitted.kind !== 'authorized') throw new Error('expected authorization')
+    const completed = await service.execute({
+      command: launch, authorization: admitted.authorization,
+      durableCommand: durableCommand(launch, admitted.authorization), context, authority: launchAuthority,
+    })
+    if (completed.kind !== 'settled') throw new Error('expected completion')
+
+    const stopAuthority = authority(provider)
+    const stop = { ...launchCommand(provider, {
+      action: 'stop', commandId: 'lifecycle-command_command02', idempotencyKey: 'idempotency_command02',
+    }), action: 'stop' as const, runId: 'run_test01' }
+    const stopAdmission = await service.authorize({ command: stop, context, authority: stopAuthority })
+    if (stopAdmission.kind !== 'authorized') throw new Error('expected authorization')
+    provider.failAfterEffect = true
+    await service.execute({
+      command: stop, authorization: stopAdmission.authorization,
+      durableCommand: durableCommand(stop, stopAdmission.authorization), context, authority: stopAuthority,
+    })
+    const status = await service.getProvisioningStatus({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
+      context, authority: authority(provider),
+    })
+    expect(status.recentCommands).toEqual([
+      { action: 'stop', commandId: stop.commandId, result: {
+        schemaVersion: 1, kind: 'operator_required', action: 'stop', commandId: stop.commandId,
+        workspaceId: incarnation.workspaceId, teamId,
+      } },
+      { action: 'launch', commandId: launch.commandId, result: completed.result },
+    ])
+  })
+
+  test('returns the WAL insertion-order tail newest-first with a 16-entry cap', async () => {
+    const { service, provider, wal } = await fixture()
+    const commands = new Map()
+    for (let index = 1; index <= 17; index += 1) {
+      const commandId = `lifecycle-command_command${String(index).padStart(2, '0')}`
+      const command = launchCommand(provider, { commandId, idempotencyKey: `idempotency_command${index}` })
+      commands.set(String(index), {
+        kind: 'completed', command,
+        authorization: { deploymentId: incarnation.deploymentId, actorId: context.actorId },
+        result: {
+          schemaVersion: 1, kind: 'accepted', action: 'launch', commandId,
+          workspaceId: incarnation.workspaceId, teamId, runId: `run_${index}`,
+          resourceRevision: command.expectedRevision,
+        },
+      })
+    }
+    wal.withLock = async operation => operation()
+    wal.load = async () => ({
+      grants: new Map(), commands, released: new Set(),
+    }) as Awaited<ReturnType<typeof wal.load>>
+    const status = await service.getProvisioningStatus({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
+      context, authority: authority(provider),
+    })
+    expect(status.recentCommands).toHaveLength(16)
+    expect((status.recentCommands as Array<{ commandId: string }>).map(entry => entry.commandId))
+      .toEqual(Array.from({ length: 16 }, (_, index) =>
+        `lifecycle-command_command${String(17 - index).padStart(2, '0')}`))
+  })
+
   test('keeps a non-launch receipt bound to the commanded run when provider state advances to another run', async () => {
     const provider = new MutableProvider()
     provider.snapshot = {
@@ -329,7 +394,10 @@ describe('HostedLifecycleAuthorityService', () => {
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: originalAuthority,
     })).resolves.toMatchObject({
       kind: 'provisioning_status', availableActions: [],
-      recentCommands: [{ action: 'launch', commandId: command.commandId, idempotencyKey: command.idempotencyKey, status: 'operator_required' }],
+      recentCommands: [{ action: 'launch', commandId: command.commandId, result: {
+        schemaVersion: 1, kind: 'operator_required', action: 'launch', commandId: command.commandId,
+        workspaceId: incarnation.workspaceId, teamId,
+      } }],
     })
     expect(provider.executions).toBe(1)
   })

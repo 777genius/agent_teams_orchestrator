@@ -517,7 +517,9 @@ function decodeLifecycleResponsePayload(
       throw new Error('Invalid hosted lifecycle available actions')
     }
     if (operation === 'prepare' || operation === 'prepare_provisioning') decodePreparedLanes(payload.lanes)
-    if (operation === 'get_status' || operation === 'get_provisioning_status') decodeRecentCommands(payload.recentCommands)
+    if (operation === 'get_status' || operation === 'get_provisioning_status') {
+      decodeRecentCommands(payload.recentCommands, request.authority)
+    }
     return payload
   }
   if (operation === 'release') {
@@ -558,7 +560,12 @@ function decodeLifecycleResponsePayload(
     if (!isDeepStrictEqual(payload.durableCommand, request.durableCommand)) throw new Error('Invalid durable command echo')
     const authorization = decodeLifecycleAuthorization(payload.authorization, request.authority)
     assertLifecycleAuthorizationCorrelation(authorization, request)
-    decodeLifecyclePublicResult(payload.result, request, authorization)
+    decodeLifecyclePublicResult(payload.result, {
+      action: record(request.command, 'lifecycle request command').action,
+      commandId: record(request.command, 'lifecycle request command').commandId,
+      workspaceId: request.authority.workspaceId,
+      teamId: request.authority.teamId,
+    }, record(request.command, 'lifecycle request command'), authorization)
     return payload
   }
   throw new Error('Invalid hosted lifecycle response payload')
@@ -608,8 +615,9 @@ function assertLifecycleAuthorizationCorrelation(
 
 function decodeLifecyclePublicResult(
   value: unknown,
-  request: Record<string, unknown> & { authority: HostedLifecycleAuthority },
-  authorization: Record<string, unknown>,
+  correlation: { action: unknown; commandId: unknown; workspaceId: unknown; teamId: unknown },
+  command?: Record<string, unknown>,
+  authorization?: Record<string, unknown>,
 ): void {
   const result = record(value, 'lifecycle public result')
   if (result.schemaVersion !== 1 || typeof result.kind !== 'string') throw new Error('Invalid lifecycle public result')
@@ -630,7 +638,7 @@ function decodeLifecyclePublicResult(
       throw new Error('Invalid lifecycle public conflict reason')
     }
     nullableRevision(result.currentRevision)
-  } else if (result.kind === 'not_found') {
+  } else if (result.kind === 'not_found' || result.kind === 'operator_required') {
     exactKeys(result, common, 'lifecycle not found result')
   } else {
     throw new Error('Invalid lifecycle public result kind')
@@ -641,17 +649,16 @@ function decodeLifecyclePublicResult(
   patternString(result.commandId, /^lifecycle-command_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'result.commandId')
   nonEmptyString(result.workspaceId, 'result.workspaceId')
   nonEmptyString(result.teamId, 'result.teamId')
-  const command = record(request.command, 'lifecycle request command')
-  if (result.action !== command.action || result.commandId !== command.commandId ||
-    result.workspaceId !== request.authority.workspaceId || result.teamId !== request.authority.teamId) {
+  if (result.action !== correlation.action || result.commandId !== correlation.commandId ||
+    result.workspaceId !== correlation.workspaceId || result.teamId !== correlation.teamId) {
     throw new Error('Invalid lifecycle public result scope')
   }
-  if ((result.kind === 'accepted' || result.kind === 'idempotent_replay') &&
+  if (command && authorization && (result.kind === 'accepted' || result.kind === 'idempotent_replay') &&
     (result.resourceRevision !== authorization.resourceRevision ||
       (command.action !== 'launch' && result.runId !== command.runId))) {
     throw new Error('Invalid lifecycle public result correlation')
   }
-  if (result.kind === 'conflict' && result.currentRevision !== authorization.resourceRevision) {
+  if (authorization && result.kind === 'conflict' && result.currentRevision !== authorization.resourceRevision) {
     throw new Error('Invalid lifecycle public conflict correlation')
   }
 }
@@ -691,24 +698,29 @@ function decodePreparedLanes(value: unknown): void {
   }
 }
 
-function decodeRecentCommands(value: unknown): void {
+function decodeRecentCommands(value: unknown, authority: HostedLifecycleAuthority): void {
   if (!Array.isArray(value) || value.length > 16) throw new Error('Invalid hosted lifecycle recent commands')
   const seen = new Set<string>()
   for (const entryValue of value) {
     const entry = record(entryValue, 'lifecycle recent command')
-    exactKeys(entry, ['action', 'commandId', 'idempotencyKey', 'status'], 'lifecycle recent command')
+    exactKeys(entry, ['action', 'commandId', 'result'], 'lifecycle recent command')
     if (!['launch', 'cancel', 'stop', 'recover'].includes(String(entry.action))) {
       throw new Error('Invalid hosted lifecycle recent command action')
     }
     patternString(entry.commandId,
       /^lifecycle-command_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'recent commandId')
-    const idempotencyKey = patternString(entry.idempotencyKey,
-      /^idempotency_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'recent idempotencyKey')
-    const scopedKey = `${entry.action}\0${idempotencyKey}`
-    if (seen.has(scopedKey)) throw new Error('Invalid duplicate hosted lifecycle recent command')
-    seen.add(scopedKey)
-    if (!['settled', 'operator_required'].includes(String(entry.status))) {
-      throw new Error('Invalid hosted lifecycle recent command status')
+    if (seen.has(String(entry.commandId))) throw new Error('Invalid duplicate hosted lifecycle recent command')
+    seen.add(String(entry.commandId))
+    const result = record(entry.result, 'lifecycle recent command result')
+    decodeLifecyclePublicResult(result, {
+      action: entry.action,
+      commandId: entry.commandId,
+      workspaceId: authority.workspaceId,
+      teamId: authority.teamId,
+    })
+    if (result.action !== entry.action || result.commandId !== entry.commandId ||
+      result.workspaceId !== authority.workspaceId || result.teamId !== authority.teamId) {
+      throw new Error('Invalid lifecycle recent command correlation')
     }
   }
 }

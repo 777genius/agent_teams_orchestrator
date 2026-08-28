@@ -96,11 +96,17 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       const snapshot = this.#snapshot(owner)
       const recentCommands = [...state.commands.values()].filter(entry =>
         entry.authorization.deploymentId === input.authority.deploymentId &&
-        entry.authorization.actorId === input.authority.actorId).slice(-16).map(entry => ({
+        entry.authorization.actorId === input.authority.actorId).slice(-16).reverse().map(entry => ({
         action: entry.command.action,
         commandId: entry.command.commandId,
-        idempotencyKey: entry.command.idempotencyKey,
-        status: entry.kind === 'completed' ? 'settled' : 'operator_required',
+        result: entry.kind === 'completed' ? entry.result : {
+          schemaVersion: 1,
+          kind: 'operator_required',
+          action: entry.command.action,
+          commandId: entry.command.commandId,
+          workspaceId: entry.command.workspaceId,
+          teamId: entry.command.teamId,
+        },
       }))
       return {
         schemaVersion: 1,

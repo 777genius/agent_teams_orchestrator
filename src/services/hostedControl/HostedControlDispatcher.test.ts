@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { createHostedLifecycleOwnerIdentityChecksum, HostedControlDispatcher } from './HostedControlDispatcher.js'
 import { HostedLifecycleCommandService } from './HostedLifecycleCommandService.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN } from './HostedControlServer.js'
@@ -157,6 +158,36 @@ describe('HostedControlDispatcher response decoding', () => {
     }).dispatch(signedLifecycleRequest('get_status'))).resolves.toMatchObject({ operation: 'get_status', payload: { kind: 'status' } })
   })
 
+  test('accepts the versioned recent commands golden', async () => {
+    const golden = JSON.parse(await readFile(new URL(
+      './fixtures/hosted-lifecycle-recent-commands-v1.json', import.meta.url,
+    ), 'utf8'))
+    expect(golden).toMatchObject({ schemaVersion: 1, contract: 'hosted-lifecycle-recent-commands-v1' })
+    await expect(lifecycleDispatcher(statusResponse(golden.recentCommands))
+      .dispatch(signedLifecycleRequest('get_status'))).resolves.toMatchObject({
+      payload: { recentCommands: golden.recentCommands },
+    })
+  })
+
+  test('rejects duplicate IDs, non-exact keys, and recent result correlation mismatches', async () => {
+    const base = recentCommand()
+    const invalid = [
+      [base, { ...base }],
+      [{ ...base, extension: true }],
+      [{ action: base.action, commandId: base.commandId }],
+      [{ ...base, result: { ...base.result, extension: true } }],
+      [{ ...base, result: { schemaVersion: 1, kind: 'operator_required' } }],
+      [{ ...base, result: { ...base.result, workspaceId: 'workspace-substituted' } }],
+      [{ ...base, result: { ...base.result, teamId: `team_${'c'.repeat(32)}` } }],
+      [{ ...base, result: { ...base.result, action: 'stop' } }],
+      [{ ...base, result: { ...base.result, commandId: 'lifecycle-command_command02' } }],
+    ]
+    for (const recentCommands of invalid) {
+      await expect(lifecycleDispatcher(statusResponse(recentCommands))
+        .dispatch(signedLifecycleRequest('get_status'))).rejects.toThrow()
+    }
+  })
+
   test('rejects a signed owner fence whose identity checksum is not the active external owner', async () => {
     const request = signedLifecycleRequest()
     const unsigned = { ...request, ownerEffectFence: { ...lifecycleAuthority.ownerEffectFence, identityChecksum: '0'.repeat(64) } }
@@ -191,6 +222,28 @@ function lifecycleDispatcher(response: {
     lifecycle: { dispatch: async () => response },
     messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
   })
+}
+
+function recentCommand() {
+  return {
+    action: 'launch', commandId: 'lifecycle-command_command01',
+    result: {
+      schemaVersion: 1, kind: 'accepted', action: 'launch', commandId: 'lifecycle-command_command01',
+      workspaceId: authority.workspaceId, teamId: authority.teamId,
+      runId: 'run_created', resourceRevision: lifecycleAuthorization.resourceRevision,
+    },
+  }
+}
+
+function statusResponse(recentCommands: unknown[]) {
+  return {
+    payload: {
+      schemaVersion: 1, kind: 'status', workspaceId: authority.workspaceId, teamId: authority.teamId,
+      deploymentId: authority.deploymentId, bootId: authority.bootId, runId: null,
+      resourceRevision: lifecycleAuthorization.resourceRevision, availableActions: ['launch'], recentCommands,
+    },
+    resourceRevision: lifecycleAuthorization.resourceRevision,
+  }
 }
 
 function lifecycleServiceDispatcher(
