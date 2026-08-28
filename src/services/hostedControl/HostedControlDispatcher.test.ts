@@ -167,12 +167,13 @@ describe('HostedControlDispatcher response decoding', () => {
       .toBe('4a94e072a308173fb921f8644ebdc7ea94e3cd9e8d3e40cb1084da5b256b11b5')
     const golden = JSON.parse(bytes.toString('utf8'))
     expect(golden).toMatchObject({ schemaVersion: 1, contract: 'hosted-lifecycle-recent-commands-v1' })
-    expect(authority.deploymentId).toMatch(/^deployment_[0-9a-f]{32}$/)
-    expect(authority.bootId).toMatch(/^boot_[0-9a-f]{32}$/)
-    for (const command of golden.recentCommands) {
-      expect(command.result.workspaceId).toMatch(/^workspace_[0-9a-f]{32}$/)
-      if ('runId' in command.result) expect(command.result.runId).toMatch(/^run_[0-9a-f]{32}$/)
-    }
+    expect(authority.deploymentId).toBe('deployment_33333333333333333333333333333333')
+    expect(authority.bootId).toBe('boot_44444444444444444444444444444444')
+    expect(golden.recentCommands[0].result.workspaceId)
+      .toBe('workspace_11111111111111111111111111111111')
+    expect(golden.recentCommands[0].result.runId).toBe('run_22222222222222222222222222222222')
+    expect(golden.recentCommands[1].result.workspaceId)
+      .toBe('workspace_11111111111111111111111111111111')
   })
 
   test('accepts the versioned recent commands golden', async () => {
