@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -115,6 +115,34 @@ describe('durable retained host-release ledger', () => {
       await expect(item.ledger.reserve({ attemptId, payloadHash, generation: 1,
         hostKeyIdentity, hostKeyDigest: 'c'.repeat(64) })).rejects
         .toThrow('ledger context is required')
+    } finally { await rm(item.root, { recursive: true, force: true }) }
+  })
+
+  test('legacy migration fails closed and remains restartable when its verified temporary disappears', async () => {
+    let removeNextTemporary = true
+    const item = await fixture('legacy-temporary-disappears', {
+      beforeAtomicRename: async temporary => {
+        if (!removeNextTemporary) return
+        removeNextTemporary = false
+        await unlink(temporary)
+      },
+    })
+    const legacy = { schemaVersion: 1 as const, attemptId, payloadHash, generation: 1,
+      hostKeyIdentity, receipt: receipt() }
+    try {
+      await writeFile(item.file, `${JSON.stringify(legacy)}\n`)
+      const migrated = await item.ledger.read({ attemptId, payloadHash, generation: 1 }, context())
+      await expect(item.ledger.record(migrated, context())).rejects.toMatchObject({
+        code: 'foreign',
+        message: expect.stringContaining('temporary durable record disappeared'),
+      })
+      expect(JSON.parse(await readFile(item.file, 'utf8'))).toEqual(legacy)
+
+      const restarted = OpenCodeLaunchHostReleaseLedger.production(
+        new OpenCodeLaunchFileJournalPersistence(item.file))
+      await restarted.record(migrated, context())
+      expect(await restarted.read({ attemptId, payloadHash, generation: 1 }, context()))
+        .toEqual(migrated)
     } finally { await rm(item.root, { recursive: true, force: true }) }
   })
 

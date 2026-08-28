@@ -262,6 +262,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       afterReadHandleOpened?: (path: string) => Promise<void>
       /** Test-only boundary after the selected backend has anchored or accepted its root. */
       afterNamespaceAnchored?: () => Promise<void>
+      /** Test-only boundary immediately before a verified temporary leaf is published. */
+      beforeAtomicRename?: (temporaryPath: string, targetPath: string) => Promise<void>
       /** Test-only platform selection; production always uses process.platform. */
       platform?: NodeJS.Platform
       windowsAuthorityFactory?: OpenCodeWindowsPublicationAuthorityFactory
@@ -419,12 +421,14 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
     const slot = (currentSlot === 0 ? 1 : 0) as 0 | 1
-    await atomicReplace(namespace, namespace.backend, namespace.slots[slot], bytes, context)
+    await atomicReplace(namespace, namespace.backend, namespace.slots[slot], bytes, context,
+      this.testHooks.beforeAtomicRename)
     // A deadline/cancellation before this point only leaves an uncommitted candidate.
     ensureContext(context)
     const marker = new TextEncoder().encode(JSON.stringify({ version: 1, slot, digest: sha256(bytes) }))
     // Marker publication is the commit point. Never publish and then throw because the caller's clock advanced.
-    await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context)
+    await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context,
+      this.testHooks.beforeAtomicRename)
   }
 
   /** One-way retained-authority migration from a validated unframed marker payload. */
@@ -439,12 +443,14 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     try { framed = validCommitMarker(JSON.parse(new TextDecoder().decode(prior))) }
     catch { /* The ledger validates the complete legacy payload before calling this method. */ }
     if (framed) throw new OpenCodeLaunchJournalError('fenced', 'legacy migration source changed')
-    await atomicReplace(namespace, namespace.backend, namespace.slots[0], bytes, context)
+    await atomicReplace(namespace, namespace.backend, namespace.slots[0], bytes, context,
+      this.testHooks.beforeAtomicRename)
     ensureContext(context)
     const marker = new TextEncoder().encode(JSON.stringify({
       version: 1, slot: 0, digest: sha256(bytes),
     }))
-    await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context)
+    await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context,
+      this.testHooks.beforeAtomicRename)
   }
 
   async readFence(context?: OpenCodeLaunchStoreContext): Promise<number | null> {
@@ -471,7 +477,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     const actual = await this.readFence(context) ?? 0
     if (actual !== expected) throw new OpenCodeLaunchJournalError('fenced', 'durable fence changed')
     await atomicReplace(namespace, namespace.authorityBackend, namespace.fence,
-      new TextEncoder().encode(JSON.stringify({ version: 1, fence: next })), context)
+      new TextEncoder().encode(JSON.stringify({ version: 1, fence: next })), context,
+      this.testHooks.beforeAtomicRename)
   }
 
   async acquireExclusive(context: OpenCodeLaunchStoreContext): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>> {
@@ -1171,7 +1178,20 @@ class RetainedDirectoryBackend implements NamespaceBackend {
     const fd = this.result((unixSymbols().symbols as any).openat(this.rootHandle.fd, ptr(cPath(name)), flags, mode), 'openat')
     return new NativeNamespaceHandle(fd, this)
   }
-  async rename(from: string, to: string) { this.result((unixSymbols().symbols as any).renameat(this.rootHandle.fd, ptr(cPath(from)), this.rootHandle.fd, ptr(cPath(to))), 'renameat') }
+  async rename(from: string, to: string) {
+    // Bun's FFI receives raw pointers, not Buffer owners. Keep both pathname allocations
+    // strongly reachable through the complete syscall; otherwise collection of the first
+    // inline cPath() result can make an existing source intermittently look like ENOENT.
+    const fromPath = cPath(from)
+    const toPath = cPath(to)
+    const result = (unixSymbols().symbols as any).renameat(
+      this.rootHandle.fd, ptr(fromPath), this.rootHandle.fd, ptr(toPath))
+    // Observe both owners after the FFI call so the runtime cannot shorten their lifetime.
+    if (fromPath.byteLength === 0 || toPath.byteLength === 0) {
+      throw new OpenCodeLaunchJournalError('foreign', 'invalid descriptor-relative rename path')
+    }
+    this.result(result, 'renameat')
+  }
   async unlink(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), 0), 'unlinkat') }
   async rmdir(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), process.platform === 'darwin' ? 0x80 : 0x200), 'unlinkat') }
   async syncDirectory(name = '.') {
@@ -1362,6 +1382,7 @@ async function atomicReplace(
   target: string,
   bytes: Uint8Array,
   context?: OpenCodeLaunchStoreContext,
+  beforeRename?: (temporaryPath: string, targetPath: string) => Promise<void>,
 ): Promise<void> {
   ensureContext(context)
   await verifyNamespace(namespace)
@@ -1379,10 +1400,30 @@ async function atomicReplace(
     if (!sameFileIdentity(visibleTemporary, temporaryIdentity)) {
       throw new OpenCodeLaunchJournalError('foreign', 'temporary durable record identity changed')
     }
+    if (beforeRename) {
+      await beforeRename(backend.displayPath(temporary), backend.displayPath(target))
+      let publicationTemporary: NamespaceStat
+      try { publicationTemporary = await backend.stat(temporary) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new OpenCodeLaunchJournalError('foreign', 'temporary durable record disappeared before publication')
+        }
+        throw error
+      }
+      if (!sameFileIdentity(publicationTemporary, temporaryIdentity)) {
+        throw new OpenCodeLaunchJournalError('foreign', 'temporary durable record identity changed before publication')
+      }
+    }
     // This is the last check before the irreversible namespace publication. There is no
     // post-publication deadline check that could turn committed authority into a thrown timeout.
     ensureContext(context)
-    await backend.rename(temporary, target)
+    try { await backend.rename(temporary, target) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new OpenCodeLaunchJournalError('foreign', 'temporary durable record disappeared during publication')
+      }
+      throw error
+    }
     const visibleTarget = await backend.stat(target)
     if (!sameFileIdentity(visibleTarget, temporaryIdentity)) {
       throw new OpenCodeLaunchJournalError('foreign', 'published durable record identity changed')
