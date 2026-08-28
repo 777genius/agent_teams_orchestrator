@@ -24,7 +24,6 @@ import {
 } from '../opencode/OpenCodeDiagnostics.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
-  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   createOpenCodeInventoryProbeProgressTracker,
   hasOpenCodeBuiltinFreeModel,
   isOpenCodeModelFree,
@@ -82,6 +81,10 @@ import type {
   RuntimeStatusDetailLevel,
   RuntimeStatusPayload,
 } from './types.js'
+import {
+  buildOpenCodePassiveStatus,
+  type OpenCodePassiveStatusDeps,
+} from './openCodePassiveStatus.js'
 
 const GEMINI_BACKEND_LABELS: Record<GeminiRuntimeBackendId, string> = {
   auto: 'Auto',
@@ -418,7 +421,7 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
-type RuntimeStatusRegistryDeps = {
+type RuntimeStatusRegistryDeps = OpenCodePassiveStatusDeps & {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
   getAnthropicSubscriptionRateLimits?: (
     authMethod: string | null,
@@ -596,9 +599,12 @@ async function buildOpenCodeStatus(
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeProviderStatus> {
   const summary = options.detailLevel === 'summary'
+  if (summary) {
+    return buildOpenCodePassiveStatus(deps)
+  }
   const timeoutMs =
     deps.openCodeInventoryTimeoutMs ??
-    (summary ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
   const abortController = new AbortController()
   const progress = createOpenCodeInventoryProbeProgressTracker()
   const snapshot = await withOpenCodeInventoryProbeTimeout(
@@ -606,20 +612,12 @@ async function buildOpenCodeStatus(
       ? deps.getOpenCodeInventorySnapshot()
       : openCodeInventoryService.probe(
           null,
-          summary
-            ? {
-                mode: 'summary',
-                bypassCache: true,
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              }
-            : {
-                mode: 'full',
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              },
+          {
+            mode: 'full',
+            includeAppMcp: false,
+            abortSignal: abortController.signal,
+            progress,
+          },
         ),
     {
       timeoutMs,
@@ -791,14 +789,31 @@ async function buildOpenCodeStatus(
                 : (snapshot.profile?.authState ?? null),
         }
       : null,
+    ...getOpenCodeActiveStatusContract(snapshot, authenticated),
   }
 
-  if (!summary) {
-    provider.modelCatalog = modelCatalog
-    provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
-  }
+  provider.modelCatalog = modelCatalog
+  provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
 
   return provider
+}
+
+function getOpenCodeActiveStatusContract(
+  snapshot: OpenCodeInventorySnapshot,
+  authenticated: boolean,
+): Pick<RuntimeProviderStatus, 'statusCheckOutcome' | 'statusCheckErrorCode'> {
+  if (!snapshot.detected) {
+    return { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'runtime_missing' }
+  }
+  if (!snapshot.probeError) {
+    return { statusCheckOutcome: 'authoritative', statusCheckErrorCode: null }
+  }
+  if (snapshot.probeError.includes('timed out')) {
+    return { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'timeout' }
+  }
+  return snapshot.models.length > 0 || authenticated
+    ? { statusCheckOutcome: 'pending', statusCheckErrorCode: 'partial_response' }
+    : { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'unavailable' }
 }
 
 async function buildGeminiStatuses(): Promise<{
