@@ -934,7 +934,7 @@ async function buildGeminiStatuses(): Promise<{
   const validationUnavailable =
     apiStatus.validationError === 'operational' ||
     cliStatus.validationError === 'operational'
-  const effectiveResolvedBackendId = validationUnavailable ? null : resolvedBackendId
+  const effectiveResolvedBackendId = resolvedBackendId
 
   return {
     selectedBackendId,
@@ -945,9 +945,11 @@ async function buildGeminiStatuses(): Promise<{
       preferredStatus?.authMethod && preferredStatus.authMethod !== 'none'
         ? preferredStatus.authMethod
         : null,
-    verificationState: validationUnavailable
-      ? 'error'
-      : effectiveResolvedBackendId ? 'verified' : 'unknown',
+    verificationState: effectiveResolvedBackendId
+      ? 'verified'
+      : validationUnavailable
+        ? 'error'
+        : 'unknown',
     statusMessage:
       effectiveResolvedBackendId !== null
         ? selectedBackendId === 'auto'
@@ -988,12 +990,16 @@ async function buildGeminiStatuses(): Promise<{
                   : null,
             }
           : null,
-    statusCheckOutcome: validationUnavailable
-      ? resolvedBackendId ? 'pending' : 'transient_error'
-      : validationFailed ? 'transient_error' : 'authoritative',
-    statusCheckErrorCode: validationUnavailable
-      ? resolvedBackendId ? 'partial_response' : 'unavailable'
-      : validationFailed ? 'unavailable' : null,
+    statusCheckOutcome: resolvedBackendId
+      ? 'authoritative'
+      : validationUnavailable || validationFailed
+        ? 'transient_error'
+        : 'authoritative',
+    statusCheckErrorCode: resolvedBackendId
+      ? null
+      : validationUnavailable || validationFailed
+        ? 'unavailable'
+        : null,
   }
 }
 

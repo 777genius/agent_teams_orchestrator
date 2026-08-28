@@ -9,12 +9,14 @@ import type { RuntimeProviderModelCatalog } from './types.js'
 const originalWhich = Bun.which
 const originalApiValidate = geminiApiBackend.validate
 const originalCliValidate = geminiCliBackend.validate
+const originalFetch = globalThis.fetch
 const originalEnv = { ...process.env }
 
 afterEach(() => {
   Bun.which = originalWhich
   geminiApiBackend.validate = originalApiValidate
   geminiCliBackend.validate = originalCliValidate
+  globalThis.fetch = originalFetch
   for (const key of Object.keys(process.env)) {
     if (!(key in originalEnv)) delete process.env[key]
   }
@@ -160,12 +162,110 @@ describe('runtime status outcome completeness', () => {
       message: 'Invalid API key',
       validationError: 'invalid_credentials',
     })
-    const invalid = await getUnifiedRuntimeStatusPayload('gemini')
-    expect(invalid.providers.gemini).toMatchObject({
-      authenticated: false,
-      capabilities: { teamLaunch: false },
+    for (const detailLevel of ['summary', 'full'] as const) {
+      const invalid = await getUnifiedRuntimeStatusPayload(
+        'gemini', undefined, { detailLevel },
+      )
+      expect(invalid.providers.gemini).toMatchObject({
+        authenticated: false,
+        verificationState: 'unknown',
+        resolvedBackendId: null,
+        capabilities: { teamLaunch: false },
+        statusCheckOutcome: 'authoritative',
+        statusCheckErrorCode: null,
+      })
+    }
+  })
+
+  test('Gemini API success survives unused CLI EACCES in auto and API-pinned status', async () => {
+    geminiApiBackend.validate = async () => ({
+      ok: true,
+      backend: 'api',
+      authMethod: 'api_key',
+      endpointLabel: 'test-api',
+    })
+    geminiCliBackend.validate = async () => {
+      const error = new Error('permission denied reading Gemini credential store')
+      Object.assign(error, { code: 'EACCES' })
+      throw error
+    }
+
+    for (const preference of ['auto', 'api'] as const) {
+      process.env.CLAUDE_CODE_GEMINI_BACKEND = preference
+      for (const detailLevel of ['summary', 'full'] as const) {
+        const payload = await getUnifiedRuntimeStatusPayload(
+          'gemini', undefined, { detailLevel },
+        )
+        const status = payload.providers.gemini
+        expect(status).toMatchObject({
+          authenticated: true,
+          authMethod: 'api_key',
+          verificationState: 'verified',
+          resolvedBackendId: 'api',
+          capabilities: { teamLaunch: true },
+          statusCheckOutcome: 'authoritative',
+          statusCheckErrorCode: null,
+        })
+        expect(
+          status?.availableBackends.find(option => option.id === 'cli-sdk'),
+        ).toMatchObject({
+          available: false,
+          detailMessage: expect.stringContaining('permission denied'),
+        })
+      }
+    }
+  })
+
+  test('Gemini CLI-pinned success survives unused API operational failure', async () => {
+    process.env.CLAUDE_CODE_GEMINI_BACKEND = 'cli'
+    geminiApiBackend.validate = async () => ({
+      ok: false,
+      backend: 'api',
+      authMethod: 'api_key',
+      endpointLabel: 'test-api',
+      message: 'API validation unavailable',
+      validationError: 'operational',
+    })
+    geminiCliBackend.validate = async () => ({
+      ok: true,
+      backend: 'cli',
+      authMethod: 'cli_oauth_personal',
+      endpointLabel: 'test-cli',
+    })
+
+    const payload = await getUnifiedRuntimeStatusPayload('gemini')
+    expect(payload.providers.gemini).toMatchObject({
+      authenticated: true,
+      authMethod: 'cli_oauth_personal',
+      verificationState: 'verified',
+      resolvedBackendId: 'cli-sdk',
+      capabilities: { teamLaunch: true },
       statusCheckOutcome: 'authoritative',
       statusCheckErrorCode: null,
+    })
+  })
+
+  test('Gemini recognizes only the explicit Google invalid-key HTTP 400', async () => {
+    process.env.GEMINI_API_KEY = 'invalid-test-key'
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: {
+        code: 400,
+        status: 'INVALID_ARGUMENT',
+        message: 'API key not valid. Please pass a valid API key.',
+      },
+    }), { status: 400 })
+    expect(await geminiApiBackend.validate()).toMatchObject({
+      ok: false,
+      authMethod: 'api_key',
+      validationError: 'invalid_credentials',
+    })
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: { code: 400, status: 'INVALID_ARGUMENT', message: 'Bad request.' },
+    }), { status: 400 })
+    expect(await geminiApiBackend.validate()).toMatchObject({
+      ok: false,
+      validationError: 'operational',
     })
   })
 
