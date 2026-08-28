@@ -50,6 +50,21 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.list()).toEqual([baseRecord])
   })
 
+  test('atomically publishes only one session for a normalized logical member', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const first = new OpenCodeSessionStore(filePath)
+    const second = new OpenCodeSessionStore(filePath)
+    const contender = { ...baseRecord, memberName: 'Alice', projectPath: '/tmp/other/../project',
+      opencodeSessionId: 'session-2' }
+    const outcomes = await Promise.all([
+      first.publishIfAbsentOrExact(baseRecord),
+      second.publishIfAbsentOrExact(contender),
+    ])
+    expect(outcomes.filter(outcome => outcome.status === 'inserted')).toHaveLength(1)
+    expect(outcomes.filter(outcome => outcome.status === 'conflict')).toHaveLength(1)
+    expect(await first.list()).toHaveLength(1)
+  })
+
   test('returns unchanged for identical record and marks stale explicitly', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
 

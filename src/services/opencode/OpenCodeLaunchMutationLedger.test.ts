@@ -5,17 +5,19 @@ import { join } from 'node:path'
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
 import { OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeLaunchMemberLinkage, OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
+import { normalizeOpenCodeLogicalMemberIdentity } from './OpenCodeLogicalMemberKey.js'
 
 const oid = (character: string) => `sha256:${character.repeat(64)}` as OpenCodeOpaqueIdentity
 const memberIdentity = oid('1')
+const logicalMember = { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' }
 const target = OpenCodeLaunchMutationLedger.targetDigest({
-  teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity,
+  ...logicalMember,
 })
 const identity = (attemptId: string, claimToken: string): OpenCodeLaunchMutationIdentity => ({
   attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
   immutableDigest: 'c'.repeat(64),
   generation: 1, fence: 1, acquisitionToken: `acquisition-${claimToken}`,
-  claimToken, memberIdentity,
+  claimToken, memberIdentity, logicalMember,
 })
 const context = () => ({
   deadlineAtMs: Date.now() + 10_000,
@@ -66,6 +68,23 @@ describe('OpenCodeLaunchMutationLedger', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test('rejects member and project identity substitutions before claim publication', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-claim-binding-'))
+    try {
+      const ledger = new OpenCodeLaunchMutationLedger(join(root, 'claims'))
+      for (const substituted of [
+        { ...logicalMember, memberName: 'bob' },
+        { ...logicalMember, projectIdentity: '/fake/foreign' },
+      ]) {
+        await expect(ledger.claim(target, { ...identity(
+          '123e4567-e89b-42d3-a456-426614174010', 'claim-substituted'),
+        logicalMember: substituted }, context())).rejects.toThrow(
+          'OpenCode launch mutation logical member claim mismatch')
+      }
+      expect(await ledger.read(target, context())).toBeNull()
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   test('two concurrent attempt journals cannot both own the same member mutation', async () => {
     const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-claim-race-'))
     try {
@@ -77,6 +96,39 @@ describe('OpenCodeLaunchMutationLedger', () => {
       ])
       expect(outcomes.filter(outcome => outcome === 'claimed')).toHaveLength(1)
       expect(outcomes.filter(outcome => outcome === 'reconciliation_required')).toHaveLength(1)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('distinct valid envelope identities normalize to one claim and exactly one provisioning effect', async () => {
+    const root = await mkdtemp(join(process.cwd(), 'src/services/opencode/.launch-logical-race-'))
+    try {
+      const firstLedger = new OpenCodeLaunchMutationLedger(join(root, 'claims'))
+      const secondLedger = new OpenCodeLaunchMutationLedger(join(root, 'claims'))
+      const firstEnvelope = { ...logicalMember, memberName: 'Alice', projectIdentity: '/fake/project' }
+      const secondEnvelope = { ...logicalMember, memberName: ' alice ', projectIdentity: '/fake/other/../project' }
+      const firstLogical = normalizeOpenCodeLogicalMemberIdentity(firstEnvelope)
+      const secondLogical = normalizeOpenCodeLogicalMemberIdentity(secondEnvelope)
+      const firstTarget = OpenCodeLaunchMutationLedger.targetDigest(firstEnvelope)
+      const secondTarget = OpenCodeLaunchMutationLedger.targetDigest(secondEnvelope)
+      expect(secondTarget).toBe(firstTarget)
+      let provisioningEffects = 0
+      const contend = async (ledger: OpenCodeLaunchMutationLedger, authority: OpenCodeLaunchMutationIdentity) => {
+        const outcome = await ledger.claim(firstTarget, authority, context())
+        if (outcome === 'claimed') provisioningEffects += 1
+        return outcome
+      }
+      const outcomes = await Promise.all([
+        contend(firstLedger, { ...identity('123e4567-e89b-42d3-a456-426614174011', 'claim-one'),
+          memberIdentity: oid('8'), logicalMember: firstLogical }),
+        contend(secondLedger, { ...identity('123e4567-e89b-42d3-a456-426614174012', 'claim-two'),
+          memberIdentity: oid('9'), logicalMember: secondLogical }),
+      ])
+      expect(outcomes.filter(outcome => outcome === 'claimed')).toHaveLength(1)
+      expect(outcomes.filter(outcome => outcome === 'reconciliation_required')).toHaveLength(1)
+      expect(provisioningEffects).toBe(1)
+      // A final authority read is also the deterministic physical-settlement
+      // barrier before the disposable namespace is removed.
+      expect(await firstLedger.read(firstTarget, context())).not.toBeNull()
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 

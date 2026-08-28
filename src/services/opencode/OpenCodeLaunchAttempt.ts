@@ -368,13 +368,20 @@ export class OpenCodeLaunchAttempt {
       continuation: input.continuation === true,
       continuationToken: attempt.continuationToken,
     })
+    const windowsPublicationOwner = {
+      ownerId: `${attempt.attemptId}:${attempt.generation}:${inputDigest}`,
+      deadlineAtMs: initialPolicy.retainedAuthorityDeadlineAtMs,
+      signal: reserveController.signal,
+    }
     const initialStoreContext = {
       deadlineAtMs: initialPolicy.workDeadlineAtMs, signal: controller.signal,
       monotonicNow: () => this.ports.clock.monotonicNow(),
+      windowsPublicationOwner,
     }
     const releaseStoreContext = {
       deadlineAtMs: initialPolicy.absoluteDeadlineAtMs, signal: reserveController.signal,
       monotonicNow: () => this.ports.clock.monotonicNow(),
+      windowsPublicationOwner,
     }
 
     try {

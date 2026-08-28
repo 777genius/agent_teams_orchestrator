@@ -58,6 +58,8 @@ export class OpenCodeLaunchAttemptPolicy {
   readonly startedAtMs: number
   readonly absoluteDeadlineAtMs: number
   readonly workDeadlineAtMs: number
+  /** Lifetime of retained publication authority; cleanup may use the reserved tail. */
+  readonly retainedAuthorityDeadlineAtMs: number
 
   private readonly monotonicNow: () => number
 
@@ -111,6 +113,7 @@ export class OpenCodeLaunchAttemptPolicy {
         'cleanup reserve must exactly partition the absolute deadline',
       )
     }
+    this.retainedAuthorityDeadlineAtMs = this.absoluteDeadlineAtMs
   }
 
   remainingAttemptMs(nowMs = this.readNow()): number {

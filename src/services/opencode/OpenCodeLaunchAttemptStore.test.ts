@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir, stat, symlink,
+  unlink, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { join, posix, win32 } from 'node:path'
 
 import {
@@ -64,6 +66,60 @@ const finalResponse = (): OpenCodeLaunchAttemptResponse => ({
   },
 })
 const leasePath = (filePath: string) => deriveOpenCodeLaunchNamespacePaths(filePath, posix).lock
+
+function filesystemWindowsAuthority(now: () => number, ownerDeadline: number) {
+  let root = ''
+  const handles = new Map<string, Awaited<ReturnType<typeof open>>>()
+  const checked = () => {
+    if (now() >= ownerDeadline) throw new Error('retained authority owner expired')
+  }
+  const target = (relativePath: string) => relativePath === '.' ? root : join(root, relativePath)
+  const metadata = async (relativePath: string) => {
+    checked(); const value = await lstat(target(relativePath))
+    return { volumeSerial: String(value.dev), fileId: String(value.ino), size: String(value.size),
+      linkCount: String(value.nlink), kind: value.isDirectory() ? 'directory' as const : 'file' as const }
+  }
+  return {
+    async openRoot(value: string) {
+      checked(); root = value; const identity = await lstat(root)
+      return { volumeSerial: String(identity.dev), fileId: String(identity.ino), createdPaths: [] }
+    },
+    namespaceStat: metadata,
+    async namespaceMkdir(relativePath: string) { checked(); await mkdir(target(relativePath), { mode: 0o700 }) },
+    async namespaceOpen(relativePath: string, mode: 'read' | 'readwrite' | 'create_file' | 'directory') {
+      checked()
+      const flags = mode === 'read' || mode === 'directory' ? constants.O_RDONLY
+        : mode === 'readwrite' ? constants.O_RDWR : constants.O_RDWR | constants.O_CREAT | constants.O_EXCL
+      const handle = await open(target(relativePath), flags, 0o600)
+      const token = crypto.randomUUID(); handles.set(token, handle)
+      return { token, ...await metadata(relativePath) }
+    },
+    async namespaceWrite(token: string, bytes: Uint8Array) {
+      checked(); const handle = handles.get(token); if (!handle) throw new Error('unknown handle')
+      await handle.truncate(0); await handle.write(bytes, 0, bytes.byteLength, 0)
+    },
+    async namespaceRead(token: string, size: number) {
+      checked(); const handle = handles.get(token); if (!handle) throw new Error('unknown handle')
+      const bytes = new Uint8Array(size); const { bytesRead } = await handle.read(bytes, 0, size, 0)
+      return bytes.subarray(0, bytesRead)
+    },
+    async namespaceSyncHandle(token: string) {
+      checked(); const handle = handles.get(token); if (!handle) throw new Error('unknown handle'); await handle.sync()
+    },
+    async namespaceCloseHandle(token: string) {
+      checked(); const handle = handles.get(token); if (!handle) return; handles.delete(token); await handle.close()
+    },
+    async namespaceRename(from: string, to: string) { checked(); await rename(target(from), target(to)) },
+    async namespaceUnlink(relativePath: string, directory: boolean) {
+      checked(); await (directory ? rmdir(target(relativePath)) : unlink(target(relativePath)))
+    },
+    async namespaceSyncDirectory() { checked() },
+    async openChildDirectory(_parentKey: string, key: string) {
+      const value = await metadata(key); return { volumeSerial: value.volumeSerial, fileId: value.fileId }
+    },
+    async close() { for (const handle of handles.values()) await handle.close(); handles.clear() },
+  }
+}
 
 async function issueContinuation(
   store: OpenCodeLaunchAttemptStore,
@@ -942,6 +998,85 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(outer, { recursive: true, force: true }) }
   })
 
+  test('keeps the Windows publication owner through a cleanup reserve longer than one second', async () => {
+    const outer = await workspaceTemp('windows-publication-cleanup-reserve')
+    const journalPath = join(outer, 'data', 'opencode', 'launch-attempts', 'attempt.journal')
+    let now = 10_000
+    const ownerSignal = new AbortController().signal
+    const owner = { ownerId: `${identity.attemptId}:1:${identity.payloadHash}`,
+      deadlineAtMs: 30_000, signal: ownerSignal }
+    const acquisition = { deadlineAtMs: 20_000, monotonicNow: () => now,
+      signal: new AbortController().signal, windowsPublicationOwner: owner }
+    const cleanup = { ...acquisition, deadlineAtMs: owner.deadlineAtMs,
+      signal: new AbortController().signal }
+    const authorityDeadlines: number[] = []
+    const factory = ((options: { deadline: number }) => {
+      authorityDeadlines.push(options.deadline)
+      return filesystemWindowsAuthority(() => now, options.deadline)
+    }) as never
+    const persistence = new OpenCodeLaunchFileJournalPersistence(journalPath, {
+      platform: 'win32', windowsAuthorityFactory: factory,
+    })
+    const response = finalResponse()
+    response.launchAttempt.inputDigest = identity.payloadHash
+    response.launchAttempt.immutableDigest = identity.payloadHash
+    try {
+      await new OpenCodeLaunchAttemptStore(persistence).withGeneration(
+        { ...identity, startedAtMs: 10_000, totalBudgetMs: 20_000 }, 'begin', async lease => {
+          now = 21_501
+          const wrongGeneration = structuredClone(response)
+          wrongGeneration.launchAttempt.generation = 2
+          await expect(lease.commitTerminalResponse(wrongGeneration, 'incomplete', cleanup))
+            .rejects.toMatchObject({ code: 'foreign' })
+          await expect(persistence.read({
+            ...cleanup,
+            windowsPublicationOwner: { ...owner, ownerId: `${identity.attemptId}:2:stale` },
+          })).rejects.toMatchObject({ code: 'fenced' })
+          await lease.commitTerminalResponse(response, 'incomplete', cleanup)
+        }, { acquisition, body: acquisition, release: cleanup },
+      )
+      expect(now - acquisition.deadlineAtMs).toBeGreaterThan(1_000)
+      expect(authorityDeadlines).toEqual([owner.deadlineAtMs])
+      const durable = await new OpenCodeLaunchAttemptStore(
+        new OpenCodeLaunchFileJournalPersistence(journalPath),
+      ).snapshotReadOnly(identity, cleanup)
+      expect(durable?.finalResponse).toEqual(response)
+      expect(durable?.cleanupState).toBe('incomplete')
+      await expect(stat(leasePath(journalPath))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  }, 15_000)
+
+  test('rejects Windows terminal publication at the unchanged absolute owner deadline', async () => {
+    const outer = await workspaceTemp('windows-publication-owner-expired')
+    const journalPath = join(outer, 'data', 'opencode', 'launch-attempts', 'attempt.journal')
+    let now = 20_000
+    const owner = { ownerId: `${identity.attemptId}:1:${identity.payloadHash}`,
+      deadlineAtMs: 50_000, signal: new AbortController().signal }
+    const acquisition = { deadlineAtMs: 40_000, monotonicNow: () => now,
+      signal: new AbortController().signal, windowsPublicationOwner: owner }
+    const cleanup = { ...acquisition, deadlineAtMs: owner.deadlineAtMs,
+      signal: new AbortController().signal }
+    const factory = ((options: { deadline: number }) =>
+      filesystemWindowsAuthority(() => now, options.deadline)) as never
+    const response = finalResponse()
+    response.launchAttempt.inputDigest = identity.payloadHash
+    response.launchAttempt.immutableDigest = identity.payloadHash
+    try {
+      await expect(new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(journalPath, {
+        platform: 'win32', windowsAuthorityFactory: factory,
+      })).withGeneration(
+        { ...identity, startedAtMs: 20_000, totalBudgetMs: 30_000 }, 'begin', async lease => {
+          now = owner.deadlineAtMs
+          await lease.commitTerminalResponse(response, 'incomplete', cleanup)
+        }, { acquisition, body: acquisition, release: cleanup },
+      )).rejects.toMatchObject({ code: 'fenced' })
+      const durable = await new OpenCodeLaunchAttemptStore(
+        new OpenCodeLaunchFileJournalPersistence(journalPath),
+      ).snapshotReadOnly(identity, { ...cleanup, deadlineAtMs: 51_000, monotonicNow: () => 50_001 })
+      expect(durable?.finalResponse).toBeUndefined()
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  }, 15_000)
+
   test.skipIf(process.platform !== 'win32')('real Windows retains journal and coordination roots across the replacement boundary', async () => {
     const outer = await workspaceTemp('windows-retained-native-authority')
     const live = join(outer, 'data', 'opencode')
@@ -1485,6 +1620,31 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       deadlineAtMs: 110, monotonicNow: () => 10, signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: 'fenced' })
     expect(JSON.parse(persistence.text()).generation).toBe(1)
+  })
+
+  test('tightens continuation publication ownership before acquiring retained authority', async () => {
+    const persistence = new MemoryPersistence()
+    const store = new OpenCodeLaunchAttemptStore(persistence)
+    const initialContext = { deadlineAtMs: 10, monotonicNow: () => 0,
+      signal: new AbortController().signal }
+    await store.withGeneration({ ...identity, startedAtMs: 0, totalBudgetMs: 10 }, 'begin',
+      async () => undefined, initialContext)
+    const continuationToken = await store.withGeneration(identity, 'replay',
+      lease => lease.issueContinuation([member], initialContext), initialContext)
+    const acquiredOwnerDeadlines: number[] = []
+    const acquire = persistence.acquireExclusive.bind(persistence)
+    persistence.acquireExclusive = async context => {
+      acquiredOwnerDeadlines.push(context.windowsPublicationOwner!.deadlineAtMs)
+      return acquire(context)
+    }
+    const owner = { ownerId: `${identity.attemptId}:2:${'b'.repeat(64)}`, deadlineAtMs: 110,
+      signal: new AbortController().signal }
+    const extended = { deadlineAtMs: 110, monotonicNow: () => 9,
+      signal: new AbortController().signal, windowsPublicationOwner: owner }
+    await store.withGeneration({ ...identity, inputDigest: 'b'.repeat(64), generation: 2,
+      continuationToken }, 'continue', async () => undefined,
+    { acquisition: extended, body: extended, release: extended })
+    expect(acquiredOwnerDeadlines).toEqual([10])
   })
 
   test('caps lock acquisition from immutable persisted timing before waiting and rereads under lease', async () => {

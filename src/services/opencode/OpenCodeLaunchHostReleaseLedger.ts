@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 
+import { isNativeProcessBirthToken } from '../../utils/processKill.js'
 import type { OpenCodeHostReleaseReceipt } from './OpenCodeHostManager.js'
 import { computeOpenCodeHostReleaseObligationIdentityDigest } from './OpenCodeHostManager.js'
 import type { OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
@@ -402,8 +403,7 @@ function validateLaunchHostReleaseRecord(value: unknown): OpenCodeLaunchHostRele
   if ((!receiptV1 && !receiptV2) || typeof receipt.receiptId !== 'string'
     || typeof receipt.hostKeyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostKeyDigest)
     || !Number.isSafeInteger(receipt.pid) || !Number.isFinite(receipt.processStartedAtMs)
-    || (receiptV2 && (typeof receipt.processBirthToken !== 'string'
-      || !receipt.processBirthToken.startsWith('linux:')))
+    || (receiptV2 && !isNativeProcessBirthToken(receipt.processBirthToken))
     || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
     throw new Error('OpenCode launch host release receipt is corrupt [redacted]')
   }

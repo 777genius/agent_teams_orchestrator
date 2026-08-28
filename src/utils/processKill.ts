@@ -1,10 +1,91 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
 const PROCESS_START_TIME_OUTPUT_LIMIT_BYTES = 64 * 1024
 const PROCESS_COMMAND_OUTPUT_LIMIT_BYTES = 256 * 1024
+const WINDOWS_PROCESS_BIRTH_OUTPUT_LIMIT_BYTES = 128
+
+const LINUX_PROCESS_BIRTH_TOKEN = /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/
+const WINDOWS_PROCESS_BIRTH_TOKEN = /^windows:[0-9a-f]{16}:[0-9a-f]{16}$/
+
+export function isNativeProcessBirthToken(value: unknown): value is string {
+  return typeof value === 'string'
+    && (LINUX_PROCESS_BIRTH_TOKEN.test(value) || WINDOWS_PROCESS_BIRTH_TOKEN.test(value))
+}
+
+export function isNativeProcessBirthTokenForPlatform(
+  value: unknown,
+  platform: NodeJS.Platform,
+): value is string {
+  return typeof value === 'string'
+    && (platform === 'linux' ? LINUX_PROCESS_BIRTH_TOKEN.test(value)
+      : platform === 'win32' ? WINDOWS_PROCESS_BIRTH_TOKEN.test(value) : false)
+}
+
+/**
+ * Query the exact Windows kernel process sequence and creation FILETIME
+ * through the trusted native launcher. The sequence distinguishes PID reuse;
+ * FILETIME also fences a sequence counter reset across a system restart.
+ */
+export function readWindowsProcessBirthToken(pid: number, nativeHelperPath: string): string | null {
+  const normalizedPid = Math.trunc(pid)
+  if (!Number.isSafeInteger(normalizedPid) || normalizedPid <= 0 || !nativeHelperPath) return null
+  try {
+    const result = spawnSync(nativeHelperPath,
+      ['--process-generation-query-v1', String(normalizedPid)], {
+        encoding: 'utf8', windowsHide: true, timeout: PROCESS_START_TIME_QUERY_TIMEOUT_MS,
+        maxBuffer: WINDOWS_PROCESS_BIRTH_OUTPUT_LIMIT_BYTES,
+      })
+    if (result.status !== 0 || result.error) return null
+    const token = result.stdout.trim()
+    return isNativeProcessBirthTokenForPlatform(token, 'win32') ? token : null
+  } catch { return null }
+}
+
+/**
+ * Atomically open, validate, and terminate one exact Windows launcher
+ * generation in native code. The retained process handle closes the PID-reuse
+ * window; terminating the launcher closes its kill-on-close job authority.
+ */
+export function terminateWindowsProcessGenerationAndWait(
+  pid: number,
+  expectedBirthToken: string,
+  nativeHelperPath: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const normalizedPid = Math.trunc(pid)
+  const normalizedTimeout = Math.max(1, Math.min(Math.trunc(timeoutMs), 60_000))
+  if (!Number.isSafeInteger(normalizedPid) || normalizedPid <= 0 || !nativeHelperPath
+    || !isNativeProcessBirthTokenForPlatform(expectedBirthToken, 'win32')) {
+    return Promise.resolve(false)
+  }
+  return new Promise(resolve => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (value: boolean): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(value)
+    }
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(nativeHelperPath, [
+        '--process-generation-terminate-v1', String(normalizedPid), expectedBirthToken,
+        String(normalizedTimeout),
+      ], { stdio: 'ignore', windowsHide: true })
+    } catch { finish(false); return }
+    timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* Best-effort helper cleanup. */ }
+      finish(false)
+    }, normalizedTimeout + 500)
+    timer.unref?.()
+    child.once('error', () => finish(false))
+    child.once('close', code => finish(code === 0))
+  })
+}
 
 function taskkillPath(): string {
   return join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
@@ -140,10 +221,18 @@ export async function readProcessStartTimeMs(
 export function readProcessBirthToken(
   pid: number,
   platform: NodeJS.Platform = process.platform,
-  observation: { readFile?: (path: string) => string } = {},
+  observation: {
+    readFile?: (path: string) => string
+    readWindowsProcess?: (pid: number) => string | null
+  } = {},
 ): string | null {
   const normalizedPid = Math.trunc(pid)
-  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0 || platform !== 'linux') return null
+  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
+  if (platform === 'win32') {
+    const token = observation.readWindowsProcess?.(normalizedPid) ?? null
+    return isNativeProcessBirthTokenForPlatform(token, 'win32') ? token : null
+  }
+  if (platform !== 'linux') return null
   const read = observation.readFile ?? (target => readFileSync(target, 'utf8'))
   try {
     const bootId = read('/proc/sys/kernel/random/boot_id').trim().toLowerCase()
@@ -154,7 +243,8 @@ export function readProcessBirthToken(
     const fields = stat.slice(commandEnd + 2).trim().split(/\s+/)
     const starttime = fields[19]
     if (!starttime || !/^\d+$/.test(starttime)) return null
-    return `linux:${bootId}:${starttime}`
+    const token = `linux:${bootId}:${starttime}`
+    return isNativeProcessBirthTokenForPlatform(token, 'linux') ? token : null
   } catch { return null }
 }
 
@@ -337,7 +427,7 @@ export async function killProcessTreeAndWait(
     /** @deprecated Kept for call compatibility; PID-only taskkill is disabled. */
     taskkillTimeoutMs?: number
     expectedStartedAtMs?: number | null
-    /** Exact native birth authority; required for detached Linux group mutation. */
+    /** Exact native birth authority for detached Linux groups and Windows launcher jobs. */
     expectedBirthToken?: string | null
     /**
      * Explicit authority to signal a detached, manager-owned POSIX process

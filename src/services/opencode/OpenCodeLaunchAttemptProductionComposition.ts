@@ -7,6 +7,7 @@ import {
 } from './OpenCodeLaunchAttemptBridge.js'
 import type { OpenCodeLaunchAttemptResult } from './OpenCodeLaunchAttempt.js'
 import { canonicalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import { openCodeLogicalMemberKey } from './OpenCodeLogicalMemberKey.js'
 import { openCodeMonotonicNow } from './OpenCodeRuntimeDeadline.js'
 
 type Command = Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0]
@@ -142,6 +143,17 @@ export function createOpenCodeLaunchAttemptProductionBridge(
           ?? new Error('OpenCode launch absolute deadline expired during authorization')
         if (authorized.projectPath !== projectIdentity
           || authorized.projectIdentity !== projectIdentity
+          || authorized.teamId !== canonicalCommand.teamId
+          || authorized.laneId !== canonicalCommand.laneId
+          || authorized.members.length !== canonicalCommand.members.length
+          || authorized.members.some((member, index) => {
+            const expected = canonicalCommand.members[index]!
+            return member.memberIdentity !== expected.memberIdentity
+              || openCodeLogicalMemberKey({ teamId: authorized.teamId, laneId: authorized.laneId,
+                projectIdentity: authorized.projectIdentity!, memberName: member.name })
+                !== openCodeLogicalMemberKey({ teamId: canonicalCommand.teamId,
+                  laneId: canonicalCommand.laneId, projectIdentity, memberName: expected.name })
+          })
           || authorized.deadlineAtMs !== deadlineAtMs
           || authorized.signal !== controller.signal) {
           throw new Error('OpenCode launch authorization changed frozen command identity')

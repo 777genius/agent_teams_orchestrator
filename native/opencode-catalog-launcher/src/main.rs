@@ -6,6 +6,144 @@ const WINDOWS_VOLUME_IDENTITY_UNVERIFIED: &str =
     "OPENCODE_LAUNCH_WINDOWS_VOLUME_IDENTITY_UNVERIFIED";
 
 #[cfg(any(windows, test))]
+fn windows_process_birth_token(sequence_number: u64, creation_filetime: u64) -> String {
+    format!("windows:{sequence_number:016x}:{creation_filetime:016x}")
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_process_birth_token(token: &str) -> Option<(u64, u64)> {
+    let mut fields = token.strip_prefix("windows:")?.split(':');
+    let parse = |value: &str| {
+        if value.len() != 16
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        u64::from_str_radix(value, 16).ok()
+    };
+    let identity = (parse(fields.next()?)?, parse(fields.next()?)?);
+    if fields.next().is_some() {
+        None
+    } else {
+        Some(identity)
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_creation_filetime(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let mut creation = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut exit = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut kernel = unsafe { std::mem::zeroed::<FILETIME>() };
+    let mut user = unsafe { std::mem::zeroed::<FILETIME>() };
+    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+#[cfg(windows)]
+fn windows_process_sequence_number(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use std::ffi::c_void;
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: windows_sys::Win32::Foundation::HANDLE,
+            process_information_class: u32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+    // PROCESSINFOCLASS::ProcessSequenceNumber. Windows assigns this monotonic
+    // kernel sequence at creation specifically so PID reuse is distinguishable.
+    const PROCESS_SEQUENCE_NUMBER: u32 = 92;
+    let mut sequence = 0u64;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            PROCESS_SEQUENCE_NUMBER,
+            (&mut sequence as *mut u64).cast(),
+            std::mem::size_of::<u64>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    (status >= 0 && sequence != 0).then_some(sequence)
+}
+
+/// Native restart authority. Termination opens one process handle and checks
+/// the persisted generation through that handle before mutation, closing the
+/// PID-reuse window and then closing the launcher's kill-on-close job.
+#[cfg(windows)]
+fn windows_process_generation_command(args: &[std::ffi::OsString]) -> Option<i32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, SYNCHRONIZE,
+    };
+    let operation = args.first()?.to_str()?;
+    let query = operation == "--process-generation-query-v1" && args.len() == 2;
+    let terminate = operation == "--process-generation-terminate-v1" && args.len() == 4;
+    if !query && !terminate {
+        return None;
+    }
+    let Some(pid) = args
+        .get(1)
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+    else {
+        return Some(64);
+    };
+    let access = PROCESS_QUERY_LIMITED_INFORMATION
+        | if terminate {
+            PROCESS_TERMINATE | SYNCHRONIZE
+        } else {
+            0
+        };
+    let process = unsafe { OpenProcess(access, 0, pid) };
+    if process.is_null() {
+        return Some(74);
+    }
+    let identity =
+        windows_process_sequence_number(process).zip(windows_process_creation_filetime(process));
+    let Some((sequence, creation)) = identity else {
+        unsafe { CloseHandle(process) };
+        return Some(74);
+    };
+    if query {
+        println!("{}", windows_process_birth_token(sequence, creation));
+        unsafe { CloseHandle(process) };
+        return Some(0);
+    }
+    let expected = args
+        .get(2)
+        .and_then(|value| value.to_str())
+        .and_then(parse_windows_process_birth_token);
+    let timeout_ms = args
+        .get(3)
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    if expected != Some((sequence, creation)) || timeout_ms.is_none() {
+        unsafe { CloseHandle(process) };
+        return Some(75);
+    }
+    if unsafe { TerminateProcess(process, 1) } == 0 {
+        unsafe { CloseHandle(process) };
+        return Some(74);
+    }
+    let wait = unsafe { WaitForSingleObject(process, timeout_ms.unwrap()) };
+    unsafe { CloseHandle(process) };
+    Some(if wait == WAIT_OBJECT_0 { 0 } else { 74 })
+}
+
+#[cfg(any(windows, test))]
 fn windows_filesystem_has_retained_identity(filesystem: &str) -> bool {
     // The staged JS contract and BY_HANDLE_FILE_INFORMATION retain only the
     // legacy 64-bit file index. NTFS supplies a stable identity in that form;
@@ -210,8 +348,11 @@ fn main() {
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
         STARTUPINFOEXW,
     };
-    let mut args = std::env::args_os();
-    let _ = args.next();
+    let all_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(code) = windows_process_generation_command(&all_args) {
+        std::process::exit(code)
+    }
+    let mut args = all_args.into_iter();
     let worker = match args.next() {
         Some(v) => v,
         None => std::process::exit(125),
@@ -620,8 +761,118 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        windows_filesystem_has_retained_identity, windows_launch_failure_record, WindowsLaunchStage,
+        parse_windows_process_birth_token, windows_filesystem_has_retained_identity,
+        windows_launch_failure_record, windows_process_birth_token, WindowsLaunchStage,
     };
+
+    #[test]
+    fn windows_process_generation_tokens_preserve_all_native_filetime_bits() {
+        assert_eq!(
+            windows_process_birth_token(0x0123, 0x01d9_abcd_0000_0042),
+            "windows:0000000000000123:01d9abcd00000042"
+        );
+        assert_eq!(
+            parse_windows_process_birth_token("windows:0000000000000123:01d9abcd00000042"),
+            Some((0x0123, 0x01d9_abcd_0000_0042))
+        );
+        for malformed in [
+            "",
+            "windows:1",
+            "windows:0000000000000123:01D9ABCD00000042",
+            "linux:0000000000000123:01d9abcd00000042",
+            "windows:0000000000000123:01d9abcd0000004g",
+            "windows:0000000000000123:01d9abcd000000420",
+        ] {
+            assert_eq!(parse_windows_process_birth_token(malformed), None);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_reads_current_native_process_generation() {
+        let handle = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let sequence = super::windows_process_sequence_number(handle)
+            .expect("current process sequence number");
+        let creation = super::windows_process_creation_filetime(handle)
+            .expect("current process creation FILETIME");
+        assert_ne!(sequence, 0);
+        assert_ne!(creation, 0);
+        let token = windows_process_birth_token(sequence, creation);
+        assert_eq!(
+            parse_windows_process_birth_token(&token),
+            Some((sequence, creation))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_atomically_terminates_only_the_exact_fixture_generation() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::windows_process_generation_termination_fixture",
+                "--nocapture",
+            ])
+            .env("OPENCODE_PROCESS_GENERATION_FIXTURE", "1")
+            .spawn()
+            .expect("spawn native process-generation fixture");
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+        let identity = if process.is_null() {
+            None
+        } else {
+            let observed = super::windows_process_sequence_number(process)
+                .zip(super::windows_process_creation_filetime(process));
+            unsafe { CloseHandle(process) };
+            observed
+        };
+        let Some((sequence, creation)) = identity else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("query native process-generation fixture");
+        };
+        let mismatched = windows_process_birth_token(sequence.wrapping_add(1), creation);
+        let mismatch_args = [
+            "--process-generation-terminate-v1".into(),
+            child.id().to_string().into(),
+            mismatched.into(),
+            "5000".into(),
+        ];
+        let mismatch_result = super::windows_process_generation_command(&mismatch_args);
+        if mismatch_result != Some(75) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(mismatch_result, Some(75));
+        assert!(child.try_wait().unwrap().is_none());
+        let token = windows_process_birth_token(sequence, creation);
+        let args = [
+            "--process-generation-terminate-v1".into(),
+            child.id().to_string().into(),
+            token.into(),
+            "5000".into(),
+        ];
+        let result = super::windows_process_generation_command(&args);
+        if result != Some(0) {
+            let _ = child.kill();
+        }
+        let status = child
+            .wait()
+            .expect("reap native process-generation fixture");
+        assert_eq!(result, Some(0));
+        assert!(!status.success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_generation_termination_fixture() {
+        if std::env::var_os("OPENCODE_PROCESS_GENERATION_FIXTURE").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
 
     #[test]
     fn retained_windows_identity_accepts_ntfs() {

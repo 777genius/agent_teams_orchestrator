@@ -193,6 +193,28 @@ describe('OpenCode production launch composition', () => {
     expect(calls).toEqual(['plan', 'command-ledger'])
   })
 
+  test('authorization cannot substitute opaque or normalized logical member identity', async () => {
+    for (const substitute of [
+      (value: ReturnType<typeof command>) => ({ ...value, members: [{ ...value.members[0]!,
+        memberIdentity: identity('9') }] }),
+      (value: ReturnType<typeof command>) => ({ ...value, members: [{ ...value.members[0]!,
+        name: 'bob' }] }),
+      (value: ReturnType<typeof command>) => ({ ...value, projectIdentity: '/foreign/project',
+        projectPath: '/foreign/project' }),
+    ]) {
+      let durableReads = 0
+      const bridge = createOpenCodeLaunchAttemptProductionBridge({
+        preflightAuthorization: async () => {},
+        authorize: async value => substitute(value as ReturnType<typeof command>),
+        inspect: async () => { durableReads += 1; return null },
+        executeAfterPreflight: async () => ({ output: { snapshot, data: null }, result }),
+      }, { canonicalizeProject: async value => value })
+      await expect(bridge.execute(command())).rejects.toThrow(
+        'OpenCode launch authorization changed frozen command identity')
+      expect(durableReads).toBe(0)
+    }
+  })
+
   test('missing correlation fails before realpath, authorization, ledger, or effects', async () => {
     const calls: string[] = []
     const bridge = createOpenCodeLaunchAttemptProductionBridge({
@@ -321,7 +343,7 @@ describe('OpenCode production launch composition', () => {
       teamId: value.teamId,
       laneId: value.laneId,
       projectIdentity: value.projectIdentity!,
-      memberIdentity: value.members[0]!.memberIdentity,
+      memberName: value.members[0]!.name,
     }))
     expect(targets[0]).toBe(targets[1])
     expect(OpenCodeLaunchMutationLedger.idempotencyIdentity(targets[0]!))

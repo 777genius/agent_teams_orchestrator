@@ -13,9 +13,13 @@ import {
   killProcessTree,
   killProcessTreeAndWait,
   isProcessTreeContainmentAlive,
+  isNativeProcessBirthToken,
+  isNativeProcessBirthTokenForPlatform,
   readProcessBirthToken,
   readProcessCommandLine,
   readProcessStartTimeMs,
+  readWindowsProcessBirthToken,
+  terminateWindowsProcessGenerationAndWait,
 } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
@@ -212,6 +216,9 @@ type OpenCodeHostManagerDeps = {
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
   readProcessBirthToken?: (pid: number) => string | null
+  terminateWindowsProcessGeneration?: (
+    pid: number, expectedBirthToken: string, timeoutMs: number
+  ) => Promise<boolean>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
   now?: () => Date
   persistentRegistryPath?: string | null
@@ -906,7 +913,7 @@ function assertValidV2RegistryRecord(
     || (record.processStartedAtMs !== undefined && record.processStartedAtMs !== null
       && (!Number.isFinite(record.processStartedAtMs) || record.processStartedAtMs! <= 0))
     || (record.processBirthToken !== undefined && record.processBirthToken !== null
-      && !isNonblankString(record.processBirthToken))
+      && !isNativeProcessBirthToken(record.processBirthToken))
     || !isNonblankString(record.updatedAt) || !Number.isFinite(Date.parse(record.updatedAt!))
     || (record.resolvedConfigFingerprint !== null && typeof record.resolvedConfigFingerprint !== 'string')
   ) fail()
@@ -1813,11 +1820,16 @@ export class OpenCodeHostManager {
     // Synthetic process-control dependencies are test authority only. They do
     // not cause production to manufacture a weak token from wall-clock time.
     if (this.deps.spawnHostProcess) return null
-    return readProcessBirthToken(pid, this.deps.platform ?? process.platform)
+    const platform = this.deps.platform ?? process.platform
+    return readProcessBirthToken(pid, platform, platform === 'win32' ? {
+      readWindowsProcess: candidate => readWindowsProcessBirthToken(
+        candidate, resolveOpenCodeVerifiedHostLauncherPath()),
+    } : {})
   }
 
   private requiresNativeBirthToken(): boolean {
-    return (this.deps.platform ?? process.platform) === 'linux'
+    const platform = this.deps.platform ?? process.platform
+    return (platform === 'linux' || platform === 'win32')
       && (this.deps.readProcessBirthToken !== undefined
         || (this.deps.spawnHostProcess === undefined
           && this.deps.readProcessStartTimeMs === undefined))
@@ -1977,6 +1989,19 @@ export class OpenCodeHostManager {
       // second-resolution wall clock identity into PGID mutation authority.
       return false
     }
+    if (requireStableContainment && platform === 'win32') {
+      if (!expectedBirthToken || !isNativeProcessBirthTokenForPlatform(expectedBirthToken, platform)
+        || this.readProcessBirthToken(pid) !== expectedBirthToken) return false
+      if (this.deps.terminateWindowsProcessGeneration) {
+        return this.deps.terminateWindowsProcessGeneration(pid, expectedBirthToken, timeoutMs)
+      }
+      return killProcessTreeAndWait(pid, signal, {
+        timeoutMs, expectedStartedAtMs, expectedBirthToken, platform,
+        windowsTaskkillTreeAuthority: true,
+        windowsOwnedTreeRelease: () => terminateWindowsProcessGenerationAndWait(
+          pid, expectedBirthToken, resolveOpenCodeVerifiedHostLauncherPath(), timeoutMs),
+      })
+    }
     if (this.deps.killProcess) {
       if (requireStableContainment && !this.isProcessAlive(pid)) return false
       this.deps.killProcess(pid, signal)
@@ -2008,8 +2033,17 @@ export class OpenCodeHostManager {
     return isProcessTreeContainmentAlive(pid) === false
   }
 
-  private persistentContainmentExited(pid: number): boolean {
-    if ((this.deps.platform ?? process.platform) !== 'linux') return false
+  private persistentContainmentExited(pid: number, expectedBirthToken?: string | null): boolean {
+    const platform = this.deps.platform ?? process.platform
+    if (platform === 'win32') {
+      if (!isNativeProcessBirthTokenForPlatform(expectedBirthToken, platform)) return false
+      // A scoped Windows host PID is the launcher that exclusively owns its
+      // kill-on-close job. PID absence proves that launcher and its job handle
+      // are gone. A live PID with a changed generation remains a conservative
+      // mismatch: never mutate the foreign process or discharge its registry.
+      return !this.isProcessAlive(pid)
+    }
+    if (platform !== 'linux') return false
     if (this.deps.isProcessGroupAlive) return this.deps.isProcessGroupAlive(pid) === false
     return isProcessTreeContainmentAlive(pid) === false
   }
@@ -2438,10 +2472,11 @@ export class OpenCodeHostManager {
       )) {
         // A structurally valid record in this key slot is still foreign unless
         // its complete identity is cryptographically bound to the key. Never
-        // overwrite the only durable containment tombstone. Linux may discard
-        // it solely after a complete stable containment scan proves emptiness;
-        // all other platforms and observer uncertainty fail closed.
-        if (!this.persistentContainmentExited(previous.pid)) {
+        // overwrite the only durable containment tombstone. Linux requires a
+        // stable containment scan; Windows requires authenticated scoped
+        // launcher absence. Every other platform and uncertainty fails closed.
+        if (!this.persistentContainmentExited(previous.pid,
+          previous.scopedIdentity ? previous.processBirthToken : undefined)) {
           throw new Error('OpenCode foreign scoped host tombstone containment is unresolved [redacted]')
         }
         delete registry.hosts[handle.hostKey]
@@ -2549,8 +2584,10 @@ export class OpenCodeHostManager {
       )) return
       // The leader's exit is not proof that its detached descendants exited.
       // Preserve the exact durable receipt until the owned containment unit is
-      // strongly observed absent (Windows returns unproven conservatively).
-      if (!this.persistentContainmentExited(expected.pid)) {
+      // strongly observed absent. Windows requires an authenticated scoped
+      // launcher token; an unscoped leader remains conservatively unproven.
+      if (!this.persistentContainmentExited(expected.pid,
+        expected.scopedIdentity ? expected.processBirthToken : undefined)) {
         throw new Error(
           `OpenCode host pid ${expected.pid} containment cleanup remains incomplete`,
         )
@@ -2740,7 +2777,8 @@ export class OpenCodeHostManager {
         }
       }
       const rejectForeignUnlessContainmentEmpty = async (): Promise<null> => {
-        if (!this.persistentContainmentExited(record.pid)) {
+        if (!this.persistentContainmentExited(record.pid,
+          record.scopedIdentity ? record.processBirthToken : undefined)) {
           throw new Error('OpenCode foreign scoped host tombstone containment is unresolved [redacted]')
         }
         await removeStaleRecord()
@@ -2766,7 +2804,8 @@ export class OpenCodeHostManager {
         return rejectForeignUnlessContainmentEmpty()
       }
       if (!this.isProcessAlive(record.pid)) {
-        if (!this.persistentContainmentExited(record.pid)) {
+        if (!this.persistentContainmentExited(record.pid,
+          record.scopedIdentity ? record.processBirthToken : undefined)) {
           throw new Error(
             `OpenCode host pid ${record.pid} leader exited but containment cleanup is incomplete`,
           )
@@ -2776,7 +2815,8 @@ export class OpenCodeHostManager {
       }
       const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
       if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-        if (!this.persistentContainmentExited(record.pid)) {
+        if (!this.persistentContainmentExited(record.pid,
+          record.scopedIdentity ? record.processBirthToken : undefined)) {
           throw new Error(
             `OpenCode host pid ${record.pid} leader exited during adoption but containment cleanup is incomplete`,
           )
@@ -2810,7 +2850,8 @@ export class OpenCodeHostManager {
         processStartedAtMs: processIdentity.startedAtMs ?? record.processStartedAtMs,
       })
       if (identityAfterHealth.state === 'gone' || identityAfterHealth.state === 'changed') {
-        if (!this.persistentContainmentExited(record.pid)) {
+        if (!this.persistentContainmentExited(record.pid,
+          record.scopedIdentity ? record.processBirthToken : undefined)) {
           throw new Error(
             `OpenCode host pid ${record.pid} leader identity changed during adoption but ` +
             'containment cleanup is incomplete',
@@ -3779,12 +3820,13 @@ export class OpenCodeHostManager {
     signal?: AbortSignal,
   ): Promise<OpenCodeRetainedHostAccessResult<T>> {
     if (signal?.aborted) throwOpenCodeAbortReason(signal)
+    const platform = this.deps.platform ?? process.platform
     if (!identity || typeof identity.hostKey !== 'string' || !identity.hostKey.trim()
       || !Number.isSafeInteger(identity.pid) || identity.pid <= 0
       || !Number.isFinite(identity.processStartedAtMs)
       || (identity.processBirthToken !== undefined
         && (typeof identity.processBirthToken !== 'string'
-          || !identity.processBirthToken.startsWith('linux:')))) {
+          || !isNativeProcessBirthTokenForPlatform(identity.processBirthToken, platform)))) {
       throw new Error('OpenCode retained host access identity is invalid [redacted]')
     }
     const exactProcessStillExists = async (): Promise<boolean> => {
@@ -3851,13 +3893,15 @@ export class OpenCodeHostManager {
       obligationIdentity?: NonNullable<OpenCodeHostCleanupControls['obligationIdentity']>
     } = {},
   ): Promise<void> {
+    const platform = this.deps.platform ?? process.platform
+    let hasProtectedReceiptIdentity = false
     if ((receipt.schemaVersion !== 1 && receipt.schemaVersion !== 2) || typeof receipt.receiptId !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(receipt.receiptId)
       || typeof receipt.hostKeyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostKeyDigest)
       || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
       || !Number.isFinite(receipt.processStartedAtMs)
       || (receipt.schemaVersion === 2 && (typeof receipt.processBirthToken !== 'string'
-        || !receipt.processBirthToken.startsWith('linux:')))
+        || !isNativeProcessBirthTokenForPlatform(receipt.processBirthToken, platform)))
       || (receipt.lifetime !== 'process' && receipt.lifetime !== 'persistent')) {
       throw new Error('OpenCode host release receipt is corrupt [redacted]')
     }
@@ -3873,6 +3917,7 @@ export class OpenCodeHostManager {
       if (expected !== options.obligationIdentity.receiptIdentityDigest) {
         throw new Error('OpenCode host release obligation identity is mismatched [redacted]')
       }
+      hasProtectedReceiptIdentity = true
     }
     const retained = durableHostReferenceCapabilities.get(receipt.receiptId)
     if (retained) {
@@ -3942,8 +3987,16 @@ export class OpenCodeHostManager {
       else await this.unlinkPersistentRegistryUnlocked()
     })
     if (registryReceiptFound) return
+    // After registry deletion, Windows no longer has the scoped lifecycle HMAC
+    // that proves this PID named our kill-on-close launcher. Only the launch
+    // ledger's independently protected receipt digest may carry that authority
+    // across the unlink/ledger-completion crash window.
+    if (platform === 'win32' && !hasProtectedReceiptIdentity) {
+      throw new Error('OpenCode durable Windows host cleanup lacks protected receipt authority [redacted]')
+    }
     if (!this.isProcessAlive(receipt.pid)) {
-      if (this.persistentContainmentExited(receipt.pid)) return
+      if (this.persistentContainmentExited(receipt.pid,
+        hasProtectedReceiptIdentity ? receipt.processBirthToken : undefined)) return
       throw new Error('OpenCode durable host containment cleanup remains incomplete [redacted]')
     }
     const observed = await this.readProcessStartTimeMs(receipt.pid).catch(() => null)
@@ -4130,31 +4183,42 @@ export class OpenCodeHostManager {
       record.scopedIdentity ? this.scopedTransportOwnerKey : undefined,
     )
     const pid = entry?.handle.pid ?? record.pid
+    const containmentBirthToken = record.scopedIdentity ? record.processBirthToken : undefined
     let terminated = false
 
     this.assertCleanupAllowed(options)
+
+    if (options.requireStableContainment === true
+      && (this.deps.platform ?? process.platform) === 'win32' && !entry?.child
+      && (!record.scopedIdentity
+        || !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)
+        || !isNativeProcessBirthTokenForPlatform(record.processBirthToken, 'win32'))) {
+      throw new Error(
+        `OpenCode host pid ${pid} has no exact retained Windows launcher/job authority; cleanup remains incomplete`,
+      )
+    }
 
     const processIdentity = await this.inspectPersistentHostProcessIdentity({
       ...record,
       processStartedAtMs: entry?.handle.processStartedAtMs ?? record.processStartedAtMs,
     })
-    if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-      // A gone or changed exact leader invalidates its numeric PGID authority. Do not
-      // probe or signal the group after this point. Cleanup completes
+    if (processIdentity.state === 'gone'
+      || (processIdentity.state === 'changed'
+        && (this.deps.platform ?? process.platform) !== 'win32')) {
+      // A gone or changed POSIX leader invalidates its numeric PGID authority.
+      // Do not probe or signal the group after this point. Cleanup completes
       // only when the non-signalling containment observer proves it empty.
-      if (!this.persistentContainmentExited(pid)) {
+      if (!this.persistentContainmentExited(pid, containmentBirthToken)) {
         throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
       }
       terminated = true
+    } else if (processIdentity.state === 'changed') {
+      // A live PID with a different native generation is a foreign process,
+      // not evidence that our containment has exited. Fail before endpoint or
+      // process mutation and keep the durable cleanup obligation pending.
+      throw new Error(`OpenCode host pid ${pid} process generation changed; refusing to terminate a reused pid`)
     } else if (processIdentity.state !== 'confirmed') {
       throw new Error(`OpenCode host pid ${pid} identity could not be verified; refusing unsafe termination`)
-    }
-
-    if (!terminated && options.requireStableContainment === true
-      && (this.deps.platform ?? process.platform) === 'win32' && !entry?.child) {
-      throw new Error(
-        `OpenCode host pid ${pid} has no owned Windows launcher/job handle; cleanup remains incomplete`,
-      )
     }
 
     if (!terminated) {
@@ -4177,7 +4241,7 @@ export class OpenCodeHostManager {
       const identityBeforeKill = await this.assertPersistentHostProcessIdentity(
         record, processIdentity.startedAtMs)
       if (identityBeforeKill === 'gone') {
-        if (!this.persistentContainmentExited(pid)) {
+        if (!this.persistentContainmentExited(pid, containmentBirthToken)) {
           throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
         }
         terminated = true
@@ -4213,7 +4277,7 @@ export class OpenCodeHostManager {
       const identityBeforeForceKill = await this.assertPersistentHostProcessIdentity(
         record, processIdentity.startedAtMs)
       if (identityBeforeForceKill === 'gone') {
-        if (!this.persistentContainmentExited(pid)) {
+        if (!this.persistentContainmentExited(pid, containmentBirthToken)) {
           throw new Error(`OpenCode host pid ${pid} containment remained alive or unproven after cleanup`)
         }
         terminated = true
@@ -4236,10 +4300,9 @@ export class OpenCodeHostManager {
     this.assertCleanupAllowed(options)
 
     if (options.requireStableContainment && pid > 0 && !terminated) {
-      // Leader loss revokes signalling authority, but Linux's complete stable
-      // /proc observer may still prove that the whole containment is empty.
-      // No group signal or probe occurs in this branch.
-      if (this.isProcessAlive(pid) || !this.hasStableProcessContainmentExited(pid)) {
+      // Linux uses its complete /proc observer. Windows proves the exact
+      // launcher generation absent, which proves its kill-on-close job closed.
+      if (!this.persistentContainmentExited(pid, containmentBirthToken)) {
         throw new Error(
           `OpenCode host pid ${pid} containment remained alive or unproven after cleanup`,
         )
@@ -4405,7 +4468,9 @@ export class OpenCodeHostManager {
             : processIdentity.startedAtMs === null)
         const safelyEmptyAfterLeaderLoss = (processIdentity.state === 'gone'
           || processIdentity.state === 'changed')
-          && this.persistentContainmentExited(receipt.record.pid)
+          && this.persistentContainmentExited(
+            receipt.record.pid, receipt.record.scopedIdentity
+              ? receipt.record.processBirthToken : undefined)
         if (!exactLeader && !safelyEmptyAfterLeaderLoss) {
           throw new Error('OpenCode created host process compare-and-swap failed [redacted]')
         }
@@ -4667,7 +4732,8 @@ export class OpenCodeHostManager {
         }
 
         if (!this.isProcessAlive(record.pid)) {
-          if (!this.persistentContainmentExited(record.pid)) {
+          if (!this.persistentContainmentExited(record.pid,
+            record.scopedIdentity ? record.processBirthToken : undefined)) {
             hosts.push({
               hostKey,
               projectPath: projectLabel,
@@ -4703,7 +4769,8 @@ export class OpenCodeHostManager {
 
         const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
         if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-          if (!this.persistentContainmentExited(record.pid)) {
+          if (!this.persistentContainmentExited(record.pid,
+            record.scopedIdentity ? record.processBirthToken : undefined)) {
             hosts.push({ hostKey, projectPath: projectLabel, pid: record.pid, port: record.port,
               action: 'failed', reason: 'leader exited during identity verification but containment remains unproven',
               leaseCount })

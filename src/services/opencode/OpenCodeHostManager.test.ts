@@ -12,6 +12,7 @@ import { afterAll, describe, expect, test } from 'bun:test'
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
+  computeOpenCodeHostReleaseObligationIdentityDigest,
   buildOpenCodeScopedHostIdentity,
   bindVerifiedScopedBinaryHandle,
   deriveOpenCodeScopedHostKey,
@@ -671,6 +672,138 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       })).rejects.toThrow('lacks exact native generation authority')
       expect(remoteEffects).toBe(0)
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[hostKey]).toBeDefined()
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('Windows native generation survives restart for retained access and exact cleanup', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-generation-restart-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_447)
+    const ownerKey = Buffer.alloc(32, 9)
+    const birthToken = 'windows:0000000000000123:01d9abcd00000042'
+    let alive = true
+    const terminated: Array<{ pid: number; token: string }> = []
+    try {
+      const manager = new OpenCodeHostManager({
+        platform: 'win32', allocateLoopbackPort: async () => 44_447,
+        spawnHostProcess: () => child.child,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+        isProcessAlive: pid => pid === 45_447 && alive,
+        readProcessStartTimeMs: async pid => pid === 45_447 ? 12_347 : null,
+        readProcessBirthToken: pid => pid === 45_447 && alive ? birthToken : null,
+        persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+      })
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const originalReceipt = manager.hostReleaseReceipt(reference)
+      expect(originalReceipt).toMatchObject({ schemaVersion: 2, processBirthToken: birthToken })
+      const persisted = JSON.parse(await readFile(registryPath, 'utf8'))
+      const record = persisted.hosts[reference.handle.hostKey]
+      expect(record.processBirthToken).toBe(birthToken)
+      expect(typeof record.scopedIdentityBinding).toBe('string')
+
+      let accesses = 0
+      const restarted = new OpenCodeHostManager({
+        platform: 'win32', persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: ownerKey,
+        isProcessAlive: pid => pid === record.pid && alive,
+        readProcessStartTimeMs: async pid => pid === record.pid ? record.processStartedAtMs : null,
+        readProcessBirthToken: pid => pid === record.pid && alive ? birthToken : null,
+        terminateWindowsProcessGeneration: async (pid, token) => {
+          terminated.push({ pid, token }); alive = false; return true
+        },
+        fetchJson: async () => ({ status: 200, data: {} }),
+      })
+      await expect(restarted.withRetainedHostAccess({
+        hostKey: reference.handle.hostKey, pid: record.pid,
+        processStartedAtMs: record.processStartedAtMs, processBirthToken: birthToken,
+      }, async () => ++accesses)).resolves.toEqual({ status: 'available', value: 1 })
+
+      const replayReceipt = {
+        ...originalReceipt, receiptId: '45454545-4545-4545-8545-454545454545',
+      }
+      await restarted.reconcileHostReleaseReceipt(replayReceipt)
+      expect(terminated).toEqual([{ pid: record.pid, token: birthToken }])
+      expect(await pathExists(registryPath)).toBe(false)
+
+      // Simulate a crash after registry unlink but before the launch ledger
+      // records completion. Its protected receipt identity is sufficient to
+      // prove the exact launcher/job generation is now absent on replay.
+      const obligationIdentity = {
+        reservationDigest: 'a'.repeat(64), hostKeyIdentity: 'protected-host',
+        hostKeyDigest: replayReceipt.hostKeyDigest,
+        receiptIdentityDigest: computeOpenCodeHostReleaseObligationIdentityDigest({
+          reservationDigest: 'a'.repeat(64), hostKeyIdentity: 'protected-host',
+          receipt: replayReceipt,
+        }),
+      }
+      await expect(restarted.reconcileHostReleaseReceipt(replayReceipt, {
+        obligationIdentity,
+      })).resolves.toBeUndefined()
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('Windows restart fences PID reuse and a foreign protected registry', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-generation-fences-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_448)
+    const ownerKey = Buffer.alloc(32, 10)
+    const oldToken = 'windows:0000000000000123:01d9abcd00000042'
+    const reusedToken = 'windows:0000000000000124:01d9abcd00000043'
+    let mutations = 0
+    try {
+      const manager = new OpenCodeHostManager({
+        platform: 'win32', allocateLoopbackPort: async () => 44_448,
+        spawnHostProcess: () => child.child,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+        isProcessAlive: pid => pid === 45_448,
+        readProcessStartTimeMs: async pid => pid === 45_448 ? 12_348 : null,
+        readProcessBirthToken: pid => pid === 45_448 ? oldToken : null,
+        persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+      })
+      const reference = await manager.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const persisted = JSON.parse(await readFile(registryPath, 'utf8'))
+      const record = persisted.hosts[reference.handle.hostKey]
+      const receipt = { ...manager.hostReleaseReceipt(reference),
+        receiptId: '46464646-4646-4646-8646-464646464646' }
+      const reused = new OpenCodeHostManager({
+        platform: 'win32', persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: ownerKey, isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => record.processStartedAtMs,
+        readProcessBirthToken: () => reusedToken,
+        terminateWindowsProcessGeneration: async () => { mutations += 1; return true },
+        fetchJson: async () => { mutations += 1; return { status: 200, data: {} } },
+      })
+      await expect(reused.withRetainedHostAccess({ hostKey: reference.handle.hostKey,
+        pid: record.pid, processStartedAtMs: record.processStartedAtMs,
+        processBirthToken: oldToken }, async () => { mutations += 1 }))
+        .resolves.toEqual({ status: 'absent' })
+      await expect(reused.reconcileHostReleaseReceipt(receipt)).rejects.toThrow(/identity|generation/)
+      expect(mutations).toBe(0)
+
+      const foreign = new OpenCodeHostManager({
+        platform: 'win32', persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: Buffer.alloc(32, 11), isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => record.processStartedAtMs,
+        readProcessBirthToken: () => oldToken,
+        terminateWindowsProcessGeneration: async () => { mutations += 1; return true },
+        fetchJson: async () => { mutations += 1; return { status: 200, data: {} } },
+      })
+      await expect(foreign.withRetainedHostAccess({ hostKey: reference.handle.hostKey,
+        pid: record.pid, processStartedAtMs: record.processStartedAtMs,
+        processBirthToken: oldToken }, async () => { mutations += 1 }))
+        .resolves.toEqual({ status: 'unresolved' })
+      await expect(foreign.reconcileHostReleaseReceipt(receipt))
+        .rejects.toThrow('registry lifecycle binding is invalid')
+      expect(mutations).toBe(0)
+      expect(await pathExists(registryPath)).toBe(true)
     } finally { await rm(tempDir, { recursive: true, force: true }) }
   })
 
@@ -1665,7 +1798,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
       Object.assign(registry.hosts[hostKey]!, {
         pid: 99_999,
         processStartedAtMs: 9_999,
-        processBirthToken: 'linux:forged-boot:9999',
+        processBirthToken: 'linux:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:9999',
       })
       await writeFile(registryPath, `${JSON.stringify(registry)}\n`, { mode: 0o600 })
       const foreignBytes = await readFile(registryPath, 'utf8')

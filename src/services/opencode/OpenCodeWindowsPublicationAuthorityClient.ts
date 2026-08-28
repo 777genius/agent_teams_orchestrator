@@ -16,6 +16,7 @@ type PendingRequest<T extends OpenCodeWindowsPublicationRequest = OpenCodeWindow
 type Pending = PendingRequest
 export type OpenCodeWindowsPublicationAuthorityFactory = (options: OpenCodeWindowsPublicationAuthorityOptions) => OpenCodeWindowsPublicationAuthorityClient
 export type OpenCodeWindowsPublicationAuthorityOptions = Readonly<{
+  /** Monotonic lifetime of this authority owner, not a renewable per-command budget. */
   deadline: number; signal?: AbortSignal; launcherPath?: string; workerPath?: string
   launch?: (input: Readonly<{ launcherPath: string; workerPath: string; argument: string }>) => OpenCodeNativeAuthorityChild
 }>
@@ -34,7 +35,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
   readonly physicalSettlement: Promise<void>
   readonly #child: OpenCodeNativeAuthorityChild
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
-  readonly #deadline: number
+  readonly #ownerExpiresAt: number
   readonly #settlementDeadline: number
   readonly #signal?: AbortSignal
   readonly #exitFailure: Promise<Error>
@@ -72,7 +73,7 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     // Keep the launcher referenced while native owns retained handles. CLOSE
     // and the kill-on-close job object, followed by exited, are the physical
     // release boundary; an unref here can let JS disappear before that boundary.
-    this.#reader = this.#child.stdout.getReader(); this.#deadline = options.deadline
+    this.#reader = this.#child.stdout.getReader(); this.#ownerExpiresAt = options.deadline
     this.#settlementDeadline = defaultSettlementDeadline; this.#signal = options.signal
     options.signal?.addEventListener('abort', this.#abort, { once: true })
     this.#callerDeadline = setTimeout(() => this.#cancelCaller(), Math.max(1, options.deadline - openCodeMonotonicNow()))
@@ -384,12 +385,13 @@ export class OpenCodeWindowsPublicationAuthorityClient {
 
   async #executeRequest(request: Pending, settlementCommand: boolean): Promise<unknown> {
     const now = openCodeMonotonicNow()
-    if (this.#closed || (!settlementCommand && now >= this.#deadline)) throw unavailable()
+    if (this.#closed || (!settlementCommand && now >= this.#ownerExpiresAt)) throw unavailable()
     // Once a root is retained, an already-started caller command physically owns
     // the wire until the existing cleanup reserve expires. The caller still loses
-    // its race at #deadline/#signal, but the reply remains serialized ahead of
+    // its race at #ownerExpiresAt/#signal, but the reply remains serialized ahead of
     // attempt-owned rollback and CLOSE instead of killing their authority.
-    const physicalDeadline = settlementCommand || this.#retained ? this.#settlementDeadline : this.#deadline
+    const physicalDeadline = settlementCommand || this.#retained
+      ? this.#settlementDeadline : this.#ownerExpiresAt
     if (now >= physicalDeadline) throw unavailable()
     const remaining = Math.max(0, physicalDeadline - openCodeMonotonicNow())
     const wire = { version: 1, ...request, wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining)) } as OpenCodeWindowsPublicationRequest

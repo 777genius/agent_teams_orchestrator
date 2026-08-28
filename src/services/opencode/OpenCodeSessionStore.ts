@@ -7,6 +7,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
+import { openCodeLogicalMemberKey } from './OpenCodeLogicalMemberKey.js'
 
 type SessionStoreShape = {
   schemaVersion: 1
@@ -14,6 +15,10 @@ type SessionStoreShape = {
 }
 
 type UpsertResult = 'created' | 'updated' | 'unchanged'
+
+export type OpenCodeSessionPublicationResult =
+  | { status: 'inserted' | 'exact'; record: OpenCodeSessionRecord }
+  | { status: 'conflict'; record: OpenCodeSessionRecord }
 
 export type ConditionalMarkStaleResult =
   | { status: 'applied'; record: OpenCodeSessionRecord }
@@ -129,6 +134,36 @@ export class OpenCodeSessionStore {
       store.records[key] = record
       await this.writeStore(store)
       return previous ? 'updated' : 'created'
+    })
+  }
+
+  /** Atomic launch projection: never replaces a different session owner. */
+  async publishIfAbsentOrExact(record: OpenCodeSessionRecord): Promise<OpenCodeSessionPublicationResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const logicalKey = openCodeLogicalMemberKey({
+        teamId: record.teamId,
+        laneId: record.laneId ?? 'primary',
+        projectIdentity: record.projectPath,
+        memberName: record.memberName,
+      })
+      const existing = Object.values(store.records).find(candidate =>
+        openCodeLogicalMemberKey({
+          teamId: candidate.teamId,
+          laneId: candidate.laneId ?? 'primary',
+          projectIdentity: candidate.projectPath,
+          memberName: candidate.memberName,
+        }) === logicalKey,
+      ) ?? store.records[key]
+      if (existing) {
+        return jsonStringify(existing) === jsonStringify(record)
+          ? { status: 'exact', record: existing }
+          : { status: 'conflict', record: existing }
+      }
+      store.records[key] = record
+      await this.writeStore(store)
+      return { status: 'inserted', record }
     })
   }
 

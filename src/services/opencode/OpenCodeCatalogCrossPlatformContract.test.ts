@@ -137,6 +137,14 @@ describe('native catalog cross-platform source contract', () => {
     expect(volumeGate).toBeGreaterThanOrEqual(0)
     expect(createProcess).toBeGreaterThan(volumeGate)
     expect(source).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE')
+    expect(source).toContain('--process-generation-query-v1')
+    expect(source).toContain('--process-generation-terminate-v1')
+    expect(source).toContain('GetProcessTimes')
+    expect(source).toContain('NtQueryInformationProcess')
+    expect(source).toContain('const PROCESS_SEQUENCE_NUMBER: u32 = 92')
+    expect(source).toContain('PROCESS_QUERY_LIMITED_INFORMATION')
+    expect(source).toContain('PROCESS_TERMINATE | SYNCHRONIZE')
+    expect(source).toMatch(/OpenProcess\(access, 0, pid\)[\s\S]*?windows_process_creation_filetime\(process\)[\s\S]*?TerminateProcess\(process, 1\)/)
     expect(source).toContain('OPENCODE_NATIVE_LAUNCHER_FAILURE_V1 stage=')
     for (const stage of ['job_create', 'job_configure', 'job_attribute', 'handle_attribute',
       'create_process', 'named_worker_identity', 'resume_thread', 'wait_process', 'query_exit_code']) {

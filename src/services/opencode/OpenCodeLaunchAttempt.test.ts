@@ -1229,12 +1229,18 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     const persistence = new OpenCodeLaunchFileJournalPersistence(journalPath)
     const acquiredDeadlines: number[] = []
     const releasedDeadlines: number[] = []
+    const authorityDeadlines: number[] = []
+    const authorityOwners: string[] = []
     const acquire = persistence.acquireExclusive.bind(persistence)
     persistence.acquireExclusive = async context => {
       acquiredDeadlines.push(context.deadlineAtMs)
+      authorityDeadlines.push(context.windowsPublicationOwner!.deadlineAtMs)
+      authorityOwners.push(context.windowsPublicationOwner!.ownerId)
       const release = await acquire(context)
       return async releaseContext => {
         releasedDeadlines.push(releaseContext!.deadlineAtMs)
+        authorityDeadlines.push(releaseContext!.windowsPublicationOwner!.deadlineAtMs)
+        authorityOwners.push(releaseContext!.windowsPublicationOwner!.ownerId)
         await release(releaseContext)
       }
     }
@@ -1257,6 +1263,8 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
       expect(result.durableFinalResponse).toMatchObject({ launchAttempt: { outcome: 'partial' } })
       expect(acquiredDeadlines).toEqual([9_000])
       expect(releasedDeadlines).toEqual([10_000])
+      expect(authorityDeadlines).toEqual([10_000, 10_000])
+      expect(new Set(authorityOwners).size).toBe(1)
       const durable = await new OpenCodeLaunchAttemptStore(
         new OpenCodeLaunchFileJournalPersistence(journalPath),
       ).snapshotReadOnly({ attemptId, payloadHash: hash, inputDigest: result.inputDigest,

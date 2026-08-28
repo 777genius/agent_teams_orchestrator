@@ -35,6 +35,7 @@ describe('OpenCodeLaunchAttemptPolicy', () => {
       startedAtMs: 12_345,
       absoluteDeadlineAtMs: 312_345,
       workDeadlineAtMs: 297_345,
+      retainedAuthorityDeadlineAtMs: 312_345,
     })
     now = 100_000
     expect(policy.remainingAttemptMs()).toBe(212_345)

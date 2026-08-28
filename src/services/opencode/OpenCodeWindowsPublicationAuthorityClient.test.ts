@@ -594,4 +594,32 @@ describe('OpenCodeWindowsPublicationAuthorityClient', () => {
     expect(Math.max(...process.requests.map(request => Number(request.wait_ms))))
       .toBeLessThanOrEqual(1_500)
   })
+  test('retains namespace authority beyond a one-second work tail and fences it at owner expiry', async () => {
+    const originalNow = Date.now
+    const originalTimeout = globalThis.setTimeout
+    let now = originalNow() + 10_000
+    const delays: number[] = []
+    Date.now = () => now
+    globalThis.setTimeout = ((handler: Parameters<typeof setTimeout>[0], timeout?: number, ...args: unknown[]) => {
+      delays.push(Number(timeout)); return originalTimeout(handler, timeout, ...args)
+    }) as typeof setTimeout
+    const process = fake()
+    const workDeadline = now + 1_000
+    const ownerDeadline = now + 4_000
+    const client = new OpenCodeWindowsPublicationAuthorityClient({ deadline: ownerDeadline,
+      launch: () => process.child })
+    try {
+      await client.openRoot('C:\\safe', false, false)
+      expect(delays).toContain(5_000)
+      now = workDeadline + 1_501
+      await expect(client.namespaceSyncDirectory('.')).resolves.toBeUndefined()
+      expect(process.kills()).toBe(0)
+      now = ownerDeadline
+      await expect(client.namespaceSyncDirectory('.')).rejects.toThrow('unavailable [redacted]')
+    } finally {
+      Date.now = originalNow
+      globalThis.setTimeout = originalTimeout
+      client.kill()
+    }
+  })
 })

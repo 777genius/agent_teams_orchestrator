@@ -4,6 +4,7 @@ import path, { basename, dirname, join, parse, resolve } from 'node:path'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { dlopen, FFIType, ptr, read } from 'bun:ffi'
 import type { PlatformPath } from 'node:path'
+import { isNativeProcessBirthToken } from '../../utils/processKill.js'
 import {
   OpenCodeWindowsPublicationAuthorityClient,
   type OpenCodeWindowsPublicationAuthorityFactory,
@@ -188,7 +189,20 @@ export type OpenCodeLaunchJournalPersistenceSnapshot = Readonly<{
   fence: number | null
 }>
 
-export type OpenCodeLaunchStoreContext = { deadlineAtMs: number; signal: AbortSignal; monotonicNow(): number }
+export type OpenCodeWindowsPublicationOwnerContext = Readonly<{
+  /** Stable logical owner; retained authority must not migrate between attempts/generations. */
+  ownerId: string
+  /** Absolute attempt deadline, distinct from the current store operation deadline. */
+  deadlineAtMs: number
+  signal: AbortSignal
+}>
+
+export type OpenCodeLaunchStoreContext = {
+  deadlineAtMs: number
+  signal: AbortSignal
+  monotonicNow(): number
+  windowsPublicationOwner?: OpenCodeWindowsPublicationOwnerContext
+}
 
 /** Distinct bounded authorities for entering, running, and leaving one generation lease. */
 export type OpenCodeLaunchGenerationContexts = Readonly<{
@@ -566,7 +580,11 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
   }
 
   private async getNamespace(context?: OpenCodeLaunchStoreContext): Promise<CanonicalNamespace> {
-    if (this.namespace) return this.namespace
+    if (this.namespace) {
+      assertSameWindowsPublicationOwner(this.namespace.windowsPublicationOwner,
+        context?.windowsPublicationOwner)
+      return this.namespace
+    }
     const paths = deriveOpenCodeLaunchNamespacePaths(this.filePath, path)
     const suppliedDirectory = paths.directory
     await createCanonicalPrivateDirectory(suppliedDirectory)
@@ -611,6 +629,16 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       && (process.platform === 'win32' || this.testHooks.windowsAuthorityFactory !== undefined)
     const deadline = context?.deadlineAtMs ?? performance.now() + 10_000
     const signal = context?.signal
+    const windowsPublicationOwner = context?.windowsPublicationOwner
+    if (windowsPublicationOwner) {
+      if (!windowsPublicationOwner.ownerId
+        || !Number.isSafeInteger(windowsPublicationOwner.deadlineAtMs)
+        || windowsPublicationOwner.deadlineAtMs < deadline
+        || windowsPublicationOwner.signal.aborted) {
+        throw new OpenCodeLaunchJournalError('fenced',
+          'invalid retained Windows publication owner context')
+      }
+    }
     let releaseRetainedRoot: (() => Promise<void>) | undefined
     let backend: NamespaceBackend
     let authorityBackend: NamespaceBackend
@@ -625,7 +653,11 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         throw error
       }
     } else if (nativeWindows) {
-      const retainedRoot = await this.acquireSharedWindowsRoot(deadline, signal)
+      const retainedRoot = await this.acquireSharedWindowsRoot(
+        windowsPublicationOwner?.deadlineAtMs ?? deadline,
+        windowsPublicationOwner?.signal ?? signal,
+        windowsPublicationOwner,
+      )
       releaseRetainedRoot = retainedRoot.release
       try {
         const directoryPrefix = relativeRetainedName(retainedRoot.root, directory)
@@ -652,6 +684,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       slots: [`${marker}.slot0`, `${marker}.slot1`],
       fence: basename(paths.fence), lock: basename(paths.lock),
       releaseRetainedRoot,
+      ...(nativeWindows && windowsPublicationOwner ? { windowsPublicationOwner } : {}),
     }
     return this.namespace
   }
@@ -663,12 +696,13 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     else await Promise.all([expected.backend.close?.(), expected.authorityBackend.close?.()])
   }
 
-  private async acquireSharedWindowsRoot(deadline: number, signal?: AbortSignal): Promise<{
+  private async acquireSharedWindowsRoot(deadline: number, signal?: AbortSignal,
+    publicationOwner?: OpenCodeWindowsPublicationOwnerContext): Promise<{
     root: string; identity: { dev: number | bigint; ino: number | bigint }
     backend: RetainedWindowsNamespaceBackend; retain(relativePath: string): Promise<void>; release(): Promise<void>
   }> {
     const owner = this.retainedAuthoritySource ?? this
-    if (owner !== this) return owner.acquireSharedWindowsRoot(deadline, signal)
+    if (owner !== this) return owner.acquireSharedWindowsRoot(deadline, signal, publicationOwner)
     if (!owner.sharedWindowsRoot) {
       const opening = owner.sharedWindowsRootOpening ??= (async () => {
         const root = deriveOpenCodeLaunchNamespacePaths(owner.filePath, path).trustedRoot
@@ -677,12 +711,18 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         const identity = await stat(root)
         const backend = await RetainedWindowsNamespaceBackend.create(root, identity, false, deadline, signal,
           owner.testHooks.windowsAuthorityFactory)
-        return { root, identity, backend, references: 0, retainedDirectories: new Map() }
+        return { root, identity, backend, references: 0, retainedDirectories: new Map(),
+          publicationOwner }
       })()
       try { owner.sharedWindowsRoot = await opening }
       finally { if (owner.sharedWindowsRootOpening === opening) owner.sharedWindowsRootOpening = undefined }
     }
     const shared = owner.sharedWindowsRoot
+    if (publicationOwner && !shared.publicationOwner) {
+      throw new OpenCodeLaunchJournalError('fenced',
+        'retained Windows publication authority owner changed')
+    }
+    assertSameWindowsPublicationOwner(shared.publicationOwner, publicationOwner)
     shared.references += 1
     let released = false
     return { root: shared.root, identity: shared.identity, backend: shared.backend,
@@ -753,6 +793,7 @@ type CanonicalNamespace = {
   fence: string
   lock: string
   releaseRetainedRoot?: () => Promise<void>
+  windowsPublicationOwner?: OpenCodeWindowsPublicationOwnerContext
 }
 
 type SharedWindowsRoot = {
@@ -761,6 +802,7 @@ type SharedWindowsRoot = {
   backend: RetainedWindowsNamespaceBackend
   references: number
   retainedDirectories: Map<string, Promise<void>>
+  publicationOwner?: OpenCodeWindowsPublicationOwnerContext
 }
 
 type NamespaceStat = {
@@ -1599,10 +1641,10 @@ export class OpenCodeLaunchAttemptStore {
     // with a cleanup reserve can explicitly keep entry/body on the work
     // deadline while release remains bounded by the same absolute deadline.
     const fallbackContext = context ?? boundedDefaultContext()
-    const contexts: OpenCodeLaunchGenerationContexts = 'acquisition' in fallbackContext
+    let contexts: OpenCodeLaunchGenerationContexts = 'acquisition' in fallbackContext
       ? fallbackContext
       : { acquisition: fallbackContext, body: fallbackContext, release: fallbackContext }
-    const bodyContext = contexts.body
+    let bodyContext = contexts.body
     let retainedPhysicalSettlement: Promise<void> | undefined
     let deactivateLease = (): void => undefined
     let acquisitionContext = contexts.acquisition
@@ -1612,10 +1654,16 @@ export class OpenCodeLaunchAttemptStore {
       // it or reconcile its bound cleanup obligations. Give that safe replay
       // the current invocation's finite deadline; unfinished work and every
       // continuation remain fenced by the original absolute envelope.
-      if (timing && !(mode === 'begin' && timing.finalized)) acquisitionContext = {
-        ...acquisitionContext,
-        deadlineAtMs: Math.min(acquisitionContext.deadlineAtMs,
-          safeAdd(timing.startedAtMs, timing.totalBudgetMs, 'absoluteDeadlineAtMs')),
+      if (timing && !(mode === 'begin' && timing.finalized)) {
+        const persistedDeadlineAtMs = safeAdd(
+          timing.startedAtMs, timing.totalBudgetMs, 'absoluteDeadlineAtMs')
+        contexts = {
+          acquisition: capStoreContext(contexts.acquisition, persistedDeadlineAtMs),
+          body: capStoreContext(contexts.body, persistedDeadlineAtMs),
+          release: capStoreContext(contexts.release, persistedDeadlineAtMs),
+        }
+        acquisitionContext = contexts.acquisition
+        bodyContext = contexts.body
       }
     }
     return this.exclusive(async acquisitionToken => {
@@ -2174,7 +2222,12 @@ export class OpenCodeLaunchAttemptStore {
     identity: OpenCodeLaunchJournalIdentity,
     context: OpenCodeLaunchStoreContext,
   ): Promise<{ startedAtMs: number; totalBudgetMs: number; finalized: boolean } | null> {
-    const bytes = await awaitWithContext(this.persistence.read(context), context)
+    // File persistence can inspect immutable timing without first creating the
+    // retained Windows authority. This lets continuation ownership be capped
+    // to the original durable absolute deadline before native handles exist.
+    const bytes = this.persistence.readOnlySnapshot
+      ? (await awaitWithContext(this.persistence.readOnlySnapshot(context), context)).bytes
+      : await awaitWithContext(this.persistence.read(context), context)
     if (!bytes) return null
     if (bytes.byteLength > OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES) {
       throw new OpenCodeLaunchJournalError('corrupt', 'journal exceeds size limit')
@@ -2458,8 +2511,7 @@ function validateMemberCleanupObligation(
     || (source.hostProcessStartedAtMs !== undefined
       && !Number.isFinite(source.hostProcessStartedAtMs))
     || (source.hostProcessBirthToken !== undefined
-      && (typeof source.hostProcessBirthToken !== 'string'
-        || !source.hostProcessBirthToken.startsWith('linux:')))
+      && !isNativeProcessBirthToken(source.hostProcessBirthToken))
     || ((source.hostProcessId === undefined) !== (source.hostProcessStartedAtMs === undefined))
     || !isOpenCodeOpaqueIdentity(source.memberIdentity)
     || typeof source.memberName !== 'string' || source.memberName.length === 0 || source.memberName.length > 512
@@ -2730,6 +2782,38 @@ function boundedReleaseContext(): OpenCodeLaunchStoreContext {
 function ensureContext(context?: OpenCodeLaunchStoreContext): void {
   if (context && (context.signal.aborted || context.monotonicNow() >= context.deadlineAtMs)) {
     throw context.signal.reason ?? new OpenCodeLaunchJournalError('fenced', 'store deadline exceeded')
+  }
+}
+
+function capStoreContext(
+  context: OpenCodeLaunchStoreContext,
+  absoluteDeadlineAtMs: number,
+): OpenCodeLaunchStoreContext {
+  const deadlineAtMs = Math.min(context.deadlineAtMs, absoluteDeadlineAtMs)
+  const owner = context.windowsPublicationOwner
+  return {
+    ...context,
+    deadlineAtMs,
+    ...(owner ? { windowsPublicationOwner: {
+      ...owner,
+      deadlineAtMs: Math.min(owner.deadlineAtMs, absoluteDeadlineAtMs),
+    } } : {}),
+  }
+}
+
+function assertSameWindowsPublicationOwner(
+  retained: OpenCodeWindowsPublicationOwnerContext | undefined,
+  requested: OpenCodeWindowsPublicationOwnerContext | undefined,
+): void {
+  // Legacy contexts may keep using an authority they opened themselves. Once
+  // an explicit owner is supplied, however, it can neither adopt an unowned
+  // authority nor reuse one from another invocation/generation.
+  if (!retained || !requested) return
+  if (retained.ownerId !== requested.ownerId
+    || retained.deadlineAtMs !== requested.deadlineAtMs
+    || retained.signal !== requested.signal) {
+    throw new OpenCodeLaunchJournalError('fenced',
+      'retained Windows publication authority owner changed')
   }
 }
 

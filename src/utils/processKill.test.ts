@@ -3,6 +3,8 @@ import { join } from 'node:path'
 
 import {
   buildWindowsTaskkillInvocation,
+  isNativeProcessBirthToken,
+  isNativeProcessBirthTokenForPlatform,
   isProcessTreeContainmentAlive,
   isProcessAlive,
   killProcessTreeAndWait,
@@ -216,6 +218,26 @@ describe('processKill', () => {
     const stat = `44 (same-second) S 1 44 ${Array(16).fill('0').join(' ')} 987654`
     expect(readProcessBirthToken(44, 'linux', { readFile: target =>
       target.endsWith('boot_id') ? boot : stat })).toBe(`linux:${boot}:987654`)
+  })
+
+  it('accepts only exact platform-native Windows generation tokens', () => {
+    const token = 'windows:0000000000000123:01d9abcd00000042'
+    expect(readProcessBirthToken(44, 'win32', {
+      readWindowsProcess: pid => pid === 44 ? token : null,
+    })).toBe(token)
+    expect(isNativeProcessBirthToken(token)).toBe(true)
+    expect(isNativeProcessBirthTokenForPlatform(token, 'win32')).toBe(true)
+    expect(isNativeProcessBirthTokenForPlatform(token, 'linux')).toBe(false)
+    for (const malformed of [
+      'windows:1', 'windows:0000000000000123:01D9ABCD00000042',
+      'windows:0000000000000123:01d9abcd0000004g',
+      'linux:boot:42', '',
+    ]) {
+      expect(readProcessBirthToken(44, 'win32', {
+        readWindowsProcess: () => malformed,
+      })).toBeNull()
+      expect(isNativeProcessBirthToken(malformed)).toBe(false)
+    }
   })
 
   it('never signals a same-second recycled group when its native birth changes', async () => {

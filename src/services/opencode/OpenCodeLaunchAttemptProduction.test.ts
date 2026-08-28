@@ -197,6 +197,34 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('attempt host release ledger persists an exact Windows generation and rejects malformed tokens', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-windows-host-release-ledger-'))
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
+  const attemptId = '123e4567-e89b-42d3-a456-426614174010'
+  const payloadHash = 'd'.repeat(64)
+  try {
+    const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
+    const obligation = await ledger.reserve({ attemptId, payloadHash, generation: 1,
+      hostKeyIdentity: identity, hostKeyDigest: 'e'.repeat(64) })
+    const exact = { ...obligation, disposition: 'dispose' as const,
+      releaseState: 'pending' as const, receipt: {
+        schemaVersion: 2 as const, receiptId: '123e4567-e89b-42d3-a456-426614174011',
+        hostKeyDigest: obligation.hostKeyDigest, pid: 443, processStartedAtMs: 12_345,
+        processBirthToken: 'windows:0000000000000123:01d9abcd000001bb', lifetime: 'persistent' as const,
+      } }
+    await ledger.record(exact)
+    const restarted = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
+    expect((await restarted.readObligation({ attemptId, payloadHash, generation: 1,
+      obligationId: obligation.obligationId }))?.receipt?.processBirthToken)
+      .toBe('windows:0000000000000123:01d9abcd000001bb')
+    await expect(ledger.record({ ...exact, receipt: {
+      ...exact.receipt, processBirthToken: 'windows:0000000000000123:01D9ABCD000001BB',
+    } })).rejects.toThrow('corrupt')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('attempt host release ledger preserves every generation and prepublished acquisition obligation', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-generations-'))
   const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
@@ -463,10 +491,10 @@ test('production authority continues member 1 committed/member 2 proven failure 
       path.join(directory, 'launch-attempts', 'attempt.journal')))
     const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
     const targetOne = OpenCodeLaunchMutationLedger.targetDigest({
-      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: identity,
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice',
     })
     const targetTwo = OpenCodeLaunchMutationLedger.targetDigest({
-      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: secondMember,
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'bob',
     })
     const now = new Date().toISOString()
     const record: OpenCodeSessionRecord = {
@@ -484,6 +512,8 @@ test('production authority continues member 1 committed/member 2 proven failure 
     const makeIdentity = (lease: { generation: number; fence: number; acquisitionToken: string },
       claimToken: string, memberIdentity: OpenCodeOpaqueIdentity, inputDigest: string): OpenCodeLaunchMutationIdentity => ({
       attemptId, payloadHash, immutableDigest, inputDigest, memberIdentity, claimToken,
+      logicalMember: { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project',
+        memberName: memberIdentity === identity ? 'alice' : 'bob' },
       generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
     })
     const deadline = productionContext()
@@ -530,7 +560,7 @@ test('production maps unknown transport to permanent unknown and never to reclai
   try {
     const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
     const unknownTarget = OpenCodeLaunchMutationLedger.targetDigest({
-      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberIdentity: identity,
+      teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice',
     })
     const owner = identityForProductionClaim(identity, 1, 'claim-one')
     expect(await ledger.claim(unknownTarget, owner, productionContext())).toBe('claimed')
@@ -552,6 +582,7 @@ function identityForProductionClaim(
     inputDigest: generation === 1 ? 'c'.repeat(64) : 'd'.repeat(64), immutableDigest: 'e'.repeat(64),
     generation, fence: generation, acquisitionToken: `acquisition-${generation}`,
     claimToken, memberIdentity,
+    logicalMember: { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' },
   }
 }
 
@@ -963,7 +994,7 @@ const staleProductionAuthorityCases = [
       seeded: ProductionSeed) => {
       const otherMember = `sha256:${'9'.repeat(64)}` as OpenCodeOpaqueIdentity
       const otherTarget = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
-        projectIdentity: fixture.command.projectPath, memberIdentity: otherMember })
+        projectIdentity: fixture.command.projectPath, memberName: 'alice' })
       expect(await fixture.ledger.claim(otherTarget, { ...seeded.authority,
         memberIdentity: otherMember }, fixture.context)).toBe('claimed')
       await fixture.sessionStore.upsert(seeded.record)
@@ -1010,9 +1041,8 @@ test.each(staleProductionAuthorityCases)(
         committed: [], failed: [], pending: [fixture.memberIdentity],
       })
       expect(output.snapshot.probeError, name).toBe('launch attempt did not acquire a host')
-      const expectedSessionReads = name === 'mismatched member claim' ? 1 : 2
       expect(fixture.sessionReads(), `${name} preflight and readMemberLinkage`)
-        .toBe(expectedSessionReads)
+        .toBe(2)
       expect(fixture.mcpChecks(), `${name} stops at recovery boundary`).toBe(0)
       expect(fixture.memberCreates(), name).toBe(0)
       const events = (await fixture.inspectJournal())?.events.map(event => event.type)
@@ -1027,11 +1057,12 @@ test('committed mutation crash failpoints rehydrate only the exact remote projec
     const ledger = new OpenCodeLaunchMutationLedger(path.join(directory, 'claims'))
     const memberIdentity = identity
     const target = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
-      projectIdentity: '/fake/project', memberIdentity })
+      projectIdentity: '/fake/project', memberName: 'alice' })
     const authority: OpenCodeLaunchMutationIdentity = { attemptId: '123e4567-e89b-42d3-a456-426614174001',
       payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64), generation: 1, fence: 1,
       immutableDigest: 'c'.repeat(64),
-      acquisitionToken: 'acquire', claimToken: 'acquire.claim', memberIdentity }
+      acquisitionToken: 'acquire', claimToken: 'acquire.claim', memberIdentity,
+      logicalMember: { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' } }
     const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
     const title = `agent-teams-launch:${authority.attemptId}:${memberIdentity}:${createHash('sha256').update(authority.claimToken).digest('hex')}`
     const text = '<bootstrap-exact>'
@@ -1231,7 +1262,7 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
   const ledger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'),
     filePath => persistence.createRelativePersistence(filePath))
   const target = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
-    projectIdentity: projectPath, memberIdentity })
+    projectIdentity: projectPath, memberName: 'alice' })
   const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
   let memberCreateCount = 0
   let mcpCheckCount = 0
@@ -1319,7 +1350,9 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
       seeded = { record, linkage, title, text, authority: { attemptId,
         payloadHash: rawCommand.request.launchAttempt.payloadHash, inputDigest, immutableDigest,
         generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
-        claimToken, memberIdentity } }
+        claimToken, memberIdentity,
+        logicalMember: { teamId: 'team', laneId: 'primary', projectIdentity: projectPath,
+          memberName: 'alice' } } }
       if (options.applied) {
         await lease.append({ type: 'member_applied', memberIdentity, linkage, claimToken })
       }
@@ -1354,6 +1387,7 @@ test('member cleanup replay uses only journaled host identity and never starts f
 async () => {
   let ensured = 0
   let recovered = 0
+  let recoveredBirthToken: string | undefined
   const manager = {
     ensureScopedHostReference: async () => { ensured += 1; throw new Error('must not provision') },
     releaseHostReference: async () => {},
@@ -1361,8 +1395,9 @@ async () => {
     retainHostLease: async () => {},
     releaseHostLease: async () => {},
     reconcileHostReleaseReceipt: async () => {},
-    withRetainedHostAccess: async () => {
+    withRetainedHostAccess: async (identity: { processBirthToken?: string }) => {
       recovered += 1
+      recoveredBirthToken = identity.processBirthToken
       return { status: 'unresolved' as const }
     },
   } as unknown as OpenCodeHostManager
@@ -1380,7 +1415,7 @@ async () => {
       attemptId: harness.command.request.launchAttempt.attemptId,
       payloadHash: harness.command.request.launchAttempt.payloadHash,
       generation: 1, hostKey: 'host', hostProcessId: 443, hostProcessStartedAtMs: 1,
-      hostProcessBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443',
+      hostProcessBirthToken: 'windows:0000000000000123:01d9abcd000001bb',
       memberIdentity: harness.memberIdentity, memberName: 'alice', teamId: 'team',
       laneId: 'primary', sessionId: harness.sessionId,
       sessionIdentity: (`sha256:${createHash('sha256').update(JSON.stringify({
@@ -1402,8 +1437,9 @@ async () => {
       .launchAttempt
     expect(launchAttempt?.members.cleanupPending).toEqual([harness.memberIdentity])
     expect({ ensured, recovered, remoteReads: harness.remoteReads(),
-      memberCreates: harness.memberCreates() })
-      .toEqual({ ensured: 0, recovered: 1, remoteReads: 0, memberCreates: 0 })
+      memberCreates: harness.memberCreates(), recoveredBirthToken })
+      .toEqual({ ensured: 0, recovered: 1, remoteReads: 0, memberCreates: 0,
+        recoveredBirthToken: 'windows:0000000000000123:01d9abcd000001bb' })
     expect(await harness.inspectJournal()).toMatchObject({ cleanupState: 'incomplete',
       memberCleanupObligations: [{ memberIdentity: harness.memberIdentity, phase: 'remote' }],
       finalResponse: { members: { cleanupPending: [harness.memberIdentity] } } })
@@ -1543,26 +1579,31 @@ async function durableTreeSnapshot(root: string): Promise<Record<string, string>
 
 function notFound(): Error { return new Error('request failed (404 Not Found)') }
 
-test('production composition routes an incomplete exact final through real HostManager reconciliation', async () => {
+test('production composition routes an incomplete exact final through real HostManager restart reconciliation', async () => {
+  const platform = 'linux' as const
+  const processBirthToken = 'linux:11111111-2222-3333-4444-555555555555:443'
   const managerDirectory = await mkdtemp(path.join(tmpdir(), 'opencode-production-real-manager-'))
   const registryPath = path.join(managerDirectory, 'registry.json')
   await writeFile(registryPath, JSON.stringify({ schemaVersion: 2, hosts: { host: {
     hostKey: 'host', profileRootKey: 'profile', projectPath: '/static/project',
     projectBehaviorFingerprint: '2'.repeat(64), baseUrl: 'http://127.0.0.1:44443',
     port: 44443, pid: 443, processStartedAtMs: 1,
-    processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443', version: null,
+    processBirthToken, version: null,
     resolvedConfigFingerprint: null, updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
   } } }))
   let leaderAlive = true
   let containmentAlive = true
   const signals: NodeJS.Signals[] = []
   const realHostManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
-    platform: 'linux', isProcessAlive: () => leaderAlive,
+    platform, isProcessAlive: () => leaderAlive,
     isProcessGroupAlive: () => containmentAlive,
     readProcessStartTimeMs: async () => 1,
-    readProcessBirthToken: () => 'linux:11111111-2222-3333-4444-555555555555:443',
+    readProcessBirthToken: () => processBirthToken,
     killProcess: (_pid, signal) => {
       signals.push(signal); leaderAlive = false; containmentAlive = false
+    },
+    terminateWindowsProcessGeneration: async () => {
+      signals.push('SIGTERM'); leaderAlive = false; containmentAlive = false; return true
     },
     sleepMs: async () => {},
     fetchJson: async () => ({ status: 200, data: { ok: true } }) })
@@ -1588,7 +1629,7 @@ test('production composition routes an incomplete exact final through real HostM
         schemaVersion: 2, receiptId: '88888888-8888-4888-8888-888888888888',
         hostKeyDigest: createHash('sha256').update('host').digest('hex'),
         pid: 443, processStartedAtMs: 1,
-        processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443',
+        processBirthToken,
         lifetime: 'persistent',
       } }, harness.context)
     const exact = await hostLedger.readObligation({
@@ -1631,16 +1672,26 @@ test('production composition routes an incomplete exact final through real HostM
   }
 })
 
-test('production composition reconciles tokenless v1 only through the exact retained capability', async () => {
-  const receipt = {
+test.each([
+  ['tokenless v1 only through its exact retained capability', {
     schemaVersion: 1 as const, receiptId: '77777777-7777-4777-8777-777777777777',
     hostKeyDigest: createHash('sha256').update('host').digest('hex'),
     pid: 443, processStartedAtMs: 1, lifetime: 'persistent' as const,
-  }
+  }, true],
+  ['Windows v2 through its persisted native generation', {
+    schemaVersion: 2 as const, receiptId: '78787878-7878-4878-8878-787878787878',
+    hostKeyDigest: createHash('sha256').update('host').digest('hex'),
+    pid: 443, processStartedAtMs: 1,
+    processBirthToken: 'windows:0000000000000123:01d9abcd000001bb',
+    lifetime: 'persistent' as const,
+  }, false],
+] as const)('production composition restart reconciles %s', async (
+  _case, receipt, exactRetainedCapability,
+) => {
   let reconciles = 0
   const manager = {
     hasExactRetainedHostReleaseCapability: (candidate: typeof receipt) =>
-      JSON.stringify(candidate) === JSON.stringify(receipt),
+      exactRetainedCapability && JSON.stringify(candidate) === JSON.stringify(receipt),
     reconcileHostReleaseReceipt: async (candidate: typeof receipt) => {
       expect(candidate).toEqual(receipt); reconciles += 1
     },
@@ -1711,7 +1762,7 @@ test.each(['committed', 'claimed'] as const)(
     hostKey: 'host', profileRootKey: 'profile', projectPath: '/static/project',
     projectBehaviorFingerprint: '2'.repeat(64), baseUrl: 'http://127.0.0.1:44443',
     port: 44443, pid: 443, processStartedAtMs: 1,
-    processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:recycled', version: null,
+    processBirthToken: 'linux:11111111-2222-3333-4444-555555555555:999', version: null,
     resolvedConfigFingerprint: null, updatedAt: '2026-08-27T00:00:00.000Z', leases: {},
   } } })
   await writeFile(registryPath, registryBytes)
@@ -1727,7 +1778,7 @@ test.each(['committed', 'claimed'] as const)(
     isProcessGroupAlive: () => { containmentProbes += 1; return true },
     readProcessStartTimeMs: async () => { startTimeProbes += 1; return 1 },
     readProcessBirthToken: () => {
-      birthProbes += 1; return 'linux:11111111-2222-3333-4444-555555555555:recycled'
+      birthProbes += 1; return 'linux:11111111-2222-3333-4444-555555555555:999'
     },
     killProcess: () => { signals += 1 },
     sleepMs: async () => {}, fetchJson: async () => {
@@ -1976,7 +2027,7 @@ async function committedRecoveryFixture() {
   const acquisitionToken = 'acquire'
   const claimToken = `${acquisitionToken}.claim`
   const targetDigest = OpenCodeLaunchMutationLedger.targetDigest({ teamId: 'team', laneId: 'primary',
-    projectIdentity: '/fake/project', memberIdentity })
+    projectIdentity: '/fake/project', memberName: 'alice' })
   const sessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(targetDigest)
   const title = `agent-teams-launch:${attemptId}:${memberIdentity}:${createHash('sha256').update(claimToken).digest('hex')}`
   const text = '<bootstrap-exact>'
@@ -1991,7 +2042,9 @@ async function committedRecoveryFixture() {
       contextHash: createHash('sha256').update(text).digest('hex'), briefingHash: createHash('sha256').update('').digest('hex'),
       injectionVerifiedAt: now, model: 'openrouter/model', agent: 'teammate-bootstrap' }, createdAt: now, updatedAt: now }
   const linkage = linkageForTest(memberIdentity, record)
-  const claim = { version: 1 as const, targetDigest, idempotencyIdentity: sessionId,
+  const logicalMember = { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' }
+  const claim = { version: 1 as const, targetDigest, logicalMemberKey: targetDigest, logicalMember,
+    idempotencyIdentity: sessionId,
     state: 'committed' as const, attemptId, payloadHash: 'a'.repeat(64), inputDigest: 'b'.repeat(64),
     immutableDigest: 'c'.repeat(64),
     generation: 1, fence: 1, acquisitionToken, claimToken, memberIdentity, linkage,

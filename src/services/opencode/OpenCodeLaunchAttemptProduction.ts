@@ -61,6 +61,7 @@ import {
   type OpenCodeLaunchMutationClaimRecord,
   type OpenCodeLaunchMutationIdentity,
 } from './OpenCodeLaunchMutationLedger.js'
+import { normalizeOpenCodeLogicalMemberIdentity } from './OpenCodeLogicalMemberKey.js'
 import {
   hydrateOpenCodeRecoveredSessionLease,
   OpenCodeLaunchRetainedHostLeases,
@@ -647,12 +648,12 @@ class OpenCodeProductionLaunchRuntime {
       continuation: command.continuation,
       continuationToken: command.request.launchAttempt.continuationToken,
     })
-    const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
-      OpenCodeLaunchMutationLedger.targetDigest({
-        teamId: command.teamId, laneId: command.laneId,
-        projectIdentity,
-        memberIdentity: member.memberIdentity,
+    const logicalMemberByIdentity = new Map(command.members.map(member => [member.memberIdentity,
+      normalizeOpenCodeLogicalMemberIdentity({
+        teamId: command.teamId, laneId: command.laneId, projectIdentity, memberName: member.name,
       })]))
+    const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
+      OpenCodeLaunchMutationLedger.targetDigest(logicalMemberByIdentity.get(member.memberIdentity)!)]))
     // Recovery populates this set before any incomplete host receipt is
     // reconciled. A restart must not dispose a persistent host which already
     // serves a committed durable member.
@@ -920,7 +921,11 @@ class OpenCodeProductionLaunchRuntime {
       if (claim.attemptId !== command.request.launchAttempt.attemptId
         || claim.payloadHash !== command.request.launchAttempt.payloadHash
         || claim.memberIdentity !== member.memberIdentity) {
-        throw new Error('OpenCode durable command ledger identity mismatch')
+        // The canonical logical-member claim belongs to another authorized
+        // envelope. This is durable reconciliation evidence, not permission
+        // to retry under the contender's different opaque identity.
+        const record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
+        return { member, claim, record, linkage: null, reconciliationError: 'authority' }
       }
       let record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
       let linkage = record ? linkageFor(member.memberIdentity, record) : null
@@ -990,7 +995,12 @@ class OpenCodeProductionLaunchRuntime {
                   claim.idempotencyIdentity, member.prompt),
                 getSession: id => client.getSession(id),
                 getSessionMessage: (id, messageId) => client.getSessionMessage!(id, messageId),
-                upsert: value => openCodeSessionStore.upsert(value),
+                upsert: async value => {
+                  const publication = await openCodeSessionStore.publishIfAbsentOrExact(value)
+                  if (publication.status === 'conflict') {
+                    throw new Error('OpenCode logical member projection is already owned by another session')
+                  }
+                },
               })
               if (recovered.status === 'recovered') {
                 record = recovered.record; linkage = recovered.linkage
@@ -1870,14 +1880,16 @@ class OpenCodeProductionLaunchRuntime {
         claimMemberMutation: async input => {
           const target = targetByMember.get(input.memberIdentity)
           if (!target) return 'reconciliation_required'
-          return mutationLedger.claim(target, input, {
+          return mutationLedger.claim(target, { ...input,
+            logicalMember: logicalMemberByIdentity.get(input.memberIdentity)! }, {
             deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow,
           })
         },
         transitionMemberClaim: async input => {
           const target = targetByMember.get(input.memberIdentity)
           if (!target) return 'fenced'
-          return transitionOpenCodeProductionMemberClaim(mutationLedger, target, input,
+          return transitionOpenCodeProductionMemberClaim(mutationLedger, target, { ...input,
+            logicalMember: logicalMemberByIdentity.get(input.memberIdentity)! },
             { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow })
         },
         createBootstrapAndCommit: async input => {
@@ -1976,7 +1988,13 @@ class OpenCodeProductionLaunchRuntime {
           if (await commitOpenCodeMemberProjection({
             commit: () => input.commitIfClaimLive(linkage, { ownershipTitle, sessionRecord: record }),
             onCommitted: () => retainedSessionLeases.commit(input.memberIdentity),
-            upsert: async () => { await openCodeSessionStore.upsert(record); records.set(input.memberIdentity, record) },
+            upsert: async () => {
+              const publication = await openCodeSessionStore.publishIfAbsentOrExact(record)
+              if (publication.status === 'conflict') {
+                throw new Error('OpenCode logical member projection is already owned by another session')
+              }
+              records.set(input.memberIdentity, publication.record)
+            },
           }) === 'committed') {
             return { outcome: 'applied', linkage, owned }
           }

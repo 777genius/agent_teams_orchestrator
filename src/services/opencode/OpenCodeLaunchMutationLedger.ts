@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
 import {
@@ -14,6 +13,11 @@ import {
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeSessionRecord } from './types.js'
+import {
+  assertOpenCodeLogicalMemberIdentity,
+  openCodeLogicalMemberKey,
+  type OpenCodeLogicalMemberIdentity,
+} from './OpenCodeLogicalMemberKey.js'
 
 export type OpenCodeLaunchMemberRecovery = {
   ownershipTitle: string
@@ -30,11 +34,13 @@ export type OpenCodeLaunchMutationIdentity = {
   acquisitionToken: string
   claimToken: string
   memberIdentity: OpenCodeOpaqueIdentity
+  logicalMember: OpenCodeLogicalMemberIdentity
 }
 
 export type OpenCodeLaunchMutationClaimRecord = OpenCodeLaunchMutationIdentity & {
   version: 1
   targetDigest: string
+  logicalMemberKey: string
   idempotencyIdentity: string
   state: 'claimed' | 'known_failure' | 'unknown' | 'committed'
   linkage?: OpenCodeLaunchMemberLinkage
@@ -59,9 +65,9 @@ export class OpenCodeLaunchMutationLedger {
   ) {}
 
   static targetDigest(input: {
-    teamId: string; laneId: string; projectIdentity: string; memberIdentity: OpenCodeOpaqueIdentity
+    teamId: string; laneId: string; projectIdentity: string; memberName: string
   }): string {
-    return sha256(JSON.stringify(input))
+    return openCodeLogicalMemberKey(input)
   }
 
   static idempotencyIdentity(targetDigest: string): string {
@@ -77,6 +83,9 @@ export class OpenCodeLaunchMutationLedger {
 
   async claim(targetDigest: string, identity: OpenCodeLaunchMutationIdentity, context: OpenCodeLaunchStoreContext):
   Promise<'claimed' | 'already_committed' | 'unknown' | 'reconciliation_required'> {
+    if (openCodeLogicalMemberKey(identity.logicalMember) !== targetDigest) {
+      throw new TypeError('OpenCode launch mutation logical member claim mismatch')
+    }
     return this.withLock(targetDigest, context, async persistence => {
       const current = await this.readUnlocked(persistence, targetDigest, context)
       if (current) {
@@ -100,7 +109,8 @@ export class OpenCodeLaunchMutationLedger {
         return current.state === 'unknown' ? 'unknown' : 'reconciliation_required'
       }
       const record: ClaimRecord = {
-        version: 1, targetDigest, idempotencyIdentity: OpenCodeLaunchMutationLedger.idempotencyIdentity(targetDigest),
+        version: 1, targetDigest, logicalMemberKey: openCodeLogicalMemberKey(identity.logicalMember),
+        idempotencyIdentity: OpenCodeLaunchMutationLedger.idempotencyIdentity(targetDigest),
         state: 'claimed', ...identity,
       }
       validateClaimRecord(record)
@@ -165,16 +175,25 @@ function validateClaimRecord(value: unknown): asserts value is ClaimRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw corrupt()
   const record = value as Record<string, unknown>
   const allowed = new Set(['version', 'targetDigest', 'idempotencyIdentity', 'state', 'attemptId', 'payloadHash',
-    'inputDigest', 'immutableDigest', 'generation', 'fence', 'acquisitionToken', 'claimToken', 'memberIdentity', 'linkage', 'recovery'])
+    'logicalMemberKey', 'logicalMember', 'inputDigest', 'immutableDigest', 'generation', 'fence', 'acquisitionToken',
+    'claimToken', 'memberIdentity', 'linkage', 'recovery'])
   if (Object.keys(record).some(key => !allowed.has(key)) || record.version !== 1
-    || !DIGEST.test(String(record.targetDigest)) || !TOKEN.test(String(record.idempotencyIdentity))
+    || !DIGEST.test(String(record.targetDigest)) || !DIGEST.test(String(record.logicalMemberKey))
+    || record.targetDigest !== record.logicalMemberKey || !TOKEN.test(String(record.idempotencyIdentity))
     || !['claimed', 'known_failure', 'unknown', 'committed'].includes(String(record.state))
     || !isOpenCodeLaunchAttemptId(record.attemptId) || !isOpenCodeLaunchPayloadHash(record.payloadHash)
     || !DIGEST.test(String(record.inputDigest)) || !DIGEST.test(String(record.immutableDigest))
     || typeof record.generation !== 'number'
     || !Number.isSafeInteger(record.generation) || typeof record.fence !== 'number'
     || !Number.isSafeInteger(record.fence) || !TOKEN.test(String(record.acquisitionToken))
-    || !TOKEN.test(String(record.claimToken)) || !isOpenCodeOpaqueIdentity(record.memberIdentity)) throw corrupt()
+    || !TOKEN.test(String(record.claimToken)) || !isOpenCodeOpaqueIdentity(record.memberIdentity)
+    || !record.logicalMember || typeof record.logicalMember !== 'object'
+    || Array.isArray(record.logicalMember)) throw corrupt()
+  try {
+    const logicalMember = record.logicalMember as OpenCodeLogicalMemberIdentity
+    const normalized = assertOpenCodeLogicalMemberIdentity(logicalMember, String(record.logicalMemberKey))
+    if (JSON.stringify(normalized) !== JSON.stringify(logicalMember)) throw corrupt()
+  } catch { throw corrupt() }
   if (record.state === 'committed') {
     if (!record.linkage || !sameLinkageShape(record.linkage, record.memberIdentity as string)
       || (record.recovery !== undefined && !sameRecoveryShape(record.recovery))) throw corrupt()
@@ -200,11 +219,13 @@ function sameAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity)
     && left.inputDigest === right.inputDigest && left.generation === right.generation
     && left.fence === right.fence && left.acquisitionToken === right.acquisitionToken
     && left.claimToken === right.claimToken && left.memberIdentity === right.memberIdentity
+    && left.logicalMemberKey === openCodeLogicalMemberKey(right.logicalMember)
 }
 
 function sameImmutableAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity): boolean {
   return left.attemptId === right.attemptId && left.payloadHash === right.payloadHash
     && left.immutableDigest === right.immutableDigest && left.memberIdentity === right.memberIdentity
+    && left.logicalMemberKey === openCodeLogicalMemberKey(right.logicalMember)
 }
 
 function sameLinkageShape(value: unknown, memberIdentity: string): value is OpenCodeLaunchMemberLinkage {
@@ -223,5 +244,3 @@ function sameLinkage(left: OpenCodeLaunchMemberLinkage, right: OpenCodeLaunchMem
 function corrupt(): OpenCodeLaunchJournalError {
   return new OpenCodeLaunchJournalError('corrupt', 'invalid launch mutation claim')
 }
-
-function sha256(value: string): string { return createHash('sha256').update(value).digest('hex') }
