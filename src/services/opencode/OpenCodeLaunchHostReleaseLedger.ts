@@ -278,9 +278,13 @@ export class OpenCodeLaunchHostReleaseLedger {
       // recognizing the complete marker shape; arbitrary malformed/foreign bytes still fail shut.
       if (error instanceof OpenCodeLaunchJournalError && error.code === 'corrupt'
         && isFramedMarker(legacyBytes)) {
-        const transitioned = await this.persistence.read(persistenceContext)
-        if (!transitioned) throwLedgerReadError(error)
-        return decode(transitioned)
+        try {
+          const transitioned = await this.persistence.read(persistenceContext)
+          if (!transitioned) throwLedgerReadError(error)
+          return decode(transitioned)
+        } catch (transitionError) {
+          throwLedgerReadError(transitionError)
+        }
       }
       let legacy: unknown
       try { legacy = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(legacyBytes)) }

@@ -183,6 +183,27 @@ describe('durable retained host-release ledger', () => {
     } finally { await rm(item.root, { recursive: true, force: true }) }
   })
 
+  test('reader classifies a corrupt framed candidate after a legacy transition as ledger corruption', async () => {
+    let reads = 0
+    const persistence: OpenCodeLaunchHostLedgerPersistence = {
+      read: async () => {
+        reads += 1
+        throw new OpenCodeLaunchJournalError('corrupt', reads === 1
+          ? 'invalid commit marker' : 'candidate digest mismatch')
+      },
+      readUnframedLegacy: async () => new TextEncoder().encode(JSON.stringify({
+        version: 1, slot: 0, digest: 'a'.repeat(64),
+      })),
+      acquireExclusive: async () => async () => undefined,
+      replaceAndSync: async () => undefined,
+      replaceUnframedLegacyAndSync: async () => undefined,
+    }
+    const ledger = OpenCodeLaunchHostReleaseLedger.production(persistence)
+    await expect(ledger.read({ attemptId, payloadHash, generation: 1 }, context()))
+      .rejects.toThrow('OpenCode launch host release ledger is corrupt [redacted]')
+    expect(reads).toBe(2)
+  })
+
   test('legacy fallback preserves a bounded wait failure instead of misreporting corruption', async () => {
     const deadline = new OpenCodeLaunchJournalError('fenced', 'store deadline exceeded')
     const persistence: OpenCodeLaunchHostLedgerPersistence = {
