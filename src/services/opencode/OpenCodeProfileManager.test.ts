@@ -1593,6 +1593,75 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     await rm(tempDir, { recursive: true, force: true })
   })
 
+  test('recovery preflight is read-only across auth, config, and complete environment drift', async () => {
+    const previous = { ...process.env }
+    const projectPath = path.join(tempDir, 'project')
+    const dataPath = path.join(tempDir, 'app-data')
+    const cachePath = path.join(tempDir, 'app-cache')
+    const homePath = path.join(tempDir, 'home')
+    const sourceDataPath = path.join(tempDir, 'source-data')
+    const sourceAuthPath = path.join(sourceDataPath, 'opencode', 'auth.json')
+    const providerLogPath = path.join(tempDir, 'provider-calls.log')
+    try {
+      await mkdir(projectPath, { recursive: true })
+      await mkdir(path.dirname(sourceAuthPath), { recursive: true })
+      await writeFile(sourceAuthPath, JSON.stringify({
+        openai: { type: 'api', key: 'source-secret-a' },
+      }))
+      process.env.CLAUDE_MULTIMODEL_DATA_HOME = dataPath
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = cachePath
+      process.env.HOME = homePath
+      process.env.USERPROFILE = homePath
+      process.env.XDG_DATA_HOME = sourceDataPath
+      process.env.FAKE_PROVIDER_CALL_LOG = providerLogPath
+      delete process.env.OPENCODE_CONFIG
+      delete process.env.OPENCODE_CONFIG_CONTENT
+      const manager = new OpenCodeProfileManager()
+      const options = { includeAppMcp: false, includeManagedSubscriptionPlugins: false } as const
+      const prepared = await manager.prepareProfile(projectPath, options)
+      const profileAAuthBytes = await readFile(prepared.managedAuthPath)
+      const stable = await manager.deriveRecoveryProfilePreflight(projectPath, options)
+      expect(stable).toMatchObject({
+        projectPath: prepared.projectPath,
+        profileRootKey: prepared.profileRootKey,
+        projectBehaviorFingerprint: prepared.projectBehaviorFingerprint,
+        managedConfigFingerprint: buildManagedConfigFingerprint(prepared.managedConfig),
+        managedAuthFingerprint: prepared.managedAuthFingerprint,
+        sourceAuthFingerprint: prepared.sourceAuthFingerprint,
+        authState: prepared.authState,
+        providerEnvironmentFingerprint: prepared.providerEnvironmentFingerprint,
+      })
+
+      await writeFile(sourceAuthPath, JSON.stringify({
+        openai: { type: 'api', key: 'source-secret-b' },
+      }))
+      process.env.AWS_ROLE_ARN = 'arn:aws:iam::222222222222:role/drifted'
+      process.env.AWS_WEB_IDENTITY_TOKEN_FILE = '/tokens/drifted.jwt'
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        provider: { openai: { apiKey: 'config-secret-c' } },
+      })
+      const drifted = await manager.deriveRecoveryProfilePreflight(projectPath, options)
+      expect(drifted.sourceAuthFingerprint).not.toBe(stable.sourceAuthFingerprint)
+      expect(drifted.providerEnvironmentFingerprint).not.toBe(stable.providerEnvironmentFingerprint)
+      expect(drifted.managedConfigFingerprint).not.toBe(stable.managedConfigFingerprint)
+      expect(drifted.managedAuthFingerprint).toBe(stable.managedAuthFingerprint)
+      expect(drifted.authState).toBe('stale')
+      expect(await readFile(prepared.managedAuthPath)).toEqual(profileAAuthBytes)
+      expect(await readFile(providerLogPath).catch(() => Buffer.alloc(0))).toEqual(Buffer.alloc(0))
+      const persisted = await readFile(prepared.managedAuthPath, 'utf8')
+      expect(persisted).not.toContain('source-secret-b')
+      const { profile: _ephemeralProfile, ...durableIdentity } = drifted
+      expect(JSON.stringify(durableIdentity)).not.toContain('source-secret-b')
+      expect(JSON.stringify(durableIdentity)).not.toContain('config-secret-c')
+      expect(JSON.stringify(durableIdentity)).not.toContain('/tokens/drifted.jwt')
+    } finally {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key]
+      }
+      Object.assign(process.env, previous)
+    }
+  })
+
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
     expect(isKiroCliWhoamiAuthenticated({
       stdout: '{"accountType":"IamIdentityCenter","email":"user@example.com"}\n\nProfile:\nKiroProfile',

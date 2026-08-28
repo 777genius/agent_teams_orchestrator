@@ -163,6 +163,25 @@ export type OpenCodePreparedProfile = {
   env: NodeJS.ProcessEnv
 }
 
+/** Credential-free, read-only identity used to gate effectful recovery preparation. */
+export type OpenCodeRecoveryProfileIdentity = Pick<
+  OpenCodeSessionSuccessorRecoveryProfile,
+  | 'projectBehaviorFingerprint'
+  | 'behaviorSourcesFingerprint'
+  | 'providerEnvironmentFingerprint'
+  | 'managedConfigFingerprint'
+  | 'managedAuthFingerprint'
+  | 'sourceAuthFingerprint'
+  | 'authState'
+>
+
+export type OpenCodeRecoveryProfilePreflight = OpenCodeRecoveryProfileIdentity & {
+  projectPath: string
+  profileRootKey: string
+  /** Ephemeral only; never copied into the durable recovery recipe. */
+  profile: OpenCodePreparedProfile
+}
+
 /** Legacy compatibility profiles cannot carry scoped-policy proof fields. */
 export type OpenCodeCompatibilityPreparedProfile = OpenCodePreparedProfile & {
   scopeSchema?: never

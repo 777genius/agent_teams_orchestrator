@@ -11,7 +11,7 @@ import {
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import {
   buildManagedConfigFingerprint,
-  fingerprintOpenCodeScopedInheritedEnvironment,
+  fingerprintOpenCodeCompleteEnvironment,
 } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
@@ -59,7 +59,8 @@ function recoveryIdentityFor(
     projectBehaviorFingerprint: value.projectBehaviorFingerprint,
     behaviorSourcesFingerprint: createHash('sha256')
       .update(JSON.stringify([...value.behaviorSources].sort())).digest('hex'),
-    providerEnvironmentFingerprint: fingerprintOpenCodeScopedInheritedEnvironment(value.env),
+    providerEnvironmentFingerprint: value.providerEnvironmentFingerprint
+      ?? fingerprintOpenCodeCompleteEnvironment(value.env),
     managedConfigFingerprint: buildManagedConfigFingerprint(value.managedConfig),
     managedAuthFingerprint: value.managedAuthFingerprint,
     sourceAuthFingerprint: value.sourceAuthFingerprint,
@@ -67,6 +68,22 @@ function recoveryIdentityFor(
   }
   return { ...identity, identityDigest: createHash('sha256')
     .update(JSON.stringify(identity)).digest('hex') }
+}
+
+function recoveryPreflightFor(value: OpenCodePreparedProfile) {
+  const identity = recoveryIdentityFor(value)
+  return {
+    projectPath: value.projectPath,
+    profileRootKey: value.profileRootKey,
+    projectBehaviorFingerprint: identity.projectBehaviorFingerprint,
+    behaviorSourcesFingerprint: identity.behaviorSourcesFingerprint,
+    providerEnvironmentFingerprint: identity.providerEnvironmentFingerprint,
+    managedConfigFingerprint: identity.managedConfigFingerprint,
+    managedAuthFingerprint: identity.managedAuthFingerprint,
+    sourceAuthFingerprint: identity.sourceAuthFingerprint,
+    authState: identity.authState,
+    profile: value,
+  }
 }
 
 const host: OpenCodeHostHandle = {
@@ -1821,8 +1838,13 @@ describe('OpenCodeSessionBridge', () => {
       expect(persistedBytes).not.toContain('mcp-env-secret-sentinel')
 
       const ensuredProfiles: OpenCodePreparedProfile[] = []
+      let recoveryPrepareCalls = 0
       const restarted = new OpenCodeSessionBridge({
-        prepareProfile: async () => profileA,
+        deriveRecoveryProfilePreflight: async () => recoveryPreflightFor(profileA),
+        prepareProfile: async () => {
+          recoveryPrepareCalls += 1
+          throw new Error('stable recovery must use the read-only derived profile')
+        },
         sessionStore: store,
         hostManager: {
           ensureHost: async input => {
@@ -1846,6 +1868,7 @@ describe('OpenCodeSessionBridge', () => {
         managedConfigFingerprint: profileA.managedConfigFingerprint,
         managedAuthFingerprint: profileA.managedAuthFingerprint,
       })
+      expect(recoveryPrepareCalls).toBe(0)
       expect(creates).toBe(1)
     } finally {
       await rm(directory, { recursive: true, force: true })
@@ -1885,9 +1908,14 @@ describe('OpenCodeSessionBridge', () => {
       await expect(first.ensureSession(attemptA)).rejects.toThrow('recoverable durable lease transition')
 
       const ensured: Array<{ hostKey?: string | null; auth: string | null }> = []
+      let prepareProfileCalls = 0
+      const beforeMismatch = await readFile(path.join(directory, 'sessions.json'))
       const restarted = new OpenCodeSessionBridge({
-        // Current preparation is B even when recovery asks for the stored mode.
-        prepareProfile: async () => profileB,
+        deriveRecoveryProfilePreflight: async () => recoveryPreflightFor(profileB),
+        prepareProfile: async () => {
+          prepareProfileCalls += 1
+          throw new Error('provider preparation must not run after preflight mismatch')
+        },
         sessionStore: store,
         hostManager: {
           ensureHost: async input => {
@@ -1903,9 +1931,92 @@ describe('OpenCodeSessionBridge', () => {
         ...attemptA, preparedProfile: profileB, selectedModel: 'openai/model-b', runId: 'run-b',
       })).rejects.toThrow('protected inputs changed; recovery refused before host effects')
       expect(ensured).toEqual([])
+      expect(prepareProfileCalls).toBe(0)
+      expect(await readFile(path.join(directory, 'sessions.json'))).toEqual(beforeMismatch)
       expect(creates).toBe(1)
     } finally {
       await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('config and AWS credential environment drift reject before writes or provider calls', async () => {
+    const variants: Array<[string, (value: OpenCodePreparedProfile) => OpenCodePreparedProfile]> = [
+      ['config', value => ({
+        ...value,
+        managedConfig: { ...value.managedConfig, model: 'openai/drifted' },
+        managedConfigFingerprint: 'ignored-in-favor-of-config-bytes',
+      })],
+      ['AWS_ROLE_ARN', value => {
+        const env = { ...value.env, AWS_ROLE_ARN: 'arn:aws:iam::222222222222:role/drifted' }
+        return { ...value, env, providerEnvironmentFingerprint: fingerprintOpenCodeCompleteEnvironment(env) }
+      }],
+      ['AWS_WEB_IDENTITY_TOKEN_FILE', value => {
+        const env = { ...value.env, AWS_WEB_IDENTITY_TOKEN_FILE: '/tokens/drifted.jwt' }
+        return { ...value, env, providerEnvironmentFingerprint: fingerprintOpenCodeCompleteEnvironment(env) }
+      }],
+    ]
+    for (const [label, drift] of variants) {
+      const directory = await mkdtemp(path.join(os.tmpdir(), `opencode-preflight-${label}-`))
+      try {
+        const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+        const old = buildRecord({ hostKey: 'host-old', runId: 'run-old' })
+        await store.upsert(old)
+        const envA = {
+          AWS_ROLE_ARN: 'arn:aws:iam::111111111111:role/original',
+          AWS_WEB_IDENTITY_TOKEN_FILE: '/tokens/original.jwt',
+          HTTPS_PROXY: 'https://proxy-a.invalid',
+        }
+        const profileA: OpenCodePreparedProfile = {
+          ...profile,
+          env: envA,
+          providerEnvironmentFingerprint: fingerprintOpenCodeCompleteEnvironment(envA),
+        }
+        let creates = 0
+        const input = {
+          teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+          selectedModel: 'openai/model-a', projectPath: old.projectPath,
+          preparedProfile: profileA, runId: 'run-a', fresh: true,
+        }
+        const first = new OpenCodeSessionBridge({
+          prepareProfile: async () => profileA,
+          sessionStore: store,
+          hostManager: {
+            ensureHost: async prepared => ({ ...host, hostKey: prepared.hostKey ?? 'host-a',
+              profile: prepared.preparedProfile }),
+            releaseHost: async () => {},
+            retainHostLease: async () => { throw new Error('simulated restart') },
+            releaseHostLease: async () => 'applied',
+          },
+          clientFactory: { create: () => ({
+            createSession: async () => ({ id: `session-${++creates}` }),
+            deleteSession: async () => true,
+          } as never) },
+        })
+        await expect(first.ensureSession(input)).rejects.toThrow('recoverable durable lease transition')
+        const profileB = drift(profileA)
+        const bytesA = await readFile(path.join(directory, 'sessions.json'))
+        expect(bytesA.toString()).not.toContain(envA.AWS_ROLE_ARN)
+        expect(bytesA.toString()).not.toContain(envA.AWS_WEB_IDENTITY_TOKEN_FILE)
+        expect(bytesA.toString()).not.toContain(envA.HTTPS_PROXY)
+        let providerCalls = 0
+        const restarted = new OpenCodeSessionBridge({
+          deriveRecoveryProfilePreflight: async () => recoveryPreflightFor(profileB),
+          prepareProfile: async () => { providerCalls += 1; throw new Error('must not run') },
+          sessionStore: store,
+          hostManager: {
+            ensureHost: async () => { providerCalls += 1; throw new Error('must not run') },
+            releaseHost: async () => { providerCalls += 1 },
+          },
+          clientFactory: { create: () => { providerCalls += 1; throw new Error('must not run') } },
+        })
+        await expect(restarted.ensureSession(input)).rejects.toThrow(
+          'protected inputs changed; recovery refused before host effects',
+        )
+        expect(providerCalls).toBe(0)
+        expect(await readFile(path.join(directory, 'sessions.json'))).toEqual(bytesA)
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
     }
   })
 

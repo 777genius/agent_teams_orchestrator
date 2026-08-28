@@ -92,6 +92,7 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeRecoveryProfilePreflight,
   OpenCodeCurrentScopedProfilePlan,
   OpenCodeScopedPreparedProfile,
   OpenCodeScopedProfilePreparationInput,
@@ -3450,10 +3451,18 @@ export const OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST = [
   'ANTHROPIC_BASE_URL',
   'AWS_ACCESS_KEY_ID',
   'AWS_DEFAULT_REGION',
+  'AWS_CONFIG_FILE',
+  'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+  'AWS_EC2_METADATA_DISABLED',
+  'AWS_ROLE_ARN',
+  'AWS_ROLE_SESSION_NAME',
+  'AWS_SHARED_CREDENTIALS_FILE',
   'AWS_PROFILE',
   'AWS_REGION',
   'AWS_SECRET_ACCESS_KEY',
   'AWS_SESSION_TOKEN',
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
   'AZURE_OPENAI_API_KEY',
   'AZURE_OPENAI_ENDPOINT',
   'CEREBRAS_API_KEY',
@@ -3478,6 +3487,16 @@ export const OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST = [
   'TOGETHER_AI_API_KEY',
   'VERTEX_PROJECT',
   'XAI_API_KEY',
+  'ALL_PROXY',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'NO_PROXY',
+  'all_proxy',
+  'https_proxy',
+  'http_proxy',
+  'no_proxy',
+  'SSL_CERT_DIR',
+  'SSL_CERT_FILE',
 ] as const
 
 /** Non-provider variables required to execute a child without inheriting the app's whole environment. */
@@ -3504,11 +3523,20 @@ function selectScopedInheritedEnvironment(env: NodeJS.ProcessEnv): NodeJS.Proces
 }
 
 export function fingerprintOpenCodeScopedInheritedEnvironment(env: NodeJS.ProcessEnv): string {
-  // Digest exactly the inherited subset. This makes every caller-controlled
-  // byte passed to the provider runtime part of durable profile/host identity.
+  // Scoped children inherit only this exact deliberate subset.
   return canonicalFingerprint(Object.fromEntries(
     [...OPEN_CODE_SCOPED_EXECUTION_ENV_ALLOWLIST, ...OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST]
       .map(key => [key, env[key] ?? null]),
+  ))
+}
+
+export function fingerprintOpenCodeCompleteEnvironment(env: NodeJS.ProcessEnv): string {
+  // Legacy children inherit the complete final object. Sort keys and retain
+  // only an opaque digest so no credential value enters durable state.
+  return canonicalFingerprint(Object.fromEntries(
+    Object.entries(env)
+      .filter((entry): entry is [string, string] => entry[1] !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right)),
   ))
 }
 
@@ -5130,6 +5158,199 @@ export class OpenCodeProfileManager {
     }
   }
 
+  /** Read-only legacy recovery derivation; it must remain free of publication and probes. */
+  async deriveRecoveryProfilePreflight(
+    projectPath?: string | null,
+    options: OpenCodePrepareProfileOptions = {},
+  ): Promise<OpenCodeRecoveryProfilePreflight> {
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectIdentity(
+      this.getProjectPath(projectPath),
+      { platform: this.platform, signal: options.abortSignal, allowMissing: true },
+    )
+    const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
+    const profileRootPath = path.join(this.paths.data, 'opencode', 'profiles', profileRootKey)
+    const { projectBehaviorFingerprint, behaviorSources } =
+      await collectProjectBehaviorMetadata(resolvedProjectPath)
+    const [managedRuntimePreferences, globalRuntimePreferences, importedRuntimeConfig] =
+      await Promise.all([
+        readOpenCodeManagedRuntimePreferences(profileRootPath),
+        readOpenCodeGlobalManagedRuntimePreferences(this.paths.data),
+        readSafeOpenCodeRuntimeConfigImport(process.env),
+      ])
+    const effectiveManagedDefaultModelId = managedRuntimePreferences.defaultModelId
+      ?? globalRuntimePreferences.defaultModelId
+    const effectiveManagedDefaultSource = managedRuntimePreferences.defaultModelId
+      ? 'project' as const
+      : globalRuntimePreferences.defaultModelId ? 'all_projects' as const : null
+    const importedConfigDefaultModelId = typeof importedRuntimeConfig.model === 'string'
+      ? importedRuntimeConfig.model.trim() || null : null
+    const effectiveModelLimitOverrides = {
+      ...globalRuntimePreferences.modelLimitOverrides,
+      ...managedRuntimePreferences.modelLimitOverrides,
+    }
+    const appMcpConfig = options.includeAppMcp === false
+      ? null
+      : await this.resolveManagedAppMcpConfig()
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
+    const managedConfig = deepMergeOpenCodeConfig(
+      importedRuntimeConfig,
+      buildManagedConfig(appMcpConfig, {
+        allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
+        defaultModelId: effectiveManagedDefaultModelId,
+        toolApprovalMode: options.toolApprovalMode,
+      }),
+    )
+    applyOpenCodeModelLimitOverrides(managedConfig, [
+      ...Object.entries(effectiveModelLimitOverrides).map(([modelId, override]) => ({
+        modelId,
+        contextTokens: override.contextTokens,
+        outputTokens: override.outputTokens,
+      })),
+      ...(options.modelOutputLimitOverrides ?? []),
+    ])
+    if (options.includeManagedSubscriptionPlugins !== false) {
+      applyOpenCodeManagedSubscriptionPlugins(managedConfig)
+    }
+    applyManagedPathEnvironmentToMcpConfig(managedConfig, {
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+    })
+
+    const homePath = path.join(profileRootPath, 'home')
+    const tmpPath = path.join(profileRootPath, 'tmp')
+    const xdgConfigHome = path.join(profileRootPath, 'config')
+    const xdgDataHome = path.join(profileRootPath, 'data')
+    const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
+    const sharedToolCachePath = path.join(xdgCacheHome, 'tools')
+    const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
+    const globalAuthPath = this.getGlobalAuthPath()
+    const sourceAuthSources = await Promise.all(this.getSourceAuthPaths().map(async sourcePath => {
+      const exists = await fileExists(sourcePath)
+      return { path: sourcePath, fingerprint: exists ? await readFingerprint(sourcePath) : null }
+    }))
+    const globalAuthExists = await fileExists(globalAuthPath)
+    const globalAuthFingerprint = globalAuthExists ? await readFingerprint(globalAuthPath) : null
+    const sourceAuthFingerprint = sourceAuthSources.some(source => source.fingerprint)
+      ? hashString(sourceAuthSources.filter(source => source.fingerprint)
+        .map(source => `${source.path}:${source.fingerprint}`).join('\n'))
+      : null
+    const authSourcePaths = orderOpenCodeAuthSyncSources({
+      globalAuthPath, globalAuthFingerprint, sourceAuthSources,
+    })
+    const peerManagedAuthPaths = Array.from(new Set([
+      managedAuthPath,
+      ...(await this.listManagedAuthPaths()),
+    ]))
+    const [currentManagedAuth, sourceStores, peerStores] = await Promise.all([
+      readOpenCodeAuthStore(managedAuthPath),
+      Promise.all(authSourcePaths.map(readOpenCodeAuthStore)),
+      Promise.all(peerManagedAuthPaths.map(readOpenCodeAuthStore)),
+    ])
+    let expectedManagedAuth = mergeOpenCodeManagedAuthSources({
+      sourceAuthPaths: authSourcePaths, sourceStores, globalAuthPath,
+    })
+    for (const providerId of Object.keys(expectedManagedAuth)) {
+      if (expectedManagedAuth[providerId]?.type !== 'oauth') continue
+      for (const peerStore of peerStores) {
+        const candidate = peerStore[providerId]
+        if (candidate?.type !== 'oauth') continue
+        const current = expectedManagedAuth[providerId]
+        const currentExpires = typeof current?.expires === 'number'
+          && Number.isFinite(current.expires) && current.expires >= 0 ? current.expires : null
+        const candidateExpires = typeof candidate.expires === 'number'
+          && Number.isFinite(candidate.expires) && candidate.expires >= 0 ? candidate.expires : null
+        if (currentExpires !== null && candidateExpires !== null
+          && candidateExpires > currentExpires) {
+          expectedManagedAuth = { ...expectedManagedAuth, [providerId]: candidate }
+        }
+      }
+    }
+    const currentManagedAuthFingerprint = await readFingerprint(managedAuthPath)
+    const authInputsMatchMaterialized = JSON.stringify(expectedManagedAuth)
+      === JSON.stringify(currentManagedAuth)
+    const managedAuthFingerprint = currentManagedAuthFingerprint
+    const authState = !managedAuthFingerprint
+      ? 'missing' as const
+      : authInputsMatchMaterialized ? 'ok' as const : 'stale' as const
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: homePath,
+      USERPROFILE: homePath,
+      TMPDIR: tmpPath,
+      TMP: tmpPath,
+      TEMP: tmpPath,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      XDG_DATA_HOME: xdgDataHome,
+      XDG_CACHE_HOME: xdgCacheHome,
+      NPM_CONFIG_CACHE: path.join(xdgCacheHome, 'npm'),
+      PLAYWRIGHT_BROWSERS_PATH: path.join(sharedToolCachePath, 'ms-playwright'),
+      PUPPETEER_CACHE_DIR: path.join(sharedToolCachePath, 'puppeteer'),
+      PIP_CACHE_DIR: path.join(sharedToolCachePath, 'pip'),
+      UV_CACHE_DIR: path.join(sharedToolCachePath, 'uv'),
+      npm_config_devdir: path.join(sharedToolCachePath, 'node-gyp'),
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+      OPENCODE_DISABLE_CLAUDE_CODE: '1',
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
+    }
+    if (options.includeManagedSubscriptionPlugins !== false) {
+      const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
+      const bridgeSuffix = this.platform === 'win32' ? '.cmd' : ''
+      env.PATH = [binPath, process.env.PATH]
+        .filter((value): value is string => Boolean(value)).join(path.delimiter)
+      env.CURSOR_ACP_HOME_DIR = process.env.CURSOR_ACP_HOME_DIR?.trim()
+        || ((this.platform === 'win32'
+          ? process.env.USERPROFILE?.trim() || process.env.HOME?.trim()
+          : process.env.HOME?.trim() || process.env.USERPROFILE?.trim()) || os.homedir())
+      env.CURSOR_AGENT_EXECUTABLE = path.join(binPath, `cursor-agent${bridgeSuffix}`)
+    }
+    delete env.OPENCODE_CONFIG
+    const finalEnv = applyOpenCodeAutoUpdatePolicy(env)
+    const providerEnvironmentFingerprint = fingerprintOpenCodeCompleteEnvironment(finalEnv)
+    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
+    const profile: OpenCodePreparedProfile = {
+      projectPath: resolvedProjectPath,
+      profileRootKey,
+      profileRootPath,
+      projectDefaultModelId: managedRuntimePreferences.defaultModelId,
+      allProjectsDefaultModelId: globalRuntimePreferences.defaultModelId,
+      importedConfigDefaultModelId,
+      effectiveManagedDefaultModelId,
+      effectiveManagedDefaultSource,
+      projectBehaviorFingerprint,
+      behaviorSources,
+      managedConfig,
+      managedConfigFingerprint,
+      providerEnvironmentFingerprint,
+      homePath,
+      tmpPath,
+      xdgConfigHome,
+      xdgDataHome,
+      xdgCacheHome,
+      globalAuthPath,
+      managedAuthPath,
+      sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
+      managedAuthFingerprint,
+      sourceAuthFingerprint,
+      authState,
+      env: finalEnv,
+    }
+    return {
+      projectPath: resolvedProjectPath,
+      profileRootKey,
+      projectBehaviorFingerprint,
+      behaviorSourcesFingerprint: hashString(JSON.stringify([...behaviorSources].sort())),
+      providerEnvironmentFingerprint,
+      managedConfigFingerprint,
+      managedAuthFingerprint,
+      sourceAuthFingerprint,
+      authState,
+      profile,
+    }
+  }
+
   /** @deprecated Compatibility only; scoped callers must use prepareScopedProfile. */
   async prepareProfile(
     projectPath?: string | null,
@@ -5166,7 +5387,6 @@ export class OpenCodeProfileManager {
       ...managedRuntimePreferences.modelLimitOverrides,
     }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
-    const providerEnvironmentFingerprint = fingerprintOpenCodeScopedInheritedEnvironment(process.env)
     const importedConfigDefaultModelId =
       typeof importedRuntimeConfig.model === 'string'
         ? importedRuntimeConfig.model.trim() || null
@@ -5348,7 +5568,9 @@ export class OpenCodeProfileManager {
       behaviorSources,
       managedConfig,
       managedConfigFingerprint,
-      providerEnvironmentFingerprint,
+      providerEnvironmentFingerprint: fingerprintOpenCodeCompleteEnvironment(
+        applyOpenCodeAutoUpdatePolicy(env),
+      ),
       homePath,
       tmpPath,
       xdgConfigHome,

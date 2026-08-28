@@ -13,7 +13,7 @@ import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinat
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import {
   buildManagedConfigFingerprint,
-  fingerprintOpenCodeScopedInheritedEnvironment,
+  fingerprintOpenCodeCompleteEnvironment,
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -27,6 +27,7 @@ import type {
   OpenCodeMessage,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeRecoveryProfilePreflight,
   OpenCodeSessionRecord,
   OpenCodeSessionSuccessorRecoveryProfile,
   OpenCodeSessionPreviewSummary,
@@ -72,6 +73,10 @@ type OpenCodeSessionBridgeDeps = {
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
   ) => Promise<OpenCodePreparedProfile>
+  deriveRecoveryProfilePreflight?: (
+    projectPath?: string | null,
+    options?: OpenCodePrepareProfileOptions,
+  ) => Promise<OpenCodeRecoveryProfilePreflight>
   fanOutOAuthCredential?: (input: {
     providerId: string
     sourceAuthPath: string
@@ -183,7 +188,8 @@ function buildSuccessorRecoveryIdentity(
   profile: OpenCodePreparedProfile,
   toolApprovalMode: OpenCodeToolApprovalMode,
 ): OpenCodeSessionSuccessorRecoveryProfile {
-  const providerEnvironmentFingerprint = fingerprintOpenCodeScopedInheritedEnvironment(profile.env)
+  const providerEnvironmentFingerprint = profile.providerEnvironmentFingerprint
+    ?? fingerprintOpenCodeCompleteEnvironment(profile.env)
   const identity = {
     version: 2 as const,
     recipe: { toolApprovalMode },
@@ -194,6 +200,24 @@ function buildSuccessorRecoveryIdentity(
     managedAuthFingerprint: profile.managedAuthFingerprint,
     sourceAuthFingerprint: profile.sourceAuthFingerprint,
     authState: profile.authState,
+  }
+  return { ...identity, identityDigest: hashText(JSON.stringify(identity)) }
+}
+
+function buildSuccessorRecoveryIdentityFromPreflight(
+  preflight: OpenCodeRecoveryProfilePreflight,
+  toolApprovalMode: OpenCodeToolApprovalMode,
+): OpenCodeSessionSuccessorRecoveryProfile {
+  const identity = {
+    version: 2 as const,
+    recipe: { toolApprovalMode },
+    projectBehaviorFingerprint: preflight.projectBehaviorFingerprint,
+    behaviorSourcesFingerprint: preflight.behaviorSourcesFingerprint,
+    providerEnvironmentFingerprint: preflight.providerEnvironmentFingerprint,
+    managedConfigFingerprint: preflight.managedConfigFingerprint,
+    managedAuthFingerprint: preflight.managedAuthFingerprint,
+    sourceAuthFingerprint: preflight.sourceAuthFingerprint,
+    authState: preflight.authState,
   }
   return { ...identity, identityDigest: hashText(JSON.stringify(identity)) }
 }
@@ -411,6 +435,34 @@ export class OpenCodeSessionBridge {
     return prepareProfile(projectPath, options)
   }
 
+  private async deriveRecoveryProfilePreflight(
+    projectPath: string,
+    options: OpenCodePrepareProfileOptions,
+  ): Promise<OpenCodeRecoveryProfilePreflight> {
+    if (this.deps.deriveRecoveryProfilePreflight) {
+      return this.deps.deriveRecoveryProfilePreflight(projectPath, options)
+    }
+    if (!this.deps.prepareProfile) {
+      return openCodeProfileManager.deriveRecoveryProfilePreflight(projectPath, options)
+    }
+    // Compatibility for older injected test adapters. Production cannot take
+    // this branch; recovery mismatch tests inject the read-only seam directly.
+    const profile = await this.deps.prepareProfile(projectPath, options)
+    return {
+      projectPath: profile.projectPath,
+      profileRootKey: profile.profileRootKey,
+      projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      behaviorSourcesFingerprint: hashText(JSON.stringify([...profile.behaviorSources].sort())),
+      providerEnvironmentFingerprint: profile.providerEnvironmentFingerprint
+        ?? fingerprintOpenCodeCompleteEnvironment(profile.env),
+      managedConfigFingerprint: buildManagedConfigFingerprint(profile.managedConfig),
+      managedAuthFingerprint: profile.managedAuthFingerprint,
+      sourceAuthFingerprint: profile.sourceAuthFingerprint,
+      authState: profile.authState,
+      profile,
+    }
+  }
+
   private sessionProfileMatchesStoredConfig(
     record: OpenCodeSessionRecord,
     profile: OpenCodePreparedProfile,
@@ -473,20 +525,22 @@ export class OpenCodeSessionBridge {
     )) {
       throw new Error('OpenCode durable successor recovery profile authority is invalid')
     }
-    const rederived = await this.prepareProfile(record.projectPath, {
+    const recoveryOptions = {
       toolApprovalMode: authority.recipe.toolApprovalMode,
-    })
-    const observed = buildSuccessorRecoveryIdentity(
-      rederived, authority.recipe.toolApprovalMode)
-    if (!hasExactSuccessorRecoveryIdentity(authority, observed)) {
+    } as const
+    const preflight = await this.deriveRecoveryProfilePreflight(record.projectPath, recoveryOptions)
+    const preflightIdentity = buildSuccessorRecoveryIdentityFromPreflight(
+      preflight, authority.recipe.toolApprovalMode)
+    if (!hasExactSuccessorRecoveryIdentity(authority, preflightIdentity)) {
       throw new Error(
-        'OpenCode durable successor recovery protected inputs changed; recovery refused before host effects',
+        'OpenCode durable successor recovery protected inputs changed; recovery refused before host effects or profile preparation',
       )
     }
-    if (rederived.profileRootKey !== record.profileRootKey) {
-      throw new Error('OpenCode durable successor recovery profile root identity changed')
+    if (preflight.profileRootKey !== record.profileRootKey
+      || preflight.projectPath !== record.projectPath) {
+      throw new Error('OpenCode durable successor recovery profile root identity changed before profile effects')
     }
-    return rederived
+    return preflight.profile
   }
 
   private buildSessionProfileStaleReason(
