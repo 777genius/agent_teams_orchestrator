@@ -179,4 +179,52 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(authority).toContain('pending.sync_all().map_err(|_| "ROOT_STATE")?')
     expect(identity).not.toContain('symlink_metadata')
   })
+
+  test('retains the identical namespace authority until rename, unlink, and tree removal succeed', async () => {
+    const [publication, identity] = await Promise.all([
+      readFile('native/opencode-catalog-authority/src/windows_publication.rs', 'utf8'),
+      readFile(identityPath, 'utf8'),
+    ])
+    const rename = publication.slice(
+      publication.indexOf('fn namespace_rename'),
+      publication.indexOf('fn namespace_unlink'),
+    )
+    const unlink = publication.slice(
+      publication.indexOf('fn namespace_unlink'),
+      publication.indexOf('fn namespace_sync_directory'),
+    )
+    const removeTree = publication.slice(
+      publication.indexOf('fn collect_tree_removals'),
+      publication.indexOf('fn namespace_acquire_lock'),
+    )
+
+    expect(rename).toContain('.try_clone()')
+    expect(rename).not.toContain('namespace_directories.remove(')
+    expect(rename.indexOf('rename_relative(')).toBeLessThan(
+      rename.indexOf('self.namespace_directories[index].0 = to.to_string()'),
+    )
+    expect(unlink).toContain('.try_clone()')
+    expect(unlink).not.toContain('namespace_directories.remove(')
+    expect(unlink.indexOf('delete_on_close(&file)')).toBeLessThan(
+      unlink.indexOf('self.namespace_directories\n            .retain('),
+    )
+    expect(removeTree.indexOf('collect_tree_removals(&parent')).toBeLessThan(
+      removeTree.indexOf('fail_namespace_mutation_boundary("remove_tree_before_transition")'),
+    )
+    expect(
+      removeTree.indexOf('fail_namespace_mutation_boundary("remove_tree_before_transition")'),
+    ).toBeLessThan(removeTree.indexOf('delete_on_close(&removal.file)'))
+    expect(removeTree.indexOf('delete_on_close(&removal.file)')).toBeLessThan(
+      removeTree.indexOf('self.namespace_handles\n                .retain('),
+    )
+    expect(identity).toContain('pub(super) fn open_relative_directory_for_mutation(')
+    for (const fixture of [
+      'namespace_rename_collision_retains_exact_custody_through_rollback',
+      'namespace_unlink_failure_retains_exact_custody_through_rollback',
+      'namespace_remove_tree_failure_retains_exact_custody_and_retry_cleans_up',
+      'namespace_mutation_success_paths_release_only_after_transition',
+    ]) {
+      expect(publication).toContain(`fn ${fixture}()`)
+    }
+  })
 })

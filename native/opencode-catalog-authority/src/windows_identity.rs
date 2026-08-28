@@ -347,6 +347,23 @@ pub(super) fn open_relative_directory_for_delete(
     Ok(file)
 }
 
+/// Retain an existing owned namespace directory with the mutation rights
+/// required for handle-bound rename and rollback. Its share mask is the same
+/// exclusive authority mask used at creation; this never reopens a directory
+/// after custody has been released.
+pub(super) fn open_relative_directory_for_mutation(
+    parent: &File,
+    component: &Path,
+) -> Result<(File, bool), ()> {
+    let (file, created) =
+        open_relative_directory_with_disposition(parent, component, 1, true, true, false)?
+            .ok_or(())?;
+    if created {
+        return Err(());
+    }
+    Ok((file, false))
+}
+
 pub(super) fn create_relative_file(parent: &File, component: &Path) -> Result<File, ()> {
     open_relative_file_with_disposition(parent, component, 2, true)?.ok_or(())
 }

@@ -190,6 +190,12 @@ struct RetainedWindowsRoot {
     )>,
 }
 
+struct NamespaceTreeRemoval {
+    key: String,
+    file: std::fs::File,
+    parent: std::fs::File,
+}
+
 struct AtomicPublication {
     final_name: String,
     temporary_name: String,
@@ -239,6 +245,30 @@ fn fail_atomic_cleanup_boundary(boundary: &'static str) -> Result<(), &'static s
 
 #[cfg(not(test))]
 fn fail_atomic_cleanup_boundary(_boundary: &'static str) -> Result<(), &'static str> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_MUTATION_FAILPOINT: std::cell::RefCell<Option<&'static str>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn fail_namespace_mutation_boundary(boundary: &'static str) -> Result<(), &'static str> {
+    NAMESPACE_MUTATION_FAILPOINT.with(|point| {
+        if point.borrow().as_ref() == Some(&boundary) {
+            point.replace(None);
+            Err("INJECTED_NAMESPACE_FAILURE")
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fail_namespace_mutation_boundary(_boundary: &'static str) -> Result<(), &'static str> {
     Ok(())
 }
 
@@ -440,10 +470,9 @@ impl RetainedWindowsRoot {
                 identity = *expected;
                 continue;
             }
-            let (opened, created) = crate::windows_identity::open_relative_directory(
+            let (opened, created) = crate::windows_identity::open_relative_directory_for_mutation(
                 &parent,
                 Path::new(component),
-                false,
             )
             .map_err(|_| "FILE_REJECTED")?;
             if created {
@@ -690,12 +719,18 @@ impl RetainedWindowsRoot {
                 .try_clone()
                 .map_err(|_| "FILE_REJECTED")?
         } else if let Some(index) = retained_index {
-            self.namespace_directories.remove(index).1
+            // Duplicate the exact retained file object. The original remains
+            // in the authority map until the rename has succeeded, so every
+            // collision/OS failure returns with identical custody and never
+            // reopens the staging directory by pathname.
+            self.namespace_directories[index]
+                .1
+                .try_clone()
+                .map_err(|_| "FILE_REJECTED")?
         } else {
-            match crate::windows_identity::open_relative_directory(
+            match crate::windows_identity::open_relative_directory_for_mutation(
                 &source_parent,
                 Path::new(from_name),
-                false,
             ) {
                 Ok((file, false)) => file,
                 _ => crate::windows_identity::open_relative_file(
@@ -729,14 +764,16 @@ impl RetainedWindowsRoot {
             !source_is_directory,
         )
         .map_err(|_| "FILE_REJECTED")?;
+        if let Some(index) = retained_index {
+            self.namespace_directories[index].0 = to.to_string();
+        } else if source_is_directory {
+            self.namespace_directories
+                .push((to.to_string(), source, source_identity));
+        }
         crate::windows_identity::flush_directory(&source_parent).map_err(|_| "FILE_REJECTED")?;
         if from_parent != to_parent {
             crate::windows_identity::flush_directory(&destination_parent)
                 .map_err(|_| "FILE_REJECTED")?;
-        }
-        if source_is_directory {
-            self.namespace_directories
-                .push((to.to_string(), source, source_identity));
         }
         let descendant_prefix = format!("{from}/");
         for (_, key, _, _, _) in &mut self.namespace_handles {
@@ -762,11 +799,19 @@ impl RetainedWindowsRoot {
             .iter()
             .position(|(key, _, _)| key == path);
         let file = if directory && retained_index.is_some() {
-            self.namespace_directories.remove(retained_index.unwrap()).1
+            // Keep the original authority entry alive until disposition is
+            // accepted. If Windows rejects a non-empty directory, dropping
+            // this duplicate cannot create a writer gap.
+            self.namespace_directories[retained_index.unwrap()]
+                .1
+                .try_clone()
+                .map_err(|_| "FILE_REJECTED")?
         } else if directory {
-            let (file, created) =
-                crate::windows_identity::open_relative_directory(&parent, Path::new(name), false)
-                    .map_err(|_| "FILE_REJECTED")?;
+            let (file, created) = crate::windows_identity::open_relative_directory_for_mutation(
+                &parent,
+                Path::new(name),
+            )
+            .map_err(|_| "FILE_REJECTED")?;
             if created {
                 return Err("FILE_REJECTED");
             }
@@ -782,10 +827,10 @@ impl RetainedWindowsRoot {
                 "FILE_REJECTED"
             }
         })?;
-        drop(file);
-        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         self.namespace_directories
             .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
+        drop(file);
+        crate::windows_identity::flush_directory(&parent).map_err(|_| "FILE_REJECTED")?;
         Ok(json!({}))
     }
 
@@ -906,41 +951,100 @@ impl RetainedWindowsRoot {
         result
     }
 
-    fn remove_tree_entry(
+    fn collect_tree_removals(
+        &self,
         parent: &std::fs::File,
         name: &str,
+        key: &str,
         depth: usize,
+        removals: &mut Vec<NamespaceTreeRemoval>,
     ) -> Result<(), &'static str> {
         if !valid_leaf(name) || depth > 256 {
             return Err("LEAF_REJECTED");
         }
-        if let Ok(directory) =
+        let retained_directory = self
+            .namespace_directories
+            .iter()
+            .find(|(candidate, _, _)| candidate == key)
+            .map(|(_, file, identity)| (file, *identity))
+            .or_else(|| {
+                self.namespace_handles
+                    .iter()
+                    .find(|(_, candidate, _, _, directory)| *directory && candidate == key)
+                    .map(|(_, _, file, identity, _)| (file, *identity))
+            });
+        let directory = if let Some((file, identity)) = retained_directory {
+            validate_retained_directory(file, identity)?;
+            Some(file.try_clone().map_err(|_| "FILE_REJECTED")?)
+        } else {
             crate::windows_identity::open_relative_directory_for_delete(parent, Path::new(name))
-        {
+                .ok()
+        };
+        if let Some(directory) = directory {
             let names = crate::windows_identity::list_relative_names(&directory)
                 .map_err(|_| "FILE_REJECTED")?;
             for child in names {
-                Self::remove_tree_entry(&directory, &child, depth + 1)?;
+                let child_key = format!("{key}/{child}");
+                self.collect_tree_removals(&directory, &child, &child_key, depth + 1, removals)?;
             }
-            crate::windows_identity::delete_on_close(&directory).map_err(|_| "NS_NOT_EMPTY")?;
-            drop(directory);
+            removals.push(NamespaceTreeRemoval {
+                key: key.to_string(),
+                file: directory,
+                parent: parent.try_clone().map_err(|_| "FILE_REJECTED")?,
+            });
         } else {
-            let file = crate::windows_identity::open_relative_file(parent, Path::new(name))
-                .map_err(|_| "NS_NOT_FOUND")?;
-            crate::windows_identity::delete_on_close(&file).map_err(|_| "FILE_REJECTED")?;
-            drop(file);
+            let file = if let Some((_, _, file, identity, directory)) = self
+                .namespace_handles
+                .iter()
+                .find(|(_, candidate, _, _, directory)| !*directory && candidate == key)
+            {
+                if *directory
+                    || crate::windows_identity::file_identity(file).map_err(|_| "FILE_REJECTED")?
+                        != *identity
+                    || file
+                        .metadata()
+                        .map_err(|_| "FILE_REJECTED")?
+                        .file_attributes()
+                        & FILE_ATTRIBUTE_REPARSE_POINT
+                        != 0
+                {
+                    return Err("FILE_REJECTED");
+                }
+                file.try_clone().map_err(|_| "FILE_REJECTED")?
+            } else {
+                crate::windows_identity::open_relative_file(parent, Path::new(name))
+                    .map_err(|_| "NS_NOT_FOUND")?
+            };
+            removals.push(NamespaceTreeRemoval {
+                key: key.to_string(),
+                file,
+                parent: parent.try_clone().map_err(|_| "FILE_REJECTED")?,
+            });
         }
-        crate::windows_identity::flush_directory(parent).map_err(|_| "FILE_REJECTED")
+        Ok(())
     }
 
     fn namespace_remove_tree(&mut self, path: &str) -> Result<Value, &'static str> {
         let (parent_key, name) = Self::namespace_parent(path)?;
-        self.namespace_handles
-            .retain(|(_, key, _, _, _)| key != path && !key.starts_with(&format!("{path}/")));
-        self.namespace_directories
-            .retain(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/")));
         let (parent, _) = self.namespace_directory(parent_key)?;
-        Self::remove_tree_entry(&parent, name, 0)?;
+        let mut removals = Vec::new();
+        self.collect_tree_removals(&parent, name, path, 0, &mut removals)?;
+        fail_namespace_mutation_boundary("remove_tree_before_transition")?;
+        // Postorder means every child transition is confirmed before its
+        // parent is attempted. The exact retained file object stays in the
+        // authority vectors until its own delete disposition succeeds; the
+        // still-retained tree root continues denying competing writers across
+        // any descendant failure.
+        for removal in removals {
+            crate::windows_identity::delete_on_close(&removal.file).map_err(|_| "FILE_REJECTED")?;
+            self.namespace_handles
+                .retain(|(_, key, _, _, _)| key != &removal.key);
+            self.namespace_directories
+                .retain(|(key, _, _)| key != &removal.key);
+            drop(removal.file);
+            crate::windows_identity::flush_directory(&removal.parent)
+                .map_err(|_| "FILE_REJECTED")?;
+        }
         Ok(json!({}))
     }
 
@@ -3249,6 +3353,7 @@ pub fn run() {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
 
     fn fixture_root(label: &str) -> PathBuf {
         let base = PathBuf::from(
@@ -3310,6 +3415,142 @@ mod protocol_tests {
         let compatible = open_volume_directory(&root, false).unwrap();
         drop(compatible);
         drop(blocker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_competing_child_writer_is_denied(directory: &Path) {
+        let child = directory.join("same-user-watcher");
+        assert!(std::fs::create_dir(&child).is_err());
+        assert!(!child.exists());
+    }
+
+    fn assert_namespace_path_released(authority: &RetainedWindowsRoot, path: &str) {
+        assert!(authority
+            .namespace_directories
+            .iter()
+            .all(|(key, _, _)| key != path && !key.starts_with(&format!("{path}/"))));
+        assert!(authority
+            .namespace_handles
+            .iter()
+            .all(|(_, key, _, _, _)| key != path && !key.starts_with(&format!("{path}/"))));
+    }
+
+    fn retained_directory_raw_handle(authority: &RetainedWindowsRoot, path: &str) -> RawHandle {
+        authority
+            .namespace_directories
+            .iter()
+            .find(|(key, _, _)| key == path)
+            .expect("fixture directory must remain retained")
+            .1
+            .as_raw_handle()
+    }
+
+    #[test]
+    fn namespace_rename_collision_retains_exact_custody_through_rollback() {
+        let root = fixture_root("namespace-rename-failure-atomic");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority.namespace_mkdir("staging").unwrap();
+        authority.namespace_mkdir("published").unwrap();
+        let retained = retained_directory_raw_handle(&authority, "staging");
+
+        assert_eq!(
+            authority.namespace_rename("staging", "published"),
+            Err("NS_EXISTS")
+        );
+        assert_eq!(
+            retained_directory_raw_handle(&authority, "staging"),
+            retained
+        );
+        assert_competing_child_writer_is_denied(&root.join("staging"));
+
+        authority.namespace_remove_tree("staging").unwrap();
+        assert!(!root.join("staging").exists());
+        assert_namespace_path_released(&authority, "staging");
+        authority.namespace_remove_tree("published").unwrap();
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespace_unlink_failure_retains_exact_custody_through_rollback() {
+        let root = fixture_root("namespace-unlink-failure-atomic");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority.namespace_mkdir("staging").unwrap();
+        authority.namespace_mkdir("staging/owned-child").unwrap();
+        let retained = retained_directory_raw_handle(&authority, "staging");
+
+        assert_eq!(
+            authority.namespace_unlink("staging", true),
+            Err("NS_NOT_EMPTY")
+        );
+        assert_eq!(
+            retained_directory_raw_handle(&authority, "staging"),
+            retained
+        );
+        assert_competing_child_writer_is_denied(&root.join("staging"));
+
+        authority.namespace_remove_tree("staging").unwrap();
+        assert!(!root.join("staging").exists());
+        assert_namespace_path_released(&authority, "staging");
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespace_remove_tree_failure_retains_exact_custody_and_retry_cleans_up() {
+        let root = fixture_root("namespace-remove-tree-failure-atomic");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority.namespace_mkdir("staging").unwrap();
+        authority.namespace_mkdir("staging/owned-child").unwrap();
+        let retained = retained_directory_raw_handle(&authority, "staging");
+
+        NAMESPACE_MUTATION_FAILPOINT
+            .with(|point| point.replace(Some("remove_tree_before_transition")));
+        assert_eq!(
+            authority.namespace_remove_tree("staging"),
+            Err("INJECTED_NAMESPACE_FAILURE")
+        );
+        assert_eq!(
+            retained_directory_raw_handle(&authority, "staging"),
+            retained
+        );
+        assert_competing_child_writer_is_denied(&root.join("staging"));
+
+        authority.namespace_remove_tree("staging").unwrap();
+        assert!(!root.join("staging").exists());
+        assert_namespace_path_released(&authority, "staging");
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespace_mutation_success_paths_release_only_after_transition() {
+        let root = fixture_root("namespace-mutation-success-cleanup");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+
+        authority.namespace_mkdir("rename-source").unwrap();
+        authority
+            .namespace_rename("rename-source", "renamed")
+            .unwrap();
+        assert!(!root.join("rename-source").exists());
+        assert!(root.join("renamed").is_dir());
+        assert_namespace_path_released(&authority, "rename-source");
+
+        authority.namespace_unlink("renamed", true).unwrap();
+        assert!(!root.join("renamed").exists());
+        assert_namespace_path_released(&authority, "renamed");
+
+        authority.namespace_mkdir("tree").unwrap();
+        authority.namespace_mkdir("tree/child").unwrap();
+        authority.namespace_remove_tree("tree").unwrap();
+        assert!(!root.join("tree").exists());
+        assert_namespace_path_released(&authority, "tree");
+
+        drop(authority);
         std::fs::remove_dir_all(root).unwrap();
     }
 
