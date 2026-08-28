@@ -1631,6 +1631,184 @@ describe('OpenCodeSessionBridge', () => {
     expect(creates).toBe(2)
   })
 
+  test('restart recovers a stored successor with profile A before creating requested profile B', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-profile-recovery-'))
+    try {
+      const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+      const old = buildRecord({ hostKey: 'host-old', runId: 'run-old' })
+      await store.upsert(old)
+      const profileA: OpenCodePreparedProfile = {
+        ...profile,
+        projectBehaviorFingerprint: 'behavior-a',
+        managedAuthFingerprint: 'managed-auth-a',
+        managedConfigFingerprint: 'managed-config-a',
+      }
+      const profileB: OpenCodePreparedProfile = {
+        ...profile,
+        projectBehaviorFingerprint: 'behavior-b',
+        managedAuthFingerprint: 'managed-auth-b',
+        managedConfig: {
+          ...profile.managedConfig,
+          agent: { teammate: { permission: { '*': 'ask' } } },
+        },
+        managedConfigFingerprint: 'managed-config-b',
+      }
+      const hostFor = (prepared: OpenCodePreparedProfile): OpenCodeHostHandle => ({
+        ...host,
+        hostKey: prepared === profileA ? 'host-a' : 'host-b',
+        projectBehaviorFingerprint: prepared.projectBehaviorFingerprint,
+        profile: prepared,
+      })
+      let creates = 0
+      const clientFactory = { create: () => ({
+        createSession: async () => ({ id: `session-${++creates === 1 ? 'a' : 'b'}` }),
+        deleteSession: async () => true,
+      } as never) }
+      const first = new OpenCodeSessionBridge({
+        prepareProfile: async () => profileA,
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async input => hostFor(input.preparedProfile),
+          releaseHost: async () => {},
+          retainHostLease: async () => { throw new Error('simulated restart') },
+          releaseHostLease: async () => 'applied',
+        },
+        clientFactory,
+      })
+      const attemptA = {
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: 'openai/model-a', projectPath: old.projectPath,
+        preparedProfile: profileA, runId: 'run-a', fresh: true,
+      }
+      await expect(first.ensureSession(attemptA)).rejects.toThrow(
+        'recoverable durable lease transition',
+      )
+      expect((await store.getByLogicalMember(old))?.successorTransition?.phase)
+        .toBe('successor_lease_pending')
+
+      const events: string[] = []
+      const restarted = new OpenCodeSessionBridge({
+        prepareProfile: async (_projectPath, options) => {
+          events.push(`prepare-stored:${options?.toolApprovalMode ?? 'missing'}`)
+          return profileA
+        },
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async input => {
+            const label = input.preparedProfile === profileA ? 'a' : 'b'
+            events.push(`ensure-${label}:${input.hostKey ?? 'new'}`)
+            if (input.hostKey && input.hostKey !== `host-${label}`) {
+              throw new Error('profile authority did not match the recorded host')
+            }
+            return hostFor(input.preparedProfile)
+          },
+          releaseHost: async hostKey => { events.push(`release-host:${hostKey}`) },
+          retainHostLease: async hostKey => { events.push(`retain:${hostKey}`) },
+          releaseHostLease: async hostKey => {
+            events.push(`release-lease:${hostKey}`)
+            return 'applied'
+          },
+        },
+        clientFactory,
+      })
+      const returned = await restarted.ensureSession({
+        ...attemptA,
+        selectedModel: 'openai/model-b',
+        preparedProfile: profileB,
+        runId: 'run-b',
+        toolApprovalMode: 'manual',
+      })
+
+      expect(returned).toMatchObject({
+        opencodeSessionId: 'session-b', selectedModel: 'openai/model-b',
+        runId: 'run-b', managedConfigFingerprint: 'managed-config-b',
+        toolApprovalMode: 'manual',
+      })
+      expect(returned.successorTransition).toBeUndefined()
+      expect(creates).toBe(2)
+      expect(events).toEqual([
+        'prepare-stored:auto',
+        'ensure-a:host-a',
+        'retain:host-a',
+        'release-lease:host-old',
+        'release-host:host-old',
+        'ensure-b:new',
+        'retain:host-b',
+        'release-lease:host-a',
+        'release-host:host-a',
+      ])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('same durable attempt returns profile A on a fresh true restart without duplication', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-same-attempt-'))
+    try {
+      const store = new OpenCodeSessionStore(path.join(directory, 'sessions.json'))
+      const old = buildRecord({ hostKey: 'host-old', runId: 'run-old' })
+      await store.upsert(old)
+      const profileA: OpenCodePreparedProfile = {
+        ...profile,
+        projectBehaviorFingerprint: 'behavior-a',
+        managedAuthFingerprint: 'managed-auth-a',
+        managedConfigFingerprint: 'managed-config-a',
+      }
+      const hostA: OpenCodeHostHandle = {
+        ...host, hostKey: 'host-a', profile: profileA,
+        projectBehaviorFingerprint: profileA.projectBehaviorFingerprint,
+      }
+      let creates = 0
+      const clientFactory = { create: () => ({
+        createSession: async () => ({ id: `session-a-${++creates}` }),
+        deleteSession: async () => true,
+      } as never) }
+      const input = {
+        teamId: old.teamId, laneId: old.laneId, memberName: old.memberName,
+        selectedModel: 'openai/model-a', projectPath: old.projectPath,
+        preparedProfile: profileA, runId: 'run-a', fresh: true,
+      }
+      const first = new OpenCodeSessionBridge({
+        prepareProfile: async () => profileA,
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async () => hostA, releaseHost: async () => {},
+          retainHostLease: async () => { throw new Error('simulated restart') },
+          releaseHostLease: async () => 'applied',
+        },
+        clientFactory,
+      })
+      await expect(first.ensureSession(input)).rejects.toThrow(
+        'recoverable durable lease transition',
+      )
+
+      const ensuredProfiles: OpenCodePreparedProfile[] = []
+      const restarted = new OpenCodeSessionBridge({
+        prepareProfile: async () => profileA,
+        sessionStore: store,
+        hostManager: {
+          ensureHost: async input => {
+            ensuredProfiles.push(input.preparedProfile)
+            return hostA
+          },
+          releaseHost: async () => {}, retainHostLease: async () => {},
+          releaseHostLease: async () => 'applied',
+        },
+        clientFactory,
+      })
+      const returned = await restarted.ensureSession(input)
+
+      expect(returned).toMatchObject({
+        opencodeSessionId: 'session-a-1', selectedModel: 'openai/model-a', runId: 'run-a',
+      })
+      expect(returned.successorTransition).toBeUndefined()
+      expect(ensuredProfiles).toEqual([profileA])
+      expect(creates).toBe(1)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   test('fresh false on restart finishes predecessor release before returning the successor', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'opencode-durable-bridge-'))
     try {

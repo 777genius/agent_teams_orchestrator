@@ -187,6 +187,18 @@ function getRecordManagedConfigFingerprint(record: OpenCodeSessionRecord): strin
   return record.managedConfigFingerprint ?? extractManagedConfigFingerprintFromHostKey(record.hostKey)
 }
 
+function buildDurableSuccessorAttemptIdentity(
+  refreshDecisionKey: string,
+  predecessor: Pick<OpenCodeSessionRecord, 'opencodeSessionId' | 'runId'>,
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    schema: 'opencode-session-successor-attempt-v1',
+    refreshDecisionKey,
+    predecessorOpencodeSessionId: predecessor.opencodeSessionId,
+    predecessorRunId: predecessor.runId,
+  })).digest('hex')
+}
+
 function inferToolApprovalModeFromPreparedProfile(
   profile: OpenCodePreparedProfile,
 ): OpenCodeToolApprovalMode {
@@ -1018,7 +1030,7 @@ export class OpenCodeSessionBridge {
         toolApprovalMode: params.toolApprovalMode ?? 'auto',
       })
     const projectIdentity = initialProfile.projectPath
-    const existing = await this.getProjectSession(
+    let existing = await this.getProjectSession(
       params.teamId, laneId, params.memberName, projectIdentity)
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
@@ -1062,10 +1074,21 @@ export class OpenCodeSessionBridge {
       existing?.opencodeSessionId ?? null,
     )
     if (existing?.successorTransition) {
-      const recovered = await this.completeDurableSuccessorTransition(existing, profile)
-      return recovered.runtimePid
-        ? { ...recovered.record, runtimePid: recovered.runtimePid }
-        : recovered.record
+      const transition = existing.successorTransition
+      const isCurrentAttempt = transition.attemptIdentity
+        === buildDurableSuccessorAttemptIdentity(refreshDecisionKey, {
+          opencodeSessionId: transition.predecessorOpencodeSessionId,
+          runId: transition.predecessorRunId,
+        })
+      const storedProfile = await this.prepareProfileForSessionRecord(existing)
+      const recovered = await this.completeDurableSuccessorTransition(
+        existing, storedProfile.profile)
+      if (isCurrentAttempt) {
+        return recovered.runtimePid
+          ? { ...recovered.record, runtimePid: recovered.runtimePid }
+          : recovered.record
+      }
+      existing = recovered.record
     }
     const knownSuccessor = this.publishedSuccessors.get(refreshDecisionKey)
     if (
@@ -1151,12 +1174,8 @@ export class OpenCodeSessionBridge {
           ...created.record,
           successorTransition: {
             version: 1,
-            attemptIdentity: createHash('sha256').update(JSON.stringify({
-              schema: 'opencode-session-successor-attempt-v1',
-              refreshDecisionKey,
-              predecessorOpencodeSessionId: existing.opencodeSessionId,
-              predecessorRunId: existing.runId,
-            })).digest('hex'),
+            attemptIdentity: buildDurableSuccessorAttemptIdentity(
+              refreshDecisionKey, existing),
             phase: 'successor_lease_pending',
             predecessorHostKey: existing.hostKey,
             predecessorOpencodeSessionId: existing.opencodeSessionId,
