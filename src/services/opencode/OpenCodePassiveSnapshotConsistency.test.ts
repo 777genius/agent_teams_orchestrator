@@ -139,7 +139,13 @@ describe('OpenCode passive SQLite transaction consistency', () => {
           const artifactIdentity=async()=>Promise.all([artifacts.launcherPath,artifacts.workerPath].map(async file=>{const item=await lstat(file,{bigint:true});if(!item.isFile()||item.isSymbolicLink())throw new Error('native authority identity mismatch [redacted]');return [String(item.dev),String(item.ino),String(item.size),String(item.mode)]}));
           const nativeBefore=JSON.stringify(await artifactIdentity());
           console.error('WINDOWS_PASSIVE_PHASE writer');
-          await new OpenCodePassiveStatusSnapshotWriter({rootDirectory:root,scheduleMaintenance:()=>undefined}).write(${JSON.stringify(value)},new AbortController().signal);
+          await new OpenCodePassiveStatusSnapshotWriter({rootDirectory:root,scheduleMaintenance:()=>undefined,safeStorageHooks:{
+            afterRootOpened:()=>console.error('WINDOWS_PASSIVE_STAGE root_opened'),
+            afterDatabasePinned:()=>console.error('WINDOWS_PASSIVE_STAGE database_pinned'),
+            beforeDatabaseOpen:()=>console.error('WINDOWS_PASSIVE_STAGE database_opening'),
+            afterDatabaseClosed:()=>console.error('WINDOWS_PASSIVE_STAGE database_closed'),
+            afterRootClosed:()=>console.error('WINDOWS_PASSIVE_STAGE root_closed'),
+          }}).write(${JSON.stringify(value)},new AbortController().signal);
           const before=JSON.stringify(await entries());
           console.error('WINDOWS_PASSIVE_PHASE reader');
           const observed=await readOpenCodePassiveSnapshot(root,scope,new AbortController().signal);

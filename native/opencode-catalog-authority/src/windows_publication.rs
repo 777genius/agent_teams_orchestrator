@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetVolumeInformationW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
@@ -276,10 +276,21 @@ fn append_atomic_recovery_record(
     Ok(())
 }
 
-fn open_volume_directory(path: &Path) -> Result<std::fs::File, &'static str> {
+fn open_volume_directory(path: &Path, create: bool) -> Result<std::fs::File, &'static str> {
     std::fs::OpenOptions::new()
-        .access_mode(0x0010_0000 | 0x0000_0080 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // The volume root is a traversal anchor, not the authority's owned
+        // root. Request mutation rights only when creation may need them, and
+        // never hold those rights with exclusive write sharing.
+        .access_mode(
+            0x0010_0000
+                | 0x0000_0080
+                | 0x0000_0001
+                | if create { 0x0000_0002 | 0x0000_0004 } else { 0 },
+        )
+        // A volume root is not replaceable. Sharing delete is required for
+        // compatibility with pre-existing Windows/system root handles whose
+        // requested DELETE access participates in mutual share checks.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|_| "ROOT_REJECTED")
@@ -1129,7 +1140,7 @@ impl RetainedWindowsRoot {
         }
         let (root_path, wide) = volume_root(&target)?;
         verify_ntfs(&wide)?;
-        let root_handle = open_volume_directory(&root_path)?;
+        let root_handle = open_volume_directory(&root_path, create)?;
         crate::windows_identity::validate_local_ntfs(&root_handle).map_err(|_| "ROOT_REJECTED")?;
         let root_meta = root_handle.metadata().map_err(|_| "ROOT_REJECTED")?;
         if !root_meta.is_dir() || root_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -1143,17 +1154,28 @@ impl RetainedWindowsRoot {
         }];
         let mut cursor = root_path.clone();
         let mut created = Vec::new();
-        for component in target.components() {
-            if matches!(component, Component::Prefix(_) | Component::RootDir) {
-                continue;
-            }
+        let components = target
+            .components()
+            .filter(|component| !matches!(component, Component::Prefix(_) | Component::RootDir))
+            .collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
             let parent = held.last().ok_or("ROOT_REJECTED")?;
-            let (handle, was_created) = crate::windows_identity::open_relative_directory(
-                &parent.handle,
-                Path::new(component.as_os_str()),
-                create,
-            )
-            .map_err(|_| "ROOT_REJECTED")?;
+            let final_component = index + 1 == components.len();
+            let (handle, was_created) = if final_component {
+                crate::windows_identity::open_relative_directory(
+                    &parent.handle,
+                    Path::new(component.as_os_str()),
+                    create,
+                )
+                .map_err(|_| "ROOT_REJECTED")?
+            } else {
+                crate::windows_identity::open_relative_directory_for_traversal(
+                    &parent.handle,
+                    Path::new(component.as_os_str()),
+                    create,
+                )
+                .map_err(|_| "ROOT_REJECTED")?
+            };
             cursor.push(component.as_os_str());
             if was_created {
                 if durable {
@@ -3273,6 +3295,136 @@ mod protocol_tests {
             r#"{"op":"CLOSE","version":1,"id":"a","wait_ms":1,"secret":"x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn volume_root_open_is_compatible_with_delete_access_system_style_handles() {
+        let root = fixture_root("volume-root-sharing");
+        std::fs::create_dir(&root).unwrap();
+        let blocker = std::fs::OpenOptions::new()
+            .access_mode(0x0010_0000 | 0x0001_0000 | 0x0000_0080)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&root)
+            .unwrap();
+        let compatible = open_volume_directory(&root, false).unwrap();
+        drop(compatible);
+        drop(blocker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_root_retains_missing_intermediate_and_final_components() {
+        let common = fixture_root("missing-root-chain");
+        let intermediate = common.join("missing-intermediate");
+        let target = intermediate.join("missing-final");
+        let (authority, created) = RetainedWindowsRoot::open(target.clone(), true, false).unwrap();
+        assert!(common.is_dir());
+        assert!(intermediate.is_dir());
+        assert!(target.is_dir());
+        assert!(created.iter().any(|value| Path::new(value) == common));
+        assert!(created.iter().any(|value| Path::new(value) == intermediate));
+        assert!(created.iter().any(|value| Path::new(value) == target));
+
+        // The final component is owned from FILE_CREATE onward: neither a
+        // replacement nor a second create authority can adopt it.
+        assert!(RetainedWindowsRoot::open(target.clone(), true, false).is_err());
+        assert!(std::fs::rename(&target, intermediate.join("redirected")).is_err());
+        drop(authority);
+        std::fs::remove_dir_all(common).unwrap();
+    }
+
+    #[test]
+    fn immutable_publication_uses_aligned_link_and_directory_barrier() {
+        let root = fixture_root("immutable-publication");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority
+            .namespace_publish_immutable(
+                "passive-status.sqlite3",
+                "00000000-0000-4000-8000-000000000443",
+                b"retained",
+            )
+            .unwrap();
+        authority.namespace_sync_directory(".").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("passive-status.sqlite3")).unwrap(),
+            b"retained"
+        );
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn different_owned_roots_share_common_ancestors_without_losing_custody() {
+        let common = fixture_root("parallel-common-ancestor");
+        let first = common.join("first-owned-root");
+        let second = common.join("second-owned-root");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let workers = [first.clone(), second.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let start = start.clone();
+                let opened_tx = opened_tx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    opened_tx.send((index, RetainedWindowsRoot::open(target, false, false)))
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(opened_tx);
+        start.wait();
+
+        // The first authority remains live in the channel while the second
+        // opens, making common-ancestor sharing deterministic rather than a
+        // scheduler-dependent smoke test.
+        let mut authorities = [None, None];
+        for _ in 0..2 {
+            let (index, result) = opened_rx.recv().unwrap();
+            authorities[index] = Some(result.unwrap().0);
+        }
+        let [Some(mut first_authority), Some(mut second_authority)] = authorities else {
+            unreachable!()
+        };
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let open_directory_writer = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .access_mode(0x0000_0002 | 0x0000_0004 | 0x0000_0100)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+        };
+        // Traversal ancestors admit unrelated writers, which is the sharing
+        // property needed by concurrent authorities.
+        drop(open_directory_writer(&common).unwrap());
+
+        // Common ancestors are shared, but each final owned root still denies
+        // delete and write sharing. Denying a second writer also denies the
+        // handle prerequisite for FSCTL_SET_REPARSE_POINT on either root.
+        assert!(open_directory_writer(&first).is_err());
+        assert!(open_directory_writer(&second).is_err());
+        assert!(std::fs::rename(&first, common.join("first-redirected")).is_err());
+        assert!(std::fs::rename(&second, common.join("second-redirected")).is_err());
+        // A relative operation therefore cannot be redirected by replacing or
+        // converting either retained root.
+        first_authority.namespace_mkdir("first-child").unwrap();
+        second_authority.namespace_mkdir("second-child").unwrap();
+        assert!(first.join("first-child").is_dir());
+        assert!(second.join("second-child").is_dir());
+        assert!(!common.join("first-redirected").exists());
+        assert!(!common.join("second-redirected").exists());
+
+        drop(first_authority);
+        drop(second_authority);
+        std::fs::remove_dir_all(common).unwrap();
     }
 
     #[test]

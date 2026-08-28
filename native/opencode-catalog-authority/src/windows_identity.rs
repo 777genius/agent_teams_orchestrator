@@ -5,8 +5,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    FileDispositionInfo, FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    SetFileInformationByHandle, FILE_DEVICE_DISK, FILE_ID_INFO,
+    FileDispositionInfo, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, SetFileInformationByHandle, FILE_DEVICE_DISK, FILE_ID_INFO,
 };
 
 /// A volume-qualified, full FILE_ID_128 identity.  Do not truncate this to the
@@ -32,11 +32,11 @@ pub(super) fn file_identity(file: &File) -> Result<FileIdentity, ()> {
     ))
 }
 
-// NtCreateFile is the only generally available Win32 primitive which can both
-// resolve a single child relative to an already-retained directory and return
-// the resulting handle.  Using FILE_OPEN_IF makes creation/open one indivisible
-// namespace operation: there is no mkdir/stat/open interval in which another
-// object can be adopted.
+// NtCreateFile resolves one child relative to a retained directory and returns
+// that exact object. Existing components are tried with FILE_OPEN before any
+// FILE_CREATE: create-capable FILE_OPEN_IF is never used to traverse existing
+// common ancestors. If a competing creator wins after the absence result, our
+// FILE_CREATE fails with a collision and the competing object is not adopted.
 #[repr(C)]
 struct UnicodeString {
     length: u16,
@@ -265,18 +265,59 @@ pub(super) fn open_relative_directory(
     component: &Path,
     create: bool,
 ) -> Result<(File, bool), ()> {
+    open_relative_directory_kind(parent, component, create, false)
+}
+
+/// Retain an ancestor for handle-relative traversal without taking exclusive
+/// write-sharing custody over the entire subtree. Delete sharing remains
+/// denied, so the ancestor itself still cannot be renamed or replaced.
+pub(super) fn open_relative_directory_for_traversal(
+    parent: &File,
+    component: &Path,
+    create: bool,
+) -> Result<(File, bool), ()> {
+    open_relative_directory_kind(parent, component, create, true)
+}
+
+fn open_relative_directory_kind(
+    parent: &File,
+    component: &Path,
+    create: bool,
+    common_ancestor: bool,
+) -> Result<(File, bool), ()> {
+    // A create-enabled traversal handle needs FILE_ADD_SUBDIRECTORY for a
+    // possibly missing next component, but shares writes so sibling roots can
+    // coexist. The final owned root always retains mutation authority and
+    // deliberately denies write/delete sharing.
+    let write_access = !common_ancestor || create;
+    if let Some((file, _)) = open_relative_directory_with_disposition(
+        parent,
+        component,
+        1,
+        write_access,
+        false,
+        common_ancestor,
+    )? {
+        return Ok((file, false));
+    }
+    if !create {
+        return Err(());
+    }
     open_relative_directory_with_disposition(
         parent,
         component,
-        if create { 3 } else { 1 },
-        true,
+        2,
+        write_access,
         false,
-    )
+        common_ancestor,
+    )?
+    .ok_or(())
 }
 
 pub(super) fn create_relative_directory(parent: &File, component: &Path) -> Result<File, ()> {
     let (file, created) =
-        open_relative_directory_with_disposition(parent, component, 2, true, true)?;
+        open_relative_directory_with_disposition(parent, component, 2, true, true, false)?
+            .ok_or(())?;
     if !created {
         return Err(());
     }
@@ -285,7 +326,8 @@ pub(super) fn create_relative_directory(parent: &File, component: &Path) -> Resu
 
 pub(super) fn probe_relative_directory(parent: &File, component: &Path) -> Result<File, ()> {
     let (file, created) =
-        open_relative_directory_with_disposition(parent, component, 1, false, false)?;
+        open_relative_directory_with_disposition(parent, component, 1, false, false, false)?
+            .ok_or(())?;
     if created {
         return Err(());
     }
@@ -297,7 +339,8 @@ pub(super) fn open_relative_directory_for_delete(
     component: &Path,
 ) -> Result<File, ()> {
     let (file, created) =
-        open_relative_directory_with_disposition(parent, component, 1, true, true)?;
+        open_relative_directory_with_disposition(parent, component, 1, true, true, false)?
+            .ok_or(())?;
     if created {
         return Err(());
     }
@@ -470,7 +513,8 @@ fn open_relative_directory_with_disposition(
     disposition: u32,
     write_access: bool,
     delete_access: bool,
-) -> Result<(File, bool), ()> {
+    common_ancestor: bool,
+) -> Result<Option<(File, bool)>, ()> {
     let mut name = component.as_os_str().encode_wide().collect::<Vec<_>>();
     if name.is_empty()
         || name.iter().any(|value| *value == 0)
@@ -517,32 +561,42 @@ fn open_relative_directory_with_disposition(
             // undeletable pathname.  Denying write sharing also prevents a
             // same-object FSCTL_SET_REPARSE_POINT conversion between identity
             // validation and a child-relative operation.
-            if write_access || delete_access {
-                0x1 // FILE_SHARE_READ; deliberately no write/delete
+            if common_ancestor {
+                0x1 | 0x2 // common traversal anchor; deliberately no delete
+            } else if write_access || delete_access {
+                0x1 // owned authority; deliberately no write/delete
             } else {
                 0x1 | 0x2 | 0x4 // transient identity probe
             },
-            disposition,              // FILE_OPEN, FILE_CREATE, or FILE_OPEN_IF
+            disposition,              // FILE_OPEN or FILE_CREATE; never FILE_OPEN_IF
             0x1 | 0x20 | 0x0020_0000, // DIRECTORY|SYNC_NONALERT|OPEN_REPARSE_POINT
             std::ptr::null_mut(),
             0,
         )
     };
-    if result < 0 || handle.is_null() {
+    if result < 0 {
+        if disposition == 1 && matches!(result as u32, 0xC000_0034 | 0xC000_003A) {
+            return Ok(None);
+        }
         return Err(());
     }
-    // FILE_CREATED is 2; FILE_OPENED is 1. Any other success information is
-    // outside this narrow authority contract.
-    if status.information != 1 && status.information != 2 {
+    if handle.is_null() {
+        return Err(());
+    }
+    // FILE_CREATED is 2; FILE_OPENED is 1. The result must match the requested
+    // disposition so a successful create can never be mistaken for an open.
+    if (disposition == 1 && status.information != 1)
+        || (disposition == 2 && status.information != 2)
+    {
         unsafe {
             drop(File::from_raw_handle(handle));
         }
         return Err(());
     }
-    Ok((
+    Ok(Some((
         unsafe { File::from_raw_handle(handle) },
         status.information == 2,
-    ))
+    )))
 }
 
 pub(super) fn rename_relative(
@@ -560,20 +614,18 @@ pub(super) fn rename_relative(
     }
     let mut information =
         RenameInformation::new(destination_parent.as_raw_handle(), &wide, replace)?;
-    let mut status = IoStatusBlock {
-        status: 0,
-        information: 0,
-    };
-    let result = unsafe {
-        NtSetInformationFile(
+    // Use the SDK-backed information class with the documented extended
+    // FILE_RENAME_INFO payload. The aligned allocation below is byte-exact on
+    // both supported 64-bit Windows ABIs.
+    if unsafe {
+        SetFileInformationByHandle(
             file.as_raw_handle(),
-            &mut status,
+            FileRenameInfoEx,
             information.as_mut_ptr(),
             information.byte_len,
-            65, // FileRenameInformationEx
         )
-    };
-    if !nt_success(result) || !nt_success(status.status) {
+    } == 0
+    {
         return Err(());
     }
     Ok(())
@@ -585,8 +637,8 @@ const RENAME_LENGTH_OFFSET: usize = 16;
 const RENAME_NAME_OFFSET: usize = 20;
 
 // Vec<usize> gives the variable-sized FILE_RENAME_INFORMATION_EX allocation
-// the alignment of HANDLE on both supported Windows ABIs. The byte length sent
-// to NT excludes only the allocation's trailing word padding.
+// the alignment of HANDLE on both supported Windows ABIs. The byte length
+// passed to Windows excludes only the allocation's trailing word padding.
 struct RenameInformation {
     storage: Vec<usize>,
     byte_len: u32,
@@ -637,36 +689,70 @@ pub(super) fn link_relative(file: &File, destination_parent: &File, name: &Path)
     {
         return Err(());
     }
-    let pointer = std::mem::size_of::<HANDLE>();
-    let root_offset = (4 + pointer - 1) & !(pointer - 1);
-    let length_offset = root_offset + pointer;
-    let name_offset = length_offset + 4;
-    let mut information = vec![0u8; name_offset + wide.len() * 2];
-    information[root_offset..root_offset + pointer]
-        .copy_from_slice(&(destination_parent.as_raw_handle() as usize).to_ne_bytes());
-    information[length_offset..name_offset]
-        .copy_from_slice(&((wide.len() * 2) as u32).to_ne_bytes());
-    for (index, value) in wide.iter().enumerate() {
-        information[name_offset + index * 2..name_offset + index * 2 + 2]
-            .copy_from_slice(&value.to_le_bytes());
-    }
+    let mut information = LinkInformation::new(destination_parent.as_raw_handle(), &wide)?;
     let mut status = IoStatusBlock {
         status: 0,
         information: 0,
     };
-    if unsafe {
+    let result = unsafe {
         NtSetInformationFile(
             file.as_raw_handle(),
             &mut status,
-            information.as_mut_ptr() as *mut c_void,
-            information.len() as u32,
+            information.as_mut_ptr(),
+            information.byte_len,
             11,
         )
-    } < 0
-    {
+    };
+    if !nt_success(result) || !nt_success(status.status) {
         return Err(());
     }
     Ok(())
+}
+
+const LINK_REPLACE_OFFSET: usize = 0;
+const LINK_ROOT_OFFSET: usize = 8;
+const LINK_LENGTH_OFFSET: usize = 16;
+const LINK_NAME_OFFSET: usize = 20;
+
+// FILE_LINK_INFORMATION has HANDLE alignment on both Windows x64 and ARM64.
+// Vec<u8> does not promise that alignment even when a particular allocator
+// happens to return an aligned address.
+struct LinkInformation {
+    storage: Vec<usize>,
+    byte_len: u32,
+}
+
+impl LinkInformation {
+    fn new(destination_parent: HANDLE, wide: &[u16]) -> Result<Self, ()> {
+        if std::mem::size_of::<HANDLE>() != 8
+            || std::mem::align_of::<usize>() < std::mem::align_of::<HANDLE>()
+        {
+            return Err(());
+        }
+        let name_bytes = wide.len().checked_mul(2).ok_or(())?;
+        let byte_len = LINK_NAME_OFFSET.checked_add(name_bytes).ok_or(())?;
+        let byte_len = u32::try_from(byte_len).map_err(|_| ())?;
+        let word = std::mem::size_of::<usize>();
+        let words = (byte_len as usize).checked_add(word - 1).ok_or(())? / word;
+        let mut storage = vec![0usize; words];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, words * word)
+        };
+        bytes[LINK_REPLACE_OFFSET] = 0;
+        bytes[LINK_ROOT_OFFSET..LINK_ROOT_OFFSET + 8]
+            .copy_from_slice(&(destination_parent as usize).to_ne_bytes());
+        bytes[LINK_LENGTH_OFFSET..LINK_NAME_OFFSET]
+            .copy_from_slice(&(name_bytes as u32).to_ne_bytes());
+        for (index, value) in wide.iter().enumerate() {
+            bytes[LINK_NAME_OFFSET + index * 2..LINK_NAME_OFFSET + index * 2 + 2]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(Self { storage, byte_len })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.storage.as_mut_ptr() as *mut c_void
+    }
 }
 
 pub(super) fn delete_on_close(file: &File) -> Result<(), ()> {
@@ -731,6 +817,20 @@ mod tests {
     }
 
     #[test]
+    fn windows_ffi_layouts_match_both_supported_64_bit_abis() {
+        assert_eq!(std::mem::size_of::<FILE_ID_INFO>(), 24);
+        assert_eq!(std::mem::align_of::<FILE_ID_INFO>(), 8);
+        assert_eq!(std::mem::size_of::<UnicodeString>(), 16);
+        assert_eq!(std::mem::align_of::<UnicodeString>(), 8);
+        assert_eq!(std::mem::size_of::<ObjectAttributes>(), 48);
+        assert_eq!(std::mem::align_of::<ObjectAttributes>(), 8);
+        assert_eq!(std::mem::size_of::<IoStatusBlock>(), 16);
+        assert_eq!(std::mem::align_of::<IoStatusBlock>(), 8);
+        assert_eq!(std::mem::size_of::<FileFsDeviceInformation>(), 8);
+        assert_eq!(std::mem::align_of::<FileFsDeviceInformation>(), 4);
+    }
+
+    #[test]
     fn rename_information_ex_is_handle_aligned_and_byte_exact() {
         assert_eq!(RENAME_FLAGS_OFFSET, 0);
         assert_eq!(RENAME_ROOT_OFFSET, 8);
@@ -775,6 +875,41 @@ mod tests {
     }
 
     #[test]
+    fn link_information_is_handle_aligned_and_byte_exact() {
+        assert_eq!(LINK_REPLACE_OFFSET, 0);
+        assert_eq!(LINK_ROOT_OFFSET, 8);
+        assert_eq!(LINK_LENGTH_OFFSET, 16);
+        assert_eq!(LINK_NAME_OFFSET, 20);
+
+        let destination = 0x0102_0304_0506_0708usize as HANDLE;
+        let wide = [b'A' as u16, 0xd83d, 0xde80];
+        let information = LinkInformation::new(destination, &wide).unwrap();
+        assert_eq!(
+            information.storage.as_ptr() as usize % std::mem::align_of::<HANDLE>(),
+            0
+        );
+        assert_eq!(
+            information.byte_len as usize,
+            LINK_NAME_OFFSET + wide.len() * 2
+        );
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                information.storage.as_ptr() as *const u8,
+                information.byte_len as usize,
+            )
+        };
+        assert_eq!(bytes[LINK_REPLACE_OFFSET], 0);
+        assert_eq!(
+            &bytes[LINK_ROOT_OFFSET..LINK_ROOT_OFFSET + 8],
+            &(destination as usize).to_ne_bytes()
+        );
+        assert_eq!(
+            &bytes[LINK_LENGTH_OFFSET..LINK_NAME_OFFSET],
+            &(wide.len() as u32 * 2).to_ne_bytes()
+        );
+    }
+
+    #[test]
     fn nt_directory_flush_accepts_a_retained_ntfs_directory() {
         let root = fixture("directory-flush");
         let parent = directory(&root);
@@ -813,6 +948,22 @@ mod tests {
         );
         assert!(std::fs::rename(root.join("child"), root.join("swapped")).is_err());
         drop(child);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_create_collision_never_adopts_a_competing_directory() {
+        let root = fixture("relative-directory-collision");
+        std::fs::create_dir(root.join("child")).unwrap();
+        let parent = directory(&root);
+        let expected =
+            file_identity(&probe_relative_directory(&parent, Path::new("child")).unwrap()).unwrap();
+        assert!(create_relative_directory(&parent, Path::new("child")).is_err());
+        assert_eq!(
+            file_identity(&probe_relative_directory(&parent, Path::new("child")).unwrap()).unwrap(),
+            expected
+        );
         drop(parent);
         std::fs::remove_dir_all(root).unwrap();
     }
