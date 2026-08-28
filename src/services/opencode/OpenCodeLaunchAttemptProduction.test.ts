@@ -39,6 +39,7 @@ import {
   inspectOpenCodeProductionGeneration,
   OpenCodeLaunchHostReleaseLedger,
   createOpenCodeLaunchAttemptProductionTestBridge,
+  readOpenCodeProductionMemberClaim,
   reobserveOpenCodeProductionRetainedProof,
   reconcileOpenCodeMemberCleanupObligations,
   resolveOpenCodeProductionRetainedProofRecord,
@@ -56,7 +57,7 @@ const cleanupObligation = (phase: OpenCodeMemberCleanupPhase = 'remote'):
 OpenCodeMemberCleanupObligation => ({
   attemptId: '123e4567-e89b-42d3-a456-426614174099', payloadHash: 'a'.repeat(64),
   generation: 1, hostKey: 'host', memberIdentity: identity, memberName: 'alice',
-  teamId: 'team', laneId: 'primary', sessionId: 'session-owned',
+  teamId: 'team', laneId: 'primary', runId: 'run-owned', sessionId: 'session-owned',
   sessionIdentity: `sha256:${'b'.repeat(64)}` as OpenCodeOpaqueIdentity,
   ownershipTitle: 'agent-teams-launch:owned', phase,
 })
@@ -585,6 +586,90 @@ function identityForProductionClaim(
     logicalMember: { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project', memberName: 'alice' },
   }
 }
+
+test('migrated V1 known-failure restart uses one durable identity for lookup, effect, and commit', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-production-v1-identity-'))
+  try {
+    const claimsDirectory = path.join(directory, 'claims')
+    await mkdir(claimsDirectory)
+    const ledger = new OpenCodeLaunchMutationLedger(claimsDirectory)
+    const logicalMember = { teamId: 'team', laneId: 'primary', projectIdentity: '/fake/project',
+      memberName: 'alice' }
+    const memberIdentity = identity
+    const canonicalTarget = OpenCodeLaunchMutationLedger.targetDigest(logicalMember)
+    const legacyTarget = createHash('sha256').update(JSON.stringify({ teamId: logicalMember.teamId,
+      laneId: logicalMember.laneId, projectIdentity: logicalMember.projectIdentity, memberIdentity })).digest('hex')
+    const durableSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(legacyTarget)
+    const canonicalSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(canonicalTarget)
+    expect(durableSessionId).not.toBe(canonicalSessionId)
+
+    const retry = identityForProductionClaim(memberIdentity, 2, 'acquisition-2.claim-retry')
+    const predecessor = {
+      version: 1 as const, targetDigest: legacyTarget, idempotencyIdentity: durableSessionId,
+      state: 'known_failure' as const, attemptId: retry.attemptId, payloadHash: retry.payloadHash,
+      inputDigest: 'c'.repeat(64), immutableDigest: retry.immutableDigest,
+      generation: 1, fence: 1, acquisitionToken: 'acquisition-1',
+      claimToken: 'acquisition-1.claim-legacy', memberIdentity,
+    }
+    const predecessorPersistence = new OpenCodeLaunchFileJournalPersistence(
+      path.join(claimsDirectory, `${legacyTarget}.claim`))
+    const predecessorContext = productionContext()
+    const releasePredecessor = await predecessorPersistence.acquireExclusive(predecessorContext)
+    try {
+      await predecessorPersistence.replaceAndSync(
+        new TextEncoder().encode(JSON.stringify(predecessor)), predecessorContext)
+    } finally { await releasePredecessor(predecessorContext) }
+    expect(await ledger.claim(canonicalTarget, retry, productionContext())).toBe('claimed')
+
+    const remote = new Map<string, { id: string; title: string }>()
+    const lookupIds: string[] = []
+    const createIds: string[] = []
+    const title = `agent-teams-launch:${retry.attemptId}:${memberIdentity}:owned`
+    const applyOnce = async (): Promise<void> => {
+      const durable = await readOpenCodeProductionMemberClaim(
+        ledger, canonicalTarget, retry, productionContext())
+      expect(durable?.legacyTargetDigest).toBe(legacyTarget)
+      const sessionId = durable!.idempotencyIdentity
+      lookupIds.push(sessionId)
+      if (!remote.has(sessionId)) {
+        createIds.push(sessionId)
+        remote.set(sessionId, { id: sessionId, title })
+      }
+    }
+
+    // The first process crashes after the effect and before settlement. The
+    // restarted process looks up the same durable identity and does not create
+    // a second effect under the canonical logical digest.
+    await applyOnce()
+    await applyOnce()
+
+    const now = new Date().toISOString()
+    const record: OpenCodeSessionRecord = {
+      teamId: 'team', laneId: 'primary', memberName: 'alice', providerId: 'opencode',
+      selectedModel: 'openrouter/model', projectPath: '/fake/project', profileRootKey: 'profile', hostKey: 'host',
+      resolvedBehaviorFingerprint: null, opencodeSessionId: durableSessionId,
+      lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
+      sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior',
+      bootstrapMode: 'app_managed_context', bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: { schemaVersion: 1, messageID: 'msg_v1', contextHash: '1'.repeat(64),
+        briefingHash: '2'.repeat(64), injectionVerifiedAt: now, model: 'openrouter/model',
+        agent: 'teammate-bootstrap' }, staleReason: null, createdAt: now, updatedAt: now,
+    }
+    const linkage = linkageForTest(memberIdentity, record)
+    expect(await transitionOpenCodeProductionMemberClaim(ledger, canonicalTarget,
+      { ...retry, transition: 'commit', linkage, recovery: { ownershipTitle: title, sessionRecord: record } },
+      productionContext())).toBe('committed')
+    expect(await ledger.read(canonicalTarget, productionContext())).toMatchObject({
+      state: 'committed', legacyTargetDigest: legacyTarget, idempotencyIdentity: durableSessionId,
+      recovery: { sessionRecord: { opencodeSessionId: durableSessionId } },
+    })
+    expect({ lookupIds, createIds, remoteIds: [...remote.keys()] }).toEqual({
+      lookupIds: [durableSessionId, durableSessionId], createIds: [durableSessionId],
+      remoteIds: [durableSessionId],
+    })
+    expect(remote.has(canonicalSessionId)).toBe(false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test('production member mutation registers deterministic ownership before an ambiguous create rejection', async () => {
   const calls: string[] = []
@@ -1298,7 +1383,8 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
     projectBehaviorFingerprint: hash('2'), baseUrl: 'http://fake.invalid', port: 1, pid: 443,
     processStartedAtMs: 1, version: 'fake', state: 'healthy', profile: {} as never,
     resolvedConfigFingerprint: null, diagnostics: [] }
-  const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: path.join(directory, 'data'),
+  const createBridge = () => createOpenCodeLaunchAttemptProductionTestBridge({
+    dataDirectory: path.join(directory, 'data'),
     profileManager: profileManager as never, sessionStore: sessionStore as never,
     clientFactory: { create: () => client } as never,
     hostManager: hostManagerOverride ?? { ensureScopedHostReference: async () => ({ handle: host }), releaseHostReference: async () => {},
@@ -1311,6 +1397,7 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
       throw new Error('MCP must not run before recovery settles')
     } } as never,
   })
+  const bridge = createBridge()
   const context = { deadlineAtMs: Date.now() + 30_000,
     signal: new AbortController().signal, monotonicNow: Date.now }
   const acceptedProof = (): OpenCodeLaunchAttemptResponse => {
@@ -1372,7 +1459,8 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
     }, context)
     return seeded
   }
-  return { bridge, command: rawCommand, sessionStore, seedIntent, ledger, target, context, directory,
+  return { bridge, restartBridge: createBridge, command: rawCommand, sessionStore, seedIntent,
+    ledger, target, context, directory,
     store, acceptedProof, inputDigest, immutableDigest, launchDirectory,
     remote, messages, sessionId, memberIdentity,
     commitClaim: async (seeded: ProductionSeed) => {
@@ -1401,6 +1489,8 @@ async () => {
   let ensured = 0
   let recovered = 0
   let released = 0
+  let releasedLease: { runId?: string | null; sessionId?: string | null } | undefined
+  const replacementLease = { runId: 'replacement-run', sessionId: '' }
   let recoveredBirthToken: string | undefined
   let retainedAccess: 'unresolved' | 'absent' = 'unresolved'
   const manager = {
@@ -1408,7 +1498,12 @@ async () => {
     releaseHostReference: async () => {},
     hasExactRetainedHostReleaseCapability: () => false,
     retainHostLease: async () => {},
-    releaseHostLease: async () => { released += 1; return 'foreign' as const },
+    releaseHostLease: async (_hostKey: string, lease: { runId?: string | null; sessionId?: string | null }) => {
+      released += 1
+      releasedLease = lease
+      return lease.runId === replacementLease.runId && lease.sessionId === replacementLease.sessionId
+        ? 'applied' as const : 'foreign' as const
+    },
     reconcileHostReleaseReceipt: async () => {},
     withRetainedHostAccess: async (identity: { processBirthToken?: string }) => {
       recovered += 1
@@ -1418,6 +1513,7 @@ async () => {
   } as unknown as OpenCodeHostManager
   const harness = await productionRecoveryHarness(manager)
   try {
+    replacementLease.sessionId = harness.sessionId
     const seeded = await harness.seedIntent({ acceptedProof: true })
     const reservationIdentity = 'union-cleanup-reservation'
     expect((await harness.sessionStore.reserveLogicalMember({
@@ -1439,7 +1535,7 @@ async () => {
       generation: 1, hostKey: 'host', hostProcessId: 443, hostProcessStartedAtMs: 1,
       hostProcessBirthToken: 'windows:0000000000000123:01d9abcd000001bb',
       memberIdentity: harness.memberIdentity, memberName: 'alice', teamId: 'team',
-      laneId: 'primary', sessionId: harness.sessionId,
+      laneId: 'primary', runId: harness.command.runId, sessionId: harness.sessionId,
       sessionIdentity: (`sha256:${createHash('sha256').update(JSON.stringify({
         kind: 'opencode-session', id: harness.sessionId,
       })).digest('hex')}` as OpenCodeOpaqueIdentity),
@@ -1470,17 +1566,71 @@ async () => {
     // reserved projection is then removed, while a foreign replacement lease
     // disposition is terminal and advances the durable cleanup obligation.
     retainedAccess = 'absent'
-    await harness.bridge.execute(harness.command)
-    expect({ ensured, recovered, released, projection:
+    await harness.restartBridge().execute(harness.command)
+    expect({ ensured, recovered, released, releasedLease, replacementLease, projection:
       await harness.sessionStore.get('team', 'primary', 'ALICE') })
-      .toEqual({ ensured: 0, recovered: 2, released: 1, projection: null })
+      .toEqual({ ensured: 0, recovered: 2, released: 1,
+        releasedLease: { teamId: 'team', laneId: 'primary', memberName: 'alice',
+          runId: harness.command.runId, sessionId: harness.sessionId },
+        replacementLease: { runId: 'replacement-run', sessionId: harness.sessionId }, projection: null })
     expect(await harness.inspectJournal()).toMatchObject({
       // Member cleanup is durably complete even though the independent host
       // receipt remains unavailable, so aggregate cleanup stays incomplete.
       cleanupState: 'incomplete',
-      memberCleanupObligations: [{ memberIdentity: harness.memberIdentity, phase: 'complete' }],
+      memberCleanupObligations: [{ memberIdentity: harness.memberIdentity,
+        runId: harness.command.runId, sessionId: harness.sessionId, phase: 'complete' }],
       acceptedProofResponse: { members: { cleanupPending: [] } },
     })
+  } finally { await harness.dispose() }
+}, 15_000)
+
+test('persisted legacy member cleanup without run identity conservatively retains the lease phase',
+async () => {
+  let released = 0
+  const manager = {
+    ensureScopedHostReference: async () => { throw new Error('must not provision') },
+    releaseHostReference: async () => {},
+    hasExactRetainedHostReleaseCapability: () => false,
+    retainHostLease: async () => {},
+    releaseHostLease: async () => { released += 1; return 'applied' as const },
+    reconcileHostReleaseReceipt: async () => {},
+  } as unknown as OpenCodeHostManager
+  const harness = await productionRecoveryHarness(manager)
+  try {
+    await harness.seedIntent({ acceptedProof: true })
+    const basis = harness.acceptedProof()
+    const failure = { code: 'pre_side_effect_transport' as const, origin: 'session' as const,
+      retryDisposition: 'automatic' as const, retryable: true,
+      phase: 'member_materialize' as const, sideEffectsStarted: false }
+    const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
+      members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+        pending: [], cleanupPending: [harness.memberIdentity] }, failure }
+    const legacyObligation: OpenCodeMemberCleanupObligation = {
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      generation: 1, hostKey: 'host', memberIdentity: harness.memberIdentity,
+      memberName: 'alice', teamId: 'team', laneId: 'primary', sessionId: harness.sessionId,
+      sessionIdentity: (`sha256:${createHash('sha256').update(JSON.stringify({
+        kind: 'opencode-session', id: harness.sessionId,
+      })).digest('hex')}` as OpenCodeOpaqueIdentity),
+      ownershipTitle: 'agent-teams-launch:owned', phase: 'lease_release',
+    }
+    await harness.store.withGeneration({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest, generation: 1,
+    }, 'replay', async lease => {
+      await lease.bindMemberCleanupObligation(legacyObligation, harness.context)
+      await lease.commitTerminalResponse(final, 'incomplete', harness.context)
+    }, harness.context)
+
+    const result = await harness.restartBridge().execute(harness.command)
+    expect((result.data as { launchAttempt?: OpenCodeLaunchAttemptResponse })
+      .launchAttempt?.members.cleanupPending).toEqual([harness.memberIdentity])
+    expect(released).toBe(0)
+    expect(await harness.inspectJournal()).toMatchObject({ cleanupState: 'incomplete',
+      memberCleanupObligations: [{ memberIdentity: harness.memberIdentity,
+        sessionId: harness.sessionId, phase: 'lease_release' }] })
   } finally { await harness.dispose() }
 }, 15_000)
 

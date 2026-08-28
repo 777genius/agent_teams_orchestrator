@@ -57,13 +57,27 @@ const LOCK_OPTIONS = {
 }
 const RESERVATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/
 
-function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
-  return `${record.teamId.trim()}::${(record.laneId ?? 'primary').trim()}::${record.memberName.trim().toLowerCase()}`
+function buildRecordKey(
+  record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'projectPath'>,
+): string {
+  // A projection has exactly the same identity domain as its reservation. In
+  // particular, project identity is not metadata: omitting it here lets a
+  // publication for another project overwrite the first project atomically
+  // and leaves no evidence that the first projection ever existed.
+  return logicalKeyForRecord(record)
 }
 
 function sameLookupIdentity(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
   teamId: string, laneId: string, memberName: string): boolean {
-  return buildRecordKey(record) === buildRecordKey({ teamId, laneId, memberName })
+  return record.teamId.trim() === teamId.trim()
+    && (record.laneId ?? 'primary').trim() === laneId.trim()
+    && record.memberName.trim().toLowerCase() === memberName.trim().toLowerCase()
+}
+
+function recordsForLegacyLookup(store: SessionStoreShape, teamId: string, laneId: string,
+  memberName: string): OpenCodeSessionRecord[] {
+  return Object.values(store.records).filter(record =>
+    sameLookupIdentity(record, teamId, laneId, memberName))
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -291,11 +305,11 @@ export class OpenCodeSessionStore {
     const staleReason = staleReasonMaybe ?? memberNameOrStaleReason
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName })
-      const previous = store.records[key]
+      const previous = recordsForLegacyLookup(store, teamId, laneId, memberName)[0]
       if (!previous) {
         return null
       }
+      const key = buildRecordKey(previous)
 
       if (previous.staleReason === staleReason) {
         return previous
@@ -322,15 +336,18 @@ export class OpenCodeSessionStore {
   ): Promise<ConditionalMarkStaleResult> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName })
-      const previous = store.records[key]
-      if (!previous) {
+      const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
+      const previous = candidates.find(record =>
+        record.opencodeSessionId === expectedOpencodeSessionId)
+      if (!previous && candidates.length === 0) {
         return { status: 'absent' }
       }
 
-      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
-        return { status: 'foreign', record: previous }
+      if (!previous) {
+        return { status: 'foreign', record: candidates[0]! }
       }
+
+      const key = buildRecordKey(previous)
 
       if (previous.staleReason === staleReason) {
         return { status: 'already-satisfied', record: previous }
@@ -353,12 +370,12 @@ export class OpenCodeSessionStore {
     const normalizedMemberName = memberName ?? laneIdOrMemberName
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })
-      if (!store.records[key]) {
+      const previous = recordsForLegacyLookup(store, teamId, laneId, normalizedMemberName)[0]
+      if (!previous) {
         return false
       }
 
-      delete store.records[key]
+      delete store.records[buildRecordKey(previous)]
       await this.writeStore(store)
       return true
     })
@@ -379,17 +396,18 @@ export class OpenCodeSessionStore {
   ): Promise<ConditionalDeleteResult> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName })
-      const previous = store.records[key]
-      if (!previous) {
+      const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
+      const previous = candidates.find(record =>
+        record.opencodeSessionId === expectedOpencodeSessionId)
+      if (!previous && candidates.length === 0) {
         return { status: 'absent' }
       }
 
-      if (previous.opencodeSessionId !== expectedOpencodeSessionId) {
-        return { status: 'foreign', record: previous }
+      if (!previous) {
+        return { status: 'foreign', record: candidates[0]! }
       }
 
-      delete store.records[key]
+      delete store.records[buildRecordKey(previous)]
       await this.writeStore(store)
       return { status: 'applied', record: previous }
     })

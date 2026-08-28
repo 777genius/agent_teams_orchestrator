@@ -1863,7 +1863,7 @@ test('member cleanup obligation persists exact phase across restart and alone au
     generation: 1, startedAtMs: 1, totalBudgetMs: 10_000 }
   const obligation = { attemptId: identity.attemptId, payloadHash: identity.payloadHash,
     generation: 1, hostKey: 'host', memberIdentity: member, memberName: 'alice',
-    teamId: 'team', laneId: 'primary', sessionId: 'session-owned',
+    teamId: 'team', laneId: 'primary', runId: 'run-owned', sessionId: 'session-owned',
     sessionIdentity: oid('2'), ownershipTitle: 'agent-teams-launch:owned', phase: 'remote' as const }
   const context = { deadlineAtMs: 20_000, signal: new AbortController().signal, monotonicNow: () => 2 }
   await new OpenCodeLaunchAttemptStore(persistence).withGeneration(exact, 'begin', async lease => {
@@ -1876,6 +1876,9 @@ test('member cleanup obligation persists exact phase across restart and alone au
   await restarted.withGeneration(exact, 'replay', async lease => {
     let current = lease.journal.memberCleanupObligations![0]!
     expect(current).toMatchObject({ ...obligation, phase: 'projection_stale' })
+    await expect(lease.advanceMemberCleanupObligation(
+      { ...current, runId: 'replacement-run' }, 'lease_release', context))
+      .rejects.toThrow('member cleanup obligation is absent or changed')
     for (const phase of ['lease_release', 'projection_delete', 'obligation_complete', 'complete'] as const) {
       await lease.advanceMemberCleanupObligation(current, phase, context)
       current = { ...current, phase }

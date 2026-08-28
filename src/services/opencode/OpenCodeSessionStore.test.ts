@@ -111,6 +111,66 @@ describe('OpenCodeSessionStore', () => {
     expect(persisted.reservations).toEqual({})
   })
 
+  test('concurrent projects reserve and publish the same team lane member without overwrite or ABA', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    const first = new OpenCodeSessionStore(filePath)
+    const second = new OpenCodeSessionStore(filePath)
+
+    const reservations = await Promise.all([
+      first.reserveLogicalMember({ teamId: projectA.teamId, laneId: projectA.laneId,
+        projectIdentity: projectA.projectPath, memberName: projectA.memberName },
+      'reservation-a', projectA.opencodeSessionId),
+      second.reserveLogicalMember({ teamId: projectB.teamId, laneId: projectB.laneId,
+        projectIdentity: projectB.projectPath, memberName: projectB.memberName },
+      'reservation-b', projectB.opencodeSessionId),
+    ])
+    expect(reservations.map(result => result.status)).toEqual(['reserved', 'reserved'])
+
+    const publications = await Promise.all([
+      second.publishReserved(projectB, 'reservation-b'),
+      first.publishReserved(projectA, 'reservation-a'),
+    ])
+    expect(publications.map(result => result.status)).toEqual(['inserted', 'inserted'])
+
+    const restarted = new OpenCodeSessionStore(filePath)
+    expect(await restarted.list()).toEqual(expect.arrayContaining([projectA, projectB]))
+    expect(await restarted.list()).toHaveLength(2)
+
+    // A delayed cleanup for A must select A by its session fence. It cannot
+    // observe B as a replacement or erase B merely because their legacy
+    // team/lane/member lookup identity is the same.
+    expect(await restarted.deleteIfSessionMatches(projectA.teamId, projectA.laneId,
+      projectA.memberName, projectA.opencodeSessionId)).toEqual({ status: 'applied', record: projectA })
+    expect(await restarted.list()).toEqual([projectB])
+    expect(await restarted.deleteIfSessionMatches(projectA.teamId, projectA.laneId,
+      projectA.memberName, projectA.opencodeSessionId)).toEqual({ status: 'foreign', record: projectB })
+    expect(await restarted.list()).toEqual([projectB])
+  })
+
+  test('restart migrates colliding legacy record keys into project-scoped projections', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const projectA = { ...baseRecord, projectPath: '/tmp/project-a', opencodeSessionId: 'session-a' }
+    const projectB = { ...baseRecord, projectPath: '/tmp/project-b', opencodeSessionId: 'session-b' }
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 2, records: {
+      'legacy-a': projectA,
+      'legacy-b': projectB,
+    }, reservations: {} }))
+
+    const restarted = new OpenCodeSessionStore(filePath)
+    expect(await restarted.list()).toEqual([projectA, projectB])
+    expect(await restarted.upsert({ ...projectA, updatedAt: '2026-04-21T01:00:00.000Z' })).toBe('updated')
+
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as {
+      records: Record<string, typeof baseRecord>
+    }
+    expect(Object.values(persisted.records)).toEqual(expect.arrayContaining([
+      { ...projectA, updatedAt: '2026-04-21T01:00:00.000Z' }, projectB,
+    ]))
+    expect(Object.values(persisted.records)).toHaveLength(2)
+  })
+
   test('post-effect publication conflict stays reserved for durable reconciliation authority', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
     const logical = { teamId: 'team-a', laneId: 'primary', projectIdentity: '/tmp/project', memberName: 'alice' }

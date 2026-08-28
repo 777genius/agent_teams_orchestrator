@@ -244,6 +244,24 @@ export function transitionOpenCodeProductionMemberClaim(
     input.transition === 'commit' ? input.recovery : undefined)
 }
 
+/** Resolve external-effect identity only from the exact durable claim installed by the ledger. */
+export async function readOpenCodeProductionMemberClaim(
+  ledger: OpenCodeLaunchMutationLedger,
+  targetDigest: string,
+  input: OpenCodeLaunchMutationIdentity,
+  context: OpenCodeLaunchStoreContext,
+): Promise<OpenCodeLaunchMutationClaimRecord | null> {
+  const claim = await ledger.read(targetDigest, context)
+  if (!claim || claim.state !== 'claimed'
+    || claim.attemptId !== input.attemptId || claim.payloadHash !== input.payloadHash
+    || claim.inputDigest !== input.inputDigest || claim.immutableDigest !== input.immutableDigest
+    || claim.generation !== input.generation || claim.fence !== input.fence
+    || claim.acquisitionToken !== input.acquisitionToken || claim.claimToken !== input.claimToken
+    || claim.memberIdentity !== input.memberIdentity
+    || OpenCodeLaunchMutationLedger.targetDigest(input.logicalMember) !== targetDigest) return null
+  return claim
+}
+
 export function inspectOpenCodeProductionGeneration(
   journal: Pick<NonNullable<Awaited<ReturnType<OpenCodeLaunchAttemptStore['inspect']>>>,
     'generation' | 'inputDigest' | 'continuation' | 'consumedContinuationToken'>,
@@ -1302,11 +1320,17 @@ class OpenCodeProductionLaunchRuntime {
         obligation.teamId, obligation.laneId, obligation.memberName, obligation.sessionId,
         'launch_attempt_cleanup') },
       releaseLease: async obligation => {
+        // Legacy journals lack the run half of the lease CAS. Session ids are
+        // deterministic and may be rebound by a later run, so such an
+        // obligation must remain pending rather than perform a session-only
+        // release against a replacement lease.
+        if (!obligation.runId) throw new Error('OpenCode cleanup lease run identity is absent')
         // `foreign` is a successful stale-replay disposition: the old cleanup
         // advances without deleting the replacement lease.
         await openCodeHostManager.releaseHostLease(obligation.hostKey, {
           teamId: obligation.teamId, laneId: obligation.laneId,
-          memberName: obligation.memberName, sessionId: obligation.sessionId,
+          memberName: obligation.memberName, runId: obligation.runId,
+          sessionId: obligation.sessionId,
         })
       },
       deleteProjection: async obligation => { await openCodeSessionStore.deleteIfSessionMatches(
@@ -1909,9 +1933,21 @@ class OpenCodeProductionLaunchRuntime {
             return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
           }
           const target = targetByMember.get(input.memberIdentity)!
-          const authoritativeSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
-          const reservationIdentity = openCodeSessionReservationIdentity({ ...input,
-            logicalMember: logicalMemberByIdentity.get(input.memberIdentity)! })
+          const mutationIdentity = { ...input,
+            logicalMember: logicalMemberByIdentity.get(input.memberIdentity)! }
+          const claimContext = { deadlineAtMs: input.deadlineAtMs, signal: input.signal,
+            monotonicNow: launchMonotonicNow }
+          const durableClaim = await readOpenCodeProductionMemberClaim(
+            mutationLedger, target, mutationIdentity, claimContext)
+          if (!durableClaim) {
+            return { outcome: 'known_failure', failure: 'contract_violation', externalEffect: false }
+          }
+          // A migrated V1 claim is stored under the canonical logical key but
+          // deliberately retains its predecessor idempotency identity. Every
+          // lookup, effect, projection, and commit below must share that one
+          // durable identity across crash/restart.
+          const authoritativeSessionId = durableClaim.idempotencyIdentity
+          const reservationIdentity = openCodeSessionReservationIdentity(mutationIdentity)
           const reservation = await openCodeSessionStore.reserveLogicalMember(
             logicalMemberByIdentity.get(input.memberIdentity)!, reservationIdentity, authoritativeSessionId)
           if (reservation.status === 'conflict') {
@@ -2043,7 +2079,8 @@ class OpenCodeProductionLaunchRuntime {
             ...(handle.processBirthToken ? { hostProcessBirthToken: handle.processBirthToken } : {}),
             memberIdentity: input.resource.memberIdentity, memberName: record.memberName,
             teamId: record.teamId, laneId: record.laneId ?? 'primary',
-            sessionId: record.opencodeSessionId, sessionIdentity: input.resource.sessionIdentity,
+            runId: command.runId, sessionId: record.opencodeSessionId,
+            sessionIdentity: input.resource.sessionIdentity,
             ownershipTitle, phase: 'remote',
           }
         },

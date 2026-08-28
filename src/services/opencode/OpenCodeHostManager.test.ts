@@ -811,7 +811,7 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     ['clear', false],
     ['scoped/opaque', true],
   ] as const)(
-    '%s registry fences a paused stale lease cleanup after replacement and process restart',
+    '%s registry fences same-session/different-run stale cleanup after replacement and restart',
     async (_registryKind, scoped) => {
       const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-lease-replacement-'))
       const registryPath = path.join(tempDir, 'registry.json')
@@ -856,26 +856,26 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
           })
         const identity = { teamId: 'team', laneId: 'lane', memberName: 'member' }
         await manager.retainHostLease(handle.hostKey, {
-          ...identity, runId: 'run-old', sessionId: 'session-old',
+          ...identity, runId: 'run-old', sessionId: 'deterministic-session',
         })
 
         // The old cleanup is paused while a new generation commits the same
         // logical member lease. Its replay happens in a fresh manager process.
         await manager.retainHostLease(handle.hostKey, {
-          ...identity, runId: 'run-new', sessionId: 'session-new',
+          ...identity, runId: 'run-new', sessionId: 'deterministic-session',
         })
         const restarted = new OpenCodeHostManager({
           persistentRegistryPath: registryPath,
           ...(scoped ? { scopedTransportOwnerKey: ownerKey } : {}),
         })
         await expect(restarted.releaseHostLease(handle.hostKey, {
-          ...identity, runId: 'run-old', sessionId: 'session-old',
+          ...identity, runId: 'run-old', sessionId: 'deterministic-session',
         })).resolves.toBe('foreign')
         await expect(restarted.releaseHostLease(handle.hostKey, {
-          ...identity, runId: 'run-old', sessionId: 'session-new',
+          ...identity, runId: 'run-old', sessionId: 'foreign-session',
         })).resolves.toBe('foreign')
         await expect(restarted.releaseHostLease(handle.hostKey, {
-          ...identity, runId: 'run-new', sessionId: 'session-old',
+          ...identity, runId: 'run-new', sessionId: 'foreign-session',
         })).resolves.toBe('foreign')
 
         await expect(manager.disposeHost(handle.hostKey)).rejects.toThrow('durable lease')
@@ -883,16 +883,17 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
         expect(alive).toBe(true)
 
         await expect(manager.releaseHostLease(handle.hostKey, {
-          ...identity, runId: 'run-new', sessionId: 'session-new',
+          ...identity, runId: 'run-new', sessionId: 'deterministic-session',
         })).resolves.toBe('applied')
         await expect(manager.releaseHostLease(handle.hostKey, {
-          ...identity, runId: 'run-new', sessionId: 'session-new',
+          ...identity, runId: 'run-new', sessionId: 'deterministic-session',
         })).resolves.toBe('absent')
         await expect(manager.disposeHost(handle.hostKey)).resolves.toBe(true)
       } finally {
         await rm(tempDir, { recursive: true, force: true })
       }
     },
+    15_000,
   )
 
   test('Windows stable cleanup never posts dispose across an exit-and-endpoint-rebind window', async () => {

@@ -279,10 +279,22 @@ thread_local! {
     static NAMESPACE_MUTATION_FAILPOINT_SKIP: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static NAMESPACE_MUTATION_DEADLINE_FAILPOINT: std::cell::RefCell<Option<&'static str>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static NAMESPACE_MUTATION_DEADLINE_EXPIRED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(test)]
 fn fail_namespace_mutation_boundary(boundary: &'static str) -> Result<(), &'static str> {
+    NAMESPACE_MUTATION_DEADLINE_FAILPOINT.with(|point| {
+        if point.borrow().as_ref() == Some(&boundary) {
+            point.replace(None);
+            NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.set(true));
+        }
+    });
     NAMESPACE_MUTATION_FAILPOINT.with(|point| {
         if point.borrow().as_ref() == Some(&boundary) {
             if NAMESPACE_MUTATION_FAILPOINT_SKIP.with(|skip| {
@@ -310,9 +322,53 @@ fn set_namespace_mutation_failpoint(boundary: &'static str, skip: usize) {
     NAMESPACE_MUTATION_FAILPOINT_SKIP.with(|remaining| remaining.set(skip));
 }
 
+#[cfg(test)]
+fn set_namespace_mutation_deadline_failpoint(boundary: &'static str) {
+    NAMESPACE_MUTATION_DEADLINE_FAILPOINT.with(|point| point.replace(Some(boundary)));
+    NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.set(false));
+}
+
 #[cfg(not(test))]
 fn fail_namespace_mutation_boundary(_boundary: &'static str) -> Result<(), &'static str> {
     Ok(())
+}
+
+fn namespace_request_deadline_expired(deadline: Instant) -> bool {
+    #[cfg(test)]
+    if NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.replace(false)) {
+        return true;
+    }
+    Instant::now() > deadline
+}
+
+fn apply_post_dispatch_deadline(
+    result: Result<Value, &'static str>,
+    deadline: Instant,
+    preserve_committed_namespace_result: bool,
+) -> Result<Value, &'static str> {
+    if !namespace_request_deadline_expired(deadline) {
+        return result;
+    }
+    if preserve_committed_namespace_result
+        && result.as_ref().is_ok_and(|value| {
+            value.get("committed") == Some(&Value::Bool(true))
+                && matches!(
+                    value.get("namespace").and_then(Value::as_str),
+                    Some("complete" | "partial")
+                )
+                && matches!(
+                    value.get("durability").and_then(Value::as_str),
+                    Some("settled" | "unknown")
+                )
+        })
+    {
+        // The namespace transition is irreversible and exact-object custody
+        // is already retained. Never replace its committed protocol status
+        // merely because the request deadline elapsed after dispatch.
+        result
+    } else {
+        Err("DEADLINE")
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2963,6 +3019,13 @@ enum Request {
 }
 
 impl Request {
+    fn preserves_committed_namespace_result_after_deadline(&self) -> bool {
+        matches!(
+            self,
+            Self::NS_RENAME { .. } | Self::NS_UNLINK { .. } | Self::NS_REMOVE_TREE { .. }
+        )
+    }
+
     fn common(&self) -> (u8, &str, u32) {
         match self {
             Self::OPEN_ROOT {
@@ -3199,6 +3262,8 @@ pub fn run() {
             break;
         }
         let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
+        let preserve_committed_namespace_result =
+            request.preserves_committed_namespace_result_after_deadline();
         // Synchronous NTFS calls are deliberately used to retain exact object
         // authority. A per-command process watchdog is their cancellation
         // boundary: deadline expiry closes every retained handle even if the
@@ -3566,11 +3631,8 @@ pub fn run() {
             },
             _ => (Err("STATE_REJECTED"), false),
         };
-        let result = if Instant::now() > deadline {
-            Err("DEADLINE")
-        } else {
-            result
-        };
+        let result =
+            apply_post_dispatch_deadline(result, deadline, preserve_committed_namespace_result);
         let reply = match result {
             Ok(value) => json!({"version":1,"id":id,"ok":true,"value":value}),
             Err(code) => json!({"version":1,"id":id,"ok":false,"error":code}),
@@ -3917,6 +3979,196 @@ mod protocol_tests {
                 json!({"committed":true,"namespace":"complete","durability":"settled"})
             );
             assert!(authority.pending_namespace_settlements.is_empty());
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_protocol_deadline_rejects_pretransition_uncommitted_work() {
+        let root = fixture_root("namespace-deadline-pretransition");
+        std::fs::create_dir(&root).unwrap();
+        let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+        authority.namespace_mkdir("tree").unwrap();
+
+        set_namespace_mutation_deadline_failpoint("remove_tree_before_transition");
+        set_namespace_mutation_failpoint("remove_tree_before_transition", 0);
+        let result = authority.namespace_remove_tree("tree");
+        assert!(NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.get()));
+        assert_eq!(
+            apply_post_dispatch_deadline(result, Instant::now() + Duration::from_secs(1), true,),
+            Err("DEADLINE")
+        );
+        assert!(root.join("tree").is_dir());
+        assert!(authority.pending_namespace_settlements.is_empty());
+
+        authority.namespace_remove_tree("tree").unwrap();
+        drop(authority);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespace_protocol_deadline_policy_is_limited_to_committing_mutations() {
+        let common_id = "00000000-0000-4000-8000-000000000445".to_string();
+        let committing = [
+            Request::NS_RENAME {
+                version: 1,
+                id: common_id.clone(),
+                wait_ms: 1,
+                from: "from".into(),
+                to: "to".into(),
+            },
+            Request::NS_UNLINK {
+                version: 1,
+                id: common_id.clone(),
+                wait_ms: 1,
+                path: "victim".into(),
+                directory: false,
+            },
+            Request::NS_REMOVE_TREE {
+                version: 1,
+                id: common_id.clone(),
+                wait_ms: 1,
+                path: "tree".into(),
+            },
+        ];
+        assert!(committing
+            .iter()
+            .all(Request::preserves_committed_namespace_result_after_deadline));
+        assert!(!Request::NS_SYNC_DIRECTORY {
+            version: 1,
+            id: common_id,
+            wait_ms: 1,
+            path: ".".into(),
+        }
+        .preserves_committed_namespace_result_after_deadline());
+
+        assert_eq!(
+            apply_post_dispatch_deadline(
+                Ok(json!({"committed":true,"namespace":"complete","durability":"settled"})),
+                Instant::now() - Duration::from_millis(1),
+                false,
+            ),
+            Err("DEADLINE")
+        );
+    }
+
+    #[test]
+    fn namespace_protocol_deadline_preserves_rename_transition_and_durability_status() {
+        for (boundary, stop_at_boundary, durability) in [
+            ("rename_after_transition", true, "unknown"),
+            ("rename_before_source_parent_flush", true, "unknown"),
+            ("rename_after_source_parent_flush", false, "settled"),
+        ] {
+            let root = fixture_root(&format!("namespace-deadline-rename-{boundary}"));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority.namespace_mkdir("source").unwrap();
+
+            set_namespace_mutation_deadline_failpoint(boundary);
+            if stop_at_boundary {
+                set_namespace_mutation_failpoint(boundary, 0);
+            }
+            let result = authority.namespace_rename("source", "destination");
+            assert!(NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.get()));
+            assert_eq!(
+                apply_post_dispatch_deadline(
+                    result,
+                    Instant::now() + Duration::from_secs(1),
+                    true,
+                )
+                .unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":durability})
+            );
+            assert!(!root.join("source").exists());
+            assert!(root.join("destination").is_dir());
+
+            authority.namespace_sync_directory(".").unwrap();
+            authority.namespace_unlink("destination", true).unwrap();
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_protocol_deadline_preserves_unlink_transition_and_durability_status() {
+        for (boundary, stop_at_boundary, durability) in [
+            ("unlink_after_transition", true, "unknown"),
+            ("unlink_before_parent_flush", true, "unknown"),
+            ("unlink_after_parent_flush", false, "settled"),
+        ] {
+            let root = fixture_root(&format!("namespace-deadline-unlink-{boundary}"));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority.namespace_mkdir("victim").unwrap();
+
+            set_namespace_mutation_deadline_failpoint(boundary);
+            if stop_at_boundary {
+                set_namespace_mutation_failpoint(boundary, 0);
+            }
+            let result = authority.namespace_unlink("victim", true);
+            assert!(NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.get()));
+            assert_eq!(
+                apply_post_dispatch_deadline(
+                    result,
+                    Instant::now() + Duration::from_secs(1),
+                    true,
+                )
+                .unwrap(),
+                json!({"committed":true,"namespace":"complete","durability":durability})
+            );
+            assert!(!root.join("victim").exists());
+
+            authority.namespace_sync_directory(".").unwrap();
+            drop(authority);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_protocol_deadline_preserves_remove_tree_transition_and_durability_status() {
+        for (boundary, stop_at_boundary, namespace, durability) in [
+            ("remove_tree_after_transition", true, "partial", "unknown"),
+            (
+                "remove_tree_before_parent_flush",
+                true,
+                "complete",
+                "unknown",
+            ),
+            (
+                "remove_tree_after_parent_flush",
+                false,
+                "complete",
+                "settled",
+            ),
+        ] {
+            let root = fixture_root(&format!("namespace-deadline-remove-tree-{boundary}"));
+            std::fs::create_dir(&root).unwrap();
+            let (mut authority, _) = RetainedWindowsRoot::open(root.clone(), false, false).unwrap();
+            authority.namespace_mkdir("tree").unwrap();
+            authority.namespace_mkdir("tree/child").unwrap();
+
+            set_namespace_mutation_deadline_failpoint(boundary);
+            if stop_at_boundary {
+                set_namespace_mutation_failpoint(boundary, 0);
+            }
+            let result = authority.namespace_remove_tree("tree");
+            assert!(NAMESPACE_MUTATION_DEADLINE_EXPIRED.with(|expired| expired.get()));
+            assert_eq!(
+                apply_post_dispatch_deadline(
+                    result,
+                    Instant::now() + Duration::from_secs(1),
+                    true,
+                )
+                .unwrap(),
+                json!({"committed":true,"namespace":namespace,"durability":durability})
+            );
+
+            if root.join("tree").exists() {
+                authority.namespace_remove_tree("tree").unwrap();
+            }
+            authority.namespace_sync_directory(".").unwrap();
+            assert!(!root.join("tree").exists());
             drop(authority);
             std::fs::remove_dir_all(root).unwrap();
         }
