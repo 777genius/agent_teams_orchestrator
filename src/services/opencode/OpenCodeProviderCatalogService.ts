@@ -10,6 +10,7 @@ import { decodeOpenCodeLegacyCatalogEnvelope } from './OpenCodeCatalogLegacyCode
 import { normalizeOpenCodeScopedProviderCatalogResponse } from './OpenCodeLiveProviderNormalizer.js'
 import {
   createOpenCodeCatalogRecordId,
+  decodeOpenCodeScopedProviderCatalog,
   type OpenCodeCatalogRecordIdentityPayload,
   type OpenCodeScopedProviderCatalog,
 } from './OpenCodeProviderCatalogContract.js'
@@ -156,6 +157,19 @@ function integer(value: unknown, minimum = 0): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
 }
 
+function closedRecord(value: unknown, keys: readonly string[]): Readonly<Record<string, unknown>> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const actual = Object.keys(value)
+  if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) return null
+  return value as Readonly<Record<string, unknown>>
+}
+
+function digest(value: unknown): value is `sha256:${string}` {
+  return typeof value === 'string' && /^sha256:[0-9a-f]{64}$/.test(value)
+}
+
 function options(deps: OpenCodeProviderCatalogServiceDeps) {
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS
@@ -222,6 +236,38 @@ function payload(catalog: OpenCodeScopedProviderCatalog): OpenCodeCatalogRecordI
     models: catalog.models }
 }
 
+function decodeEvidence(raw: unknown, identity: CacheIdentity,
+  catalog: OpenCodeScopedProviderCatalog): OpenCodeCatalogPublicationEvidence | null {
+  const value = closedRecord(raw, ['providerId', 'requestGeneration', 'startedAt', 'attemptIdentity',
+    'binaryFingerprint', 'configFingerprint', 'authFingerprint'])
+  if (!value || value.providerId !== identity.providerId
+    || value.requestGeneration !== catalog.generation || !integer(value.requestGeneration, 1)
+    || !integer(value.startedAt) || !digest(value.attemptIdentity)
+    || value.binaryFingerprint !== fingerprint('opencode-catalog-binary-v1', identity.binaryFingerprint)
+    || value.configFingerprint !== fingerprint('opencode-catalog-config-v1', identity.managedConfigFingerprint)
+    || value.authFingerprint !== fingerprint('opencode-catalog-auth-v1', identity.selectedAuthBaselineFingerprint)) {
+    return null
+  }
+  return Object.freeze({ providerId: identity.providerId,
+    requestGeneration: value.requestGeneration, startedAt: value.startedAt,
+    attemptIdentity: value.attemptIdentity,
+    binaryFingerprint: value.binaryFingerprint as `sha256:${string}`,
+    configFingerprint: value.configFingerprint as `sha256:${string}`,
+    authFingerprint: value.authFingerprint as `sha256:${string}` })
+}
+
+function envelopeMaterial(identity: CacheIdentity, catalog: OpenCodeScopedProviderCatalog,
+  catalogEvidence: OpenCodeCatalogPublicationEvidence, observedAt: number, expiresAt: number): string {
+  return JSON.stringify({
+    identity,
+    authorityIdentity: authorityIdentity(identity),
+    catalog,
+    catalogEvidence,
+    catalogObservedAt: observedAt,
+    catalogExpiresAt: expiresAt,
+  })
+}
+
 function refresh(catalog: OpenCodeScopedProviderCatalog, now: number, ttlMs: number,
   maxStaleMs: number): OpenCodeScopedProviderCatalog | null {
   const observed = catalog.freshness.observedAtMs
@@ -235,53 +281,60 @@ function refresh(catalog: OpenCodeScopedProviderCatalog, now: number, ttlMs: num
 
 function persisted(identity: CacheIdentity, catalog: OpenCodeScopedProviderCatalog,
   catalogEvidence: OpenCodeCatalogPublicationEvidence, observedAt: number, expiresAt: number): Persisted {
-  const material = `${JSON.stringify(identity)}\0${catalog.recordId}\0${JSON.stringify(catalogEvidence)}\0${observedAt}\0${expiresAt}`
   return Object.freeze({ schema: 'opencode-provider-catalog-cache-v44307', identity, catalog,
     authorityIdentity: authorityIdentity(identity),
     catalogEvidence, catalogObservedAt: observedAt, catalogExpiresAt: expiresAt,
-    envelopeHash: `sha256:${hash(material)}` })
+    envelopeHash: `sha256:${hash(envelopeMaterial(identity, catalog, catalogEvidence, observedAt, expiresAt))}` })
 }
 
 function decodePersisted(raw: unknown, identity: CacheIdentity): Persisted | null {
   try {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const value = raw as Partial<Persisted>
-    if (value.schema !== 'opencode-provider-catalog-cache-v44307'
-      || JSON.stringify(value.identity) !== JSON.stringify(identity)
-      || JSON.stringify(value.authorityIdentity) !== JSON.stringify(authorityIdentity(identity))
-      || !value.catalog || value.catalog.providerId !== identity.providerId
-      || !value.catalogEvidence || value.catalogEvidence.providerId !== identity.providerId
+    const value = closedRecord(raw, ['schema', 'identity', 'authorityIdentity', 'catalog',
+      'catalogEvidence', 'catalogObservedAt', 'catalogExpiresAt', 'envelopeHash'])
+    const decodedIdentity = closedRecord(value?.identity, ['projectPath', 'providerId',
+      'binaryFingerprint', 'managedConfigFingerprint', 'selectedAuthBaselineFingerprint'])
+    const decodedAuthority = closedRecord(value?.authorityIdentity, ['project_path', 'provider_id',
+      'config_fingerprint', 'auth_fingerprint', 'binary_fingerprint', 'cache_key'])
+    const catalog = decodeOpenCodeScopedProviderCatalog(value?.catalog)
+    if (!value || value.schema !== 'opencode-provider-catalog-cache-v44307'
+      || !decodedIdentity || JSON.stringify(decodedIdentity) !== JSON.stringify(identity)
+      || !decodedAuthority
+      || JSON.stringify(decodedAuthority) !== JSON.stringify(authorityIdentity(identity))
+      || !catalog || catalog.providerId !== identity.providerId
       || !integer(value.catalogObservedAt) || !integer(value.catalogExpiresAt)
-      || value.catalogExpiresAt! < value.catalogObservedAt!
-      || createOpenCodeCatalogRecordId(payload(value.catalog)) !== value.catalog.recordId) return null
-    const material = `${JSON.stringify(identity)}\0${value.catalog.recordId}\0${JSON.stringify(value.catalogEvidence)}\0${value.catalogObservedAt}\0${value.catalogExpiresAt}`
-    if (value.envelopeHash !== `sha256:${hash(material)}`) return null
-    return value as Persisted
+      || value.catalogExpiresAt < value.catalogObservedAt
+      || catalog.freshness.observedAtMs !== value.catalogObservedAt) return null
+    const catalogEvidence = decodeEvidence(value.catalogEvidence, identity, catalog)
+    if (!catalogEvidence || catalogEvidence.startedAt > value.catalogObservedAt
+      || value.envelopeHash !== `sha256:${hash(envelopeMaterial(identity, catalog, catalogEvidence,
+        value.catalogObservedAt, value.catalogExpiresAt))}`) return null
+    return Object.freeze({ schema: 'opencode-provider-catalog-cache-v44307', identity,
+      authorityIdentity: authorityIdentity(identity), catalog, catalogEvidence,
+      catalogObservedAt: value.catalogObservedAt, catalogExpiresAt: value.catalogExpiresAt,
+      envelopeHash: value.envelopeHash as `sha256:${string}` })
   } catch { return null }
 }
 
 function decodeLegacyPersisted(raw: unknown, identity: CacheIdentity): Persisted | null {
   try {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const value = raw as Record<string, unknown>
-    const fingerprints = value.fingerprints as Record<string, unknown> | null
-    const catalog = value.catalog as OpenCodeScopedProviderCatalog | null
-    const priorEvidence = value.catalogEvidence as OpenCodeCatalogPublicationEvidence | null
-    const observed = value.catalogObservedAt
-    const expires = value.catalogExpiresAt
+    const value = closedRecord(raw, ['schema', 'identityHash', 'fingerprints', 'catalog',
+      'catalogEvidence', 'catalogObservedAt', 'catalogExpiresAt', 'envelopeHash'])
+    const fingerprints = closedRecord(value?.fingerprints, ['providerId', 'binaryFingerprint',
+      'managedConfigFingerprint', 'selectedAuthBaselineFingerprint'])
+    const catalog = decodeOpenCodeScopedProviderCatalog(value?.catalog)
+    const observed = value?.catalogObservedAt
+    const expires = value?.catalogExpiresAt
     const key = authorityIdentity(identity).cache_key
-    if (value.schema !== 'opencode-provider-catalog-cache-v4' || value.identityHash !== `sha256:${key}`
+    if (!value || value.schema !== 'opencode-provider-catalog-cache-v4' || value.identityHash !== `sha256:${key}`
       || !fingerprints || fingerprints.providerId !== identity.providerId
       || fingerprints.binaryFingerprint !== identity.binaryFingerprint
       || fingerprints.managedConfigFingerprint !== identity.managedConfigFingerprint
       || fingerprints.selectedAuthBaselineFingerprint !== identity.selectedAuthBaselineFingerprint
-      || !catalog || catalog.providerId !== identity.providerId || !priorEvidence
-      || priorEvidence.providerId !== identity.providerId
-      || priorEvidence.binaryFingerprint !== fingerprint('opencode-catalog-binary-v1', identity.binaryFingerprint)
-      || priorEvidence.configFingerprint !== fingerprint('opencode-catalog-config-v1', identity.managedConfigFingerprint)
-      || priorEvidence.authFingerprint !== fingerprint('opencode-catalog-auth-v1', identity.selectedAuthBaselineFingerprint)
+      || !catalog || catalog.providerId !== identity.providerId
       || !integer(observed) || !integer(expires) || expires < observed
-      || createOpenCodeCatalogRecordId(payload(catalog)) !== catalog.recordId) return null
+      || catalog.freshness.observedAtMs !== observed) return null
+    const priorEvidence = decodeEvidence(value.catalogEvidence, identity, catalog)
+    if (!priorEvidence || priorEvidence.startedAt > observed) return null
     const expectedHash = `sha256:${hash(`sha256:${key}\0${catalog.recordId}\0${JSON.stringify(priorEvidence)}\0${observed}\0${expires}`)}`
     if (value.envelopeHash !== expectedHash) return null
     return persisted(identity, catalog, priorEvidence, observed, expires)

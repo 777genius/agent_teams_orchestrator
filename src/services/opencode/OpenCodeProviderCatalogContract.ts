@@ -347,3 +347,48 @@ export function createOpenCodeCatalogRecordId(
   const hash = createHash('sha256').update(JSON.stringify(closed)).digest('hex')
   return `sha256:${hash}`
 }
+
+/**
+ * Decodes a catalog crossing a persistence boundary.  This deliberately
+ * snapshots the closed wire shape instead of returning (or spreading) the
+ * caller-owned object: catalog cache data is untrusted even after its record
+ * digest has been checked.
+ */
+export function decodeOpenCodeScopedProviderCatalog(
+  value: unknown,
+): OpenCodeScopedProviderCatalog | null {
+  try {
+    const catalog = inertCatalogRecord(value, [
+      'schema', 'providerId', 'source', 'endpoint', 'generation', 'recordId',
+      'freshness', 'connected', 'models', 'selectionAllowed', 'launchAuthorization',
+    ])
+    if (!catalog || catalog.schema !== 'opencode-scoped-provider-catalog-v1'
+      || catalog.selectionAllowed !== true || catalog.launchAuthorization !== 'forbidden'
+      || typeof catalog.recordId !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(catalog.recordId)) {
+      return null
+    }
+    const payload = snapshotCatalogIdentityPayload({
+      providerId: catalog.providerId,
+      source: catalog.source,
+      endpoint: catalog.endpoint,
+      generation: catalog.generation,
+      freshness: catalog.freshness,
+      connected: catalog.connected,
+      models: catalog.models,
+    })
+    if (!payload || createOpenCodeCatalogRecordId(payload) !== catalog.recordId) return null
+    return Object.freeze({
+      schema: 'opencode-scoped-provider-catalog-v1',
+      providerId: payload.providerId,
+      source: payload.source,
+      endpoint: payload.endpoint,
+      generation: payload.generation,
+      recordId: catalog.recordId as `sha256:${string}`,
+      freshness: payload.freshness,
+      connected: payload.connected,
+      models: payload.models,
+      selectionAllowed: true,
+      launchAuthorization: 'forbidden',
+    })
+  } catch { return null }
+}

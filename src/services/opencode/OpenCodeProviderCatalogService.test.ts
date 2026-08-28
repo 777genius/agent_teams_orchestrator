@@ -51,6 +51,36 @@ async function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
     fetches: () => fetches }
 }
 
+async function fakePersistedFixture() {
+  let stored: unknown | null = null
+  let generation = 0
+  let clock = 1_000
+  let fetches = 0
+  let failFetch = false
+  const allocateAttempt = () => ({ requestGeneration: ++generation,
+    attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` as const })
+  const f = await fixture({
+    now: () => clock,
+    allocateAttempt,
+    readPersisted: async () => stored,
+    writePersisted: async (_key, value) => { stored = value },
+    fetchProviderCatalog: async () => {
+      fetches += 1
+      if (failFetch) throw new Error('injected catalog refresh failure')
+      return response(`model-${fetches}`)
+    },
+  })
+  return { service: f.service, fetches: () => fetches,
+    stored: () => stored,
+    replaceStored: (value: unknown) => { stored = value },
+    setClock: (value: number) => { clock = value },
+    failFetch: () => { failFetch = true } }
+}
+
+function jsonClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
 describe.serial('OpenCodeProviderCatalogService native ownership', () => {
   test('settles prepared auth once before host work and rolls back validation failures once', async () => {
     const order: string[] = []; let rollbacks = 0
@@ -205,6 +235,79 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
       expect(second.catalogProvenance).toBe('cache-hit')
       expect(second.catalogEvidence).toEqual(first.catalogEvidence)
     } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
+  })
+
+  test('rejects injected launch authority and unknown secret fields without trusting their old hashes', async () => {
+    for (const inject of [
+      (raw: Record<string, any>) => { raw.catalog.launchAuthorization = 'fresh-retained-host-exact-proof' },
+      (raw: Record<string, any>) => { raw.catalog.apiSecret = 'must-not-cross-cache-boundary' },
+      (raw: Record<string, any>) => { raw.persistedSecret = 'must-not-cross-envelope-boundary' },
+    ]) {
+      const f = await fakePersistedFixture()
+      await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/injected-cache' })
+      const poisoned = jsonClone(f.stored()) as Record<string, any>
+      inject(poisoned)
+      f.replaceStored(poisoned)
+      const repaired = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/injected-cache' })
+      expect(f.fetches()).toBe(2)
+      expect(repaired.catalog.launchAuthorization).toBe('forbidden')
+      expect(repaired.catalog.selectionAllowed).toBe(true)
+      expect('apiSecret' in repaired.catalog).toBe(false)
+      expect('persistedSecret' in repaired.catalog).toBe(false)
+    }
+  })
+
+  test('ignores catalog record, allowed payload, and envelope hash tampering', async () => {
+    for (const tamper of [
+      (raw: Record<string, any>) => { raw.catalog.recordId = `sha256:${'0'.repeat(64)}` },
+      (raw: Record<string, any>) => { raw.catalog.models[0].displayName = 'Tampered Name' },
+      (raw: Record<string, any>) => { raw.envelopeHash = `sha256:${'0'.repeat(64)}` },
+    ]) {
+      const f = await fakePersistedFixture()
+      await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/tampered-cache' })
+      const corrupted = jsonClone(f.stored()) as Record<string, any>
+      tamper(corrupted)
+      f.replaceStored(corrupted)
+      const repaired = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/tampered-cache' })
+      expect(f.fetches()).toBe(2)
+      expect(repaired.catalog.models.map(model => model.id)).toEqual(['model-2'])
+      expect(repaired.catalog.launchAuthorization).toBe('forbidden')
+    }
+  })
+
+  test('rejects a legacy catalog with injected launch authority even when its legacy hashes are unchanged', async () => {
+    const f = await fakePersistedFixture()
+    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/legacy-poison' })
+    const current = jsonClone(f.stored()) as Record<string, any>
+    const key = createHash('sha256').update(JSON.stringify([
+      '/sandbox/legacy-poison', 'deepinfra', 'binary', 'config', 'auth',
+    ])).digest('hex')
+    const identityHash = `sha256:${key}`
+    const legacyHash = `sha256:${createHash('sha256').update(
+      `${identityHash}\0${current.catalog.recordId}\0${JSON.stringify(current.catalogEvidence)}\0${current.catalogObservedAt}\0${current.catalogExpiresAt}`,
+    ).digest('hex')}`
+    current.catalog.launchAuthorization = 'fresh-retained-host-exact-proof'
+    f.replaceStored({ schema: 'opencode-provider-catalog-cache-v4', identityHash,
+      fingerprints: { providerId: 'deepinfra', binaryFingerprint: 'binary',
+        managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth' },
+      catalog: current.catalog, catalogEvidence: current.catalogEvidence,
+      catalogObservedAt: current.catalogObservedAt, catalogExpiresAt: current.catalogExpiresAt,
+      envelopeHash: legacyHash })
+    const repaired = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/legacy-poison' })
+    expect(f.fetches()).toBe(2)
+    expect(repaired.catalog.launchAuthorization).toBe('forbidden')
+  })
+
+  test('returns a valid bounded-stale catalog for selection but never for launch', async () => {
+    const f = await fakePersistedFixture()
+    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/stale-selection' })
+    f.setClock(12_000)
+    f.failFetch()
+    const stale = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/stale-selection' })
+    expect(stale.catalogProvenance).toBe('bounded-stale')
+    expect(stale.catalog.freshness.state).toBe('bounded-stale')
+    expect(stale.catalog.selectionAllowed).toBe(true)
+    expect(stale.catalog.launchAuthorization).toBe('forbidden')
   })
 
   test('post-COMMIT cleanup, mutable input, and timer faults cannot reject the acknowledged catalog', async () => {
