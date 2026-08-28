@@ -980,6 +980,8 @@ export class OpenCodeSessionBridge {
     ) {
       const retained = await this.retainSessionHost(existing, existing.runId, profile)
       await this.completePendingLeaseTransition(refreshDecisionKey)
+      this.publishedSuccessors.delete(refreshDecisionKey)
+      this.pendingLeaseTransitions.delete(refreshDecisionKey)
       return retained?.pid && retained.pid > 0 ? { ...existing, runtimePid: retained.pid } : existing
     }
     const existingManagedConfigFingerprint = existing
@@ -1112,6 +1114,8 @@ export class OpenCodeSessionBridge {
         )
       }
     }
+    this.publishedSuccessors.delete(refreshDecisionKey)
+    this.pendingLeaseTransitions.delete(refreshDecisionKey)
     return created.record
   }
 

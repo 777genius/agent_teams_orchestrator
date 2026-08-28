@@ -1486,6 +1486,69 @@ describe('OpenCodeSessionBridge', () => {
       'publish-successor', 'retain-failed', 'retain-successor', 'release-old:session-1',
     ])
     expect({ creates, deletes }).toEqual({ creates: 1, deletes: 0 })
+
+    const nextFresh = await bridge.ensureSession(input)
+    expect(nextFresh).toMatchObject({ opencodeSessionId: 'session-new-2', runId: 'run-new' })
+    expect(creates).toBe(2)
+
+    const reused = await bridge.ensureSession({ ...input, fresh: false })
+    expect(reused.opencodeSessionId).toBe('session-new-2')
+    expect({ creates, deletes }).toEqual({ creates: 2, deletes: 0 })
+  })
+
+  test('retries a failed predecessor lease release before allowing another fresh successor', async () => {
+    let current = buildRecord({ runId: 'run-old' })
+    let creates = 0
+    let predecessorReleaseAttempts = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => current,
+        publishSuccessorIfExact: async successor => {
+          current = successor
+          return { status: 'replaced', record: successor }
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+        releaseHostLease: async () => {
+          predecessorReleaseAttempts += 1
+          if (predecessorReleaseAttempts === 1) throw new Error('lease release unavailable')
+          return 'applied'
+        },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: `session-new-${++creates}` }),
+        deleteSession: async () => true,
+      } as never) },
+    })
+    const input = {
+      teamId: current.teamId, laneId: current.laneId, memberName: current.memberName,
+      selectedModel: current.selectedModel, projectPath: current.projectPath,
+      runId: 'run-new', fresh: true,
+    }
+
+    await expect(bridge.ensureSession(input)).rejects.toThrow(
+      /predecessor host lease release failed.*lease release unavailable/,
+    )
+    expect(current.opencodeSessionId).toBe('session-new-1')
+    expect({ creates, predecessorReleaseAttempts }).toEqual({
+      creates: 1, predecessorReleaseAttempts: 1,
+    })
+
+    const retried = await bridge.ensureSession(input)
+    expect(retried.opencodeSessionId).toBe('session-new-1')
+    expect({ creates, predecessorReleaseAttempts }).toEqual({
+      creates: 1, predecessorReleaseAttempts: 2,
+    })
+
+    const nextFresh = await bridge.ensureSession(input)
+    expect(nextFresh.opencodeSessionId).toBe('session-new-2')
+    expect({ creates, predecessorReleaseAttempts }).toEqual({
+      creates: 2, predecessorReleaseAttempts: 3,
+    })
   })
 
   test('a restarted bridge reuses the durable successor after lease retention failure', async () => {
@@ -1567,7 +1630,7 @@ describe('OpenCodeSessionBridge', () => {
     }])
   })
 
-  test('idempotent refresh retry reuses an already-published exact successor', async () => {
+  test('consecutive successful fresh calls create distinct sessions and fresh false reuses the latest', async () => {
     let current = buildRecord({ runId: 'run-old' })
     let creates = 0
     const bridge = new OpenCodeSessionBridge({
@@ -1594,9 +1657,52 @@ describe('OpenCodeSessionBridge', () => {
       runId: 'run-new', fresh: true,
     }
     const first = await bridge.ensureSession(input)
-    const retry = await bridge.ensureSession(input)
-    expect(retry.opencodeSessionId).toBe(first.opencodeSessionId)
-    expect(creates).toBe(1)
+    const second = await bridge.ensureSession(input)
+    const reused = await bridge.ensureSession({ ...input, fresh: false })
+    expect(first.opencodeSessionId).toBe('session-successor-1')
+    expect(second.opencodeSessionId).toBe('session-successor-2')
+    expect(reused.opencodeSessionId).toBe(second.opencodeSessionId)
+    expect(creates).toBe(2)
+  })
+
+  test('successful first publication does not poison a later fresh request', async () => {
+    let current: OpenCodeSessionRecord | null = null
+    let creates = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => current,
+        publishIfAbsentOrExact: async record => {
+          current = record
+          return { status: 'inserted', record }
+        },
+        publishSuccessorIfExact: async successor => {
+          current = successor
+          return { status: 'replaced', record: successor }
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async () => {}, releaseHostLease: async () => 'applied',
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: `session-first-${++creates}` }),
+        deleteSession: async () => true,
+      } as never) },
+    })
+    const input = {
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', projectPath: '/tmp/project',
+      runId: 'run-first', fresh: true,
+    }
+
+    const first = await bridge.ensureSession(input)
+    const second = await bridge.ensureSession(input)
+    const reused = await bridge.ensureSession({ ...input, fresh: false })
+    expect(first.opencodeSessionId).toBe('session-first-1')
+    expect(second.opencodeSessionId).toBe('session-first-2')
+    expect(reused.opencodeSessionId).toBe(second.opencodeSessionId)
+    expect(creates).toBe(2)
   })
 
   test('foreign lease CAS preserves the exact retained project run session owner', async () => {
