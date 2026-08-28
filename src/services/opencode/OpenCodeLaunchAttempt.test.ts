@@ -821,6 +821,64 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     ])
   })
 
+  test('same-generation replay advances a durable member cleanup obligation before host completion', async () => {
+    const memberIdentity = members[1]!
+    let memberTwoAttempts = 0
+    const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
+    const subject = setup({ authoritative, materialize: async member => member === members[0]
+      ? { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } }
+      : ++memberTwoAttempts === 1
+        ? { outcome: 'known_failure', failure: 'pre_side_effect_transport', externalEffect: false,
+          owned: { memberIdentity: member, sessionIdentity: oid('2') } }
+        : { outcome: 'applied', linkage: linkage(member), owned: { memberIdentity: member } } })
+    subject.ports.ownership.createCleanupObligation = input => ({
+      attemptId: input.attemptId, payloadHash: input.payloadHash, generation: input.generation,
+      hostKey: 'host', memberIdentity: input.resource.memberIdentity, memberName: 'alice',
+      teamId: 'team', laneId: 'primary', sessionId: 'session-owned',
+      sessionIdentity: input.resource.sessionIdentity!, ownershipTitle: 'agent-teams-launch:owned',
+      phase: 'remote',
+    })
+    subject.ports.ownership.cleanupOwned = async () => 'timed_out'
+    const first = await subject.launch.run({ request: request(), members,
+      requestedBudgetMs: 10_000 })
+    expect(first).toMatchObject({ cleanup: 'timed_out', cleanupPending: [memberIdentity] })
+    expect(first.committed.map(item => item.memberIdentity)).toEqual([members[0]])
+    expect(subject.persistence.json().memberCleanupObligations).toMatchObject([
+      { memberIdentity, phase: 'remote' },
+    ])
+
+    const replayedPhases: string[] = []
+    subject.ports.ownership.reconcileCleanupObligations = async input => {
+      let obligation = input.cleanupObligations[0]!
+      for (const phase of ['projection_stale', 'lease_release', 'projection_delete',
+        'obligation_complete', 'complete'] as const) {
+        await input.advanceCleanupObligation(obligation, phase)
+        obligation = { ...obligation, phase }
+        replayedPhases.push(phase)
+      }
+      return 'complete'
+    }
+    subject.ports.host.reconcileOperationHost = async () => 'complete'
+    const replay = await new OpenCodeLaunchAttempt(
+      new OpenCodeLaunchAttemptStore(subject.persistence), subject.ports).run({
+        request: request(), members, requestedBudgetMs: 10_000,
+      })
+    expect(replay.cleanup).toBe('complete')
+    expect(replayedPhases).toEqual(['projection_stale', 'lease_release', 'projection_delete',
+      'obligation_complete', 'complete'])
+    expect(subject.persistence.json()).toMatchObject({ cleanupState: 'complete',
+      memberCleanupObligations: [{ memberIdentity, phase: 'complete' }] })
+    expect(subject.calls.filter(call => call === `create:${memberIdentity}`)).toHaveLength(1)
+    authoritative.set(members[0]!, first.committed[0]!)
+    const continuationRequest = request(2)
+    continuationRequest.launchAttempt.continuationToken = first.continuationToken
+    const continued = await subject.launch.run({ request: continuationRequest, members,
+      continuation: true, requestedBudgetMs: 10_000 })
+    expect(continued.committed.map(item => item.memberIdentity)).toEqual(members)
+    expect(subject.calls.filter(call => call === `create:${members[0]}`)).toHaveLength(1)
+    expect(subject.calls.filter(call => call === `create:${members[1]}`)).toHaveLength(2)
+  })
+
   test('rejects forged and stale continuation tokens before advancing the durable generation', async () => {
     const authoritative = new Map<string, OpenCodeLaunchMemberLinkage | null>()
     const subject = setup({ authoritative, materialize: async member => member === members[0]

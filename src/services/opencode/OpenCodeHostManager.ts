@@ -168,6 +168,17 @@ export type OpenCodeHostReleaseReceipt = Readonly<{
   lifetime: OpenCodeHostLifetime
 }>
 
+export type OpenCodeRetainedHostAccessIdentity = Readonly<{
+  hostKey: string
+  pid: number
+  processStartedAtMs: number
+  processBirthToken?: string
+}>
+
+export type OpenCodeRetainedHostAccessResult<T> =
+  | Readonly<{ status: 'available'; value: T }>
+  | Readonly<{ status: 'absent' | 'unresolved' }>
+
 const hostReferenceCapabilities = new WeakMap<object, {
   manager: OpenCodeHostManager
   entry: ManagedHostEntry
@@ -3753,6 +3764,82 @@ export class OpenCodeHostManager {
     return retained?.manager === this
       && canonicalSerializeOpenCodePolicyIdentity(retained.receipt)
         === canonicalSerializeOpenCodePolicyIdentity(receipt)
+  }
+
+  /**
+   * Uses only an already-journaled process generation to access an existing
+   * host. It never prepares a profile, stages a binary, adopts a host entry, or
+   * starts a process. The persistent registry is held under its retained
+   * lifecycle locks for the complete callback so the authenticated endpoint
+   * cannot be replaced between identity proof and cleanup.
+   */
+  async withRetainedHostAccess<T>(
+    identity: OpenCodeRetainedHostAccessIdentity,
+    operation: (access: Readonly<{ hostKey: string; baseUrl: string }>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<OpenCodeRetainedHostAccessResult<T>> {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
+    if (!identity || typeof identity.hostKey !== 'string' || !identity.hostKey.trim()
+      || !Number.isSafeInteger(identity.pid) || identity.pid <= 0
+      || !Number.isFinite(identity.processStartedAtMs)
+      || (identity.processBirthToken !== undefined
+        && (typeof identity.processBirthToken !== 'string'
+          || !identity.processBirthToken.startsWith('linux:')))) {
+      throw new Error('OpenCode retained host access identity is invalid [redacted]')
+    }
+    const exactProcessStillExists = async (): Promise<boolean> => {
+      if (!this.isProcessAlive(identity.pid)) return false
+      const startedAt = await this.readProcessStartTimeMs(identity.pid).catch(() => null)
+      if (startedAt !== identity.processStartedAtMs) return false
+      if (identity.processBirthToken !== undefined
+        && this.readProcessBirthToken(identity.pid) !== identity.processBirthToken) return false
+      return true
+    }
+    const tracked = this.hosts.get(identity.hostKey)
+    if (tracked) {
+      const handle = tracked.handle
+      if (handle.pid !== identity.pid
+        || handle.processStartedAtMs !== identity.processStartedAtMs
+        || (identity.processBirthToken !== undefined
+          && handle.processBirthToken !== identity.processBirthToken)) {
+        return { status: 'unresolved' }
+      }
+      if (!await exactProcessStillExists()) return { status: 'absent' }
+      tracked.refCount += 1
+      try {
+        return { status: 'available',
+          value: await operation({ hostKey: handle.hostKey, baseUrl: handle.baseUrl }) }
+      } finally {
+        tracked.refCount = Math.max(0, tracked.refCount - 1)
+      }
+    }
+    // After a process restart, tokenless PID/time identity is not authority to
+    // contact a possibly recycled endpoint.
+    if (!identity.processBirthToken) return { status: 'unresolved' }
+    if (!this.persistentRegistryPath) {
+      return await exactProcessStillExists() ? { status: 'unresolved' } : { status: 'absent' }
+    }
+    return this.withPersistentHostStartupLock(identity.hostKey, () =>
+      this.withPersistentRegistryLock(async () => {
+        const registry = await this.readPersistentRegistryUnlocked()
+        if (registry.schemaVersion !== 2) return { status: 'unresolved' } as const
+        const record = registry.hosts[identity.hostKey]
+        if (!record) {
+          return await exactProcessStillExists()
+            ? { status: 'unresolved' } as const : { status: 'absent' } as const
+        }
+        if (!record.scopedIdentity
+          || !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)
+          || record.pid !== identity.pid
+          || record.processStartedAtMs !== identity.processStartedAtMs
+          || record.processBirthToken !== identity.processBirthToken) {
+          return { status: 'unresolved' } as const
+        }
+        if (!await exactProcessStillExists()) return { status: 'absent' } as const
+        return { status: 'available' as const,
+          value: await operation({ hostKey: record.hostKey,
+            baseUrl: scopedRecordBaseUrl(record, this.scopedTransportOwnerKey) }) }
+      }), signal)
   }
 
   async reconcileHostReleaseReceipt(

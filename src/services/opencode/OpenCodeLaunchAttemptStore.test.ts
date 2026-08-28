@@ -909,6 +909,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
         relativePaths.push(relativePath)
         const value = await lstat(relativePath === '.' ? retainedRoot : join(retainedRoot, relativePath))
         return { volumeSerial: String(value.dev), fileId: String(value.ino), size: String(value.size),
+          linkCount: String(value.nlink),
           kind: value.isDirectory() ? 'directory' as const : 'file' as const }
       },
       async namespaceOpen(relativePath: string) {
@@ -1694,6 +1695,36 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       ])
     } finally { await rm(directory, { recursive: true, force: true }) }
   }, 15_000)
+})
+
+test('member cleanup obligation persists exact phase across restart and alone authorizes cleanup completion', async () => {
+  const persistence = new MemoryPersistence()
+  const exact = { ...identity, inputDigest: 'e'.repeat(64), immutableDigest: 'f'.repeat(64),
+    generation: 1, startedAtMs: 1, totalBudgetMs: 10_000 }
+  const obligation = { attemptId: identity.attemptId, payloadHash: identity.payloadHash,
+    generation: 1, hostKey: 'host', memberIdentity: member, memberName: 'alice',
+    teamId: 'team', laneId: 'primary', sessionId: 'session-owned',
+    sessionIdentity: oid('2'), ownershipTitle: 'agent-teams-launch:owned', phase: 'remote' as const }
+  const context = { deadlineAtMs: 20_000, signal: new AbortController().signal, monotonicNow: () => 2 }
+  await new OpenCodeLaunchAttemptStore(persistence).withGeneration(exact, 'begin', async lease => {
+    await lease.bindMemberCleanupObligation(obligation, context)
+    await lease.advanceMemberCleanupObligation(obligation, 'projection_stale', context)
+    await lease.commitTerminalResponse(finalResponse(), 'incomplete', context)
+  }, context)
+
+  const restarted = new OpenCodeLaunchAttemptStore(persistence)
+  await restarted.withGeneration(exact, 'replay', async lease => {
+    let current = lease.journal.memberCleanupObligations![0]!
+    expect(current).toMatchObject({ ...obligation, phase: 'projection_stale' })
+    for (const phase of ['lease_release', 'projection_delete', 'obligation_complete', 'complete'] as const) {
+      await lease.advanceMemberCleanupObligation(current, phase, context)
+      current = { ...current, phase }
+    }
+    await lease.reconcileCleanupComplete(context)
+  }, context)
+  expect(await restarted.inspect(exact, context)).toMatchObject({ cleanupState: 'complete',
+    finalResponse: { members: { cleanupPending: [] } },
+    memberCleanupObligations: [{ ...obligation, phase: 'complete' }] })
 })
 
 const temporaryRoots = new Set<string>()

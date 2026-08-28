@@ -17,7 +17,8 @@ import {
 import { OpenCodeLaunchMutationLedger, type OpenCodeLaunchMutationIdentity } from './OpenCodeLaunchMutationLedger.js'
 import { computeOpenCodeLaunchAttemptInputDigest, computeOpenCodeLaunchAttemptImmutableDigest } from './OpenCodeLaunchAttempt.js'
 import { deriveOpenCodeLaunchNamespacePaths, OpenCodeLaunchAttemptStore,
-  OpenCodeLaunchFileJournalPersistence } from './OpenCodeLaunchAttemptStore.js'
+  OpenCodeLaunchFileJournalPersistence, type OpenCodeMemberCleanupObligation,
+  type OpenCodeMemberCleanupPhase } from './OpenCodeLaunchAttemptStore.js'
 import type { OpenCodeLaunchAttemptResponse, OpenCodeLaunchMemberLinkage,
   OpenCodeOpaqueIdentity, OpenCodeRetainedHostIdentity } from './OpenCodeBridgeContractV2.js'
 import type { OpenCodeCurrentScopedProfilePlan, OpenCodeScopedPreparedProfile,
@@ -39,6 +40,7 @@ import {
   OpenCodeLaunchHostReleaseLedger,
   createOpenCodeLaunchAttemptProductionTestBridge,
   reobserveOpenCodeProductionRetainedProof,
+  reconcileOpenCodeMemberCleanupObligations,
   resolveOpenCodeProductionRetainedProofRecord,
   transitionOpenCodeProductionMemberClaim,
 } from './OpenCodeLaunchAttemptProduction.js'
@@ -50,9 +52,114 @@ const productionContext = () => ({
   monotonicNow: Date.now,
 })
 
+const cleanupObligation = (phase: OpenCodeMemberCleanupPhase = 'remote'):
+OpenCodeMemberCleanupObligation => ({
+  attemptId: '123e4567-e89b-42d3-a456-426614174099', payloadHash: 'a'.repeat(64),
+  generation: 1, hostKey: 'host', memberIdentity: identity, memberName: 'alice',
+  teamId: 'team', laneId: 'primary', sessionId: 'session-owned',
+  sessionIdentity: `sha256:${'b'.repeat(64)}` as OpenCodeOpaqueIdentity,
+  ownershipTitle: 'agent-teams-launch:owned', phase,
+})
+
+test.each([
+  ['markStale', new Set(['mark'])],
+  ['releaseHostLease', new Set(['release'])],
+  ['delete', new Set(['delete'])],
+  ['markStale+releaseHostLease', new Set(['mark', 'release'])],
+  ['releaseHostLease+delete', new Set(['release', 'delete'])],
+] as const)('member cleanup restart resumes the exact missing phase after %s failure',
+async (_name, initialFaults) => {
+  let durable = cleanupObligation()
+  let remotePresent = true
+  let projection: { sessionId: string; stale?: boolean } | null = { sessionId: durable.sessionId }
+  let faults = new Set<string>(initialFaults)
+  const counts = { remoteReads: 0, remoteDeletes: 0, mark: 0, release: 0, delete: 0 }
+  const run = () => reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 100,
+    signal: new AbortController().signal, monotonicNow: () => 0,
+    reconcileRemote: async () => {
+      counts.remoteReads += 1
+      if (remotePresent) { counts.remoteDeletes += 1; remotePresent = false; return 'deleted' }
+      return 'absent'
+    },
+    readProjection: async () => projection,
+    markProjectionStale: async () => {
+      counts.mark += 1
+      if (faults.has('mark')) throw new Error('mark fault')
+      if (projection) projection = { ...projection, stale: true }
+    },
+    releaseLease: async () => {
+      counts.release += 1
+      if (faults.has('release')) throw new Error('release fault')
+    },
+    deleteProjection: async () => {
+      counts.delete += 1
+      if (faults.has('delete')) throw new Error('delete fault')
+      projection = null
+    },
+    advance: async (_obligation, phase) => { durable = { ...durable, phase } },
+    completed: () => {},
+  })
+
+  expect(await run()).toBe('timed_out')
+  const restartPhase = durable.phase
+  const beforeReplay = { ...counts }
+  faults = new Set()
+  expect(await run()).toBe('complete')
+  expect(durable.phase).toBe('complete')
+  expect(projection).toBeNull()
+  expect(counts.remoteDeletes).toBe(1)
+  if (restartPhase !== 'remote') expect(counts.remoteReads).toBe(beforeReplay.remoteReads)
+  if (restartPhase === 'lease_release' || restartPhase === 'projection_delete'
+    || restartPhase === 'obligation_complete') expect(counts.mark).toBe(beforeReplay.mark)
+  if (restartPhase === 'projection_delete' || restartPhase === 'obligation_complete') {
+    expect(counts.release).toBe(beforeReplay.release)
+  }
+})
+
+test('member cleanup retains cancellation/deadline and never mutates a foreign replacement projection',
+async () => {
+  for (const boundary of ['cancelled', 'expired'] as const) {
+    let durable = cleanupObligation()
+    let effects = 0
+    const controller = new AbortController()
+    if (boundary === 'cancelled') controller.abort(new Error('cancelled'))
+    expect(await reconcileOpenCodeMemberCleanupObligations({
+      obligations: [durable], deadlineAtMs: 10, signal: controller.signal,
+      monotonicNow: () => boundary === 'expired' ? 10 : 0,
+      reconcileRemote: async () => { effects += 1; return 'deleted' },
+      readProjection: async () => { effects += 1; return null },
+      markProjectionStale: async () => { effects += 1 },
+      releaseLease: async () => { effects += 1 },
+      deleteProjection: async () => { effects += 1 },
+      advance: async (_obligation, phase) => { durable = { ...durable, phase } },
+      completed: () => { effects += 1 },
+    })).toBe('timed_out')
+    expect(durable.phase).toBe('remote')
+    expect(effects).toBe(0)
+  }
+
+  let durable = cleanupObligation('projection_stale')
+  let stale = 0; let deleted = 0; let released = 0
+  expect(await reconcileOpenCodeMemberCleanupObligations({
+    obligations: [durable], deadlineAtMs: 10, signal: new AbortController().signal,
+    monotonicNow: () => 0, reconcileRemote: async () => 'absent',
+    readProjection: async () => ({ sessionId: 'foreign-replacement' }),
+    markProjectionStale: async () => { stale += 1 },
+    releaseLease: async () => { released += 1 },
+    deleteProjection: async () => { deleted += 1 },
+    advance: async (_obligation, phase) => { durable = { ...durable, phase } },
+    completed: () => {},
+  })).toBe('complete')
+  expect({ stale, deleted, released, phase: durable.phase })
+    .toEqual({ stale: 0, deleted: 0, released: 1, phase: 'complete' })
+})
+
 test('attempt host release ledger survives restart, rejects foreign/corrupt receipts, and clears idempotently', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-ledger-'))
-  const file = path.join(directory, 'receipt.json')
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
   const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
     payloadHash: 'b'.repeat(64), generation: 3 }
   const record = { schemaVersion: 1 as const, ...expected, hostKeyIdentity: identity,
@@ -60,16 +167,16 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
       hostKeyDigest: 'c'.repeat(64), pid: 443, processStartedAtMs: 12_345,
       lifetime: 'process' as const } }
   try {
-    const first = new OpenCodeLaunchHostReleaseLedger(file)
+    const first = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     await writeFile(file, `${JSON.stringify(record)}\n`)
     const migrated = await first.read(expected)
     await first.record(migrated)
-    const recordFile = path.join(`${file}.records`,
-      `${expected.generation}.${record.receipt.receiptId}.json`)
+    const marker = JSON.parse(await readFile(file, 'utf8')) as { slot: 0 | 1 }
+    const recordFile = `${file}.slot${marker.slot}`
     const raw = await readFile(recordFile, 'utf8')
     expect(raw).not.toContain('://')
     expect(raw).not.toContain('auth')
-    const restarted = new OpenCodeLaunchHostReleaseLedger(file)
+    const restarted = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     expect(migrated).toMatchObject({ ...record, schemaVersion: 4,
       obligationId: record.receipt.receiptId, disposition: 'unknown', releaseState: 'pending' })
     expect(await restarted.readPending({ attemptId: expected.attemptId,
@@ -83,21 +190,25 @@ test('attempt host release ledger survives restart, rejects foreign/corrupt rece
     await restarted.clear(completedKeepAlive)
     expect(await restarted.read(expected)).toBeNull()
 
-    await writeFile(recordFile, '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')
+    const currentMarker = JSON.parse(await readFile(file, 'utf8')) as { slot: 0 | 1 }
+    await writeFile(`${file}.slot${currentMarker.slot}`,
+      '{"schemaVersion":1,"receipt":{"hostKeyDigest":"not-a-digest"}}')
     await expect(restarted.read(expected)).rejects.toThrow('corrupt')
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('attempt host release ledger preserves every generation and prepublished acquisition obligation', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-generations-'))
-  const file = path.join(directory, 'receipt.json')
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
   const attemptId = '123e4567-e89b-42d3-a456-426614174000'
   const payloadHash = 'b'.repeat(64)
   try {
-    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     const firstObligation = await ledger.reserve({ attemptId, payloadHash, generation: 1,
       hostKeyIdentity: identity, hostKeyDigest: 'c'.repeat(64) })
-    expect(await new OpenCodeLaunchHostReleaseLedger(file).hasUnresolvedAcquisition({
+    expect(await OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file).hasUnresolvedAcquisition({
       attemptId, payloadHash, currentGeneration: 2,
     })).toBe(true)
     const first = { ...firstObligation, receipt: { schemaVersion: 1 as const,
@@ -112,7 +223,7 @@ test('attempt host release ledger preserves every generation and prepublished ac
         pid: 442, processStartedAtMs: 1_442, lifetime: 'persistent' as const } }
     await ledger.record(second)
 
-    const restarted = new OpenCodeLaunchHostReleaseLedger(file)
+    const restarted = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     expect(await restarted.hasUnresolvedAcquisition({ attemptId, payloadHash, currentGeneration: 2 }))
       .toBe(false)
     expect((await restarted.readAllPending({ attemptId, payloadHash, currentGeneration: 2 }))
@@ -127,11 +238,13 @@ test('attempt host release ledger preserves every generation and prepublished ac
 
 test('attempt host release ledger updates only the exact obligation when one generation has multiple receipts', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-same-generation-'))
-  const file = path.join(directory, 'receipt.json')
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
   const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
     payloadHash: 'b'.repeat(64), generation: 1 }
   try {
-    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     const predecessor = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
       hostKeyDigest: 'c'.repeat(64) })
     const current = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
@@ -163,11 +276,13 @@ test('attempt host release ledger updates only the exact obligation when one gen
 
 test('attempt host release ledger CAS fences host substitution and non-monotonic transitions', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-cas-'))
-  const file = path.join(directory, 'receipt.json')
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
   const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
     payloadHash: 'b'.repeat(64), generation: 1 }
   try {
-    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     const reservation = await ledger.reserve({ ...expected, hostKeyIdentity: identity,
       hostKeyDigest: 'c'.repeat(64) })
     await ledger.record({ ...reservation, receipt: { schemaVersion: 1,
@@ -179,7 +294,7 @@ test('attempt host release ledger CAS fences host substitution and non-monotonic
     await expect(ledger.record({ ...acquired, hostKeyIdentity: `sha256:${'d'.repeat(64)}`,
       receipt: { ...acquired.receipt, hostKeyDigest: 'd'.repeat(64), pid: 462 } }))
       .rejects.toThrow('identity')
-    const contender = new OpenCodeLaunchHostReleaseLedger(file)
+    const contender = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     const competing = await Promise.allSettled([
       ledger.record({ ...acquired, disposition: 'dispose' }),
       contender.record({ ...acquired, disposition: 'keep_alive' }),
@@ -202,7 +317,9 @@ test('attempt host release ledger CAS fences host substitution and non-monotonic
 
 test('attempt host release ledger fences a foreign legacy slot before capability reconciliation', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'opencode-host-release-foreign-legacy-'))
-  const file = path.join(directory, 'receipt.json')
+  const ledgerDirectory = path.join(directory, 'opencode', 'launch-attempts')
+  await mkdir(ledgerDirectory, { recursive: true })
+  const file = path.join(ledgerDirectory, 'receipt.json')
   const expected = { attemptId: '123e4567-e89b-42d3-a456-426614174000',
     payloadHash: 'b'.repeat(64), generation: 3 }
   try {
@@ -212,7 +329,7 @@ test('attempt host release ledger fences a foreign legacy slot before capability
       receipt: { schemaVersion: 1, receiptId: '123e4567-e89b-42d3-a456-426614174443',
         hostKeyDigest: 'c'.repeat(64), pid: 443, processStartedAtMs: 12_345,
         lifetime: 'process' } }))
-    const ledger = new OpenCodeLaunchHostReleaseLedger(file)
+    const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(file)
     await expect(ledger.read(expected)).rejects.toThrow('foreign')
     await expect(ledger.readAllPending({ attemptId: expected.attemptId,
       payloadHash: expected.payloadHash, currentGeneration: expected.generation }))
@@ -1233,13 +1350,73 @@ async function productionRecoveryHarness(hostManagerOverride?: OpenCodeHostManag
   }
 }
 
+test('member cleanup replay uses only journaled host identity and never starts fresh host provisioning',
+async () => {
+  let ensured = 0
+  let recovered = 0
+  const manager = {
+    ensureScopedHostReference: async () => { ensured += 1; throw new Error('must not provision') },
+    releaseHostReference: async () => {},
+    hasExactRetainedHostReleaseCapability: () => false,
+    retainHostLease: async () => {},
+    releaseHostLease: async () => {},
+    reconcileHostReleaseReceipt: async () => {},
+    withRetainedHostAccess: async () => {
+      recovered += 1
+      return { status: 'unresolved' as const }
+    },
+  } as unknown as OpenCodeHostManager
+  const harness = await productionRecoveryHarness(manager)
+  try {
+    await harness.seedIntent({ acceptedProof: true })
+    const basis = harness.acceptedProof()
+    const failure = { code: 'pre_side_effect_transport' as const, origin: 'session' as const,
+      retryDisposition: 'automatic' as const, retryable: true,
+      phase: 'member_materialize' as const, sideEffectsStarted: false }
+    const final = { ...basis, launchAttempt: { ...basis.launchAttempt, outcome: 'failed' as const },
+      members: { committed: [], failed: [{ memberIdentity: harness.memberIdentity, failure }],
+        pending: [], cleanupPending: [harness.memberIdentity] }, failure }
+    const obligation: OpenCodeMemberCleanupObligation = {
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      generation: 1, hostKey: 'host', hostProcessId: 443, hostProcessStartedAtMs: 1,
+      hostProcessBirthToken: 'linux:11111111-2222-3333-4444-555555555555:443',
+      memberIdentity: harness.memberIdentity, memberName: 'alice', teamId: 'team',
+      laneId: 'primary', sessionId: harness.sessionId,
+      sessionIdentity: (`sha256:${createHash('sha256').update(JSON.stringify({
+        kind: 'opencode-session', id: harness.sessionId,
+      })).digest('hex')}` as OpenCodeOpaqueIdentity),
+      ownershipTitle: 'agent-teams-launch:owned', phase: 'remote',
+    }
+    await harness.store.withGeneration({
+      attemptId: harness.command.request.launchAttempt.attemptId,
+      payloadHash: harness.command.request.launchAttempt.payloadHash,
+      inputDigest: harness.inputDigest, immutableDigest: harness.immutableDigest, generation: 1,
+    }, 'replay', async lease => {
+      await lease.bindMemberCleanupObligation(obligation, harness.context)
+      await lease.commitTerminalResponse(final, 'incomplete', harness.context)
+    }, harness.context)
+
+    const result = await harness.bridge.execute(harness.command)
+    const launchAttempt = (result.data as { launchAttempt?: OpenCodeLaunchAttemptResponse })
+      .launchAttempt
+    expect(launchAttempt?.members.cleanupPending).toEqual([harness.memberIdentity])
+    expect({ ensured, recovered, remoteReads: harness.remoteReads(),
+      memberCreates: harness.memberCreates() })
+      .toEqual({ ensured: 0, recovered: 1, remoteReads: 0, memberCreates: 0 })
+    expect(await harness.inspectJournal()).toMatchObject({ cleanupState: 'incomplete',
+      memberCleanupObligations: [{ memberIdentity: harness.memberIdentity, phase: 'remote' }],
+      finalResponse: { members: { cleanupPending: [harness.memberIdentity] } } })
+  } finally { await harness.dispose() }
+})
+
 test.each(['kiro', 'cursor-acp'] as const)(
   'production-composed %s authorization and native exec stay behind every unsafe tokenless-v1 state',
   async providerId => {
   for (const state of ['current', 'cleanupPending', 'predecessor', 'continuation'] as const) {
     const harness = await productionRecoveryHarness()
     try {
-      const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+      const hostLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(harness.launchDirectory,
         `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
       const receipt = { schemaVersion: 1 as const,
         receiptId: `${state === 'current' ? '1' : state === 'cleanupPending' ? '2'
@@ -1391,7 +1568,7 @@ test('production composition routes an incomplete exact final through real HostM
     fetchJson: async () => ({ status: 200, data: { ok: true } }) })
   const harness = await productionRecoveryHarness(realHostManager)
   try {
-    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+    const hostLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(harness.launchDirectory,
       `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
     const obligation = await hostLedger.reserve({
       attemptId: harness.command.request.launchAttempt.attemptId,
@@ -1473,7 +1650,7 @@ test('production composition reconciles tokenless v1 only through the exact reta
   } as unknown as OpenCodeHostManager
   const harness = await productionRecoveryHarness(manager)
   try {
-    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+    const hostLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(harness.launchDirectory,
       `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
     const obligation = await hostLedger.reserve({
       attemptId: harness.command.request.launchAttempt.attemptId,
@@ -1565,7 +1742,7 @@ test.each(['committed', 'claimed'] as const)(
     } else {
       expect(await harness.ledger.claim(harness.target, seeded.authority, harness.context)).toBe('claimed')
     }
-    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+    const hostLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(harness.launchDirectory,
       `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
     const obligation = await hostLedger.reserve({
       attemptId: harness.command.request.launchAttempt.attemptId,
@@ -1689,7 +1866,7 @@ test('production continuation rejects a predecessor tokenless v1 obligation befo
     }, 'replay', async lease => {
       continuationToken = await lease.issueContinuation([harness.memberIdentity], harness.context)
     }, harness.context)
-    const hostLedger = new OpenCodeLaunchHostReleaseLedger(path.join(harness.launchDirectory,
+    const hostLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(harness.launchDirectory,
       `${harness.command.request.launchAttempt.attemptId}.host-release.json`))
     const obligation = await hostLedger.reserve({
       attemptId: harness.command.request.launchAttempt.attemptId,

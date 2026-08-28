@@ -169,26 +169,33 @@ export class OpenCodeWindowsPublicationAuthorityClient {
     if (typeof value?.recovered !== 'boolean') throw unavailable()
     return value.recovered
   }
-  async namespaceStat(relativePath: string): Promise<Readonly<{ volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>> {
+  async namespaceStat(relativePath: string): Promise<Readonly<{ volumeSerial: string; fileId: string;
+    size: string; linkCount: string; kind: 'file' | 'directory' }>> {
     if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
     const value = await this.#request({ id: randomUUID(), op: 'NS_STAT', path: relativePath }) as Record<string, unknown>
     if (!/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
-      || !/^\d+$/.test(String(value?.size)) || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
-    return value as { volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }
+      || !/^\d+$/.test(String(value?.size)) || !/^\d+$/.test(String(value?.linkCount))
+      || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
+    return value as { volumeSerial: string; fileId: string; size: string; linkCount: string;
+      kind: 'file' | 'directory' }
   }
   async namespaceMkdir(relativePath: string): Promise<void> {
     if (!validOpenCodePublicationRelativePath(relativePath) || relativePath === '.') throw unavailable()
     await this.#request({ id: randomUUID(), op: 'NS_MKDIR', path: relativePath })
   }
   async namespaceOpen(relativePath: string, mode: 'read' | 'readwrite' | 'create_file' | 'directory'):
-  Promise<Readonly<{ token: string; volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>> {
+  Promise<Readonly<{ token: string; volumeSerial: string; fileId: string; size: string;
+    linkCount: string; kind: 'file' | 'directory' }>> {
     if (!validOpenCodePublicationRelativePath(relativePath)) throw unavailable()
     const token = randomUUID()
     const value = await this.#request({ id: randomUUID(), op: 'NS_OPEN', path: relativePath, token, mode }) as Record<string, unknown>
     if (typeof value?.token !== 'string' || !/^[0-9a-f-]{36}$/.test(value.token)
       || !/^\d+$/.test(String(value?.volumeSerial)) || !/^\d+$/.test(String(value?.fileId))
-      || value.token !== token || !/^\d+$/.test(String(value?.size)) || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
-    return value as { token: string; volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }
+      || value.token !== token || !/^\d+$/.test(String(value?.size))
+      || !/^\d+$/.test(String(value?.linkCount))
+      || (value?.kind !== 'file' && value?.kind !== 'directory')) throw unavailable()
+    return value as { token: string; volumeSerial: string; fileId: string; size: string;
+      linkCount: string; kind: 'file' | 'directory' }
   }
   async namespaceRead(token: string, size: number): Promise<Uint8Array> {
     if (!/^[0-9a-f-]{36}$/.test(token) || !Number.isSafeInteger(size) || size < 0

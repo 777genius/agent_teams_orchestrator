@@ -22,9 +22,11 @@ function fake(rejectLockAttempts = 0, exitOnKill = true) {
               || request.op === 'CREATE_CHILD_DIRECTORY' || request.op === 'CREATE_CHILD_FILE'
               ? { volumeSerial: '1', fileId: '5' }
               : request.op === 'NS_STAT'
-                ? { volumeSerial: '1', fileId: '8', size: '3', kind: request.path === '.' ? 'directory' : 'file' }
+                ? { volumeSerial: '1', fileId: '8', size: '3', linkCount: '1',
+                    kind: request.path === '.' ? 'directory' : 'file' }
                 : request.op === 'NS_OPEN'
-                  ? { token: request.token, volumeSerial: '1', fileId: '9', size: '3', kind: request.mode === 'directory' ? 'directory' : 'file' }
+                  ? { token: request.token, volumeSerial: '1', fileId: '9', size: '3', linkCount: '1',
+                      kind: request.mode === 'directory' ? 'directory' : 'file' }
                   : request.op === 'NS_READ'
                     ? { content_base64: Buffer.from('abc').subarray(request.offset, request.offset + request.length).toString('base64') }
                     : request.op === 'NS_WRITE'

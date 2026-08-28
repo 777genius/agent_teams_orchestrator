@@ -462,7 +462,9 @@ impl RetainedWindowsRoot {
         }
         Ok(
             json!({"volumeSerial":identity.0.to_string(),"fileId":identity.1.to_string(),
-            "size":metadata.file_size().to_string(),"kind":if metadata.is_dir(){"directory"}else{"file"}}),
+            "size":metadata.file_size().to_string(),"linkCount":metadata.number_of_links()
+                .ok_or("FILE_REJECTED")?.to_string(),
+            "kind":if metadata.is_dir(){"directory"}else{"file"}}),
         )
     }
 

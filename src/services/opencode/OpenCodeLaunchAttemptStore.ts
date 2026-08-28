@@ -36,6 +36,38 @@ export type OpenCodeHostCleanupObligationBinding = Readonly<{
   receiptIdentityDigest?: string
 }>
 
+export type OpenCodeMemberCleanupPhase =
+  | 'remote'
+  | 'projection_stale'
+  | 'lease_release'
+  | 'projection_delete'
+  | 'obligation_complete'
+  | 'complete'
+
+/**
+ * Exact durable capability for finishing cleanup of one uncommitted member.
+ * `phase` names the next missing phase; advancing it is monotonic and
+ * idempotent under same-generation replay.
+ */
+export type OpenCodeMemberCleanupObligation = Readonly<{
+  attemptId: string
+  payloadHash: string
+  generation: number
+  hostKey: string
+  /** Exact acquired host generation; legacy obligations may omit these and remain unreplayable. */
+  hostProcessId?: number
+  hostProcessStartedAtMs?: number
+  hostProcessBirthToken?: string
+  memberIdentity: OpenCodeOpaqueIdentity
+  memberName: string
+  teamId: string
+  laneId: string
+  sessionId: string
+  sessionIdentity: OpenCodeOpaqueIdentity
+  ownershipTitle: string
+  phase: OpenCodeMemberCleanupPhase
+}>
+
 export function deriveOpenCodeLaunchNamespacePaths(filePath: string, pathApi: PlatformPath): {
   directory: string; trustedRoot: string; marker: string; slots: readonly [string, string]; fence: string; lock: string
 } {
@@ -103,6 +135,8 @@ export type OpenCodeLaunchJournal = {
   hostCleanupObligationIds?: string[]
   /** Monotonic exact reservation/receipt identity bindings for those obligations. */
   hostCleanupObligations?: OpenCodeHostCleanupObligationBinding[]
+  /** Exact phase-aware cleanup capabilities for uncommitted member sessions. */
+  memberCleanupObligations?: OpenCodeMemberCleanupObligation[]
   events: OpenCodeLaunchJournalEvent[]
 }
 
@@ -249,6 +283,26 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
   }
 
   /**
+   * Reads the pre-framing single-file format through the same retained relative backend.
+   * This is intentionally not part of the general journal interface; it exists solely for
+   * one-way migration of authorities that predate slot/marker publication.
+   */
+  async readUnframedLegacy(context?: OpenCodeLaunchStoreContext): Promise<Uint8Array | null> {
+    ensureContext(context)
+    const namespace = await this.getNamespace(context)
+    await verifyNamespace(namespace)
+    try {
+      const bytes = await readNoFollow(namespace.backend, namespace.marker,
+        OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES, this.testHooks, true)
+      ensureContext(context)
+      return bytes
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  /**
    * Reads the already-published namespace without opening the normal retained
    * namespace or lease path. In particular this must never create a missing
    * directory, anchor, fence, marker, candidate, or lock. Two identical passes
@@ -271,7 +325,8 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         const retained = await handle.stat()
         const visible = await lstat(target)
         if (!retained.isFile() || visible.isSymbolicLink()
-          || retained.dev !== visible.dev || retained.ino !== visible.ino) {
+          || retained.dev !== visible.dev || retained.ino !== visible.ino
+          || retained.nlink !== 1 || visible.nlink !== 1) {
           throw new OpenCodeLaunchJournalError('foreign', 'read-only durable record identity changed')
         }
         if (retained.size > maxBytes) {
@@ -350,6 +405,26 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     ensureContext(context)
     const marker = new TextEncoder().encode(JSON.stringify({ version: 1, slot, digest: sha256(bytes) }))
     // Marker publication is the commit point. Never publish and then throw because the caller's clock advanced.
+    await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context)
+  }
+
+  /** One-way retained-authority migration from a validated unframed marker payload. */
+  async replaceUnframedLegacyAndSync(bytes: Uint8Array,
+    context?: OpenCodeLaunchStoreContext): Promise<void> {
+    ensureContext(context)
+    const namespace = await this.getNamespace(context)
+    await verifyNamespace(namespace)
+    const prior = await readNoFollow(namespace.backend, namespace.marker,
+      OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES, this.testHooks, true)
+    let framed = false
+    try { framed = validCommitMarker(JSON.parse(new TextDecoder().decode(prior))) }
+    catch { /* The ledger validates the complete legacy payload before calling this method. */ }
+    if (framed) throw new OpenCodeLaunchJournalError('fenced', 'legacy migration source changed')
+    await atomicReplace(namespace, namespace.backend, namespace.slots[0], bytes, context)
+    ensureContext(context)
+    const marker = new TextEncoder().encode(JSON.stringify({
+      version: 1, slot: 0, digest: sha256(bytes),
+    }))
     await atomicReplace(namespace, namespace.backend, namespace.marker, marker, context)
   }
 
@@ -690,6 +765,7 @@ type SharedWindowsRoot = {
 
 type NamespaceStat = {
   dev: number | bigint; ino: number | bigint; mode: number; size: number
+  nlink?: number
   isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean
 }
 
@@ -718,10 +794,11 @@ interface NamespaceBackend {
 
 function normalizedStat(value: {
   dev: number | bigint; ino: number | bigint; mode: number; size: number
+  nlink?: number
   isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean
 }): NamespaceStat {
   const file = value.isFile(); const directory = value.isDirectory(); const symlink = value.isSymbolicLink()
-  return { dev: value.dev, ino: value.ino, mode: value.mode, size: value.size,
+  return { dev: value.dev, ino: value.ino, mode: value.mode, size: value.size, nlink: value.nlink,
     isFile: () => file, isDirectory: () => directory, isSymbolicLink: () => symlink }
 }
 
@@ -803,9 +880,11 @@ class RetainedWindowsNamespaceBackend implements NamespaceBackend {
     }
     return normalized
   }
-  private value(input: Readonly<{ volumeSerial: string; fileId: string; size: string; kind: 'file' | 'directory' }>): NamespaceStat {
+  private value(input: Readonly<{ volumeSerial: string; fileId: string; size: string;
+    linkCount: string; kind: 'file' | 'directory' }>): NamespaceStat {
     const file = input.kind === 'file'; const directory = input.kind === 'directory'
     return { dev: BigInt(input.volumeSerial), ino: BigInt(input.fileId), size: Number(input.size),
+      nlink: Number(input.linkCount),
       mode: directory ? 0o700 : 0o600, isFile: () => file, isDirectory: () => directory,
       isSymbolicLink: () => false }
   }
@@ -1096,16 +1175,19 @@ class NativeNamespaceHandle implements NamespaceHandle {
 }
 
 function decodeNativeStat(buffer: Buffer): NamespaceStat {
-  let dev: bigint; let ino: bigint; let mode: number; let size: number
+  let dev: bigint; let ino: bigint; let mode: number; let size: number; let nlink: number
   if (process.platform === 'darwin') {
-    dev = BigInt(buffer.readUInt32LE(0)); mode = buffer.readUInt16LE(4); ino = buffer.readBigUInt64LE(8); size = Number(buffer.readBigInt64LE(96))
+    dev = BigInt(buffer.readUInt32LE(0)); mode = buffer.readUInt16LE(4); nlink = buffer.readUInt16LE(6)
+    ino = buffer.readBigUInt64LE(8); size = Number(buffer.readBigInt64LE(96))
   } else if (process.arch === 'arm64') {
-    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); mode = buffer.readUInt32LE(16); size = Number(buffer.readBigInt64LE(48))
+    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); mode = buffer.readUInt32LE(16)
+    nlink = buffer.readUInt32LE(20); size = Number(buffer.readBigInt64LE(48))
   } else {
-    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); mode = buffer.readUInt32LE(24); size = Number(buffer.readBigInt64LE(48))
+    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); nlink = Number(buffer.readBigUInt64LE(16))
+    mode = buffer.readUInt32LE(24); size = Number(buffer.readBigInt64LE(48))
   }
   const kind = mode & 0o170000
-  return { dev, ino, mode, size, isFile: () => kind === 0o100000, isDirectory: () => kind === 0o040000,
+  return { dev, ino, mode, size, nlink, isFile: () => kind === 0o100000, isDirectory: () => kind === 0o040000,
     isSymbolicLink: () => kind === 0o120000 }
 }
 
@@ -1141,6 +1223,7 @@ async function readNoFollow(
     readNoFollowAvailable?: boolean
     afterReadHandleOpened?: (path: string) => Promise<void>
   } = {},
+  requireSingleLink = true,
 ): Promise<Uint8Array> {
   await rejectSymlink(backend, name)
   const noFollow = hooks.readNoFollowAvailable === false ? 0 : (constants.O_NOFOLLOW ?? 0)
@@ -1149,7 +1232,8 @@ async function readNoFollow(
     const retained = await handle.stat()
     await hooks.afterReadHandleOpened?.(backend.displayPath(name))
     const visible = await backend.lstat(name)
-    if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)) {
+    if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)
+      || (requireSingleLink && (retained.nlink !== 1 || visible.nlink !== 1))) {
       throw new OpenCodeLaunchJournalError('foreign', 'durable record identity changed while opening')
     }
     if (retained.size > maxBytes) {
@@ -1164,7 +1248,8 @@ async function openNoFollowExclusive(backend: NamespaceBackend, name: string): P
   const handle = await backend.open(name,
     constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
   const [retained, visible] = await Promise.all([handle.stat(), backend.lstat(name)])
-  if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)) {
+  if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)
+    || retained.nlink !== 1 || visible.nlink !== 1) {
     await handle.close().catch(() => undefined)
     throw new OpenCodeLaunchJournalError('foreign', 'exclusive durable record identity changed')
   }
@@ -1416,6 +1501,10 @@ export type OpenCodeLaunchJournalLease = {
   recordCleanupState(state: 'complete' | 'incomplete', context?: OpenCodeLaunchStoreContext): Promise<void>
   bindHostCleanupObligation(binding: OpenCodeHostCleanupObligationBinding,
     context?: OpenCodeLaunchStoreContext): Promise<void>
+  bindMemberCleanupObligation(obligation: OpenCodeMemberCleanupObligation,
+    context?: OpenCodeLaunchStoreContext): Promise<void>
+  advanceMemberCleanupObligation(obligation: OpenCodeMemberCleanupObligation,
+    phase: OpenCodeMemberCleanupPhase, context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Exact same-generation replay promotion after physical receipt reconciliation. */
   reconcileCleanupComplete(context?: OpenCodeLaunchStoreContext): Promise<void>
   /** Reconciliation is not a claimant transition and must name the historical claim explicitly. */
@@ -1587,6 +1676,10 @@ export class OpenCodeLaunchAttemptStore {
           if (!journal.continuation || journal.continuation.issuedGeneration !== journal.generation
             || identity.continuationToken !== journal.continuation.token) {
             throw new OpenCodeLaunchJournalError('fenced', 'continuation capability mismatch')
+          }
+          if ((journal.memberCleanupObligations ?? []).some(item => item.phase !== 'complete')) {
+            throw new OpenCodeLaunchJournalError('fenced',
+              'continuation requires member cleanup reconciliation')
           }
           consumedContinuationMembers = [...journal.continuation.eligibleMemberIdentities]
           const candidate: OpenCodeLaunchJournal = { ...journal, inputDigest: identity.inputDigest,
@@ -1897,6 +1990,55 @@ export class OpenCodeLaunchAttemptStore {
             Object.assign(lease.journal, candidate)
           }, obligationContext)
         },
+        bindMemberCleanupObligation: async (obligation, obligationContext) => {
+          validateMemberCleanupObligation(obligation, journal!)
+          if (obligation.generation !== journal!.generation) {
+            throw new OpenCodeLaunchJournalError('fenced', 'member cleanup obligation generation changed')
+          }
+          await serializeMutation(async () => {
+            const existing = journal!.memberCleanupObligations ?? []
+            const prior = existing.find(item => sameMemberCleanupKey(item, obligation))
+            if (prior) {
+              if (!sameMemberCleanupIdentity(prior, obligation)) {
+                throw new OpenCodeLaunchJournalError('fenced', 'member cleanup obligation identity changed')
+              }
+              return
+            }
+            const candidate = { ...journal!, memberCleanupObligations: [...existing, obligation] }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, obligationContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, obligationContext)
+        },
+        advanceMemberCleanupObligation: async (obligation, phase, obligationContext) => {
+          validateMemberCleanupObligation({ ...obligation, phase }, journal!)
+          await serializeMutation(async () => {
+            const existing = journal!.memberCleanupObligations ?? []
+            const index = existing.findIndex(item => sameMemberCleanupKey(item, obligation))
+            if (index < 0 || !sameMemberCleanupIdentity(existing[index]!, obligation)) {
+              throw new OpenCodeLaunchJournalError('fenced', 'member cleanup obligation is absent or changed')
+            }
+            const phases: readonly OpenCodeMemberCleanupPhase[] = ['remote', 'projection_stale',
+              'lease_release', 'projection_delete', 'obligation_complete', 'complete']
+            const currentIndex = phases.indexOf(existing[index]!.phase)
+            const nextIndex = phases.indexOf(phase)
+            if (nextIndex < currentIndex) return
+            if (nextIndex > currentIndex + 1) {
+              throw new OpenCodeLaunchJournalError('fenced', 'member cleanup phase skipped')
+            }
+            if (nextIndex === currentIndex) return
+            const memberCleanupObligations = existing.map((item, candidateIndex) =>
+              candidateIndex === index ? { ...item, phase } : item)
+            const candidate = { ...journal!, memberCleanupObligations }
+            validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
+              inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
+            await this.persist(candidate, obligationContext ?? effectiveContext)
+            journal = candidate
+            Object.assign(lease.journal, candidate)
+          }, obligationContext)
+        },
         reconcileCleanupComplete: async cleanupContext => {
           if (beganGeneration) {
             throw new OpenCodeLaunchJournalError('fenced',
@@ -1908,12 +2050,26 @@ export class OpenCodeLaunchAttemptStore {
             if (current !== 'incomplete') {
               throw new OpenCodeLaunchJournalError('fenced', 'cleanup reconciliation has no durable receipt')
             }
+            const pendingMembers = journal!.finalResponse?.members.cleanupPending ?? []
+            const memberObligations = journal!.memberCleanupObligations ?? []
+            const completedMembers = new Set(memberObligations
+              .filter(item => item.phase === 'complete').map(item => item.memberIdentity))
             if (!journal!.finalResponse
-              || journal!.finalResponse.members.cleanupPending.length !== 0) {
+              || memberObligations.some(item => item.phase !== 'complete')
+              || pendingMembers.some(member => !completedMembers.has(member))) {
               throw new OpenCodeLaunchJournalError('fenced',
                 'member cleanup obligations remain incomplete')
             }
-            const candidate = { ...journal!, cleanupState: 'complete' as const }
+            const completedPending = new Set(memberObligations
+              .filter(item => item.phase === 'complete').map(item => item.memberIdentity))
+            const finalResponse = { ...journal!.finalResponse,
+              members: { ...journal!.finalResponse.members,
+                cleanupPending: pendingMembers.filter(member => !completedPending.has(member)) } }
+            if (finalResponse.members.cleanupPending.length !== 0) {
+              throw new OpenCodeLaunchJournalError('fenced',
+                'member cleanup projection remains incomplete')
+            }
+            const candidate = { ...journal!, finalResponse, cleanupState: 'complete' as const }
             validateJournal(candidate, { attemptId: journal!.attemptId, payloadHash: journal!.payloadHash,
               inputDigest: journal!.inputDigest, immutableDigest: journal!.immutableDigest })
             await this.persist(candidate, cleanupContext ?? effectiveContext)
@@ -2250,6 +2406,74 @@ function validateIdentity(identity: OpenCodeLaunchJournalIdentity): void {
   }
 }
 
+const MEMBER_CLEANUP_PHASES = new Set<OpenCodeMemberCleanupPhase>([
+  'remote', 'projection_stale', 'lease_release', 'projection_delete',
+  'obligation_complete', 'complete',
+])
+
+function memberCleanupKey(obligation: OpenCodeMemberCleanupObligation): string {
+  return JSON.stringify([obligation.attemptId, obligation.generation, obligation.hostKey,
+    obligation.memberIdentity, obligation.sessionId])
+}
+
+function sameMemberCleanupKey(
+  left: OpenCodeMemberCleanupObligation,
+  right: OpenCodeMemberCleanupObligation,
+): boolean {
+  return memberCleanupKey(left) === memberCleanupKey(right)
+}
+
+function sameMemberCleanupIdentity(
+  left: OpenCodeMemberCleanupObligation,
+  right: OpenCodeMemberCleanupObligation,
+): boolean {
+  return left.attemptId === right.attemptId && left.payloadHash === right.payloadHash
+    && left.generation === right.generation && left.hostKey === right.hostKey
+    && left.hostProcessId === right.hostProcessId
+    && left.hostProcessStartedAtMs === right.hostProcessStartedAtMs
+    && left.hostProcessBirthToken === right.hostProcessBirthToken
+    && left.memberIdentity === right.memberIdentity && left.memberName === right.memberName
+    && left.teamId === right.teamId && left.laneId === right.laneId
+    && left.sessionId === right.sessionId && left.sessionIdentity === right.sessionIdentity
+    && left.ownershipTitle === right.ownershipTitle
+}
+
+function validateMemberCleanupObligation(
+  value: OpenCodeMemberCleanupObligation,
+  journal: Pick<OpenCodeLaunchJournal, 'attemptId' | 'payloadHash' | 'generation'>,
+): void {
+  const source = record(value)
+  const requiredKeys = ['attemptId', 'payloadHash', 'generation', 'hostKey', 'memberIdentity',
+    'memberName', 'teamId', 'laneId', 'sessionId', 'sessionIdentity', 'ownershipTitle', 'phase']
+  const allowedKeys = new Set([...requiredKeys, 'hostProcessId', 'hostProcessStartedAtMs',
+    'hostProcessBirthToken'])
+  if (!source || !requiredKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
+    || Object.keys(source).some(key => !allowedKeys.has(key))
+    || source.attemptId !== journal.attemptId || source.payloadHash !== journal.payloadHash
+    || typeof source.generation !== 'number' || !Number.isSafeInteger(source.generation)
+    || source.generation <= 0 || source.generation > journal.generation
+    || typeof source.hostKey !== 'string' || source.hostKey.length === 0 || source.hostKey.length > 4_096
+    || (source.hostProcessId !== undefined
+      && (!Number.isSafeInteger(source.hostProcessId) || (source.hostProcessId as number) <= 0))
+    || (source.hostProcessStartedAtMs !== undefined
+      && !Number.isFinite(source.hostProcessStartedAtMs))
+    || (source.hostProcessBirthToken !== undefined
+      && (typeof source.hostProcessBirthToken !== 'string'
+        || !source.hostProcessBirthToken.startsWith('linux:')))
+    || ((source.hostProcessId === undefined) !== (source.hostProcessStartedAtMs === undefined))
+    || !isOpenCodeOpaqueIdentity(source.memberIdentity)
+    || typeof source.memberName !== 'string' || source.memberName.length === 0 || source.memberName.length > 512
+    || typeof source.teamId !== 'string' || source.teamId.length === 0 || source.teamId.length > 512
+    || typeof source.laneId !== 'string' || source.laneId.length === 0 || source.laneId.length > 512
+    || typeof source.sessionId !== 'string' || source.sessionId.length === 0 || source.sessionId.length > 4_096
+    || !isOpenCodeOpaqueIdentity(source.sessionIdentity)
+    || typeof source.ownershipTitle !== 'string' || source.ownershipTitle.length === 0
+    || source.ownershipTitle.length > 4_096
+    || !MEMBER_CLEANUP_PHASES.has(source.phase as OpenCodeMemberCleanupPhase)) {
+    throw new OpenCodeLaunchJournalError('corrupt', 'invalid member cleanup obligation')
+  }
+}
+
 function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity): OpenCodeLaunchJournal {
   const source = record(value)
   if (!source || source.version !== 1 || !isOpenCodeLaunchAttemptId(source.attemptId)
@@ -2262,6 +2486,7 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
     ...journalKeys, 'profileBinding', 'continuation', 'authorizedMemberIdentities',
     'consumedContinuationToken', 'acceptedProofResponse', 'finalResponse', 'cleanupState',
     'hostCleanupObligationIds', 'hostCleanupObligations',
+    'memberCleanupObligations',
   ])
   if (!journalKeys.every(key => Object.prototype.hasOwnProperty.call(source, key))
     || Object.keys(source).some(key => !allowedJournalKeys.has(key))
@@ -2370,6 +2595,17 @@ function validateJournal(value: unknown, expected: OpenCodeLaunchJournalIdentity
       || new Set(bindings.map(binding => binding.obligationId)).size !== bindings.length
       || source.hostCleanupObligationIds?.length !== bindings.length) {
       throw new OpenCodeLaunchJournalError('corrupt', 'invalid host cleanup obligation bindings')
+    }
+  }
+  if (source.memberCleanupObligations !== undefined) {
+    if (!Array.isArray(source.memberCleanupObligations)
+      || source.memberCleanupObligations.length > 1_000) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'invalid member cleanup obligations')
+    }
+    const obligations = source.memberCleanupObligations as unknown as OpenCodeMemberCleanupObligation[]
+    for (const obligation of obligations) validateMemberCleanupObligation(obligation, source as OpenCodeLaunchJournal)
+    if (new Set(obligations.map(memberCleanupKey)).size !== obligations.length) {
+      throw new OpenCodeLaunchJournalError('corrupt', 'duplicate member cleanup obligation')
     }
   }
   if (!Array.isArray(source.events) || source.events.length > OPEN_CODE_LAUNCH_JOURNAL_MAX_EVENTS) {

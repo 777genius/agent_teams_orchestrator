@@ -443,6 +443,9 @@ describe('OpenCode production launch composition', () => {
         runtimeInstanceId: result.attemptId, projectPath: project,
       })
       const value = command()
+      // Retained relative ledger publication adds native fsync/lock barriers;
+      // source-mode CI can be substantially slower than the bundled launcher.
+      value.requestedBudgetMs = 30_000
       value.projectPath = project
       value.selectedModel = 'deepinfra/static-model'
       value.request.launchAttempt.providerId = 'deepinfra'
@@ -493,18 +496,19 @@ describe('OpenCode production launch composition', () => {
       }
       expect(projectedLaunchAttempt(first)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
       expect(firstMcpObservedHostAlive).toBe(true)
+      // Physical cleanup may settle after the failed projection is published.
+      // Observe its durable receipt before asserting the exact release effect.
+      const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode',
+        'launch-attempts', `${value.request.launchAttempt.attemptId}.host-release.json`))
+      const receipt = await waitForCompletedHostReleaseReceipt(ledger, {
+        attemptId: value.request.launchAttempt.attemptId,
+        payloadHash: value.request.launchAttempt.payloadHash, generation: 1 })
+      expect(receipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
       expect(exactReleaseCalls).toBe(1)
       const pidLines = (await readFile(path.join(data, 'static-host-fixture.pids'), 'utf8'))
         .trim().split('\n')
       expect(pidLines.map(line => line.split(':')[0]).sort()).toEqual(['child', 'grandchild'])
       for (const line of pidLines) expect(isProcessAlive(Number(line.split(':')[1]))).toBe(false)
-
-      const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
-        `${value.request.launchAttempt.attemptId}.host-release.json`))
-      const receipt = await waitForCompletedHostReleaseReceipt(ledger, {
-        attemptId: value.request.launchAttempt.attemptId,
-        payloadHash: value.request.launchAttempt.payloadHash, generation: 1 })
-      expect(receipt).toMatchObject({ disposition: 'dispose', releaseState: 'complete' })
       await expect(readFile(registryPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
 
       // A new production runtime/HostManager must project the exact durable
@@ -563,7 +567,7 @@ describe('OpenCode production launch composition', () => {
       caller.abort(new Error('static caller envelope closed after physical acquisition'))
       exposeReference()
       await lateRun.catch(() => undefined)
-      const lateLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
+      const lateLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode', 'launch-attempts',
         `${lateValue.request.launchAttempt.attemptId}.host-release.json`))
       const lateReceipt = await waitForCompletedHostReleaseReceipt(lateLedger, {
         attemptId: lateValue.request.launchAttempt.attemptId,
@@ -595,7 +599,7 @@ describe('OpenCode production launch composition', () => {
         computeOpenCodeLaunchRequestCorrelationDigest(unhealthyValue)
       const unhealthy = await createBridge().execute(unhealthyValue)
       expect(projectedLaunchAttempt(unhealthy)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
-      const unhealthyLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+      const unhealthyLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode',
         'launch-attempts', `${unhealthyValue.request.launchAttempt.attemptId}.host-release.json`))
       expect(await unhealthyLedger.read({ attemptId: unhealthyValue.request.launchAttempt.attemptId,
         payloadHash: unhealthyValue.request.launchAttempt.payloadHash, generation: 1 })).toBeNull()
@@ -635,7 +639,7 @@ describe('OpenCode production launch composition', () => {
         mcpManager: disconnectedMcp as never })
       const failed = await failedBridge.execute(failedValue)
       expect(projectedLaunchAttempt(failed)).toMatchObject({ launchAttempt: { outcome: 'failed' } })
-      const failedLedger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+      const failedLedger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode',
         'launch-attempts', `${failedValue.request.launchAttempt.attemptId}.host-release.json`))
       let failedReceipt = null
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -681,7 +685,7 @@ describe('OpenCode production launch composition', () => {
       restoreEnvironment()
       await rm(root, { recursive: true, force: true })
     }
-  }, 30_000)
+  }, 60_000)
 
   test('separate acquisition and replay processes repair receipt and disposition publication crash boundaries', async () => {
     if (process.platform !== 'linux' && process.platform !== 'win32') return
@@ -722,7 +726,7 @@ describe('OpenCode production launch composition', () => {
         expect(crashed.code, crashed.output).toBe(86)
 
         const attempt = '018f47a2-4a13-7c2f-8d44-c0ffee777777'
-        const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode',
+        const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode',
           'launch-attempts', `${attempt}.host-release.json`))
         const beforeReplay = await ledger.read({ attemptId: attempt,
           payloadHash: '7'.repeat(64), generation: 1 })
@@ -772,7 +776,7 @@ describe('OpenCode production launch composition', () => {
         await rm(root, { recursive: true, force: true })
       }
     }
-  }, 30_000)
+  }, 60_000)
 
   test.skipIf(!canExerciseNativePidRecycle)(
     'native cleanup acquisition and replay use separate OS processes with no retained authority', async () => {

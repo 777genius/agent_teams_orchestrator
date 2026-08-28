@@ -28,6 +28,8 @@ import {
   type OpenCodeLaunchJournalReconciliationEvent,
   type OpenCodeLaunchStoreContext,
   type OpenCodeHostCleanupObligationBinding,
+  type OpenCodeMemberCleanupObligation,
+  type OpenCodeMemberCleanupPhase,
 } from './OpenCodeLaunchAttemptStore.js'
 import { runOpenCodeMutationWithFreshProof } from './OpenCodeLaunchProofMutationPolicy.js'
 
@@ -202,13 +204,32 @@ export type OpenCodeLaunchAttemptPorts = {
     abortOwned(input: {
       resources: OpenCodeLaunchOwnedResources; deadlineAtMs: number; signal: AbortSignal
     }): Promise<void>
+    /** Builds the exact durable cleanup capability before the first cleanup effect. */
+    createCleanupObligation?(input: {
+      attemptId: string
+      payloadHash: string
+      generation: number
+      resource: OpenCodeLaunchOwnedResources
+      host: OpenCodeRetainedHostIdentity
+    }): OpenCodeMemberCleanupObligation
     cleanupOwned(input: {
       resources: OpenCodeLaunchOwnedResources[]
+      cleanupObligations?: readonly OpenCodeMemberCleanupObligation[]
+      advanceCleanupObligation?(obligation: OpenCodeMemberCleanupObligation,
+        phase: OpenCodeMemberCleanupPhase): Promise<void>
       host: OpenCodeRetainedHostIdentity
       /** Cleanup implementations must reject shared/unowned resources. */
       deadlineAtMs: number
       /** Remains aborted after attempt cancellation while bounded cleanup proceeds. */
       attemptSignal: AbortSignal
+      signal: AbortSignal
+    }): Promise<OpenCodeLaunchCleanupOutcome>
+    /** Same-generation replay resumes only the next missing durable phase. */
+    reconcileCleanupObligations?(input: {
+      cleanupObligations: readonly OpenCodeMemberCleanupObligation[]
+      advanceCleanupObligation(obligation: OpenCodeMemberCleanupObligation,
+        phase: OpenCodeMemberCleanupPhase): Promise<void>
+      deadlineAtMs: number
       signal: AbortSignal
     }): Promise<OpenCodeLaunchCleanupOutcome>
   }
@@ -405,8 +426,26 @@ export class OpenCodeLaunchAttempt {
               members,
             })
             let replayCleanup = lease.journal.cleanupState
+            if (replayCleanup !== 'complete' && this.ports.ownership.reconcileCleanupObligations) {
+              const obligations = lease.journal.memberCleanupObligations ?? []
+              if (obligations.length > 0) {
+                await this.ports.ownership.reconcileCleanupObligations({
+                  cleanupObligations: obligations,
+                  advanceCleanupObligation: (obligation, phase) =>
+                    lease.advanceMemberCleanupObligation(obligation, phase, {
+                      deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
+                      signal: reserveController.signal,
+                      monotonicNow: () => this.ports.clock.monotonicNow(),
+                    }),
+                  deadlineAtMs: initialPolicy.absoluteDeadlineAtMs,
+                  signal: reserveController.signal,
+                }).catch(() => 'timed_out' as const)
+              }
+            }
             if (replayCleanup !== 'complete'
-              && lease.journal.finalResponse.members.cleanupPending.length === 0
+              && (lease.journal.finalResponse.members.cleanupPending.length === 0
+                || (lease.journal.memberCleanupObligations?.length ?? 0) > 0)
+              && (lease.journal.memberCleanupObligations ?? []).every(item => item.phase === 'complete')
               && this.ports.host.reconcileOperationHost) {
               const cleanupObligations = lease.journal.hostCleanupObligations
               const reconciled = await this.ports.host.reconcileOperationHost({
@@ -946,6 +985,21 @@ export class OpenCodeLaunchAttempt {
                   const uncommitted = owned.filter(resource =>
                     !committed.some(link => link.memberIdentity === resource.memberIdentity))
                   const cleanupController = new AbortController()
+                  const memberCleanupObligations: OpenCodeMemberCleanupObligation[] = []
+                  if (this.ports.ownership.createCleanupObligation) {
+                    for (const resource of uncommitted) {
+                      const obligation = this.ports.ownership.createCleanupObligation({
+                        attemptId: attempt.attemptId, payloadHash: attempt.payloadHash,
+                        generation: lease.generation, resource, host: host!,
+                      })
+                      await lease.bindMemberCleanupObligation(obligation, {
+                        deadlineAtMs: policy.absoluteDeadlineAtMs,
+                        signal: reserveController.signal,
+                        monotonicNow: () => this.ports.clock.monotonicNow(),
+                      })
+                      memberCleanupObligations.push(obligation)
+                    }
+                  }
                   for (const resource of uncommitted) {
                     const abortOperation = this.ports.ownership.abortOwned({
                       resources: resource, deadlineAtMs: policy.absoluteDeadlineAtMs,
@@ -961,6 +1015,16 @@ export class OpenCodeLaunchAttempt {
                     // completion can be diagnosed/reaped without delaying the launch result.
                     const physicalCleanup = this.ports.ownership.cleanupOwned({
                       resources: uncommitted,
+                      ...(memberCleanupObligations.length > 0 ? {
+                        cleanupObligations: memberCleanupObligations,
+                        advanceCleanupObligation: (obligation: OpenCodeMemberCleanupObligation,
+                          phase: OpenCodeMemberCleanupPhase) =>
+                          lease.advanceMemberCleanupObligation(obligation, phase, {
+                            deadlineAtMs: policy.absoluteDeadlineAtMs,
+                            signal: reserveController.signal,
+                            monotonicNow: () => this.ports.clock.monotonicNow(),
+                          }),
+                      } : {}),
                       host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs,
                       attemptSignal: controller.signal, signal: cleanupController.signal,
                     })

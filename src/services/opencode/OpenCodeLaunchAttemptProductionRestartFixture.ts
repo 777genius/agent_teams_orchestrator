@@ -59,7 +59,7 @@ const command: Parameters<OpenCodeLaunchAttemptBridgePort['execute']>[0] = {
   members: [{ name: 'restart-native', memberIdentity: identity('7') }],
   runId: 'run', laneId: 'primary', teamId: 'team', projectPath: project,
   selectedModel: 'deepinfra/static-model', toolApprovalMode: 'auto', continuation: false,
-  requestedBudgetMs: 10_000,
+  requestedBudgetMs: 30_000,
   preconditions: {
     handshakeIdentityHash: '1'.repeat(64), laneId: 'primary', expectedRunId: 'run',
     expectedCapabilitySnapshotId: null,
@@ -96,7 +96,15 @@ const bridge = createOpenCodeLaunchAttemptProductionTestBridge({ dataDirectory: 
     } } : {}),
 })
 const result = await bridge.execute(command)
-const ledger = new OpenCodeLaunchHostReleaseLedger(path.join(data, 'opencode', 'launch-attempts',
+if (phase === 'crash-before-disposition') {
+  // The failed terminal projection can precede retained physical cleanup.
+  // Keep this crash fixture alive until the injected settlement boundary wins.
+  await new Promise<never>((_, reject) => {
+    setTimeout(() => reject(
+      new Error('host disposition publication boundary was not reached')), 10_000)
+  })
+}
+const ledger = OpenCodeLaunchHostReleaseLedger.forSyntheticFixture(path.join(data, 'opencode', 'launch-attempts',
   `${command.request.launchAttempt.attemptId}.host-release.json`))
 const receipt = await ledger.read({ attemptId: command.request.launchAttempt.attemptId,
   payloadHash: command.request.launchAttempt.payloadHash, generation: 1 }).catch(async () =>

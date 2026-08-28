@@ -43,7 +43,7 @@ async function nativeRequests(requests: object[]): Promise<Record<string, unknow
   const explicit = artifacts(); const workerPath = 'workerPath' in explicit
     ? explicit.workerPath : resolveOpenCodeNativeAuthorityArtifacts({}).workerPath
   const controller = new AbortController()
-  let child: ReturnType<typeof Bun.spawn> | undefined
+  let child: Bun.PipedSubprocess | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeoutMs = 30_000
   const timeout = new Promise<never>((_, reject) => {
@@ -174,6 +174,23 @@ describe('Windows retained publication native contract', () => {
       try { await directory.close() } finally { await directory.awaitPhysicalSettlement() }
     }
     expect((await readdir(root)).sort()).toEqual(before)
+  })
+  windowsTest('retained native reads reject hard-linked authority records', async () => {
+    const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-publication-hardlink-')); roots.push(sandbox)
+    const root = path.join(sandbox, 'store'); const record = path.join(root, 'ledger.json')
+    await mkdir(root); await writeFile(record, '{"authority":"expected"}')
+    await link(record, path.join(root, 'foreign-link.json'))
+    const client = new OpenCodeWindowsPublicationAuthorityClient({
+      deadline: Date.now() + 10_000, ...artifacts(),
+    })
+    try {
+      await client.openRoot(root, false, false)
+      expect(await client.namespaceStat('ledger.json')).toMatchObject({
+        kind: 'file', linkCount: '2',
+      })
+    } finally {
+      await client.close()
+    }
   })
   windowsTest('creates and publishes a temp root through one retained relative handle', async () => {
     const sandbox = await mkdtemp(path.join(nativeFixtureBase(), 'opencode-retained-temp-root-')); roots.push(sandbox)
