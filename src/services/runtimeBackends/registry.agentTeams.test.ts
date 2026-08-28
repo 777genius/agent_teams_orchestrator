@@ -652,7 +652,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
   })
 
   test(
-    'opencode summary runtime status returns degraded JSON when inventory probing stalls',
+    'opencode summary runtime status stays passive when active inventory stalls',
     async () => {
       const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
       process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
@@ -664,6 +664,10 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         )
 
         const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+          readOpenCodePassiveEvidence: () => ({
+            state: 'timeout',
+            binaryPath: process.execPath,
+          }),
           getOpenCodeInventorySnapshot: async () => new Promise(resolve => {
             setTimeout(() => resolve({
               detected: true,
@@ -687,9 +691,10 @@ describe('runtime backend registry with agent_teams capabilities', () => {
 
         expect(opencode?.supported).toBe(true)
         expect(opencode?.authenticated).toBe(false)
-        expect(opencode?.verificationState).toBe('error')
-        expect(opencode?.statusMessage).toBe('OpenCode probe incomplete')
-        expect(opencode?.detailMessage).toContain('OpenCode inventory probe timed out after 1ms')
+        expect(opencode?.verificationState).toBe('unknown')
+        expect(opencode?.statusMessage).toBe('OpenCode passive status timed out')
+        expect(opencode?.statusCheckOutcome).toBe('transient_error')
+        expect(opencode?.statusCheckErrorCode).toBe('timeout')
         expect(opencode?.models).toEqual([])
         expect(opencode).not.toHaveProperty('modelCatalog')
       } finally {
@@ -704,7 +709,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
   )
 
   test(
-    'summary runtime status omits full catalogs without losing live provider state',
+    'summary runtime status reports retained models without granting live provider state',
     async () => {
       const registryModulePath = new URL('./registry.js', import.meta.url).href
       const { getUnifiedRuntimeStatusPayload } = await import(
@@ -712,6 +717,12 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       )
 
       const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        readOpenCodePassiveEvidence: () => ({
+          state: 'ready',
+          binaryPath: '/opt/homebrew/bin/opencode',
+          version: '1.14.48',
+          models: ['openrouter/display-model'],
+        }),
         getOpenCodeInventorySnapshot: async () => ({
           detected: true,
           binaryPath: '/opt/homebrew/bin/opencode',
@@ -731,9 +742,11 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       const opencode = payload.providers.opencode
 
       expect(opencode?.supported).toBe(true)
-      expect(opencode?.authenticated).toBe(true)
-      expect(opencode?.authMethod).toBe('opencode_managed')
-      expect(opencode?.models).toEqual([])
+      expect(opencode?.authenticated).toBe(false)
+      expect(opencode?.authMethod).toBeNull()
+      expect(opencode?.capabilities.teamLaunch).toBe(false)
+      expect(opencode?.statusCheckOutcome).toBe('model_only')
+      expect(opencode?.models).toEqual(['openrouter/display-model'])
       expect(opencode).not.toHaveProperty('modelCatalog')
       expect(opencode).not.toHaveProperty('capabilitiesInfo')
       expect(opencode?.runtimeCapabilities?.modelCatalog).toEqual({
@@ -753,6 +766,10 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       )
 
       const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        readOpenCodePassiveEvidence: () => ({
+          state: 'ready',
+          binaryPath: '/opt/homebrew/bin/opencode',
+        }),
         getOpenCodeInventorySnapshot: async () => ({
           detected: true,
           binaryPath: '/opt/homebrew/bin/opencode',
@@ -775,7 +792,8 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.authenticated).toBe(false)
       expect(opencode?.authMethod).toBe(null)
       expect(opencode?.models).toEqual([])
-      expect(opencode?.statusMessage).toBe('No OpenCode providers connected')
+      expect(opencode?.statusMessage).toBe('OpenCode detected (passive)')
+      expect(opencode?.statusCheckOutcome).toBe('model_only')
       expect(opencode).not.toHaveProperty('modelCatalog')
     },
     15_000,
