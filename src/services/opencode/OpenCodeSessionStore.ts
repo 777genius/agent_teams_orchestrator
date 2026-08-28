@@ -46,6 +46,11 @@ export type OpenCodeSessionPublicationResult =
   | { status: 'inserted' | 'exact'; record: OpenCodeSessionRecord }
   | { status: 'conflict'; record: OpenCodeSessionRecord }
 
+export type OpenCodeSessionSuccessorPublicationResult =
+  | { status: 'replaced' | 'exact'; record: OpenCodeSessionRecord }
+  | { status: 'absent' }
+  | { status: 'conflict'; record?: OpenCodeSessionRecord; reservation?: OpenCodeSessionReservation }
+
 export type ConditionalMarkStaleResult =
   | { status: 'applied'; record: OpenCodeSessionRecord }
   | { status: 'already-satisfied'; record: OpenCodeSessionRecord }
@@ -144,7 +149,7 @@ export class OpenCodeSessionStore {
     }
   }
 
-  private async readStore(): Promise<SessionStoreShape> {
+  private async readStore(persistMigration = false): Promise<SessionStoreShape> {
     if (!(await fileExists(this.filePath))) {
       return {
         schemaVersion: 3,
@@ -177,11 +182,12 @@ export class OpenCodeSessionStore {
       throw new Error('invalid OpenCode session reservations')
     }
     const reservations = Number(parsed.schemaVersion) >= 2
-      ? parsed.reservations as Record<string, OpenCodeSessionReservation> : {}
-    for (const [key, reservation] of Object.entries(reservations)) {
-      validateReservation(key, reservation)
-    }
-    return { schemaVersion: 3, records, reservations }
+      ? await migrateAndValidateReservations(
+        Number(parsed.schemaVersion), parsed.reservations as Record<string, unknown>)
+      : {}
+    const store: SessionStoreShape = { schemaVersion: 3, records, reservations }
+    if (persistMigration && Number(parsed.schemaVersion) !== 3) await this.writeStore(store)
+    return store
   }
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
@@ -214,7 +220,7 @@ export class OpenCodeSessionStore {
   async upsert(record: OpenCodeSessionRecord): Promise<UpsertResult> {
     const validatedRecord = await validateCanonicalRecordForWrite(record)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const validated = validatedRecord
       const key = buildRecordKey(validated)
       const previous = store.records[key]
@@ -243,7 +249,7 @@ export class OpenCodeSessionStore {
   ): Promise<ConditionalUpsertResult> {
     const validatedRecord = await validateCanonicalRecordForWrite(record)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const validated = validatedRecord
       const previous = recordForLogicalMember(store, validated)
       if (!previous) return { status: 'absent' }
@@ -263,7 +269,7 @@ export class OpenCodeSessionStore {
   async publishIfAbsentOrExact(record: OpenCodeSessionRecord): Promise<OpenCodeSessionPublicationResult> {
     const validatedRecord = await validateCanonicalRecordForWrite(record)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const validated = validatedRecord
       const key = buildRecordKey(validated)
       const logicalKey = openCodeLogicalMemberKey({
@@ -297,6 +303,34 @@ export class OpenCodeSessionStore {
     })
   }
 
+  /** Atomically replaces only the exact predecessor projection for refresh. */
+  async publishSuccessorIfExact(
+    record: OpenCodeSessionRecord,
+    expectedOldSessionId: string,
+    expectedOldRunId: string | null,
+  ): Promise<OpenCodeSessionSuccessorPublicationResult> {
+    const validated = await validateCanonicalRecordForWrite(record)
+    requiredString(expectedOldSessionId, 'expectedOldSessionId')
+    if (expectedOldRunId !== null) requiredString(expectedOldRunId, 'expectedOldRunId')
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const logicalKey = logicalKeyForRecord(validated)
+      const existing = recordForLogicalMember(store, validated)
+      const reservation = store.reservations[logicalKey]
+      if (reservation) return { status: 'conflict', record: existing, reservation }
+      if (!existing) return { status: 'absent' }
+      if (jsonStringify(existing) === jsonStringify(validated)) {
+        return { status: 'exact', record: existing }
+      }
+      if (!hasExpectedOwner(existing, expectedOldSessionId, expectedOldRunId)) {
+        return { status: 'conflict', record: existing }
+      }
+      store.records[logicalKey] = validated
+      await this.writeStore(store)
+      return { status: 'replaced', record: validated }
+    })
+  }
+
   /**
    * Reserves the normalized logical member under the same durable store lock as
    * publication. This transition must complete before provider/session effects.
@@ -310,7 +344,7 @@ export class OpenCodeSessionStore {
     const normalized = await canonicalizeLogicalMember(logicalMember)
     const logicalMemberKey = openCodeLogicalMemberKey(normalized)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const record = Object.values(store.records).find(candidate => logicalKeyForRecord(candidate) === logicalMemberKey)
       if (record) {
         return record.opencodeSessionId === expectedOpencodeSessionId
@@ -342,7 +376,7 @@ export class OpenCodeSessionStore {
     reservationIdentity: string): Promise<OpenCodeSessionPublicationResult> {
     const validatedRecord = await validateCanonicalRecordForWrite(record)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const validated = validatedRecord
       const logicalKey = logicalKeyForRecord(validated)
       const reservation = store.reservations[logicalKey]
@@ -371,7 +405,7 @@ export class OpenCodeSessionStore {
     const memberName = staleReasonMaybe ? memberNameOrStaleReason : laneIdOrMemberName
     const staleReason = staleReasonMaybe ?? memberNameOrStaleReason
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = unambiguousLegacyRecord(store, teamId, laneId, memberName)
       if (!previous) {
         return null
@@ -400,7 +434,7 @@ export class OpenCodeSessionStore {
   ): Promise<OpenCodeSessionRecord | null> {
     const canonicalLogicalMember = await canonicalizeLogicalMember(logicalMember)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = recordForLogicalMember(store, canonicalLogicalMember)
       if (!previous) return null
       if (previous.staleReason === staleReason) return previous
@@ -419,7 +453,7 @@ export class OpenCodeSessionStore {
     staleReason: string,
   ): Promise<ConditionalMarkStaleResult> {
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
       if (candidates.length > 1) throw new Error('ambiguous OpenCode legacy session mutation')
       const previous = candidates[0]
@@ -456,7 +490,7 @@ export class OpenCodeSessionStore {
   ): Promise<ConditionalMarkStaleResult> {
     const canonicalLogicalMember = await canonicalizeLogicalMember(logicalMember)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = recordForLogicalMember(store, canonicalLogicalMember)
       if (!previous) return { status: 'absent' }
       if (!hasExpectedOwner(previous, expectedOpencodeSessionId, expectedRunId)) {
@@ -476,7 +510,7 @@ export class OpenCodeSessionStore {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = unambiguousLegacyRecord(store, teamId, laneId, normalizedMemberName)
       if (!previous) {
         return false
@@ -491,7 +525,7 @@ export class OpenCodeSessionStore {
   async deleteByLogicalMember(logicalMember: OpenCodeLogicalMemberIdentity): Promise<boolean> {
     const canonicalLogicalMember = await canonicalizeLogicalMember(logicalMember)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = recordForLogicalMember(store, canonicalLogicalMember)
       if (!previous) return false
       delete store.records[buildRecordKey(previous)]
@@ -514,7 +548,7 @@ export class OpenCodeSessionStore {
     expectedOpencodeSessionId: string,
   ): Promise<ConditionalDeleteResult> {
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const candidates = recordsForLegacyLookup(store, teamId, laneId, memberName)
       if (candidates.length > 1) throw new Error('ambiguous OpenCode legacy session mutation')
       const previous = candidates[0]
@@ -538,7 +572,7 @@ export class OpenCodeSessionStore {
   ): Promise<ConditionalDeleteResult> {
     const canonicalLogicalMember = await canonicalizeLogicalMember(logicalMember)
     return this.withStoreLock(async () => {
-      const store = await this.readStore()
+      const store = await this.readStore(true)
       const previous = recordForLogicalMember(store, canonicalLogicalMember)
       if (!previous) return { status: 'absent' }
       if (!hasExpectedOwner(previous, expectedOpencodeSessionId, expectedRunId)) {
@@ -755,6 +789,53 @@ function hasExpectedOwner(
     && (expectedRunId === undefined || record.runId === expectedRunId)
 }
 
+async function migrateAndValidateReservations(
+  storeVersion: number,
+  persisted: Record<string, unknown>,
+): Promise<Record<string, OpenCodeSessionReservation>> {
+  const normalized: Record<string, OpenCodeSessionReservation> = {}
+  for (const [persistedKey, value] of Object.entries(persisted).sort(([a], [b]) => a.localeCompare(b))) {
+    validateReservation(persistedKey, value)
+    const canonicalProjectIdentity = await canonicalizeOpenCodeProjectIdentity(value.projectIdentity, {
+      allowMissing: true,
+    })
+    if (storeVersion === 3 && canonicalProjectIdentity !== value.projectIdentity) {
+      throw new Error('OpenCode session reservation project identity is not canonical')
+    }
+    const logical = normalizeOpenCodeLogicalMemberIdentity({
+      teamId: value.teamId,
+      laneId: value.laneId,
+      projectIdentity: canonicalProjectIdentity,
+      memberName: value.memberName,
+    })
+    const logicalMemberKey = openCodeLogicalMemberKey(logical)
+    const reservation: OpenCodeSessionReservation = {
+      version: 1,
+      logicalMemberKey,
+      ...logical,
+      reservationIdentity: value.reservationIdentity,
+      expectedOpencodeSessionId: value.expectedOpencodeSessionId,
+      createdAt: value.createdAt,
+    }
+    const collision = normalized[logicalMemberKey]
+    if (collision && !sameReservationAuthority(collision, reservation)) {
+      throw new Error('conflicting normalized OpenCode session reservations')
+    }
+    normalized[logicalMemberKey] = collision && collision.createdAt <= reservation.createdAt
+      ? collision : reservation
+  }
+  return normalized
+}
+
+function sameReservationAuthority(
+  left: OpenCodeSessionReservation,
+  right: OpenCodeSessionReservation,
+): boolean {
+  const { createdAt: _leftCreatedAt, ...leftAuthority } = left
+  const { createdAt: _rightCreatedAt, ...rightAuthority } = right
+  return jsonStringify(leftAuthority) === jsonStringify(rightAuthority)
+}
+
 function validateReservation(key: string, value: unknown): asserts value is OpenCodeSessionReservation {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('invalid OpenCode session reservation')
@@ -766,7 +847,8 @@ function validateReservation(key: string, value: unknown): asserts value is Open
     || reservation.logicalMemberKey !== key
     || !RESERVATION_TOKEN.test(String(reservation.reservationIdentity))
     || !RESERVATION_TOKEN.test(String(reservation.expectedOpencodeSessionId))
-    || typeof reservation.createdAt !== 'string') {
+    || typeof reservation.createdAt !== 'string'
+    || !Number.isFinite(Date.parse(reservation.createdAt))) {
     throw new Error('invalid OpenCode session reservation')
   }
   const logical = normalizeOpenCodeLogicalMemberIdentity({

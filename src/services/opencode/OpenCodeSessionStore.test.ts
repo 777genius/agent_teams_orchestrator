@@ -38,6 +38,19 @@ function asLegacyRecord(record: typeof baseRecord = baseRecord) {
   return legacy
 }
 
+function reservationFor(projectIdentity: string, overrides: Record<string, string> = {}) {
+  const logical = { teamId: 'team-a', laneId: 'primary', projectIdentity, memberName: 'alice' }
+  return {
+    version: 1,
+    logicalMemberKey: openCodeLogicalMemberKey(logical),
+    ...logical,
+    reservationIdentity: 'reservation-a',
+    expectedOpencodeSessionId: 'session-1',
+    createdAt: '2026-04-21T00:00:00.000Z',
+    ...overrides,
+  }
+}
+
 let tempDir = ''
 
 beforeEach(async () => {
@@ -73,6 +86,84 @@ describe('OpenCodeSessionStore', () => {
     expect(outcomes.filter(outcome => outcome.status === 'inserted')).toHaveLength(1)
     expect(outcomes.filter(outcome => outcome.status === 'conflict')).toHaveLength(1)
     expect(await first.list()).toHaveLength(1)
+  })
+
+  test('publishes a successor only over the exact predecessor and retries idempotently', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const predecessor = { ...baseRecord, runId: 'run-old' }
+    const successor = { ...baseRecord, opencodeSessionId: 'session-2', runId: 'run-new',
+      updatedAt: '2026-04-21T01:00:00.000Z' }
+    await store.upsert(predecessor)
+
+    expect(await store.publishSuccessorIfExact(successor, 'session-1', 'run-old'))
+      .toEqual({ status: 'replaced', record: successor })
+    expect(await store.publishSuccessorIfExact(successor, 'session-1', 'run-old'))
+      .toEqual({ status: 'exact', record: successor })
+    expect(await store.publishSuccessorIfExact({ ...successor, opencodeSessionId: 'session-3' },
+      'session-1', 'run-old')).toEqual({ status: 'conflict', record: successor })
+  })
+
+  test('successor publication returns absent and rejects the same deterministic session from another run', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const successor = { ...baseRecord, runId: 'run-new', updatedAt: '2026-04-21T01:00:00.000Z' }
+    expect(await store.publishSuccessorIfExact(successor, 'session-1', 'run-old'))
+      .toEqual({ status: 'absent' })
+    const current = { ...baseRecord, runId: 'run-other' }
+    await store.upsert(current)
+    expect(await store.publishSuccessorIfExact(successor, 'session-1', 'run-old'))
+      .toEqual({ status: 'conflict', record: current })
+  })
+
+  test('successor publication is project-isolated', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const projectA = { ...baseRecord, projectIdentity: '/tmp/project-a', projectPath: '/tmp/project-a',
+      runId: 'run-a' }
+    const projectB = { ...baseRecord, projectIdentity: '/tmp/project-b', projectPath: '/tmp/project-b',
+      opencodeSessionId: 'session-b', runId: 'run-b' }
+    const successorA = { ...projectA, opencodeSessionId: 'session-a2', runId: 'run-a2',
+      updatedAt: '2026-04-21T01:00:00.000Z' }
+    await store.upsert(projectA)
+    await store.upsert(projectB)
+
+    expect((await store.publishSuccessorIfExact(successorA, 'session-1', 'run-a')).status).toBe('replaced')
+    expect(await store.getByLogicalMember({ teamId: projectB.teamId, laneId: projectB.laneId,
+      projectIdentity: projectB.projectIdentity, memberName: projectB.memberName })).toEqual(projectB)
+  })
+
+  test('concurrent successor replacements cannot overwrite the winner', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const first = new OpenCodeSessionStore(filePath)
+    const second = new OpenCodeSessionStore(filePath)
+    const predecessor = { ...baseRecord, runId: 'run-old' }
+    const successorA = { ...predecessor, opencodeSessionId: 'session-a', runId: 'run-a' }
+    const successorB = { ...predecessor, opencodeSessionId: 'session-b', runId: 'run-b' }
+    await first.upsert(predecessor)
+    const outcomes = await Promise.all([
+      first.publishSuccessorIfExact(successorA, 'session-1', 'run-old'),
+      second.publishSuccessorIfExact(successorB, 'session-1', 'run-old'),
+    ])
+    expect(outcomes.filter(result => result.status === 'replaced')).toHaveLength(1)
+    expect(outcomes.filter(result => result.status === 'conflict')).toHaveLength(1)
+    const persisted = await first.getByLogicalMember({ teamId: baseRecord.teamId, laneId: baseRecord.laneId,
+      projectIdentity: baseRecord.projectIdentity, memberName: baseRecord.memberName })
+    expect(['session-a', 'session-b']).toContain(persisted?.opencodeSessionId)
+  })
+
+  test('successor publication cannot bypass durable reservation authority', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const logical = { teamId: baseRecord.teamId, laneId: baseRecord.laneId,
+      projectIdentity: baseRecord.projectIdentity, memberName: baseRecord.memberName }
+    const reservation = reservationFor(baseRecord.projectIdentity)
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 3, records: {
+      [openCodeLogicalMemberKey(logical)]: baseRecord,
+    }, reservations: { [reservation.logicalMemberKey]: reservation } }))
+    const store = new OpenCodeSessionStore(filePath)
+    const successor = { ...baseRecord, opencodeSessionId: 'session-2' }
+
+    expect(await store.publishSuccessorIfExact(successor, 'session-1', null)).toEqual({
+      status: 'conflict', record: baseRecord, reservation,
+    })
+    expect(await store.getByLogicalMember(logical)).toEqual(baseRecord)
   })
 
   test('uses normalized member lookup consistently for legacy Alice versus alice records', async () => {
@@ -239,6 +330,85 @@ describe('OpenCodeSessionStore', () => {
     await expect(store.reserveLogicalMember({ teamId: 'team-a', laneId: 'primary',
       projectIdentity: '/tmp/project', memberName: 'alice' }, 'reservation', 'session')).rejects.toThrow(
       'invalid OpenCode session reservation')
+  })
+
+  test('migrates a schema-2 symlink reservation key on the next locked mutation but not passive read', async () => {
+    const project = path.join(tempDir, 'project')
+    const alias = path.join(tempDir, 'project-alias')
+    const filePath = path.join(tempDir, 'session-store.json')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    const reservation = reservationFor(alias)
+    const original = JSON.stringify({ schemaVersion: 2, records: {}, reservations: {
+      [reservation.logicalMemberKey]: reservation,
+    } })
+    await writeFile(filePath, original)
+    const store = new OpenCodeSessionStore(filePath)
+
+    expect(await store.list()).toEqual([])
+    expect(await readFile(filePath, 'utf8')).toBe(original)
+    expect((await store.reserveLogicalMember({ teamId: 'team-a', laneId: 'primary',
+      projectIdentity: project, memberName: 'alice' }, 'reservation-a', 'session-1')).status).toBe('exact')
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as {
+      schemaVersion: number; reservations: Record<string, ReturnType<typeof reservationFor>> }
+    const canonicalKey = openCodeLogicalMemberKey({ teamId: 'team-a', laneId: 'primary',
+      projectIdentity: project, memberName: 'alice' })
+    expect(persisted.schemaVersion).toBe(3)
+    expect(Object.keys(persisted.reservations)).toEqual([canonicalKey])
+    expect(persisted.reservations[canonicalKey]?.projectIdentity).toBe(project)
+  })
+
+  test('coalesces identical schema-2 reservations that collide after canonicalization', async () => {
+    const project = path.join(tempDir, 'project')
+    const alias = path.join(tempDir, 'project-alias')
+    const filePath = path.join(tempDir, 'session-store.json')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    const canonical = reservationFor(project)
+    const aliased = reservationFor(alias, { createdAt: '2026-04-20T00:00:00.000Z' })
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 2, records: {}, reservations: {
+      [aliased.logicalMemberKey]: aliased, [canonical.logicalMemberKey]: canonical,
+    } }))
+    const store = new OpenCodeSessionStore(filePath)
+
+    expect((await store.reserveLogicalMember({ teamId: 'team-a', laneId: 'primary',
+      projectIdentity: project, memberName: 'alice' }, 'reservation-a', 'session-1')).status).toBe('exact')
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as { reservations: Record<string, unknown> }
+    expect(Object.keys(persisted.reservations)).toEqual([canonical.logicalMemberKey])
+    expect(persisted.reservations[canonical.logicalMemberKey]).toMatchObject({
+      createdAt: '2026-04-20T00:00:00.000Z',
+    })
+  })
+
+  test('rejects conflicting schema-2 reservation collisions after canonicalization', async () => {
+    const project = path.join(tempDir, 'project')
+    const alias = path.join(tempDir, 'project-alias')
+    const filePath = path.join(tempDir, 'session-store.json')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    const canonical = reservationFor(project)
+    const aliased = reservationFor(alias, { reservationIdentity: 'reservation-foreign' })
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 2, records: {}, reservations: {
+      [aliased.logicalMemberKey]: aliased, [canonical.logicalMemberKey]: canonical,
+    } }))
+    const store = new OpenCodeSessionStore(filePath)
+
+    await expect(store.list()).rejects.toThrow('conflicting normalized OpenCode session reservations')
+  })
+
+  test('rejects a noncanonical schema-3 reservation instead of rewriting it', async () => {
+    const project = path.join(tempDir, 'project')
+    const alias = path.join(tempDir, 'project-alias')
+    const filePath = path.join(tempDir, 'session-store.json')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    const reservation = reservationFor(alias)
+    await writeFile(filePath, JSON.stringify({ schemaVersion: 3, records: {}, reservations: {
+      [reservation.logicalMemberKey]: reservation,
+    } }))
+    const store = new OpenCodeSessionStore(filePath)
+
+    await expect(store.list()).rejects.toThrow('reservation project identity is not canonical')
   })
 
   test('returns unchanged for identical record and marks stale explicitly', async () => {
