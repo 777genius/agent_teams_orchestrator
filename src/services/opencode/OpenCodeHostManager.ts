@@ -153,6 +153,13 @@ type ManagedHostEntry = {
   createdDisposalReceipt?: CreatedHostDisposalReceipt
 }
 
+type PersistentExitCleanupGeneration = Readonly<{
+  token: symbol
+  hostKey: string
+  receipt: PersistentHostRegistryRecord
+  entry: ManagedHostEntry
+}>
+
 class OpenCodeHostDurablyLeasedError extends Error {}
 
 declare const openCodeHostReferenceBrand: unique symbol
@@ -1691,12 +1698,14 @@ export class OpenCodeHostManager {
   private readonly scopedStagingGenerations = new Map<string, symbol>()
   private activeRegistryDirectory: OpenCodeSafePublicationDirectory | null = null
   private durableScopedTransportOwnerKey: Buffer | null = null
-  private readonly pendingExitCleanups = new Map<string, Readonly<{
-    receipt: PersistentHostRegistryRecord
-    entry: ManagedHostEntry
+  private readonly pendingExitCleanups = new Map<symbol, Readonly<{
+    generation: PersistentExitCleanupGeneration
     lastError: string
   }>>()
-  private readonly exitCleanupTasks = new Map<string, Promise<boolean>>()
+  private readonly exitCleanupTasks = new Map<symbol, Readonly<{
+    generation: PersistentExitCleanupGeneration
+    promise: Promise<boolean>
+  }>>()
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
 
@@ -3135,41 +3144,56 @@ export class OpenCodeHostManager {
     entry: ManagedHostEntry,
   ): void {
     const immutableReceipt = immutableCanonicalPersistentHostRegistryRecord(receipt)
-    this.pendingExitCleanups.set(hostKey, { receipt: immutableReceipt, entry, lastError: 'pending' })
-    const task = this.retryPersistentExitCleanup(hostKey, 3).catch(error => {
-      const pending = this.pendingExitCleanups.get(hostKey)
-      if (pending) this.pendingExitCleanups.set(hostKey, { ...pending,
-        lastError: error instanceof Error ? error.message : String(error) })
+    const token = Symbol(hostKey)
+    const generation = Object.freeze({ token, hostKey, receipt: immutableReceipt, entry })
+    this.pendingExitCleanups.set(token, { generation, lastError: 'pending' })
+    const task = this.retryPersistentExitCleanup(generation, 3).catch(error => {
+      const pending = this.pendingExitCleanups.get(token)
+      if (pending?.generation === generation) this.pendingExitCleanups.set(token, {
+        generation,
+        lastError: error instanceof Error ? error.message : String(error),
+      })
       return false
     })
       .finally(() => {
-        if (this.exitCleanupTasks.get(hostKey) === task) {
-          this.exitCleanupTasks.delete(hostKey)
+        const current = this.exitCleanupTasks.get(token)
+        if (current?.generation === generation && current.promise === task) {
+          this.exitCleanupTasks.delete(token)
         }
       })
-    this.exitCleanupTasks.set(hostKey, task)
+    this.exitCleanupTasks.set(token, { generation, promise: task })
   }
 
-  private async retryPersistentExitCleanup(hostKey: string, attempts: number): Promise<boolean> {
+  private async retryPersistentExitCleanup(
+    generation: PersistentExitCleanupGeneration,
+    attempts: number,
+  ): Promise<boolean> {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const pending = this.pendingExitCleanups.get(hostKey)
-      if (!pending) return true
+      const pending = this.pendingExitCleanups.get(generation.token)
+      if (!pending || pending.generation !== generation) return true
       try {
-        await this.removePersistentHostByReceipt(hostKey, pending.receipt)
-        this.pendingExitCleanups.delete(hostKey)
+        await this.removePersistentHostByReceipt(generation.hostKey, generation.receipt)
+        if (this.pendingExitCleanups.get(generation.token) === pending) {
+          this.pendingExitCleanups.delete(generation.token)
+        }
         return true
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        this.pendingExitCleanups.set(hostKey, { ...pending, lastError: message })
-        pending.entry.handle.diagnostics.push(
-          `persistent exit cleanup pending retry: ${isScopedPreparedProfile(pending.entry.handle.profile)
+        if (this.pendingExitCleanups.get(generation.token) === pending) {
+          this.pendingExitCleanups.set(generation.token, { generation, lastError: message })
+        }
+        generation.entry.handle.diagnostics.push(
+          `persistent exit cleanup pending retry: ${isScopedPreparedProfile(generation.entry.handle.profile)
             ? '[redacted]' : message}`,
         )
         if (attempt + 1 < attempts) {
           try { await (this.deps.sleepMs ?? sleep)(Math.min(50, 5 * (attempt + 1))) }
           catch (sleepError) {
-            this.pendingExitCleanups.set(hostKey, { ...pending,
-              lastError: sleepError instanceof Error ? sleepError.message : String(sleepError) })
+            const current = this.pendingExitCleanups.get(generation.token)
+            if (current?.generation === generation) {
+              this.pendingExitCleanups.set(generation.token, { generation,
+                lastError: sleepError instanceof Error ? sleepError.message : String(sleepError) })
+            }
           }
         }
       }
@@ -3187,19 +3211,19 @@ export class OpenCodeHostManager {
     // pending-failure map: successful cleanup removes that entry, and an
     // immediate reconciliation must still synchronize with the in-flight
     // lifecycle work. Drain tasks registered while an earlier one is awaited.
-    const observedTasks = new Set<Promise<boolean>>()
+    const observedTasks = new Set<symbol>()
     while (true) {
-      const tasks = Array.from(this.exitCleanupTasks.values())
-        .filter(task => !observedTasks.has(task))
+      const tasks = Array.from(this.exitCleanupTasks.entries())
+        .filter(([token]) => !observedTasks.has(token))
       if (tasks.length === 0) break
-      for (const task of tasks) {
-        observedTasks.add(task)
-        if (await task) cleaned += 1
+      for (const [token, task] of tasks) {
+        observedTasks.add(token)
+        if (await task.promise) cleaned += 1
       }
     }
-    for (const hostKey of Array.from(this.pendingExitCleanups.keys())) {
-      if (this.pendingExitCleanups.has(hostKey)
-        && await this.retryPersistentExitCleanup(hostKey, 3)) cleaned += 1
+    for (const pending of Array.from(this.pendingExitCleanups.values())) {
+      if (this.pendingExitCleanups.get(pending.generation.token) === pending
+        && await this.retryPersistentExitCleanup(pending.generation, 3)) cleaned += 1
     }
     return Object.freeze({
       cleaned,
@@ -4089,6 +4113,14 @@ export class OpenCodeHostManager {
       const record = registry.hosts[entry.handle.hostKey]
       const expectedRecord = entry.ownedByProcess
         ? entry.createdDisposalReceipt?.registryReceipt : entry.adoptedRegistryReceipt
+      if (record?.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(record, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode persistent host registry lifecycle binding is invalid [redacted]')
+      }
+      if (expectedRecord?.scopedIdentity
+        && !hasExactScopedHostIdentityBinding(expectedRecord, this.scopedTransportOwnerKey)) {
+        throw new Error('OpenCode persistent host receipt lifecycle binding is invalid [redacted]')
+      }
       if (!record
         || !expectedRecord
         || record.pid !== entry.handle.pid

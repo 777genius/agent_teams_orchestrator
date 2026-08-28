@@ -1006,6 +1006,233 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     } finally { await rm(tempDir, { recursive: true, force: true }) }
   })
 
+  test.each([
+    ['current registry record', 'current'],
+    ['expected disposal receipt', 'expected'],
+  ] as const)(
+    'a tampered scoped binding on the %s cannot consume the final durable-leased reference',
+    async (_label, tamperTarget) => {
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-leased-binding-fence-'))
+      const registryPath = path.join(tempDir, 'registry.json')
+      const profile = scopedProfile('launch', { projectPath: tempDir })
+      const child = createMockChildProcess(45_454)
+      const ownerKey = Buffer.alloc(32, 14)
+      let disposalEffects = 0
+      const manager = new OpenCodeHostManager({
+        allocateLoopbackPort: async () => 44_454,
+        spawnHostProcess: () => child.child,
+        fetchJson: async url => {
+          if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
+          disposalEffects += 1
+          return { status: 200, data: {} }
+        },
+        isProcessAlive: pid => pid === 45_454,
+        readProcessStartTimeMs: async pid => pid === 45_454 ? 12_354 : null,
+        readProcessBirthToken: pid => pid === 45_454
+          ? 'linux:11111111-2222-3333-4444-555555555555:454' : null,
+        killProcess: () => { disposalEffects += 1 },
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+        scopedTransportOwnerKey: ownerKey,
+      })
+      try {
+        const reference = await manager.ensureScopedHostReference({
+          preparedProfile: profile,
+          expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+        })
+        await manager.retainHostLease(reference.handle.hostKey, {
+          teamId: 'team', laneId: 'lane', memberName: 'member',
+          runId: 'run', sessionId: 'session',
+        })
+        const registry = JSON.parse(await readFile(registryPath, 'utf8'))
+        const record = registry.hosts[reference.handle.hostKey]
+        expect(typeof record.scopedIdentityBinding).toBe('string')
+        if (tamperTarget === 'current') {
+          delete record.scopedIdentityBinding
+          await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`)
+        } else {
+          const entry = (manager as any).hosts.get(reference.handle.hostKey)
+          entry.createdDisposalReceipt = {
+            ...entry.createdDisposalReceipt,
+            registryReceipt: { ...entry.createdDisposalReceipt.registryReceipt,
+              scopedIdentityBinding: '0'.repeat(64) },
+          }
+        }
+
+        await expect(manager.releaseHostReference(reference)).rejects.toThrow(
+          tamperTarget === 'current'
+            ? 'registry lifecycle binding is invalid'
+            : 'receipt lifecycle binding is invalid',
+        )
+        expect(manager.hasExactRetainedHostReleaseCapability(
+          manager.hostReleaseReceipt(reference),
+        )).toBe(true)
+        expect(manager.getHost(reference.handle.hostKey)).not.toBeNull()
+        expect(disposalEffects).toBe(0)
+      } finally { await rm(tempDir, { recursive: true, force: true }) }
+    },
+  )
+
+  test('valid adoption protection refresh still consumes a durable-leased final reference', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-adopted-binding-refresh-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const child = createMockChildProcess(45_455)
+    const ownerKey = Buffer.alloc(32, 15)
+    let nowMs = Date.parse('2026-08-28T00:00:00.000Z')
+    const deps = () => ({
+      allocateLoopbackPort: async () => 44_455,
+      spawnHostProcess: () => child.child,
+      fetchJson: async (url: string) => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+      isProcessAlive: (pid: number) => pid === 45_455,
+      readProcessStartTimeMs: async (pid: number) => pid === 45_455 ? 12_355 : null,
+      readProcessBirthToken: (pid: number) => pid === 45_455
+        ? 'linux:11111111-2222-3333-4444-555555555555:455' : null,
+      sleepMs: async () => {}, now: () => new Date(nowMs),
+      persistentRegistryPath: registryPath, scopedTransportOwnerKey: ownerKey,
+    })
+    try {
+      const owner = new OpenCodeHostManager(deps())
+      await owner.ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const before = JSON.parse(await readFile(registryPath, 'utf8'))
+        .hosts[deriveOpenCodeScopedHostKey(profile)]
+      nowMs += 1_000
+      const adopter = new OpenCodeHostManager(deps())
+      const reference = await adopter.ensureScopedHostReference({
+        preparedProfile: profile, expectedHostKey: deriveOpenCodeScopedHostKey(profile),
+      })
+      const after = JSON.parse(await readFile(registryPath, 'utf8'))
+        .hosts[reference.handle.hostKey]
+      expect(after.coordinationProtectedUntil).not.toBe(before.coordinationProtectedUntil)
+      expect(after.scopedIdentityBinding).not.toBe(before.scopedIdentityBinding)
+      await adopter.retainHostLease(reference.handle.hostKey, {
+        teamId: 'team', laneId: 'lane', memberName: 'member', runId: 'run', sessionId: 'session',
+      })
+      await expect(adopter.releaseHostReference(reference)).resolves.toBeUndefined()
+      expect(adopter.getHost(reference.handle.hostKey)).not.toBeNull()
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('legacy unscoped durable-lease records remain compatible with final-reference consumption', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-unscoped-lease-release-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const child = createMockChildProcess(45_456)
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => ({ ...baseProfile, projectPath: tempDir }),
+      allocateLoopbackPort: async () => 44_456,
+      spawnHostProcess: () => child.child,
+      fetchJson: async url => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } } : { status: 200, data: {} },
+      isProcessAlive: pid => pid === 45_456,
+      readProcessStartTimeMs: async pid => pid === 45_456 ? 12_356 : null,
+      sleepMs: async () => {}, persistentRegistryPath: registryPath,
+    })
+    try {
+      const handle = await manager.ensureHost({ hostKey: 'legacy-unscoped-host' })
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team', laneId: 'lane', memberName: 'member', runId: 'run', sessionId: 'session',
+      })
+      const entry = (manager as any).hosts.get(handle.hostKey)
+      let consumed = false
+      await expect((manager as any).consumeFinalReferenceForDurableLease(
+        entry, () => { consumed = true },
+      )).resolves.toBe(true)
+      expect(consumed).toBe(true)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('an older successful exit cleanup cannot erase a newer pending generation', async () => {
+    const manager = new OpenCodeHostManager({ sleepMs: async () => {} }) as any
+    const olderGate = createDeferred<void>()
+    const newerInitialAttempts = createDeferred<void>()
+    let newerCanSucceed = false
+    let newerCalls = 0
+    manager.removePersistentHostByReceipt = async (
+      _hostKey: string,
+      receipt: { updatedAt: string },
+    ) => {
+      if (receipt.updatedAt === '2026-08-28T00:00:00.000Z') {
+        await olderGate.promise
+        return
+      }
+      newerCalls += 1
+      if (newerCalls === 3) newerInitialAttempts.resolve()
+      if (!newerCanSucceed) throw new Error('newer generation remains pending')
+    }
+    const entry = (diagnostic: string) => ({
+      handle: { profile: baseProfile, diagnostics: [diagnostic] },
+    })
+    const receipt = (updatedAt: string) => ({
+      hostKey: 'overlapping-host', profileRootKey: 'profile', projectPath: '/synthetic',
+      projectBehaviorFingerprint: 'behavior', baseUrl: 'http://127.0.0.1:44000',
+      port: 44_000, pid: 54_443, processStartedAtMs: 12_345,
+      version: null, resolvedConfigFingerprint: null, updatedAt, leases: {},
+    })
+
+    manager.schedulePersistentExitCleanup(
+      'overlapping-host', receipt('2026-08-28T00:00:00.000Z'), entry('older'),
+    )
+    manager.schedulePersistentExitCleanup(
+      'overlapping-host', receipt('2026-08-28T00:00:01.000Z'), entry('newer'),
+    )
+    await newerInitialAttempts.promise
+    const reconciliation = manager.reconcilePendingExitCleanups()
+    olderGate.resolve()
+    await expect(reconciliation).resolves.toMatchObject({
+      cleaned: 1, pending: 1,
+      diagnostics: ['newer generation remains pending'],
+    })
+    expect(newerCalls).toBe(6)
+
+    newerCanSucceed = true
+    await expect(manager.reconcilePendingExitCleanups()).resolves.toMatchObject({
+      cleaned: 1, pending: 0, diagnostics: [],
+    })
+  })
+
+  test('cleanup task failures retain exact generations and cannot overwrite a replacement', async () => {
+    const manager = new OpenCodeHostManager({ sleepMs: async () => {} }) as any
+    const originalRetry = manager.retryPersistentExitCleanup.bind(manager)
+    const olderGate = createDeferred<void>()
+    let scheduled = 0
+    manager.retryPersistentExitCleanup = async () => {
+      scheduled += 1
+      if (scheduled === 1) {
+        await olderGate.promise
+        throw new Error('older generation failure')
+      }
+      throw new Error('newer generation failure')
+    }
+    const entry = { handle: { profile: baseProfile, diagnostics: [] } }
+    const receipt = (updatedAt: string) => ({
+      hostKey: 'replacement-host', profileRootKey: 'profile', projectPath: '/synthetic',
+      projectBehaviorFingerprint: 'behavior', baseUrl: 'http://127.0.0.1:44001',
+      port: 44_001, pid: 54_444, processStartedAtMs: 12_346,
+      version: null, resolvedConfigFingerprint: null, updatedAt, leases: {},
+    })
+    manager.schedulePersistentExitCleanup(
+      'replacement-host', receipt('2026-08-28T00:00:00.000Z'), entry,
+    )
+    manager.schedulePersistentExitCleanup(
+      'replacement-host', receipt('2026-08-28T00:00:01.000Z'), entry,
+    )
+    await Promise.resolve()
+    olderGate.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(Array.from(manager.pendingExitCleanups.values(), (pending: any) => pending.lastError).sort())
+      .toEqual(['newer generation failure', 'older generation failure'])
+
+    manager.retryPersistentExitCleanup = originalRetry
+    manager.removePersistentHostByReceipt = async () => {}
+    await expect(manager.reconcilePendingExitCleanups()).resolves.toMatchObject({
+      cleaned: 2, pending: 0, diagnostics: [],
+    })
+  })
+
   test('Darwin strict persistent release fails closed without a negative group signal or probe', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-darwin-fail-closed-'))
     const registryPath = path.join(tempDir, 'registry.json')
