@@ -125,14 +125,17 @@ describe('issue #443 strict launch fake E2E', () => {
 })
 
 describe('issue #443 canonical contract fixture', () => {
-  test('has the canonical SHA and every independent tuple mutation changes the digest', async () => {
-    const fixturePath = fileURLToPath(new URL('./fixtures/expected-behavior-fingerprint-v1.json', import.meta.url))
+  test('uses the canonical v2 SHA, rejects v1, and binds every tuple component', async () => {
+    const fixturePath = fileURLToPath(new URL('./fixtures/expected-behavior-fingerprint-v2.json', import.meta.url))
     const bytes = await readFile(fixturePath)
     expect(createHash('sha256').update(bytes).digest('hex')).toBe(
-      '0290ad191e318736b4a69a6c898c993b1280b7bd54831cb2335404e406624601',
+      'ab20af8704ba9bcdbc04e6f2bd288f68645cb62c3a6aa35e948a76503bf34fd9',
     )
     const fixture = JSON.parse(bytes.toString()) as { cases: Array<Record<string, string>> }
     const [baseline, ...mutations] = fixture.cases
+    expect(validateOpenCodeExpectedBehaviorEvidence({
+      ...baseline!, expectedBehaviorFingerprint: '24c90d07dabd7df2da360970e41f28657b043649c4028e50f78ec986bafaf501',
+    })).toBe(false)
     expect(mutations.slice(0, 6).map(item => item.name)).toEqual([
       'project-path-changed', 'provider-changed', 'model-changed',
       'project-behavior-changed', 'config-changed', 'auth-changed',
