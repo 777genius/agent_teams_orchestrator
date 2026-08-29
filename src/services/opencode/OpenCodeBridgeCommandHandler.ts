@@ -119,8 +119,22 @@ const SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES = new Set([
   'video/quicktime',
 ])
 
-function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
-  return body.skipPermissions === false ? 'manual' : 'auto'
+export function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
+  const explicit = body.toolApprovalMode
+  if (explicit !== undefined && explicit !== 'manual' && explicit !== 'auto') {
+    throw new Error('opencode.launchTeam toolApprovalMode must be manual or auto')
+  }
+  if (explicit === undefined) {
+    // Preserve the pre-explicit-wire bridge behavior for legacy callers only.
+    return body.skipPermissions === false ? 'manual' : 'auto'
+  }
+  if (explicit === 'manual' && body.skipPermissions !== false) {
+    throw new Error('opencode.launchTeam manual tool approval requires skipPermissions=false')
+  }
+  if (explicit === 'auto' && body.skipPermissions !== true) {
+    throw new Error('opencode.launchTeam auto tool approval requires skipPermissions=true')
+  }
+  return explicit
 }
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
@@ -3096,7 +3110,7 @@ async function runLaunchWithProvisioningSnapshot(
   }
 }
 
-async function runReconcile(envelope: BridgeEnvelope) {
+async function runReconcile(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -3123,6 +3137,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
     if (!record) {
       diagnostics.push(teamDiagnostic('member_session_missing', `No stored OpenCode session for ${teamId}/${name}`, 'warning'))
       continue
+    }
+    if (lifecycleOwner && record.runId !== runId) {
+      throw new Error(`Stored OpenCode session for ${teamId}/${laneId}/${name} belongs to stale run ${record.runId}`)
     }
     selectedModel = record.selectedModel
     const expectedModel = asString(member?.model)
@@ -3224,7 +3241,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
   }
 }
 
-async function runStop(envelope: BridgeEnvelope) {
+async function runStop(envelope: BridgeEnvelope, lifecycleOwner: boolean) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -3240,6 +3257,10 @@ async function runStop(envelope: BridgeEnvelope) {
   const records = (await openCodeSessionStore.list()).filter(
     record => record.teamId === teamId && record.laneId === laneId,
   )
+  const staleRun = lifecycleOwner ? records.find(record => record.runId !== runId) : undefined
+  if (staleRun) {
+    throw new Error(`Refusing to stop replacement OpenCode run ${staleRun.runId} with stale run ${runId}`)
+  }
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   const diagnostics: TeamDiagnostic[] = []
   for (const record of records) {
@@ -4367,6 +4388,7 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
 async function handleEnvelope(
   envelope: BridgeEnvelope,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  lifecycleOwner = false,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -4410,9 +4432,9 @@ async function handleEnvelope(
       }
       return runLaunch(envelope, runtimeDeadline)
     case 'opencode.reconcileTeam':
-      return runReconcile(envelope)
+      return runReconcile(envelope, lifecycleOwner)
     case 'opencode.stopTeam':
-      return runStop(envelope)
+      return runStop(envelope, lifecycleOwner)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery':
@@ -4457,6 +4479,38 @@ async function handleEnvelope(
 }
 
 export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
+  return executeOpenCodeBridgeCommandEnvelopeInternal(input)
+}
+
+const HOSTED_LIFECYCLE_OWNER_CAPABILITY = Symbol('hosted-lifecycle-owner')
+
+/**
+ * Dedicated in-process entrypoint for the hosted sole-owner adapter. The
+ * module-private capability cannot be represented in a bridge envelope. The
+ * public entrypoint intentionally retains the legacy runtime command surface
+ * for non-hosted callers.
+ */
+export function createOwnedOpenCodeLifecycleCommandExecutor() {
+  const capability = HOSTED_LIFECYCLE_OWNER_CAPABILITY
+  return async (input: unknown) => {
+    if (capability !== HOSTED_LIFECYCLE_OWNER_CAPABILITY) {
+      throw new Error('OpenCode lifecycle owner capability is invalid')
+    }
+    const envelope = validateEnvelope(input)
+    if (!['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam'].includes(envelope.command)) {
+      throw new Error('OpenCode lifecycle owner only accepts lifecycle commands')
+    }
+    return executeOpenCodeBridgeCommandEnvelopeInternal(
+      envelope,
+      HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+    )
+  }
+}
+
+async function executeOpenCodeBridgeCommandEnvelopeInternal(
+  input: unknown,
+  ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+) {
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
   try {
@@ -4487,7 +4541,11 @@ export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
   try {
-    const result = await handleEnvelope(envelope, runtimeDeadline)
+    const result = await handleEnvelope(
+      envelope,
+      runtimeDeadline,
+      ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+    )
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
     }

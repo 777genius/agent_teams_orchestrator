@@ -8,8 +8,16 @@
  */
 
 import { createHash } from 'crypto'
-import { mkdir, readFile, writeFile } from 'fs/promises'
-import { join } from 'path'
+import {
+  constants,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  writeFile,
+} from 'fs/promises'
+import { dirname, isAbsolute, join } from 'path'
 import { z } from 'zod/v4'
 import { TEAMMATE_MESSAGE_TAG } from '../constants/xml.js'
 import { PermissionModeSchema } from '../entrypoints/sdk/coreSchemas.js'
@@ -100,6 +108,10 @@ export type VerifiedMailboxWriteReceipt = {
   totalMessages: number
 }
 
+export type ExplicitRootVerifiedMailboxWriteResult =
+  | ({ kind: 'written' | 'idempotent_replay' } & VerifiedMailboxWriteReceipt)
+  | { kind: 'conflict' }
+
 export const MAILBOX_STALE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000
 const VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS = 3
 const VERIFIED_MAILBOX_WRITE_RETRY_DELAYS_MS = [25, 75] as const
@@ -113,9 +125,15 @@ export function createCompatibilityInboxMessageId(parts: {
 }
 
 export function resolveTeammateMessageId(
-  message: Pick<RawTeammateMessage, 'from' | 'text' | 'timestamp' | 'messageId'>,
+  message: Pick<
+    RawTeammateMessage,
+    'from' | 'text' | 'timestamp' | 'messageId'
+  >,
 ): string {
-  if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
+  if (
+    typeof message.messageId === 'string' &&
+    message.messageId.trim().length > 0
+  ) {
     return message.messageId
   }
   return createCompatibilityInboxMessageId(message)
@@ -191,9 +209,7 @@ export async function readMailbox(
     const content = await readFile(inboxPath, 'utf-8')
     const parsed = jsonParse(content)
     const messages = Array.isArray(parsed)
-      ? parsed
-          .filter(isRawMailboxMessage)
-          .map(normalizeTeammateMessage)
+      ? parsed.filter(isRawMailboxMessage).map(normalizeTeammateMessage)
       : []
     logForDebugging(
       `[TeammateMailbox] readMailbox: read ${messages.length} message(s)`,
@@ -334,9 +350,16 @@ export async function writeToMailboxVerified(
   }
   let lastError: unknown = new Error('message was not observed after write')
 
-  for (let attempt = 0; attempt < VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS;
+    attempt++
+  ) {
     try {
-      const messages = await readMailboxStrictForVerification(recipientName, teamName)
+      const messages = await readMailboxStrictForVerification(
+        recipientName,
+        teamName,
+      )
       if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
         return {
           messageId,
@@ -352,7 +375,10 @@ export async function writeToMailboxVerified(
 
     await writeToMailbox(recipientName, canonicalMessage, teamName)
     try {
-      const messages = await readMailboxStrictForVerification(recipientName, teamName)
+      const messages = await readMailboxStrictForVerification(
+        recipientName,
+        teamName,
+      )
       if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
         return {
           messageId,
@@ -375,6 +401,257 @@ export async function writeToMailboxVerified(
   throw new Error(
     `Verified mailbox write failed for ${recipientName}: messageId=${messageId}; path=${inboxPath}; lastError=${stringifyUnknownError(lastError)}`,
   )
+}
+
+/**
+ * Hosted-control-only mailbox primitive. Unlike the compatibility helpers above,
+ * this never consults process globals and never retries after attempting a write.
+ */
+export async function writeToMailboxAtCanonicalTeamRootVerified(input: {
+  canonicalTeamRoot: string
+  recipientName: string
+  message: Omit<RawTeammateMessage, 'read'>
+}): Promise<ExplicitRootVerifiedMailboxWriteResult> {
+  if (
+    !isAbsolute(input.canonicalTeamRoot) ||
+    (await realpath(input.canonicalTeamRoot)) !== input.canonicalTeamRoot
+  ) {
+    throw new Error('Mailbox team root must be canonical and absolute')
+  }
+  await assertPrivateDirectory(input.canonicalTeamRoot)
+  const safeRecipient = sanitizePathComponent(input.recipientName)
+  if (safeRecipient !== input.recipientName)
+    throw new Error('Unsafe mailbox recipient')
+  const inboxDir = join(input.canonicalTeamRoot, 'inboxes')
+  try {
+    await mkdir(inboxDir, { mode: 0o700 })
+  } catch (error) {
+    if (getErrnoCode(error) !== 'EEXIST') throw error
+  }
+  const inboxDirIdentity = await assertPrivateDirectory(inboxDir)
+  const inboxPath = join(inboxDir, `${safeRecipient}.json`)
+  try {
+    await writeFile(inboxPath, '[]', {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    })
+  } catch (error) {
+    if (getErrnoCode(error) !== 'EEXIST') throw error
+  }
+  await assertPrivateRegularFile(inboxPath)
+
+  const messageId = resolveTeammateMessageId(input.message)
+  const canonicalMessage = normalizeTeammateMessage({
+    ...input.message,
+    messageId,
+    read: false,
+  })
+  const release = await lockfile.lock(inboxPath, {
+    lockfilePath: `${inboxPath}.lock`,
+    realpath: false,
+    ...LOCK_OPTIONS,
+  })
+  try {
+    await assertSamePrivateDirectory(inboxDir, inboxDirIdentity)
+    await assertPrivateRegularFile(inboxPath)
+    const messages = await readMailboxPathStrict(inboxPath)
+    const existing = messages.filter(row => row.messageId === messageId)
+    if (existing.length > 0) {
+      return existing.length === 1 &&
+        hasVerifiedMailboxMessage(existing, canonicalMessage)
+        ? {
+            kind: 'idempotent_replay',
+            messageId,
+            inboxPath,
+            attempts: 0,
+            totalMessages: messages.length,
+          }
+        : { kind: 'conflict' }
+    }
+
+    messages.push(canonicalMessage)
+    await assertSamePrivateDirectory(inboxDir, inboxDirIdentity)
+    await assertPrivateRegularFile(inboxPath)
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2), {
+      mode: 0o600,
+    })
+    await assertSamePrivateDirectory(inboxDir, inboxDirIdentity)
+    await assertPrivateRegularFile(inboxPath)
+    await fsyncFileAndParentDirectory(inboxPath)
+    const readback = await readMailboxPathStrict(inboxPath)
+    const writtenRows = readback.filter(row => row.messageId === messageId)
+    if (
+      writtenRows.length !== 1 ||
+      !hasVerifiedMailboxMessage(writtenRows, canonicalMessage)
+    ) {
+      throw new Error(
+        `Explicit-root mailbox write was not observed: ${messageId}`,
+      )
+    }
+    return {
+      kind: 'written',
+      messageId,
+      inboxPath,
+      attempts: 1,
+      totalMessages: readback.length,
+    }
+  } finally {
+    await release()
+  }
+}
+
+async function readMailboxPathStrict(
+  inboxPath: string,
+): Promise<TeammateMessage[]> {
+  const handle = await open(
+    inboxPath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const [stat, current] = await Promise.all([handle.stat(), lstat(inboxPath)])
+    if (
+      !stat.isFile() ||
+      !current.isFile() ||
+      current.isSymbolicLink() ||
+      stat.dev !== current.dev ||
+      stat.ino !== current.ino ||
+      (stat.mode & 0o077) !== 0 ||
+      (process.getuid?.() !== undefined && stat.uid !== process.getuid())
+    ) {
+      throw new Error(`mailbox path was substituted: ${inboxPath}`)
+    }
+    const parsed = jsonParse(await handle.readFile('utf8'))
+    if (
+      !Array.isArray(parsed) ||
+      parsed.some(row => !isRawMailboxMessage(row))
+    ) {
+      throw new Error(`mailbox file is not a valid message array: ${inboxPath}`)
+    }
+    return parsed.map(normalizeTeammateMessage)
+  } finally {
+    await handle.close()
+  }
+}
+
+type PrivatePathIdentity = { dev: number; ino: number }
+
+async function assertPrivateDirectory(
+  path: string,
+): Promise<PrivatePathIdentity> {
+  const handle = await open(
+    path,
+    constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const [stat, current, canonical] = await Promise.all([
+      handle.stat(),
+      lstat(path),
+      realpath(path),
+    ])
+    if (
+      !stat.isDirectory() ||
+      !current.isDirectory() ||
+      current.isSymbolicLink() ||
+      stat.dev !== current.dev ||
+      stat.ino !== current.ino ||
+      canonical !== path ||
+      (stat.mode & 0o022) !== 0 ||
+      (process.getuid?.() !== undefined && stat.uid !== process.getuid())
+    ) {
+      throw new Error(`Unsafe explicit-root mailbox directory: ${path}`)
+    }
+    return { dev: stat.dev, ino: stat.ino }
+  } finally {
+    await handle.close()
+  }
+}
+
+async function assertSamePrivateDirectory(
+  path: string,
+  expected: PrivatePathIdentity,
+): Promise<void> {
+  const actual = await assertPrivateDirectory(path)
+  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    throw new Error(`Explicit-root mailbox directory was substituted: ${path}`)
+  }
+}
+
+async function assertPrivateRegularFile(
+  path: string,
+): Promise<PrivatePathIdentity> {
+  const handle = await open(
+    path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const [stat, current] = await Promise.all([handle.stat(), lstat(path)])
+    if (
+      !stat.isFile() ||
+      !current.isFile() ||
+      current.isSymbolicLink() ||
+      stat.dev !== current.dev ||
+      stat.ino !== current.ino ||
+      (stat.mode & 0o077) !== 0 ||
+      (process.getuid?.() !== undefined && stat.uid !== process.getuid())
+    ) {
+      throw new Error(`Unsafe explicit-root mailbox file: ${path}`)
+    }
+    return { dev: stat.dev, ino: stat.ino }
+  } finally {
+    await handle.close()
+  }
+}
+
+async function fsyncFileAndParentDirectory(path: string): Promise<void> {
+  const parentPath = dirname(path)
+  const parent = await open(
+    parentPath,
+    constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const file = await open(
+      path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    )
+    try {
+      const [fileStat, currentFile, parentStat, currentParent] =
+        await Promise.all([
+          file.stat(),
+          lstat(path),
+          parent.stat(),
+          lstat(parentPath),
+        ])
+      if (
+        !fileStat.isFile() ||
+        !currentFile.isFile() ||
+        currentFile.isSymbolicLink() ||
+        fileStat.dev !== currentFile.dev ||
+        fileStat.ino !== currentFile.ino ||
+        (fileStat.mode & 0o077) !== 0 ||
+        (process.getuid?.() !== undefined &&
+          fileStat.uid !== process.getuid()) ||
+        !parentStat.isDirectory() ||
+        !currentParent.isDirectory() ||
+        currentParent.isSymbolicLink() ||
+        parentStat.dev !== currentParent.dev ||
+        parentStat.ino !== currentParent.ino ||
+        (parentStat.mode & 0o022) !== 0 ||
+        (process.getuid?.() !== undefined &&
+          parentStat.uid !== process.getuid())
+      ) {
+        throw new Error(
+          'Explicit-root mailbox path was substituted before fsync',
+        )
+      }
+      await file.sync()
+      await parent.sync()
+    } finally {
+      await file.close()
+    }
+  } finally {
+    await parent.close()
+  }
 }
 
 /**
@@ -681,10 +958,7 @@ export type IdleNotificationMessage = {
 }
 
 export type IdleNotificationPrimaryKind =
-  | 'heartbeat'
-  | 'interrupted'
-  | 'task_terminal'
-  | 'failure'
+  'heartbeat' | 'interrupted' | 'task_terminal' | 'failure'
 
 export type ClassifiedIdleNotification = {
   payload: IdleNotificationMessage
@@ -694,11 +968,7 @@ export type ClassifiedIdleNotification = {
   countsAsBootstrapConfirmation: boolean
   liveDelivery: 'silent_finalize' | 'passive_activity' | 'visible_actionable'
   uiPresentation:
-    | 'heartbeat'
-    | 'peer_summary'
-    | 'interrupted'
-    | 'task_terminal'
-    | 'failure'
+    'heartbeat' | 'peer_summary' | 'interrupted' | 'task_terminal' | 'failure'
 }
 
 /**
@@ -744,14 +1014,13 @@ export function isIdleNotification(
 }
 
 function getTrimmedOptionalString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : null
 }
 
 function normalizeIdleNotificationInput(
-  value:
-    | string
-    | Pick<TeammateMessage, 'text'>
-    | IdleNotificationMessage,
+  value: string | Pick<TeammateMessage, 'text'> | IdleNotificationMessage,
 ): IdleNotificationMessage | null {
   if (typeof value === 'string') {
     return isIdleNotification(value)
@@ -763,10 +1032,7 @@ function normalizeIdleNotificationInput(
 }
 
 export function classifyIdleNotification(
-  value:
-    | string
-    | Pick<TeammateMessage, 'text'>
-    | IdleNotificationMessage,
+  value: string | Pick<TeammateMessage, 'text'> | IdleNotificationMessage,
 ): ClassifiedIdleNotification | null {
   const payload = normalizeIdleNotificationInput(value)
   if (!payload) {
@@ -836,9 +1102,7 @@ export function isSilentRegularMailboxMessageForLiveContext(
   message: Pick<TeammateMessage, 'text'>,
 ): boolean {
   const classified = classifyIdleNotification(message)
-  return (
-    classified !== null && classified.liveDelivery !== 'visible_actionable'
-  )
+  return classified !== null && classified.liveDelivery !== 'visible_actionable'
 }
 
 /**
@@ -1130,13 +1394,17 @@ export type ShutdownRequestMessage = z.infer<
  * Shutdown approved message sent from teammate to leader via mailbox
  */
 export const ShutdownApprovedMessageSchema = lazySchema(() =>
-  z.object({
+  z.strictObject({
     type: z.literal('shutdown_approved'),
     requestId: z.string(),
     from: z.string(),
     timestamp: z.string(),
     paneId: z.string().optional(),
-    backendType: z.string().optional(),
+    backendType: z.enum(['tmux', 'iterm2', 'in-process', 'process']).optional(),
+    processStartedAtMs: z.number().optional(),
+    processOsIdentity: z.string().optional(),
+    processOwnerToken: z.string().optional(),
+    processRunId: z.string().optional(),
   }),
 )
 
@@ -1186,6 +1454,10 @@ export function createShutdownApprovedMessage(params: {
   from: string
   paneId?: string
   backendType?: BackendType
+  processStartedAtMs?: number
+  processOsIdentity?: string
+  processOwnerToken?: string
+  processRunId?: string
 }): ShutdownApprovedMessage {
   return {
     type: 'shutdown_approved',
@@ -1194,6 +1466,10 @@ export function createShutdownApprovedMessage(params: {
     timestamp: new Date().toISOString(),
     paneId: params.paneId,
     backendType: params.backendType,
+    processStartedAtMs: params.processStartedAtMs,
+    processOsIdentity: params.processOsIdentity,
+    processOwnerToken: params.processOwnerToken,
+    processRunId: params.processRunId,
   }
 }
 
@@ -1242,6 +1518,11 @@ export async function sendShutdownRequestToMailbox(
     from: senderName,
     reason,
   })
+
+  const { recordOutstandingShutdownRequest } = await import('./swarm/teamHelpers.js')
+  if (!(await recordOutstandingShutdownRequest(resolvedTeamName, targetName, requestId))) {
+    throw new Error(`Cannot record shutdown request for unregistered teammate "${targetName}"`)
+  }
 
   await writeToMailbox(
     targetName,
@@ -1593,9 +1874,15 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
           claimedAtMs > nowMs ||
           nowMs - claimedAtMs >= staleClaimTimeoutMs)
 
-      if (!claimedBySessionId || claimedBySessionId === sessionId || claimIsStale) {
+      if (
+        !claimedBySessionId ||
+        claimedBySessionId === sessionId ||
+        claimIsStale
+      ) {
         const nextMessage =
-          !claimedBySessionId || claimedBySessionId !== sessionId || claimIsStale
+          !claimedBySessionId ||
+          claimedBySessionId !== sessionId ||
+          claimIsStale
             ? {
                 ...message,
                 claimedBySessionId: sessionId,

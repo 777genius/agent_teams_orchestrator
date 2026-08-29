@@ -127,6 +127,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
   return {
     teamId: 'team-a',
     laneId: 'primary',
+    runId: null,
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openrouter/minimax-m2.5-free',
@@ -688,6 +689,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)
+  })
+
+  test('keeps legacy public lifecycle commands on the public bridge path', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-legacy-public',
+        laneId: 'legacy-public-lane',
+        teamId: 'legacy-public-team',
+        expectedMembers: [],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {

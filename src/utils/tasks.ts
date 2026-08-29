@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises'
+import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from 'fs/promises'
+import { createHash } from 'node:crypto'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { getIsNonInteractiveSession, getSessionId } from '../bootstrap/state.js'
@@ -15,6 +16,7 @@ import { jsonParse, jsonStringify } from './slowOperations.js'
 import { getTeamName } from './teammate.js'
 import { getTeammateContext } from './teammateContext.js'
 import { safeWindowsPathSegment } from './windowsReservedNames.js'
+import { withTaskMutationCoordination } from './taskMutationCoordinator.js'
 
 // Listeners for task list updates (used for immediate UI refresh in same process)
 const tasksUpdated = createSignal()
@@ -79,7 +81,9 @@ export const TaskSchema = lazySchema(() =>
   z.object({
     id: z.string(),
     subject: z.string(),
-    description: z.string(),
+    // Hosted v1 create postimages omit description when the request used null.
+    // Normalize only a missing field on read; present non-strings still fail.
+    description: z.string().default(''),
     activeForm: z.string().optional(), // present continuous form for spinner (e.g., "Running tests")
     owner: z.string().optional(), // agent ID
     status: TaskStatusSchema(),
@@ -147,6 +151,12 @@ export function isTodoV2Enabled(): boolean {
  * Uses file locking to prevent race conditions when multiple Claudes run in parallel.
  */
 export async function resetTaskList(taskListId: string): Promise<void> {
+  return withTaskMutationCoordination(taskListId, () =>
+    resetTaskListCoordinated(taskListId),
+  )
+}
+
+async function resetTaskListCoordinated(taskListId: string): Promise<void> {
   const dir = getTasksDir(taskListId)
   const lockPath = await ensureTaskListLockFile(taskListId)
 
@@ -242,6 +252,14 @@ export async function ensureTasksDir(taskListId: string): Promise<void> {
   }
 }
 
+/** Removes an entire task list under the same lane used by every task writer. */
+export async function removeTaskList(taskListId: string): Promise<void> {
+  return withTaskMutationCoordination(taskListId, async () => {
+    await rm(getTasksDir(taskListId), { recursive: true, force: true })
+    notifyTasksUpdated()
+  })
+}
+
 /**
  * Finds the highest task ID from existing task files (not including high water mark).
  */
@@ -284,6 +302,15 @@ async function findHighestTaskId(taskListId: string): Promise<number> {
  * create tasks concurrently.
  */
 export async function createTask(
+  taskListId: string,
+  taskData: Omit<Task, 'id'>,
+): Promise<string> {
+  return withTaskMutationCoordination(taskListId, () =>
+    createTaskCoordinated(taskListId, taskData),
+  )
+}
+
+async function createTaskCoordinated(
   taskListId: string,
   taskData: Omit<Task, 'id'>,
 ): Promise<string> {
@@ -374,6 +401,16 @@ export async function updateTask(
   taskId: string,
   updates: Partial<Omit<Task, 'id'>>,
 ): Promise<Task | null> {
+  return withTaskMutationCoordination(taskListId, () =>
+    updateTaskCoordinated(taskListId, taskId, updates),
+  )
+}
+
+async function updateTaskCoordinated(
+  taskListId: string,
+  taskId: string,
+  updates: Partial<Omit<Task, 'id'>>,
+): Promise<Task | null> {
   const path = getTaskPath(taskListId, taskId)
 
   // Check existence before locking — proper-lockfile throws if the
@@ -393,6 +430,15 @@ export async function updateTask(
 }
 
 export async function deleteTask(
+  taskListId: string,
+  taskId: string,
+): Promise<boolean> {
+  return withTaskMutationCoordination(taskListId, () =>
+    deleteTaskCoordinated(taskListId, taskId),
+  )
+}
+
+async function deleteTaskCoordinated(
   taskListId: string,
   taskId: string,
 ): Promise<boolean> {
@@ -458,6 +504,16 @@ export async function listTasks(taskListId: string): Promise<Task[]> {
 }
 
 export async function blockTask(
+  taskListId: string,
+  fromTaskId: string,
+  toTaskId: string,
+): Promise<boolean> {
+  return withTaskMutationCoordination(taskListId, () =>
+    blockTaskCoordinated(taskListId, fromTaskId, toTaskId),
+  )
+}
+
+async function blockTaskCoordinated(
   taskListId: string,
   fromTaskId: string,
   toTaskId: string,
@@ -545,6 +601,17 @@ export async function claimTask(
   taskId: string,
   claimantAgentId: string,
   options: ClaimTaskOptions = {},
+): Promise<ClaimTaskResult> {
+  return withTaskMutationCoordination(taskListId, () =>
+    claimTaskCoordinated(taskListId, taskId, claimantAgentId, options),
+  )
+}
+
+async function claimTaskCoordinated(
+  taskListId: string,
+  taskId: string,
+  claimantAgentId: string,
+  options: ClaimTaskOptions,
 ): Promise<ClaimTaskResult> {
   const taskPath = getTaskPath(taskListId, taskId)
 
@@ -700,6 +767,8 @@ export type TeamMember = {
   agentId: string
   name: string
   agentType?: string
+  /** Canonical hosted identity, when it can be derived without name inheritance. */
+  hostedOwnerId?: string
 }
 
 /**
@@ -727,20 +796,39 @@ async function readTeamMembers(
   teamName: string,
 ): Promise<{ leadAgentId: string; members: TeamMember[] } | null> {
   const teamsDir = getTeamsDir()
-  const teamFilePath = join(teamsDir, sanitizeName(teamName), 'config.json')
+  const teamDirectory = join(teamsDir, sanitizeName(teamName))
+  const teamFilePath = join(teamDirectory, 'config.json')
   try {
     const content = await readFile(teamFilePath, 'utf-8')
     const teamFile = jsonParse(content) as {
       leadAgentId: string
-      members: TeamMember[]
+      members: Array<TeamMember & { memberId?: unknown; joinedAt?: unknown; removedAt?: unknown }>
     }
+    const identity = await readHostedTeamId(teamDirectory)
+    const authoritativeRoster = await readHostedRosterMembers(teamDirectory)
+    const resolvedAuthoritativeMembers = authoritativeRoster.kind === 'valid'
+      ? resolveAuthoritativeRosterMembers(authoritativeRoster.members, teamFile.members)
+      : null
+    const members = resolvedAuthoritativeMembers ?? teamFile.members
+    // A present but malformed roster must not resurrect ownership aliases from
+    // stale config.json. Legacy display can continue, but opaque owners remain opaque.
+    const trustedIdentity = authoritativeRoster.kind === 'invalid' ||
+      (authoritativeRoster.kind === 'valid' && resolvedAuthoritativeMembers === null)
+      ? null
+      : identity
     return {
       leadAgentId: teamFile.leadAgentId,
-      members: teamFile.members.map(m => ({
-        agentId: m.agentId,
-        name: m.name,
-        agentType: m.agentType,
-      })),
+      members: members
+        .filter(m => m.removedAt === undefined)
+        .map(m => {
+          const ownerId = hostedOwnerId(trustedIdentity, m)
+          return {
+            agentId: m.agentId,
+            name: m.name,
+            agentType: m.agentType,
+            ...(ownerId ? { hostedOwnerId: ownerId } : {}),
+          }
+        }),
     }
   } catch (e) {
     const code = getErrnoCode(e)
@@ -752,6 +840,113 @@ async function readTeamMembers(
     )
     return null
   }
+}
+
+type HostedRosterMember = {
+  agentId?: string
+  name: string
+  agentType?: string
+  memberId?: unknown
+  joinedAt?: unknown
+  removedAt?: unknown
+}
+
+type ResolvedHostedRosterMember = HostedRosterMember & { agentId: string }
+
+const MAX_HOSTED_ROSTER_BYTES = 256 * 1024
+
+async function readHostedTeamId(teamDirectory: string): Promise<string | null> {
+  try {
+    const value = jsonParse(await readFile(join(teamDirectory, 'team.identity.json'), 'utf8')) as { teamId?: unknown }
+    return typeof value.teamId === 'string' && /^team_[0-9a-f]{32}$/.test(value.teamId) ? value.teamId : null
+  } catch {
+    return null
+  }
+}
+
+async function readHostedRosterMembers(teamDirectory: string): Promise<
+  | { kind: 'absent' }
+  | { kind: 'invalid' }
+  | { kind: 'valid'; members: HostedRosterMember[] }
+> {
+  try {
+    const rosterFile = await open(join(teamDirectory, 'members.meta.json'), 'r')
+    let rosterText: string
+    try {
+      const bytes = Buffer.alloc(MAX_HOSTED_ROSTER_BYTES + 1)
+      const { bytesRead } = await rosterFile.read(bytes, 0, bytes.length, 0)
+      if (bytesRead > MAX_HOSTED_ROSTER_BYTES) return { kind: 'invalid' }
+      rosterText = bytes.subarray(0, bytesRead).toString('utf8')
+    } finally {
+      await rosterFile.close()
+    }
+    const value = jsonParse(rosterText) as { version?: unknown; members?: unknown }
+    if (value.version !== 1 || !Array.isArray(value.members) || value.members.length > 512) return { kind: 'invalid' }
+    if (!value.members.every(member => {
+      if (!member || typeof member !== 'object' || Array.isArray(member)) return false
+      const candidate = member as HostedRosterMember
+      return typeof candidate.name === 'string' && candidate.name.length > 0 && candidate.name.trim() === candidate.name &&
+        (candidate.agentId === undefined || (typeof candidate.agentId === 'string' && candidate.agentId.length > 0 && candidate.agentId.length <= 256 && candidate.agentId.trim() === candidate.agentId)) &&
+        (candidate.memberId === undefined || (typeof candidate.memberId === 'string' && /^member_[0-9a-f]{32}$/.test(candidate.memberId))) &&
+        (candidate.joinedAt === undefined || (Number.isSafeInteger(candidate.joinedAt) && (candidate.joinedAt as number) >= 0)) &&
+        (candidate.removedAt === undefined || (typeof candidate.removedAt === 'number' && Number.isFinite(candidate.removedAt)))
+    })) return { kind: 'invalid' }
+    const members = value.members as HostedRosterMember[]
+    const identities = new Set<string>()
+    const activeNames = new Set<string>()
+    for (const member of members) {
+      const immutableIdentity = Number.isSafeInteger(member.joinedAt) && (member.joinedAt as number) >= 0
+        ? `${member.name}\0${member.joinedAt as number}`
+        : typeof member.agentId === 'string'
+          ? member.agentId
+          : member.name
+      const identity = typeof member.memberId === 'string'
+        ? `member:${member.memberId}`
+        : `identity:${immutableIdentity}`
+      const activeName = member.name.toLowerCase()
+      if (identities.has(identity) || (member.removedAt === undefined && activeNames.has(activeName))) return { kind: 'invalid' }
+      identities.add(identity)
+      if (member.removedAt === undefined) activeNames.add(activeName)
+    }
+    return { kind: 'valid', members }
+  } catch (error) {
+    return getErrnoCode(error) === 'ENOENT' ? { kind: 'absent' } : { kind: 'invalid' }
+  }
+}
+
+function resolveAuthoritativeRosterMembers(
+  roster: HostedRosterMember[],
+  configMembers: Array<TeamMember & { removedAt?: unknown }>,
+): ResolvedHostedRosterMember[] | null {
+  const activeConfigMembers = configMembers.filter(member => member.removedAt === undefined)
+  const resolved: ResolvedHostedRosterMember[] = []
+  for (const member of roster) {
+    if (member.removedAt !== undefined) continue
+    if (typeof member.agentId === 'string') {
+      resolved.push(member as ResolvedHostedRosterMember)
+      continue
+    }
+    const matchingConfigMembers = activeConfigMembers.filter(candidate => candidate.name === member.name)
+    if (matchingConfigMembers.length !== 1) return null
+    const configMember = matchingConfigMembers[0]!
+    resolved.push({
+      ...member,
+      agentId: configMember.agentId,
+      agentType: member.agentType ?? configMember.agentType,
+    })
+  }
+  return resolved
+}
+
+function hostedOwnerId(teamId: string | null, member: HostedRosterMember): string | null {
+  if (typeof member.memberId === 'string' && /^member_[0-9a-f]{32}$/.test(member.memberId)) return member.memberId
+  if (!teamId || typeof member.name !== 'string' || member.name.length === 0) return null
+  const immutableIdentity = Number.isSafeInteger(member.joinedAt) && (member.joinedAt as number) >= 0
+    ? `${member.name}\0${member.joinedAt as number}`
+    : typeof member.agentId === 'string' && member.agentId.length > 0
+      ? member.agentId
+      : member.name
+  return `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: immutableIdentity })).digest('hex').slice(0, 32)}`
 }
 
 /**
@@ -788,7 +983,10 @@ export async function getAgentStatuses(
     // Check both name (new) and agentId (legacy) for backwards compatibility
     const tasksByName = unresolvedTasksByOwner.get(member.name) || []
     const tasksById = unresolvedTasksByOwner.get(member.agentId) || []
-    const currentTasks = uniq([...tasksByName, ...tasksById])
+    const tasksByHostedId = member.hostedOwnerId
+      ? unresolvedTasksByOwner.get(member.hostedOwnerId) || []
+      : []
+    const currentTasks = uniq([...tasksByName, ...tasksById, ...tasksByHostedId])
     return {
       agentId: member.agentId,
       name: member.name,
@@ -823,11 +1021,36 @@ export async function unassignTeammateTasks(
   teammateName: string,
   reason: 'terminated' | 'shutdown',
 ): Promise<UnassignTasksResult> {
+  return withTaskMutationCoordination(teamName, () =>
+    unassignTeammateTasksCoordinated(
+      teamName,
+      teammateId,
+      teammateName,
+      reason,
+    ),
+  )
+}
+
+async function unassignTeammateTasksCoordinated(
+  teamName: string,
+  teammateId: string,
+  teammateName: string,
+  reason: 'terminated' | 'shutdown',
+): Promise<UnassignTasksResult> {
   const tasks = await listTasks(teamName)
+  const teamData = await readTeamMembers(teamName)
+  const exactMembers = teamData?.members.filter(
+    member => member.agentId === teammateId && member.name === teammateName,
+  ) ?? []
+  const hostedOwnerId = exactMembers.length === 1
+    ? exactMembers[0]!.hostedOwnerId
+    : undefined
   const unresolvedAssignedTasks = tasks.filter(
     t =>
       t.status !== 'completed' &&
-      (t.owner === teammateId || t.owner === teammateName),
+      (t.owner === teammateId ||
+        t.owner === teammateName ||
+        (hostedOwnerId !== undefined && t.owner === hostedOwnerId)),
   )
 
   // Unassign each task and reset status to open

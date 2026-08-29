@@ -22,9 +22,8 @@ type OpenCodeProvisioningProbeDeps = {
   inventoryService?: Pick<typeof openCodeInventoryService, 'probe'>
   hostManager?: Pick<
     typeof openCodeHostManager,
-    'ensureHost' | 'releaseHost' | 'refreshResolvedConfigFingerprint'
+    'ensureHost' | 'releaseHost' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease'
   >
-    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
 }
@@ -195,6 +194,7 @@ export class OpenCodeProvisioningProbe {
         hostLifetime: options.retainHost || options.disposeHostOnRelease === false
           ? 'persistent'
           : 'process',
+        lease: preflightLease,
       })
       host = await ensurePromise
       if (options.phaseContext?.signal.aborted) {
@@ -202,7 +202,6 @@ export class OpenCodeProvisioningProbe {
         host = undefined
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
-      await hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
     } catch (error) {
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)

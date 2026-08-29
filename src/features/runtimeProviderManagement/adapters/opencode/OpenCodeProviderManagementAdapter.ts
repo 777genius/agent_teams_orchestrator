@@ -2988,22 +2988,22 @@ export class OpenCodeProviderManagementAdapter
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
 
-  private async retainProviderManagementHost(
-    hostManager: OpenCodeHostManagerLike,
-    host: OpenCodeHostHandle,
-  ): Promise<OpenCodeHostLeaseInput | null> {
-    if (!hostManager.retainHostLease) {
-      return null
-    }
-    const lease: OpenCodeHostLeaseInput = {
+  private createProviderManagementHostLease(): OpenCodeHostLeaseInput {
+    return {
       teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
       laneId: 'provider-management',
       memberName: `provider-management-${process.pid}-${++this.hostLeaseSequence}`,
       runId: null,
       sessionId: null,
     }
+  }
+
+  private async reconcileProviderManagementHostLease(
+    hostManager: OpenCodeHostManagerLike,
+    host: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput,
+  ): Promise<OpenCodeHostLeaseInput | null> {
     try {
-      await hostManager.retainHostLease(host.hostKey, lease)
       await hostManager.reconcilePersistentHosts?.({
         mode: 'stale',
         reason: 'provider-management-idle-eviction',
@@ -3455,16 +3455,19 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         hostLifetime,
         resolveConfigFingerprint: false,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
-      if (hostLifetime === 'persistent') {
-        hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
       }
       const client = clientFactory.create(host.baseUrl)
       return await run({ inventory, inventoryService, host, client })
@@ -3533,7 +3536,7 @@ export class OpenCodeProviderManagementAdapter
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = this.createProviderManagementHostLease()
 
     try {
       host = await hostManager.ensureHost({
@@ -3545,8 +3548,9 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime: 'persistent',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        lease: hostLease,
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
       const client = clientFactory.create(host.baseUrl)
 
       return {
@@ -3649,7 +3653,9 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
       host = await hostManager.ensureHost({
@@ -3661,8 +3667,11 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+      }
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,

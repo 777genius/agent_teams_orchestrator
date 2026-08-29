@@ -43,6 +43,8 @@ export type OpenCodePreparedProfile = {
   globalAuthPath?: string
   managedAuthPath: string
   sourceAuthPath: string | null
+  /** Every canonical auth source included in sourceAuthFingerprint, in hash order. */
+  sourceAuthSources?: Array<{ path: string; fingerprint: string | null }>
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
   authState: OpenCodeAuthState
@@ -54,6 +56,8 @@ export type OpenCodeHostHandle = {
   profileRootKey: string
   projectPath: string
   projectBehaviorFingerprint: string
+  /** Exact installed/executing OpenCode executable bytes for this host. */
+  openCodeArtifactDigest?: `sha256:${string}` | null
   baseUrl: string
   port: number
   pid: number
@@ -169,6 +173,50 @@ export type OpenCodeProviderOAuthCallbackInput = {
 
 export type OpenCodeServerDocResponse = {
   paths?: Record<string, Record<string, unknown>>
+}
+
+/**
+ * Optional upstream contract required for race-free hosted approval delivery.
+ * Current OpenCode releases do not expose this capability, so callers must
+ * keep hosted approval effects disabled when the probe is absent or malformed.
+ */
+export type OpenCodeHostedApprovalCapability = {
+  schemaVersion: 2
+  protocol: 'agent-teams-hosted-approval-v2'
+  authentication: 'opencode-basic'
+  runtimeInstanceId: string
+  configGeneration: string
+}
+
+export type OpenCodeHostedApprovalPermission = {
+  requestId: string
+  sessionId: string
+  requestIncarnation: string
+  permissionDigest: string
+  rawPermission: OpenCodeHostedApprovalRawPermission
+}
+
+/** Exact JSON projection of the OpenCode v1 PermissionV1.Request schema. */
+export type OpenCodeHostedApprovalRawPermission = {
+  id: string
+  sessionID: string
+  permission: string
+  patterns: string[]
+  metadata: Record<string, unknown>
+  always: string[]
+  tool?: {
+    messageID: string
+    callID: string
+  }
+}
+
+export type OpenCodeHostedApprovalObservation = {
+  schemaVersion: 2
+  protocol: 'agent-teams-hosted-approval-v2'
+  runtimeInstanceId: string
+  configGeneration: string
+  sessionId: string
+  permissions: OpenCodeHostedApprovalPermission[]
 }
 
 export type OpenCodeMcpServerConfig = {
@@ -294,7 +342,7 @@ export type OpenCodePendingPermission = {
   sessionID?: string
   sessionId?: string
   session?: string
-  tool?: string
+  tool?: string | { messageID?: string; callID?: string }
   toolName?: string
   name?: string
   title?: string
@@ -302,7 +350,7 @@ export type OpenCodePendingPermission = {
   kind?: string
   type?: string
   metadata?: Record<string, unknown>
-  permission?: Record<string, unknown>
+  permission?: Record<string, unknown> | string
   [key: string]: unknown
 }
 
@@ -606,6 +654,8 @@ export type OpenCodeSessionPreviewSummary = {
 export type OpenCodeSessionRecord = {
   teamId: string
   laneId?: string
+  /** Durable lifecycle incarnation; absent only on legacy persisted records. */
+  runId?: string | null
   memberName: string
   providerId: 'opencode'
   selectedModel: string
@@ -613,6 +663,8 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  /** Exact OpenCode executable bytes bound when this session was created. */
+  openCodeArtifactDigest?: `sha256:${string}` | null
   toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null

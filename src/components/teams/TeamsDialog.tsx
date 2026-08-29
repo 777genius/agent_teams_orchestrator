@@ -11,6 +11,7 @@ import { Box, Text, useInput } from '../../ink.js';
 import { useKeybindings } from '../../keybindings/useKeybinding.js';
 import { useShortcutDisplay } from '../../keybindings/useShortcutDisplay.js';
 import { type AppState, useAppState, useSetAppState } from '../../state/AppState.js';
+import { isInProcessTeammateTask } from '../../tasks/InProcessTeammateTask/types.js';
 import { getEmptyToolPermissionContext } from '../../Tool.js';
 import { AGENT_COLOR_TO_THEME_COLOR } from '../../tools/AgentTool/agentColorManager.js';
 import { logForDebugging } from '../../utils/debug.js';
@@ -24,9 +25,11 @@ import { ensureBackendsRegistered, getBackendByType, getCachedBackend } from '..
 import { isPaneBackend, type BackendType } from '../../utils/swarm/backends/types.js';
 import { getSwarmSocketName, TMUX_COMMAND } from '../../utils/swarm/constants.js';
 import { killProcessBackendRuntime } from '../../utils/swarm/processBackend.js';
-import { addHiddenPaneId, removeHiddenPaneId, removeMemberFromTeam, setMemberMode, setMultipleMemberModes } from '../../utils/swarm/teamHelpers.js';
+import { killInProcessTeammate } from '../../utils/swarm/spawnInProcess.js';
+import { addHiddenPaneId, removeHiddenPaneId, removeTeammateFromTeamFileIfIdentityMatches, setMemberMode, setMultipleMemberModes } from '../../utils/swarm/teamHelpers.js';
 import { listTasks, type Task, unassignTeammateTasks } from '../../utils/tasks.js';
 import { getTeammateStatuses, type TeammateStatus, type TeamSummary } from '../../utils/teamDiscovery.js';
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from '../../utils/teammateTermination.js';
 import { createModeSetRequestMessage, sendShutdownRequestToMailbox, writeToMailbox } from '../../utils/teammateMailbox.js';
 import { Dialog } from '../design-system/Dialog.js';
 import ThemedText from '../design-system/ThemedText.js';
@@ -51,7 +54,7 @@ export function TeamsDialog({
   onDone
 }: Props): React.ReactNode {
   // Register as overlay so CancelRequestHandler doesn't intercept escape
-  useRegisterOverlay('teams-dialog');
+  useRegisterOverlay('teams-dialog', true);
 
   // initialTeams is derived from teamContext in PromptInput (no filesystem I/O)
   const setAppState = useSetAppState();
@@ -151,14 +154,16 @@ export function TeamsDialog({
     // Handle 'k' to kill teammate
     if (input === 'k') {
       if (dialogLevel.type === 'teammateList' && teammateStatuses[selectedIndex]) {
-        void killTeammate(teammateStatuses[selectedIndex].tmuxPaneId, teammateStatuses[selectedIndex].backendType, dialogLevel.teamName, teammateStatuses[selectedIndex].agentId, teammateStatuses[selectedIndex].name, setAppState).then(() => {
+        void killTeammate(teammateStatuses[selectedIndex], dialogLevel.teamName, setAppState).then(removed => {
+          if (!removed) return;
           setRefreshKey(k => k + 1);
           // Adjust selection if needed
           setSelectedIndex(prev => Math.max(0, Math.min(prev, teammateStatuses.length - 2)));
         });
       } else if (dialogLevel.type === 'teammateDetail' && currentTeammate) {
-        void killTeammate(currentTeammate.tmuxPaneId, currentTeammate.backendType, dialogLevel.teamName, currentTeammate.agentId, currentTeammate.name, setAppState);
-        goBackToList();
+        void killTeammate(currentTeammate, dialogLevel.teamName, setAppState).then(removed => {
+          if (removed) goBackToList();
+        });
       }
       return;
     }
@@ -209,9 +214,11 @@ export function TeamsDialog({
     if (input === 'p' && dialogLevel.type === 'teammateList') {
       const idleTeammates = teammateStatuses.filter(t => t.status === 'idle');
       if (idleTeammates.length > 0) {
-        void Promise.all(idleTeammates.map(t => killTeammate(t.tmuxPaneId, t.backendType, dialogLevel.teamName, t.agentId, t.name, setAppState))).then(() => {
+        void Promise.all(idleTeammates.map(t => killTeammate(t, dialogLevel.teamName, setAppState))).then(results => {
+          const removedCount = results.filter(Boolean).length;
+          if (removedCount === 0) return;
           setRefreshKey(k => k + 1);
-          setSelectedIndex(prev => Math.max(0, Math.min(prev, teammateStatuses.length - idleTeammates.length - 1)));
+          setSelectedIndex(prev => Math.max(0, Math.min(prev, teammateStatuses.length - removedCount - 1)));
         });
       }
       return;
@@ -545,19 +552,83 @@ function _temp2(task_0) {
 function _temp(prev) {
   return !prev;
 }
-async function killTeammate(paneId: string, backendType: BackendType | undefined, teamName: string, teammateId: string, teammateName: string, setAppState: (f: (prev: AppState) => AppState) => void): Promise<void> {
+type KillTeammateDependencies = {
+  killProcessRuntime: typeof killProcessBackendRuntime;
+  removeMember: typeof removeTeammateFromTeamFileIfIdentityMatches;
+  unassignTasks: typeof unassignTeammateTasks;
+  killInProcess: typeof killInProcessTeammate;
+};
+
+async function reportTeammateTerminationFailure(teammate: TeammateStatus, teamName: string, setAppState: (f: (prev: AppState) => AppState) => void, detail: string): Promise<void> {
+  await persistTeammateTerminationRecovery(teamName, teammate.agentId, {
+    teammateName: teammate.name,
+    paneId: teammate.tmuxPaneId,
+    processStartedAtMs: teammate.processStartedAtMs,
+    processOsIdentity: teammate.processOsIdentity,
+    processOwnerToken: teammate.processOwnerToken,
+    processRunId: teammate.processRunId,
+    spawnClaimToken: teammate.spawnClaimToken,
+    spawnClaimRunId: teammate.spawnClaimRunId,
+    detail
+  });
+  setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+    teammateName: teammate.name,
+    paneId: teammate.tmuxPaneId,
+    processStartedAtMs: teammate.processStartedAtMs,
+    processOsIdentity: teammate.processOsIdentity,
+    processOwnerToken: teammate.processOwnerToken,
+    processRunId: teammate.processRunId,
+    spawnClaimToken: teammate.spawnClaimToken,
+    spawnClaimRunId: teammate.spawnClaimRunId,
+    detail
+  }));
+}
+
+export async function killTeammate(teammate: TeammateStatus, teamName: string, setAppState: (f: (prev: AppState) => AppState) => void, dependencies: KillTeammateDependencies = {
+  killProcessRuntime: killProcessBackendRuntime,
+  removeMember: removeTeammateFromTeamFileIfIdentityMatches,
+  unassignTasks: unassignTeammateTasks,
+  killInProcess: killInProcessTeammate
+}): Promise<boolean> {
+  const { tmuxPaneId: paneId, backendType, agentId: teammateId, name: teammateName } = teammate;
   // Kill the pane using the backend that created it (handles -s / -L flags correctly).
-  // Wrapped in try/catch so cleanup (removeMemberFromTeam, unassignTeammateTasks,
-  // setAppState) always runs - matches useInboxPoller.ts error isolation.
-  if (backendType === 'process' || paneId.trim().startsWith('process:')) {
+  // Recovery state is removed only after the runtime termination is confirmed.
+  if (backendType === 'in-process' || paneId.trim() === 'in-process') {
+    let taskId: string | undefined;
+    setAppState(prev => {
+      const task = Object.values(prev.tasks).find(candidate =>
+        isInProcessTeammateTask(candidate) &&
+        candidate.status === 'running' &&
+        candidate.identity.agentId === teammateId,
+      );
+      taskId = isInProcessTeammateTask(task) ? task.id : undefined;
+      return prev;
+    });
+    if (!taskId || !await dependencies.killInProcess(taskId, setAppState)) {
+      await reportTeammateTerminationFailure(teammate, teamName, setAppState, 'In-process termination was not confirmed.');
+      return false;
+    }
+    // killInProcessTeammate owns roster/task/AppState cleanup.
+    return true;
+  } else if (backendType === 'process' || paneId.trim().startsWith('process:')) {
     try {
-      const killed = await killProcessBackendRuntime(paneId, {
+      const killed = await dependencies.killProcessRuntime(paneId, {
         expectedAgentId: teammateId,
         teamName,
+        expectedStartedAtMs: teammate.processStartedAtMs,
+        expectedOsIdentity: teammate.processOsIdentity,
+        expectedOwnerToken: teammate.processOwnerToken,
+        expectedRunId: teammate.processRunId,
       });
       logForDebugging(`[TeamsDialog] Killed process runtime ${paneId}: ${killed}`);
+      if (!killed) {
+        await reportTeammateTerminationFailure(teammate, teamName, setAppState, 'Exact process termination was not confirmed.');
+        return false;
+      }
     } catch (error) {
       logForDebugging(`[TeamsDialog] Failed to kill process runtime ${paneId}: ${error}`);
+      await reportTeammateTerminationFailure(teammate, teamName, setAppState, String(error));
+      return false;
     }
   } else if (backendType && isPaneBackend(backendType)) {
     try {
@@ -565,21 +636,38 @@ async function killTeammate(paneId: string, backendType: BackendType | undefined
       // be a teammate that never ran detection, but we only need class imports
       // here, not subprocess probes that could throw in a different environment.
       await ensureBackendsRegistered();
-      await getBackendByType(backendType).killPane(paneId, !isInsideTmuxSync());
+      const killed = await getBackendByType(backendType).killPane(paneId, !isInsideTmuxSync());
+      if (!killed) {
+        await reportTeammateTerminationFailure(teammate, teamName, setAppState, 'Pane termination was not confirmed.');
+        return false;
+      }
     } catch (error) {
       logForDebugging(`[TeamsDialog] Failed to kill pane ${paneId}: ${error}`);
+      await reportTeammateTerminationFailure(teammate, teamName, setAppState, String(error));
+      return false;
     }
   } else {
     // backendType undefined: old team files predating this field, or in-process.
     // Old tmux-file case is a migration gap — the pane is orphaned. In-process
     // teammates have no pane to kill, so this is correct for them.
-    logForDebugging(`[TeamsDialog] Skipping pane kill for ${paneId}: no backendType recorded`);
+    await reportTeammateTerminationFailure(teammate, teamName, setAppState, 'Runtime type is unavailable; termination cannot be confirmed.');
+    return false;
   }
   // Remove from team config file, but never let a lock/write issue abort the
   // rest of teammate teardown. Task unassignment and leader notification must
   // still happen even if persisted roster cleanup is temporarily unavailable.
   try {
-    await removeMemberFromTeam(teamName, paneId);
+    const removed = await dependencies.removeMember(teamName, {
+      agentId: teammateId,
+      paneId,
+      processStartedAtMs: teammate.processStartedAtMs,
+      processOsIdentity: teammate.processOsIdentity,
+      processOwnerToken: teammate.processOwnerToken,
+      processRunId: teammate.processRunId,
+      spawnClaimToken: teammate.spawnClaimToken,
+      spawnClaimRunId: teammate.spawnClaimRunId,
+    });
+    if (!removed) return false;
   } catch (error) {
     logForDebugging(`[TeamsDialog] Failed to remove teammate ${teammateId} from team file: ${error}`);
   }
@@ -587,7 +675,7 @@ async function killTeammate(paneId: string, backendType: BackendType | undefined
   // Unassign tasks and build notification message
   const {
     notificationMessage
-  } = await unassignTeammateTasks(teamName, teammateId, teammateName, 'terminated');
+  } = await dependencies.unassignTasks(teamName, teammateId, teammateName, 'terminated');
 
   // Update AppState to keep status line in sync and notify the lead
   setAppState(prev => {
@@ -618,6 +706,7 @@ async function killTeammate(paneId: string, backendType: BackendType | undefined
     };
   });
   logForDebugging(`[TeamsDialog] Removed ${teammateId} from teamContext`);
+  return true;
 }
 async function viewTeammateOutput(paneId: string, backendType: BackendType | undefined): Promise<void> {
   const trimmedPaneId = paneId.trim();
