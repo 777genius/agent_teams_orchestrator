@@ -25,7 +25,7 @@ describe('issue #443 strict launch fake E2E', () => {
     await persistent.close()
   })
 
-  test('fresh one-shot handlers recover a known cancelled create and only recreate missing member two', async () => {
+  test('fresh second one-shot invocation resumes the exact known session-two-2 after cancellation', async () => {
     const failed = await persistent.invokeOneShot({ cancelAfterKnownCreate: 'two' })
     expect(failed).toMatchObject({ status: 'stopped', committedMemberIds: ['one'] })
 
@@ -47,13 +47,13 @@ describe('issue #443 strict launch fake E2E', () => {
     expect(evidence.creates).toEqual([
       { managerId: 1, member: 'one', sessionId: 'session-one-1' },
       { managerId: 1, member: 'two', sessionId: 'session-two-2' },
-      { managerId: 2, member: 'two', sessionId: 'session-two-3' },
     ])
     const sessions = await persistent.sessions()
     expect(sessions.map(record => [record.memberName, record.opencodeSessionId]).sort()).toEqual([
       ['one', 'session-one-1'],
-      ['two', 'session-two-3'],
+      ['two', 'session-two-2'],
     ])
+    expect(evidence.creates.some(create => create.sessionId === 'session-two-3')).toBe(false)
   })
 
   test('one retained host carries App MCP, exact proof, profile identity, and committed members', async () => {

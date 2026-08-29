@@ -191,7 +191,7 @@ class PersistentLaunchManager implements StrictLaunchPorts<string, string, Proje
         expectedBehaviorFingerprint: behaviorFingerprint,
         expectedBootstrapForSession: sessionId => bootstrap(member.memberId, sessionId),
       })
-      if (!materialized.created) {
+      if (!materialized.created && !materialized.resumeBootstrap) {
         return { kind: 'unknown', error: 'incomplete committed session replayed during materialization' }
       }
       const record = completeRecord(materialized.record, member.memberId)
