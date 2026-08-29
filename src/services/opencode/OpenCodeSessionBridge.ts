@@ -197,6 +197,55 @@ function profileScopeMetadataMatches(
   )
 }
 
+export type OpenCodeStrictSessionCompatibility = {
+  teamId: string
+  laneId: string
+  memberName: string
+  selectedModel: string
+  selectedVariant?: string
+  host: OpenCodeHostHandle
+  toolApprovalMode: OpenCodeToolApprovalMode
+  expectedBehaviorFingerprint: string
+  bootstrap: {
+    messageID: string
+    contextHash: string
+    briefingHash: string
+    agent: string
+  }
+}
+
+export function isOpenCodeStrictSessionCompatible(
+  record: OpenCodeSessionRecord,
+  expected: OpenCodeStrictSessionCompatibility,
+): boolean {
+  const bootstrap = record.appManagedBootstrap
+  return !record.staleReason
+    && record.teamId === expected.teamId
+    && record.laneId === expected.laneId
+    && record.memberName === expected.memberName
+    && record.hostKey === expected.host.hostKey
+    && record.projectPath === expected.host.projectPath
+    && record.profileRootKey === expected.host.profileRootKey
+    && ((!record.profileScope && !expected.host.profile.profileScope)
+      || profileScopeMetadataMatches(record.profileScope, expected.host.profile.profileScope))
+    && record.toolApprovalMode === expected.toolApprovalMode
+    && record.selectedModel === expected.selectedModel
+    && (record.selectedVariant?.trim() || undefined) === (expected.selectedVariant?.trim() || undefined)
+    && record.resolvedBehaviorFingerprint === expected.host.resolvedConfigFingerprint
+    && record.projectBehaviorFingerprint === expected.host.projectBehaviorFingerprint
+    && record.managedConfigFingerprint === expected.host.profile.managedConfigFingerprint
+    && record.sourceAuthFingerprint === expected.host.profile.sourceAuthFingerprint
+    && record.managedAuthFingerprint === expected.host.profile.managedAuthFingerprint
+    && record.expectedBehaviorFingerprint === expected.expectedBehaviorFingerprint
+    && record.bootstrapMode === 'app_managed_context'
+    && record.bootstrapEvidenceSource === 'app_managed_bootstrap'
+    && bootstrap?.messageID === expected.bootstrap.messageID
+    && bootstrap.contextHash === expected.bootstrap.contextHash
+    && bootstrap.briefingHash === expected.bootstrap.briefingHash
+    && bootstrap.model === expected.selectedModel
+    && bootstrap.agent === expected.bootstrap.agent
+}
+
 function inferToolApprovalModeFromPreparedProfile(
   profile: OpenCodePreparedProfile,
 ): OpenCodeToolApprovalMode {
@@ -942,17 +991,25 @@ export class OpenCodeSessionBridge {
     remainingMs: () => number
     toolApprovalMode?: OpenCodeToolApprovalMode
     expectedBehaviorFingerprint: string
+    expectedBootstrapForSession: (
+      sessionId: string,
+    ) => OpenCodeStrictSessionCompatibility['bootstrap']
   }): Promise<{ record: OpenCodeSessionRecord; created: boolean }> {
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     const existing = await this.sessionStore.get(params.teamId, params.laneId, params.memberName)
     if (existing) {
-      if (
-        existing.hostKey !== params.host.hostKey
-        || existing.selectedModel !== params.selectedModel
-        || existing.projectBehaviorFingerprint !== params.host.projectBehaviorFingerprint
-        || existing.managedAuthFingerprint !== params.host.profile.managedAuthFingerprint
-        || existing.expectedBehaviorFingerprint !== params.expectedBehaviorFingerprint
-      ) {
+      const selectedVariant = params.selectedVariant?.trim() || undefined
+      if (!isOpenCodeStrictSessionCompatible(existing, {
+        teamId: params.teamId,
+        laneId: params.laneId,
+        memberName: params.memberName,
+        selectedModel: params.selectedModel,
+        selectedVariant,
+        host: params.host,
+        toolApprovalMode: params.toolApprovalMode ?? 'auto',
+        expectedBehaviorFingerprint: params.expectedBehaviorFingerprint,
+        bootstrap: params.expectedBootstrapForSession(existing.opencodeSessionId),
+      })) {
         throw new Error('OpenCode committed session identity does not match strict launch')
       }
       return { record: existing, created: false }

@@ -2603,6 +2603,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
           memberName: input.memberName,
           selectedModel: input.selectedModel,
           hostKey: input.host.hostKey,
+          profileScope: input.host.profile.profileScope ?? null,
+          toolApprovalMode: input.toolApprovalMode ?? 'auto',
+          resolvedBehaviorFingerprint: input.host.resolvedConfigFingerprint,
+          projectBehaviorFingerprint: input.host.projectBehaviorFingerprint,
+          managedConfigFingerprint: input.host.profile.managedConfigFingerprint,
+          expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
           opencodeSessionId: `session-${input.memberName}`,
         }),
       }
@@ -2658,6 +2664,46 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(second.ok).toBe(true)
     expect(Object.keys(second.data.members)).toEqual(['alice', 'bob'])
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
+  })
+
+  test('strict launch keeps a compatible materialization race non-owned and untouched', async () => {
+    const calls = { readiness: 0, injection: 0, writes: 0, cleanup: 0 }
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot, host: snapshot.host, release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
+    openCodeSessionStore.upsert = (async () => { calls.writes += 1; return 'updated' }) as typeof openCodeSessionStore.upsert
+    openCodeSessionStore.markStale = (async () => { calls.cleanup += 1; return null }) as typeof openCodeSessionStore.markStale
+    openCodeSessionStore.delete = (async () => { calls.cleanup += 1 }) as typeof openCodeSessionStore.delete
+    openCodeSessionBridge.releaseSession = (async () => { calls.cleanup += 1 }) as typeof openCodeSessionBridge.releaseSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async () => { calls.readiness += 1; throw new Error('must not mutate') }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.injectAppManagedBootstrapContext = (async () => { calls.injection += 1; throw new Error('must not reinject') }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+    openCodeSessionBridge.materializeSessionOnHost = (async input => {
+      const bootstrap = input.expectedBootstrapForSession('session-existing')
+      return {
+        created: false,
+        record: buildRecord({
+          laneId: input.laneId, memberName: input.memberName,
+          selectedModel: input.selectedModel, selectedVariant: input.selectedVariant,
+          opencodeSessionId: 'session-existing', expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+          bootstrapMode: 'app_managed_context', bootstrapEvidenceSource: 'app_managed_bootstrap',
+          appManagedBootstrap: {
+            schemaVersion: 1, ...bootstrap, injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+            model: input.selectedModel,
+          },
+        }),
+      }
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+      runId: 'run-raced-commit', laneId: 'primary', teamId: 'team-a',
+      projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free',
+      members: [{ name: 'alice', prompt: 'Alice join' }],
+    }))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('materialization race must not be reported committed')
+    expect(result.error.message).toContain('appeared during materialization')
+    expect(calls).toEqual({ readiness: 0, injection: 0, writes: 0, cleanup: 0 })
   })
 
   test('strict launch rejects missing or malformed behavior digests before host or member effects', async () => {

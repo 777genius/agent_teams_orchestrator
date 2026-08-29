@@ -9,7 +9,7 @@ import {
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
-import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
@@ -147,6 +147,54 @@ describe('OpenCodeSessionBridge', () => {
     else process.env.HOME = originalHome
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
     else process.env.XDG_DATA_HOME = originalXdgDataHome
+  })
+
+  test('strict compatibility rejects stale, different-effort, behavior, bootstrap, and member identities', () => {
+    const bootstrap = {
+      schemaVersion: 1 as const,
+      messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing',
+      injectionVerifiedAt: '2026-04-21T00:00:00.000Z',
+      model: 'openai/gpt-5.4-mini', agent: 'teammate',
+    }
+    const compatible = buildRecord({
+      selectedVariant: 'high',
+      profileScope: profile.profileScope,
+      toolApprovalMode: 'auto',
+      resolvedBehaviorFingerprint: host.resolvedConfigFingerprint,
+      managedConfigFingerprint: profile.managedConfigFingerprint,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      bootstrapMode: 'app_managed_context',
+      bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: bootstrap,
+    })
+    const expected = {
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', selectedVariant: 'high', host,
+      toolApprovalMode: 'auto' as const, expectedBehaviorFingerprint: 'a'.repeat(64),
+      bootstrap: {
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      },
+    }
+    expect(isOpenCodeStrictSessionCompatible(compatible, expected)).toBe(true)
+
+    const incompatible: Array<Partial<OpenCodeSessionRecord>> = [
+      { staleReason: 'old_attempt' },
+      { teamId: 'other-team' }, { laneId: 'other-lane' }, { memberName: 'bob' },
+      { selectedModel: 'openai/other' }, { selectedVariant: 'low' },
+      { hostKey: 'other-host' }, { resolvedBehaviorFingerprint: 'other-resolved' },
+      { projectBehaviorFingerprint: 'other-behavior' },
+      { managedConfigFingerprint: 'other-config' },
+      { sourceAuthFingerprint: 'other-source-auth' }, { managedAuthFingerprint: 'other-auth' },
+      { expectedBehaviorFingerprint: 'b'.repeat(64) },
+      { bootstrapMode: undefined }, { bootstrapEvidenceSource: undefined },
+      { appManagedBootstrap: { ...bootstrap, messageID: 'msg_other' } },
+      { appManagedBootstrap: { ...bootstrap, contextHash: 'other-context' } },
+      { appManagedBootstrap: { ...bootstrap, briefingHash: 'other-briefing' } },
+      { appManagedBootstrap: { ...bootstrap, agent: 'other-agent' } },
+    ]
+    for (const mismatch of incompatible) {
+      expect(isOpenCodeStrictSessionCompatible({ ...compatible, ...mismatch }, expected)).toBe(false)
+    }
   })
 
   test('reuses an existing clean session record', async () => {
@@ -762,6 +810,7 @@ describe('OpenCodeSessionBridge', () => {
       selectedModel: 'openai/gpt-5.4-mini',
       runId: 'run-1',
       expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate' }),
       host,
       signal: controller.signal,
       remainingMs: () => 1_000,
@@ -799,6 +848,7 @@ describe('OpenCodeSessionBridge', () => {
       selectedModel: 'openai/gpt-5.4-mini',
       runId: 'run-1',
       expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate' }),
       host,
       signal: controller.signal,
       remainingMs: () => 1_000,
@@ -836,6 +886,7 @@ describe('OpenCodeSessionBridge', () => {
       selectedModel: 'openai/gpt-5.4-mini',
       runId: 'run-1',
       expectedBehaviorFingerprint: digest,
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate' }),
       host,
       signal: controller.signal,
       remainingMs: () => 1_000,

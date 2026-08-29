@@ -55,7 +55,10 @@ import {
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
-import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import {
+  isOpenCodeStrictSessionCompatible,
+  openCodeSessionBridge,
+} from './OpenCodeSessionBridge.js'
 import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
@@ -3130,6 +3133,43 @@ async function runLaunch(
 
   const resources = new Map<string, OpenCodeSessionRecord>()
   const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  const strictSessionCompatibility = (
+    sessionId: string,
+    input: NonNullable<ReturnType<typeof memberInputs.get>>,
+  ) => {
+    const contextText = buildOpenCodeAppManagedBootstrapContextText({
+      teamName: teamId,
+      memberName: input.name,
+      runId,
+      laneId,
+      runtimeSessionId: sessionId,
+      prompt: input.prompt,
+    })
+    const contextHash = hashText(contextText)
+    return {
+      teamId,
+      laneId,
+      memberName: input.name,
+      selectedModel: apiSelectedModel,
+      selectedVariant: input.selectedVariant,
+      host,
+      toolApprovalMode,
+      expectedBehaviorFingerprint,
+      bootstrap: {
+        messageID: buildOpenCodeAppManagedBootstrapMessageID({
+          teamName: teamId,
+          memberName: input.name,
+          runId,
+          laneId,
+          runtimeSessionId: sessionId,
+          contextHash,
+        }),
+        contextHash,
+        briefingHash: input.fingerprint,
+        agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+      },
+    }
+  }
   let requiredMcpContractConfigIdentity: string | null = null
   const matchesCurrentExpectedBehavior = async (): Promise<boolean> => {
     return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
@@ -3239,16 +3279,12 @@ async function runLaunch(
       }
       const input = memberInputs.get(member.memberId)!
       const record = await openCodeSessionStore.get(teamId, laneId, input.name)
-      const bootstrap = record?.appManagedBootstrap
       if (
         !record
-        || record.staleReason
-        || record.selectedModel !== apiSelectedModel
-        || record.expectedBehaviorFingerprint !== expectedBehaviorFingerprint
-        || record.selectedVariant !== input.selectedVariant
-        || record.bootstrapMode !== 'app_managed_context'
-        || record.bootstrapEvidenceSource !== 'app_managed_bootstrap'
-        || bootstrap?.briefingHash !== input.fingerprint
+        || !isOpenCodeStrictSessionCompatible(
+          record,
+          strictSessionCompatibility(record.opencodeSessionId, input),
+        )
       ) return { kind: 'ok', value: null }
       return {
         kind: 'ok',
@@ -3287,8 +3323,16 @@ async function runLaunch(
           remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
           toolApprovalMode,
           expectedBehaviorFingerprint,
+          expectedBootstrapForSession: sessionId =>
+            strictSessionCompatibility(sessionId, input).bootstrap,
         })
         record = materialized.record
+        if (!materialized.created) {
+          return {
+            kind: 'unknown',
+            error: 'OpenCode compatible committed session appeared during materialization',
+          }
+        }
         resources.set(record.opencodeSessionId, record)
         const sessionMcp = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
           attachIfMissing: false,
