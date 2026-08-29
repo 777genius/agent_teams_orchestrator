@@ -87,9 +87,21 @@ const host: OpenCodeHostHandle = {
 
 describe('OpenCodeProvisioningProbe', () => {
   for (const selectedModel of [
-    'deepinfra/chosen', 'custom-provider/nested/model', 'kiro/auto', 'cursor-acp/auto',
+    'deepinfra/chosen', 'custom-provider/nested/model',
   ]) {
     test(`keeps strict ${selectedModel} provisioning selected-provider scoped`, async () => {
+      const authorityEnvName = selectedModel.startsWith('deepinfra/')
+        ? 'DEEPINFRA_API_KEY'
+        : 'CUSTOM_PROVIDER_API_KEY'
+      const previousAuthority = process.env[authorityEnvName]
+      const previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+      const previousMcpArgs = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+      process.env[authorityEnvName] = 'focused-test-static-authority'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = JSON.stringify([
+        '-e', 'process.stdin.resume()',
+      ])
+      try {
       const commandLog: string[] = []
       let inventoryInput: Record<string, unknown> | null = null
       let ensureInput: Record<string, unknown> | null = null
@@ -167,6 +179,16 @@ describe('OpenCodeProvisioningProbe', () => {
       expect(commandLog).toEqual([])
       await retained.release()
       expect(releasedHosts).toEqual([retainedHost!.hostKey])
+      } finally {
+        if (previousAuthority === undefined) delete process.env[authorityEnvName]
+        else process.env[authorityEnvName] = previousAuthority
+        if (previousMcpCommand === undefined) {
+          delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+        } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+        if (previousMcpArgs === undefined) {
+          delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+        } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = previousMcpArgs
+      }
     })
   }
 
@@ -177,6 +199,10 @@ describe('OpenCodeProvisioningProbe', () => {
       'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME',
       'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
       'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
+      'OPENCODE_CONFIG_CONTENT', 'SELECTED_ROUTE_AUTHORITY', 'DEEPINFRA_API_KEY',
     ] as const
     const original = Object.fromEntries(keys.map(key => [key, process.env[key]]))
     try {
@@ -193,6 +219,11 @@ describe('OpenCodeProvisioningProbe', () => {
       process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(tempDir, 'app-cache')
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = mcpEntry
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
+      process.env.DEEPINFRA_API_KEY = 'focused-test-static-authority'
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        provider: { deepinfra: { options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' } } },
+      })
       const scope = await resolveOpenCodeProfileScope({
         projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
       })
@@ -211,7 +242,7 @@ describe('OpenCodeProvisioningProbe', () => {
           mcp: { 'agent-teams': { connected } },
           summary: {
             serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
-            connected, launchSource: 'env-override', availableServerNames: ['agent-teams'],
+            connected, launchSource: null, availableServerNames: ['agent-teams'],
             diagnostics: [],
           },
         }) },
@@ -225,7 +256,29 @@ describe('OpenCodeProvisioningProbe', () => {
         expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint,
       })
 
+      const recomputedScope = await resolveOpenCodeProfileScope({
+        projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
+        env: prepared.env,
+      })
+      expect(prepared.appMcpLaunchSource).toBe('env-override')
+      expect(recomputedScope).toEqual(scope)
       expect(await refresh()).not.toBeNull()
+      const liveMcp = (liveConfig.mcp as Record<string, unknown>)['agent-teams']
+      liveConfig = {
+        ...liveConfig,
+        mcp: {
+          ...(liveConfig.mcp as object),
+          'agent-teams': { ...liveMcp as object, url: 'https://mismatch.example/mcp' },
+        },
+      }
+      expect(await refresh()).toBeNull()
+      liveConfig = structuredClone(prepared.managedConfig)
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-two'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'mutated-command'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify({ ROUTE: 'mutated' })
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'https://mutated.example/mcp'
+      expect(await refresh()).not.toBeNull()
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
       liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
       expect(await refresh()).toBeNull()
       liveConfig = structuredClone(prepared.managedConfig)

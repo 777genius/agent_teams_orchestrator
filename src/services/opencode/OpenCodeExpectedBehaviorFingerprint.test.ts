@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import {
   buildOpenCodeExpectedBehaviorEvidence,
   computeOpenCodeExpectedBehaviorFingerprint,
+  OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
   validateOpenCodeExpectedBehaviorEvidence,
 } from './OpenCodeExpectedBehaviorFingerprint.js'
 
@@ -100,6 +101,30 @@ describe('OpenCode expected behavior fingerprint v2', () => {
     const second = await build({ metadata: { a: 2, z: 1 }, key: 'top-secret', type: 'api' })
     expect(first).toEqual(second)
     expect(JSON.stringify(first)).not.toContain('top-secret')
+  })
+
+  test('folds scoped authority-source rotation into the opaque auth component without v2 drift', async () => {
+    const build = (authoritySourceFingerprint: string) => buildOpenCodeExpectedBehaviorEvidence({
+      profile: {
+        ...profile(),
+        profileScope: {
+          purpose: 'launch_runtime', providerId: 'deepinfra',
+          configFingerprint: 'e'.repeat(64), selectedAuthIdentity: 'absent',
+          scopeToken: 'f'.repeat(64),
+        },
+        authoritySourceFingerprint,
+      },
+      fullModelId: 'deepinfra/model',
+      effectiveConfigFingerprint: 'd'.repeat(64),
+      readCredential: async () => null,
+    })
+    const first = await build('1'.repeat(64))
+    const rotated = await build('2'.repeat(64))
+    expect(rotated.effectiveSelectedAuthFingerprint)
+      .not.toBe(first.effectiveSelectedAuthFingerprint)
+    expect(rotated.expectedBehaviorFingerprint).not.toBe(first.expectedBehaviorFingerprint)
+    expect(OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION).toBe(2)
+    expect(Object.keys(rotated).sort()).toEqual(Object.keys(first).sort())
   })
 
   test('auth read errors and unavailable live config fail closed', async () => {

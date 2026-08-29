@@ -140,10 +140,10 @@ export class OpenCodeProvisioningProbe {
           baseUrl: input.host.baseUrl, attachIfMissing: false,
           requestContext,
         }),
-        collectProjectBehaviorMetadata(profile.canonicalProjectPath, process.env),
+        collectProjectBehaviorMetadata(profile.canonicalProjectPath, profile.env),
         resolveOpenCodeProfileScope({
           projectPath: profile.canonicalProjectPath, purpose: 'launch_runtime',
-          selectedModel: selected.raw, env: process.env,
+          selectedModel: selected.raw, env: profile.env,
         }),
       ])
       input.phaseContext?.throwIfExpired()
@@ -157,6 +157,7 @@ export class OpenCodeProvisioningProbe {
         || identity(liveMcp) !== identity(preparedMcp)
         || (input.contractConfigIdentity && identity(liveMcp) !== input.contractConfigIdentity)
         || selectedConfigIdentity(live) !== selectedConfigIdentity(profile.managedConfig)
+        || scope.scopeToken !== profile.profileScope.scopeToken
         || scope.configFingerprint !== profile.profileScope.configFingerprint
         || scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity) return null
       const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }

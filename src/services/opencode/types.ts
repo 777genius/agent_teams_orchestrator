@@ -41,6 +41,7 @@ export type OpenCodePreparedProfile = {
   profileRootKey: string
   profileRootPath: string
   profileScope?: OpenCodeProfileScope | null
+  appMcpLaunchSource?: OpenCodeAppMcpLaunchSource | null
   projectDefaultModelId?: string | null
   allProjectsDefaultModelId?: string | null
   importedConfigDefaultModelId?: string | null
@@ -62,6 +63,7 @@ export type OpenCodePreparedProfile = {
   managedAuthFingerprint: string | null
   selectedSourceAuthIdentity?: 'absent' | 'error' | `known:${string}`
   selectedManagedAuthIdentity?: 'absent' | 'error' | `known:${string}`
+  authoritySourceFingerprint?: string | null
   authState: OpenCodeAuthState
   env: NodeJS.ProcessEnv
 }
