@@ -1354,7 +1354,9 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
     purpose: OpenCodeProfilePurpose
     providerId: string
     configFingerprint: string
+    selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
   }>
+  selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
 }>
 
 const openCodeProfileScopeKey = randomBytes(32)
@@ -1378,11 +1380,13 @@ function buildScopeIdentity(scope: OpenCodeProfileScope): {
   purpose: OpenCodeProfilePurpose
   providerId: string
   configFingerprint: string
+  selectedAuthIdentity: OpenCodeIdentityComponent
 } {
   return {
     purpose: scope.purpose,
     providerId: scope.providerId,
     configFingerprint: scope.configFingerprint,
+    selectedAuthIdentity: scope.selectedAuthIdentity,
   }
 }
 
@@ -1392,7 +1396,8 @@ function isolateCatalogRuntimeConfig(
 ): Record<string, unknown> {
   const selectedProvider = asRecord(config.provider)[providerId]
   const selectedManagedPlugins = planOpenCodeProfilePolicy({
-    purpose: 'catalog', providerId, configFingerprint: 'isolation', scopeToken: 'isolation',
+    purpose: 'catalog', providerId, configFingerprint: 'isolation',
+    selectedAuthIdentity: 'absent', scopeToken: 'isolation',
   }).managedSubscriptionPlugins
   const isolated: Record<string, unknown> = {}
   if (selectedProvider !== undefined) isolated.provider = { [providerId]: selectedProvider }
@@ -1463,11 +1468,22 @@ export async function resolveOpenCodeProfileScope(input: {
     plugin: effective.plugin ?? null,
   }, env)
   const configFingerprint = hashString(JSON.stringify(identity))
+  const paths = resolveClaudeMultimodelPaths()
+  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
+  const selectedAuth = await readSelectedAuthFromSources({
+    providerId,
+    sourcePaths: Array.from(new Set([
+      path.join(paths.data, 'opencode', 'auth.json'),
+      path.join(xdgDataHome, 'opencode', 'auth.json'),
+      path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+    ])),
+  })
   const scopeToken = keyedIdentity({
     projectPath,
     purpose: input.purpose,
     providerId,
     configFingerprint,
+    selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
     runtimeEnvironment: Object.keys(env).sort().map(key => [key, env[key] ?? null]),
   })
@@ -1475,6 +1491,7 @@ export async function resolveOpenCodeProfileScope(input: {
     purpose: input.purpose,
     providerId,
     configFingerprint,
+    selectedAuthIdentity: selectedAuth.identity,
     scopeToken,
   }
   if (!openCodeEffectiveConfigSnapshots.has(scopeToken)) {
@@ -1483,6 +1500,7 @@ export async function resolveOpenCodeProfileScope(input: {
       importedRuntimeConfig,
       runtimeEnv: { ...env },
       scopeIdentity: buildScopeIdentity(scope),
+      selectedAuthCredential: selectedAuth.credential,
     }))
   }
   return scope
@@ -1953,18 +1971,14 @@ export class OpenCodeProfileManager {
       sourceAuthSources,
     })
     let selectedSourceAuthIdentity: OpenCodeIdentityComponent | undefined
-    if (policy?.scope.purpose === 'catalog') {
-      const selected = await readSelectedAuthFromSources({
-        providerId: policy.scope.providerId,
-        sourcePaths: Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()])),
-      })
-      selectedSourceAuthIdentity = selected.identity
+    if (policy) {
+      selectedSourceAuthIdentity = configSnapshot!.scopeIdentity.selectedAuthIdentity
       await materializeOpenCodeSelectedAuthCredential({
         authPath: managedAuthPath,
         providerId: policy.scope.providerId,
-        credential: selected.credential,
+        credential: configSnapshot!.selectedAuthCredential,
       })
-    } else if (policy?.reconcileAuth !== false) {
+    } else {
       await reconcileOpenCodeManagedAuthStores({
         sourceAuthPaths: authSourcePaths,
         globalAuthPath,
@@ -1994,7 +2008,7 @@ export class OpenCodeProfileManager {
       ? await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
       : undefined
     const authState = await (async () => {
-      if (policy?.scope.purpose === 'catalog') {
+      if (policy) {
         return selectedSourceAuthIdentity === selectedManagedAuthIdentity ? 'ok' as const : 'stale' as const
       }
       if (!managedAuthFingerprint) {

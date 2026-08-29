@@ -423,6 +423,16 @@ export function buildOpenCodeHostSpawnOptions(
   }
 }
 
+export function buildOpenCodeHostProfileIdentity(
+  profile: OpenCodePreparedProfile,
+  binaryHostIdentity: string,
+): string {
+  const authIdentity = profile.profileScope?.selectedAuthIdentity
+    ?? profile.managedAuthFingerprint
+    ?? 'absent'
+  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+}
+
 function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {}
@@ -1445,7 +1455,7 @@ export class OpenCodeHostManager {
             params.abortSignal,
           )
         : 'missing-binary'
-      const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${profile.managedAuthFingerprint}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+      const baseHostKey = buildOpenCodeHostProfileIdentity(profile, binaryHostIdentity)
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
         : baseHostKey

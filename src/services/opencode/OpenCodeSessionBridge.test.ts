@@ -330,6 +330,7 @@ describe('OpenCodeSessionBridge', () => {
           purpose: 'launch_runtime',
           providerId: 'openai',
           configFingerprint: 'forged',
+          selectedAuthIdentity: 'absent',
           scopeToken: 'forged',
         },
         scopeToken: 'forged',
@@ -2149,6 +2150,45 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.reconcileOutcome).toBe('stale')
     expect(result.summary.staleReason).toBe('project_behavior_changed')
     expect(result.summary.messageCount).toBe(0)
+  })
+
+  test('resolves a fresh scope after restart and safely stales the old process identity', async () => {
+    const oldScope = {
+      ...profile.profileScope!,
+      selectedAuthIdentity: 'known:old-process-auth' as const,
+      scopeToken: 'old-process-opaque-token',
+    }
+    let preparedScope: OpenCodePrepareProfileOptions['profileScope']
+    const staleMarks: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        preparedScope = options?.profileScope
+        return {
+          ...profile,
+          profileScope: options?.profileScope,
+          scopeToken: options?.profileScope?.scopeToken ?? null,
+        }
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('stale restart must not start the old host') },
+        releaseHost: async () => {},
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'unchanged',
+        markStale: async (_teamId, _laneId, _memberName, reason) => {
+          staleMarks.push(reason)
+          return buildRecord({ profileScope: oldScope, staleReason: reason })
+        },
+      },
+      clientFactory: { create: () => { throw new Error('stale restart must not create a client') } },
+    })
+
+    const result = await bridge.reconcileSession(buildRecord({ profileScope: oldScope }))
+
+    expect(preparedScope?.scopeToken).not.toBe(oldScope.scopeToken)
+    expect(result.summary.reconcileOutcome).toBe('stale')
+    expect(staleMarks).toEqual(['profile_scope_changed'])
   })
 
   test('marks session stale when resolved runtime behavior changes unexpectedly', async () => {

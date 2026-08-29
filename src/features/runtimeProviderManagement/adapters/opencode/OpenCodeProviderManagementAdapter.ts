@@ -687,6 +687,22 @@ function redactDiagnostics(messages: readonly string[]): string[] {
   return messages.map(redactDiagnostic).filter(Boolean)
 }
 
+function redactCatalogDiagnostics(messages: readonly string[]): string[] {
+  return messages.map(message => {
+    const lower = message.toLowerCase()
+    if (lower.includes('timed out') || lower.includes('timeout')) {
+      return 'OpenCode catalog request timed out.'
+    }
+    if (/(?:auth|credential|api[-_ ]?key|token|secret|cookie)/i.test(message)) {
+      return 'OpenCode catalog authentication diagnostic redacted.'
+    }
+    if (/(?:https?:\/\/|endpoint|request|response|network|connect|fetch|http)/i.test(message)) {
+      return 'OpenCode catalog endpoint request failed.'
+    }
+    return 'OpenCode catalog diagnostic redacted.'
+  }).filter((message, index, all) => all.indexOf(message) === index)
+}
+
 function appendViewDiagnostics(
   view: ProviderManagementView,
   diagnostics: readonly string[],
@@ -3073,7 +3089,7 @@ export class OpenCodeProviderManagementAdapter
       config = input.expectedScope
         && (
           input.expectedScope.configFingerprint !== profileScope.configFingerprint
-          || input.expectedScope.scopeToken !== profileScope.scopeToken
+          || input.expectedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
         )
         ? { state: 'error' }
         : { state: 'known', value: profileScope.configFingerprint }
@@ -3082,6 +3098,7 @@ export class OpenCodeProviderManagementAdapter
         purpose: 'catalog',
         providerId: input.providerId,
         configFingerprint: 'identity-read-error',
+        selectedAuthIdentity: 'error',
         scopeToken: 'identity-read-error',
       }
       config = { state: 'error' }
@@ -3121,9 +3138,7 @@ export class OpenCodeProviderManagementAdapter
       providerId: input.providerId,
       binary,
       config,
-      scopeToken: config.state === 'known'
-        ? catalogIdentityComponent(profileScope.scopeToken)
-        : { state: 'error' } as CatalogIdentityComponent,
+      selectedAuth: catalogIdentityComponent(profileScope.selectedAuthIdentity),
       preferences,
       sourceAuth,
       managedSelectedAuth,
@@ -4096,14 +4111,14 @@ export class OpenCodeProviderManagementAdapter
         ]
         const sanitizedInventory = {
           ...inventory,
-          diagnostics: redactDiagnostics(inventory.diagnostics),
+          diagnostics: redactCatalogDiagnostics(inventory.diagnostics),
         }
         const entry: ProviderCatalogCacheEntry = {
           identity: identity.key,
           inventory: sanitizedInventory,
           configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
           providers: providersResult.ok ? providersResult.value : null,
-          diagnostics: redactDiagnostics(diagnostics),
+          diagnostics: redactCatalogDiagnostics(diagnostics),
           managedModelLimitOverrides:
             preferencesResult.ok && preferencesResult.value
               ? preferencesResult.value.modelLimitOverrides
@@ -4123,6 +4138,22 @@ export class OpenCodeProviderManagementAdapter
               `OpenCode provider ${providerId} was not found in the live catalog`,
             )
           }
+        }
+
+        const publishScope = await resolveOpenCodeProfileScope({
+          projectPath: input.projectPath ?? inventory.projectPath,
+          purpose: 'catalog',
+          selectedModel: `${providerId}/catalog`,
+        }).catch(() => null)
+        if (
+          !publishScope
+          || publishScope.configFingerprint !== profileScope.configFingerprint
+          || publishScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
+        ) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode catalog authentication changed while the response was in flight',
+          )
         }
 
         if (this.catalogGenerationByScope.get(scopeKey) !== generation) {
@@ -4173,10 +4204,9 @@ export class OpenCodeProviderManagementAdapter
             new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
           ])
           if (cleanupTimeout) clearTimeout(cleanupTimeout)
-          const cached = currentIdentity
-            && timeoutIdentity?.reusable
-            && timeoutIdentity.key === currentIdentity
-            ? this.catalogCache.get(currentIdentity)
+          const cached = timeoutIdentity?.reusable
+            && (!currentIdentity || timeoutIdentity.key === currentIdentity)
+            ? this.catalogCache.get(timeoutIdentity.key)
             : undefined
           resolve(cached
             ? {

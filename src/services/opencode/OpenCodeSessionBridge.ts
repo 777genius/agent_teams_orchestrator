@@ -26,6 +26,7 @@ import type {
   OpenCodeMessage,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeProfileScope,
   OpenCodeSessionRecord,
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionReconcileSummary,
@@ -179,6 +180,20 @@ function getRecordManagedConfigFingerprint(record: OpenCodeSessionRecord): strin
   return record.managedConfigFingerprint ?? extractManagedConfigFingerprintFromHostKey(record.hostKey)
 }
 
+function profileScopeMetadataMatches(
+  left: OpenCodeProfileScope | null | undefined,
+  right: OpenCodeProfileScope | null | undefined,
+): boolean {
+  return Boolean(
+    left
+    && right
+    && left.purpose === right.purpose
+    && left.providerId === right.providerId
+    && left.configFingerprint === right.configFingerprint
+    && left.selectedAuthIdentity === right.selectedAuthIdentity,
+  )
+}
+
 function inferToolApprovalModeFromPreparedProfile(
   profile: OpenCodePreparedProfile,
 ): OpenCodeToolApprovalMode {
@@ -308,7 +323,9 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     projectPath: string | null | undefined = record.projectPath,
   ): Promise<PreparedSessionProfile> {
-    const profileScope = record.profileScope ?? await resolveOpenCodeProfileScope({
+    // A stored scope token belongs to the process that created the record. Resolve
+    // a new snapshot before preparing so restart reconciliation never consumes it.
+    const profileScope = await resolveOpenCodeProfileScope({
         projectPath,
         purpose: 'launch_runtime',
         selectedModel: record.selectedModel,
@@ -350,7 +367,9 @@ export class OpenCodeSessionBridge {
             ? `managed_config_changed:${managedConfigFingerprint}->${profile.managedConfigFingerprint}`
             : profile.managedAuthFingerprint !== record.managedAuthFingerprint
               ? 'managed_auth_changed'
-              : null)
+              : !profileScopeMetadataMatches(record.profileScope, profile.profileScope)
+                ? 'profile_scope_changed'
+                : null)
   }
 
   private withSessionProfileMetadata(
@@ -369,7 +388,7 @@ export class OpenCodeSessionBridge {
     if (
       record.toolApprovalMode === sessionProfile.toolApprovalMode
       && record.managedConfigFingerprint === sessionProfile.profile.managedConfigFingerprint
-      && record.profileScope?.scopeToken === sessionProfile.profile.scopeToken
+      && profileScopeMetadataMatches(record.profileScope, sessionProfile.profile.profileScope)
     ) {
       return record
     }
@@ -815,7 +834,7 @@ export class OpenCodeSessionBridge {
       existing.projectPath === profile.projectPath &&
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
-      existing.profileScope?.scopeToken === profile.scopeToken &&
+      profileScopeMetadataMatches(existing.profileScope, profile.profileScope) &&
       (!existingManagedConfigFingerprint || existingManagedConfigFingerprint === profile.managedConfigFingerprint) &&
       params.fresh !== true &&
       !existing.staleReason
@@ -844,7 +863,7 @@ export class OpenCodeSessionBridge {
                 ? `managed_config_changed:${existingManagedConfigFingerprint}->${profile.managedConfigFingerprint}`
                 : existing.managedAuthFingerprint !== profile.managedAuthFingerprint
                   ? 'managed_auth_changed'
-                  : existing.profileScope?.scopeToken !== profile.scopeToken
+                  : !profileScopeMetadataMatches(existing.profileScope, profile.profileScope)
                     ? 'profile_scope_changed'
                     : existing.staleReason ?? 'session_refresh_required'
 

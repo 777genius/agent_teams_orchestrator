@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -7476,7 +7476,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       resolveSlow = resolve
     })
     const adapter = new OpenCodeProviderManagementAdapter({
-      catalogTimeoutMs: 50,
+      catalogTimeoutMs: 500,
       resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
@@ -7554,7 +7554,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let rejectionObserved = false
     let hostStarts = 0
     const adapter = new OpenCodeProviderManagementAdapter({
-      catalogTimeoutMs: 20,
+      catalogTimeoutMs: 500,
       inventoryTimeoutMs: 5_000,
       resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
       resolveBinaryIdentity: async () => 'binary-a',
@@ -7614,7 +7614,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       default: Record<string, string>
     }>(resolve => { resolveSlow = resolve })
     const adapter = new OpenCodeProviderManagementAdapter({
-      catalogTimeoutMs: 30,
+      catalogTimeoutMs: 500,
       resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
@@ -7772,5 +7772,151 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(timedOut.ok).toBe(false)
     if (!timedOut.ok) expect(timedOut.error.message).toContain('timed out')
+  })
+
+  test.each(['profile preparation', 'host startup'] as const)(
+    'reuses identity-proven stale catalog evidence during early %s timeout',
+    async stage => {
+      let blocked = false
+      const adapter = new OpenCodeProviderManagementAdapter({
+        catalogTimeoutMs: 500,
+        inventoryTimeoutMs: 5_000,
+        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryIdentity: async () => 'binary-a',
+        profileManager: {
+          listManagedAuthPaths: async () => [],
+          readCatalogSelectedAuthIdentity: async () => ({
+            source: 'absent', managed: 'absent', preferences: 'known:preferences-a',
+          }),
+        },
+        inventoryService: {
+          probe: async (_projectPath, options) => {
+            if (blocked && stage === 'profile preparation') {
+              return new Promise<OpenCodeInventorySnapshot>((_resolve, reject) => {
+                options?.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason), { once: true })
+              })
+            }
+            return inventory({ models: [], availableProviders: [] })
+          },
+        },
+        hostManager: {
+          ensureHost: async options => {
+            if (blocked && stage === 'host startup') {
+              return new Promise<OpenCodeHostHandle>((_resolve, reject) => {
+                options.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason), { once: true })
+              })
+            }
+            return host()
+          },
+          releaseHost: async () => {},
+        },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local', models: { initial: {} } }],
+            connected: [], default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+      const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+      expect((await adapter.loadModels(input)).ok).toBe(true)
+      blocked = true
+      const stale = await adapter.loadModels(input)
+      expect(stale.ok).toBe(true)
+      if (stale.ok) expect(stale.value.catalogState).toBe('stale')
+    },
+  )
+
+  test('rejects a probe result when selected auth changes before catalog publication', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-auth-race-'))
+    const previousData = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    const previousXdg = process.env.XDG_DATA_HOME
+    const previousHome = process.env.HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(tempDir, 'app-data')
+    process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg-data')
+    process.env.HOME = path.join(tempDir, 'home')
+    const authPath = path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json')
+    await mkdir(path.dirname(authPath), { recursive: true })
+    await writeFile(authPath, JSON.stringify({ local: { type: 'api', key: 'auth-a' } }))
+    let releaseProviders!: () => void
+    let markProvidersStarted!: () => void
+    const providersGate = new Promise<void>(resolve => { releaseProviders = resolve })
+    const providersStarted = new Promise<void>(resolve => { markProvidersStarted = resolve })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogTimeoutMs: 1_000,
+      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryIdentity: async () => 'binary-a',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async () => ({
+          source: 'known:auth-a', managed: 'known:auth-a',
+          preferences: 'known:preferences-a',
+        }),
+      },
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => {
+          markProvidersStarted()
+          await providersGate
+          return { all: [{ id: 'local', name: 'Local', models: { late: {} } }], connected: [], default: {} }
+        },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    try {
+      const pending = adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
+      })
+      await providersStarted
+      await writeFile(authPath, JSON.stringify({ local: { type: 'api', key: 'auth-b' } }))
+      releaseProviders()
+      const result = await pending
+      expect(result.ok).toBe(false)
+      expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
+    } finally {
+      if (previousData === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousData
+      if (previousXdg === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousXdg
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('deny-by-default catalog diagnostics hide custom endpoints and arbitrary secrets', async () => {
+    const endpoint = 'https://private.example.invalid/v1/models?tenant=classified'
+    const secret = 'violet-elephant-uncatalogued-7391'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryIdentity: async () => 'binary-a',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async () => ({
+          source: 'absent', managed: 'absent', preferences: 'known:preferences-a',
+        }),
+      },
+      inventoryService: { probe: async () => inventory({
+        models: [], availableProviders: [], diagnostics: [`client failed at ${endpoint}: ${secret}`],
+      }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => { throw new Error(`response from ${endpoint}: ${secret}`) },
+        getProviders: async () => ({
+          all: [{ id: 'local', name: 'Local', models: { model: {} } }], connected: [], default: {},
+        }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
+    })
+    expect(result.ok).toBe(true)
+    expect(JSON.stringify(result)).not.toContain(endpoint)
+    expect(JSON.stringify(result)).not.toContain('classified')
+    expect(JSON.stringify(result)).not.toContain(secret)
   })
 })

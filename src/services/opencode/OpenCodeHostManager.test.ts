@@ -10,6 +10,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
+  buildOpenCodeHostProfileIdentity,
   buildOpenCodeHostSpawnOptions,
   resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
@@ -126,6 +127,27 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
+  test('isolates scoped hosts by process-keyed selected auth identity', () => {
+    const scoped = {
+      ...baseProfile,
+      scopeToken: 'current-token',
+      profileScope: {
+        purpose: 'catalog' as const,
+        providerId: 'custom',
+        configFingerprint: 'config-a',
+        selectedAuthIdentity: 'known:auth-a' as const,
+        scopeToken: 'current-token',
+      },
+    }
+    const changed = {
+      ...scoped,
+      profileScope: { ...scoped.profileScope, selectedAuthIdentity: 'known:auth-b' as const },
+    }
+    expect(buildOpenCodeHostProfileIdentity(scoped, 'binary-a'))
+      .not.toBe(buildOpenCodeHostProfileIdentity(changed, 'binary-a'))
+    expect(buildOpenCodeHostProfileIdentity(scoped, 'binary-a')).toContain('auth:known:auth-a')
+  })
+
   test('starts a fresh persistent host when managed OpenCode auth changes', async () => {
     let profile = baseProfile
     let port = 43150

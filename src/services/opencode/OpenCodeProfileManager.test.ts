@@ -299,12 +299,24 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const profileScope = await resolveOpenCodeProfileScope({
       projectPath, purpose: 'catalog', selectedModel: 'custom/model',
     })
+    await writeFile(sourceAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'changed-after-resolve' },
+    }))
     const profile = await manager.prepareProfile(projectPath, { profileScope })
     expect(JSON.parse(await readFile(profile.managedAuthPath, 'utf8'))).toEqual({
       custom: { type: 'api', key: 'local-selected' },
     })
     expect(profile.selectedSourceAuthIdentity).toStartWith('known:')
     expect(profile.selectedManagedAuthIdentity).toBe(profile.selectedSourceAuthIdentity)
+    expect(profile.profileRootPath).toContain(profile.profileRootKey)
+    const changedScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const changedProfile = await manager.prepareProfile(projectPath, { profileScope: changedScope })
+    expect(changedProfile.profileRootPath).not.toBe(profile.profileRootPath)
+    expect(JSON.parse(await readFile(changedProfile.managedAuthPath, 'utf8'))).toEqual({
+      custom: { type: 'api', key: 'changed-after-resolve' },
+    })
   })
 
   test('canonicalizes symlink retargets into distinct profile roots', async () => {
@@ -340,6 +352,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         purpose: 'catalog',
         providerId: 'custom',
         configFingerprint: 'forged',
+        selectedAuthIdentity: 'absent',
         scopeToken: 'forged',
       },
     })).rejects.toThrow('exact resolver-issued snapshot')

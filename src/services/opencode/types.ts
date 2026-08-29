@@ -29,6 +29,7 @@ export type OpenCodeProfileScope = {
   purpose: OpenCodeProfilePurpose
   providerId: string
   configFingerprint: string
+  selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
   scopeToken: string
 }
 
