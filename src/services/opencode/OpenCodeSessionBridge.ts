@@ -11,6 +11,7 @@ import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 import {
   assertOpenCodePreparedProfileScope,
   openCodeProfileManager,
@@ -22,6 +23,7 @@ import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 import type {
   OpenCodeAuthState,
   OpenCodeAppMcpStatus,
+  OpenCodeHostHandle,
   OpenCodeLogProjection,
   OpenCodeMessage,
   OpenCodePrepareProfileOptions,
@@ -554,14 +556,25 @@ export class OpenCodeSessionBridge {
 
   async ensureSessionAppMcpReady(
     record: OpenCodeSessionRecord,
-    options: { attachIfMissing?: boolean } = {},
+    options: {
+      attachIfMissing?: boolean
+      host?: OpenCodeHostHandle
+      signal?: AbortSignal
+      remainingMs?: () => number
+    } = {},
   ): Promise<OpenCodeSessionAppMcpReadyResult> {
-    return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
+    const check = async (baseUrl: string, runtimePid: number | null) => {
       let result: Awaited<ReturnType<typeof openCodeMcpManager.ensureAppMcp>>
       try {
         result = await this.mcpManager.ensureAppMcp({
           baseUrl,
           attachIfMissing: options.attachIfMissing === true,
+          ...(options.signal ? {
+            requestContext: {
+              signal: options.signal,
+              remainingMs: options.remainingMs,
+            },
+          } : {}),
         })
       } catch (error) {
         return {
@@ -583,7 +596,14 @@ export class OpenCodeSessionBridge {
         connected: result.summary.connected,
         diagnostics: result.summary.diagnostics,
       }
-    })
+    }
+    if (options.host) {
+      if (record.hostKey !== options.host.hostKey) {
+        throw new Error('OpenCode strict member MCP host identity mismatch')
+      }
+      return check(options.host.baseUrl, options.host.pid > 0 ? options.host.pid : null)
+    }
+    return this.withSessionHost(record, ({ baseUrl, runtimePid }) => check(baseUrl, runtimePid))
   }
 
   private async withSessionHost<T>(
@@ -908,6 +928,93 @@ export class OpenCodeSessionBridge {
     return created.record
   }
 
+  /** Strict launch path: one create request on the caller-retained exact host. */
+  async materializeSessionOnHost(params: {
+    teamId: string
+    laneId: string
+    memberName: string
+    selectedModel: string
+    selectedVariant?: string
+    title?: string | null
+    runId: string
+    host: OpenCodeHostHandle
+    signal: AbortSignal
+    remainingMs: () => number
+    toolApprovalMode?: OpenCodeToolApprovalMode
+  }): Promise<{ record: OpenCodeSessionRecord; created: boolean }> {
+    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
+    const existing = await this.sessionStore.get(params.teamId, params.laneId, params.memberName)
+    if (existing) {
+      if (
+        existing.hostKey !== params.host.hostKey
+        || existing.selectedModel !== params.selectedModel
+        || existing.projectBehaviorFingerprint !== params.host.projectBehaviorFingerprint
+        || existing.managedAuthFingerprint !== params.host.profile.managedAuthFingerprint
+      ) {
+        throw new Error('OpenCode committed session identity does not match strict launch')
+      }
+      return { record: existing, created: false }
+    }
+
+    const selectedVariant = params.selectedVariant?.trim() || undefined
+    const client = this.clientFactory.create(params.host.baseUrl, {
+      signal: params.signal,
+      remainingMs: params.remainingMs,
+    })
+    const session = await client.createSession({
+      title: params.title?.trim() || `${params.teamId} - ${params.memberName}`,
+    })
+    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
+    const now = buildNowIso()
+    const record: OpenCodeSessionRecord = {
+      teamId: params.teamId,
+      laneId: params.laneId,
+      memberName: params.memberName,
+      providerId: 'opencode',
+      selectedModel: params.selectedModel,
+      ...(selectedVariant ? { selectedVariant } : {}),
+      projectPath: params.host.projectPath,
+      profileRootKey: params.host.profileRootKey,
+      profileScope: params.host.profile.profileScope ?? null,
+      toolApprovalMode: params.toolApprovalMode ?? 'auto',
+      runtimePid: params.host.pid > 0 ? params.host.pid : undefined,
+      resolvedBehaviorFingerprint: params.host.resolvedConfigFingerprint,
+      hostKey: params.host.hostKey,
+      opencodeSessionId: session.id,
+      lastCanonicalCursor: null,
+      lastKnownRawStatus: null,
+      lastKnownDurableState: null,
+      sourceAuthFingerprint: params.host.profile.sourceAuthFingerprint,
+      managedAuthFingerprint: params.host.profile.managedAuthFingerprint,
+      projectBehaviorFingerprint: params.host.projectBehaviorFingerprint,
+      managedConfigFingerprint: params.host.profile.managedConfigFingerprint,
+      opencodeVersion: params.host.version ?? undefined,
+      bootstrapMode: 'app_managed_context',
+      staleReason: null,
+      createdAt: now,
+      updatedAt: now,
+    }
+    await this.hostManager.retainHostLease?.(params.host.hostKey, {
+      teamId: params.teamId,
+      laneId: params.laneId,
+      memberName: params.memberName,
+      runId: params.runId,
+      sessionId: session.id,
+    })
+    try {
+      await this.sessionStore.upsert(record)
+    } catch (error) {
+      await this.hostManager.releaseHostLease?.(params.host.hostKey, {
+        teamId: params.teamId,
+        laneId: params.laneId,
+        memberName: params.memberName,
+      }).catch(() => undefined)
+      throw error
+    }
+    this.retainedSessionHosts.set(this.buildSessionKey(record), params.host.hostKey)
+    return { record, created: true }
+  }
+
   async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
     const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
       this.prepareProfileForSessionRecord(record),
@@ -1047,6 +1154,9 @@ export class OpenCodeSessionBridge {
       agent?: string
       contextHash: string
       briefingHash: string
+      host?: OpenCodeHostHandle
+      signal?: AbortSignal
+      remainingMs?: () => number
     },
   ): Promise<{
     messageID: string
@@ -1056,8 +1166,10 @@ export class OpenCodeSessionBridge {
     injectionVerifiedAt: string
     alreadyPresent: boolean
   }> {
-    return this.withSessionPromptHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+    const inject = async (baseUrl: string) => {
+      const client = this.clientFactory.create(baseUrl, params.signal
+        ? { signal: params.signal, remainingMs: params.remainingMs }
+        : undefined)
       const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
         if (!message) {
           throw new Error(`OpenCode app-managed bootstrap context was not found after ${phase}`)
@@ -1146,7 +1258,14 @@ export class OpenCodeSessionBridge {
         injectionVerifiedAt: buildNowIso(),
         alreadyPresent: false,
       }
-    })
+    }
+    if (params.host) {
+      if (record.hostKey !== params.host.hostKey) {
+        throw new Error('OpenCode strict bootstrap host identity mismatch')
+      }
+      return inject(params.host.baseUrl)
+    }
+    return this.withSessionPromptHost(record, ({ baseUrl }) => inject(baseUrl))
   }
 
   async promptAsync(

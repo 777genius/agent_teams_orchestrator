@@ -96,7 +96,12 @@ type ProbeModelParams = {
   outputTokens?: number
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
-  runtimeDeadline?: OpenCodeRuntimeDeadline
+  runtimeDeadline?: Pick<
+    OpenCodeRuntimeDeadline,
+    'signal' | 'remainingMs' | 'throwIfExpired' | 'runPhase'
+  >
+  requireExactOutput?: boolean
+  cleanupSuccessfulSession?: boolean
   cursorNativePreflightBeforeHost?: boolean
   cursorNativePreflightOnly?: boolean
 }
@@ -222,6 +227,17 @@ function buildDurationMs(startedAtMs: number): number {
 
 function isProbeSuccessOutput(value: string | null | undefined): boolean {
   return /\bPONG\b/i.test(value?.trim() ?? '')
+}
+
+function isExpectedProbeOutput(
+  value: string | null | undefined,
+  expectedOutput: string,
+  requireExactOutput: boolean,
+): boolean {
+  const normalized = value?.trim() ?? ''
+  return requireExactOutput
+    ? normalized === expectedOutput
+    : isProbeSuccessOutput(normalized)
 }
 
 function normalizeFailureMessage(value: string): string {
@@ -655,7 +671,7 @@ export class OpenCodeExecutionProbe {
   }
 
   private runPhase<T>(
-    deadline: OpenCodeRuntimeDeadline | undefined,
+    deadline: ProbeModelParams['runtimeDeadline'],
     phase: OpenCodePhaseContext['phase'],
     operation: (context?: OpenCodePhaseContext) => Promise<T>,
   ): Promise<T> {
@@ -792,6 +808,25 @@ export class OpenCodeExecutionProbe {
     // A generic probe key cannot prove the exact prepared host identity. Until
     // that identity is available here, every proof is deliberately fresh.
     return cloneProbeResult(await this.runProbeModel({ ...params, bypassCache: true }))
+  }
+
+  async probeModelOnHost(
+    params: ProbeModelParams & { host: OpenCodeHostHandle },
+  ): Promise<OpenCodeExecutionProbeResult> {
+    const startedAtMs = nowMs()
+    const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
+    const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
+    parseProviderScopedModel(params.selectedModel)
+    return cloneProbeResult(await this.runProbeModelWithHost({
+      params: { ...params, bypassCache: true },
+      host: params.host,
+      startedAtMs,
+      prompt,
+      expectedOutput,
+      probeTimeoutMs: Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS),
+      pollIntervalMs: Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS),
+      diagnostics: new Set<string>(),
+    }))
   }
 
   private async runProbeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
@@ -1540,8 +1575,16 @@ export class OpenCodeExecutionProbe {
           if (
             summary.durableState === 'idle'
             && (
-              isProbeSuccessOutput(summary.latestAssistantText)
-              || isProbeSuccessOutput(summary.latestAssistantPreview)
+              isExpectedProbeOutput(
+                summary.latestAssistantText,
+                expectedOutput,
+                params.requireExactOutput === true,
+              )
+              || isExpectedProbeOutput(
+                summary.latestAssistantPreview,
+                expectedOutput,
+                params.requireExactOutput === true,
+              )
             )
           ) {
             sessionRequiresCleanup = false
@@ -1674,6 +1717,8 @@ export class OpenCodeExecutionProbe {
               )
             }
             if (
+              params.requireExactOutput !== true
+              &&
               summary.durableState === 'idle'
               && classified.outcome === 'unknown'
               && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
@@ -1743,7 +1788,7 @@ export class OpenCodeExecutionProbe {
         nativeFailureController?.abort()
       })
     } finally {
-      if (sessionId && sessionRequiresCleanup) {
+      if (sessionId && (sessionRequiresCleanup || params.cleanupSuccessfulSession === true)) {
         await this.cleanupProbeSession(host, sessionId).catch(() => undefined)
       }
     }

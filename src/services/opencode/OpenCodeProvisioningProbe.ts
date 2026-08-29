@@ -6,6 +6,7 @@ import {
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
@@ -44,9 +45,10 @@ type OpenCodeProvisioningProbeOptions = {
   phaseContext?: OpenCodePhaseContext
 }
 
-type RetainedProvisioningProbe = {
+export type RetainedOpenCodeProvisioningProbe = {
   snapshot: OpenCodeProvisioningSnapshot
-  release: () => Promise<void>
+  host: OpenCodeHostHandle | null
+  release: (keepAlive?: boolean) => Promise<void>
 }
 
 function cloneHost(handle: NonNullable<OpenCodeProvisioningSnapshot['host']>): NonNullable<OpenCodeProvisioningSnapshot['host']> {
@@ -94,13 +96,18 @@ export class OpenCodeProvisioningProbe {
 
   async probeRetainingHost(
     projectPath?: string | null,
-    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> = {},
-  ): Promise<RetainedProvisioningProbe> {
+    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> & {
+      selectedModel?: string
+      leaseId?: string
+    } = {},
+  ): Promise<RetainedOpenCodeProvisioningProbe> {
     return this.probeWithHost(projectPath, {
       retainHost: true,
       useCache: false,
       toolApprovalMode: options.toolApprovalMode,
       phaseContext: options.phaseContext,
+      selectedModel: options.selectedModel,
+      leaseId: options.leaseId,
     })
   }
 
@@ -113,14 +120,24 @@ export class OpenCodeProvisioningProbe {
       ensureAppMcp?: boolean
       toolApprovalMode?: OpenCodeToolApprovalMode
       phaseContext?: OpenCodePhaseContext
+      selectedModel?: string
+      leaseId?: string
     },
-  ): Promise<RetainedProvisioningProbe> {
+  ): Promise<RetainedOpenCodeProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+    const profileScope = options.selectedModel
+      ? await resolveOpenCodeProfileScope({
+          projectPath,
+          purpose: 'launch_runtime',
+          selectedModel: options.selectedModel,
+        })
+      : undefined
     const inventory = await inventoryService.probe(projectPath, {
       bypassCache: !options.useCache,
       includeAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
       abortSignal: options.phaseContext?.signal,
+      ...(profileScope ? { profileScope } : {}),
     })
     const cacheKey = [
       inventory.projectPath,
@@ -134,6 +151,7 @@ export class OpenCodeProvisioningProbe {
     if (cached && cached.expiresAt > Date.now()) {
       return {
         snapshot: cached.snapshot,
+        host: cached.snapshot.host,
         release: async () => {},
       }
     }
@@ -163,6 +181,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host: null,
         release: async () => {},
       }
     }
@@ -172,16 +191,18 @@ export class OpenCodeProvisioningProbe {
     const mcpManager = this.deps.mcpManager ?? openCodeMcpManager
 
     let host: OpenCodeHostHandle | undefined
-    const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      options.leaseId ? `strict-launch-${options.leaseId}` : 'readiness',
+    )
     let released = false
-    const release = async () => {
+    const release = async (keepAlive = false) => {
       if (released || !host) {
         return
       }
       released = true
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (options.disposeHostOnRelease !== false) {
-        await hostManager.releaseHost(host.hostKey)
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive })
       }
     }
     try {
@@ -236,6 +257,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host: null,
         release,
       }
     }
@@ -351,6 +373,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host,
         release,
       }
     } catch (error) {
@@ -388,6 +411,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host,
         release,
       }
     } finally {

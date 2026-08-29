@@ -385,8 +385,10 @@ const originalProbe = openCodeProvisioningProbe.probe
 const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
 const originalInventoryProbe = openCodeInventoryService.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
+const originalProbeModelOnHost = openCodeExecutionProbe.probeModelOnHost
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalEnsureSession = openCodeSessionBridge.ensureSession
+const originalMaterializeSessionOnHost = openCodeSessionBridge.materializeSessionOnHost
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalRefreshSessionEnvironment = openCodeSessionBridge.refreshSessionEnvironment
@@ -479,8 +481,42 @@ beforeEach(async () => {
   mockRequiredMcpTools()
   openCodeProvisioningProbe.probeRetainingHost = (async projectPath => ({
     snapshot: await openCodeProvisioningProbe.probe(projectPath),
+    host: snapshot.host,
     release: async () => {},
   })) as typeof openCodeProvisioningProbe.probeRetainingHost
+  openCodeExecutionProbe.probeModelOnHost = (async input => ({
+    providerId: 'opencode',
+    modelId: input.selectedModel,
+    probePrompt: input.prompt ?? '',
+    expectedOutput: input.expectedOutput ?? '',
+    outcome: 'available',
+    reason: null,
+    durationMs: 1,
+    rawStatus: 'idle',
+    durableState: 'idle',
+    latestAssistantText: input.expectedOutput ?? 'PONG',
+    latestAssistantPreview: input.expectedOutput ?? 'PONG',
+    toolCallCount: 0,
+    errorCount: 0,
+    diagnostics: [],
+    verifiedAt: '2026-04-21T12:00:00.000Z',
+  })) as typeof openCodeExecutionProbe.probeModelOnHost
+  openCodeSessionBridge.materializeSessionOnHost = (async input => ({
+    record: await openCodeSessionBridge.ensureSession({
+      teamId: input.teamId,
+      laneId: input.laneId,
+      memberName: input.memberName,
+      selectedModel: input.selectedModel,
+      selectedVariant: input.selectedVariant,
+      title: input.title,
+      projectPath: input.host.projectPath,
+      preparedProfile: input.host.profile,
+      runId: input.runId,
+      fresh: true,
+      toolApprovalMode: input.toolApprovalMode,
+    }),
+    created: true,
+  })) as typeof openCodeSessionBridge.materializeSessionOnHost
   openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
     await openCodeSessionBridge.promptAsync(record, {
       text: input.text,
@@ -624,8 +660,10 @@ afterEach(async () => {
   openCodeProvisioningProbe.probeRetainingHost = originalProbeRetainingHost
   openCodeInventoryService.probe = originalInventoryProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
+  openCodeExecutionProbe.probeModelOnHost = originalProbeModelOnHost
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeSessionBridge.ensureSession = originalEnsureSession
+  openCodeSessionBridge.materializeSessionOnHost = originalMaterializeSessionOnHost
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
   openCodeSessionBridge.refreshSessionEnvironment = originalRefreshSessionEnvironment
@@ -664,7 +702,21 @@ function buildEnvelope(command: string, body: Record<string, unknown>) {
     cwd: '/tmp/project',
     startedAt: '2026-04-22T12:00:00.000Z',
     timeoutMs: 30_000,
-    body,
+    body: command === 'opencode.launchTeam' && body.preconditions === undefined
+      ? {
+          ...body,
+          preconditions: {
+            handshakeIdentityHash: 'handshake-test',
+            laneId: body.laneId ?? null,
+            expectedRunId: body.runId ?? null,
+            expectedCapabilitySnapshotId: null,
+            expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: body.manifestHighWatermark ?? 0,
+            commandLeaseId: 'lease-test',
+            idempotencyKey: `launch:${String(body.runId ?? 'test')}`,
+          },
+        }
+      : body,
   }
 }
 
@@ -2217,7 +2269,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toHaveLength(1)
     expect(ensureInputs[0]?.laneId).toBe('secondary:opencode:alice')
-    expect(ensureInputs[0]?.preparedProfile).toBe(snapshot.profile)
+    expect(ensureInputs[0]?.preparedProfile).toEqual(snapshot.profile)
     expect(
       (result.data as { members: Record<string, { runtimePid?: number }> }).members.alice?.runtimePid,
     ).toBe(123)
@@ -2279,6 +2331,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     openCodeProvisioningProbe.probeRetainingHost = (async () => ({
       snapshot,
+      host: snapshot.host,
       release: async () => {
         releaseCalls += 1
       },
@@ -2318,6 +2371,139 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ]),
     )
     expect(releaseCalls).toBe(1)
+  })
+
+  test('strict launch preserves a commit, stops on unknown, and continues only the missing member', async () => {
+    const records = new Map<string, OpenCodeSessionRecord>()
+    const events: string[] = []
+    const probeOptions: Array<Record<string, unknown>> = []
+    let bobUnknown = true
+    openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
+      probeOptions.push(options as Record<string, unknown>)
+      return { snapshot, host: snapshot.host, release: async () => {} }
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionStore.get = (async (_teamId, _laneId, memberName) =>
+      records.get(memberName ?? _laneId) ?? null) as typeof openCodeSessionStore.get
+    openCodeSessionStore.upsert = (async record => {
+      records.set(record.memberName, record)
+      return 'updated'
+    }) as typeof openCodeSessionStore.upsert
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
+      events.push(`proof:${input.host.hostKey}`)
+      return {
+        providerId: 'opencode',
+        modelId: input.selectedModel,
+        probePrompt: input.prompt ?? '',
+        expectedOutput: input.expectedOutput ?? '',
+        outcome: 'available',
+        reason: null,
+        durationMs: 1,
+        rawStatus: 'idle',
+        durableState: 'idle',
+        latestAssistantText: input.expectedOutput ?? null,
+        latestAssistantPreview: input.expectedOutput ?? null,
+        toolCallCount: 0,
+        errorCount: 0,
+        diagnostics: [],
+        verifiedAt: '2026-04-21T12:00:00.000Z',
+      }
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
+    openCodeSessionBridge.materializeSessionOnHost = (async input => {
+      events.push(`member:${input.memberName}:${input.host.hostKey}`)
+      if (input.memberName === 'bob' && bobUnknown) {
+        bobUnknown = false
+        throw new Error(`transport result unknown authorization=secret ${'x'.repeat(600)}`)
+      }
+      return {
+        created: true,
+        record: buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          hostKey: input.host.hostKey,
+          opencodeSessionId: `session-${input.memberName}`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+    openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => ({
+      messageID: input.messageID,
+      runtimeSessionId: record.opencodeSessionId,
+      contextHash: input.contextHash,
+      briefingHash: input.briefingHash,
+      injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+      alreadyPresent: false,
+    })) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+    const body = {
+      runId: 'run-strict-partial',
+      laneId: 'primary',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'openrouter/minimax-m2.5-free',
+      members: [
+        { name: 'alice', prompt: 'Alice join' },
+        { name: 'bob', prompt: 'Bob join' },
+      ],
+    }
+
+    const first = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
+    expect(first.ok).toBe(true)
+    expect(Object.keys(first.data.members)).toEqual(['alice'])
+    expect(events).toEqual([
+      'proof:host-key',
+      'member:alice:host-key',
+      'member:bob:host-key',
+    ])
+    expect(probeOptions[0]).toMatchObject({
+      selectedModel: 'openrouter/minimax-m2.5-free',
+      leaseId: 'lease-test',
+    })
+    expect((probeOptions[0]?.phaseContext as { signal?: unknown })?.signal).toBeInstanceOf(
+      AbortSignal,
+    )
+    const publicUnknown = first.data.diagnostics.find(
+      diagnostic => diagnostic.code === 'opencode_strict_launch_unknown',
+    )?.message ?? ''
+    expect(publicUnknown).not.toContain('secret')
+    expect(publicUnknown.length).toBeLessThanOrEqual(512)
+
+    events.length = 0
+    const second = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
+    expect(second.ok).toBe(true)
+    expect(Object.keys(second.data.members)).toEqual(['alice', 'bob'])
+    expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
+  })
+
+  test('strict launch fails closed on missing preconditions before proof or materialization', async () => {
+    let proofCalls = 0
+    let memberCalls = 0
+    openCodeExecutionProbe.probeModelOnHost = (async () => {
+      proofCalls += 1
+      throw new Error('must not run')
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
+    openCodeSessionBridge.materializeSessionOnHost = (async () => {
+      memberCalls += 1
+      throw new Error('must not run')
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-missing-strict-preconditions',
+        laneId: 'primary',
+        teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice' }],
+        preconditions: null,
+      }),
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error.message).toContain('strict launch requires full preconditions')
+    expect(proofCalls).toBe(0)
+    expect(memberCalls).toBe(0)
   })
 
   test('launches provider-scoped OpenCode model ids that contain nested slashes', async () => {
@@ -2857,7 +3043,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
-  test('recreates launch session after app MCP is attached before bootstrap prompt', async () => {
+  test('does not recreate a proven strict-host session after MCP is already attached', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     let ensureCount = 0
     const callOrder: string[] = []
@@ -2910,16 +3096,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(callOrder).toEqual([
       'ensure:session-1',
       'mcp:session-1',
-      'stale:app_mcp_attached_after_session_create',
-      'ensure:session-2',
-      'mcp:session-2',
-      'prompt:session-2',
+      'prompt:session-1',
     ])
     if (result.ok) {
-      expect(result.data.members.alice?.sessionId).toBe('session-2')
-      expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
-        'opencode_launch_session_recreated_after_mcp_attach',
-      )
+      expect(result.data.members.alice?.sessionId).toBe('session-1')
     }
   })
 
@@ -2982,7 +3162,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       }),
     )
 
-    expect(result.ok).toBe(true)
+    expect(result.ok).toBe(false)
     if (!result.ok) {
       return
     }
@@ -3369,26 +3549,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
-    expect(promptAttempts).toEqual(['alice', 'bob', 'zoe'])
+    expect(ensureInputs).toEqual(['alice', 'bob'])
+    expect(promptAttempts).toEqual(['alice', 'bob'])
     expect(reconciledMembers).toEqual([])
-    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
-    expect(result.data.members.bob).toMatchObject({
-      sessionId: 'session-bob',
-      launchState: 'failed',
-      runtimePid: 802,
-      diagnostics: ['bob prompt delivery failed'],
-    })
-    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
-      'member_launch_failed',
-    ])
-    expect(result.data.members.zoe?.launchState).toBe('created')
-    expect(result.data.diagnostics).toContainEqual({
-      code: 'member_launch_failed',
-      message: 'bob: bob prompt delivery failed',
-      severity: 'error',
-    })
+    expect(result.data.members.bob).toBeUndefined()
+    expect(result.data.members.zoe).toBeUndefined()
   })
 
   test('keeps OpenCode peers visible when one launch member session creation fails', async () => {
@@ -3443,28 +3610,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
-    expect(promptAttempts).toEqual(['alice', 'zoe'])
+    expect(ensureInputs).toEqual(['alice', 'bob'])
+    expect(promptAttempts).toEqual(['alice'])
     expect(reconciledMembers).toEqual([])
-    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.runtimePid).toBe(1101)
-    expect(result.data.members.bob).toMatchObject({
-      sessionId: 'failed:team-a:primary:bob',
-      launchState: 'failed',
-      runtimePid: 123,
-      diagnostics: ['bob ensure session failed'],
-    })
-    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
-      'member_launch_failed',
-    ])
-    expect(result.data.members.zoe?.launchState).toBe('created')
-    expect(result.data.members.zoe?.runtimePid).toBe(1103)
-    expect(result.data.diagnostics).toContainEqual({
-      code: 'member_launch_failed',
-      message: 'bob: bob ensure session failed',
-      severity: 'error',
-    })
+    expect(result.data.members.bob).toBeUndefined()
+    expect(result.data.members.zoe).toBeUndefined()
   })
 
   test('keeps launch context visible without reconcile-time failure coupling', async () => {
@@ -4095,7 +4248,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     let probedModelId: string | null = null
     let probedDisposeHostOnRelease: boolean | undefined
     let ensureSessionCalls = 0
-    openCodeExecutionProbe.probeModel = (async input => {
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
       return {
@@ -4114,7 +4267,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         errorCount: 0,
         diagnostics: [],
       }
-    }) as typeof openCodeExecutionProbe.probeModel
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -4142,7 +4295,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
+    expect(probedDisposeHostOnRelease).toBeUndefined()
     expect(ensureSessionCalls).toBe(1)
     expect(result.data.teamLaunchState).toBe('launching')
   })
@@ -4168,13 +4321,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
       })
     let receivedRuntimeDeadline = false
     let ensureSessionCalls = 0
-    openCodeExecutionProbe.probeModel = (async input => {
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
       receivedRuntimeDeadline = input.runtimeDeadline !== undefined
       return input.runtimeDeadline!.runPhase(
         'execution_poll',
         () => new Promise(() => {}),
       )
-    }) as typeof openCodeExecutionProbe.probeModel
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -4196,15 +4349,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
 
-    expect(receivedRuntimeDeadline).toBe(true)
+    expect(receivedRuntimeDeadline).toBe(false)
     expect(ensureSessionCalls).toBe(0)
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error.kind).toBe('timeout')
-    expect(result.error.details).toMatchObject({
-      phase: 'execution_poll',
-      commandBudgetMs: 20,
-    })
+    expect(result.error.message).toContain('deadline')
   })
 
   test('allows launch for built-in free OpenCode models without connected providers', async () => {

@@ -852,9 +852,13 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {
+    let strictHostOnly = false
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async () => {
+          if (strictHostOnly) throw new Error('strict proof must not acquire another host')
+          return host
+        },
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -920,6 +924,18 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.diagnostics.join('\n')).toContain(
       'Model verification completed with non-matching assistant output',
     )
+
+    strictHostOnly = true
+    const strictResult = await probe.probeModelOnHost({
+      host,
+      selectedModel: 'ollama/qwen2.5-coder:0.5b',
+      prompt: 'Output only this exact token: PONG',
+      expectedOutput: 'PONG',
+      requireExactOutput: true,
+      cleanupSuccessfulSession: true,
+    })
+    expect(strictResult.outcome).toBe('unknown')
+    expect(strictResult.latestAssistantText).toBe('PING')
   })
 
   test('does not treat a plain-text Cursor authentication error as execution proof', async () => {

@@ -712,6 +712,63 @@ describe('OpenCodeSessionBridge', () => {
     }])
   })
 
+  test('strict exact-host materialization never retries an unknown create result', async () => {
+    let ensureHostCalls = 0
+    let createSessionCalls = 0
+    const controller = new AbortController()
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'created',
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          throw new Error('strict materialization must use the retained host')
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: (baseUrl, context) => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => {
+            expect(baseUrl).toBe(host.baseUrl)
+            expect(context?.signal).toBe(controller.signal)
+            createSessionCalls += 1
+            throw new Error('socket connection was closed unexpectedly')
+          },
+          getSession: async () => ({ id: 'unused' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      runId: 'run-1',
+      host,
+      signal: controller.signal,
+      remainingMs: () => 1_000,
+    })).rejects.toThrow('socket connection was closed unexpectedly')
+    expect(createSessionCalls).toBe(1)
+    expect(ensureHostCalls).toBe(0)
+  })
+
   test('does not retry fresh session creation after a non-transient OpenCode error', async () => {
     let createSessionCalls = 0
     let releaseHostCalls = 0
