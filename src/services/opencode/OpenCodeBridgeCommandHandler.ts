@@ -2854,15 +2854,12 @@ async function assertOpenCodeLaunchMcpReady(
 
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
+  attemptId?: string,
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
+  let owned = false
   try {
-    await openCodeSessionStore.markStale(
-      record.teamId,
-      record.laneId,
-      record.memberName,
-      'launch_failed',
-    )
+    owned = Boolean(await openCodeSessionStore.markStaleIfSession(record, 'launch_failed', attemptId))
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_mark_stale_failed',
@@ -2871,6 +2868,7 @@ async function cleanupFailedLaunchSession(
     ))
   }
 
+  if (!owned) return diagnostics
   try {
     await openCodeSessionBridge.releaseSession(record)
   } catch (error) {
@@ -2882,7 +2880,7 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionStore.delete(record.teamId, record.laneId, record.memberName)
+    await openCodeSessionStore.deleteIfSession(record, attemptId)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_delete_failed',
@@ -3318,6 +3316,7 @@ async function runLaunch(
           selectedVariant: input.selectedVariant,
           title: `${teamId} - ${input.name}`,
           runId,
+          attemptId: identity.attemptId,
           host,
           signal,
           remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
@@ -3423,7 +3422,7 @@ async function runLaunch(
       for (const resource of cleanupResources) {
         const record = resources.get(resource.resourceId)
         if (record && !resource.committed) {
-          await cleanupFailedLaunchSession(record)
+          await cleanupFailedLaunchSession(record, envelope.requestId)
         }
       }
     },
@@ -3466,6 +3465,8 @@ async function runLaunch(
       }),
     },
   }, ports)
+  await Promise.all([...resources.values()].map(record =>
+    openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId).catch(() => false)))
   diagnostics.push(teamDiagnostic(
     `opencode_strict_launch_${result.status.replaceAll('-', '_')}`,
     result.status === 'committed'

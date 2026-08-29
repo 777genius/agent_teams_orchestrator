@@ -46,6 +46,8 @@ type OpenCodeSessionBridgeDeps = {
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
+    & Partial<Pick<typeof openCodeSessionStore,
+      'claimMaterialization' | 'commitMaterialization' | 'releaseMaterializationClaim'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -986,6 +988,7 @@ export class OpenCodeSessionBridge {
     selectedVariant?: string
     title?: string | null
     runId: string
+    attemptId?: string
     host: OpenCodeHostHandle
     signal: AbortSignal
     remainingMs: () => number
@@ -996,7 +999,23 @@ export class OpenCodeSessionBridge {
     ) => OpenCodeStrictSessionCompatibility['bootstrap']
   }): Promise<{ record: OpenCodeSessionRecord; created: boolean }> {
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
-    const existing = await this.sessionStore.get(params.teamId, params.laneId, params.memberName)
+    const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
+    const attemptId = params.attemptId ?? params.runId
+    const claim = this.sessionStore.claimMaterialization
+      ? await this.sessionStore.claimMaterialization(identity, attemptId)
+      : null
+    const existing = claim?.kind === 'existing'
+      ? claim.record
+      : claim === null
+        ? await this.sessionStore.get(params.teamId, params.laneId, params.memberName)
+        : null
+    if (claim?.kind === 'owned_by_other') {
+      throw new Error('OpenCode session materialization is owned by another launch attempt')
+    }
+    if (params.signal.aborted) {
+      await this.sessionStore.releaseMaterializationClaim?.(identity, attemptId)
+      throwOpenCodeAbortReason(params.signal)
+    }
     if (existing) {
       const selectedVariant = params.selectedVariant?.trim() || undefined
       if (!isOpenCodeStrictSessionCompatible(existing, {
@@ -1020,10 +1039,16 @@ export class OpenCodeSessionBridge {
       signal: params.signal,
       remainingMs: params.remainingMs,
     })
-    const session = await client.createSession({
-      title: params.title?.trim() || `${params.teamId} - ${params.memberName}`,
-    })
-    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
+    let session: { id: string }
+    try {
+      session = await client.createSession({
+        title: params.title?.trim() || `${params.teamId} - ${params.memberName}`,
+      })
+    } catch (error) {
+      // A transport failure can have an unknown remote outcome. Keep the claim
+      // so a later attempt cannot repeat that side effect automatically.
+      throw error
+    }
     const now = buildNowIso()
     const record: OpenCodeSessionRecord = {
       teamId: params.teamId,
@@ -1062,7 +1087,12 @@ export class OpenCodeSessionBridge {
       sessionId: session.id,
     })
     try {
-      await this.sessionStore.upsert(record)
+      const committed = this.sessionStore.commitMaterialization
+        ? await this.sessionStore.commitMaterialization(record, attemptId)
+        : (await this.sessionStore.upsert(record)) !== 'unchanged'
+      if (!committed) {
+        throw new Error('OpenCode session materialization claim was lost before commit')
+      }
     } catch (error) {
       await this.hostManager.releaseHostLease?.(params.host.hostKey, {
         teamId: params.teamId,
@@ -1072,6 +1102,7 @@ export class OpenCodeSessionBridge {
       throw error
     }
     this.retainedSessionHosts.set(this.buildSessionKey(record), params.host.hostKey)
+    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     return { record, created: true }
   }
 
@@ -1143,7 +1174,10 @@ export class OpenCodeSessionBridge {
         sessionId,
         OPENCODE_PROMPT_MESSAGE_ID_RECENT_LIMIT,
       )
-      lowerBoundMessageIds = messages.map(getMessageId)
+      lowerBoundMessageIds = messages.map(getMessageId).filter(messageId =>
+        // 0-prefixed 128-bit ids from older OpenCode releases are random, not
+        // ascending. Treating msg_0d... as a time bound poisons msg_01... ids.
+        !messageId?.match(/^msg_0[0-9a-f]{31}$/))
     } catch (error) {
       diagnostics.push(
         `OpenCode prompt id lower-bound check skipped - ${error instanceof Error ? error.message : String(error)}`,
