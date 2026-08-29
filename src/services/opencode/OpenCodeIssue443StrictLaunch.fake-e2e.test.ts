@@ -158,6 +158,28 @@ describe('issue #443 strict launch fake E2E', () => {
     expect(harness.releases[0]).toMatchObject({ keepAlive: true })
   })
 
+  test('definitive failure cleans only its known owned uncommitted resource', async () => {
+    const harness = new Issue443Harness()
+    harness.materializeResults.set('one', {
+      kind: 'failure', error: 'materialization definitively failed',
+      resources: [
+        { attemptId: 'attempt-443', generation: 7, resourceId: 'owned-one', committed: false },
+        { attemptId: 'foreign-attempt', generation: 7, resourceId: 'foreign-one', committed: false },
+        { attemptId: 'attempt-443', generation: 7, resourceId: 'committed-one', committed: true },
+      ],
+    })
+    const result = await coordinateStrictLaunch(harness.strictRequest(), harness)
+    expect(result).toMatchObject({
+      status: 'failure', reason: 'materialization definitively failed',
+      committedMemberIds: [], projections: [],
+    })
+    expect(harness.members).toEqual(['one'])
+    expect(harness.cleanupEvents).toEqual([[
+      { attemptId: 'attempt-443', generation: 7, resourceId: 'owned-one', committed: false },
+    ]])
+    expect(harness.releases).toEqual([{ leaseId: 'lease-443', keepAlive: true, at: 0 }])
+  })
+
   test('deadline cancels a hung exact proof and preserves the cleanup reserve for owned release', async () => {
     const harness = new Issue443Harness()
     const late = deferred<{ kind: 'ok'; value: StrictProof }>()

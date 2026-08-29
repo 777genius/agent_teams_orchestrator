@@ -9,6 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore, openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -25,7 +26,19 @@ const laneId = 'lane-443'
 const runId = 'run-443'
 const providerId = 'deepinfra'
 const modelId = 'deepinfra/meta-llama/Llama-3.3-70B-Instruct'
-const managedConfigFingerprint = createHash('sha256').update('{}').digest('hex')
+const appMcpLaunchSource = 'env-override' as const
+const managedConfig = {
+  mcp: {
+    'agent-teams': {
+      type: 'local' as const,
+      command: [process.execPath, '-e', 'process.stdin.resume()'],
+      environment: {},
+      enabled: true,
+      timeout: 30_000,
+    },
+  },
+}
+const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
 const projectBehaviorFingerprint = 'b'.repeat(64)
 const childFlag = 'OPENCODE_ISSUE443_COMMAND_CHILD'
 
@@ -82,8 +95,9 @@ function profileFor(root: string): OpenCodePreparedProfile {
     effectiveManagedDefaultSource: null,
     projectBehaviorFingerprint,
     behaviorSources: [],
-    managedConfig: {},
+    managedConfig,
     managedConfigFingerprint,
+    appMcpLaunchSource,
     homePath: path.join(profileRoot, 'home'),
     tmpPath: path.join(profileRoot, 'tmp'),
     xdgConfigHome: path.join(profileRoot, 'config'),
@@ -141,7 +155,8 @@ function snapshotFor(state: PersistedFakeState): OpenCodeProvisioningSnapshot {
     mcp: {},
     appMcp: {
       serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
-      connected: true, launchSource: 'workspace-src', availableServerNames: ['agent-teams'],
+      connected: true, launchSource: appMcpLaunchSource,
+      availableServerNames: ['agent-teams'],
       diagnostics: [],
     },
     probeError: null,
