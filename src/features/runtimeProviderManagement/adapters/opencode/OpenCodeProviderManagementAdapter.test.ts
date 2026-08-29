@@ -7763,9 +7763,71 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
-  test('returns timeout instead of stale evidence when current identity cannot be proven', async () => {
-    let hangInventory = false
+  test('rejects catalog evidence when effective source scope changes during preparation', async () => {
+    const previousConfig = process.env.OPENCODE_CONFIG_CONTENT
+    let changeScopeDuringPreparation = false
+    let providerCalls = 0
+    const firstConfig = JSON.stringify({
+      provider: { local: { options: { baseURL: 'http://first.invalid/v1' } } },
+    })
+    const changedConfig = JSON.stringify({
+      provider: { local: { options: { baseURL: 'http://changed.invalid/v1' } } },
+    })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: {
+        probe: async () => {
+          if (changeScopeDuringPreparation) process.env.OPENCODE_CONFIG_CONTENT = changedConfig
+          return inventory({ models: [], availableProviders: [] })
+        },
+      },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => {
+          providerCalls += 1
+          return {
+            all: [{ id: 'local', name: 'Local', models: { initial: {} } }],
+            connected: [],
+            default: {},
+          }
+        },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const input = {
+      runtimeId: 'opencode' as const,
+      providerId: 'local',
+      projectPath: '/tmp/project',
+    }
+
+    try {
+      process.env.OPENCODE_CONFIG_CONTENT = firstConfig
+      expect((await adapter.loadModels(input)).ok).toBe(true)
+      expect(providerCalls).toBe(1)
+      expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size)
+        .toBe(1)
+
+      changeScopeDuringPreparation = true
+      const changed = await adapter.loadModels(input)
+
+      expect(changed).toMatchObject({
+        ok: false,
+        error: { message: 'OpenCode catalog request failed.' },
+      })
+      expect(providerCalls).toBe(1)
+      expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size)
+        .toBe(1)
+      expect(JSON.stringify(changed)).not.toContain('changed.invalid')
+    } finally {
+      if (previousConfig === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+      else process.env.OPENCODE_CONFIG_CONTENT = previousConfig
+    }
+  })
+
+  test('rejects before preparation when current catalog identity cannot be proven', async () => {
     let identityReadError = false
+    let probeCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 200,
       inventoryTimeoutMs: 5_000,
@@ -7779,9 +7841,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       inventoryService: {
-        probe: async () => hangInventory
-          ? new Promise<OpenCodeInventorySnapshot>(() => {})
-          : inventory({ models: [], availableProviders: [] }),
+        probe: async () => {
+          probeCalls += 1
+          return inventory({ models: [], availableProviders: [] })
+        },
       },
       hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
       clientFactory: { create: () => ({
@@ -7794,13 +7857,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
     const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
     expect((await adapter.loadModels(input)).ok).toBe(true)
-    hangInventory = true
     identityReadError = true
 
     const timedOut = await adapter.loadModels(input)
 
     expect(timedOut.ok).toBe(false)
-    if (!timedOut.ok) expect(timedOut.error.message).toContain('timed out')
+    if (!timedOut.ok) expect(timedOut.error.message).toBe('OpenCode catalog request failed.')
+    expect(probeCalls).toBe(1)
   })
 
   test.each(['profile preparation', 'host startup'] as const)(
@@ -8050,7 +8113,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/tmp/project',
       })
       expect(result.ok).toBe(true)
-      expect(identityReads).toBe(2)
+      expect(identityReads).toBe(3)
     } finally {
       if (previousData === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
       else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousData
