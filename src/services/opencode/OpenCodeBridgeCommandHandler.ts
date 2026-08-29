@@ -42,6 +42,7 @@ import {
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
@@ -2435,6 +2436,31 @@ async function runReadiness(
       }
       assertOpenCodeLaunchRuntimeAvailable(retained.snapshot)
       if (!retained.host) throw new Error('OpenCode readiness retained host is unavailable')
+      const selectedAccess = evaluateOpenCodeModelAccess({
+        selectedModel: qualifiedSelectedModel.raw,
+        catalog: getOpenCodeAccessPolicyCatalog(retained.snapshot),
+      })
+      const selectedProviderCatalogued = retained.snapshot.configProviders?.providers
+        ?.some(provider => canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
+          === qualifiedSelectedModel.providerId) === true
+      if (selectedProviderCatalogued && (selectedAccess.kind === 'unknown_model'
+        || selectedAccess.kind === 'not_authenticated')) {
+        const data = readinessData(
+          retained.snapshot, qualifiedSelectedModel.raw, undefined,
+          skippedAppMcpToolProof(), true,
+        )
+        data.state = selectedAccess.kind === 'unknown_model'
+          ? 'model_unavailable' : 'not_authenticated'
+        data.launchAllowed = false
+        data.supportLevel = null
+        data.missing = [selectedAccess.reason ?? (selectedAccess.kind === 'unknown_model'
+          ? 'OpenCode selected model is unavailable'
+          : 'OpenCode selected model provider is not connected')]
+        return {
+          snapshot: retained.snapshot,
+          data,
+        }
+      }
       if (!shouldProbeSelectedModel) {
         const toolProof = await runDirectToolProof(retained.host)
         const data = readinessData(
@@ -3095,15 +3121,6 @@ async function runLaunch(
     await retainedProbe.release().catch(() => undefined)
     throw new Error('OpenCode strict launch behavior precondition mismatch')
   }
-  if (!await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
-    host,
-    selectedModel: apiSelectedModel,
-    expectedBehaviorFingerprint,
-  })) {
-    await retainedProbe.release().catch(() => undefined)
-    throw new Error('OpenCode strict launch live authority is unavailable')
-  }
-
   const memberInputs = new Map<string, {
     name: string
     prompt: string
@@ -3169,12 +3186,23 @@ async function runLaunch(
     }
   }
   let requiredMcpContractConfigIdentity: string | null = null
-  const matchesCurrentExpectedBehavior = async (): Promise<boolean> => {
+  const matchesCurrentExpectedBehavior = async (signal: AbortSignal): Promise<boolean> => {
     return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
       host,
       selectedModel: apiSelectedModel,
       expectedBehaviorFingerprint,
       contractConfigIdentity: requiredMcpContractConfigIdentity,
+      phaseContext: {
+        phase: 'post_probe_refresh',
+        signal,
+        remainingMs: () => Math.max(0, workDeadlineAt - Date.now()),
+        throwIfExpired: () => {
+          if (signal.aborted) throwOpenCodeAbortReason(signal)
+          if (Date.now() >= workDeadlineAt) {
+            throw new Error('OpenCode strict launch authority refresh deadline expired')
+          }
+        },
+      },
     })) !== null
   }
   const ports: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft> = {
@@ -3191,7 +3219,7 @@ async function runLaunch(
         if (signal.aborted) throwOpenCodeAbortReason(signal)
         return { kind: 'failure', error: 'retained host identity mismatch' }
       }
-      if (!await matchesCurrentExpectedBehavior()) {
+      if (!await matchesCurrentExpectedBehavior(signal)) {
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed before proof' }
       }
       const remainingMs = () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs)
@@ -3218,7 +3246,7 @@ async function runLaunch(
       appMcpProof.contractConfigIdentity = hashStable(launchConfig.config)
       requiredMcpContractConfigIdentity = appMcpProof.contractConfigIdentity
       if (!isAppMcpConnected(snapshot)
-        || !appMcpProof.ok || !await matchesCurrentExpectedBehavior()) {
+        || !appMcpProof.ok || !await matchesCurrentExpectedBehavior(signal)) {
         return { kind: 'failure', error: 'Agent Teams MCP retained connection/contract proof is unavailable' }
       }
       const expectedOutput = `STRICT_LAUNCH_${request.nonce}`
@@ -3253,7 +3281,7 @@ async function runLaunch(
       }
       // The exact-model probe can take long enough for config or credentials to
       // rotate. Seal the proof only after a final fresh read on this retained host.
-      if (!await matchesCurrentExpectedBehavior()) {
+      if (!await matchesCurrentExpectedBehavior(signal)) {
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed during proof' }
       }
       return {
@@ -3272,7 +3300,7 @@ async function runLaunch(
     },
     findCommitted: async (_context, member, signal) => {
       if (signal.aborted) throwOpenCodeAbortReason(signal)
-      if (!await matchesCurrentExpectedBehavior()) {
+      if (!await matchesCurrentExpectedBehavior(signal)) {
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
       }
       const input = memberInputs.get(member.memberId)!
@@ -3300,7 +3328,7 @@ async function runLaunch(
       if (strictHost.hostId !== host.hostKey) {
         return { kind: 'failure', error: 'materialization host identity mismatch' }
       }
-      if (!await matchesCurrentExpectedBehavior()) {
+      if (!await matchesCurrentExpectedBehavior(signal)) {
         return {
           kind: 'failure',
           error: 'OpenCode strict launch behavior changed before materialization',

@@ -1943,7 +1943,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'openrouter/minimax-m2.5-free',
+        selectedModel: 'raw-model',
         requireExecutionProbe: true,
       }),
     )
@@ -2856,6 +2856,48 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(proofCalls).toBe(1)
       })
     } finally { Date.now = realNow }
+  })
+
+  test('cancels a hanging initial authority refresh and releases the owned host', async () => {
+    await withManualTimers(async timers => {
+      let refreshSignal: AbortSignal | null = null
+      const refreshStarted = createDeferred<void>()
+      let releaseCalls = 0
+      openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+        snapshot,
+        host: snapshot.host,
+        release: async () => { releaseCalls += 1 },
+      })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      openCodeProvisioningProbe.refreshSelectedProfileAuthority = (async input => {
+        refreshSignal = input.phaseContext?.signal ?? null
+        refreshStarted.resolve()
+        return new Promise((_resolve, reject) => {
+          refreshSignal?.addEventListener('abort', () => reject(refreshSignal?.reason), { once: true })
+        })
+      }) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
+      let proofCalls = 0
+      openCodeExecutionProbe.probeModelOnHost = (async () => {
+        proofCalls += 1
+        throw new Error('proof must not run after authority refresh hangs')
+      }) as typeof openCodeExecutionProbe.probeModelOnHost
+      const envelope = buildEnvelope('opencode.launchTeam', {
+        runId: 'run-authority-refresh-timeout', laneId: 'primary',
+        teamId: 'team-a', selectedModel: 'deepinfra/chosen',
+        members: [{ name: 'alice' }],
+      })
+      envelope.timeoutMs = 1_000
+      const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
+      await refreshStarted.promise
+      expect(refreshSignal).not.toBeNull()
+      const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
+      expect(workTimer).toBeDefined()
+      workTimer!.callback()
+      const result = await resultPromise
+      expect(result.ok).toBe(false)
+      expect(refreshSignal?.aborted).toBe(true)
+      expect(proofCalls).toBe(0)
+      expect(releaseCalls).toBe(1)
+    })
   })
 
   test('fences abort-ignoring provisioning and releases only a late owned host in time', async () => {

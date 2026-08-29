@@ -95,6 +95,7 @@ export class OpenCodeProvisioningProbe {
     selectedModel: string
     expectedBehaviorFingerprint: string
     contractConfigIdentity?: string | null
+    phaseContext?: OpenCodePhaseContext
   }): Promise<OpenCodeHostHandle['profile'] | null> {
     const selected = parseOpenCodeProviderScopedModelRef(input.selectedModel)
     const profile = input.host.profile
@@ -125,11 +126,19 @@ export class OpenCodeProvisioningProbe {
       }, profile.env)
     }
     try {
-      const client = (this.deps.clientFactory ?? openCodeClientFactory).create(input.host.baseUrl)
+      input.phaseContext?.throwIfExpired()
+      const requestContext = input.phaseContext
+        ? { signal: input.phaseContext.signal, remainingMs: input.phaseContext.remainingMs }
+        : undefined
+      const client = (this.deps.clientFactory ?? openCodeClientFactory).create(
+        input.host.baseUrl,
+        requestContext,
+      )
       const [liveConfig, appMcp, behavior, scope] = await Promise.all([
         client.getConfig(),
         (this.deps.mcpManager ?? openCodeMcpManager).ensureAppMcp({
           baseUrl: input.host.baseUrl, attachIfMissing: false,
+          requestContext,
         }),
         collectProjectBehaviorMetadata(profile.canonicalProjectPath, process.env),
         resolveOpenCodeProfileScope({
@@ -137,6 +146,7 @@ export class OpenCodeProvisioningProbe {
           selectedModel: selected.raw, env: process.env,
         }),
       ])
+      input.phaseContext?.throwIfExpired()
       const live = liveConfig as Record<string, unknown>
       const liveMcp = (live.mcp as Record<string, unknown> | undefined)
         ?.[OPEN_CODE_APP_MCP_SERVER_NAME]
