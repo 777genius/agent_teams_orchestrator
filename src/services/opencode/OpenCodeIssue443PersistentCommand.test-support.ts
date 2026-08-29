@@ -1,317 +1,463 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-import { OpenCodeSessionBridge, isOpenCodeStrictSessionCompatible } from './OpenCodeSessionBridge.js'
-import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
-import { coordinateStrictLaunch } from './OpenCodeStrictLaunchCoordinator.js'
-import { ManualScheduler } from './OpenCodeIssue443FakeE2E.test-support.js'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
-import type { OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
+import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
+import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeSessionStore, openCodeSessionStore } from './OpenCodeSessionStore.js'
+
 import type {
-  StrictCommittedMember,
-  StrictLaunchPorts,
-  StrictLaunchResult,
-  StrictMaterializedMember,
-  StrictMember,
-  StrictProof,
-  StrictResource,
-} from './OpenCodeStrictLaunchCoordinator.js'
-
-type Projection = { member: string; sessionId: string; managerId: number }
-type PersistedFakeState = {
-  host: OpenCodeHostHandle
-  managerInvocations: number[]
-  creates: Array<{ managerId: number; member: string; sessionId: string }>
-  releases: Array<{ managerId: number; keepAlive: boolean }>
-}
+  OpenCodeHostHandle,
+  OpenCodePreparedProfile,
+  OpenCodeProvisioningSnapshot,
+  OpenCodeSessionRecord,
+} from './types.js'
 
 const teamId = 'team-443'
 const laneId = 'lane-443'
 const runId = 'run-443'
+const providerId = 'deepinfra'
 const modelId = 'deepinfra/meta-llama/Llama-3.3-70B-Instruct'
-const behaviorFingerprint = 'digest-443'
+const managedConfigFingerprint = createHash('sha256').update('{}').digest('hex')
+const projectBehaviorFingerprint = 'b'.repeat(64)
+const childFlag = 'OPENCODE_ISSUE443_COMMAND_CHILD'
 
-function bootstrap(member: string, sessionId: string) {
+export type PersistentInvocationMode = 'first-unknown' | 'restart' | 'stale' | 'unknown-proof'
+
+export type PersistentFakeEvent = {
+  type: 'adopt-profile' | 'authority' | 'proof' | 'member' | 'inject' | 'release-host' | 'release-session'
+  requestId: string
+  hostId?: string
+  projectPath?: string
+  purpose?: string
+  providerId?: string
+  modelId?: string
+  nonce?: string
+  attemptId?: string
+  generation?: number
+  fingerprint?: string
+  memberFingerprint?: string
+  member?: string
+  sessionId?: string
+  keepAlive?: boolean
+}
+
+export type PersistedFakeState = {
+  host: OpenCodeHostHandle
+  expectedBehaviorFingerprint: string
+  invocations: Array<{ requestId: string; pid: number; mode: PersistentInvocationMode }>
+  creates: Array<{ requestId: string; member: string; sessionId: string }>
+  events: PersistentFakeEvent[]
+}
+
+type ChildResult = Awaited<ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>>
+
+function profileFor(root: string): OpenCodePreparedProfile {
+  const projectPath = path.join(root, 'project')
+  const profileRoot = path.join(root, 'profile')
   return {
-    messageID: `message-${member}-${sessionId}`,
-    contextHash: `context-${member}`,
-    briefingHash: `briefing-${member}`,
-    agent: 'teammate',
+    projectPath,
+    canonicalProjectPath: projectPath,
+    workingDirectoryPath: projectPath,
+    scopeToken: 'launch-scope-443',
+    profileRootKey: 'fake-profile-443',
+    profileRootPath: profileRoot,
+    profileScope: {
+      purpose: 'launch_runtime',
+      providerId,
+      configFingerprint: managedConfigFingerprint,
+      selectedAuthIdentity: 'absent',
+      scopeToken: 'launch-scope-443',
+    },
+    projectDefaultModelId: null,
+    allProjectsDefaultModelId: null,
+    effectiveManagedDefaultModelId: null,
+    effectiveManagedDefaultSource: null,
+    projectBehaviorFingerprint,
+    behaviorSources: [],
+    managedConfig: {},
+    managedConfigFingerprint,
+    homePath: path.join(profileRoot, 'home'),
+    tmpPath: path.join(profileRoot, 'tmp'),
+    xdgConfigHome: path.join(profileRoot, 'config'),
+    xdgDataHome: path.join(profileRoot, 'data'),
+    xdgCacheHome: path.join(profileRoot, 'cache'),
+    globalAuthPath: path.join(root, 'source-auth.json'),
+    managedAuthPath: path.join(profileRoot, 'data/opencode/auth.json'),
+    sourceAuthPath: path.join(root, 'source-auth.json'),
+    sourceAuthFingerprint: 'source-auth-443',
+    managedAuthFingerprint: 'managed-auth-443',
+    authState: 'ok',
+    env: {},
   }
 }
 
-function completeRecord(record: OpenCodeSessionRecord, member: string): OpenCodeSessionRecord {
-  const expected = bootstrap(member, record.opencodeSessionId)
+function hostFor(root: string): OpenCodeHostHandle {
+  const profile = profileFor(root)
   return {
-    ...record,
-    bootstrapEvidenceSource: 'app_managed_bootstrap',
-    appManagedBootstrap: {
-      schemaVersion: 1,
-      ...expected,
-      injectionVerifiedAt: '2026-08-29T00:00:00.000Z',
-      model: modelId,
+    hostKey: 'fake-retained-host-443',
+    profileRootKey: profile.profileRootKey,
+    projectPath: profile.projectPath,
+    projectBehaviorFingerprint,
+    baseUrl: 'http://fake-host.invalid',
+    port: 443,
+    pid: 44301,
+    version: 'fake-443',
+    state: 'healthy',
+    profile,
+    resolvedConfigFingerprint: managedConfigFingerprint,
+    diagnostics: [],
+  }
+}
+
+function snapshotFor(state: PersistedFakeState): OpenCodeProvisioningSnapshot {
+  return {
+    detected: true,
+    hostHealthy: true,
+    projectPath: state.host.projectPath,
+    profile: state.host.profile,
+    host: state.host,
+    config: null,
+    configProviders: {
+      providers: [{
+        id: providerId,
+        models: { 'meta-llama/Llama-3.3-70B-Instruct': {} },
+      }],
+      default: { [providerId]: 'meta-llama/Llama-3.3-70B-Instruct' },
     },
+    providers: {
+      connected: [providerId],
+      default: { [providerId]: 'meta-llama/Llama-3.3-70B-Instruct' },
+    },
+    providerAuth: null,
+    agents: [],
+    mcp: {},
+    appMcp: {
+      serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
+      connected: true, launchSource: 'workspace-src', availableServerNames: ['agent-teams'],
+      diagnostics: [],
+    },
+    probeError: null,
+    diagnostics: [],
+  }
+}
+
+function incompleteRecord(
+  state: PersistedFakeState,
+  member: string,
+  sessionId: string,
+): OpenCodeSessionRecord {
+  return {
+    teamId,
+    laneId,
+    memberName: member,
+    providerId: 'opencode',
+    selectedModel: modelId,
+    projectPath: state.host.projectPath,
+    profileRootKey: state.host.profileRootKey,
+    profileScope: state.host.profile.profileScope,
+    hostKey: state.host.hostKey,
+    toolApprovalMode: 'auto',
+    resolvedBehaviorFingerprint: state.host.resolvedConfigFingerprint,
+    opencodeSessionId: sessionId,
+    lastCanonicalCursor: null,
+    lastKnownRawStatus: null,
+    lastKnownDurableState: 'idle',
+    sourceAuthFingerprint: state.host.profile.sourceAuthFingerprint,
+    managedAuthFingerprint: state.host.profile.managedAuthFingerprint,
+    projectBehaviorFingerprint: state.host.projectBehaviorFingerprint,
+    managedConfigFingerprint: state.host.profile.managedConfigFingerprint,
+    expectedBehaviorFingerprint: state.expectedBehaviorFingerprint,
+    staleReason: null,
+    createdAt: '2026-08-29T00:00:00.000Z',
     updatedAt: '2026-08-29T00:00:00.000Z',
   }
 }
 
-class PersistentLaunchManager implements StrictLaunchPorts<string, string, Projection> {
-  readonly store: OpenCodeSessionStore
-  readonly bridge: OpenCodeSessionBridge
-  private readonly scheduler = new ManualScheduler()
-  private operationSettled: Promise<void> = Promise.resolve()
+const requiredMcpTools = [
+  'cross_team_get_outbox', 'cross_team_list_targets', 'cross_team_send', 'member_briefing',
+  'message_send', 'process_list', 'process_register', 'process_stop', 'process_unregister',
+  'review_approve', 'review_request', 'review_request_changes', 'review_start',
+  'runtime_bootstrap_checkin', 'runtime_deliver_message', 'runtime_task_event',
+  'runtime_heartbeat', 'task_add_comment', 'task_attach_comment_file', 'task_attach_file',
+  'task_briefing', 'task_complete', 'task_create', 'task_create_from_message', 'task_get',
+  'task_get_comment', 'task_link', 'task_list', 'task_set_clarification', 'task_set_owner',
+  'task_set_status', 'task_start', 'task_unlink',
+]
 
-  constructor(
-    private readonly owner: Issue443PersistentCommandFake,
-    private readonly managerId: number,
-    private readonly attemptId: string,
-    private readonly controller: AbortController,
-    private readonly cancelAfterKnownCreate: string | null,
-  ) {
-    this.store = new OpenCodeSessionStore(owner.storePath)
-    this.bridge = new OpenCodeSessionBridge({
-      sessionStore: this.store,
-      hostManager: {
-        ensureHost: async () => { throw new Error('one-shot fake must use its persisted retained host') },
-        releaseHost: async () => {},
-        retainHostLease: async () => {},
-        releaseHostLease: async () => {},
-      },
-      clientFactory: {
-        create: baseUrl => ({
-          createSession: async ({ title }: { title?: string }) => {
-            const state = await owner.readState()
-            if (baseUrl !== state.host.baseUrl) throw new Error('non-fake host escaped persistent harness')
-            const member = title?.split(' - ').at(-1) ?? 'unknown'
-            const sessionId = `session-${member}-${state.creates.length + 1}`
-            state.creates.push({ managerId, member, sessionId })
-            await owner.writeState(state)
-            if (member === cancelAfterKnownCreate) {
-              controller.abort(new Error(`cancelled after known create for ${member}`))
-            }
-            return { id: sessionId }
-          },
-        }) as never,
-      },
-    })
+async function runChild(root: string, requestId: string, mode: PersistentInvocationMode): Promise<ChildResult> {
+  // The production deadline/scheduler boundary sees a fixed clock. Child exit,
+  // durable file writes, and awaited process completion are the only barriers.
+  Date.now = () => Date.parse('2026-08-29T00:00:00.000Z')
+  const statePath = path.join(root, 'fake-state.json')
+  const store = new OpenCodeSessionStore(path.join(root, 'session-store.json'))
+  const readState = async () => JSON.parse(await readFile(statePath, 'utf8')) as PersistedFakeState
+  const writeState = async (state: PersistedFakeState) => {
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  }
+  const recordEvent = async (event: PersistentFakeEvent) => {
+    const state = await readState()
+    state.events.push(event)
+    await writeState(state)
   }
 
-  async execute(): Promise<StrictLaunchResult<Projection>> {
-    const state = await this.owner.readState()
-    state.managerInvocations.push(this.managerId)
-    await this.owner.writeState(state)
-    const result = await coordinateStrictLaunch({
-      attemptId: this.attemptId,
+  const initial = await readState()
+  initial.invocations.push({ requestId, pid: process.pid, mode })
+  await writeState(initial)
+
+  ;(Client.prototype.connect as unknown as () => Promise<void>) = async () => {}
+  ;(Client.prototype.listTools as unknown as () => Promise<{ tools: Array<{ name: string }> }>) =
+    async () => ({ tools: requiredMcpTools.map(name => ({ name })) })
+  ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+
+  openCodeProvisioningProbe.probeRetainingHost = (async (projectPath, options) => {
+    const state = await readState()
+    if (projectPath !== state.host.projectPath || options.selectedModel !== modelId) {
+      throw new Error('fake command escaped its adopted project/model profile')
+    }
+    await recordEvent({
+      type: 'adopt-profile', requestId, hostId: state.host.hostKey, projectPath,
+      purpose: state.host.profile.profileScope?.purpose,
+      providerId: state.host.profile.profileScope?.providerId,
+      modelId: options.selectedModel,
+      attemptId: requestId,
       generation: 1,
-      nonce: `nonce-${this.managerId}`,
-      providerId: 'deepinfra',
-      modelId,
-      behaviorFingerprint,
-      mcpTools: ['app_status'],
-      members: [
-        { memberId: 'one', memberFingerprint: 'briefing-one' },
-        { memberId: 'two', memberFingerprint: 'briefing-two' },
-      ],
-      workContext: 'work',
-      cleanupContext: 'cleanup',
-      hostLease: { leaseId: `lease-${this.managerId}`, expectedHostId: state.host.hostKey },
-      deadlineAt: 100,
-      cleanupReserveMs: 20,
-      signal: this.controller.signal,
-      scheduler: this.scheduler,
-    }, this)
-    // The coordinator intentionally stops waiting after cancellation. The fake
-    // handler still joins its known create so the next invocation is truly a
-    // fresh process boundary over durable state, never a discarded promise.
-    await this.operationSettled
-    return result
-  }
-
-  snapshotProjection(value: Projection): Projection { return { ...value } }
-
-  async acquireHost() {
-    const state = await this.owner.readState()
-    return { kind: 'ok' as const, value: { hostId: state.host.hostKey } }
-  }
-
-  async requestProof(_work: string, host: { hostId: string }, request: Omit<StrictProof, 'hostId'>) {
-    return { kind: 'ok' as const, value: { ...request, hostId: host.hostId } }
-  }
-
-  async findCommitted(
-    _work: string,
-    member: StrictMember,
-  ): Promise<{ kind: 'ok'; value: StrictCommittedMember<Projection> | null }> {
-    const state = await this.owner.readState()
-    const record = await this.store.get(teamId, laneId, member.memberId)
-    if (!record || !isOpenCodeStrictSessionCompatible(record, {
-      teamId,
-      laneId,
-      memberName: member.memberId,
-      selectedModel: modelId,
-      host: state.host,
-      toolApprovalMode: 'auto',
-      expectedBehaviorFingerprint: behaviorFingerprint,
-      bootstrap: bootstrap(member.memberId, record.opencodeSessionId),
-    })) return { kind: 'ok', value: null }
+      fingerprint: state.expectedBehaviorFingerprint,
+    })
     return {
-      kind: 'ok',
-      value: {
-        memberId: member.memberId,
-        memberFingerprint: member.memberFingerprint,
-        behaviorFingerprint,
-        projection: { member: member.memberId, sessionId: record.opencodeSessionId, managerId: this.managerId },
-      },
+      snapshot: snapshotFor(state),
+      host: state.host,
+      release: async (keepAlive?: boolean) => recordEvent({
+        type: 'release-host', requestId, hostId: state.host.hostKey, keepAlive,
+      }),
     }
-  }
+  }) as typeof openCodeProvisioningProbe.probeRetainingHost
 
-  async projectCommitted() { return { kind: 'ok' as const, value: undefined } }
+  openCodeProvisioningProbe.refreshSelectedProfileAuthority = (async input => {
+    const state = await readState()
+    await recordEvent({
+      type: 'authority', requestId, hostId: input.host.hostKey,
+      projectPath: input.host.projectPath, providerId, modelId: input.selectedModel,
+      attemptId: requestId, generation: 1, fingerprint: input.expectedBehaviorFingerprint,
+    })
+    return mode === 'stale' ? null : state.host.profile
+  }) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
 
-  async materialize(
-    _work: string,
-    _host: { hostId: string },
-    member: StrictMember,
-  ): Promise<{ kind: 'ok'; value: StrictMaterializedMember<Projection> } | { kind: 'unknown'; error: string }> {
-    const state = await this.owner.readState()
-    let settle!: () => void
-    this.operationSettled = new Promise<void>(resolve => { settle = resolve })
-    try {
-      const materialized = await this.bridge.materializeSessionOnHost({
-        teamId,
-        laneId,
-        memberName: member.memberId,
-        selectedModel: modelId,
-        title: `${teamId} - ${member.memberId}`,
-        runId,
-        attemptId: this.attemptId,
-        host: state.host,
-        signal: this.controller.signal,
-        remainingMs: () => 1_000,
-        expectedBehaviorFingerprint: behaviorFingerprint,
-        expectedBootstrapForSession: sessionId => bootstrap(member.memberId, sessionId),
+  openCodeExecutionProbe.probeModelOnHost = (async input => {
+    const nonce = input.expectedOutput?.replace(/^STRICT_LAUNCH_/, '') ?? ''
+    const state = await readState()
+    await recordEvent({
+      type: 'proof', requestId, hostId: input.host.hostKey, projectPath: input.host.projectPath,
+      providerId, modelId: input.selectedModel, nonce, attemptId: requestId, generation: 1,
+      fingerprint: state.expectedBehaviorFingerprint,
+    })
+    const common = {
+      providerId: 'opencode' as const,
+      modelId: input.selectedModel,
+      observedProviderId: providerId,
+      observedModelId: modelId.slice(providerId.length + 1),
+      probePrompt: input.prompt ?? '',
+      expectedOutput: input.expectedOutput ?? '',
+      durationMs: 0,
+      rawStatus: 'idle',
+      durableState: 'idle' as const,
+      latestAssistantPreview: input.expectedOutput ?? null,
+      toolCallCount: 0,
+      errorCount: 0,
+      diagnostics: [],
+      verifiedAt: '2026-08-29T00:00:00.000Z',
+    }
+    if (mode === 'unknown-proof') return {
+      ...common, outcome: 'unknown' as const, reason: 'fake proof acknowledgement unknown',
+      latestAssistantText: null,
+    }
+    return {
+      ...common, outcome: 'available' as const, reason: null,
+      latestAssistantText: input.expectedOutput ?? null,
+    }
+  }) as typeof openCodeExecutionProbe.probeModelOnHost
+
+  openCodeSessionStore.get = store.get.bind(store)
+  openCodeSessionStore.upsert = store.upsert.bind(store)
+  openCodeSessionStore.releaseMaterializationOwner = store.releaseMaterializationOwner.bind(store)
+  openCodeSessionStore.markStaleIfSession = store.markStaleIfSession.bind(store)
+  openCodeSessionStore.deleteIfSession = store.deleteIfSession.bind(store)
+
+  openCodeSessionBridge.materializeSessionOnHost = (async input => {
+    const state = await readState()
+    const proof = [...state.events].reverse().find(event =>
+      event.requestId === requestId && event.type === 'proof')
+    if (!proof || proof.hostId !== state.host.hostKey || proof.modelId !== modelId || !proof.nonce) {
+      throw new Error('member side effect attempted before exact retained-host proof')
+    }
+    const existing = await store.get(teamId, laneId, input.memberName)
+    if (existing) {
+      const expectedBootstrap = input.expectedBootstrapForSession(existing.opencodeSessionId)
+      await recordEvent({
+        type: 'member', requestId, hostId: input.host.hostKey, member: input.memberName,
+        sessionId: existing.opencodeSessionId, attemptId: requestId, generation: 1,
+        providerId, modelId, fingerprint: input.expectedBehaviorFingerprint,
+        memberFingerprint: expectedBootstrap.briefingHash,
       })
-      if (!materialized.created && !materialized.resumeBootstrap) {
-        return { kind: 'unknown', error: 'incomplete committed session replayed during materialization' }
-      }
-      const record = completeRecord(materialized.record, member.memberId)
-      await this.store.upsert(record)
-      return {
-        kind: 'ok',
-        value: {
-          attemptId: this.attemptId,
-          generation: 1,
-          memberId: member.memberId,
-          memberFingerprint: member.memberFingerprint,
-          behaviorFingerprint,
-          projection: { member: member.memberId, sessionId: record.opencodeSessionId, managerId: this.managerId },
-          resource: {
-            attemptId: this.attemptId,
-            generation: 1,
-            resourceId: record.opencodeSessionId,
-            committed: true,
-          },
-        },
-      }
-    } catch (error) {
-      return { kind: 'unknown', error: error instanceof Error ? error.message : String(error) }
-    } finally {
-      settle()
+      return { record: existing, created: false, resumeBootstrap: true }
     }
-  }
+    const next = await readState()
+    const sessionId = `session-${input.memberName}-${next.creates.length + 1}`
+    const record = incompleteRecord(next, input.memberName, sessionId)
+    const expectedBootstrap = input.expectedBootstrapForSession(sessionId)
+    next.creates.push({ requestId, member: input.memberName, sessionId })
+    next.events.push({
+      type: 'member', requestId, hostId: input.host.hostKey, member: input.memberName,
+      sessionId, attemptId: requestId, generation: 1, providerId, modelId,
+      fingerprint: input.expectedBehaviorFingerprint,
+      memberFingerprint: expectedBootstrap.briefingHash,
+    })
+    await writeState(next)
+    await store.upsert(record)
+    if (mode === 'first-unknown' && input.memberName === 'two') {
+      throw new Error('fake create acknowledgement unknown')
+    }
+    return { record, created: true }
+  }) as typeof openCodeSessionBridge.materializeSessionOnHost
 
-  async cleanup(_cleanup: string, _resources: StrictResource[]): Promise<void> {}
+  openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
+    ok: true, status: 'present', connected: true, runtimePid: record.runtimePid, diagnostics: [],
+  })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+  openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+    await recordEvent({
+      type: 'inject', requestId, hostId: record.hostKey, member: record.memberName,
+      sessionId: record.opencodeSessionId, attemptId: requestId, generation: 1,
+      providerId, modelId: record.selectedModel, fingerprint: record.expectedBehaviorFingerprint,
+    })
+    return {
+      messageID: input.messageID,
+      runtimeSessionId: record.opencodeSessionId,
+      contextHash: input.contextHash,
+      briefingHash: input.briefingHash,
+      injectionVerifiedAt: '2026-08-29T00:00:00.000Z',
+      alreadyPresent: false,
+    }
+  }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+  openCodeSessionBridge.releaseSession = (async record => {
+    await recordEvent({
+      type: 'release-session', requestId, member: record.memberName,
+      sessionId: record.opencodeSessionId,
+    })
+  }) as typeof openCodeSessionBridge.releaseSession
 
-  async releaseHost(_cleanup: string, _lease: unknown, keepAlive: boolean): Promise<void> {
-    const state = await this.owner.readState()
-    state.releases.push({ managerId: this.managerId, keepAlive })
-    await this.owner.writeState(state)
-  }
+  return executeOpenCodeBridgeCommandEnvelope({
+    schemaVersion: 1,
+    requestId,
+    command: 'opencode.launchTeam',
+    cwd: initial.host.projectPath,
+    startedAt: '2026-08-29T00:00:00.000Z',
+    timeoutMs: 60_000,
+    body: {
+      runId,
+      laneId,
+      teamId,
+      teamName: teamId,
+      projectPath: initial.host.projectPath,
+      selectedModel: modelId,
+      members: [
+        { name: 'one', prompt: 'One joins the fake team.' },
+        { name: 'two', prompt: 'Two joins the fake team.' },
+      ],
+      preconditions: {
+        handshakeIdentityHash: 'fake-handshake-443',
+        laneId,
+        expectedRunId: runId,
+        expectedCapabilitySnapshotId: null,
+        expectedBehaviorFingerprint: initial.expectedBehaviorFingerprint,
+        expectedManifestHighWatermark: 0,
+        commandLeaseId: 'lease-443',
+        idempotencyKey: `launch:${runId}`,
+      },
+    },
+  })
 }
 
 export class Issue443PersistentCommandFake {
   root = ''
   storePath = ''
-  private statePath = ''
-  private nextManagerId = 0
+  statePath = ''
+  private invocation = 0
 
   async open(): Promise<void> {
-    this.root = await mkdtemp(path.join(os.tmpdir(), 'opencode-issue443-persistent-'))
+    this.root = await mkdtemp(path.join(os.tmpdir(), 'opencode-issue443-command-boundary-'))
     this.storePath = path.join(this.root, 'session-store.json')
-    this.statePath = path.join(this.root, 'profile-host.json')
-    const profileRoot = path.join(this.root, 'profile')
-    const host: OpenCodeHostHandle = {
-      hostKey: 'fake-retained-host',
-      profileRootKey: 'fake-profile',
-      projectPath: path.join(this.root, 'project'),
-      projectBehaviorFingerprint: 'project-behavior-443',
-      baseUrl: 'http://fake-host.invalid',
-      port: 443,
-      pid: 44301,
-      version: 'fake-443',
-      state: 'healthy',
-      resolvedConfigFingerprint: 'resolved-config-443',
-      diagnostics: [],
-      profile: {
-        projectPath: path.join(this.root, 'project'),
-        canonicalProjectPath: path.join(this.root, 'project'),
-        workingDirectoryPath: path.join(this.root, 'project'),
-        scopeToken: null,
-        profileRootKey: 'fake-profile',
-        profileRootPath: profileRoot,
-        projectDefaultModelId: null,
-        allProjectsDefaultModelId: null,
-        effectiveManagedDefaultModelId: null,
-        effectiveManagedDefaultSource: null,
-        projectBehaviorFingerprint: 'project-behavior-443',
-        behaviorSources: [],
-        managedConfig: {},
-        managedConfigFingerprint: 'managed-config-443',
-        homePath: path.join(profileRoot, 'home'),
-        tmpPath: path.join(profileRoot, 'tmp'),
-        xdgConfigHome: path.join(profileRoot, 'config'),
-        xdgDataHome: path.join(profileRoot, 'data'),
-        xdgCacheHome: path.join(profileRoot, 'cache'),
-        globalAuthPath: path.join(this.root, 'source-auth.json'),
-        managedAuthPath: path.join(profileRoot, 'data/opencode/auth.json'),
-        sourceAuthPath: path.join(this.root, 'source-auth.json'),
-        sourceAuthFingerprint: 'source-auth-443',
-        managedAuthFingerprint: 'managed-auth-443',
-        authState: 'ok',
-        env: {},
-      },
-    }
-    await this.writeState({ host, managerInvocations: [], creates: [], releases: [] })
+    this.statePath = path.join(this.root, 'fake-state.json')
+    const host = hostFor(this.root)
+    await mkdir(host.profile.projectPath, { recursive: true })
+    const expectedBehaviorFingerprint = (await buildOpenCodeExpectedBehaviorEvidence({
+      profile: host.profile,
+      fullModelId: modelId,
+      effectiveConfigFingerprint: host.resolvedConfigFingerprint,
+    })).expectedBehaviorFingerprint
+    await writeFile(this.statePath, `${JSON.stringify({
+      host, expectedBehaviorFingerprint, invocations: [], creates: [], events: [],
+    } satisfies PersistedFakeState, null, 2)}\n`)
   }
 
   async close(): Promise<void> {
+    if (!path.basename(this.root).startsWith('opencode-issue443-command-boundary-')) {
+      throw new Error(`refusing non-owned cleanup: ${this.root}`)
+    }
     await rm(this.root, { recursive: true, force: true })
   }
 
-  async invokeOneShot(options: { cancelAfterKnownCreate?: string } = {}) {
-    const managerId = ++this.nextManagerId
-    const controller = new AbortController()
-    const manager = new PersistentLaunchManager(
-      this,
-      managerId,
-      `request-${managerId}`,
-      controller,
-      options.cancelAfterKnownCreate ?? null,
-    )
-    return manager.execute()
+  async invokeOneShot(mode: PersistentInvocationMode): Promise<ChildResult> {
+    const requestId = `request-${++this.invocation}`
+    const source = fileURLToPath(import.meta.url)
+    const child = Bun.spawn([process.execPath, source], {
+      cwd: this.root,
+      env: {
+        ...process.env,
+        [childFlag]: '1',
+        OPENCODE_ISSUE443_ROOT: this.root,
+        OPENCODE_ISSUE443_REQUEST_ID: requestId,
+        OPENCODE_ISSUE443_MODE: mode,
+        HOME: path.join(this.root, 'home'),
+        XDG_CONFIG_HOME: path.join(this.root, 'xdg-config'),
+        XDG_DATA_HOME: path.join(this.root, 'xdg-data'),
+        XDG_CACHE_HOME: path.join(this.root, 'xdg-cache'),
+        TMPDIR: path.join(this.root, 'tmp'),
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: process.execPath,
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: source,
+        AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH: path.join(this.root, `mcp-proof-${requestId}.json`),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    if (exitCode !== 0) throw new Error(`fake command child exited ${exitCode}: ${stderr}`)
+    return JSON.parse(stdout) as ChildResult
   }
 
   async sessions(): Promise<OpenCodeSessionRecord[]> {
     return new OpenCodeSessionStore(this.storePath).list()
   }
 
-  async evidence(): Promise<PersistedFakeState> { return this.readState() }
-
-  async readState(): Promise<PersistedFakeState> {
+  async evidence(): Promise<PersistedFakeState> {
     return JSON.parse(await readFile(this.statePath, 'utf8')) as PersistedFakeState
   }
+}
 
-  async writeState(state: PersistedFakeState): Promise<void> {
-    await writeFile(this.statePath, `${JSON.stringify(state, null, 2)}\n`)
-  }
+if (process.env[childFlag] === '1') {
+  const root = process.env.OPENCODE_ISSUE443_ROOT
+  const requestId = process.env.OPENCODE_ISSUE443_REQUEST_ID
+  const mode = process.env.OPENCODE_ISSUE443_MODE as PersistentInvocationMode | undefined
+  if (!root || !requestId || !mode) throw new Error('incomplete issue443 fake child contract')
+  process.stdout.write(JSON.stringify(await runChild(root, requestId, mode)))
 }

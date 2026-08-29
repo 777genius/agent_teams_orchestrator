@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
@@ -25,9 +25,14 @@ describe('issue #443 strict launch fake E2E', () => {
     await persistent.close()
   })
 
-  test('fresh second one-shot invocation resumes the exact known session-two-2 after cancellation', async () => {
-    const failed = await persistent.invokeOneShot({ cancelAfterKnownCreate: 'two' })
-    expect(failed).toMatchObject({ status: 'stopped', committedMemberIds: ['one'] })
+  test('production command envelope adopts one retained fake profile and replays across Bun processes', async () => {
+    const failed = await persistent.invokeOneShot('first-unknown')
+    expect(failed.ok).toBe(true)
+    if (!failed.ok) throw new Error(JSON.stringify(failed))
+    expect(Object.keys(failed.data.members)).toEqual(['one'])
+    expect(failed.data.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'opencode_strict_launch_unknown' }),
+    ]))
 
     const afterFailure = await persistent.sessions()
     expect(afterFailure.find(record => record.memberName === 'one')).toMatchObject({
@@ -38,53 +43,86 @@ describe('issue #443 strict launch fake E2E', () => {
     expect(incompleteTwo?.opencodeSessionId).toBe('session-two-2')
     expect(incompleteTwo?.bootstrapEvidenceSource).toBeUndefined()
 
-    const retried = await persistent.invokeOneShot()
-    expect(retried).toMatchObject({ status: 'committed', committedMemberIds: ['one', 'two'] })
-    expect(retried.projections.map(projection => projection.member)).toEqual(['one', 'two'])
+    const retried = await persistent.invokeOneShot('restart')
+    expect(retried.ok).toBe(true)
+    if (!retried.ok) throw new Error(JSON.stringify(retried))
+    expect(Object.keys(retried.data.members)).toEqual(['one', 'two'])
+    expect(retried.data.members.two?.sessionId).toBe('session-two-2')
 
     const evidence = await persistent.evidence()
-    expect(evidence.managerInvocations).toEqual([1, 2])
+    expect(evidence.invocations.map(item => [item.requestId, item.mode])).toEqual([
+      ['request-1', 'first-unknown'],
+      ['request-2', 'restart'],
+    ])
+    expect(new Set(evidence.invocations.map(item => item.pid)).size).toBe(2)
+    expect(evidence.invocations.every(item => item.pid !== process.pid)).toBe(true)
     expect(evidence.creates).toEqual([
-      { managerId: 1, member: 'one', sessionId: 'session-one-1' },
-      { managerId: 1, member: 'two', sessionId: 'session-two-2' },
+      { requestId: 'request-1', member: 'one', sessionId: 'session-one-1' },
+      { requestId: 'request-1', member: 'two', sessionId: 'session-two-2' },
     ])
     const sessions = await persistent.sessions()
     expect(sessions.map(record => [record.memberName, record.opencodeSessionId]).sort()).toEqual([
       ['one', 'session-one-1'],
       ['two', 'session-two-2'],
     ])
-    expect(evidence.creates.some(create => create.sessionId === 'session-two-3')).toBe(false)
-  })
-
-  test('one retained host carries App MCP, exact proof, profile identity, and committed members', async () => {
-    const harness = new Issue443Harness()
-    const result = await coordinateStrictLaunch(harness.strictRequest(), harness)
-
-    expect(result).toMatchObject({ status: 'committed', committedMemberIds: ['one', 'two'] })
-    expect(harness.profiles).toEqual([{
-      purpose: 'launch_runtime', providerId: 'deepinfra', modelId: harness.catalogModel,
-    }])
-    expect(harness.hosts).toEqual([{
-      hostId: 'launch-host', baseUrl: 'http://fake-host.invalid', retained: true,
+    const adoptions = evidence.events.filter(event => event.type === 'adopt-profile')
+    expect(adoptions).toHaveLength(2)
+    expect(adoptions).toEqual(adoptions.map(event => expect.objectContaining({
+      hostId: 'fake-retained-host-443',
+      projectPath: evidence.host.projectPath,
       purpose: 'launch_runtime',
-    }])
-    expect(harness.mcp).toEqual([
-      { hostId: 'launch-host', action: 'attach' },
-      { hostId: 'launch-host', action: 'probe' },
+      providerId: 'deepinfra',
+      modelId: 'deepinfra/meta-llama/Llama-3.3-70B-Instruct',
+      generation: 1,
+      fingerprint: evidence.expectedBehaviorFingerprint,
+    })))
+    for (const requestId of ['request-1', 'request-2']) {
+      const events = evidence.events.filter(event => event.requestId === requestId)
+      const proofIndex = events.findIndex(event => event.type === 'proof')
+      const memberIndex = events.findIndex(event => event.type === 'member')
+      expect(proofIndex).toBeGreaterThanOrEqual(0)
+      expect(memberIndex).toBeGreaterThan(proofIndex)
+      const proof = events[proofIndex]!
+      expect(proof).toMatchObject({
+        hostId: 'fake-retained-host-443',
+        projectPath: evidence.host.projectPath,
+        providerId: 'deepinfra',
+        modelId: 'deepinfra/meta-llama/Llama-3.3-70B-Instruct',
+        attemptId: requestId,
+        generation: 1,
+        fingerprint: evidence.expectedBehaviorFingerprint,
+      })
+      expect(proof.nonce).toMatch(/^[0-9a-f-]{36}$/)
+      for (const member of events.filter(event => event.type === 'member')) {
+        expect(member.memberFingerprint).toMatch(/^[0-9a-f]{64}$/)
+      }
+    }
+    const replayedTwo = evidence.events.filter(event =>
+      event.requestId === 'request-2' && event.type === 'member')
+    expect(replayedTwo).toEqual([
+      expect.objectContaining({ member: 'two', sessionId: 'session-two-2' }),
     ])
-    expect(harness.proofs[0]).toMatchObject({
-      input: { nonce: 'nonce-443', expectedHostId: 'launch-host', providerId: 'deepinfra' },
-      output: { nonce: 'nonce-443', hostId: 'launch-host', providerId: 'deepinfra' },
-    })
-    expect(harness.timeline).toEqual([
-      'host:launch-host', 'mcp:launch-host', 'proof:nonce-443', 'member:one', 'member:two',
+    expect(replayedTwo[0]?.memberFingerprint).toBe(evidence.events.find(event =>
+      event.requestId === 'request-1' && event.type === 'member' && event.member === 'two',
+    )?.memberFingerprint)
+    expect(evidence.events.filter(event => event.type === 'release-session')).toEqual([])
+    expect(evidence.events.filter(event => event.type === 'release-host')).toEqual([
+      expect.objectContaining({ requestId: 'request-1', hostId: 'fake-retained-host-443', keepAlive: true }),
+      expect.objectContaining({ requestId: 'request-2', hostId: 'fake-retained-host-443', keepAlive: true }),
     ])
-    expect(harness.releases).toEqual([{ leaseId: 'lease-443', keepAlive: true, at: 0 }])
-    expect(harness.processTrees).toEqual([{ pid: 44301, parentPid: null, owner: 'attempt-443:7' }])
-    expect(harness.commands).toEqual([])
-    expect(harness.plugins).toEqual([])
-    harness.assertSafe()
-  })
+
+    for (const mode of ['stale', 'unknown-proof'] as const) {
+      const before = (await persistent.evidence()).events.length
+      const rejected = await persistent.invokeOneShot(mode)
+      expect(rejected.ok, mode).toBe(false)
+      const events = (await persistent.evidence()).events.slice(before)
+      expect(events.some(event => event.type === 'member' || event.type === 'inject'), mode).toBe(false)
+    }
+
+    const ownedRoot = persistent.root
+    await persistent.close()
+    await expect(stat(ownedRoot)).rejects.toThrow()
+  }, 20_000)
 
   test('non-exact behavior evidence rejects before every member boundary', async () => {
     const variants: Array<[string, Partial<StrictProof>]> = [
