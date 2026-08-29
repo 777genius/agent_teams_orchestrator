@@ -1507,17 +1507,23 @@ async function proveAppMcpTools(
   return proveAppMcpToolsFromLaunchConfig(phaseContext)
 }
 
+function getRetainedAppMcpLaunchConfig(host: OpenCodeHostHandle): ResolvedAppMcpLaunchConfig {
+  const source = host.profile.appMcpLaunchSource
+  const config = asRecord(host.profile.managedConfig.mcp)
+    ?.[OPEN_CODE_APP_MCP_SERVER_NAME] as OpenCodeMcpServerConfig | undefined
+  if (!source || !config) {
+    throw new Error('OpenCode retained App MCP launch source/config is unavailable')
+  }
+  return { source, config }
+}
+
 async function proveAppMcpToolsFromLaunchConfig(
   phaseContext?: OpenCodePhaseContext,
   preparedHost?: OpenCodeHostHandle,
 ): Promise<AppMcpToolProof> {
-  const resolved = await resolveOpenCodeAppMcpLaunchConfig()
-  const preparedConfig = preparedHost
-    ? asRecord(preparedHost.profile.managedConfig.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
-    : null
-  const launchConfig: ResolvedAppMcpLaunchConfig = preparedConfig
-    ? { ...resolved, config: preparedConfig as OpenCodeMcpServerConfig }
-    : resolved
+  const launchConfig: ResolvedAppMcpLaunchConfig = preparedHost
+    ? getRetainedAppMcpLaunchConfig(preparedHost)
+    : await resolveOpenCodeAppMcpLaunchConfig()
   const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) {
@@ -1544,6 +1550,7 @@ async function proveAppMcpToolsFromLaunchConfig(
       const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(
         launchConfig,
         phaseContext,
+        preparedHost?.profile.env,
       )
       const proof = matchAppMcpTools(observedTools, 'direct-contract:mcp/tools/list')
       proof.contractConfigIdentity = hashStable(launchConfig.config)
@@ -1584,6 +1591,7 @@ async function proveAppMcpToolsFromLaunchConfig(
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
   phaseContext?: OpenCodePhaseContext,
+  baseEnv: NodeJS.ProcessEnv = process.env,
 ): Promise<string[]> {
   const preflightTimeoutMs = Math.min(
     appMcpPreflightTimeoutMs(launchConfig),
@@ -1651,7 +1659,7 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   const transport = new StdioClientTransport({
     command: binary,
     args,
-    env: buildMcpPreflightEnv(launchConfig.config.environment),
+    env: buildMcpPreflightEnv(baseEnv, launchConfig.config.environment),
     stderr: 'pipe',
   })
   let stderr = ''
@@ -1680,9 +1688,12 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
-function buildMcpPreflightEnv(extra?: Record<string, string>): Record<string, string> {
+function buildMcpPreflightEnv(
+  base: NodeJS.ProcessEnv,
+  extra?: Record<string, string>,
+): Record<string, string> {
   const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(base)) {
     if (typeof value === 'string') {
       env[key] = value
     }
@@ -2378,6 +2389,13 @@ async function runReadiness(
   if (hasSelectedModel && !qualifiedSelectedModel) {
     throw new Error('OpenCode readiness requires a provider-qualified selectedModel')
   }
+  if (qualifiedSelectedModel
+    && (qualifiedSelectedModel.providerId === 'kiro'
+      || qualifiedSelectedModel.providerId === 'cursor-acp')) {
+    throw new Error(
+      `OpenCode execution_probe does not support extension-bound provider ${qualifiedSelectedModel.providerId}`,
+    )
+  }
   const runProvisioningPhase = async (
     phase: 'host_start' | 'post_probe_refresh',
     options: Parameters<typeof openCodeProvisioningProbe.probe>[1],
@@ -3044,6 +3062,11 @@ async function runLaunch(
   if (!selectedModelRef) {
     throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
   }
+  if (selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp') {
+    throw new Error(
+      `OpenCode launch_runtime does not support extension-bound provider ${selectedModelRef.providerId}`,
+    )
+  }
   const apiSelectedModel = selectedModelRef.raw
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
   const deadlineAt = Date.now() + runtimeDeadline.remainingMs()
@@ -3254,16 +3277,11 @@ async function runLaunch(
           if (remainingMs() <= 0) throw new Error('OpenCode strict launch proof deadline expired')
         },
       })
-      const resolvedLaunchConfig = await resolveOpenCodeAppMcpLaunchConfig()
-      const launchConfig = {
-        ...resolvedLaunchConfig,
-        config: (asRecord(host.profile.managedConfig.mcp)
-          ?.[OPEN_CODE_APP_MCP_SERVER_NAME] as OpenCodeMcpServerConfig | undefined)
-          ?? resolvedLaunchConfig.config,
-      }
+      const launchConfig = getRetainedAppMcpLaunchConfig(host)
       const appMcpProof = await listAppMcpToolsFromResolvedLaunchConfig(
         launchConfig,
         phaseContext('mcp_preflight'),
+        host.profile.env,
       ).then(tools => matchAppMcpTools(tools, 'direct-contract:mcp/tools/list'))
       appMcpProof.contractConfigIdentity = hashStable(launchConfig.config)
       requiredMcpContractConfigIdentity = appMcpProof.contractConfigIdentity

@@ -28,6 +28,7 @@ import {
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   resolveOpenCodeAppMcpLaunchConfig,
+  type ResolvedAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
 import {
   getOpenCodeCuratedSubscriptionProviderConfigs,
@@ -78,6 +79,19 @@ export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
 const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
+const OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV =
+  'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT'
+const OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV =
+  'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_APP_MCP_LAUNCH_CONFIG'
+const OPEN_CODE_SCOPE_ENVIRONMENT_ENV =
+  'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_ENVIRONMENT'
+const OPEN_CODE_PROFILE_RUNTIME_OVERRIDE_KEYS = [
+  'HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+  'XDG_CACHE_HOME', 'NPM_CONFIG_CACHE', 'PLAYWRIGHT_BROWSERS_PATH',
+  'PUPPETEER_CACHE_DIR', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_devdir',
+  'OPENCODE_DISABLE_CLAUDE_CODE',
+  'PATH', 'CURSOR_ACP_HOME_DIR', 'CURSOR_AGENT_EXECUTABLE',
+] as const
 
 // Copilot Free and Student can expose only GitHub's Auto picker, which OpenCode
 // cannot currently execute through an explicit model id. Seed one conservative
@@ -1247,18 +1261,21 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
 }
 
 function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
-  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
-  const candidates = [
-    path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
-    path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
+  const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(snapshotHomePath, '.config')
+  const candidates = Array.from(new Set([
+    path.join(snapshotHomePath, '.config', 'opencode', 'opencode.json'),
+    path.join(snapshotHomePath, '.config', 'opencode', 'opencode.jsonc'),
     // An explicit XDG config is closer to the invoking runtime than the
     // canonical user config and must win model/provider conflicts.
     path.join(xdgConfigHome, 'opencode', 'opencode.json'),
     path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
-  ]
+  ]))
   const explicitConfigPath = env.OPENCODE_CONFIG?.trim()
   if (explicitConfigPath) {
-    candidates.push(path.resolve(explicitConfigPath))
+    candidates.push(path.isAbsolute(explicitConfigPath)
+      ? path.normalize(explicitConfigPath)
+      : path.resolve(snapshotHomePath, explicitConfigPath))
   }
   return Array.from(new Set(candidates.map(candidate => path.resolve(candidate))))
 }
@@ -1397,6 +1414,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
   projectPath: string
   importedRuntimeConfig: Readonly<Record<string, unknown>>
   runtimeEnv: Readonly<NodeJS.ProcessEnv>
+  managedPaths: Readonly<ReturnType<typeof resolveClaudeMultimodelPaths>>
   scopeIdentity: Readonly<{
     purpose: OpenCodeProfilePurpose
     providerId: string
@@ -1404,6 +1422,8 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
     selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
   }>
   selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
+  authoritySourceFingerprint: string
+  appMcpLaunchConfig: Readonly<ResolvedAppMcpLaunchConfig> | null
 }>
 
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
@@ -1513,19 +1533,284 @@ function selectedProviderApiKeyIdentity(
     : semanticSecretIdentity('selected-provider-api-key-environment', { providerId, value })
 }
 
+const OPEN_CODE_AUTHORITY_FILE_MAX_BYTES = 1024 * 1024
+const OPEN_CODE_PROVIDER_AUTHORITY_FAMILIES = Object.freeze({
+  bedrock: Object.freeze({
+    providerIds: Object.freeze(['amazon-bedrock', 'aws-bedrock', 'bedrock']),
+    environmentNames: Object.freeze([
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'AWS_SESSION_TOKEN',
+      'AWS_SHARED_CREDENTIALS_FILE',
+    ]),
+  }),
+  vertex: Object.freeze({
+    providerIds: Object.freeze(['google-vertex', 'vertex']),
+    environmentNames: Object.freeze(['GOOGLE_APPLICATION_CREDENTIALS']),
+  }),
+  azure: Object.freeze({
+    providerIds: Object.freeze(['azure', 'azure-openai']),
+    environmentNames: Object.freeze([
+      'AZURE_API_KEY',
+      'AZURE_OPENAI_API_KEY',
+      'AZURE_AUTH_LOCATION',
+    ]),
+  }),
+})
+
+type OpenCodeProviderAuthorityFamily = keyof typeof OPEN_CODE_PROVIDER_AUTHORITY_FAMILIES
+
+function getOpenCodeProviderAuthorityFamily(
+  providerId: string,
+): OpenCodeProviderAuthorityFamily | null {
+  for (const [family, contract] of Object.entries(OPEN_CODE_PROVIDER_AUTHORITY_FAMILIES)) {
+    if ((contract.providerIds as readonly string[]).includes(providerId)) {
+      return family as OpenCodeProviderAuthorityFamily
+    }
+  }
+  return null
+}
+
+function isStrictAuthorityPurpose(purpose: OpenCodeProfilePurpose): boolean {
+  return purpose === 'execution_probe' || purpose === 'launch_runtime'
+}
+
+type OpenCodeAuthoritySourceBinding = {
+  fingerprint: string
+  fullyBound: boolean
+  hasStaticCredential: boolean
+}
+
+function readEnvironmentValue(
+  env: NodeJS.ProcessEnv,
+  name: string,
+): { state: 'missing' | 'empty' | 'present' | 'error'; value?: string } {
+  try {
+    const value = env[name]
+    return value === undefined
+      ? { state: 'missing' }
+      : value === '' ? { state: 'empty' } : { state: 'present', value }
+  } catch {
+    return { state: 'error' }
+  }
+}
+
+async function bindAuthorityFile(value: string): Promise<{
+  state: 'not-file' | 'bound' | 'error'
+  digest?: string
+}> {
+  try {
+    const before = await stat(value)
+    if (!before.isFile()) return { state: 'error' }
+    if (before.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) return { state: 'error' }
+    const bytes = await readFile(value)
+    if (bytes.byteLength > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) return { state: 'error' }
+    return {
+      state: 'bound',
+      digest: createHash('sha256').update(bytes).digest('hex'),
+    }
+  } catch (error) {
+    const code = getErrnoCode(error)
+    return code === 'ENOENT' || code === 'ENOTDIR'
+      ? { state: 'not-file' }
+      : { state: 'error' }
+  }
+}
+
+async function bindSelectedProviderAuthoritySources(input: {
+  providerId: string
+  providerConfig: unknown
+  env: NodeJS.ProcessEnv
+  projectPath: string
+}): Promise<OpenCodeAuthoritySourceBinding> {
+  const sources: unknown[] = []
+  let fullyBound = true
+  let hasStaticCredential = false
+  let awsOptionsAccessKeyBound = false
+  let awsOptionsSecretKeyBound = false
+  let azureOptionsApiKeyBound = false
+  let genericOptionsCredentialBound = false
+  const family = getOpenCodeProviderAuthorityFamily(input.providerId)
+  const supportsGenericStaticCredential = family === null
+    && input.providerId !== 'kiro' && input.providerId !== 'cursor-acp'
+  const familyContract = family === null
+    ? null
+    : OPEN_CODE_PROVIDER_AUTHORITY_FAMILIES[family]
+
+  const bindEnv = async (
+    name: string,
+    pathKeys: readonly string[],
+    syntax: string,
+    required = true,
+  ): Promise<boolean> => {
+    const effective = readEnvironmentValue(input.env, name)
+    if (effective.state !== 'present') {
+      if (required || effective.state === 'error') fullyBound = false
+      sources.push({ name, syntax, pathKeys, state: effective.state })
+      return false
+    }
+    const file = await bindAuthorityFile(path.isAbsolute(effective.value!)
+      ? effective.value!
+      : path.resolve(input.projectPath, effective.value!))
+    const expectsFile = pathKeys.some(key => /(?:(?:^|[-_.])(?:file|path)|(?:File|Path))$/.test(key))
+      || name.endsWith('_FILE') || name === 'GOOGLE_APPLICATION_CREDENTIALS'
+      || name === 'AZURE_AUTH_LOCATION'
+    if (file.state === 'error' || (expectsFile && file.state !== 'bound')) {
+      fullyBound = false
+      sources.push({ name, syntax, pathKeys, state: 'file-error' })
+      return false
+    }
+    if (file.state === 'bound') {
+      sources.push({ name, syntax, pathKeys, state: 'file', digest: file.digest })
+      // File-backed values are useful for cache/catalog identity only. A path,
+      // symlink, metadata container, or atomically replaced file is never a
+      // strict execution authority.
+      fullyBound = false
+      return false
+    } else {
+      sources.push({
+        name, syntax, pathKeys, state: 'value',
+        digest: semanticSecretIdentity('selected-provider-environment-value', effective.value),
+      })
+    }
+    return true
+  }
+
+  const visit = async (value: unknown, pathKeys: string[]): Promise<void> => {
+    if (Array.isArray(value)) {
+      for (const item of value) await visit(item, pathKeys)
+      return
+    }
+    if (typeof value === 'string') {
+      const matches = Array.from(value.matchAll(ENV_REFERENCE))
+      let valueBound = value.length > 0
+      for (const match of matches) {
+        valueBound = await bindEnv(
+          match[1] || match[2]!, pathKeys, match[1] ? 'opencode' : 'shell',
+        ) && valueBound
+      }
+      const isFileLocation = pathKeys.some(key =>
+        /(?:(?:^|[-_.])(?:file|path)|(?:File|Path))$/.test(key))
+      if (matches.length === 0 && value.length > 0 && isFileLocation) {
+        const file = await bindAuthorityFile(path.isAbsolute(value)
+          ? value
+          : path.resolve(input.projectPath, value))
+        sources.push({
+          kind: 'config-file', pathKeys, state: file.state,
+          ...(file.state === 'bound' ? { digest: file.digest } : {}),
+        })
+        fullyBound = false
+        valueBound = false
+      } else if (matches.length === 0 && value.length > 0
+        && pathKeys.length === 2 && pathKeys[0] === 'options'
+        && ((supportsGenericStaticCredential
+          && (pathKeys[1] === 'apiKey' || pathKeys[1] === 'authorization'))
+          || (family === 'azure' && pathKeys[1] === 'apiKey')
+          || (family === 'bedrock'
+            && (pathKeys[1] === 'accessKeyId' || pathKeys[1] === 'secretAccessKey')))) {
+        const file = await bindAuthorityFile(path.isAbsolute(value)
+          ? value
+          : path.resolve(input.projectPath, value))
+        if (file.state === 'bound' || file.state === 'error') {
+          sources.push({
+            kind: 'config-credential-file', pathKeys, state: file.state,
+            ...(file.state === 'bound' ? { digest: file.digest } : {}),
+          })
+          fullyBound = false
+          valueBound = false
+        }
+      }
+      if (family === 'bedrock' && pathKeys.length === 2 && pathKeys[0] === 'options') {
+        if (pathKeys[1] === 'accessKeyId') awsOptionsAccessKeyBound = valueBound
+        if (pathKeys[1] === 'secretAccessKey') awsOptionsSecretKeyBound = valueBound
+      }
+      if (family === 'azure' && pathKeys.length === 2
+        && pathKeys[0] === 'options' && pathKeys[1] === 'apiKey') {
+        azureOptionsApiKeyBound = valueBound
+      }
+      if (supportsGenericStaticCredential && pathKeys.length === 2 && pathKeys[0] === 'options'
+        && (pathKeys[1] === 'apiKey' || pathKeys[1] === 'authorization')) {
+        genericOptionsCredentialBound = valueBound && value.length > 0
+      }
+      return
+    }
+    if (!value || typeof value !== 'object') return
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      await visit((value as Record<string, unknown>)[key], [...pathKeys, key])
+    }
+  }
+  await visit(input.providerConfig, [])
+
+  if (supportsGenericStaticCredential) {
+    const directApiKeyName =
+      `${input.providerId.replace(/[^A-Za-z0-9]+/g, '_').toUpperCase()}_API_KEY`
+    // OpenCode's generic selected-provider contract consumes this exact key.
+    const directApiKeyBound = await bindEnv(directApiKeyName, ['directApiKey'], 'ambient', false)
+    hasStaticCredential = directApiKeyBound || genericOptionsCredentialBound
+  }
+  if (family === 'bedrock' && familyContract) {
+    const [accessKeyName, secretKeyName, sessionTokenName, sharedFileName] =
+      familyContract.environmentNames
+    const accessKeyBound = await bindEnv(accessKeyName!, ['familyAccessKeyId'], 'ambient', false)
+    const secretKeyBound = await bindEnv(secretKeyName!, ['familySecretAccessKey'], 'ambient', false)
+    await bindEnv(sessionTokenName!, ['familySessionToken'], 'ambient', false)
+    await bindEnv(sharedFileName!, ['ambientFile'], 'ambient', false)
+    if ((accessKeyBound && secretKeyBound)
+      || (awsOptionsAccessKeyBound && awsOptionsSecretKeyBound)) hasStaticCredential = true
+  }
+  if (family === 'vertex' && familyContract) {
+    await bindEnv(familyContract.environmentNames[0]!, ['ambientFile'], 'ambient', false)
+  }
+  if (family === 'azure' && familyContract) {
+    let azureEnvironmentApiKeyBound = false
+    for (const name of familyContract.environmentNames.filter(name => name.endsWith('_API_KEY'))) {
+      azureEnvironmentApiKeyBound = await bindEnv(name, ['familyApiKey'], 'ambient', false)
+        || azureEnvironmentApiKeyBound
+    }
+    const authLocationName = familyContract.environmentNames.find(name => name.endsWith('_LOCATION'))
+    if (authLocationName) await bindEnv(authLocationName, ['ambientFile'], 'ambient', false)
+    hasStaticCredential = azureEnvironmentApiKeyBound || azureOptionsApiKeyBound
+  }
+
+  return {
+    fingerprint: semanticSecretIdentity('selected-provider-authority-sources', sources),
+    fullyBound,
+    hasStaticCredential,
+  }
+}
+
 export async function resolveOpenCodeProfileScope(input: {
   projectPath?: string | null
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
 }): Promise<OpenCodeProfileScope> {
+  const inputEnv = input.env ?? process.env
+  const retainedScopeEnvironment = asRecord(safeParseJSONC(
+    inputEnv[OPEN_CODE_SCOPE_ENVIRONMENT_ENV],
+  ))
+  const envSnapshot = { ...inputEnv }
+  for (const [key, value] of Object.entries(retainedScopeEnvironment)) {
+    if (value === null) delete envSnapshot[key]
+    else if (typeof value === 'string') envSnapshot[key] = value
+  }
+  const env = Object.freeze(envSnapshot)
+  const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  const snapshotManagedPaths = resolveClaudeMultimodelPaths(env)
   const providerId = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '')
   if (!providerId) {
     throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
   }
-  const env = input.env ?? process.env
+  if (isStrictAuthorityPurpose(input.purpose)
+    && (providerId === 'kiro' || providerId === 'cursor-acp')) {
+    throw new Error(
+      `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`,
+    )
+  }
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
-  const imported = await readSafeOpenCodeRuntimeConfigImport(env)
+  const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
+    ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
+    : await readSafeOpenCodeRuntimeConfigImport(env)
   const project = await readProjectOpenCodeRuntimeConfig(projectPath)
   const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
@@ -1535,25 +1820,66 @@ export async function resolveOpenCodeProfileScope(input: {
     importedRuntimeConfig,
     buildManagedConfig(null, { managedProviderId: providerId }),
   )
+  const selectedProviderConfig = asRecord(effective.provider)[providerId] ?? null
+  const authoritySources = await bindSelectedProviderAuthoritySources({
+    providerId,
+    providerConfig: selectedProviderConfig,
+    env,
+    projectPath,
+  })
   const identity = redactConfigIdentity({
     providerId,
-    provider: asRecord(effective.provider)[providerId] ?? null,
+    provider: selectedProviderConfig,
     model: effective.model ?? null,
     small_model: effective.small_model ?? null,
     plugin: effective.plugin ?? null,
   }, env)
-  const configFingerprint = hashString(JSON.stringify(identity))
-  const paths = resolveClaudeMultimodelPaths()
-  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
+  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(snapshotHomePath, '.local', 'share')
   const selectedAuth = await readSelectedAuthFromSources({
     providerId,
-    globalAuthPath: path.join(paths.data, 'opencode', 'auth.json'),
+    globalAuthPath: path.join(snapshotManagedPaths.data, 'opencode', 'auth.json'),
     sourcePaths: Array.from(new Set([
-      path.join(paths.data, 'opencode', 'auth.json'),
+      path.join(snapshotManagedPaths.data, 'opencode', 'auth.json'),
       path.join(xdgDataHome, 'opencode', 'auth.json'),
-      path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+      path.join(snapshotHomePath, '.local', 'share', 'opencode', 'auth.json'),
     ])),
   })
+  if (isStrictAuthorityPurpose(input.purpose) && !authoritySources.fullyBound) {
+    throw new Error('OpenCode strict profile authority source is unavailable')
+  }
+  const selectedAuthIsCredential = isValidatedStrictAuthCredential(providerId, selectedAuth.credential)
+  if (isStrictAuthorityPurpose(input.purpose) && selectedAuth.identity === 'error') {
+    throw new Error('OpenCode strict profile selected authentication is unavailable')
+  }
+  if (isStrictAuthorityPurpose(input.purpose) && !selectedAuthIsCredential
+    && !authoritySources.hasStaticCredential) {
+    throw new Error('OpenCode strict profile requires explicit selected authentication')
+  }
+  const retainedAppMcpLaunchConfig = safeParseJSONC(
+    env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
+  ) as ResolvedAppMcpLaunchConfig | null
+  const appMcpLaunchConfig = input.purpose === 'launch_runtime'
+    ? retainedAppMcpLaunchConfig ?? await resolveOpenCodeAppMcpLaunchConfig({ env }).then(resolved => {
+        const managedConfig = buildManagedConfig(resolved.config)
+        applyManagedPathEnvironmentToMcpConfig(managedConfig, {
+          [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: snapshotManagedPaths.data,
+          [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: snapshotManagedPaths.cache,
+        })
+        return {
+          source: resolved.source,
+          config: (
+            asRecord(managedConfig.mcp)[OPEN_CODE_APP_MCP_SERVER_NAME]
+          ) as OpenCodeMcpServerConfig,
+        }
+      })
+    : null
+  const appMcpLaunchIdentity = redactConfigIdentity(appMcpLaunchConfig, env)
+  const configFingerprint = hashString(JSON.stringify({
+    identity,
+    authoritySourceFingerprint: authoritySources.fingerprint,
+    managedPaths: snapshotManagedPaths,
+    appMcpLaunchIdentity,
+  }))
   // The token is persisted in session and host identities, so it must survive a
   // one-shot bridge process exit. Bind only the effective, redacted inputs that
   // can affect this scoped profile; the local snapshot map below still proves
@@ -1566,6 +1892,9 @@ export async function resolveOpenCodeProfileScope(input: {
     selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
     selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
+    authoritySourceFingerprint: authoritySources.fingerprint,
+    managedPaths: snapshotManagedPaths,
+    appMcpLaunchIdentity,
   })
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,
@@ -1578,9 +1907,12 @@ export async function resolveOpenCodeProfileScope(input: {
     openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
       projectPath,
       importedRuntimeConfig,
-      runtimeEnv: { ...env },
+      runtimeEnv: env,
+      managedPaths: snapshotManagedPaths,
       scopeIdentity: buildScopeIdentity(scope),
       selectedAuthCredential: selectedAuth.credential,
+      authoritySourceFingerprint: authoritySources.fingerprint,
+      appMcpLaunchConfig,
     }))
   }
   return scope
@@ -1703,6 +2035,23 @@ function authCredentialIdentity(
       })}`
 }
 
+function isValidatedStrictAuthCredential(providerId: string, credential: unknown): boolean {
+  if (!credential || typeof credential !== 'object' || Array.isArray(credential)) return false
+  const record = credential as Record<string, unknown>
+  if (record.type === 'api') {
+    const key = typeof record.key === 'string' ? record.key.trim() : ''
+    return Boolean(key) && !(providerId === 'cursor-acp' && key === 'cursor-agent')
+  }
+  if (record.type === 'oauth') {
+    const access = typeof record.access === 'string' ? record.access.trim() : ''
+    const refresh = typeof record.refresh === 'string' ? record.refresh.trim() : ''
+    const token = typeof record.token === 'string' ? record.token.trim() : ''
+    if (providerId === 'kiro' && access === 'authenticated' && !refresh && !token) return false
+    return Boolean(access || refresh || token)
+  }
+  return false
+}
+
 async function readSelectedAuthFromSources(input: {
   providerId: string
   sourcePaths: readonly string[]
@@ -1747,25 +2096,28 @@ export class OpenCodeProfileManager {
     return resolveClaudeMultimodelPaths()
   }
 
-  private getSourceAuthPaths(): string[] {
+  private getSourceAuthPaths(
+    env: NodeJS.ProcessEnv = process.env,
+    homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
+  ): string[] {
     const xdgDataHome =
-      process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
+      env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
     return Array.from(new Set([
       path.join(xdgDataHome, 'opencode', 'auth.json'),
       // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
       // isolated runtime directory. Always include the canonical user OpenCode
       // auth store as the highest-priority source so a fresh `opencode auth`
       // login can override stale app-global OAuth credentials.
-      path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+      path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
     ]))
   }
 
-  getGlobalAuthPath(): string {
-    return path.join(this.paths.data, 'opencode', 'auth.json')
+  getGlobalAuthPath(dataPath = this.paths.data): string {
+    return path.join(dataPath, 'opencode', 'auth.json')
   }
 
-  async listManagedAuthPaths(): Promise<string[]> {
-    const profilesRootPath = path.join(this.paths.data, 'opencode', 'profiles')
+  async listManagedAuthPaths(dataPath = this.paths.data): Promise<string[]> {
+    const profilesRootPath = path.join(dataPath, 'opencode', 'profiles')
     let entries: Dirent[]
     try {
       entries = await readdir(profilesRootPath, { withFileTypes: true })
@@ -1797,12 +2149,16 @@ export class OpenCodeProfileManager {
   }> {
     const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
     const policy = planOpenCodeProfilePolicy(input.profileScope)
+    const snapshot = openCodeEffectiveConfigSnapshots.get(policy.scope.scopeToken)
+    const managedPaths = snapshot?.managedPaths ?? this.paths
+    const runtimeEnv = snapshot?.runtimeEnv ?? process.env
+    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     const profileRootKey = hashString(JSON.stringify({
       projectPath,
       ...buildScopeIdentity(policy.scope),
     })).slice(0, 16)
     const managedAuthPath = path.join(
-      this.paths.data,
+      managedPaths.data,
       'opencode',
       'profiles',
       profileRootKey,
@@ -1811,19 +2167,19 @@ export class OpenCodeProfileManager {
       'auth.json',
     )
     const sourcePaths = Array.from(new Set([
-      this.getGlobalAuthPath(),
-      ...this.getSourceAuthPaths(),
+      this.getGlobalAuthPath(managedPaths.data),
+      ...this.getSourceAuthPaths(runtimeEnv, snapshotHome),
     ]))
     const [source, managed, preferences] = await Promise.all([
       readSelectedAuthFromSources({
         providerId: policy.scope.providerId,
         sourcePaths,
-        globalAuthPath: this.getGlobalAuthPath(),
+        globalAuthPath: this.getGlobalAuthPath(managedPaths.data),
       }),
       readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId),
       Promise.all([
         readOpenCodeManagedRuntimePreferences(path.dirname(path.dirname(path.dirname(managedAuthPath)))),
-        readOpenCodeGlobalManagedRuntimePreferences(this.paths.data),
+        readOpenCodeGlobalManagedRuntimePreferences(managedPaths.data),
       ]).then(value => `known:${hashString(JSON.stringify(value))}` as const).catch(() => 'error' as const),
     ])
     return { source: source.identity, managed, preferences }
@@ -1833,9 +2189,11 @@ export class OpenCodeProfileManager {
     return hashString(projectPath).slice(0, 16)
   }
 
-  private async resolveManagedAppMcpConfig(): Promise<OpenCodeMcpServerConfig | null> {
+  private async resolveManagedAppMcpConfig(
+    env: NodeJS.ProcessEnv = process.env,
+  ): Promise<OpenCodeMcpServerConfig | null> {
     try {
-      return (await resolveOpenCodeAppMcpLaunchConfig()).config
+      return (await resolveOpenCodeAppMcpLaunchConfig({ env })).config
     } catch {
       return null
     }
@@ -1903,6 +2261,9 @@ export class OpenCodeProfileManager {
       throw new Error('OpenCode scoped profile canonical project path changed')
     }
     const resolvedProjectPath = configSnapshot?.projectPath ?? currentProjectPath
+    const managedPaths = configSnapshot?.managedPaths ?? this.paths
+    const runtimeEnv = configSnapshot?.runtimeEnv ?? process.env
+    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     const policy = options.profileScope
       ? planOpenCodeProfilePolicy(options.profileScope)
       : null
@@ -1915,7 +2276,7 @@ export class OpenCodeProfileManager {
     return this.withProfilePreparationLock(profileRootKey, async () => {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const profileRootPath = path.join(
-      this.paths.data,
+      managedPaths.data,
       'opencode',
       'profiles',
       profileRootKey,
@@ -1927,7 +2288,7 @@ export class OpenCodeProfileManager {
       )
     const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
     const globalRuntimePreferences = await readOpenCodeGlobalManagedRuntimePreferences(
-      this.paths.data,
+      managedPaths.data,
     )
     const effectiveManagedDefaultModelId =
       managedRuntimePreferences.defaultModelId ?? globalRuntimePreferences.defaultModelId
@@ -1958,10 +2319,11 @@ export class OpenCodeProfileManager {
       typeof importedRuntimeConfig.model === 'string'
         ? importedRuntimeConfig.model.trim() || null
         : null
-    const appMcpConfig =
-      (policy ? !policy.includeAppMcp : options.includeAppMcp === false)
+    const appMcpConfig = policy
+      ? (policy.includeAppMcp ? configSnapshot!.appMcpLaunchConfig?.config ?? null : null)
+      : options.includeAppMcp === false
         ? null
-        : await this.resolveManagedAppMcpConfig()
+        : await this.resolveManagedAppMcpConfig(runtimeEnv)
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const effectiveModelOutputLimitOverrides = [
       ...Object.entries(effectiveModelLimitOverrides).map(([modelId, override]) => ({
@@ -1996,8 +2358,8 @@ export class OpenCodeProfileManager {
       )
     }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
-      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
-      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: managedPaths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: managedPaths.cache,
     })
     const managedConfigFingerprint = buildManagedConfigFingerprint(
       managedConfig,
@@ -2007,7 +2369,7 @@ export class OpenCodeProfileManager {
     const tmpPath = path.join(profileRootPath, 'tmp')
     const xdgConfigHome = path.join(profileRootPath, 'config')
     const xdgDataHome = path.join(profileRootPath, 'data')
-    const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
+    const xdgCacheHome = path.join(managedPaths.cache, 'opencode', 'shared-cache')
     const sharedNpmCachePath = path.join(xdgCacheHome, 'npm')
     const sharedToolCachePath = path.join(xdgCacheHome, 'tools')
     const sharedOpenCodeNodeModulesPath = path.join(xdgCacheHome, 'config-node_modules')
@@ -2016,9 +2378,9 @@ export class OpenCodeProfileManager {
       ? path.join(profileRootPath, 'catalog-workspace')
       : resolvedProjectPath
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
-    const globalAuthPath = this.getGlobalAuthPath()
+    const globalAuthPath = this.getGlobalAuthPath(managedPaths.data)
     const sourceAuthSources = await Promise.all(
-      this.getSourceAuthPaths().map(async sourceAuthPath => {
+      this.getSourceAuthPaths(runtimeEnv, snapshotHome).map(async sourceAuthPath => {
         const exists = await fileExists(sourceAuthPath)
         return {
           path: sourceAuthPath,
@@ -2041,7 +2403,10 @@ export class OpenCodeProfileManager {
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
-      nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath)
+      nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
+        profileRootPath,
+        runtimeEnv,
+      )
     }
     await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
@@ -2074,7 +2439,7 @@ export class OpenCodeProfileManager {
         sourceAuthPaths: authSourcePaths,
         globalAuthPath,
         managedAuthPath,
-        peerManagedAuthPaths: await this.listManagedAuthPaths(),
+        peerManagedAuthPaths: await this.listManagedAuthPaths(managedPaths.data),
         abortSignal: options.abortSignal,
       })
     }
@@ -2141,17 +2506,26 @@ export class OpenCodeProfileManager {
       PIP_CACHE_DIR: path.join(sharedToolCachePath, 'pip'),
       UV_CACHE_DIR: path.join(sharedToolCachePath, 'uv'),
       npm_config_devdir: path.join(sharedToolCachePath, 'node-gyp'),
-      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
-      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: managedPaths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: managedPaths.cache,
       OPENCODE_DISABLE_CLAUDE_CODE: '1',
       OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
+      ...(configSnapshot ? {
+        [OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]: JSON.stringify(configSnapshot.importedRuntimeConfig),
+        [OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV]: JSON.stringify(
+          configSnapshot.appMcpLaunchConfig,
+        ),
+        [OPEN_CODE_SCOPE_ENVIRONMENT_ENV]: JSON.stringify(Object.fromEntries(
+          OPEN_CODE_PROFILE_RUNTIME_OVERRIDE_KEYS.map(key => [key, runtimeEnv[key] ?? null]),
+        )),
+      } : {}),
     }
     if (nativeCliCredentialBridge) {
-      env.PATH = [nativeCliCredentialBridge.binPath, process.env.PATH]
+      env.PATH = [nativeCliCredentialBridge.binPath, runtimeEnv.PATH]
         .filter((value): value is string => Boolean(value))
         .join(path.delimiter)
       env.CURSOR_ACP_HOME_DIR =
-        process.env.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
+        runtimeEnv.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
         nativeCliCredentialBridge.cursorAgentExecutablePath
     }
@@ -2166,6 +2540,7 @@ export class OpenCodeProfileManager {
       profileRootKey,
       profileRootPath,
       profileScope: policy?.scope ?? null,
+      appMcpLaunchSource: configSnapshot?.appMcpLaunchConfig?.source ?? null,
       projectDefaultModelId: managedRuntimePreferences.defaultModelId,
       allProjectsDefaultModelId: globalRuntimePreferences.defaultModelId,
       importedConfigDefaultModelId,
@@ -2187,6 +2562,7 @@ export class OpenCodeProfileManager {
       managedAuthFingerprint,
       selectedSourceAuthIdentity,
       selectedManagedAuthIdentity,
+      authoritySourceFingerprint: configSnapshot?.authoritySourceFingerprint ?? null,
       authState,
       env: applyOpenCodeAutoUpdatePolicy(env),
     }

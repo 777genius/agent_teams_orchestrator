@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -103,8 +103,13 @@ async function runCommandCapture(
 describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
   const isolatedEnvKeys = [
-    'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+    'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
+    'PATH', 'CURSOR_ACP_HOME_DIR',
     CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
   ] as const
   const originalEnv = Object.fromEntries(isolatedEnvKeys.map(key => [key, process.env[key]]))
 
@@ -116,6 +121,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg-data')
     process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(tempDir, 'app-data')
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(tempDir, 'app-cache')
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = JSON.stringify([
+      '-e', 'process.stdin.resume()',
+    ])
   })
 
   afterEach(async () => {
@@ -143,7 +152,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         env: {
           ...process.env,
           OPENCODE_CONFIG_CONTENT: JSON.stringify({
-            provider: { [providerId.toLowerCase()]: { options: { route: configFingerprint } } },
+            provider: { [providerId.toLowerCase()]: { options: {
+              route: configFingerprint,
+              apiKey: `${providerId.toLowerCase()}-static-key`,
+            } } },
           }),
         },
       })
@@ -157,8 +169,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const probe = await prepare('execution_probe', 'deepinfra', 'config-a')
     const provider = await prepare('catalog', 'openrouter', 'config-a')
     const config = await prepare('catalog', 'deepinfra', 'config-b')
-    const kiroLaunch = await prepare('launch_runtime', 'kiro', 'config-a')
-    const cursorProbe = await prepare('execution_probe', 'cursor-acp', 'config-a')
+    await expect(prepare('launch_runtime', 'kiro', 'config-a'))
+      .rejects.toThrow('does not support extension-bound provider kiro')
+    await expect(prepare('execution_probe', 'cursor-acp', 'config-a'))
+      .rejects.toThrow('does not support extension-bound provider cursor-acp')
     const customCatalog = await prepare('catalog', 'custom-provider', 'config-a')
     const legacy = await manager.prepareProfile(projectPath, {
       includeAppMcp: false,
@@ -171,11 +185,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       probe.profileRootPath,
       provider.profileRootPath,
       config.profileRootPath,
-      kiroLaunch.profileRootPath,
-      cursorProbe.profileRootPath,
       customCatalog.profileRootPath,
       legacy.profileRootPath,
-    ]).size).toBe(8)
+    ]).size).toBe(6)
   })
 
   test('fingerprints effective selected-provider endpoints without secret material', async () => {
@@ -185,7 +197,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       projectPath,
       purpose: 'catalog',
       selectedModel: 'custom/model',
-      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      env: { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({
         provider: { custom: { options: { baseURL, apiKey } } },
       }) },
     })
@@ -276,7 +288,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(envRotated.config).not.toBe(envFirst.config)
     expect(unrelatedCredentialRotated.config).toBe(unrelatedCredentialFirst.config)
     expect(unrelatedCredentialRotated.scope).toBe(unrelatedCredentialFirst.scope)
-    expect(selectedCredentialRotated.config).toBe(selectedCredentialFirst.config)
+    expect(selectedCredentialRotated.config).not.toBe(selectedCredentialFirst.config)
     expect(selectedCredentialRotated.scope).not.toBe(selectedCredentialFirst.scope)
     const output = JSON.stringify([
       first, second, valueChanged, typeChanged, providerChanged, authChanged,
@@ -302,11 +314,12 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       purpose: 'launch_runtime',
       selectedModel: `${providerId}/model`,
       env: {
+        ...process.env,
         ...env,
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
           provider: { [providerId]: { options: credentialPath === 'apiKey'
             ? { apiKey: reference }
-            : { headers: { Authorization: reference } } } },
+            : { authorization: reference } } },
         }),
       },
     })
@@ -323,16 +336,17 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const literal = await resolve(value, {})
     const providerChanged = await resolve(reference, { [envName]: value }, 'custom')
     const pathChanged = await resolve(reference, { [envName]: value }, 'deepinfra', 'authorization')
-    const missing = await resolve(reference, {})
-    const empty = await resolve(reference, { [envName]: '' })
+    await expect(resolve(reference, {}))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await expect(resolve(reference, { [envName]: '' }))
+      .rejects.toThrow('strict profile authority source is unavailable')
 
     expect(same.configFingerprint).toBe(first.configFingerprint)
     for (const changed of [
-      rotated, renamed, shellSyntax, literal, providerChanged, pathChanged, missing, empty,
+      rotated, renamed, shellSyntax, literal, providerChanged, pathChanged,
     ]) {
       expect(changed.configFingerprint).not.toBe(first.configFingerprint)
     }
-    expect(missing.configFingerprint).not.toBe(empty.configFingerprint)
     await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
       provider: { deepinfra: { options: { apiKey: reference } } },
     }))
@@ -347,12 +361,490 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(errorBehavior.projectBehaviorFingerprint).not.toBe(missingBehavior.projectBehaviorFingerprint)
     const output = JSON.stringify([
       first, same, rotated, renamed, shellSyntax, literal, providerChanged, pathChanged,
-      missing, empty, missingBehavior, errorBehavior,
+      missingBehavior, errorBehavior,
     ])
     expect(output).not.toContain(envName)
     expect(output).not.toContain(otherEnvName)
     expect(output).not.toContain(value)
     expect(output).not.toContain(rotatedValue)
+  })
+
+  test('content-fingerprints credential files for catalog identity but never strict authority', async () => {
+    const projectPath = path.join(tempDir, 'credential-file-project')
+    const credentialPath = path.join(tempDir, 'selected-credential.json')
+    const envName = 'SELECTED_PROVIDER_CREDENTIAL_FILE'
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (purpose: 'catalog' | 'execution_probe' | 'launch_runtime') => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose,
+      selectedModel: 'custom/model',
+      env: {
+        [envName]: credentialPath,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { custom: { options: { transport: { credentialFile: `{env:${envName}}` } } } },
+        }),
+      },
+    })
+    await writeFile(credentialPath, JSON.stringify({ token: 'file-secret-one' }))
+    const first = await resolve('catalog')
+    const same = await resolve('catalog')
+    await expect(resolve('execution_probe'))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await expect(resolve('launch_runtime'))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await writeFile(credentialPath, JSON.stringify({ token: 'file-secret-two' }))
+    const rotated = await resolve('catalog')
+    await rm(credentialPath)
+
+    expect(same).toEqual(first)
+    expect(rotated.configFingerprint).not.toBe(first.configFingerprint)
+    expect(rotated.scopeToken).not.toBe(first.scopeToken)
+    await expect(resolve('launch_runtime')).rejects.toThrow('strict profile authority source is unavailable')
+    await writeFile(credentialPath, Buffer.alloc(1024 * 1024 + 1))
+    await expect(resolve('launch_runtime')).rejects.toThrow('strict profile authority source is unavailable')
+    const output = JSON.stringify([first, rotated])
+    expect(output).not.toContain(credentialPath)
+    expect(output).not.toContain('file-secret')
+  })
+
+  test('fails strict ambient providers closed without explicit bound credentials', async () => {
+    const projectPath = path.join(tempDir, 'ambient-provider-project')
+    const googlePath = path.join(tempDir, 'google.json')
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (providerId: string, env: NodeJS.ProcessEnv, purpose = 'launch_runtime' as const) =>
+      resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: `${providerId}/model`,
+        env: {
+          ...process.env,
+          ...env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { [providerId]: {} } }),
+        },
+      })
+
+    await expect(resolve('amazon-bedrock', {}))
+      .rejects.toThrow('requires explicit selected authentication')
+    const selectedAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await mkdir(path.dirname(selectedAuthPath), { recursive: true })
+    await writeFile(selectedAuthPath, JSON.stringify({
+      'amazon-bedrock': { type: 'api', key: 'selected-store-key' },
+    }))
+    const selectedAuth = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'launch_runtime', selectedModel: 'amazon-bedrock/model',
+      env: {
+        ...process.env,
+        XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { 'amazon-bedrock': {} } }),
+      },
+    })
+    expect(selectedAuth.selectedAuthIdentity).toStartWith('known:')
+    await rm(selectedAuthPath)
+    const aws = await resolve('amazon-bedrock', {
+      AWS_ACCESS_KEY_ID: 'access-key-one',
+      AWS_SECRET_ACCESS_KEY: 'secret-key-one',
+    })
+    const awsRotated = await resolve('amazon-bedrock', {
+      AWS_ACCESS_KEY_ID: 'access-key-one',
+      AWS_SECRET_ACCESS_KEY: 'secret-key-two',
+    })
+    expect(awsRotated.scopeToken).not.toBe(aws.scopeToken)
+    const awsConfigTuple = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'execution_probe', selectedModel: 'amazon-bedrock/model',
+      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        provider: { 'amazon-bedrock': { options: {
+          accessKeyId: 'config-access-key', secretAccessKey: 'config-secret-key',
+        } } },
+      }) },
+    })
+    expect(awsConfigTuple.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+
+    await writeFile(googlePath, JSON.stringify({ type: 'authorized_user', refresh_token: 'secret' }))
+    await expect(resolve('google-vertex', { GOOGLE_APPLICATION_CREDENTIALS: googlePath }))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await writeFile(googlePath, JSON.stringify({ type: 'service_account', private_key: 'secret' }))
+    await expect(resolve('google-vertex', { GOOGLE_APPLICATION_CREDENTIALS: googlePath }))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await expect(resolveOpenCodeProfileScope({
+      projectPath, purpose: 'execution_probe', selectedModel: 'google-vertex/model',
+      env: {
+        GOOGLE_CONFIG_FILE: googlePath,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: {
+          'google-vertex': { options: { credentialsFile: '{env:GOOGLE_CONFIG_FILE}' } },
+        } }),
+      },
+    })).rejects.toThrow('strict profile authority source is unavailable')
+
+    const azure = await resolve('azure', { AZURE_API_KEY: 'azure-key-one' })
+    expect(azure.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+    const catalog = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'amazon-bedrock/model', env: {},
+    })
+    expect(catalog.selectedAuthIdentity).toBe('absent')
+    expect(JSON.stringify([
+      selectedAuth, aws, awsRotated, awsConfigTuple, azure, catalog,
+    ])).not.toContain('secret')
+    expect(JSON.stringify([azure])).not.toContain(googlePath)
+  })
+
+  test('rejects both extension-bound providers for both strict purposes despite near-marker credentials', async () => {
+    const projectPath = path.join(tempDir, 'strict-authority-allowlist-project')
+    const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([mkdir(projectPath, { recursive: true }), mkdir(path.dirname(authPath), { recursive: true })])
+    await writeFile(authPath, JSON.stringify({
+      kiro: {
+        type: 'oauth', access: 'authenticated', refresh: 'near-marker-refresh',
+        expires: Date.now() + 60_000,
+      },
+      'cursor-acp': {
+        type: 'api', key: 'cursor-agent-near-marker', expires: Date.now() + 60_000,
+      },
+    }))
+    const strict = (providerId: string, purpose: 'execution_probe' | 'launch_runtime', env = {}) =>
+      resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: `${providerId}/model`,
+        env: { ...process.env, ...env },
+      })
+
+    for (const providerId of ['kiro', 'cursor-acp']) {
+      for (const purpose of ['execution_probe', 'launch_runtime'] as const) {
+        await expect(strict(providerId, purpose))
+          .rejects.toThrow(`does not support extension-bound provider ${providerId}`)
+      }
+    }
+    await expect(strict('deepinfra', 'launch_runtime'))
+      .rejects.toThrow('requires explicit selected authentication')
+
+    const genericEnv = await strict('deepinfra', 'execution_probe', {
+      DEEPINFRA_API_KEY: 'snapshot-generic-key',
+    })
+    const genericConfig = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'deepinfra/model',
+      env: {
+        ...process.env,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { deepinfra: { options: { authorization: 'snapshot-config-token' } } },
+        }),
+      },
+    })
+    expect(genericEnv.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+    expect(genericConfig.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  test('rejects regular, symlinked, and atomically replaced file paths as strict credentials', async () => {
+    const projectPath = path.join(tempDir, 'file-authority-project')
+    const credentialPath = path.join(tempDir, 'credential-value')
+    const replacementPath = path.join(tempDir, 'credential-replacement')
+    const symlinkPath = path.join(tempDir, 'credential-link')
+    await mkdir(projectPath, { recursive: true })
+    await writeFile(credentialPath, 'credential-one')
+    await symlink(credentialPath, symlinkPath)
+    const resolve = (value: string) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'azure/model',
+      env: {
+        AZURE_API_KEY: value,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { azure: {} } }),
+      },
+    })
+
+    await expect(resolve(credentialPath))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await expect(resolve(symlinkPath))
+      .rejects.toThrow('strict profile authority source is unavailable')
+    await expect(resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'azure/model',
+      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        provider: { azure: { options: { apiKey: credentialPath } } },
+      }) },
+    })).rejects.toThrow('strict profile authority source is unavailable')
+    await writeFile(replacementPath, 'credential-two')
+    await rename(replacementPath, credentialPath)
+    await expect(resolve(credentialPath))
+      .rejects.toThrow('strict profile authority source is unavailable')
+  })
+
+  test('authorizes only exact runtime-consumed provider credential locations', async () => {
+    const projectPath = path.join(tempDir, 'exact-provider-authority-project')
+    await mkdir(projectPath, { recursive: true })
+    const resolveBedrock = (providerId: string, provider: Record<string, unknown>, env = {}) =>
+      resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'launch_runtime',
+        selectedModel: `${providerId}/model`,
+        env: {
+          ...process.env,
+          ...env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { [providerId]: provider } }),
+        },
+      })
+
+    await expect(resolveBedrock('bedrock', {
+      options: { nested: { apiKey: 'not-consumed' }, accessKeyId: 'incomplete' },
+      metadata: { secretAccessKey: 'not-consumed' },
+    })).rejects.toThrow('requires explicit selected authentication')
+    await expect(resolveBedrock('aws-bedrock', {
+      options: { nested: { accessKeyId: 'not-consumed', secretAccessKey: 'not-consumed' } },
+    })).rejects.toThrow('requires explicit selected authentication')
+    await expect(resolveBedrock('azure', {
+      options: { nested: { apiKey: 'not-consumed' } },
+    })).rejects.toThrow('requires explicit selected authentication')
+
+    for (const providerId of ['amazon-bedrock', 'aws-bedrock', 'bedrock']) {
+      const direct = await resolveBedrock(providerId, {}, {
+        AWS_ACCESS_KEY_ID: 'direct-access',
+        AWS_SECRET_ACCESS_KEY: 'direct-secret',
+      })
+      expect(direct.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+    }
+    for (const providerId of ['azure', 'azure-openai']) {
+      const direct = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'launch_runtime',
+        selectedModel: `${providerId}/model`,
+        env: {
+          ...process.env,
+          AZURE_OPENAI_API_KEY: 'direct-azure-key',
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { [providerId]: {} } }),
+        },
+      })
+      expect(direct.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+      const exactOptions = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'execution_probe',
+        selectedModel: `${providerId}/model`,
+        env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { [providerId]: { options: { apiKey: 'exact-options-key' } } },
+        }) },
+      })
+      expect(exactOptions.scopeToken).toMatch(/^[a-f0-9]{64}$/)
+    }
+    for (const providerId of ['google-vertex', 'vertex']) {
+      await expect(resolveBedrock(providerId, {
+        options: { apiKey: 'not-a-vertex-runtime-contract' },
+      })).rejects.toThrow('requires explicit selected authentication')
+    }
+  })
+
+  test('fingerprints but never authorizes arbitrary nested credential-named env references', async () => {
+    const projectPath = path.join(tempDir, 'nested-provider-env-project')
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (purpose: 'catalog' | 'launch_runtime', value: string) =>
+      resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: 'bedrock/model',
+        env: {
+          NESTED_PROVIDER_VALUE: value,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { bedrock: {
+            options: { nested: {
+              apiKey: '{env:NESTED_PROVIDER_VALUE}',
+              accessKeyId: '{env:NESTED_PROVIDER_VALUE}',
+              secretAccessKey: '{env:NESTED_PROVIDER_VALUE}',
+            } },
+          } } }),
+        },
+      })
+
+    await expect(resolve('launch_runtime', 'nested-value'))
+      .rejects.toThrow('requires explicit selected authentication')
+    const first = await resolve('catalog', 'nested-value')
+    const rotated = await resolve('catalog', 'rotated-nested-value')
+    expect(rotated.configFingerprint).not.toBe(first.configFingerprint)
+    expect(JSON.stringify([first, rotated])).not.toContain('nested-value')
+  })
+
+  test('uses one immutable environment snapshot for authority and prepared runtime', async () => {
+    const projectPath = path.join(tempDir, 'environment-snapshot-project')
+    await mkdir(projectPath, { recursive: true })
+    let reads = 0
+    const changingEnv = {
+      ...process.env,
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { azure: {} } }),
+    } as NodeJS.ProcessEnv
+    Object.defineProperty(changingEnv, 'AZURE_API_KEY', {
+      enumerable: true,
+      get: () => ++reads === 1 ? 'snapshot-key' : undefined,
+    })
+
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'azure/model',
+      env: changingEnv,
+    })
+    const prepared = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: scope,
+      includeAppMcp: false,
+    })
+
+    expect(reads).toBe(1)
+    expect(prepared.env.AZURE_API_KEY).toBe('snapshot-key')
+    expect(prepared.profileScope?.scopeToken).toBe(scope.scopeToken)
+  })
+
+  test('freezes App MCP command, environment, and remote URL at launch scope resolution', async () => {
+    const projectPath = path.join(tempDir, 'mcp-environment-snapshot-project')
+    await mkdir(projectPath, { recursive: true })
+    const baseEnv = {
+      ...process.env,
+      DEEPINFRA_API_KEY: 'snapshot-provider-key',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/snapshot/mcp-node',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify(['-e', 'snapshot-command']),
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({ MCP_ROUTE: 'snapshot-route' }),
+    }
+    const localScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/model', env: baseEnv,
+    })
+
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = '/mutated/mcp-node'
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = JSON.stringify(['-e', 'mutated-command'])
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify({ MCP_ROUTE: 'mutated-route' })
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'https://mutated.example/mcp'
+    const localProfile = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: localScope,
+    })
+    const localMcp = (localProfile.managedConfig.mcp as Record<string, Record<string, unknown>>)
+      ['agent-teams']!
+    expect(localProfile.appMcpLaunchSource).toBe('env-override')
+    expect(localMcp.type).toBe('local')
+    expect(localMcp.command).toEqual([
+      '/snapshot/mcp-node', '-e', path.resolve('snapshot-command'),
+    ])
+    expect(localMcp.environment).toMatchObject({ MCP_ROUTE: 'snapshot-route' })
+
+    const remoteScope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'deepinfra/model',
+      env: {
+        ...baseEnv,
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'https://snapshot.example/mcp',
+      },
+    })
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'https://second-mutation.example/mcp'
+    const remoteProfile = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: remoteScope,
+    })
+    const remoteMcp = (remoteProfile.managedConfig.mcp as Record<string, Record<string, unknown>>)
+      ['agent-teams']!
+    expect(remoteMcp).toMatchObject({ type: 'remote', url: 'https://snapshot.example/mcp' })
+    expect(remoteScope.configFingerprint).not.toBe(localScope.configFingerprint)
+    expect(remoteScope.scopeToken).not.toBe(localScope.scopeToken)
+  })
+
+  test('keeps catalog and execution-probe scoped profiles free of App MCP config', async () => {
+    const projectPath = path.join(tempDir, 'scope-without-app-mcp-project')
+    await mkdir(projectPath, { recursive: true })
+    for (const purpose of ['catalog', 'execution_probe'] as const) {
+      const scope = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: 'deepinfra/model',
+        env: {
+          ...process.env,
+          DEEPINFRA_API_KEY: 'scope-provider-key',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'https://must-not-appear.example/mcp',
+        },
+      })
+      const prepared = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+        profileScope: scope,
+      })
+      expect(prepared.managedConfig.mcp).toBeUndefined()
+      expect(prepared.appMcpLaunchSource).toBeNull()
+    }
+  })
+
+  test('binds resolved managed path identity into config and scope tokens', async () => {
+    const projectPath = path.join(tempDir, 'managed-path-identity-project')
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (suffix: string) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'deepinfra/model',
+      env: {
+        ...process.env,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: path.join(tempDir, `data-${suffix}`),
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: path.join(tempDir, `cache-${suffix}`),
+      },
+    })
+    const first = await resolve('one')
+    const second = await resolve('two')
+    expect(second.configFingerprint).not.toBe(first.configFingerprint)
+    expect(second.scopeToken).not.toBe(first.scopeToken)
+  })
+
+  test('keeps scoped managed paths, PATH, home, and auth frozen after resolution', async () => {
+    const projectPath = path.join(tempDir, 'frozen-path-project')
+    const snapshotHome = path.join(tempDir, 'snapshot-home')
+    const snapshotXdgData = path.join(tempDir, 'snapshot-xdg-data')
+    const snapshotManagedData = path.join(tempDir, 'snapshot-managed-data')
+    const snapshotManagedCache = path.join(tempDir, 'snapshot-managed-cache')
+    const snapshotPath = path.join(tempDir, 'snapshot-bin')
+    const snapshotCursorHome = path.join(tempDir, 'snapshot-cursor-home')
+    const authPath = path.join(snapshotXdgData, 'opencode', 'auth.json')
+    const snapshotConfigDir = path.join(snapshotHome, '.config', 'opencode')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      mkdir(path.dirname(authPath), { recursive: true }),
+      mkdir(snapshotConfigDir, { recursive: true }),
+    ])
+    await writeFile(authPath, JSON.stringify({
+      deepinfra: { type: 'api', key: 'real-snapshot-provider-key' },
+    }))
+    await writeFile(path.join(snapshotConfigDir, 'opencode.json'), JSON.stringify({
+      provider: { deepinfra: { options: { route: 'snapshot-home-route' } } },
+    }))
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'deepinfra/model',
+      env: {
+        ...process.env,
+        HOME: snapshotHome,
+        USERPROFILE: snapshotHome,
+        XDG_DATA_HOME: snapshotXdgData,
+        PATH: snapshotPath,
+        CURSOR_ACP_HOME_DIR: snapshotCursorHome,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: snapshotManagedData,
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: snapshotManagedCache,
+      },
+    })
+
+    process.env.HOME = path.join(tempDir, 'mutated-home')
+    process.env.USERPROFILE = process.env.HOME
+    process.env.XDG_DATA_HOME = path.join(tempDir, 'mutated-xdg-data')
+    process.env.PATH = path.join(tempDir, 'mutated-bin')
+    process.env.CURSOR_ACP_HOME_DIR = path.join(tempDir, 'mutated-cursor-home')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(tempDir, 'mutated-managed-data')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(tempDir, 'mutated-managed-cache')
+
+    const prepared = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: scope,
+      includeAppMcp: false,
+    })
+    expect(prepared.profileRootPath).toStartWith(snapshotManagedData)
+    expect(prepared.xdgCacheHome).toStartWith(snapshotManagedCache)
+    expect(prepared.globalAuthPath).toBe(path.join(snapshotManagedData, 'opencode', 'auth.json'))
+    expect(prepared.env.PATH?.split(path.delimiter)).toContain(snapshotPath)
+    expect(prepared.env.PATH).not.toContain('mutated-bin')
+    expect(prepared.env.CURSOR_ACP_HOME_DIR).toBe(snapshotCursorHome)
+    expect(prepared.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(snapshotManagedData)
+    expect(prepared.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(snapshotManagedCache)
+    expect(prepared.managedConfig).toMatchObject({
+      provider: { deepinfra: { options: { route: 'snapshot-home-route' } } },
+    })
+    expect(await readOpenCodeAuthCredential({
+      authPath: prepared.managedAuthPath,
+      providerId: 'deepinfra',
+    })).toMatchObject({ key: 'real-snapshot-provider-key' })
   })
 
   test('fingerprints query, limit, header, and non-secret env behavior while redacting credentials', async () => {
@@ -1525,6 +2017,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       provider: {
         deepinfra: { options: { apiKey: 'deepinfra-config-secret' }, models: { chosen: {} } },
+        unrelated: { options: { apiKey: 'unrelated-provider-secret-must-not-cross-scope' } },
         kiro: { options: { poisoned: true }, models: { poison: {} } },
         'cursor-acp': { options: { poisoned: true }, models: { poison: {} } },
         lmstudio: {
@@ -1606,11 +2099,28 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         })))
       for (const selected of ['deepinfra/chosen', 'llama.cpp/qwen-test:0.5b']) {
         const providerId = selected.slice(0, selected.indexOf('/'))
-        const launchProfile = await manager.prepareProfile(projectPath, {
-          profileScope: await resolveOpenCodeProfileScope({
-            projectPath, purpose: 'launch_runtime', selectedModel: selected,
-          }),
+        const launchScope = await resolveOpenCodeProfileScope({
+          projectPath, purpose: 'launch_runtime', selectedModel: selected,
         })
+        const launchProfile = await manager.prepareProfile(projectPath, {
+          profileScope: launchScope,
+        })
+        const retainedScopeEnvironment = JSON.parse(
+          launchProfile.env.CLAUDE_MULTIMODEL_OPENCODE_SCOPE_ENVIRONMENT ?? '{}',
+        ) as Record<string, unknown>
+        expect(retainedScopeEnvironment).not.toHaveProperty('OPENCODE_CONFIG_CONTENT')
+        expect(retainedScopeEnvironment).not.toHaveProperty('OPENCODE_CONFIG')
+        const serializedProfileEnvironment = Object.values(launchProfile.env).join('\n')
+        expect(serializedProfileEnvironment).not.toContain(
+          'unrelated-provider-secret-must-not-cross-scope',
+        )
+        expect(JSON.stringify(launchProfile.managedConfig)).not.toContain(
+          'unrelated-provider-secret-must-not-cross-scope',
+        )
+        expect(await resolveOpenCodeProfileScope({
+          projectPath, purpose: 'launch_runtime', selectedModel: selected,
+          env: launchProfile.env,
+        })).toEqual(launchScope)
         expect(Object.keys(launchProfile.managedConfig.provider as object)).toEqual([providerId])
         expect(launchProfile.managedConfig.plugin).toEqual(['unsafe-plugin', 'project-user-plugin'])
         expect(launchProfile.managedConfig.mcp).toHaveProperty('agent-teams')

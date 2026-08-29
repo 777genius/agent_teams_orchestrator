@@ -120,9 +120,17 @@ export async function buildOpenCodeExpectedBehaviorEvidence(input: {
       input.effectiveConfigFingerprint,
       'effective config fingerprint',
     ),
-    effectiveSelectedAuthFingerprint: credential === null
-      ? OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT
-      : sha256(JSON.stringify([
+    effectiveSelectedAuthFingerprint: input.profile.profileScope
+      && input.profile.authoritySourceFingerprint
+      ? sha256(JSON.stringify([
+          SELECTED_AUTH_DOMAIN,
+          modelProviderId,
+          credential === null ? 'absent' : 'present',
+          credential === null ? null : stableValue(credential),
+          requireFingerprint(input.profile.authoritySourceFingerprint, 'authority source fingerprint'),
+        ]))
+      : credential === null ? OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT
+        : sha256(JSON.stringify([
           SELECTED_AUTH_DOMAIN,
           modelProviderId,
           'present',
