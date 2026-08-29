@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
+import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 
 import type {
@@ -73,6 +74,88 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
+  for (const selectedModel of ['deepinfra/chosen', 'custom-provider/nested/model']) {
+    test(`keeps strict ${selectedModel} provisioning selected-provider scoped`, async () => {
+      const commandLog: string[] = []
+      let inventoryInput: Record<string, unknown> | null = null
+      let ensureInput: Record<string, unknown> | null = null
+      const mcpUrls: string[] = []
+      const releasedHosts: string[] = []
+      let prepared: OpenCodePreparedProfile | null = null
+      let retainedHost: OpenCodeHostHandle | null = null
+      const probe = new OpenCodeProvisioningProbe({
+        inventoryService: {
+          probe: async (projectPath, options) => {
+            inventoryInput = options
+            const scope = options.profileScope!
+            prepared = {
+              ...profile, projectPath: projectPath!, canonicalProjectPath: projectPath!,
+              scopeToken: scope.scopeToken, profileScope: scope, managedConfig: {},
+              managedConfigFingerprint: buildManagedConfigFingerprint({}),
+              selectedSourceAuthIdentity: scope.selectedAuthIdentity,
+              selectedManagedAuthIdentity: scope.selectedAuthIdentity,
+              authState: 'ok',
+            }
+            return {
+              ...inventory, projectPath: projectPath!, profile: prepared,
+              connectedProviders: [], availableProviders: [], models: [], agents: [],
+            }
+          },
+        },
+        hostManager: {
+          ensureHost: async input => {
+            ensureInput = input
+            const preparedProfile = input.preparedProfile!
+            retainedHost = {
+              ...host, projectPath: preparedProfile.projectPath,
+              profileRootKey: preparedProfile.profileRootKey, profile: preparedProfile,
+              resolvedConfigFingerprint: preparedProfile.managedConfigFingerprint,
+            }
+            return retainedHost
+          },
+          retainHostLease: async () => {},
+          releaseHostLease: async () => {},
+          releaseHost: async hostKey => { releasedHosts.push(hostKey) },
+          refreshResolvedConfigFingerprint: async () => { throw new Error('broad refresh') },
+        },
+        clientFactory: { create: () => { throw new Error('broad live client') } },
+        mcpManager: {
+          ensureAppMcp: async input => {
+            mcpUrls.push(input.baseUrl)
+            return {
+              mcp: { 'agent-teams': { connected: true } },
+              summary: {
+                serverName: 'agent-teams', matchedServerName: 'agent-teams',
+                status: 'present' as const, connected: true, launchSource: null,
+                availableServerNames: ['agent-teams'], diagnostics: [],
+              },
+            }
+          },
+        },
+      })
+
+      const retained = await probe.probeRetainingHost('/tmp/project', {
+        selectedModel, leaseId: 'lease-scoped',
+      })
+      expect(inventoryInput).toEqual(expect.objectContaining({
+        mode: 'profile',
+        profileScope: expect.objectContaining({
+          purpose: 'launch_runtime',
+          providerId: selectedModel.slice(0, selectedModel.indexOf('/')),
+        }),
+      }))
+      expect(ensureInput).toEqual(expect.objectContaining({
+        preparedProfile: prepared,
+        prewarmManagedSubscriptionPlugins: false,
+        resolveConfigFingerprint: false,
+      }))
+      expect(mcpUrls).toEqual([retainedHost!.baseUrl])
+      expect(commandLog).toEqual([])
+      await retained.release()
+      expect(releasedHosts).toEqual([retainedHost!.hostKey])
+    })
+  }
+
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({
       inventoryService: {

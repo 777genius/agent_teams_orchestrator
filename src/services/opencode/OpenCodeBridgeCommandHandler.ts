@@ -42,6 +42,7 @@ import {
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -2865,6 +2866,11 @@ async function runLaunch(
   if (!preconditions?.commandLeaseId) {
     throw new Error('OpenCode strict launch requires full preconditions and commandLeaseId')
   }
+  const selectedModelRef = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!selectedModelRef) {
+    throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
+  }
+  const apiSelectedModel = selectedModelRef.raw
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
   const deadlineAt = Date.now() + runtimeDeadline.remainingMs()
   const cleanupReserveMs = Math.min(
@@ -2888,7 +2894,7 @@ async function runLaunch(
         {
           toolApprovalMode,
           phaseContext,
-          selectedModel,
+          selectedModel: apiSelectedModel,
           leaseId: preconditions.commandLeaseId,
         },
       )
@@ -2926,8 +2932,6 @@ async function runLaunch(
       'warning',
     ))
   }
-  const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
-  assertOpenCodeSelectedModelReconcilable(apiSelectedModel, snapshot)
   const initialExpectedBehaviorEvidence = await buildOpenCodeExpectedBehaviorEvidence({
     profile: host.profile,
     fullModelId: apiSelectedModel,
@@ -2967,8 +2971,14 @@ async function runLaunch(
   const resources = new Map<string, OpenCodeSessionRecord>()
   const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
   const matchesCurrentExpectedBehavior = async (): Promise<boolean> => {
-    const currentConfigFingerprint = await openCodeHostManager
-      .refreshResolvedConfigFingerprint(host.hostKey)
+    const currentConfigFingerprint = buildManagedConfigFingerprint(
+      host.profile.managedConfig,
+      host.profile.env,
+    )
+    if (
+      currentConfigFingerprint !== host.profile.managedConfigFingerprint
+      || currentConfigFingerprint !== host.resolvedConfigFingerprint
+    ) return false
     const currentEvidence = await buildOpenCodeExpectedBehaviorEvidence({
       profile: host.profile,
       fullModelId: apiSelectedModel,
@@ -3031,6 +3041,13 @@ async function runLaunch(
           kind: executionOutcome.outcome === 'unknown' ? 'unknown' : 'failure',
           error: executionOutcome.reason ?? 'OpenCode exact-model execution proof failed',
         }
+      }
+      if (
+        executionOutcome.providerId !== selectedModelRef.providerId
+        || executionOutcome.modelId !== apiSelectedModel
+        || executionOutcome.latestAssistantText?.trim() !== expectedOutput
+      ) {
+        return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }
       }
       // The exact-model probe can take long enough for config or credentials to
       // rotate. Seal the proof only after a final fresh read on this retained host.
@@ -3213,7 +3230,7 @@ async function runLaunch(
     attemptId: envelope.requestId,
     generation: 1,
     nonce: randomUUID(),
-    providerId: parseOpenCodeProviderScopedModelRef(apiSelectedModel)!.providerId,
+    providerId: selectedModelRef.providerId,
     modelId: apiSelectedModel,
     behaviorFingerprint: expectedBehaviorFingerprint,
     mcpTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
@@ -3276,7 +3293,7 @@ async function runLaunch(
     snapshot,
     data: buildTeamLaunchData({
       runId,
-      selectedModel,
+      selectedModel: apiSelectedModel,
       members,
       expectedMemberNames: strictMembers.map(member => member.memberId),
       diagnostics,

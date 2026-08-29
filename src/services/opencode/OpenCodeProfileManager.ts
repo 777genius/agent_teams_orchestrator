@@ -1390,26 +1390,37 @@ function buildScopeIdentity(scope: OpenCodeProfileScope): {
   }
 }
 
-function isolateCatalogRuntimeConfig(
+function isolateScopedRuntimeConfig(
   config: Record<string, unknown>,
   providerId: string,
+  purpose: OpenCodeProfilePurpose,
 ): Record<string, unknown> {
   const selectedProvider = asRecord(config.provider)[providerId]
   const selectedManagedPlugins = planOpenCodeProfilePolicy({
-    purpose: 'catalog', providerId, configFingerprint: 'isolation',
+    purpose, providerId, configFingerprint: 'isolation',
     selectedAuthIdentity: 'absent', scopeToken: 'isolation',
   }).managedSubscriptionPlugins
-  const isolated: Record<string, unknown> = {}
+  const isolated: Record<string, unknown> = purpose === 'launch_runtime'
+    ? deepMergeOpenCodeConfig({}, config)
+    : {}
   if (selectedProvider !== undefined) isolated.provider = { [providerId]: selectedProvider }
+  else isolated.provider = {}
   for (const key of ['model', 'small_model'] as const) {
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (value.startsWith(`${providerId}/`)) isolated[key] = value
   }
-  if (selectedManagedPlugins.length > 0) isolated.plugin = [...selectedManagedPlugins]
+  const configuredPlugins = Array.isArray(config.plugin)
+    ? config.plugin.filter((plugin): plugin is string => typeof plugin === 'string')
+    : []
+  isolated.plugin = purpose === 'launch_runtime'
+    ? configuredPlugins.filter(plugin =>
+        !getOpenCodeManagedSubscriptionPluginPackages().includes(plugin)
+        || selectedManagedPlugins.includes(plugin))
+    : [...selectedManagedPlugins]
   return isolated
 }
 
-function enforceCatalogProviderIsolation(
+function enforceScopedProviderIsolation(
   config: Record<string, unknown>,
   providerId: string,
   managedPlugins: readonly string[],
@@ -1420,7 +1431,7 @@ function enforceCatalogProviderIsolation(
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (!value.startsWith(`${providerId}/`)) delete config[key]
   }
-  config.plugin = [...managedPlugins]
+  applyOpenCodeManagedSubscriptionPlugins(config, [...managedPlugins])
 }
 
 function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
@@ -1454,8 +1465,8 @@ export async function resolveOpenCodeProfileScope(input: {
   const imported = await readSafeOpenCodeRuntimeConfigImport(env)
   const project = await readProjectOpenCodeRuntimeConfig(projectPath)
   const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
-  const importedRuntimeConfig = input.purpose === 'catalog'
-    ? isolateCatalogRuntimeConfig(mergedRuntimeConfig, providerId)
+  const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
+    ? isolateScopedRuntimeConfig(mergedRuntimeConfig, providerId, input.purpose)
     : mergedRuntimeConfig
   const effective = deepMergeOpenCodeConfig(
     importedRuntimeConfig,
@@ -1903,8 +1914,8 @@ export class OpenCodeProfileManager {
     if (policy || managedSubscriptionPlugins.length > 0) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
-    if (policy?.scope.purpose === 'catalog') {
-      enforceCatalogProviderIsolation(
+    if (policy?.scope.purpose === 'catalog' || policy?.scope.purpose === 'launch_runtime') {
+      enforceScopedProviderIsolation(
         managedConfig,
         policy.scope.providerId,
         managedSubscriptionPlugins,

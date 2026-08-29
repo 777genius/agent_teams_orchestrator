@@ -19,6 +19,7 @@ import {
 } from './OpenCodeExpectedBehaviorFingerprint.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
+import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -34,6 +35,9 @@ import type {
   OpenCodeSessionReconcileSummary,
 } from './types.js'
 
+const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const managedConfigFingerprint = hash('{}')
+
 const snapshot: OpenCodeProvisioningSnapshot = {
   detected: true,
   hostHealthy: true,
@@ -48,7 +52,7 @@ const snapshot: OpenCodeProvisioningSnapshot = {
     projectBehaviorFingerprint: 'b'.repeat(64),
     behaviorSources: ['AGENTS.md'],
     managedConfig: {},
-    managedConfigFingerprint: 'c'.repeat(64),
+    managedConfigFingerprint,
     homePath: '/tmp/profile-root/home',
     xdgConfigHome: '/tmp/profile-root/config',
     xdgDataHome: '/tmp/profile-root/data',
@@ -80,7 +84,7 @@ const snapshot: OpenCodeProvisioningSnapshot = {
       projectBehaviorFingerprint: 'b'.repeat(64),
       behaviorSources: ['AGENTS.md'],
       managedConfig: {},
-      managedConfigFingerprint: 'c'.repeat(64),
+      managedConfigFingerprint,
       homePath: '/tmp/profile-root/home',
       xdgConfigHome: '/tmp/profile-root/config',
       xdgDataHome: '/tmp/profile-root/data',
@@ -92,7 +96,7 @@ const snapshot: OpenCodeProvisioningSnapshot = {
       authState: 'ok',
       env: {},
     },
-    resolvedConfigFingerprint: 'd'.repeat(64),
+    resolvedConfigFingerprint: managedConfigFingerprint,
     diagnostics: [],
   },
   config: null,
@@ -134,7 +138,6 @@ const snapshot: OpenCodeProvisioningSnapshot = {
   diagnostics: [],
 }
 
-const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 function expectedFingerprintForModel(model: string): string {
   const fullModelId = model.includes('/') ? model : `openrouter/${model}`
   const providerId = fullModelId.slice(0, fullModelId.indexOf('/')).toLowerCase()
@@ -143,7 +146,7 @@ function expectedFingerprintForModel(model: string): string {
     modelProviderId: providerId,
     fullModelId: `${providerId}${fullModelId.slice(fullModelId.indexOf('/'))}`,
     projectBehaviorFingerprint: 'b'.repeat(64),
-    effectiveConfigFingerprint: 'd'.repeat(64),
+    effectiveConfigFingerprint: managedConfigFingerprint,
     effectiveSelectedAuthFingerprint: OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
   })
 }
@@ -410,6 +413,18 @@ function mockRequiredMcpTools(): void {
   ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
 }
 
+function mockUnavailableExactProof(reason = 'selected execution unavailable'): void {
+  openCodeExecutionProbe.probeModelOnHost = (async input => ({
+    providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
+    modelId: input.selectedModel,
+    probePrompt: input.prompt ?? '', expectedOutput: input.expectedOutput ?? '',
+    outcome: 'unavailable', reason, durationMs: 1, rawStatus: 'error',
+    durableState: 'failed', latestAssistantText: null, latestAssistantPreview: null,
+    toolCallCount: 0, errorCount: 1, diagnostics: [reason],
+    verifiedAt: '2026-04-21T12:00:00.000Z',
+  })) as typeof openCodeExecutionProbe.probeModelOnHost
+}
+
 const originalProbe = openCodeProvisioningProbe.probe
 const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
 const originalInventoryProbe = openCodeInventoryService.probe
@@ -509,13 +524,33 @@ beforeEach(async () => {
   })) as typeof openCodeCommandOutcomeStore.query
   openCodeCommandOutcomeStore.prune = (async () => 0) as typeof openCodeCommandOutcomeStore.prune
   mockRequiredMcpTools()
-  openCodeProvisioningProbe.probeRetainingHost = (async projectPath => ({
-    snapshot: await openCodeProvisioningProbe.probe(projectPath),
-    host: snapshot.host,
-    release: async () => {},
-  })) as typeof openCodeProvisioningProbe.probeRetainingHost
+  openCodeProvisioningProbe.probeRetainingHost = (async (projectPath, options) => {
+    const retainedSnapshot = await openCodeProvisioningProbe.probe(projectPath)
+    const selected = parseOpenCodeProviderScopedModelRef(options.selectedModel)
+    const retainedHost = retainedSnapshot.host && selected
+      ? {
+          ...retainedSnapshot.host,
+          profile: {
+            ...retainedSnapshot.host.profile,
+            scopeToken: 'launch-scope',
+            profileScope: {
+              purpose: 'launch_runtime' as const,
+              providerId: selected.providerId,
+              configFingerprint: 'config-fingerprint',
+              selectedAuthIdentity: 'absent' as const,
+              scopeToken: 'launch-scope',
+            },
+          },
+        }
+      : retainedSnapshot.host
+    return {
+      snapshot: retainedHost ? { ...retainedSnapshot, host: retainedHost } : retainedSnapshot,
+      host: retainedHost,
+      release: async () => {},
+    }
+  }) as typeof openCodeProvisioningProbe.probeRetainingHost
   openCodeExecutionProbe.probeModelOnHost = (async input => ({
-    providerId: 'opencode',
+    providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
     modelId: input.selectedModel,
     probePrompt: input.prompt ?? '',
     expectedOutput: input.expectedOutput ?? '',
@@ -2309,7 +2344,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toHaveLength(1)
     expect(ensureInputs[0]?.laneId).toBe('secondary:opencode:alice')
-    expect(ensureInputs[0]?.preparedProfile).toEqual(snapshot.profile)
+    expect(ensureInputs[0]?.preparedProfile).toMatchObject({
+      profileRootKey: snapshot.profile?.profileRootKey,
+      managedConfigFingerprint: snapshot.profile?.managedConfigFingerprint,
+    })
     expect(
       (result.data as { members: Record<string, { runtimePid?: number }> }).members.alice?.runtimePid,
     ).toBe(123)
@@ -2431,7 +2469,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeExecutionProbe.probeModelOnHost = (async input => {
       events.push(`proof:${input.host.hostKey}`)
       return {
-        providerId: 'opencode',
+        providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
         modelId: input.selectedModel,
         probePrompt: input.prompt ?? '',
         expectedOutput: input.expectedOutput ?? '',
@@ -2569,14 +2607,63 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(memberCalls).toBe(0)
   })
 
+  for (const selectedModel of ['deepinfra/chosen', 'custom-provider/nested/model']) {
+    test(`authorizes empty-catalog ${selectedModel} only through exact retained-host proof`, async () => {
+      const strictHost = snapshot.host!
+      openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+        snapshot: {
+          ...snapshot, models: [], modelMetadata: [], configProviders: null,
+          providers: null, providerAuth: null,
+        },
+        host: strictHost,
+        release: async () => {},
+      })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      const proofHosts: string[] = []
+      const prove = openCodeExecutionProbe.probeModelOnHost
+      openCodeExecutionProbe.probeModelOnHost = (async input => {
+        proofHosts.push(input.host.hostKey)
+        return prove(input)
+      }) as typeof openCodeExecutionProbe.probeModelOnHost
+      openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+      const memberHosts: string[] = []
+      openCodeSessionBridge.materializeSessionOnHost = (async input => {
+        memberHosts.push(input.host.hostKey)
+        return {
+          record: buildRecord({
+            laneId: input.laneId, memberName: input.memberName,
+            selectedModel: input.selectedModel, opencodeSessionId: `session-${input.memberName}`,
+            expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+          }),
+          created: true,
+        }
+      }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope(
+        'opencode.launchTeam', {
+          runId: `run-${selectedModel}`, laneId: 'primary', teamId: 'team-a',
+          projectPath: '/tmp/project', selectedModel, members: [{ name: 'alice' }],
+        },
+      ))
+      expect(result.ok).toBe(true)
+      expect(proofHosts).toEqual([strictHost.hostKey])
+      expect(memberHosts).toEqual([strictHost.hostKey])
+    })
+  }
+
   test('rechecks retained-host behavior after model proof before materialization', async () => {
-    let refreshCalls = 0
     let memberCalls = 0
     openCodeProvisioningProbe.probe = async () => snapshot
-    openCodeHostManager.refreshResolvedConfigFingerprint = (async () => {
-      refreshCalls += 1
-      return refreshCalls === 1 ? 'd'.repeat(64) : 'e'.repeat(64)
-    }) as typeof openCodeHostManager.refreshResolvedConfigFingerprint
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
+      input.host.profile.managedConfig = { changed: true }
+      return {
+        providerId: 'openrouter', modelId: input.selectedModel,
+        probePrompt: input.prompt ?? '', expectedOutput: input.expectedOutput ?? '',
+        outcome: 'available', reason: null, durationMs: 1, rawStatus: 'idle',
+        durableState: 'idle', latestAssistantText: input.expectedOutput ?? '',
+        latestAssistantPreview: input.expectedOutput ?? '', toolCallCount: 0,
+        errorCount: 0, diagnostics: [], verifiedAt: '2026-04-21T12:00:00.000Z',
+      }
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
     openCodeSessionBridge.materializeSessionOnHost = (async () => {
       memberCalls += 1
       throw new Error('must not materialize after proof evidence changes')
@@ -2595,7 +2682,6 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error.message).toContain('behavior changed during proof')
-    expect(refreshCalls).toBe(2)
     expect(memberCalls).toBe(0)
   })
 
@@ -2658,9 +2744,18 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
-  test('launches raw OpenCode model ids that contain slashes when the catalog match is unique', async () => {
+  test('fails closed for an unqualified raw model id before host, proof, or member effects', async () => {
+    let hostCalls = 0
+    let proofCalls = 0
     const ensureInputs: Array<{ memberName: string; selectedModel: string }> = []
-    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeProvisioningProbe.probeRetainingHost = (async () => {
+      hostCalls += 1
+      throw new Error('host must not be reached')
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeExecutionProbe.probeModelOnHost = (async () => {
+      proofCalls += 1
+      throw new Error('proof must not be reached')
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
     openCodeSessionBridge.ensureSession = (async input => {
       ensureInputs.push({
         memberName: input.memberName,
@@ -2689,24 +2784,15 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'moonshotai/kimi-k2',
+        selectedModel: 'kimi-k2',
         members: [{ name: 'alice', role: 'Developer', prompt: 'Alice join' }],
       }),
     )
 
-    expect(result.ok).toBe(true)
-    if (!result.ok) {
-      return
-    }
-    expect(ensureInputs).toEqual([
-      {
-        memberName: 'alice',
-        selectedModel: 'openrouter/moonshotai/kimi-k2',
-      },
-    ])
-    expect(result.data.teamLaunchState).toBe('launching')
-    expect(result.data.members.alice?.launchState).toBe('created')
-    expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
+    expect(result.ok).toBe(false)
+    expect(hostCalls).toBe(0)
+    expect(proofCalls).toBe(0)
+    expect(ensureInputs).toEqual([])
   })
 
   test('persists app-managed bootstrap metadata after launch injection', async () => {
@@ -3799,7 +3885,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode raw model id "ghost-model" was not found in the live provider catalog',
+      'provider-qualified selectedModel',
     )
     expect(ensureSessionCalls).toBe(0)
   })
@@ -3807,6 +3893,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('rejects launch before creating sessions when the provider-scoped selected model is unknown', async () => {
     let ensureSessionCalls = 0
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    mockUnavailableExactProof()
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -3833,7 +3920,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
+      'selected execution unavailable',
     )
     expect(ensureSessionCalls).toBe(0)
   })
@@ -3891,7 +3978,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'moonshotai/kimi-k2',
+        selectedModel: 'kimi-k2',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -3901,7 +3988,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode raw model id "moonshotai/kimi-k2" is ambiguous',
+      'provider-qualified selectedModel',
     )
     expect(connectCalls).toBe(0)
     expect(listToolsCalls).toBe(0)
@@ -3947,10 +4034,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (result.ok) {
       return
     }
-    expect(result.error.message).toContain(
-      'OpenCode provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
-    )
-    expect(connectCalls).toBe(0)
+    expect(result.error.message).toContain('MCP proof should not run before launch model rejection')
+    expect(connectCalls).toBe(1)
     expect(listToolsCalls).toBe(0)
     expect(ensureSessionCalls).toBe(0)
   })
@@ -3964,6 +4049,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           default: {},
         },
       })
+    mockUnavailableExactProof()
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -3990,7 +4076,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+      'selected execution unavailable',
     )
     expect(ensureSessionCalls).toBe(0)
   })
@@ -4040,10 +4126,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (result.ok) {
       return
     }
-    expect(result.error.message).toContain(
-      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
-    )
-    expect(connectCalls).toBe(0)
+    expect(result.error.message).toContain('MCP proof should not run before launch provider rejection')
+    expect(connectCalls).toBe(1)
     expect(listToolsCalls).toBe(0)
     expect(ensureSessionCalls).toBe(0)
   })
@@ -4071,7 +4155,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [
           { name: 'bob', role: 'Developer', prompt: 'Bob side lane join' },
           { name: 'BOB', role: 'Reviewer', prompt: 'Duplicate Bob side lane join' },
@@ -4113,7 +4197,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: '   ', role: 'Developer', prompt: 'Blank side lane join' }],
       }),
     )
@@ -4155,6 +4239,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           default: {},
         },
       })
+    mockUnavailableExactProof()
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -4171,7 +4256,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4180,9 +4265,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (result.ok) {
       return
     }
-    expect(result.error.message).toContain('OpenCode raw model id "minimax-m2.5-free" is ambiguous')
-    expect(result.error.message).toContain('openrouter/minimax-m2.5-free')
-    expect(result.error.message).toContain('opencode/minimax-m2.5-free')
+    expect(result.error.message).toContain('selected execution unavailable')
     expect(ensureSessionCalls).toBe(0)
   })
 
@@ -4212,7 +4295,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4258,7 +4341,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4303,7 +4386,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4312,10 +4395,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (result.ok) {
       return
     }
-    expect(result.error.message).toContain(
-      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
-    )
-    expect(connectCalls).toBe(0)
+    expect(result.error.message).toContain('MCP proof should not run when provider auth is missing')
+    expect(connectCalls).toBe(1)
     expect(ensureSessionCalls).toBe(0)
   })
 
@@ -4345,17 +4426,17 @@ describe('OpenCodeBridgeCommandHandler', () => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
       return {
-        providerId: 'opencode' as const,
+        providerId: 'llama.cpp' as const,
         modelId: input.selectedModel,
         probePrompt: 'Output only the single word PONG.',
-        expectedOutput: 'PONG',
+        expectedOutput: input.expectedOutput ?? '',
         outcome: 'available' as const,
         reason: null,
         durationMs: 1,
         rawStatus: 'idle',
         durableState: 'idle',
-        latestAssistantText: 'PONG',
-        latestAssistantPreview: 'PONG',
+        latestAssistantText: input.expectedOutput ?? '',
+        latestAssistantPreview: input.expectedOutput ?? '',
         toolCallCount: 0,
         errorCount: 0,
         diagnostics: [],
@@ -4481,7 +4562,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4492,7 +4573,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureSessionCalls).toBe(1)
     expect(result.data.teamLaunchState).toBe('launching')
-    expect(result.data.members.bob?.model).toBe('big-pickle')
+    expect(result.data.members.bob?.model).toBe('opencode/big-pickle')
     expect(result.data.members.bob?.launchState).toBe('created')
   })
 
@@ -4510,6 +4591,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           default: {},
         },
       })
+    mockUnavailableExactProof()
     let ensureSessionCalls = 0
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
@@ -4527,7 +4609,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4537,7 +4619,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode provider "opencode" for selected model "opencode/big-pickle" is not connected',
+      'selected execution unavailable',
     )
     expect(ensureSessionCalls).toBe(0)
   })
@@ -4556,6 +4638,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           default: {},
         },
       })
+    mockUnavailableExactProof()
     let ensureSessionCalls = 0
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
@@ -4573,7 +4656,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
     )
@@ -4583,7 +4666,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'OpenCode provider "opencode" for selected model "opencode/big-pickle" is not connected',
+      'selected execution unavailable',
     )
     expect(ensureSessionCalls).toBe(0)
   })
@@ -4607,7 +4690,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
@@ -4648,7 +4731,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
           capabilitySnapshotRecoveryAttemptId: 'recovery-1',
           members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
@@ -4691,7 +4774,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         manifestHighWatermark: 1,
         members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
       }),
@@ -4726,13 +4809,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         preconditions: {
           handshakeIdentityHash: 'handshake-1',
           laneId: 'secondary:opencode:jack',
           expectedRunId: 'run-lane-precondition',
           expectedCapabilitySnapshotId: null,
-          expectedBehaviorFingerprint: null,
+          expectedBehaviorFingerprint: expectedFingerprintForModel('openrouter/minimax-m2.5-free'),
           expectedManifestHighWatermark: null,
           commandLeaseId: null,
           idempotencyKey: 'idempotency-lane-mismatch',
@@ -4770,13 +4853,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamId: 'team-a',
         teamName: 'team-a',
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         preconditions: {
           handshakeIdentityHash: 'handshake-1',
           laneId: 'secondary:opencode:bob',
           expectedRunId: 'run-stale',
           expectedCapabilitySnapshotId: null,
-          expectedBehaviorFingerprint: null,
+          expectedBehaviorFingerprint: expectedFingerprintForModel('openrouter/minimax-m2.5-free'),
           expectedManifestHighWatermark: null,
           commandLeaseId: null,
           idempotencyKey: 'idempotency-run-mismatch',
@@ -4835,7 +4918,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           members: [
             { name: 'bob', role: 'Developer', prompt: 'Bob OpenCode join' },
             { name: 'jack', role: 'Reviewer', prompt: 'Jack OpenCode join' },
@@ -4920,7 +5003,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
         }),
       )
@@ -4996,7 +5079,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
         }),
       )
@@ -5110,7 +5193,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
         }),
       )
@@ -5213,7 +5296,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           teamId: 'team-a',
           teamName: 'team-a',
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
         }),
       )

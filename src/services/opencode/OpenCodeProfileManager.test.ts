@@ -1291,6 +1291,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const previousOpenCodeConfigContent = process.env.OPENCODE_CONFIG_CONTENT
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
     const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousMcpUrl = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
     const appDataHome = path.join(tempDir, 'app-data-config-import')
     const appCacheHome = path.join(tempDir, 'app-cache-config-import')
     const xdgConfigHome = path.join(tempDir, 'real-xdg-config')
@@ -1339,6 +1340,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env.OPENCODE_CONFIG = customConfigPath
     process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       provider: {
+        deepinfra: { options: { apiKey: 'deepinfra-config-secret' }, models: { chosen: {} } },
+        kiro: { options: { poisoned: true }, models: { poison: {} } },
+        'cursor-acp': { options: { poisoned: true }, models: { poison: {} } },
         lmstudio: {
           npm: '@ai-sdk/openai-compatible',
           options: { baseURL: 'http://localhost:1234/v1' },
@@ -1349,6 +1353,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
     process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'http://127.0.0.1:43123/mcp'
 
     try {
       const manager = new OpenCodeProfileManager()
@@ -1384,7 +1389,12 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         profileScope: await catalogScope('deepinfra'),
       })
       expect(scopedProfile.managedConfig.plugin).toEqual([])
-      expect(scopedProfile.managedConfig.provider).toEqual({})
+      expect(scopedProfile.managedConfig.provider).toEqual({
+        deepinfra: {
+          options: { apiKey: 'deepinfra-config-secret' },
+          models: { chosen: {} },
+        },
+      })
       expect(scopedProfile.workingDirectoryPath).not.toBe(projectPath)
       const kiroProfile = await manager.prepareProfile(
         projectPath,
@@ -1404,6 +1414,33 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(cursorProfile.managedConfig.plugin).toEqual([
         '@rama_nigg/open-cursor@2.5.2',
       ])
+      await Promise.all(['deepinfra', 'llama.cpp', 'kiro', 'cursor-acp'].map(providerId =>
+        upsertOpenCodeAuthCredential({
+          authPath: path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+          providerId,
+          credential: { type: 'api', key: `${providerId}-secret` },
+        })))
+      for (const selected of ['deepinfra/chosen', 'llama.cpp/qwen-test:0.5b']) {
+        const providerId = selected.slice(0, selected.indexOf('/'))
+        const launchProfile = await manager.prepareProfile(projectPath, {
+          profileScope: await resolveOpenCodeProfileScope({
+            projectPath, purpose: 'launch_runtime', selectedModel: selected,
+          }),
+        })
+        expect(Object.keys(launchProfile.managedConfig.provider as object)).toEqual([providerId])
+        expect(launchProfile.managedConfig.plugin).toEqual(['unsafe-plugin', 'project-user-plugin'])
+        expect(launchProfile.managedConfig.mcp).toHaveProperty('agent-teams')
+        expect(launchProfile.managedConfig.agent).toHaveProperty('teammate')
+        expect(await readOpenCodeAuthCredential({
+          authPath: launchProfile.managedAuthPath, providerId,
+        })).toMatchObject({ key: `${providerId}-secret` })
+        expect(await readOpenCodeAuthCredential({
+          authPath: launchProfile.managedAuthPath, providerId: 'kiro',
+        })).toBeNull()
+        expect(await readOpenCodeAuthCredential({
+          authPath: launchProfile.managedAuthPath, providerId: 'cursor-acp',
+        })).toBeNull()
+      }
       expect(managedConfig).not.toHaveProperty('permission')
       expect(managedConfig).not.toHaveProperty('command')
       expect(mcp.unsafe).toBeUndefined()
@@ -1434,6 +1471,11 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
       } else {
         process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+      if (previousMcpUrl === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = previousMcpUrl
       }
     }
   })
