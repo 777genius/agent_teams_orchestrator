@@ -507,6 +507,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const builtin = await resolve('opencode/big-pickle', 'execution_probe')
     const builtinSame = await resolve('opencode/big-pickle', 'execution_probe')
     const builtinLaunch = await resolve('opencode/big-pickle', 'launch_runtime')
+    await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await expect(resolve('opencode/BIG-PICKLE', 'launch_runtime'))
+      .rejects.toThrow('requires explicit selected authentication')
     const ollama = await resolve('ollama/qwen3:8b', 'execution_probe')
     const ollamaOtherModel = await resolve('ollama/llama3.2:3b', 'execution_probe')
     const loopback = await resolve('custom-local/exact-model', 'execution_probe', {
