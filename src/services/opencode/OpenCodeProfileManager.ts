@@ -59,7 +59,10 @@ import {
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
-import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  canonicalizeOpenCodeProviderId,
+  isLiteralLoopbackOpenCodeUrl,
+} from './OpenCodeProviderIdentity.js'
 import {
   buildCursorAgentResourceExhaustedPreloadScript,
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
@@ -1595,20 +1598,6 @@ const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
   'big-pickle',
 ])
 
-function isLoopbackOpenCodeAuthorityUrl(value: unknown): boolean {
-  if (typeof value !== 'string' || !value.trim()) return false
-  try {
-    const hostname = new URL(value).hostname.toLowerCase()
-    return hostname === 'localhost'
-      || hostname === '0.0.0.0'
-      || hostname === '::1'
-      || hostname === '[::1]'
-      || hostname.startsWith('127.')
-  } catch {
-    return false
-  }
-}
-
 function resolveOpenCodeAuthlessAuthorityMode(input: {
   providerId: string
   selectedModel: string
@@ -1619,7 +1608,7 @@ function resolveOpenCodeAuthlessAuthorityMode(input: {
   if (
     input.providerId === 'opencode'
     && modelId.length > 0
-    && OPEN_CODE_BUILTIN_FREE_MODEL_IDS.has(modelId.toLowerCase())
+    && OPEN_CODE_BUILTIN_FREE_MODEL_IDS.has(modelId)
   ) {
     return 'builtin_free'
   }
@@ -1629,7 +1618,7 @@ function resolveOpenCodeAuthlessAuthorityMode(input: {
   const providerConfig = asRecord(input.providerConfig)
   const options = asRecord(providerConfig?.options)
   return providerConfig?.npm === '@ai-sdk/openai-compatible'
-    && isLoopbackOpenCodeAuthorityUrl(options?.baseURL ?? options?.baseUrl)
+    && isLiteralLoopbackOpenCodeUrl(options?.baseURL ?? options?.baseUrl)
     ? 'configured_authless'
     : null
 }

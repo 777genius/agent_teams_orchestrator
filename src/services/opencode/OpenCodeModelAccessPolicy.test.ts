@@ -61,6 +61,20 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(false)
   })
 
+  test('continues allowing every catalog-confirmed built-in free OpenCode model', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'opencode/catalog-free-model',
+      catalog: catalog({
+        models: ['opencode/catalog-free-model'],
+        modelMetadata: [modelMetadata('opencode/catalog-free-model')],
+      }),
+    })
+
+    expect(access.kind).toBe('builtin_free')
+    expect(access.launchAllowed).toBe(true)
+    expect(access.requiresExecutionProof).toBe(false)
+  })
+
   test('requires execution proof for configured authless local providers', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'llama.cpp/qwen-test:0.5b',
@@ -231,6 +245,59 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.kind).toBe('not_authenticated')
     expect(access.launchAllowed).toBe(false)
     expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test.each([
+    'http://127.attacker.example/v1',
+    'http://127.0.0.1.attacker.example/v1',
+    'http://attacker.example@127.0.0.1/v1',
+    'http://2130706433/v1',
+    'http://192.168.1.10/v1',
+    'not a URL',
+  ])('does not treat nonliteral loopback confusion as authless: %s', baseURL => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'custom/exact-model',
+      catalog: catalog({
+        configProviders: {
+          providers: [{
+            id: 'custom',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL },
+            models: { 'exact-model': {} },
+          }],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('not_authenticated')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test.each([
+    'http://127.0.0.1:8080/v1',
+    'http://127.1.2.3:8080/v1',
+    'http://[::1]:8080/v1',
+  ])('requires proof for a literal loopback authority: %s', baseURL => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'custom/exact-model',
+      catalog: catalog({
+        configProviders: {
+          providers: [{
+            id: 'custom',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL },
+            models: { 'exact-model': {} },
+          }],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('configured_authless')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(true)
   })
 
   test('requires execution proof for known local provider models discovered only from inventory', () => {
