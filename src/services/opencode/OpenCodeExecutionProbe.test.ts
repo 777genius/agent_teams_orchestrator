@@ -3046,13 +3046,31 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test('releases a host that finishes startup after the runtime deadline', async () => {
-    let resolveHost: ((value: OpenCodeHostHandle) => void) | null = null
+    let now = 0
+    let expireDeadline = () => {
+      throw new Error('runtime deadline timer was not installed')
+    }
+    let resolveHost = (_value: OpenCodeHostHandle) => {
+      throw new Error('host startup did not begin')
+    }
+    let markHostStartupStarted!: () => void
+    const hostStartupStarted = new Promise<void>(resolve => {
+      markHostStartupStarted = resolve
+    })
     let releaseHostCount = 0
-    const runtimeDeadline = new OpenCodeRuntimeDeadline(10)
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(10, {
+      monotonicNow: () => now,
+      setTimer: callback => {
+        expireDeadline = callback
+        return { unref() {} } as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => new Promise<OpenCodeHostHandle>(resolve => {
           resolveHost = resolve
+          markHostStartupStarted()
         }),
         releaseHost: async () => {
           releaseHostCount += 1
@@ -3068,7 +3086,10 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
         runtimeDeadline,
       })
-      setTimeout(() => resolveHost?.(host), 25)
+      await hostStartupStarted
+      now = 10
+      expireDeadline()
+      resolveHost(host)
 
       await expect(result).rejects.toBeInstanceOf(OpenCodeRuntimeDeadlineError)
       expect(releaseHostCount).toBe(1)
