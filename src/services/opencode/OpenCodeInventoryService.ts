@@ -874,6 +874,35 @@ function mergeConnectedProviders(
   })
 }
 
+export function deriveOpenCodeProfileConnectedProviders(input: {
+  profileScope?: OpenCodeProfileScope
+  profile: OpenCodePreparedProfile
+  readAuthProviderSummaries?: typeof readOpenCodeAuthProviderSummaries
+}): { providers: OpenCodeConnectedProvider[]; profileScopeError: boolean } {
+  const requestedScope = input.profileScope
+  const preparedScope = input.profile.profileScope
+  const sourceIdentity = input.profile.selectedSourceAuthIdentity
+  const managedIdentity = input.profile.selectedManagedAuthIdentity
+  const valid = Boolean(
+    requestedScope
+    && preparedScope
+    && JSON.stringify(preparedScope) === JSON.stringify(requestedScope)
+    && input.profile.scopeToken === requestedScope.scopeToken
+    && sourceIdentity !== undefined
+    && sourceIdentity !== 'error'
+    && managedIdentity !== undefined
+    && managedIdentity !== 'error'
+    && sourceIdentity === managedIdentity
+    && sourceIdentity === requestedScope.selectedAuthIdentity,
+  )
+  return {
+    providers: valid && sourceIdentity !== 'absent'
+      ? [{ id: requestedScope!.providerId, authHint: null, source: 'credentials' }]
+      : [],
+    profileScopeError: !valid,
+  }
+}
+
 export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSummary[] {
   const agents: OpenCodeAgentSummary[] = []
 
@@ -1060,18 +1089,18 @@ export class OpenCodeInventoryService {
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
     const globalAuthProviderIds = new Set(
-      (profile.globalAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
+      mode === 'profile' || !profile.globalAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
             () => [],
-          )
-        : []
-      ).map(provider => provider.id),
+          )).map(provider => provider.id),
     )
     const sourceAuthProviderIds = new Set(
-      (profile.sourceAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
-        : []
-      ).map(provider => provider.id),
+      mode === 'profile' || !profile.sourceAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(
+            () => [],
+          )).map(provider => provider.id),
     )
     const credentialScopesForProvider = (providerId: string): Array<'managed' | 'local'> => {
       const scopes: Array<'managed' | 'local'> = []
@@ -1079,30 +1108,27 @@ export class OpenCodeInventoryService {
       if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
       return scopes.length > 0 ? scopes : ['managed']
     }
-    const managedAuthProviders = (
-      await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
-    ).map(provider => ({
-      ...provider,
-      credentialScopes: credentialScopesForProvider(provider.id),
-    }))
-    const cliConnectedProviders = providerParse.connectedProviders.map(provider => {
-      if (provider.source !== 'credentials') {
-        return provider
-      }
-      return {
-        ...provider,
-        credentialScopes: credentialScopesForProvider(provider.id),
-      }
-    })
-    const discoveredConnectedProviders = mergeConnectedProviders([
-      ...cliConnectedProviders,
-      ...managedAuthProviders,
-    ])
+    const discovered = mode === 'profile'
+      ? deriveOpenCodeProfileConnectedProviders({ profileScope: options.profileScope, profile })
+      : {
+          providers: mergeConnectedProviders([
+            ...providerParse.connectedProviders.map(provider => provider.source === 'credentials'
+              ? { ...provider, credentialScopes: credentialScopesForProvider(provider.id) }
+              : provider),
+            ...(await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed'])
+              .catch(() => []))
+              .map(provider => ({
+                ...provider,
+                credentialScopes: credentialScopesForProvider(provider.id),
+              })),
+          ]),
+          profileScopeError: false,
+        }
     const {
       connectedProviders,
       unsupportedSuperGrokOAuth,
     } = filterOpenCodeConnectedProvidersForRuntime({
-      providers: discoveredConnectedProviders,
+      providers: discovered.providers,
       version,
     })
     const verboseModels =
@@ -1146,6 +1172,9 @@ export class OpenCodeInventoryService {
     const diagnostics: string[] = []
     if (profile.authState === 'stale') {
       diagnostics.push('Managed OpenCode auth differs from the source auth store')
+    }
+    if (discovered.profileScopeError) {
+      diagnostics.push('OpenCode profile scope auth evidence is invalid')
     }
     if (unsupportedSuperGrokOAuth) {
       diagnostics.push(
