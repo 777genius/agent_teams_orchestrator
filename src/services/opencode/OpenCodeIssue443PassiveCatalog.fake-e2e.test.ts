@@ -21,6 +21,10 @@ describe('issue #443 passive status/catalog fake E2E', () => {
   function adapter(timeoutMs = 500, hooks: {
     onIdentityRead?: () => void
     onReleaseHost?: () => void
+    poisonedProviders?: Partial<Record<'kiro' | 'cursor-acp', {
+      entered: ReturnType<typeof deferred<void>>
+      release: ReturnType<typeof deferred<void>>
+    }>>
   } = {}) {
     return new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: timeoutMs,
@@ -43,6 +47,14 @@ describe('issue #443 passive status/catalog fake E2E', () => {
       inventoryService: {
         probe: async (_projectPath, options) => {
           expect(options?.mode).toBe('profile')
+          const providerId = options?.profileScope?.providerId
+          const poison = providerId === 'kiro' || providerId === 'cursor-acp'
+            ? hooks.poisonedProviders?.[providerId]
+            : undefined
+          if (poison) {
+            poison.entered.resolve()
+            await poison.release.promise
+          }
           return harness.catalogInventory({ mode: options?.mode })
         },
       },
@@ -64,10 +76,21 @@ describe('issue #443 passive status/catalog fake E2E', () => {
   }
 
   test('poisoned unrelated providers cannot block passive status or scoped DeepInfra catalog', async () => {
-    const poisonedKiro = deferred<never>()
-    const poisonedCursor = deferred<never>()
-    void poisonedKiro
-    void poisonedCursor
+    const poisonedProviders = {
+      kiro: { entered: deferred<void>(), release: deferred<void>() },
+      'cursor-acp': { entered: deferred<void>(), release: deferred<void>() },
+    }
+    const catalog = adapter(500, { poisonedProviders })
+    const kiroRequest = catalog.loadModels({
+      runtimeId: 'opencode', providerId: 'kiro', projectPath: harness.projectPath,
+    })
+    const cursorRequest = catalog.loadModels({
+      runtimeId: 'opencode', providerId: 'cursor-acp', projectPath: harness.projectPath,
+    })
+    await Promise.all([
+      poisonedProviders.kiro.entered.promise,
+      poisonedProviders['cursor-acp'].entered.promise,
+    ])
 
     const status = buildOpenCodePassiveStatus({
       readOpenCodePassiveEvidence: () => ({
@@ -79,7 +102,7 @@ describe('issue #443 passive status/catalog fake E2E', () => {
     expect(await harness.sandboxEntries()).toEqual([])
     expect(harness).toMatchObject({ writes: [], profiles: [], hosts: [], processTrees: [] })
 
-    const result = await adapter().loadModels({
+    const result = await catalog.loadModels({
       runtimeId: 'opencode', providerId: 'deepinfra', projectPath: harness.projectPath,
     })
     if (!result.ok) throw new Error(JSON.stringify(result))
@@ -91,6 +114,9 @@ describe('issue #443 passive status/catalog fake E2E', () => {
     expect(harness.plugins).toEqual([])
     expect(harness.mcp).toEqual([])
     expect(await harness.sandboxEntries()).toEqual([])
+    poisonedProviders.kiro.release.resolve()
+    poisonedProviders['cursor-acp'].release.resolve()
+    await Promise.all([kiroRequest, cursorRequest])
     harness.assertSafe()
   })
 

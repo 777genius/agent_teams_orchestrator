@@ -1,18 +1,61 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { coordinateStrictLaunch } from './OpenCodeStrictLaunchCoordinator.js'
 import { validateOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import { deferred, Issue443Harness } from './OpenCodeIssue443FakeE2E.test-support.js'
-import type { StrictProof, StrictResource } from './OpenCodeStrictLaunchCoordinator.js'
+import { Issue443PersistentCommandFake } from './OpenCodeIssue443PersistentCommand.test-support.js'
+import type { StrictProof } from './OpenCodeStrictLaunchCoordinator.js'
 
 async function drain(): Promise<void> {
   for (let index = 0; index < 20; index += 1) await Promise.resolve()
 }
 
 describe('issue #443 strict launch fake E2E', () => {
+  let persistent: Issue443PersistentCommandFake
+
+  beforeEach(async () => {
+    persistent = new Issue443PersistentCommandFake()
+    await persistent.open()
+  })
+
+  afterEach(async () => {
+    await persistent.close()
+  })
+
+  test('fresh one-shot handlers recover a known cancelled create and only recreate missing member two', async () => {
+    const failed = await persistent.invokeOneShot({ cancelAfterKnownCreate: 'two' })
+    expect(failed).toMatchObject({ status: 'stopped', committedMemberIds: ['one'] })
+
+    const afterFailure = await persistent.sessions()
+    expect(afterFailure.find(record => record.memberName === 'one')).toMatchObject({
+      opencodeSessionId: 'session-one-1',
+      bootstrapEvidenceSource: 'app_managed_bootstrap',
+    })
+    const incompleteTwo = afterFailure.find(record => record.memberName === 'two')
+    expect(incompleteTwo?.opencodeSessionId).toBe('session-two-2')
+    expect(incompleteTwo?.bootstrapEvidenceSource).toBeUndefined()
+
+    const retried = await persistent.invokeOneShot()
+    expect(retried).toMatchObject({ status: 'committed', committedMemberIds: ['one', 'two'] })
+    expect(retried.projections.map(projection => projection.member)).toEqual(['one', 'two'])
+
+    const evidence = await persistent.evidence()
+    expect(evidence.managerInvocations).toEqual([1, 2])
+    expect(evidence.creates).toEqual([
+      { managerId: 1, member: 'one', sessionId: 'session-one-1' },
+      { managerId: 1, member: 'two', sessionId: 'session-two-2' },
+      { managerId: 2, member: 'two', sessionId: 'session-two-3' },
+    ])
+    const sessions = await persistent.sessions()
+    expect(sessions.map(record => [record.memberName, record.opencodeSessionId]).sort()).toEqual([
+      ['one', 'session-one-1'],
+      ['two', 'session-two-3'],
+    ])
+  })
+
   test('one retained host carries App MCP, exact proof, profile identity, and committed members', async () => {
     const harness = new Issue443Harness()
     const result = await coordinateStrictLaunch(harness.strictRequest(), harness)
@@ -62,28 +105,6 @@ describe('issue #443 strict launch fake E2E', () => {
       expect(harness.cleanupEvents, label).toEqual([[]])
       expect(harness.releases[0], label).toMatchObject({ keepAlive: false })
     }
-  })
-
-  test('known partial failure preserves member one and retry materializes only member two', async () => {
-    const harness = new Issue443Harness()
-    const owned: StrictResource = {
-      attemptId: 'attempt-443', generation: 7, resourceId: 'member-two-uncommitted', committed: false,
-    }
-    const foreign: StrictResource = {
-      attemptId: 'other-attempt', generation: 7, resourceId: 'foreign', committed: false,
-    }
-    harness.materializeResults.set('two', { kind: 'failure', error: 'selected member failed', resources: [owned, foreign] })
-
-    const failed = await coordinateStrictLaunch(harness.strictRequest(), harness)
-    expect(failed).toMatchObject({ status: 'failure', committedMemberIds: ['one'] })
-    expect(harness.cleanupEvents).toEqual([[owned]])
-    expect(harness.releases[0]).toMatchObject({ keepAlive: true })
-
-    const priorCalls = harness.members.length
-    harness.materializeResults.delete('two')
-    const retried = await coordinateStrictLaunch(harness.strictRequest(), harness)
-    expect(retried).toMatchObject({ status: 'committed', committedMemberIds: ['one', 'two'] })
-    expect(harness.members.slice(priorCalls)).toEqual(['two'])
   })
 
   test('unknown materialization is not automatically retried or cleaned', async () => {
