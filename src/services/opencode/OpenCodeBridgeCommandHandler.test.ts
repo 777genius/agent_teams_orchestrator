@@ -415,7 +415,7 @@ function mockRequiredMcpTools(): void {
 
 function mockUnavailableExactProof(reason = 'selected execution unavailable'): void {
   openCodeExecutionProbe.probeModelOnHost = (async input => ({
-    providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
+    providerId: 'opencode',
     modelId: input.selectedModel,
     probePrompt: input.prompt ?? '', expectedOutput: input.expectedOutput ?? '',
     outcome: 'unavailable', reason, durationMs: 1, rawStatus: 'error',
@@ -550,7 +550,7 @@ beforeEach(async () => {
     }
   }) as typeof openCodeProvisioningProbe.probeRetainingHost
   openCodeExecutionProbe.probeModelOnHost = (async input => ({
-    providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
+    providerId: 'opencode',
     modelId: input.selectedModel,
     probePrompt: input.prompt ?? '',
     expectedOutput: input.expectedOutput ?? '',
@@ -796,10 +796,30 @@ function buildEnvelope(command: string, body: Record<string, unknown>) {
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(nextResolve => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((nextResolve, nextReject) => {
     resolve = nextResolve
+    reject = nextReject
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
+}
+
+type ManualTimer = { callback: () => void; timeoutMs: number; cancelled: boolean }
+type RetainedProbe = Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
+async function withManualTimers<T>(run: (timers: ManualTimer[]) => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout; const realClearTimeout = globalThis.clearTimeout
+  const timers: ManualTimer[] = []
+  globalThis.setTimeout = ((callback: () => void, timeoutMs = 0) => {
+    const timer = { callback, timeoutMs, cancelled: false }
+    timers.push(timer)
+    return Object.assign(timer, { unref: () => timer })
+  }) as typeof setTimeout
+  globalThis.clearTimeout = ((timer: ManualTimer) => { timer.cancelled = true }) as typeof clearTimeout
+  try {
+    return await run(timers)
+  } finally {
+    globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout
+  }
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
@@ -2469,7 +2489,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeExecutionProbe.probeModelOnHost = (async input => {
       events.push(`proof:${input.host.hostKey}`)
       return {
-        providerId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
+        providerId: 'opencode',
         modelId: input.selectedModel,
         probePrompt: input.prompt ?? '',
         expectedOutput: input.expectedOutput ?? '',
@@ -2607,7 +2627,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(memberCalls).toBe(0)
   })
 
-  for (const selectedModel of ['deepinfra/chosen', 'custom-provider/nested/model']) {
+  for (const selectedModel of [
+    'deepinfra/chosen',
+    'custom-provider/nested/model',
+    'opencode/big-pickle',
+  ]) {
     test(`authorizes empty-catalog ${selectedModel} only through exact retained-host proof`, async () => {
       const strictHost = snapshot.host!
       openCodeProvisioningProbe.probeRetainingHost = (async () => ({
@@ -2650,13 +2674,137 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   }
 
+  test('rejects mismatched exact full-model and nonce output proofs before member work', async () => {
+    const prove = openCodeExecutionProbe.probeModelOnHost
+    let memberCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => (
+      { snapshot, host: snapshot.host, release: async () => {} }
+    )) as typeof openCodeProvisioningProbe.probeRetainingHost
+    const noMember = async () => { memberCalls += 1; throw new Error('member must not run') }
+    openCodeSessionBridge.materializeSessionOnHost = noMember as typeof openCodeSessionBridge.materializeSessionOnHost
+    for (const mismatch of ['full-model', 'nonce'] as const) {
+      openCodeExecutionProbe.probeModelOnHost = (async input => {
+        const proof = await prove(input)
+        return mismatch === 'full-model'
+          ? { ...proof, modelId: 'deepinfra/not-chosen' }
+          : { ...proof, latestAssistantText: 'STRICT_LAUNCH_wrong-nonce' }
+      }) as typeof openCodeExecutionProbe.probeModelOnHost
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+        runId: `run-mismatched-${mismatch}`, laneId: 'primary', teamId: 'team-a',
+        selectedModel: 'deepinfra/chosen', members: [{ name: 'alice' }],
+      }))
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error.message).toContain('mismatched')
+    }
+    expect(memberCalls).toBe(0)
+  })
+  test('allows provisioning completed immediately before the work deadline to reach proof', async () => {
+    const realNow = Date.now; let now = 1_000; Date.now = () => now
+    try {
+      await withManualTimers(async () => {
+        let proofCalls = 0
+        const prove = openCodeExecutionProbe.probeModelOnHost
+        const acquire = openCodeProvisioningProbe.probeRetainingHost
+        openCodeProvisioningProbe.probe = async () => snapshot
+        openCodeProvisioningProbe.probeRetainingHost = (async (_path, options) => {
+          now += options.phaseContext.remainingMs() - 1
+          return acquire(_path, options)
+        }) as typeof openCodeProvisioningProbe.probeRetainingHost
+        openCodeExecutionProbe.probeModelOnHost = (async input => {
+          proofCalls += 1; return prove(input)
+        }) as typeof openCodeExecutionProbe.probeModelOnHost
+        const envelope = buildEnvelope('opencode.launchTeam', {
+          runId: 'run-provisioning-before-work-deadline', laneId: 'primary',
+          teamId: 'team-a', selectedModel: 'deepinfra/chosen',
+          members: [{ name: 'alice' }],
+        })
+        envelope.timeoutMs = 1_000
+        await executeOpenCodeBridgeCommandEnvelope(envelope)
+        expect(proofCalls).toBe(1)
+      })
+    } finally { Date.now = realNow }
+  })
+
+  test('fences abort-ignoring provisioning and releases only a late owned host in time', async () => {
+    await withManualTimers(async timers => {
+      const acquired = createDeferred<RetainedProbe>()
+      let workCalls = 0; let releaseCalls = 0
+      openCodeProvisioningProbe.probeRetainingHost = (async () => acquired.promise) as
+        typeof openCodeProvisioningProbe.probeRetainingHost
+      const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
+      openCodeExecutionProbe.probeModelOnHost = noWork as typeof openCodeExecutionProbe.probeModelOnHost
+      openCodeSessionBridge.materializeSessionOnHost = noWork as typeof openCodeSessionBridge.materializeSessionOnHost
+      const envelope = buildEnvelope('opencode.launchTeam', {
+        runId: 'run-provisioning-work-timeout', laneId: 'primary',
+        teamId: 'team-a', selectedModel: 'deepinfra/chosen', members: [{ name: 'alice' }],
+      })
+      envelope.timeoutMs = 1_000
+      const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
+      await Promise.resolve()
+      const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
+      expect(workTimer).toBeDefined(); workTimer!.callback()
+      const result = await resultPromise
+      expect(result.ok).toBe(false)
+      expect(workCalls).toBe(0)
+      acquired.resolve({ snapshot, host: snapshot.host, release: async () => { releaseCalls += 1 } })
+      await Promise.resolve(); await Promise.resolve()
+      expect(releaseCalls).toBe(1)
+    })
+  })
+
+  test('external cancellation observes late rejection and skips cleanup after the absolute deadline', async () => {
+    const realNow = Date.now; let now = 1_000; Date.now = () => now
+    try {
+      await withManualTimers(async () => {
+        const acquired = createDeferred<RetainedProbe>()
+        let workCalls = 0; let unrelatedReleaseCalls = 0
+        openCodeProvisioningProbe.probeRetainingHost = (async () => acquired.promise) as
+          typeof openCodeProvisioningProbe.probeRetainingHost
+        const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
+        openCodeExecutionProbe.probeModelOnHost = noWork as typeof openCodeExecutionProbe.probeModelOnHost
+        openCodeSessionBridge.materializeSessionOnHost = noWork as typeof openCodeSessionBridge.materializeSessionOnHost
+        const controller = new AbortController()
+        const envelope = buildEnvelope('opencode.launchTeam', {
+          runId: 'run-cancelled-provisioning', laneId: 'primary',
+          teamId: 'team-a', selectedModel: 'deepinfra/chosen', members: [{ name: 'alice' }],
+        })
+        envelope.timeoutMs = 1_000
+        const resultPromise = executeOpenCodeBridgeCommandEnvelope(
+          envelope, { signal: controller.signal },
+        )
+        await Promise.resolve()
+        controller.abort(new Error('cancelled externally'))
+        const result = await resultPromise
+        expect(result.ok).toBe(false)
+        expect(workCalls).toBe(0)
+        now = 2_001
+        acquired.resolve({ snapshot, host: snapshot.host,
+          release: async () => { unrelatedReleaseCalls += 1 } })
+        await Promise.resolve(); await Promise.resolve()
+        expect(unrelatedReleaseCalls).toBe(0)
+        const rejected = createDeferred<RetainedProbe>()
+        openCodeProvisioningProbe.probeRetainingHost = (async () => rejected.promise) as
+          typeof openCodeProvisioningProbe.probeRetainingHost
+        const secondController = new AbortController()
+        const second = executeOpenCodeBridgeCommandEnvelope(
+          envelope, { signal: secondController.signal },
+        )
+        await Promise.resolve()
+        secondController.abort(new Error('cancelled externally'))
+        await second
+        rejected.reject(new Error('late provisioning rejection'))
+        await Promise.resolve()
+      })
+    } finally { Date.now = realNow }
+  })
+
   test('rechecks retained-host behavior after model proof before materialization', async () => {
     let memberCalls = 0
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeExecutionProbe.probeModelOnHost = (async input => {
       input.host.profile.managedConfig = { changed: true }
       return {
-        providerId: 'openrouter', modelId: input.selectedModel,
+        providerId: 'opencode', modelId: input.selectedModel,
         probePrompt: input.prompt ?? '', expectedOutput: input.expectedOutput ?? '',
         outcome: 'available', reason: null, durationMs: 1, rawStatus: 'idle',
         durableState: 'idle', latestAssistantText: input.expectedOutput ?? '',
@@ -4426,7 +4574,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
       return {
-        providerId: 'llama.cpp' as const,
+        providerId: 'opencode' as const,
         modelId: input.selectedModel,
         probePrompt: 'Output only the single word PONG.',
         expectedOutput: input.expectedOutput ?? '',

@@ -2877,38 +2877,50 @@ async function runLaunch(
     5_000,
     Math.max(250, Math.floor(runtimeDeadline.remainingMs() / 10)),
   )
+  const workDeadlineAt = deadlineAt - cleanupReserveMs
   const probeStartedAt = Date.now()
   let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
   let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
   const launchSignal = externalSignal
     ? AbortSignal.any([runtimeDeadline.signal, externalSignal])
     : runtimeDeadline.signal
+  const provisioningController = new AbortController()
+  const provisioningSignal = AbortSignal.any([launchSignal, provisioningController.signal])
+  const provisioningTimer = setTimeout(() => provisioningController.abort(
+    new Error('OpenCode strict launch provisioning deadline expired'),
+  ), Math.max(0, workDeadlineAt - Date.now()))
+  provisioningTimer.unref?.()
   try {
-    retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
-      const phaseContext: OpenCodePhaseContext = {
-        ...context,
-        signal: launchSignal,
-      }
-      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
-        asString(body.projectPath) ?? envelope.cwd,
-        {
-          toolApprovalMode,
-          phaseContext,
-          selectedModel: apiSelectedModel,
-          leaseId: preconditions.commandLeaseId,
-        },
-      )
-      return pendingProbe
-    })
+    const phaseContext: OpenCodePhaseContext = {
+      phase: 'host_start',
+      signal: provisioningSignal,
+      remainingMs: () => Math.max(0, workDeadlineAt - Date.now()),
+      throwIfExpired: () => {
+        if (provisioningSignal.aborted) throwOpenCodeAbortReason(provisioningSignal)
+        if (Date.now() >= workDeadlineAt) throw new Error(
+          'OpenCode strict launch provisioning deadline expired',
+        )
+      },
+    }
+    phaseContext.throwIfExpired()
+    pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+      asString(body.projectPath) ?? envelope.cwd,
+      { toolApprovalMode, phaseContext, selectedModel: apiSelectedModel,
+        leaseId: preconditions.commandLeaseId },
+    )
+    retainedProbe = await raceOpenCodeAbortSignal(pendingProbe, provisioningSignal)
   } catch (error) {
-    if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
-      const cleanup = pendingProbe
-        .then(probe => probe.release())
-        .catch(() => undefined)
+    provisioningController.abort(error)
+    if (pendingProbe) {
+      const cleanup = pendingProbe.then(async probe => {
+        const remainingMs = Math.max(0, deadlineAt - Date.now())
+        if (remainingMs > 0) await withTimeout(probe.release(), remainingMs)
+      }).catch(() => undefined)
       void cleanup
-      await withTimeout(cleanup, 5_000).catch(() => undefined)
     }
     throw error
+  } finally {
+    clearTimeout(provisioningTimer)
   }
   const provisioningProbeMs = elapsedMs(probeStartedAt)
   const snapshot = retainedProbe.snapshot
@@ -3043,7 +3055,7 @@ async function runLaunch(
         }
       }
       if (
-        executionOutcome.providerId !== selectedModelRef.providerId
+        executionOutcome.providerId !== 'opencode'
         || executionOutcome.modelId !== apiSelectedModel
         || executionOutcome.latestAssistantText?.trim() !== expectedOutput
       ) {
