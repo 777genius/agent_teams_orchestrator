@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -243,8 +243,15 @@ describe('OpenCodeSessionBridge', () => {
       ...profile,
       profileScope,
       scopeToken: profileScope.scopeToken,
+      managedConfig: { agent: { teammate: { permission: { '*': 'ask' } } } },
     }
-    const existing = { ...buildRecord(), profileScope }
+    const existing = {
+      ...buildRecord(),
+      profileScope,
+      toolApprovalMode: 'auto' as const,
+      managedConfigFingerprint: preparedProfile.managedConfigFingerprint,
+    }
+    let updated: OpenCodeSessionRecord | null = null
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => {
         prepareProfileCalls += 1
@@ -252,7 +259,10 @@ describe('OpenCodeSessionBridge', () => {
       },
       sessionStore: {
         get: async () => existing,
-        upsert: async () => 'unchanged',
+        upsert: async record => {
+          updated = record
+          return 'updated'
+        },
         markStale: async () => existing,
       },
       hostManager: {
@@ -306,7 +316,13 @@ describe('OpenCodeSessionBridge', () => {
       preparedProfile,
     })
 
-    expect(record).toEqual({ ...existing, runtimePid: 123 })
+    expect(record).toEqual({
+      ...existing,
+      toolApprovalMode: 'manual',
+      runtimePid: 123,
+      updatedAt: expect.any(String),
+    })
+    expect(updated?.toolApprovalMode).toBe('manual')
     expect(prepareProfileCalls).toBe(0)
     expect(createSessionCalls).toBe(0)
   })
@@ -2190,6 +2206,49 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.reconcileOutcome).toBe('stale')
     expect(staleMarks).toEqual(['profile_scope_changed'])
   })
+
+  test.each(['absent', 'error'] as const)(
+    'does not reuse a persisted host after restart when credential identity is %s',
+    async credentialIdentity => {
+      if (credentialIdentity === 'error') {
+        const authPath = path.join(process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]!, 'opencode', 'auth.json')
+        await mkdir(path.dirname(authPath), { recursive: true })
+        await writeFile(authPath, '{invalid-json')
+      }
+      const currentScope = await resolveOpenCodeProfileScope({
+        projectPath: profile.projectPath,
+        purpose: 'launch_runtime',
+        selectedModel: 'openai/gpt-5.4-mini',
+      })
+      expect(currentScope.selectedAuthIdentity).toBe(credentialIdentity)
+      const oldScope = { ...currentScope, scopeToken: `old-process-${credentialIdentity}` }
+      const staleReasons: string[] = []
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async (_projectPath, options) => ({
+          ...profile,
+          profileScope: options?.profileScope,
+          scopeToken: options?.profileScope?.scopeToken ?? null,
+        }),
+        hostManager: {
+          ensureHost: async () => { throw new Error('old persisted host must not be reused') },
+          releaseHost: async () => {},
+        },
+        sessionStore: {
+          get: async () => null,
+          upsert: async () => 'unchanged',
+          markStale: async (_teamId, _laneId, _memberName, reason) => {
+            staleReasons.push(reason)
+            return buildRecord({ profileScope: oldScope, staleReason: reason })
+          },
+        },
+      })
+
+      const result = await bridge.reconcileSession(buildRecord({ profileScope: oldScope }))
+
+      expect(result.summary.reconcileOutcome).toBe('stale')
+      expect(staleReasons).toEqual(['profile_scope_changed'])
+    },
+  )
 
   test('marks session stale when resolved runtime behavior changes unexpectedly', async () => {
     const staleMarks: Array<{ laneId: string; staleReason: string }> = []

@@ -425,7 +425,10 @@ type CatalogIdentityComponent =
 type CatalogIdentity = {
   key: string
   reusable: boolean
+  managedAuthConsistent: boolean
 }
+
+const OPEN_CODE_CATALOG_FAILURE_MESSAGE = 'OpenCode catalog request failed.'
 
 function catalogIdentityComponent(value: string | null | undefined): CatalogIdentityComponent {
   if (value === 'error') return { state: 'error' }
@@ -3133,21 +3136,24 @@ export class OpenCodeProviderManagementAdapter
     } catch {
       // An identity read error must fail closed for stale evidence.
     }
+    const selectedAuth = catalogIdentityComponent(profileScope.selectedAuthIdentity)
     const components = {
       projectPath,
       providerId: input.providerId,
       binary,
       config,
-      selectedAuth: catalogIdentityComponent(profileScope.selectedAuthIdentity),
+      selectedAuth,
       preferences,
       sourceAuth,
-      managedSelectedAuth,
       generation: 'catalog-generation-v3',
     }
     return {
       key: JSON.stringify(components),
       reusable: Object.values(components).every(value =>
-        !value || typeof value !== 'object' || !('state' in value) || value.state !== 'error'),
+        !value || typeof value !== 'object' || !('state' in value) || value.state !== 'error')
+        && JSON.stringify(sourceAuth) === JSON.stringify(selectedAuth),
+      managedAuthConsistent: managedSelectedAuth.state !== 'error'
+        && JSON.stringify(managedSelectedAuth) === JSON.stringify(selectedAuth),
     }
   }
 
@@ -3600,6 +3606,7 @@ export class OpenCodeProviderManagementAdapter
       profileScope?: OpenCodePrepareProfileOptions['profileScope']
       prewarmManagedSubscriptionPlugins?: boolean
       abortSignal?: AbortSignal
+      catalogFailureSanitization?: boolean
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3629,7 +3636,9 @@ export class OpenCodeProviderManagementAdapter
       if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
         return providerManagementError(
           'runtime-unhealthy',
-          inventory.probeError ?? 'OpenCode inventory probe timed out',
+          options.catalogFailureSanitization
+            ? OPEN_CODE_CATALOG_FAILURE_MESSAGE
+            : inventory.probeError ?? 'OpenCode inventory probe timed out',
         )
       }
       host = await hostManager.ensureHost({
@@ -3653,7 +3662,9 @@ export class OpenCodeProviderManagementAdapter
       const rawMessage = error instanceof Error ? error.message : String(error)
       return providerManagementError(
         options.failureCode ?? 'runtime-unhealthy',
-        redactDiagnostic(redactSecret(rawMessage, options.secretToRedact)),
+        options.catalogFailureSanitization
+          ? OPEN_CODE_CATALOG_FAILURE_MESSAGE
+          : redactDiagnostic(redactSecret(rawMessage, options.secretToRedact)),
       )
     } finally {
       if (host) {
@@ -4060,7 +4071,7 @@ export class OpenCodeProviderManagementAdapter
     } catch (error) {
       return providerManagementError(
         'runtime-unhealthy',
-        error instanceof Error ? error.message : String(error),
+        OPEN_CODE_CATALOG_FAILURE_MESSAGE,
       )
     }
     const scopeKey = [
@@ -4071,6 +4082,7 @@ export class OpenCodeProviderManagementAdapter
     const generation = (this.catalogGenerationByScope.get(scopeKey) ?? 0) + 1
     this.catalogGenerationByScope.set(scopeKey, generation)
     let currentIdentity: string | null = null
+    let mayReuseCatalogEvidence = false
     const abortController = new AbortController()
     const render = (entry: ProviderCatalogCacheEntry, stale: boolean) => buildProviderModelsView({
       providerId,
@@ -4095,7 +4107,11 @@ export class OpenCodeProviderManagementAdapter
           expectedScope: profileScope,
           expectedBinaryPath: inventory.binaryPath,
         })
-        currentIdentity = identity.reusable ? identity.key : null
+        if (!identity.reusable) {
+          return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+        }
+        currentIdentity = identity.key
+        mayReuseCatalogEvidence = identity.managedAuthConsistent
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
@@ -4140,19 +4156,20 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
-        const publishScope = await resolveOpenCodeProfileScope({
+        const publishIdentity = await this.readCatalogIdentity({
           projectPath: input.projectPath ?? inventory.projectPath,
-          purpose: 'catalog',
-          selectedModel: `${providerId}/catalog`,
+          providerId,
+          expectedScope: profileScope,
+          expectedBinaryPath: inventory.binaryPath,
         }).catch(() => null)
         if (
-          !publishScope
-          || publishScope.configFingerprint !== profileScope.configFingerprint
-          || publishScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
+          !publishIdentity?.reusable
+          || !publishIdentity.managedAuthConsistent
+          || publishIdentity.key !== identity.key
         ) {
           return providerManagementError(
             'runtime-unhealthy',
-            'OpenCode catalog authentication changed while the response was in flight',
+            OPEN_CODE_CATALOG_FAILURE_MESSAGE,
           )
         }
 
@@ -4162,7 +4179,7 @@ export class OpenCodeProviderManagementAdapter
             'OpenCode catalog response was superseded by a newer provider request',
           )
         }
-        if (identity.reusable) this.catalogCache.set(entry.identity, entry)
+        this.catalogCache.set(entry.identity, entry)
         return {
           ok: true,
           value: modelsView,
@@ -4173,6 +4190,7 @@ export class OpenCodeProviderManagementAdapter
         profileScope,
         prewarmManagedSubscriptionPlugins: false,
         abortSignal: abortController.signal,
+        catalogFailureSanitization: true,
       },
     )
     const timeoutMs = this.deps.catalogTimeoutMs ?? 15_000
@@ -4204,8 +4222,10 @@ export class OpenCodeProviderManagementAdapter
             new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
           ])
           if (cleanupTimeout) clearTimeout(cleanupTimeout)
-          const cached = timeoutIdentity?.reusable
-            && (!currentIdentity || timeoutIdentity.key === currentIdentity)
+          const cached = (currentIdentity === null || mayReuseCatalogEvidence)
+            && timeoutIdentity?.reusable
+            && timeoutIdentity.managedAuthConsistent
+            && (currentIdentity === null || currentIdentity === timeoutIdentity.key)
             ? this.catalogCache.get(timeoutIdentity.key)
             : undefined
           resolve(cached

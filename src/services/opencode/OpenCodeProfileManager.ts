@@ -1472,6 +1472,7 @@ export async function resolveOpenCodeProfileScope(input: {
   const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
   const selectedAuth = await readSelectedAuthFromSources({
     providerId,
+    globalAuthPath: path.join(paths.data, 'opencode', 'auth.json'),
     sourcePaths: Array.from(new Set([
       path.join(paths.data, 'opencode', 'auth.json'),
       path.join(xdgDataHome, 'opencode', 'auth.json'),
@@ -1620,19 +1621,20 @@ function authCredentialIdentity(credential: unknown): OpenCodeIdentityComponent 
 async function readSelectedAuthFromSources(input: {
   providerId: string
   sourcePaths: readonly string[]
+  globalAuthPath: string
 }): Promise<{
   credential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
   identity: OpenCodeIdentityComponent
 }> {
   let selected: Awaited<ReturnType<typeof readOpenCodeAuthCredential>> = null
   try {
-    for (const authPath of input.sourcePaths) {
-      const credential = await readOpenCodeAuthCredential({
-        authPath,
-        providerId: input.providerId,
-      })
-      if (credential) selected = credential
-    }
+    const sourceStores = await Promise.all(input.sourcePaths.map(readOpenCodeAuthStore))
+    const merged = mergeOpenCodeManagedAuthSources({
+      sourceAuthPaths: input.sourcePaths,
+      sourceStores,
+      globalAuthPath: input.globalAuthPath,
+    })
+    selected = merged[input.providerId] ?? null
     return { credential: selected, identity: authCredentialIdentity(selected) }
   } catch {
     return { credential: null, identity: 'error' }
@@ -1728,7 +1730,11 @@ export class OpenCodeProfileManager {
       ...this.getSourceAuthPaths(),
     ]))
     const [source, managed, preferences] = await Promise.all([
-      readSelectedAuthFromSources({ providerId: policy.scope.providerId, sourcePaths }),
+      readSelectedAuthFromSources({
+        providerId: policy.scope.providerId,
+        sourcePaths,
+        globalAuthPath: this.getGlobalAuthPath(),
+      }),
       readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId),
       Promise.all([
         readOpenCodeManagedRuntimePreferences(path.dirname(path.dirname(path.dirname(managedAuthPath)))),

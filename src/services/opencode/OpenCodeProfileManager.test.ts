@@ -278,7 +278,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(secondProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
-  test('materializes only the selected catalog credential with local source precedence', async () => {
+  test('materializes only the selected catalog credential with app-global API precedence', async () => {
     const projectPath = path.join(tempDir, 'selected-auth-project')
     await mkdir(projectPath, { recursive: true })
     const manager = new OpenCodeProfileManager()
@@ -304,7 +304,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }))
     const profile = await manager.prepareProfile(projectPath, { profileScope })
     expect(JSON.parse(await readFile(profile.managedAuthPath, 'utf8'))).toEqual({
-      custom: { type: 'api', key: 'local-selected' },
+      custom: { type: 'api', key: 'global-selected' },
     })
     expect(profile.selectedSourceAuthIdentity).toStartWith('known:')
     expect(profile.selectedManagedAuthIdentity).toBe(profile.selectedSourceAuthIdentity)
@@ -313,9 +313,9 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       projectPath, purpose: 'catalog', selectedModel: 'custom/model',
     })
     const changedProfile = await manager.prepareProfile(projectPath, { profileScope: changedScope })
-    expect(changedProfile.profileRootPath).not.toBe(profile.profileRootPath)
+    expect(changedProfile.profileRootPath).toBe(profile.profileRootPath)
     expect(JSON.parse(await readFile(changedProfile.managedAuthPath, 'utf8'))).toEqual({
-      custom: { type: 'api', key: 'changed-after-resolve' },
+      custom: { type: 'api', key: 'global-selected' },
     })
   })
 
@@ -1562,6 +1562,62 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env.XDG_DATA_HOME = previousXdgDataHome
       }
     }
+  })
+
+  test('captures the freshest competing OAuth credential with the managed-auth policy', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'oauth-catalog-project')
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      upsertOpenCodeAuthCredential({
+        authPath: globalAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'older', refresh: 'older-refresh', expires: 100 },
+      }),
+      upsertOpenCodeAuthCredential({
+        authPath: sourceAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'newer', refresh: 'newer-refresh', expires: 200 },
+      }),
+    ])
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'openai/catalog',
+    })
+    const prepared = await manager.prepareProfile(projectPath, { profileScope })
+
+    expect(await readOpenCodeAuthCredential({
+      authPath: prepared.managedAuthPath, providerId: 'openai',
+    })).toMatchObject({ access: 'newer', expires: 200 })
+  })
+
+  test('captures an app-global API credential ahead of competing user auth', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'global-api-catalog-project')
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      upsertOpenCodeAuthCredential({
+        authPath: globalAuthPath,
+        providerId: 'openai',
+        credential: { type: 'api', key: 'app-global-key' },
+      }),
+      upsertOpenCodeAuthCredential({
+        authPath: sourceAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'user-oauth', refresh: 'refresh', expires: 999 },
+      }),
+    ])
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'openai/catalog',
+    })
+    const prepared = await manager.prepareProfile(projectPath, { profileScope })
+
+    expect(await readOpenCodeAuthCredential({
+      authPath: prepared.managedAuthPath, providerId: 'openai',
+    })).toEqual({ type: 'api', key: 'app-global-key' })
   })
 
   test('keeps generated OpenCode dependency caches outside per-profile HOME', async () => {

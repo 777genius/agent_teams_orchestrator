@@ -94,6 +94,23 @@ function authStore() {
   }
 }
 
+function catalogIdentityDependencies() {
+  return {
+    resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+    resolveBinaryIdentity: async () => 'test-binary-identity',
+    profileManager: {
+      listManagedAuthPaths: async () => [],
+      readCatalogSelectedAuthIdentity: async ({ profileScope }: {
+        profileScope: { selectedAuthIdentity: string }
+      }) => ({
+        source: profileScope.selectedAuthIdentity,
+        managed: profileScope.selectedAuthIdentity,
+        preferences: 'known:test-preferences',
+      }),
+    },
+  }
+}
+
 function expectFailure<T>(result: ProviderManagementResult<T>): ProviderManagementError {
   expect(result.ok).toBe(false)
   if ('error' in result) {
@@ -317,6 +334,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const releasedHostLeases: Array<{ hostKey: string; lease: OpenCodeHostLeaseInput }> = []
     const reconcileCalls: OpenCodePersistentHostReconcileOptions[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () => inventory(),
       },
@@ -5583,6 +5601,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('loads provider-scoped models lazily with query filtering', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5660,6 +5679,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('paginates the filtered union of inventory, config, and live provider models', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5744,6 +5764,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('marks provider-scoped zero-cost OpenRouter models as free', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5815,6 +5836,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
   test('filters deprecated catalog models but keeps a persisted deprecated default visible', async () => {
     let defaultModelId = 'active-model'
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5900,6 +5922,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('loads provider-scoped models reported only by the live provider catalog', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -5954,6 +5977,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('marks configured local OpenCode models as authless routes that need proof', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -6012,6 +6036,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('surfaces configured Ollama Cloud models as launchable authless routes', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async () =>
           inventory({
@@ -7323,6 +7348,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('loads catalog and project-managed context limits for the exact model', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async projectPath =>
           inventory({
@@ -7403,6 +7429,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let ensureOptions: Record<string, unknown> | undefined
     let providerAuthCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
       inventoryService: {
         probe: async (_projectPath, options) => {
           probeOptions = options as Record<string, unknown>
@@ -7688,9 +7715,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       resolveBinaryIdentity: async () => binaryFingerprint,
       profileManager: {
         listManagedAuthPaths: async () => [],
-        readCatalogSelectedAuthIdentity: async () => ({
-          source: `known:${sourceAuthFingerprint}`,
-          managed: 'known:managed-a',
+        readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
+          source: sourceAuthFingerprint === 'auth-a'
+            ? profileScope.selectedAuthIdentity
+            : 'known:changed-source-auth',
+          managed: profileScope.selectedAuthIdentity,
           preferences: 'known:preferences-a',
         }),
       },
@@ -7849,8 +7878,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
-        readCatalogSelectedAuthIdentity: async () => ({
-          source: 'known:auth-a', managed: 'known:auth-a',
+        readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
+          source: profileScope.selectedAuthIdentity,
+          managed: profileScope.selectedAuthIdentity,
           preferences: 'known:preferences-a',
         }),
       },
@@ -7919,4 +7949,203 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(JSON.stringify(result)).not.toContain('classified')
     expect(JSON.stringify(result)).not.toContain(secret)
   })
+
+  test.each(['inventory', 'profile preparation', 'host', 'client'] as const)(
+    'uses a constant catalog failure at the %s boundary',
+    async stage => {
+      const leaked = 'unprefixed-secret-violet https://private.invalid/models?token=query-secret'
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async () => {
+            if (stage === 'inventory' || stage === 'profile preparation') throw new Error(leaked)
+            return inventory({ models: [], availableProviders: [] })
+          },
+        },
+        hostManager: {
+          ensureHost: async () => {
+            if (stage === 'host') throw new Error(leaked)
+            return host()
+          },
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => {
+            if (stage === 'client') throw new Error(leaked)
+            return {
+              getConfigProviders: async () => ({ providers: [], default: {} }),
+              getProviders: async () => ({ all: [], connected: [], default: {} }),
+              getProviderAuth: async () => ({}),
+            }
+          },
+        },
+      })
+
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
+      })
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { message: 'OpenCode catalog request failed.' },
+      })
+      expect(JSON.stringify(result)).not.toContain(leaked)
+      expect(JSON.stringify(result)).not.toContain('private.invalid')
+      expect(JSON.stringify(result)).not.toContain('query-secret')
+    },
+  )
+
+  test('uses a constant catalog failure when scope resolution rejects unsafe input', async () => {
+    const result = await new OpenCodeProviderManagementAdapter().loadModels({
+      runtimeId: 'opencode', providerId: 'local', projectPath: '\0secret?token=query-secret',
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { message: 'OpenCode catalog request failed.' },
+    })
+    expect(JSON.stringify(result)).not.toContain('query-secret')
+  })
+
+  test('allows first catalog preparation to materialize an initially absent managed credential', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-materialize-'))
+    const previousData = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    const previousXdg = process.env.XDG_DATA_HOME
+    const previousHome = process.env.HOME
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(tempDir, 'app-data')
+    process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg-data')
+    process.env.HOME = path.join(tempDir, 'home')
+    const authPath = path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json')
+    await mkdir(path.dirname(authPath), { recursive: true })
+    await writeFile(authPath, JSON.stringify({ openrouter: { type: 'api', key: 'selected-key' } }))
+    let identityReads = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryIdentity: async () => 'binary-a',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async ({ profileScope }) => {
+          identityReads += 1
+          expect(profileScope.selectedAuthIdentity).toStartWith('known:')
+          return {
+            source: profileScope.selectedAuthIdentity,
+            managed: identityReads === 1 ? 'absent' : profileScope.selectedAuthIdentity,
+            preferences: 'known:preferences-a',
+          }
+        },
+      },
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({
+          all: [{ id: 'openrouter', name: 'OpenRouter', models: { model: {} } }],
+          connected: [], default: {},
+        }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+
+    try {
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/tmp/project',
+      })
+      expect(result.ok).toBe(true)
+      expect(identityReads).toBe(2)
+    } finally {
+      if (previousData === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousData
+      if (previousXdg === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousXdg
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('does not reuse cached evidence after an initially mismatched managed identity', async () => {
+    let managedMismatch = false
+    let slow = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogTimeoutMs: 100,
+      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryIdentity: async () => 'binary-a',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
+          source: profileScope.selectedAuthIdentity,
+          managed: managedMismatch ? 'known:stale-managed-auth' : profileScope.selectedAuthIdentity,
+          preferences: 'known:preferences-a',
+        }),
+      },
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => slow
+          ? new Promise<never>(() => {})
+          : {
+              all: [{ id: 'local', name: 'Local', models: { cached: {} } }],
+              connected: [], default: {},
+            },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+    expect((await adapter.loadModels(input)).ok).toBe(true)
+    managedMismatch = true
+    slow = true
+
+    const result = await adapter.loadModels(input)
+
+    expect(result.ok).toBe(false)
+    expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(1)
+  })
+
+  test.each(['changes', 'becomes unreadable'] as const)(
+    'rejects publication and cache update when the final managed identity %s',
+    async finalState => {
+      let identityReads = 0
+      const adapter = new OpenCodeProviderManagementAdapter({
+        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryIdentity: async () => 'binary-a',
+        profileManager: {
+          listManagedAuthPaths: async () => [],
+          readCatalogSelectedAuthIdentity: async ({ profileScope }) => {
+            identityReads += 1
+            if (identityReads === 2 && finalState === 'becomes unreadable') {
+              throw new Error('unprefixed-final-identity-secret')
+            }
+            return {
+              source: profileScope.selectedAuthIdentity,
+              managed: identityReads === 2 && finalState === 'changes'
+                ? 'known:changed-managed-auth'
+                : profileScope.selectedAuthIdentity,
+              preferences: 'known:preferences-a',
+            }
+          },
+        },
+        inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local', models: { model: {} } }],
+            connected: [], default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
+      })
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { message: 'OpenCode catalog request failed.' },
+      })
+      expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
+      expect(JSON.stringify(result)).not.toContain('unprefixed-final-identity-secret')
+    },
+  )
 })

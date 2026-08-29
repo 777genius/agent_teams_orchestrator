@@ -190,7 +190,8 @@ function profileScopeMetadataMatches(
     && left.purpose === right.purpose
     && left.providerId === right.providerId
     && left.configFingerprint === right.configFingerprint
-    && left.selectedAuthIdentity === right.selectedAuthIdentity,
+    && left.selectedAuthIdentity === right.selectedAuthIdentity
+    && left.scopeToken === right.scopeToken,
   )
 }
 
@@ -784,26 +785,26 @@ export class OpenCodeSessionBridge {
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: params.projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: params.selectedModel,
+    })
     if (params.preparedProfile) {
       await assertOpenCodePreparedProfileScope(params.preparedProfile, params.projectPath)
       if (
         params.preparedProfile.profileScope?.purpose !== 'launch_runtime'
         || params.preparedProfile.profileScope.providerId
           !== canonicalizeOpenCodeProviderId(params.selectedModel.split('/')[0] ?? '')
+        || !profileScopeMetadataMatches(params.preparedProfile.profileScope, profileScope)
       ) {
         throw new Error('OpenCode prepared profile scope does not match the requested session')
       }
     }
-    const profileScope = params.preparedProfile?.profileScope ?? await resolveOpenCodeProfileScope({
-        projectPath: params.projectPath,
-        purpose: 'launch_runtime',
-        selectedModel: params.selectedModel,
-      })
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
         profile: params.preparedProfile!,
         toolApprovalMode: params.toolApprovalMode
-          ?? existing?.toolApprovalMode
           ?? inferToolApprovalModeFromPreparedProfile(params.preparedProfile),
       }
       : params.toolApprovalMode
