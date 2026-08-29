@@ -2506,6 +2506,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   test('keeps the launch provisioning host retained until launch finishes', async () => {
     let releaseCalls = 0
+    const ownershipEvents: string[] = []
     openCodeProvisioningProbe.probe = async () => {
       throw new Error('unretained probe should not be used for launch')
     }
@@ -2514,15 +2515,18 @@ describe('OpenCodeBridgeCommandHandler', () => {
       host: snapshot.host,
       release: async () => {
         releaseCalls += 1
+        ownershipEvents.push('release')
       },
     })) as typeof openCodeProvisioningProbe.probeRetainingHost
-    openCodeSessionBridge.ensureSession = (async input =>
-      buildRecord({
+    openCodeSessionBridge.ensureSession = (async input => {
+      ownershipEvents.push('materialize')
+      return buildRecord({
         laneId: input.laneId,
         memberName: input.memberName,
         selectedModel: input.selectedModel,
         opencodeSessionId: `session-${input.memberName}`,
-      })) as typeof openCodeSessionBridge.ensureSession
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
     openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
     openCodeSessionBridge.reconcileSession = (async record => ({
       summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
@@ -2550,6 +2554,87 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect.objectContaining({ code: 'opencode_launch_total_timing' }),
       ]),
     )
+    expect(releaseCalls).toBe(1)
+    expect(ownershipEvents).toEqual(['materialize', 'release'])
+  })
+
+  test('releases the attempt-owned retained host once when App MCP is unavailable', async () => {
+    let releaseCalls = 0
+    let memberCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot: {
+        ...snapshot,
+        appMcp: {
+          serverName: 'agent-teams',
+          matchedServerName: 'agent-teams',
+          status: 'unavailable',
+          connected: false,
+          launchSource: null,
+          availableServerNames: [],
+          diagnostics: ['fake unavailable App MCP'],
+        },
+      },
+      host: snapshot.host,
+      release: async () => { releaseCalls += 1 },
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionBridge.materializeSessionOnHost = (async () => {
+      memberCalls += 1
+      throw new Error('member work must not run')
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-app-mcp-unavailable',
+        laneId: 'primary',
+        teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.message).toContain('MCP retained connection')
+    expect(memberCalls).toBe(0)
+    expect(releaseCalls).toBe(1)
+  })
+
+  test('releases the attempt-owned retained host once on capability precondition failure', async () => {
+    let releaseCalls = 0
+    let proofCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot,
+      host: snapshot.host,
+      release: async () => { releaseCalls += 1 },
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeExecutionProbe.probeModelOnHost = (async () => {
+      proofCalls += 1
+      throw new Error('proof must not run')
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
+    const body = {
+      runId: 'run-capability-failure',
+      laneId: 'primary',
+      teamId: 'team-a',
+      selectedModel: 'openrouter/minimax-m2.5-free',
+      members: [{ name: 'alice' }],
+      preconditions: {
+        handshakeIdentityHash: 'handshake-test',
+        laneId: 'primary',
+        expectedRunId: 'run-capability-failure',
+        expectedCapabilitySnapshotId: 'opencode:stale-capability',
+        expectedBehaviorFingerprint,
+        expectedManifestHighWatermark: 0,
+        commandLeaseId: 'lease-capability-failure',
+        idempotencyKey: 'launch:capability-failure',
+      },
+    }
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.message).toContain('capability snapshot precondition mismatch')
+    expect(proofCalls).toBe(0)
     expect(releaseCalls).toBe(1)
   })
 

@@ -3092,34 +3092,44 @@ async function runLaunch(
   const provisioningProbeMs = elapsedMs(probeStartedAt)
   const snapshot = retainedProbe.snapshot
   const host = retainedProbe.host
-  assertOpenCodeLaunchRuntimeAvailable(snapshot)
-  if (!host || !snapshot.host || snapshot.host.hostKey !== host.hostKey) {
-    await retainedProbe.release().catch(() => undefined)
-    throw new Error('OpenCode strict launch retained host is unavailable')
+  let attemptOwnsRetainedProbe = true
+  const releaseAttemptOwnedProbe = async () => {
+    if (!attemptOwnsRetainedProbe) return
+    attemptOwnsRetainedProbe = false
+    await retainedProbe.release()
   }
 
   const diagnostics: TeamDiagnostic[] = []
-  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
-    body,
-    runtime: createRuntimePreconditionSnapshot(snapshot),
-    allowCapabilitySnapshotRecovery: true,
-  })
+  let commandEvidence: ReturnType<typeof validateOpenCodeBridgeStateChangingPreconditions>
+  try {
+    assertOpenCodeLaunchRuntimeAvailable(snapshot)
+    if (!host || !snapshot.host || snapshot.host.hostKey !== host.hostKey) {
+      throw new Error('OpenCode strict launch retained host is unavailable')
+    }
+    commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+      body,
+      runtime: createRuntimePreconditionSnapshot(snapshot),
+      allowCapabilitySnapshotRecovery: true,
+    })
+    const initialExpectedBehaviorEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+      profile: host.profile,
+      fullModelId: apiSelectedModel,
+      effectiveConfigFingerprint: host.resolvedConfigFingerprint,
+    }).catch(() => null)
+    if (initialExpectedBehaviorEvidence?.expectedBehaviorFingerprint
+      !== expectedBehaviorFingerprint) {
+      throw new Error('OpenCode strict launch behavior precondition mismatch')
+    }
+  } catch (error) {
+    await releaseAttemptOwnedProbe().catch(() => undefined)
+    throw error
+  }
   if (commandEvidence.capabilitySnapshotRecovery) {
     diagnostics.push(teamDiagnostic(
       'opencode_capability_snapshot_recovery',
       'Accepted a fresh OpenCode capability snapshot for the explicit recovery attempt.',
       'warning',
     ))
-  }
-  const initialExpectedBehaviorEvidence = await buildOpenCodeExpectedBehaviorEvidence({
-    profile: host.profile,
-    fullModelId: apiSelectedModel,
-    effectiveConfigFingerprint: host.resolvedConfigFingerprint,
-  }).catch(() => null)
-  if (initialExpectedBehaviorEvidence?.expectedBehaviorFingerprint
-    !== expectedBehaviorFingerprint) {
-    await retainedProbe.release().catch(() => undefined)
-    throw new Error('OpenCode strict launch behavior precondition mismatch')
   }
   const memberInputs = new Map<string, {
     name: string
@@ -3208,6 +3218,9 @@ async function runLaunch(
   const ports: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft> = {
     snapshotProjection: projection => structuredClone(projection),
     acquireHost: async (_context, _identity, lease, signal) => {
+      // The coordinator has set leaseUsed before invoking this port, so its
+      // finally block exclusively owns release from this point forward.
+      attemptOwnsRetainedProbe = false
       if (signal.aborted) throwOpenCodeAbortReason(signal)
       if (lease.expectedHostId !== host.hostKey) {
         return { kind: 'failure', error: 'retained host identity mismatch' }
@@ -3492,7 +3505,7 @@ async function runLaunch(
         signal.addEventListener('abort', abort, { once: true })
       }),
     },
-  }, ports)
+  }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
   await Promise.all([...resources.values()].map(record =>
     openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId).catch(() => false)))
   diagnostics.push(teamDiagnostic(
