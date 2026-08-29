@@ -1575,6 +1575,65 @@ function isStrictAuthorityPurpose(purpose: OpenCodeProfilePurpose): boolean {
   return purpose === 'execution_probe' || purpose === 'launch_runtime'
 }
 
+type OpenCodeAuthlessAuthorityMode = 'builtin_free' | 'configured_authless'
+
+// Keep this strict authority allowlist aligned with the credential-free local
+// provider classes in OpenCodeModelAccessPolicy. Extension-backed providers are
+// deliberately omitted because strict scopes reject them before this point.
+const OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS = new Set([
+  'atomic-chat',
+  'llama.cpp',
+  'llamacpp',
+  'lmstudio',
+  'lm-studio',
+  'local',
+  'ollama',
+  'vllm',
+])
+
+const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
+  'big-pickle',
+])
+
+function isLoopbackOpenCodeAuthorityUrl(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.trim()) return false
+  try {
+    const hostname = new URL(value).hostname.toLowerCase()
+    return hostname === 'localhost'
+      || hostname === '0.0.0.0'
+      || hostname === '::1'
+      || hostname === '[::1]'
+      || hostname.startsWith('127.')
+  } catch {
+    return false
+  }
+}
+
+function resolveOpenCodeAuthlessAuthorityMode(input: {
+  providerId: string
+  selectedModel: string
+  providerConfig: unknown
+}): OpenCodeAuthlessAuthorityMode | null {
+  const selectedModel = input.selectedModel.trim()
+  const modelId = selectedModel.slice(selectedModel.indexOf('/') + 1)
+  if (
+    input.providerId === 'opencode'
+    && modelId.length > 0
+    && OPEN_CODE_BUILTIN_FREE_MODEL_IDS.has(modelId.toLowerCase())
+  ) {
+    return 'builtin_free'
+  }
+
+  if (OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS.has(input.providerId)) return 'configured_authless'
+
+  const providerConfig = asRecord(input.providerConfig)
+  const options = asRecord(providerConfig?.options)
+  return providerConfig?.npm === '@ai-sdk/openai-compatible'
+    && isLoopbackOpenCodeAuthorityUrl(options?.baseURL ?? options?.baseUrl)
+    ? 'configured_authless'
+    : null
+}
+
 type OpenCodeAuthoritySourceBinding = {
   fingerprint: string
   fullyBound: boolean
@@ -1851,10 +1910,34 @@ export async function resolveOpenCodeProfileScope(input: {
   if (isStrictAuthorityPurpose(input.purpose) && selectedAuth.identity === 'error') {
     throw new Error('OpenCode strict profile selected authentication is unavailable')
   }
-  if (isStrictAuthorityPurpose(input.purpose) && !selectedAuthIsCredential
-    && !authoritySources.hasStaticCredential) {
+  const authlessAuthorityMode = isStrictAuthorityPurpose(input.purpose)
+    && selectedAuth.credential === null
+    && !authoritySources.hasStaticCredential
+    ? resolveOpenCodeAuthlessAuthorityMode({
+        providerId,
+        selectedModel: input.selectedModel,
+        providerConfig: selectedProviderConfig,
+      })
+    : null
+  if (
+    isStrictAuthorityPurpose(input.purpose)
+    && !selectedAuthIsCredential
+    && !authoritySources.hasStaticCredential
+    && authlessAuthorityMode === null
+  ) {
     throw new Error('OpenCode strict profile requires explicit selected authentication')
   }
+  const authlessAuthorityFingerprint = authlessAuthorityMode === null
+    ? null
+    : semanticSecretIdentity('authless-profile-authority', {
+        mode: authlessAuthorityMode,
+        providerId,
+        selectedModel: input.selectedModel.trim(),
+      })
+  const authoritySourceFingerprint = semanticSecretIdentity('selected-provider-authority', {
+    sourceFingerprint: authoritySources.fingerprint,
+    authlessAuthorityFingerprint,
+  })
   const retainedAppMcpLaunchConfig = safeParseJSONC(
     env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
   ) as ResolvedAppMcpLaunchConfig | null
@@ -1876,7 +1959,7 @@ export async function resolveOpenCodeProfileScope(input: {
   const appMcpLaunchIdentity = redactConfigIdentity(appMcpLaunchConfig, env)
   const configFingerprint = hashString(JSON.stringify({
     identity,
-    authoritySourceFingerprint: authoritySources.fingerprint,
+    authoritySourceFingerprint,
     managedPaths: snapshotManagedPaths,
     appMcpLaunchIdentity,
   }))
@@ -1892,7 +1975,7 @@ export async function resolveOpenCodeProfileScope(input: {
     selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
     selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
-    authoritySourceFingerprint: authoritySources.fingerprint,
+    authoritySourceFingerprint,
     managedPaths: snapshotManagedPaths,
     appMcpLaunchIdentity,
   })
@@ -1911,7 +1994,7 @@ export async function resolveOpenCodeProfileScope(input: {
       managedPaths: snapshotManagedPaths,
       scopeIdentity: buildScopeIdentity(scope),
       selectedAuthCredential: selectedAuth.credential,
-      authoritySourceFingerprint: authoritySources.fingerprint,
+      authoritySourceFingerprint,
       appMcpLaunchConfig,
     }))
   }
