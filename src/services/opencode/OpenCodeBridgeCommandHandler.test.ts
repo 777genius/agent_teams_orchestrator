@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -12,6 +13,10 @@ import {
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  computeOpenCodeExpectedBehaviorFingerprint,
+  OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
@@ -35,12 +40,15 @@ const snapshot: OpenCodeProvisioningSnapshot = {
   projectPath: '/tmp/project',
   profile: {
     projectPath: '/tmp/project',
+    canonicalProjectPath: '/tmp/project',
+    workingDirectoryPath: '/tmp/project',
+    scopeToken: null,
     profileRootKey: 'profile-root',
     profileRootPath: '/tmp/profile-root',
-    projectBehaviorFingerprint: 'behavior-v1',
+    projectBehaviorFingerprint: 'b'.repeat(64),
     behaviorSources: ['AGENTS.md'],
     managedConfig: {},
-    managedConfigFingerprint: 'managed-config-v1',
+    managedConfigFingerprint: 'c'.repeat(64),
     homePath: '/tmp/profile-root/home',
     xdgConfigHome: '/tmp/profile-root/config',
     xdgDataHome: '/tmp/profile-root/data',
@@ -64,12 +72,15 @@ const snapshot: OpenCodeProvisioningSnapshot = {
     state: 'healthy',
     profile: {
       projectPath: '/tmp/project',
+      canonicalProjectPath: '/tmp/project',
+      workingDirectoryPath: '/tmp/project',
+      scopeToken: null,
       profileRootKey: 'profile-root',
       profileRootPath: '/tmp/profile-root',
-      projectBehaviorFingerprint: 'behavior-v1',
+      projectBehaviorFingerprint: 'b'.repeat(64),
       behaviorSources: ['AGENTS.md'],
       managedConfig: {},
-      managedConfigFingerprint: 'managed-config-v1',
+      managedConfigFingerprint: 'c'.repeat(64),
       homePath: '/tmp/profile-root/home',
       xdgConfigHome: '/tmp/profile-root/config',
       xdgDataHome: '/tmp/profile-root/data',
@@ -81,7 +92,7 @@ const snapshot: OpenCodeProvisioningSnapshot = {
       authState: 'ok',
       env: {},
     },
-    resolvedConfigFingerprint: 'resolved-fingerprint',
+    resolvedConfigFingerprint: 'd'.repeat(64),
     diagnostics: [],
   },
   config: null,
@@ -123,6 +134,23 @@ const snapshot: OpenCodeProvisioningSnapshot = {
   diagnostics: [],
 }
 
+const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+function expectedFingerprintForModel(model: string): string {
+  const fullModelId = model.includes('/') ? model : `openrouter/${model}`
+  const providerId = fullModelId.slice(0, fullModelId.indexOf('/')).toLowerCase()
+  return computeOpenCodeExpectedBehaviorFingerprint({
+    canonicalProjectPathFingerprint: hash('/tmp/project'),
+    modelProviderId: providerId,
+    fullModelId: `${providerId}${fullModelId.slice(fullModelId.indexOf('/'))}`,
+    projectBehaviorFingerprint: 'b'.repeat(64),
+    effectiveConfigFingerprint: 'd'.repeat(64),
+    effectiveSelectedAuthFingerprint: OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
+  })
+}
+const expectedBehaviorFingerprint = expectedFingerprintForModel(
+  'openrouter/minimax-m2.5-free',
+)
+
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
     teamId: 'team-a',
@@ -141,6 +169,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
     sourceAuthFingerprint: 'source-auth',
     managedAuthFingerprint: 'managed-auth',
     projectBehaviorFingerprint: 'behavior-v1',
+    expectedBehaviorFingerprint,
     staleReason: null,
     createdAt: '2026-04-22T12:00:00.000Z',
     updatedAt: '2026-04-22T12:00:00.000Z',
@@ -387,6 +416,7 @@ const originalInventoryProbe = openCodeInventoryService.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalProbeModelOnHost = openCodeExecutionProbe.probeModelOnHost
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
+const originalRefreshResolvedConfigFingerprint = openCodeHostManager.refreshResolvedConfigFingerprint
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalMaterializeSessionOnHost = openCodeSessionBridge.materializeSessionOnHost
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
@@ -502,19 +532,22 @@ beforeEach(async () => {
     verifiedAt: '2026-04-21T12:00:00.000Z',
   })) as typeof openCodeExecutionProbe.probeModelOnHost
   openCodeSessionBridge.materializeSessionOnHost = (async input => ({
-    record: await openCodeSessionBridge.ensureSession({
-      teamId: input.teamId,
-      laneId: input.laneId,
-      memberName: input.memberName,
-      selectedModel: input.selectedModel,
-      selectedVariant: input.selectedVariant,
-      title: input.title,
-      projectPath: input.host.projectPath,
-      preparedProfile: input.host.profile,
-      runId: input.runId,
-      fresh: true,
-      toolApprovalMode: input.toolApprovalMode,
-    }),
+    record: {
+      ...await openCodeSessionBridge.ensureSession({
+        teamId: input.teamId,
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        selectedVariant: input.selectedVariant,
+        title: input.title,
+        projectPath: input.host.projectPath,
+        preparedProfile: input.host.profile,
+        runId: input.runId,
+        fresh: true,
+        toolApprovalMode: input.toolApprovalMode,
+      }),
+      expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+    },
     created: true,
   })) as typeof openCodeSessionBridge.materializeSessionOnHost
   openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
@@ -586,6 +619,9 @@ beforeEach(async () => {
     hosts: [],
     diagnostics: [],
   })) as typeof openCodeHostManager.reconcilePersistentHosts
+  openCodeHostManager.refreshResolvedConfigFingerprint = (async () =>
+    snapshot.host?.resolvedConfigFingerprint ?? null
+  ) as typeof openCodeHostManager.refreshResolvedConfigFingerprint
   openCodeSessionBridge.observePreview = (async record => ({
     record,
     summary: {
@@ -662,6 +698,7 @@ afterEach(async () => {
   openCodeExecutionProbe.probeModel = originalProbeModel
   openCodeExecutionProbe.probeModelOnHost = originalProbeModelOnHost
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
+  openCodeHostManager.refreshResolvedConfigFingerprint = originalRefreshResolvedConfigFingerprint
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.materializeSessionOnHost = originalMaterializeSessionOnHost
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
@@ -710,7 +747,9 @@ function buildEnvelope(command: string, body: Record<string, unknown>) {
             laneId: body.laneId ?? null,
             expectedRunId: body.runId ?? null,
             expectedCapabilitySnapshotId: null,
-            expectedBehaviorFingerprint: null,
+            expectedBehaviorFingerprint: expectedFingerprintForModel(
+              String(body.selectedModel ?? 'openrouter/minimax-m2.5-free'),
+            ),
             expectedManifestHighWatermark: body.manifestHighWatermark ?? 0,
             commandLeaseId: 'lease-test',
             idempotencyKey: `launch:${String(body.runId ?? 'test')}`,
@@ -740,6 +779,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)
+    expect(result.data.server.bridgeProtocol.expectedBehaviorFingerprintSchemaVersion).toBe(1)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
@@ -2478,9 +2518,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
-  test('strict launch fails closed on missing preconditions before proof or materialization', async () => {
+  test('strict launch rejects missing or malformed behavior digests before host or member effects', async () => {
+    let hostCalls = 0
     let proofCalls = 0
     let memberCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => {
+      hostCalls += 1
+      throw new Error('must not run')
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeExecutionProbe.probeModelOnHost = (async () => {
       proofCalls += 1
       throw new Error('must not run')
@@ -2490,19 +2535,67 @@ describe('OpenCodeBridgeCommandHandler', () => {
       throw new Error('must not run')
     }) as typeof openCodeSessionBridge.materializeSessionOnHost
 
-    const result = await executeOpenCodeBridgeCommandEnvelope(
-      buildEnvelope('opencode.launchTeam', {
+    const values = [undefined, null, '', ' ', 'A'.repeat(64), 'a'.repeat(63)]
+    for (const value of values) {
+      const body: Record<string, unknown> = {
         runId: 'run-missing-strict-preconditions',
         laneId: 'primary',
         teamId: 'team-a',
         selectedModel: 'openrouter/minimax-m2.5-free',
         members: [{ name: 'alice' }],
-        preconditions: null,
+      }
+      if (value !== undefined) {
+        body.preconditions = {
+          handshakeIdentityHash: 'handshake-test',
+          laneId: 'primary',
+          expectedRunId: 'run-missing-strict-preconditions',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: value,
+          expectedManifestHighWatermark: 0,
+          commandLeaseId: 'lease-test',
+          idempotencyKey: 'launch:invalid-fingerprint',
+        }
+      } else {
+        body.preconditions = null
+      }
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', body),
+      )
+      expect(result.ok).toBe(false)
+      expect(result.error.message).toContain('expectedBehaviorFingerprint')
+    }
+    expect(hostCalls).toBe(0)
+    expect(proofCalls).toBe(0)
+    expect(memberCalls).toBe(0)
+  })
+
+  test('rechecks retained-host behavior after model proof before materialization', async () => {
+    let refreshCalls = 0
+    let memberCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeHostManager.refreshResolvedConfigFingerprint = (async () => {
+      refreshCalls += 1
+      return refreshCalls === 1 ? 'd'.repeat(64) : 'e'.repeat(64)
+    }) as typeof openCodeHostManager.refreshResolvedConfigFingerprint
+    openCodeSessionBridge.materializeSessionOnHost = (async () => {
+      memberCalls += 1
+      throw new Error('must not materialize after proof evidence changes')
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-proof-change',
+        laneId: 'primary',
+        teamId: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice' }],
       }),
     )
+
     expect(result.ok).toBe(false)
-    expect(result.error.message).toContain('strict launch requires full preconditions')
-    expect(proofCalls).toBe(0)
+    expect(result.error.message).toContain('behavior changed during proof')
+    expect(refreshCalls).toBe(2)
     expect(memberCalls).toBe(0)
   })
 

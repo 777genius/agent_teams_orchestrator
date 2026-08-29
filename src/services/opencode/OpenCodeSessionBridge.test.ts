@@ -761,12 +761,88 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
       runId: 'run-1',
+      expectedBehaviorFingerprint: 'a'.repeat(64),
       host,
       signal: controller.signal,
       remainingMs: () => 1_000,
     })).rejects.toThrow('socket connection was closed unexpectedly')
     expect(createSessionCalls).toBe(1)
     expect(ensureHostCalls).toBe(0)
+  })
+
+  test('strict exact-host materialization rejects legacy records without a behavior digest', async () => {
+    let clientCalls = 0
+    const controller = new AbortController()
+    const legacy = buildRecord({ expectedBehaviorFingerprint: undefined })
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => legacy,
+        upsert: async () => { throw new Error('must not update a legacy record') },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clientCalls += 1
+          throw new Error('must reject before creating an OpenCode client')
+        },
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      runId: 'run-1',
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      host,
+      signal: controller.signal,
+      remainingMs: () => 1_000,
+    })).rejects.toThrow('committed session identity does not match strict launch')
+    expect(clientCalls).toBe(0)
+    expect(legacy.expectedBehaviorFingerprint).toBeUndefined()
+  })
+
+  test('strict exact-host materialization persists the requested behavior digest', async () => {
+    let persisted: OpenCodeSessionRecord | null = null
+    const controller = new AbortController()
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => { persisted = record; return 'created' },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => ({ id: 'strict-session' }),
+        }) as never,
+      },
+    })
+    const digest = 'a'.repeat(64)
+
+    const materialized = await bridge.materializeSessionOnHost({
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      runId: 'run-1',
+      expectedBehaviorFingerprint: digest,
+      host,
+      signal: controller.signal,
+      remainingMs: () => 1_000,
+    })
+
+    expect(materialized.record.expectedBehaviorFingerprint).toBe(digest)
+    expect(persisted?.expectedBehaviorFingerprint).toBe(digest)
   })
 
   test('does not retry fresh session creation after a non-transient OpenCode error', async () => {

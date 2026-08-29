@@ -941,6 +941,7 @@ export class OpenCodeSessionBridge {
     signal: AbortSignal
     remainingMs: () => number
     toolApprovalMode?: OpenCodeToolApprovalMode
+    expectedBehaviorFingerprint: string
   }): Promise<{ record: OpenCodeSessionRecord; created: boolean }> {
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     const existing = await this.sessionStore.get(params.teamId, params.laneId, params.memberName)
@@ -950,6 +951,7 @@ export class OpenCodeSessionBridge {
         || existing.selectedModel !== params.selectedModel
         || existing.projectBehaviorFingerprint !== params.host.projectBehaviorFingerprint
         || existing.managedAuthFingerprint !== params.host.profile.managedAuthFingerprint
+        || existing.expectedBehaviorFingerprint !== params.expectedBehaviorFingerprint
       ) {
         throw new Error('OpenCode committed session identity does not match strict launch')
       }
@@ -988,6 +990,7 @@ export class OpenCodeSessionBridge {
       managedAuthFingerprint: params.host.profile.managedAuthFingerprint,
       projectBehaviorFingerprint: params.host.projectBehaviorFingerprint,
       managedConfigFingerprint: params.host.profile.managedConfigFingerprint,
+      expectedBehaviorFingerprint: params.expectedBehaviorFingerprint,
       opencodeVersion: params.host.version ?? undefined,
       bootstrapMode: 'app_managed_context',
       staleReason: null,

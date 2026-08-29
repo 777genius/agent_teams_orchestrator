@@ -2,8 +2,10 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   buildOpenCodeExecutionProof,
+  parseOpenCodeExecutionProof,
   validateOpenCodeExecutionProof,
 } from './OpenCodeExecutionProof.js'
+import { computeOpenCodeExpectedBehaviorFingerprint } from './OpenCodeExpectedBehaviorFingerprint.js'
 
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
@@ -14,12 +16,15 @@ function snapshot(): OpenCodeProvisioningSnapshot {
     projectPath: '/tmp/proof-project',
     profile: {
       projectPath: '/tmp/proof-project',
+      canonicalProjectPath: '/tmp/proof-project',
+      workingDirectoryPath: '/tmp/proof-project',
+      scopeToken: null,
       profileRootKey: 'root',
       profileRootPath: '/tmp/profile',
-      projectBehaviorFingerprint: 'behavior',
+      projectBehaviorFingerprint: 'b'.repeat(64),
       behaviorSources: [],
       managedConfig: {},
-      managedConfigFingerprint: 'config',
+      managedConfigFingerprint: 'c'.repeat(64),
       homePath: '/tmp/home',
       tmpPath: '/tmp/tmp',
       xdgConfigHome: '/tmp/config',
@@ -36,14 +41,14 @@ function snapshot(): OpenCodeProvisioningSnapshot {
       hostKey: 'host',
       profileRootKey: 'root',
       projectPath: '/tmp/proof-project',
-      projectBehaviorFingerprint: 'behavior',
+      projectBehaviorFingerprint: 'b'.repeat(64),
       baseUrl: 'http://127.0.0.1:1',
       port: 1,
       pid: 1,
       version: '1.18.2',
       state: 'healthy',
       profile: null as never,
-      resolvedConfigFingerprint: null,
+      resolvedConfigFingerprint: 'd'.repeat(64),
       diagnostics: [],
     },
     config: null,
@@ -110,6 +115,31 @@ describe('OpenCodeExecutionProof', () => {
     expect(result).toEqual({
       valid: false,
       reason: 'execution proof is not reusable for oauth credentials',
+    })
+  })
+
+  test('rejects self-consistent changed evidence when the enclosing proof hash is stale', async () => {
+    const current = snapshot()
+    current.host!.profile = current.profile!
+    const proof = await buildOpenCodeExecutionProof({
+      selectedModel: 'ollama/gemma4:12b',
+      snapshot: current,
+      capabilitySnapshotId: 'capability-1',
+    }, { ...identityDeps, readCredential: async () => null })
+    const changed = structuredClone(proof)
+    changed.expectedBehaviorEvidence.effectiveConfigFingerprint = 'e'.repeat(64)
+    changed.expectedBehaviorEvidence.expectedBehaviorFingerprint =
+      computeOpenCodeExpectedBehaviorFingerprint(changed.expectedBehaviorEvidence)
+    expect(parseOpenCodeExecutionProof(changed)).not.toBeNull()
+    await expect(validateOpenCodeExecutionProof({
+      proof: changed,
+      selectedModel: proof.modelId,
+      projectPath: current.projectPath,
+      snapshot: current,
+      capabilitySnapshotId: 'capability-1',
+    }, identityDeps)).resolves.toMatchObject({
+      valid: false,
+      reason: 'execution proof integrity mismatch',
     })
   })
 

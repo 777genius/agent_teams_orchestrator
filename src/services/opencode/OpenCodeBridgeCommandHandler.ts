@@ -19,8 +19,13 @@ import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
   parseOpenCodeBridgePreconditions,
+  requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
+import {
+  buildOpenCodeExpectedBehaviorEvidence,
+  OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 import {
   hasOpenCodeBuiltinFreeModel,
   openCodeInventoryService,
@@ -972,6 +977,8 @@ function createBridgeServerIdentity(
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
       opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,
       opencodeFilePartsContractVersion: OPENCODE_FILE_PARTS_CONTRACT_VERSION,
+      expectedBehaviorFingerprintSchemaVersion:
+        OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
@@ -1842,6 +1849,9 @@ function readinessData(
       observedMcpTools: toolProof.observedTools,
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
+    ...(executionProof
+      ? { expectedBehaviorEvidence: executionProof.expectedBehaviorEvidence }
+      : {}),
     ...(executionProof ? { executionProof } : {}),
   }
 }
@@ -2038,6 +2048,7 @@ function buildTeamLaunchData(params: {
   diagnostics: TeamDiagnostic[]
   warnings?: TeamWarning[]
   commandEvidence?: OpenCodeBridgeCommandEvidence
+  expectedBehaviorFingerprint?: string
 }) {
   const states = Object.values(params.members).map(member => member.launchState)
   const now = nowIso()
@@ -2060,6 +2071,9 @@ function buildTeamLaunchData(params: {
         : 'launching'
   return {
     runId: params.runId,
+    ...(params.expectedBehaviorFingerprint
+      ? { expectedBehaviorFingerprint: params.expectedBehaviorFingerprint }
+      : {}),
     teamLaunchState,
     members: Object.fromEntries(
       Object.entries(params.members).map(([memberName, member]) => [
@@ -2838,6 +2852,7 @@ async function runLaunch(
   }
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
   const preconditions = parseOpenCodeBridgePreconditions(body.preconditions)
+  const expectedBehaviorFingerprint = requireOpenCodeExpectedBehaviorFingerprint(preconditions)
   if (preconditions?.laneId && preconditions.laneId !== laneId) {
     throw new Error('OpenCode bridge expected laneId precondition does not match command laneId')
   }
@@ -2913,11 +2928,13 @@ async function runLaunch(
   }
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
   assertOpenCodeSelectedModelReconcilable(apiSelectedModel, snapshot)
-  const behaviorFingerprint = host.resolvedConfigFingerprint
-  if (
-    preconditions.expectedBehaviorFingerprint
-    && preconditions.expectedBehaviorFingerprint !== behaviorFingerprint
-  ) {
+  const initialExpectedBehaviorEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+    profile: host.profile,
+    fullModelId: apiSelectedModel,
+    effectiveConfigFingerprint: host.resolvedConfigFingerprint,
+  }).catch(() => null)
+  if (initialExpectedBehaviorEvidence?.expectedBehaviorFingerprint
+    !== expectedBehaviorFingerprint) {
     await retainedProbe.release().catch(() => undefined)
     throw new Error('OpenCode strict launch behavior precondition mismatch')
   }
@@ -2948,7 +2965,17 @@ async function runLaunch(
   }
 
   const resources = new Map<string, OpenCodeSessionRecord>()
-  const workContext = { snapshot, host, memberInputs }
+  const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  const matchesCurrentExpectedBehavior = async (): Promise<boolean> => {
+    const currentConfigFingerprint = await openCodeHostManager
+      .refreshResolvedConfigFingerprint(host.hostKey)
+    const currentEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+      profile: host.profile,
+      fullModelId: apiSelectedModel,
+      effectiveConfigFingerprint: currentConfigFingerprint,
+    }).catch(() => null)
+    return currentEvidence?.expectedBehaviorFingerprint === expectedBehaviorFingerprint
+  }
   const ports: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft> = {
     snapshotProjection: projection => structuredClone(projection),
     acquireHost: async (_context, _identity, lease, signal) => {
@@ -2962,6 +2989,9 @@ async function runLaunch(
       if (strictHost.hostId !== host.hostKey || signal.aborted) {
         if (signal.aborted) throwOpenCodeAbortReason(signal)
         return { kind: 'failure', error: 'retained host identity mismatch' }
+      }
+      if (!await matchesCurrentExpectedBehavior()) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before proof' }
       }
       const remainingMs = () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs)
       const phaseContext = (phase: OpenCodePhaseContext['phase']): OpenCodePhaseContext => ({
@@ -3002,6 +3032,11 @@ async function runLaunch(
           error: executionOutcome.reason ?? 'OpenCode exact-model execution proof failed',
         }
       }
+      // The exact-model probe can take long enough for config or credentials to
+      // rotate. Seal the proof only after a final fresh read on this retained host.
+      if (!await matchesCurrentExpectedBehavior()) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed during proof' }
+      }
       return {
         kind: 'ok',
         value: {
@@ -3011,13 +3046,16 @@ async function runLaunch(
           hostId: host.hostKey,
           providerId: request.providerId,
           modelId: apiSelectedModel,
-          behaviorFingerprint,
+          behaviorFingerprint: expectedBehaviorFingerprint,
           mcpTools: [...request.mcpTools],
         },
       }
     },
     findCommitted: async (_context, member, signal) => {
       if (signal.aborted) throwOpenCodeAbortReason(signal)
+      if (!await matchesCurrentExpectedBehavior()) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
+      }
       const input = memberInputs.get(member.memberId)!
       const record = await openCodeSessionStore.get(teamId, laneId, input.name)
       const bootstrap = record?.appManagedBootstrap
@@ -3025,6 +3063,7 @@ async function runLaunch(
         !record
         || record.staleReason
         || record.selectedModel !== apiSelectedModel
+        || record.expectedBehaviorFingerprint !== expectedBehaviorFingerprint
         || record.selectedVariant !== input.selectedVariant
         || record.bootstrapMode !== 'app_managed_context'
         || record.bootstrapEvidenceSource !== 'app_managed_bootstrap'
@@ -3035,6 +3074,7 @@ async function runLaunch(
         value: {
           memberId: input.name,
           memberFingerprint: input.fingerprint,
+          behaviorFingerprint: expectedBehaviorFingerprint,
           projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
         },
       }
@@ -3044,6 +3084,12 @@ async function runLaunch(
       const input = memberInputs.get(member.memberId)!
       if (strictHost.hostId !== host.hostKey) {
         return { kind: 'failure', error: 'materialization host identity mismatch' }
+      }
+      if (!await matchesCurrentExpectedBehavior()) {
+        return {
+          kind: 'failure',
+          error: 'OpenCode strict launch behavior changed before materialization',
+        }
       }
       let record: OpenCodeSessionRecord | null = null
       try {
@@ -3059,6 +3105,7 @@ async function runLaunch(
           signal,
           remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
           toolApprovalMode,
+          expectedBehaviorFingerprint,
         })
         record = materialized.record
         resources.set(record.opencodeSessionId, record)
@@ -3134,6 +3181,7 @@ async function runLaunch(
             ...identity,
             memberId: input.name,
             memberFingerprint: input.fingerprint,
+            behaviorFingerprint: expectedBehaviorFingerprint,
             projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
             resource,
           },
@@ -3167,7 +3215,7 @@ async function runLaunch(
     nonce: randomUUID(),
     providerId: parseOpenCodeProviderScopedModelRef(apiSelectedModel)!.providerId,
     modelId: apiSelectedModel,
-    behaviorFingerprint,
+    behaviorFingerprint: expectedBehaviorFingerprint,
     mcpTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
     members: strictMembers,
     workContext,
@@ -3233,6 +3281,7 @@ async function runLaunch(
       expectedMemberNames: strictMembers.map(member => member.memberId),
       diagnostics,
       commandEvidence,
+      expectedBehaviorFingerprint,
       warnings: [],
     }),
   }

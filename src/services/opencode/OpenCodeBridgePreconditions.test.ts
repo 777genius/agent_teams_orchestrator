@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   parseOpenCodeBridgePreconditions,
+  requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
 
@@ -126,6 +127,18 @@ describe('OpenCodeBridgePreconditions', () => {
     expect(() => parseOpenCodeBridgePreconditions({ idempotencyKey: 'idem-1' })).toThrow(
       'handshakeIdentityHash',
     )
+  })
+
+  test('requires an exact lowercase SHA-256 behavior fingerprint', () => {
+    const valid = 'a'.repeat(64)
+    expect(requireOpenCodeExpectedBehaviorFingerprint(
+      parseOpenCodeBridgePreconditions(preconditions({ expectedBehaviorFingerprint: valid })),
+    )).toBe(valid)
+    for (const value of [null, '', ' ', 'A'.repeat(64), 'a'.repeat(63), `${'a'.repeat(64)} `]) {
+      expect(() => requireOpenCodeExpectedBehaviorFingerprint(
+        parseOpenCodeBridgePreconditions(preconditions({ expectedBehaviorFingerprint: value })),
+      )).toThrow()
+    }
   })
 })
 

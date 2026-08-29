@@ -227,9 +227,11 @@ function normalizeResolvedFingerprintValue(
   if (Array.isArray(value)) {
     const normalized = value.map(item => normalizeResolvedFingerprintValue(item, scope))
     if (scope === 'configProviders' || scope === 'agents') {
-      return normalized.sort((left, right) =>
-        JSON.stringify(left).localeCompare(JSON.stringify(right)),
-      )
+      return normalized.sort((left, right) => {
+        const leftJson = JSON.stringify(left)
+        const rightJson = JSON.stringify(right)
+        return leftJson < rightJson ? -1 : leftJson > rightJson ? 1 : 0
+      })
     }
     return normalized
   }
@@ -1224,9 +1226,9 @@ export class OpenCodeHostManager {
       }
 
       if (
-        fingerprintSource.config === null &&
-        fingerprintSource.configProviders === null &&
-        fingerprintSource.agents === null &&
+        fingerprintSource.config === null ||
+        fingerprintSource.configProviders === null ||
+        fingerprintSource.agents === null ||
         fingerprintSource.mcp === null
       ) {
         return null
@@ -1525,10 +1527,8 @@ export class OpenCodeHostManager {
     }
 
     const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
-    if (fingerprint) {
-      entry.handle.resolvedConfigFingerprint = fingerprint
-    }
-    return entry.handle.resolvedConfigFingerprint
+    entry.handle.resolvedConfigFingerprint = fingerprint
+    return fingerprint
   }
 
   private async terminatePersistentHostRecord(

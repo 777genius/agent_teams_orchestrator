@@ -99,6 +99,7 @@ function materialized(member: StrictMember): StrictMaterializedMember<Projection
   return {
     ...identity,
     ...member,
+    behaviorFingerprint: 'behavior',
     projection: { member: member.memberId, source: 'new', nested: { label: member.memberId } },
     resource: resource(`resource-${member.memberId}`, true),
   }
@@ -107,6 +108,7 @@ function materialized(member: StrictMember): StrictMaterializedMember<Projection
 function committed(member: StrictMember): StrictCommittedMember<Projection> {
   return {
     ...member,
+    behaviorFingerprint: 'behavior',
     projection: { member: member.memberId, source: 'existing', nested: { label: member.memberId } },
   }
 }
@@ -254,6 +256,22 @@ describe('strict launch invariants', () => {
     expect(ports.releaseCalls).toHaveLength(1)
     expect(ports.releaseCalls[0]?.keepAlive).toBe(true)
     expect(ports.signals.every(signal => signal instanceof AbortSignal)).toBe(true)
+  })
+
+  test('does not reuse a committed member bound to an older behavior digest', async () => {
+    const scheduler = new ManualScheduler()
+    const ports = new FakePorts()
+    ports.existing.set('one', {
+      ...committed(members[0]!),
+      behaviorFingerprint: 'older-behavior',
+    })
+
+    const result = await coordinateStrictLaunch(request(scheduler), ports)
+
+    expect(result.status).toBe('stale-result')
+    expect(result.committedMemberIds).toEqual([])
+    expect(ports.events).not.toContain('project:one')
+    expect(ports.events).not.toContain('materialize:one')
   })
 
   test('invalid proof starts zero member operations and releases the host', async () => {
@@ -778,6 +796,7 @@ describe('immutable snapshots and uncertain leases', () => {
     expect(Object.isFrozen(received)).toBe(true)
     expect(received).toEqual({
       ...members[0]!,
+      behaviorFingerprint: 'behavior',
       projection: { member: 'one', source: 'existing', nested: { label: 'project-mutated' } },
     })
     expect(result.projections).toEqual([

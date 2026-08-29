@@ -561,6 +561,16 @@ export type OpenCodeExecutionProbeResult = {
 
 export type OpenCodeExecutionProofCredentialMode = 'api' | 'oauth' | 'none' | 'unknown'
 
+export type OpenCodeExpectedBehaviorEvidence = {
+  canonicalProjectPathFingerprint: string
+  modelProviderId: string
+  fullModelId: string
+  projectBehaviorFingerprint: string
+  effectiveConfigFingerprint: string
+  effectiveSelectedAuthFingerprint: string
+  expectedBehaviorFingerprint: string
+}
+
 export type OpenCodeExecutionProof = {
   schemaVersion: 1
   providerId: 'opencode'
@@ -576,6 +586,7 @@ export type OpenCodeExecutionProof = {
   capabilitySnapshotId: string | null
   credentialMode: OpenCodeExecutionProofCredentialMode
   reusable: boolean
+  expectedBehaviorEvidence: OpenCodeExpectedBehaviorEvidence
   verifiedAt: string
   expiresAt: string
   proofHash: string
@@ -642,6 +653,7 @@ export type OpenCodeSessionRecord = {
   managedAuthFingerprint: string | null
   projectBehaviorFingerprint: string
   managedConfigFingerprint?: string
+  expectedBehaviorFingerprint?: string
   opencodeVersion?: string
   bootstrapMode?: OpenCodeBootstrapMode
   bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource

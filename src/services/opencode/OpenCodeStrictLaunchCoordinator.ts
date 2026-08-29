@@ -41,6 +41,7 @@ export interface StrictMember {
 export interface StrictCommittedMember<P> {
   memberId: string
   memberFingerprint: string
+  behaviorFingerprint: string
   projection: P
 }
 export interface StrictMaterializedMember<P>
@@ -382,12 +383,17 @@ export async function coordinateStrictLaunch<W, C, P>(
           finish(result, 'stale-result', 'committed member identity')
           break
         }
+        if (found.behaviorFingerprint !== proofRequest.behaviorFingerprint) {
+          finish(result, 'stale-result', 'committed member behavior fingerprint')
+          break
+        }
         result.committedMemberIds.push(member.memberId)
         let retainedProjection: P
         let value: StrictCommittedMember<P>
         try {
           retainedProjection = snapshotProjection(found.projection)
           value = Object.freeze({ memberId, memberFingerprint,
+            behaviorFingerprint: found.behaviorFingerprint,
             projection: snapshotProjection(retainedProjection) })
         } catch (error) {
           finish(result, 'unknown', errorText(error))
@@ -433,7 +439,8 @@ export async function coordinateStrictLaunch<W, C, P>(
       const exact = sameIdentity(identity, value) &&
         sameIdentity(identity, value.resource) && value.resource.committed &&
         value.memberId === member.memberId &&
-        value.memberFingerprint === member.memberFingerprint
+        value.memberFingerprint === member.memberFingerprint &&
+        value.behaviorFingerprint === proofRequest.behaviorFingerprint
       if (!exact) {
         uncertainIrreversible = collectOwnedFailureResources(identity, cleanup, [value.resource]) ||
           uncertainIrreversible
