@@ -74,6 +74,7 @@ export class Issue443Harness implements StrictLaunchPorts<string, string, Projec
   proofOverride: Partial<StrictProof> = {}
   materializeResults = new Map<string, StrictPortResult<StrictMaterializedMember<Projection>>>()
   catalogGate: ReturnType<typeof deferred<void>> | null = null
+  catalogGateEntered = deferred<void>()
   private previousEnv = new Map<string, string | undefined>()
 
   async open(): Promise<void> {
@@ -178,7 +179,10 @@ export class Issue443Harness implements StrictLaunchPorts<string, string, Projec
       },
       getProviders: async () => {
         this.endpoints.push({ baseUrl: 'http://fake-host.invalid', endpoint: '/provider' })
-        if (this.catalogGate) await this.catalogGate.promise
+        if (this.catalogGate) {
+          this.catalogGateEntered.resolve()
+          await this.catalogGate.promise
+        }
         return { all: [{ id: 'deepinfra', name: 'DeepInfra', models: { [this.catalogModel.slice(10)]: {} } }], connected: ['deepinfra'], default: {} }
       },
       getProviderAuth: async () => this.denyRealInvocation('all-provider auth endpoint'),

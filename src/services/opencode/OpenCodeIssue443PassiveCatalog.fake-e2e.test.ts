@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, jest, test } from 'bun:test'
 
 import { OpenCodeProviderManagementAdapter } from '../../features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.js'
 import { buildOpenCodePassiveStatus } from '../runtimeBackends/openCodePassiveStatus.js'
@@ -8,12 +8,20 @@ describe('issue #443 passive status/catalog fake E2E', () => {
   let harness: Issue443Harness
 
   beforeEach(async () => {
+    jest.useFakeTimers()
     harness = new Issue443Harness()
     await harness.open()
   })
-  afterEach(async () => { await harness.close() })
+  afterEach(async () => {
+    jest.clearAllTimers()
+    jest.useRealTimers()
+    await harness.close()
+  })
 
-  function adapter(timeoutMs = 500) {
+  function adapter(timeoutMs = 500, hooks: {
+    onIdentityRead?: () => void
+    onReleaseHost?: () => void
+  } = {}) {
     return new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: timeoutMs,
       inventoryTimeoutMs: 1_000,
@@ -23,6 +31,7 @@ describe('issue #443 passive status/catalog fake E2E', () => {
         listManagedAuthPaths: async () => [],
         readCatalogSelectedAuthIdentity: async ({ profileScope }) => {
           harness.commands.push(['selected-auth-identity', 'deepinfra'])
+          hooks.onIdentityRead?.()
           return {
             source: profileScope.selectedAuthIdentity,
             managed: profileScope.selectedAuthIdentity,
@@ -43,16 +52,11 @@ describe('issue #443 passive status/catalog fake E2E', () => {
           expect(options.profileOptions?.profileScope?.purpose).toBe('catalog')
           return harness.catalogHost()
         },
-        releaseHost: async () => {},
+        releaseHost: async () => { hooks.onReleaseHost?.() },
       },
       clientFactory: {
-        create: (baseUrl, options) => {
+        create: baseUrl => {
           expect(baseUrl).toBe('http://fake-host.invalid')
-          if (harness.catalogGate) {
-            options?.signal?.addEventListener('abort', () => {
-              queueMicrotask(() => harness.catalogGate?.resolve())
-            }, { once: true })
-          }
           return harness.catalogClient()
         },
       },
@@ -91,14 +95,39 @@ describe('issue #443 passive status/catalog fake E2E', () => {
   })
 
   test('timeout serves stale evidence and a late generation cannot replace newer evidence', async () => {
-    const catalog = adapter(100)
+    let identityReads = 0
+    let releases = 0
+    const timeoutIdentityRead = deferred<void>()
+    const latePublishIdentityRead = deferred<void>()
+    const catalog = adapter(100, {
+      onIdentityRead: () => {
+        identityReads += 1
+        if (identityReads === 6) timeoutIdentityRead.resolve()
+        if (identityReads === 10) latePublishIdentityRead.resolve()
+      },
+      onReleaseHost: () => {
+        releases += 1
+      },
+    })
     const input = { runtimeId: 'opencode' as const, providerId: 'deepinfra', projectPath: harness.projectPath }
     const initial = await catalog.loadModels(input)
     if (!initial.ok) throw new Error(JSON.stringify(initial))
     expect(initial.ok).toBe(true)
+    expect(initial.value.catalogState).toBe('fresh')
+    expect(initial.value.models.map(model => model.modelId)).toEqual([harness.catalogModel])
 
-    harness.catalogGate = deferred<void>()
-    const stale = await catalog.loadModels(input)
+    const lateGate = deferred<void>()
+    harness.catalogGate = lateGate
+    const staleRequest = catalog.loadModels(input)
+    await harness.catalogGateEntered.promise
+    expect(jest.getTimerCount()).toBe(1)
+    jest.advanceTimersByTime(100)
+    await timeoutIdentityRead.promise
+    for (let index = 0; index < 10; index += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    const stale = await staleRequest
+    if (!stale.ok) throw new Error(JSON.stringify(stale))
     expect(stale.ok).toBe(true)
     if (!stale.ok) return
     expect(stale.value.catalogState).toBe('stale')
@@ -112,11 +141,20 @@ describe('issue #443 passive status/catalog fake E2E', () => {
     expect(current.value.catalogState).toBe('fresh')
     expect(current.value.models.map(model => model.modelId)).toEqual([harness.catalogModel])
 
-    const afterLateCompletion = await catalog.loadModels(input)
-    expect(afterLateCompletion.ok).toBe(true)
-    if (afterLateCompletion.ok) {
-      expect(afterLateCompletion.value.models.map(model => model.modelId)).toEqual([harness.catalogModel])
+    expect(releases).toBe(3)
+    lateGate.resolve()
+    await latePublishIdentityRead.promise
+    for (let index = 0; index < 10; index += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve))
     }
+    const cache = (catalog as unknown as {
+      catalogCache: Map<string, {
+        providers: { all: Array<{ models?: Record<string, unknown> }> } | null
+      }>
+    }).catalogCache
+    expect(Array.from(cache.values()).at(-1)?.providers?.all[0]?.models).toEqual({
+      'Qwen/Qwen3-Next': {},
+    })
     expect(harness.endpoints.every(call => call.baseUrl === 'http://fake-host.invalid')).toBe(true)
     expect(harness.commands.flat()).not.toContain('kiro')
     expect(harness.commands.flat()).not.toContain('cursor-acp')
