@@ -1029,7 +1029,7 @@ describe('OpenCodeSessionBridge', () => {
     expect(await store.get('team-a', 'primary', 'alice')).toBeNull()
   })
 
-  test('durably records a known create side effect before observing cancellation', async () => {
+  test('resumes bootstrap for a persisted known create after cancellation with a fresh bridge', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const controller = new AbortController()
     let createCalls = 0
@@ -1064,7 +1064,23 @@ describe('OpenCodeSessionBridge', () => {
     expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
 
     const retryController = new AbortController()
-    await expect(bridge.materializeSessionOnHost({
+    const restartedBridge = new OpenCodeSessionBridge({
+      sessionStore: new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json')),
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => {
+            createCalls += 1
+            throw new Error('known create must not be duplicated')
+          },
+        }) as never,
+      },
+    })
+    const resumed = await restartedBridge.materializeSessionOnHost({
       teamId: 'team-a', laneId: 'primary', memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini', runId: 'run-2', attemptId: 'attempt-b', host,
       signal: retryController.signal, remainingMs: () => 1_000,
@@ -1072,7 +1088,12 @@ describe('OpenCodeSessionBridge', () => {
       expectedBootstrapForSession: () => ({
         messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
       }),
-    })).rejects.toThrow('committed session identity does not match strict launch')
+    })
+    expect(resumed).toMatchObject({
+      created: false,
+      resumeBootstrap: true,
+      record: { opencodeSessionId: 'session-known' },
+    })
     expect(createCalls).toBe(1)
   })
 

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { createHash, createHmac, randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
   chmod,
@@ -1406,7 +1406,6 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
   selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
 }>
 
-const openCodeProfileScopeKey = randomBytes(32)
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
 const OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN =
   'agent-teams.opencode.semantic-secret-identity/v2'
@@ -1417,12 +1416,6 @@ function freezeConfigSnapshot<T>(value: T): T {
     Object.freeze(value)
   }
   return value
-}
-
-function localScopeIdentity(value: unknown): string {
-  return createHmac('sha256', openCodeProfileScopeKey)
-    .update(JSON.stringify(value) ?? '')
-    .digest('hex')
 }
 
 // Cross-process equality needs no stored key: the identity is a versioned,
@@ -1550,14 +1543,27 @@ export async function resolveOpenCodeProfileScope(input: {
       path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
     ])),
   })
-  const scopeToken = localScopeIdentity({
+  // The token is persisted in session and host identities, so it must survive a
+  // one-shot bridge process exit. Bind only the effective, redacted inputs that
+  // can affect this scoped profile; the local snapshot map below still proves
+  // that callers in this process possess the exact prepared snapshot.
+  const scopeToken = semanticSecretIdentity('profile-scope', {
     projectPath,
     purpose: input.purpose,
     providerId,
     configFingerprint,
     selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
-    runtimeEnvironment: Object.keys(env).sort().map(key => [key, env[key] ?? null]),
+    runtimeAuthEnvironment: Object.keys(env)
+      .filter(isClassifiedIdentityKey)
+      .sort()
+      .map(name => [
+        name,
+        semanticSecretIdentity('profile-scope-auth-environment', {
+          name,
+          value: env[name] ?? null,
+        }),
+      ]),
   })
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,

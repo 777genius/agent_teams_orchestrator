@@ -221,6 +221,20 @@ export function isOpenCodeStrictSessionCompatible(
   expected: OpenCodeStrictSessionCompatibility,
 ): boolean {
   const bootstrap = record.appManagedBootstrap
+  return isOpenCodeStrictMaterializedSessionCompatible(record, expected)
+    && record.bootstrapMode === 'app_managed_context'
+    && record.bootstrapEvidenceSource === 'app_managed_bootstrap'
+    && bootstrap?.messageID === expected.bootstrap.messageID
+    && bootstrap.contextHash === expected.bootstrap.contextHash
+    && bootstrap.briefingHash === expected.bootstrap.briefingHash
+    && bootstrap.model === expected.selectedModel
+    && bootstrap.agent === expected.bootstrap.agent
+}
+
+function isOpenCodeStrictMaterializedSessionCompatible(
+  record: OpenCodeSessionRecord,
+  expected: OpenCodeStrictSessionCompatibility,
+): boolean {
   return !record.staleReason
     && record.teamId === expected.teamId
     && record.laneId === expected.laneId
@@ -239,13 +253,6 @@ export function isOpenCodeStrictSessionCompatible(
     && record.sourceAuthFingerprint === expected.host.profile.sourceAuthFingerprint
     && record.managedAuthFingerprint === expected.host.profile.managedAuthFingerprint
     && record.expectedBehaviorFingerprint === expected.expectedBehaviorFingerprint
-    && record.bootstrapMode === 'app_managed_context'
-    && record.bootstrapEvidenceSource === 'app_managed_bootstrap'
-    && bootstrap?.messageID === expected.bootstrap.messageID
-    && bootstrap.contextHash === expected.bootstrap.contextHash
-    && bootstrap.briefingHash === expected.bootstrap.briefingHash
-    && bootstrap.model === expected.selectedModel
-    && bootstrap.agent === expected.bootstrap.agent
 }
 
 function inferToolApprovalModeFromPreparedProfile(
@@ -997,7 +1004,7 @@ export class OpenCodeSessionBridge {
     expectedBootstrapForSession: (
       sessionId: string,
     ) => OpenCodeStrictSessionCompatibility['bootstrap']
-  }): Promise<{ record: OpenCodeSessionRecord; created: boolean }> {
+  }): Promise<{ record: OpenCodeSessionRecord; created: boolean; resumeBootstrap?: boolean }> {
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
     const attemptId = params.attemptId ?? params.runId
@@ -1021,7 +1028,7 @@ export class OpenCodeSessionBridge {
     }
     if (existing) {
       const selectedVariant = params.selectedVariant?.trim() || undefined
-      if (!isOpenCodeStrictSessionCompatible(existing, {
+      const expected = {
         teamId: params.teamId,
         laneId: params.laneId,
         memberName: params.memberName,
@@ -1031,10 +1038,17 @@ export class OpenCodeSessionBridge {
         toolApprovalMode: params.toolApprovalMode ?? 'auto',
         expectedBehaviorFingerprint: params.expectedBehaviorFingerprint,
         bootstrap: params.expectedBootstrapForSession(existing.opencodeSessionId),
-      })) {
+      }
+      if (isOpenCodeStrictSessionCompatible(existing, expected)) {
+        return { record: existing, created: false }
+      }
+      if (!isOpenCodeStrictMaterializedSessionCompatible(existing, expected)) {
         throw new Error('OpenCode committed session identity does not match strict launch')
       }
-      return { record: existing, created: false }
+      // createSession returned a known id and the exact bound record was
+      // committed before bootstrap was interrupted. Resume only that session;
+      // an unknown create outcome has no record and remains fenced by its claim.
+      return { record: existing, created: false, resumeBootstrap: true }
     }
 
     const selectedVariant = params.selectedVariant?.trim() || undefined

@@ -217,7 +217,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       `const {resolveOpenCodeProfileScope:r}=await import(${JSON.stringify(moduleUrl)});`,
       'const s=await r({projectPath:process.argv[1],purpose:"launch_runtime",',
       'selectedModel:process.argv[2],env:{...process.env,OPENCODE_CONFIG_CONTENT:process.argv[3]}});',
-      'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity}))',
+      'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity,scope:s.scopeToken}))',
     ].join('')
     const run = async (
       provider: string,
@@ -229,7 +229,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           provider: { [provider]: { options: { apiKey: secret } } },
         }),
       ], { ...process.env, ...effectiveEnv }),
-    ) as { config: string; auth: string }
+    ) as { config: string; auth: string; scope: string }
     await writeFile(authPath, JSON.stringify({
       deepinfra: { type: 'api', key: 'selected-auth-secret' },
     }))
@@ -251,18 +251,28 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const envRotated = await run('deepinfra', envReference, {
       [envName]: rotatedEnvValue,
     })
+    const runtimeAuthFirst = await run('deepinfra', 'config-secret', {
+      OPENAI_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const runtimeAuthRotated = await run('deepinfra', 'config-secret', {
+      OPENAI_API_KEY: randomBytes(32).toString('hex'),
+    })
 
     expect(second).toEqual(first)
     expect(valueChanged.config).not.toBe(first.config)
+    expect(valueChanged.scope).not.toBe(first.scope)
     expect(typeChanged.config).not.toBe(first.config)
     expect(providerChanged.config).not.toBe(first.config)
     expect(providerChanged.auth).not.toBe(first.auth)
     expect(authChanged.auth).not.toBe(first.auth)
+    expect(authChanged.scope).not.toBe(first.scope)
     expect(envSecond.config).toBe(envFirst.config)
     expect(envRotated.config).not.toBe(envFirst.config)
+    expect(runtimeAuthRotated.config).toBe(runtimeAuthFirst.config)
+    expect(runtimeAuthRotated.scope).not.toBe(runtimeAuthFirst.scope)
     const output = JSON.stringify([
       first, second, valueChanged, typeChanged, providerChanged, authChanged,
-      envFirst, envSecond, envRotated,
+      envFirst, envSecond, envRotated, runtimeAuthFirst, runtimeAuthRotated,
     ])
     expect(output).not.toContain('secret')
     expect(output).not.toContain(envName)
