@@ -1,5 +1,6 @@
 import { lstat, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -217,12 +218,16 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       'selectedModel:process.argv[2],env:{...process.env,OPENCODE_CONFIG_CONTENT:process.argv[3]}});',
       'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity}))',
     ].join('')
-    const run = async (provider: string, secret: unknown) => JSON.parse(
+    const run = async (
+      provider: string,
+      secret: unknown,
+      effectiveEnv: NodeJS.ProcessEnv = {},
+    ) => JSON.parse(
       await runCommandCapture(process.execPath, [
         '-e', script, projectPath, `${provider}/model`, JSON.stringify({
           provider: { [provider]: { options: { apiKey: secret } } },
         }),
-      ], process.env),
+      ], { ...process.env, ...effectiveEnv }),
     ) as { config: string; auth: string }
     await writeFile(authPath, JSON.stringify({
       deepinfra: { type: 'api', key: 'selected-auth-secret' },
@@ -236,6 +241,15 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       deepinfra: { type: 'api', key: 'changed-auth-secret' },
     }))
     const authChanged = await run('deepinfra', 'config-secret')
+    const envName = ['PROFILE', 'IDENTITY', 'A'].join('_')
+    const envReference = `{env:${envName}}`
+    const envValue = randomBytes(32).toString('hex')
+    const envFirst = await run('deepinfra', envReference, { [envName]: envValue })
+    const envSecond = await run('deepinfra', envReference, { [envName]: envValue })
+    const rotatedEnvValue = randomBytes(32).toString('hex')
+    const envRotated = await run('deepinfra', envReference, {
+      [envName]: rotatedEnvValue,
+    })
 
     expect(second).toEqual(first)
     expect(valueChanged.config).not.toBe(first.config)
@@ -243,8 +257,82 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(providerChanged.config).not.toBe(first.config)
     expect(providerChanged.auth).not.toBe(first.auth)
     expect(authChanged.auth).not.toBe(first.auth)
-    expect(JSON.stringify([first, second, valueChanged, typeChanged, providerChanged, authChanged]))
-      .not.toContain('secret')
+    expect(envSecond.config).toBe(envFirst.config)
+    expect(envRotated.config).not.toBe(envFirst.config)
+    const output = JSON.stringify([
+      first, second, valueChanged, typeChanged, providerChanged, authChanged,
+      envFirst, envSecond, envRotated,
+    ])
+    expect(output).not.toContain('secret')
+    expect(output).not.toContain(envName)
+    expect(output).not.toContain(envValue)
+    expect(output).not.toContain(rotatedEnvValue)
+  })
+
+  test('binds semantic config identity to effective secret environment references', async () => {
+    const projectPath = path.join(tempDir, 'env-secret-identity-project')
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (
+      reference: string,
+      env: NodeJS.ProcessEnv,
+      providerId = 'deepinfra',
+      credentialPath: 'apiKey' | 'authorization' = 'apiKey',
+    ) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: `${providerId}/model`,
+      env: {
+        ...env,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { [providerId]: { options: credentialPath === 'apiKey'
+            ? { apiKey: reference }
+            : { headers: { Authorization: reference } } } },
+        }),
+      },
+    })
+    const envName = ['PROFILE', 'IDENTITY', 'A'].join('_')
+    const otherEnvName = ['PROFILE', 'IDENTITY', 'B'].join('_')
+    const value = randomBytes(32).toString('hex')
+    const rotatedValue = randomBytes(32).toString('hex')
+    const reference = `{env:${envName}}`
+    const first = await resolve(reference, { [envName]: value })
+    const same = await resolve(reference, { [envName]: value })
+    const rotated = await resolve(reference, { [envName]: rotatedValue })
+    const renamed = await resolve(`{env:${otherEnvName}}`, { [otherEnvName]: value })
+    const shellSyntax = await resolve(`\${${envName}}`, { [envName]: value })
+    const literal = await resolve(value, {})
+    const providerChanged = await resolve(reference, { [envName]: value }, 'custom')
+    const pathChanged = await resolve(reference, { [envName]: value }, 'deepinfra', 'authorization')
+    const missing = await resolve(reference, {})
+    const empty = await resolve(reference, { [envName]: '' })
+
+    expect(same.configFingerprint).toBe(first.configFingerprint)
+    for (const changed of [
+      rotated, renamed, shellSyntax, literal, providerChanged, pathChanged, missing, empty,
+    ]) {
+      expect(changed.configFingerprint).not.toBe(first.configFingerprint)
+    }
+    expect(missing.configFingerprint).not.toBe(empty.configFingerprint)
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
+      provider: { deepinfra: { options: { apiKey: reference } } },
+    }))
+    const errorEnv = new Proxy<NodeJS.ProcessEnv>({}, {
+      get: (_target, key) => {
+        if (key === envName) throw new Error('lookup failed')
+        return undefined
+      },
+    })
+    const missingBehavior = await collectProjectBehaviorMetadata(projectPath, {})
+    const errorBehavior = await collectProjectBehaviorMetadata(projectPath, errorEnv)
+    expect(errorBehavior.projectBehaviorFingerprint).not.toBe(missingBehavior.projectBehaviorFingerprint)
+    const output = JSON.stringify([
+      first, same, rotated, renamed, shellSyntax, literal, providerChanged, pathChanged,
+      missing, empty, missingBehavior, errorBehavior,
+    ])
+    expect(output).not.toContain(envName)
+    expect(output).not.toContain(otherEnvName)
+    expect(output).not.toContain(value)
+    expect(output).not.toContain(rotatedValue)
   })
 
   test('fingerprints query, limit, header, and non-secret env behavior while redacting credentials', async () => {

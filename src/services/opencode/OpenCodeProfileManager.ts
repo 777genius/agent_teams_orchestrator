@@ -1293,9 +1293,29 @@ function isClassifiedIdentityKey(key: string): boolean {
   return SECRET_IDENTITY_KEY.test(key)
 }
 
-function resolveIdentityEnvironment(value: string, env: NodeJS.ProcessEnv): string {
+function resolveIdentityEnvironment(
+  value: string,
+  env: NodeJS.ProcessEnv,
+  bindClassifiedReferences = false,
+): string {
   return value.replace(ENV_REFERENCE, (reference, bracedName: string, shellName: string) => {
     const name = bracedName || shellName
+    if (bindClassifiedReferences) {
+      let state: 'missing' | 'empty' | 'present' | 'error'
+      let effectiveValue: string | undefined
+      try {
+        effectiveValue = env[name]
+        state = effectiveValue === undefined ? 'missing' : effectiveValue === '' ? 'empty' : 'present'
+      } catch {
+        state = 'error'
+      }
+      return `[env-secret:${semanticSecretIdentity('config-secret-env-reference', {
+        syntax: bracedName ? 'opencode' : 'shell',
+        name,
+        state,
+        ...(state === 'present' ? { value: effectiveValue } : {}),
+      })}]`
+    }
     if (isClassifiedIdentityKey(name)) return '[redacted-env]'
     return env[name] ?? reference
   })
@@ -1448,7 +1468,7 @@ function enforceScopedProviderIsolation(
 
 function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
   const resolve = (item: unknown): unknown => {
-    if (typeof item === 'string') return resolveIdentityEnvironment(item, env)
+    if (typeof item === 'string') return resolveIdentityEnvironment(item, env, true)
     if (Array.isArray(item)) return item.map(resolve)
     if (!item || typeof item !== 'object') return item
     return Object.keys(item as Record<string, unknown>).sort().reduce<Record<string, unknown>>(
