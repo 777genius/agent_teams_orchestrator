@@ -2952,8 +2952,15 @@ async function markStaleAndReleaseSession(
 
 function strictPublicError(error: unknown): string {
   const message = (error instanceof Error ? error.message : String(error))
-    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
-    .replace(/\b(api[_-]?key|token|authorization|password)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')
+    .replace(
+      /("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|passwords?|credentials?|client[_-]?secret|secret)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+      '$1"[redacted]"',
+    )
+    .replace(/\bBearer\s+[^\s"',;}\]]+/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|passwords?|credentials?|client[_-]?secret|secret)\s*[:=]\s*[^\s,;]+/gi,
+      '$1=[redacted]',
+    )
     .replace(/[\r\n\t]+/g, ' ')
     .trim()
   return (message || 'OpenCode strict launch failed').slice(0, 512)
@@ -3080,8 +3087,10 @@ async function runLaunch(
     provisioningController.abort(error)
     if (pendingProbe) {
       const cleanup = pendingProbe.then(async probe => {
-        const remainingMs = Math.max(0, deadlineAt - Date.now())
-        if (remainingMs > 0) await withTimeout(probe.release(), remainingMs)
+        // An abort-ignoring provisioner still transfers this exact caller-owned
+        // lease when it eventually resolves. Release it on a fresh bounded
+        // cleanup budget even when the command's absolute deadline is exhausted.
+        await withTimeout(probe.release(), cleanupReserveMs)
       }).catch(() => undefined)
       void cleanup
     }
@@ -3374,6 +3383,13 @@ async function runLaunch(
           }
         }
         if (materialized.created) resources.set(record.opencodeSessionId, record)
+        const ownedUncommittedResources = materialized.created ? {
+          resources: [{
+            ...identity,
+            resourceId: record.opencodeSessionId,
+            committed: false as const,
+          }],
+        } : {}
         const sessionMcp = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
           attachIfMissing: false,
           host,
@@ -3384,13 +3400,14 @@ async function runLaunch(
           return {
             kind: 'failure',
             error: 'OpenCode app MCP is unavailable on the retained member host',
-            ...(materialized.created ? {
-              resources: [{
-                ...identity,
-                resourceId: record.opencodeSessionId,
-                committed: false,
-              }],
-            } : {}),
+            ...ownedUncommittedResources,
+          }
+        }
+        if (!await matchesCurrentExpectedBehavior(signal)) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode strict launch behavior changed before bootstrap',
+            ...ownedUncommittedResources,
           }
         }
         const contextText = buildOpenCodeAppManagedBootstrapContextText({
@@ -3435,6 +3452,13 @@ async function runLaunch(
             agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
           },
           updatedAt: candidateAt,
+        }
+        if (!await matchesCurrentExpectedBehavior(signal)) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode strict launch behavior changed during bootstrap',
+            ...ownedUncommittedResources,
+          }
         }
         await openCodeSessionStore.upsert(record)
         const resource: StrictResource = {

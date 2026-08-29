@@ -2751,6 +2751,169 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
+  test('refreshes authority after MCP readiness and cleans only the uncommitted attempt member', async () => {
+    const events: string[] = []
+    let authorityCurrent = true
+    const originalMarkStaleIfSession = openCodeSessionStore.markStaleIfSession
+    const originalDeleteIfSession = openCodeSessionStore.deleteIfSession
+    try {
+      openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+        snapshot, host: snapshot.host, release: async () => {},
+      })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      openCodeProvisioningProbe.refreshSelectedProfileAuthority = (async () =>
+        authorityCurrent ? snapshot.profile! : null
+      ) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
+      openCodeSessionBridge.materializeSessionOnHost = (async input => {
+        events.push(`materialize:${input.memberName}`)
+        return {
+          created: true,
+          record: buildRecord({
+            memberName: input.memberName,
+            opencodeSessionId: `session-${input.memberName}`,
+            expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+          }),
+        }
+      }) as typeof openCodeSessionBridge.materializeSessionOnHost
+      openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+        events.push(`mcp:${record.memberName}`)
+        authorityCurrent = false
+        return { ok: true, status: 'present', connected: true, runtimePid: 123, diagnostics: [] }
+      }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+      openCodeSessionBridge.injectAppManagedBootstrapContext = (async () => {
+        events.push('bootstrap')
+        throw new Error('bootstrap must be fenced after stale MCP readiness')
+      }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+      openCodeSessionStore.upsert = (async () => {
+        events.push('publish')
+        return 'updated'
+      }) as typeof openCodeSessionStore.upsert
+      openCodeSessionStore.markStaleIfSession = (async record => {
+        events.push(`cleanup-stale:${record.memberName}`)
+        return record as OpenCodeSessionRecord
+      }) as typeof openCodeSessionStore.markStaleIfSession
+      openCodeSessionStore.deleteIfSession = (async record => {
+        events.push(`cleanup-delete:${record.memberName}`)
+        return true
+      }) as typeof openCodeSessionStore.deleteIfSession
+      openCodeSessionBridge.releaseSession = (async record => {
+        events.push(`cleanup-release:${record.memberName}`)
+      }) as typeof openCodeSessionBridge.releaseSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+        runId: 'run-authority-mutated-during-mcp', laneId: 'primary', teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free', members: [{ name: 'alice' }],
+      }))
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error.message).toContain('changed before bootstrap')
+      expect(events).toEqual([
+        'materialize:alice', 'mcp:alice', 'cleanup-stale:alice',
+        'cleanup-release:alice', 'cleanup-delete:alice',
+      ])
+    } finally {
+      openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
+      openCodeSessionStore.deleteIfSession = originalDeleteIfSession
+    }
+  })
+
+  test('refreshes authority after bootstrap while preserving an earlier committed member', async () => {
+    const events: string[] = []
+    let authorityCurrent = true
+    const originalMarkStaleIfSession = openCodeSessionStore.markStaleIfSession
+    const originalDeleteIfSession = openCodeSessionStore.deleteIfSession
+    try {
+      openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+        snapshot, host: snapshot.host, release: async () => {},
+      })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      openCodeProvisioningProbe.refreshSelectedProfileAuthority = (async () =>
+        authorityCurrent ? snapshot.profile! : null
+      ) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
+      openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.materializeSessionOnHost = (async input => ({
+        created: true,
+        record: buildRecord({
+          memberName: input.memberName,
+          opencodeSessionId: `session-${input.memberName}`,
+          expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+        }),
+      })) as typeof openCodeSessionBridge.materializeSessionOnHost
+      openCodeSessionBridge.ensureSessionAppMcpReady = (async () => ({
+        ok: true, status: 'present', connected: true, runtimePid: 123, diagnostics: [],
+      })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+      openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+        events.push(`bootstrap:${record.memberName}`)
+        if (record.memberName === 'bob') authorityCurrent = false
+        return {
+          messageID: input.messageID, runtimeSessionId: record.opencodeSessionId,
+          contextHash: input.contextHash, briefingHash: input.briefingHash,
+          injectionVerifiedAt: '2026-04-21T12:00:00.000Z', alreadyPresent: false,
+        }
+      }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+      openCodeSessionStore.upsert = (async record => {
+        events.push(`publish:${record.memberName}`)
+        return 'updated'
+      }) as typeof openCodeSessionStore.upsert
+      openCodeSessionStore.markStaleIfSession = (async record => {
+        events.push(`cleanup-stale:${record.memberName}`)
+        return record as OpenCodeSessionRecord
+      }) as typeof openCodeSessionStore.markStaleIfSession
+      openCodeSessionStore.deleteIfSession = (async record => {
+        events.push(`cleanup-delete:${record.memberName}`)
+        return true
+      }) as typeof openCodeSessionStore.deleteIfSession
+      openCodeSessionBridge.releaseSession = (async record => {
+        events.push(`cleanup-release:${record.memberName}`)
+      }) as typeof openCodeSessionBridge.releaseSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+        runId: 'run-authority-mutated-during-bootstrap', laneId: 'primary', teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice' }, { name: 'bob' }],
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(Object.keys(result.data.members)).toEqual(['alice'])
+      expect(events).toEqual([
+        'bootstrap:alice', 'publish:alice', 'bootstrap:bob',
+        'cleanup-stale:bob', 'cleanup-release:bob', 'cleanup-delete:bob',
+      ])
+    } finally {
+      openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
+      openCodeSessionStore.deleteIfSession = originalDeleteIfSession
+    }
+  })
+
+  test('redacts quoted JSON credential values without hiding diagnostic context', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot, host: snapshot.host, release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.materializeSessionOnHost = (async () => {
+      throw new Error(
+        'provider request failed {"apiKey":"alpha key",' +
+        '"token":"token-value","authorization":"Basic credential",' +
+        '"passwords":"password-value","credentials":"credential-value",' +
+        '"detail":"retry disabled"} status=401',
+      )
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+      runId: 'run-quoted-json-redaction', laneId: 'primary', teamId: 'team-a',
+      selectedModel: 'openrouter/minimax-m2.5-free', members: [{ name: 'alice' }],
+    }))
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('provider request failed')
+    expect(result.error.message).toContain('"detail":"retry disabled"')
+    expect(result.error.message).toContain('status=401')
+    expect(result.error.message).toContain('"apiKey":"[redacted]"')
+    for (const secret of [
+      'alpha key', 'token-value', 'Basic credential', 'password-value', 'credential-value',
+    ]) expect(result.error.message).not.toContain(secret)
+  })
+
   test('strict launch resumes bootstrap for an exact persisted materialization', async () => {
     const writes: OpenCodeSessionRecord[] = []
     let createCalls = 0
@@ -3086,12 +3249,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   })
 
-  test('external cancellation observes late rejection and skips cleanup after the absolute deadline', async () => {
+  test('external cancellation cleans an exact late lease after deadline and contains late rejection', async () => {
     const realNow = Date.now; let now = 1_000; Date.now = () => now
     try {
       await withManualTimers(async () => {
         const acquired = createDeferred<RetainedProbe>()
-        let workCalls = 0; let unrelatedReleaseCalls = 0
+        let workCalls = 0; let lateReleaseCalls = 0
         openCodeProvisioningProbe.probeRetainingHost = (async () => acquired.promise) as
           typeof openCodeProvisioningProbe.probeRetainingHost
         const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
@@ -3113,9 +3276,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(workCalls).toBe(0)
         now = 2_001
         acquired.resolve({ snapshot, host: snapshot.host,
-          release: async () => { unrelatedReleaseCalls += 1 } })
+          release: async () => { lateReleaseCalls += 1 } })
         await Promise.resolve(); await Promise.resolve()
-        expect(unrelatedReleaseCalls).toBe(0)
+        expect(lateReleaseCalls).toBe(1)
         const rejected = createDeferred<RetainedProbe>()
         openCodeProvisioningProbe.probeRetainingHost = (async () => rejected.promise) as
           typeof openCodeProvisioningProbe.probeRetainingHost
