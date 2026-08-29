@@ -3550,8 +3550,13 @@ async function runLaunch(
       }),
     },
   }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
-  await Promise.all([...resources.values()].map(record =>
-    openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId).catch(() => false)))
+  await withTimeout(
+    Promise.all([...resources.values()].map(record =>
+      openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId)
+        .catch(() => false))),
+    Math.max(0, deadlineAt - Date.now()),
+    launchSignal,
+  ).catch(() => undefined)
   diagnostics.push(teamDiagnostic(
     `opencode_strict_launch_${result.status.replaceAll('-', '_')}`,
     result.status === 'committed'
