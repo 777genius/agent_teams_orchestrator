@@ -17,7 +17,10 @@ import {
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import {
+  assertOpenCodePreparedProfileScope,
+  openCodeProfileManager,
+} from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import {
   raceOpenCodeAbortSignal,
@@ -412,12 +415,22 @@ export function buildOpenCodeHostSpawnOptions(
 ): SpawnOptions {
   const lifetime = options.lifetime ?? 'persistent'
   return {
-    cwd: profile.projectPath,
+    cwd: profile.workingDirectoryPath ?? profile.projectPath,
     env: profile.env,
     detached: lifetime === 'persistent' || platform !== 'win32',
     stdio: 'ignore',
     windowsHide: true,
   }
+}
+
+export function buildOpenCodeHostProfileIdentity(
+  profile: OpenCodePreparedProfile,
+  binaryHostIdentity: string,
+): string {
+  const authIdentity = profile.profileScope?.selectedAuthIdentity
+    ?? profile.managedAuthFingerprint
+    ?? 'absent'
+  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
 }
 
 function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
@@ -1403,6 +1416,7 @@ export class OpenCodeHostManager {
       healthTimeoutMs?: number | null
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
+      prewarmManagedSubscriptionPlugins?: boolean
       abortSignal?: AbortSignal
     } = {},
   ): Promise<OpenCodeHostHandle> {
@@ -1416,8 +1430,9 @@ export class OpenCodeHostManager {
       }),
       params.abortSignal,
     )
+    await assertOpenCodePreparedProfileScope(profile, params.projectPath)
     const binaryPath = resolveOpenCodeBinaryPath()
-    if (binaryPath) {
+    if (binaryPath && params.prewarmManagedSubscriptionPlugins !== false) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
         profile,
@@ -1440,11 +1455,18 @@ export class OpenCodeHostManager {
             params.abortSignal,
           )
         : 'missing-binary'
-      const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${profile.managedAuthFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+      const baseHostKey = buildOpenCodeHostProfileIdentity(profile, binaryHostIdentity)
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
         : baseHostKey
     })()
+    if (
+      explicitHostKey
+      && profile.scopeToken
+      && !explicitHostKey.includes(`::scope:${profile.scopeToken}::`)
+    ) {
+      throw new Error('OpenCode host reuse rejected because the profile scope token changed')
+    }
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
     const existing = this.hosts.get(hostKey)

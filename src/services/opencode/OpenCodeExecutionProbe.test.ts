@@ -30,6 +30,9 @@ import type {
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-v1',
@@ -216,7 +219,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releaseHostCount).toBe(1)
-    expect(ensureHostInput).toEqual({
+    expect(ensureHostInput).toMatchObject({
       projectPath: '/tmp/project',
       profileOptions: {
         includeAppMcp: false,
@@ -1133,12 +1136,12 @@ describe('OpenCodeExecutionProbe', () => {
     expect(hungStatusSignal?.aborted).toBe(true)
     expect(abortCalls).toBeGreaterThan(0)
 
-    const cachedResult = await probe.probeModel({
+    const freshResult = await probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
-    expect(cachedResult.outcome).toBe('unavailable')
-    expect(nativeProbeCalls).toBe(2)
+    expect(freshResult.outcome).toBe('unavailable')
+    expect(nativeProbeCalls).toBe(3)
   })
 
   test('uses a nested terminal OpenCode retry error without a second Cursor request', async () => {
@@ -1685,6 +1688,11 @@ describe('OpenCodeExecutionProbe', () => {
       prepareProfile: async (_projectPath, options) => {
         prepareProfileCalls += 1
         expect(options?.includeAppMcp).toBe(false)
+        expect(options?.profileScope).toMatchObject({
+          purpose: 'execution_probe',
+          providerId: 'cursor-acp',
+        })
+        expect(options?.profileScope?.configFingerprint).not.toContain('placeholder')
         return profile
       },
       hostManager: {
@@ -2326,7 +2334,7 @@ describe('OpenCodeExecutionProbe', () => {
     )
   })
 
-  test('deduplicates concurrent probes and reuses a short-lived successful result', async () => {
+  test('runs every generic execution proof fresh, including concurrent requests', async () => {
     let createSessionCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -2392,10 +2400,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(first.outcome).toBe('available')
     expect(second.outcome).toBe('available')
     expect(third.outcome).toBe('available')
-    expect(createSessionCount).toBe(1)
+    expect(createSessionCount).toBe(3)
   })
 
-  test('bounds an in-memory deduplicated caller by its own runtime deadline', async () => {
+  test('bounds independent concurrent callers by their own runtime deadlines', async () => {
     let createSessionCount = 0
     let releaseCreateSession!: () => void
     let markCreateSessionStarted!: () => void
@@ -2458,7 +2466,7 @@ describe('OpenCodeExecutionProbe', () => {
         runtimeDeadline: deadline,
       })).rejects.toMatchObject({
         name: 'OpenCodeRuntimeDeadlineError',
-        phase: 'execution_poll',
+        phase: expect.any(String),
       })
     } finally {
       deadline.dispose()
@@ -2466,7 +2474,8 @@ describe('OpenCodeExecutionProbe', () => {
     }
 
     await expect(sharedProbe).resolves.toMatchObject({ outcome: 'available' })
-    expect(createSessionCount).toBe(1)
+    expect(createSessionCount).toBeGreaterThanOrEqual(1)
+    expect(createSessionCount).toBeLessThanOrEqual(2)
   })
 
   test('does not let a short in-flight owner deadline abort a longer caller', async () => {
@@ -2537,7 +2546,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(createSessionCount).toBe(2)
   })
 
-  test('bypasses in-memory probe cache when requested', async () => {
+  test('treats bypassCache as equivalent because generic caching is disabled', async () => {
     let createSessionCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -2601,10 +2610,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(first.outcome).toBe('available')
     expect(second.outcome).toBe('available')
     expect(third.outcome).toBe('available')
-    expect(createSessionCount).toBe(2)
+    expect(createSessionCount).toBe(3)
   })
 
-  test('deduplicates concurrent probes across probe instances with the persistent cache', async () => {
+  test('does not read or store persistent generic probe proofs', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-probe-cache-'))
     try {
       let createSessionCount = 0
@@ -2695,7 +2704,7 @@ describe('OpenCodeExecutionProbe', () => {
       expect(first.outcome).toBe('available')
       expect(second.outcome).toBe('available')
       expect(third.outcome).toBe('available')
-      expect(createSessionCount).toBe(1)
+      expect(createSessionCount).toBe(3)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

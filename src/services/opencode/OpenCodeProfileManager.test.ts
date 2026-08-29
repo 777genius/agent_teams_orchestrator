@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -16,6 +16,7 @@ import {
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
+  resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -99,13 +100,262 @@ async function runCommandCapture(
 
 describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
+  const isolatedEnvKeys = [
+    'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+    CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  ] as const
+  const originalEnv = Object.fromEntries(isolatedEnvKeys.map(key => [key, process.env[key]]))
 
   beforeEach(async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-profile-'))
+    process.env.HOME = path.join(tempDir, 'home')
+    process.env.USERPROFILE = process.env.HOME
+    process.env.XDG_CONFIG_HOME = path.join(tempDir, 'xdg-config')
+    process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg-data')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(tempDir, 'app-data')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(tempDir, 'app-cache')
   })
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
+    for (const key of isolatedEnvKeys) {
+      const value = originalEnv[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
+  test('isolates scoped profile roots by normalized project, purpose, provider, and config', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'project')
+    await mkdir(projectPath, { recursive: true })
+    const prepare = async (
+      purpose: 'catalog' | 'execution_probe' | 'launch_runtime',
+      providerId: string,
+      configFingerprint: string,
+    ) => {
+      const profileScope = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: `${providerId}/model`,
+        env: {
+          ...process.env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            provider: { [providerId.toLowerCase()]: { options: { route: configFingerprint } } },
+          }),
+        },
+      })
+      return manager.prepareProfile(path.join(projectPath, '.'), {
+        profileScope,
+      })
+    }
+
+    const catalog = await prepare('catalog', 'DeepInfra', 'config-a')
+    const sameCatalog = await prepare('catalog', 'deepinfra', 'config-a')
+    const probe = await prepare('execution_probe', 'deepinfra', 'config-a')
+    const provider = await prepare('catalog', 'openrouter', 'config-a')
+    const config = await prepare('catalog', 'deepinfra', 'config-b')
+    const kiroLaunch = await prepare('launch_runtime', 'kiro', 'config-a')
+    const cursorProbe = await prepare('execution_probe', 'cursor-acp', 'config-a')
+    const customCatalog = await prepare('catalog', 'custom-provider', 'config-a')
+    const legacy = await manager.prepareProfile(projectPath, {
+      includeAppMcp: false,
+      includeManagedSubscriptionPlugins: false,
+    })
+
+    expect(sameCatalog.profileRootPath).toBe(catalog.profileRootPath)
+    expect(new Set([
+      catalog.profileRootPath,
+      probe.profileRootPath,
+      provider.profileRootPath,
+      config.profileRootPath,
+      kiroLaunch.profileRootPath,
+      cursorProbe.profileRootPath,
+      customCatalog.profileRootPath,
+      legacy.profileRootPath,
+    ]).size).toBe(8)
+  })
+
+  test('fingerprints effective selected-provider endpoints without secret material', async () => {
+    const projectPath = path.join(tempDir, 'fingerprint-project')
+    await mkdir(projectPath, { recursive: true })
+    const scope = (baseURL: string, apiKey: string) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'custom/model',
+      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        provider: { custom: { options: { baseURL, apiKey } } },
+      }) },
+    })
+    const first = await scope('https://one.example/v1', 'secret-one')
+    const secretChanged = await scope('https://one.example/v1', 'secret-two')
+    const endpointChanged = await scope('https://two.example/v1', 'secret-one')
+
+    expect(secretChanged.configFingerprint).not.toBe(first.configFingerprint)
+    expect(endpointChanged.configFingerprint).not.toBe(first.configFingerprint)
+    const manager = new OpenCodeProfileManager()
+    const [firstProfile, secretProfile, endpointProfile] = await Promise.all([
+      manager.prepareProfile(projectPath, { profileScope: first }),
+      manager.prepareProfile(projectPath, { profileScope: secretChanged }),
+      manager.prepareProfile(projectPath, { profileScope: endpointChanged }),
+    ])
+    expect(secretProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
+    expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
+  })
+
+  test('fingerprints query, limit, header, and non-secret env behavior while redacting credentials', async () => {
+    const projectPath = path.join(tempDir, 'identity-project')
+    await mkdir(projectPath, { recursive: true })
+    const scope = (input: {
+      baseURL?: string
+      limit?: number
+      route?: string
+      authorization?: string
+      cookie?: string
+      apiKey?: string
+      env?: NodeJS.ProcessEnv
+    }) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'custom/model',
+      env: {
+        ...input.env,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: {
+            custom: {
+              options: {
+                baseURL: input.baseURL ?? '{env:CUSTOM_BASE_URL}',
+                headers: {
+                  'X-Route': input.route ?? 'blue',
+                  Authorization: input.authorization ?? 'Bearer one',
+                  Cookie: input.cookie ?? 'session=one',
+                },
+                apiKey: input.apiKey ?? 'key-one',
+              },
+              models: { model: { limit: { context: input.limit ?? 1000, output: 100 } } },
+            },
+          },
+        }),
+      },
+    })
+    const base = await scope({ env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one&api_key=one' } })
+    const credentialOnly = await scope({
+      authorization: 'Bearer two', cookie: 'session=two', apiKey: 'key-two',
+      env: { CUSTOM_BASE_URL: 'https://example.test/v1?api_key=two&region=one' },
+    })
+    const query = await scope({ env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=two&api_key=one' } })
+    const limit = await scope({ limit: 2000, env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
+    const header = await scope({ route: 'green', env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
+
+    expect(credentialOnly.configFingerprint).not.toBe(base.configFingerprint)
+    expect(query.configFingerprint).not.toBe(base.configFingerprint)
+    expect(limit.configFingerprint).not.toBe(base.configFingerprint)
+    expect(header.configFingerprint).not.toBe(base.configFingerprint)
+  })
+
+  test('prepares the immutable effective-config snapshot in its matching root', async () => {
+    const projectPath = path.join(tempDir, 'snapshot-project')
+    await mkdir(projectPath, { recursive: true })
+    const configPath = path.join(projectPath, 'opencode.json')
+    await writeFile(configPath, JSON.stringify({
+      provider: { custom: { options: { baseURL: 'https://one.test/v1?route=one' } } },
+    }))
+    const firstScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    await writeFile(configPath, JSON.stringify({
+      provider: { custom: { options: { baseURL: 'https://two.test/v1?route=two' } } },
+    }))
+    const manager = new OpenCodeProfileManager()
+    const firstProfile = await manager.prepareProfile(projectPath, { profileScope: firstScope })
+    expect(firstProfile.managedConfig).toMatchObject({
+      provider: { custom: { options: { baseURL: 'https://one.test/v1?route=one' } } },
+    })
+    const secondScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const secondProfile = await manager.prepareProfile(projectPath, { profileScope: secondScope })
+    expect(secondProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
+  })
+
+  test('materializes only the selected catalog credential with app-global API precedence', async () => {
+    const projectPath = path.join(tempDir, 'selected-auth-project')
+    await mkdir(projectPath, { recursive: true })
+    const manager = new OpenCodeProfileManager()
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(path.dirname(globalAuthPath), { recursive: true }),
+      mkdir(path.dirname(sourceAuthPath), { recursive: true }),
+    ])
+    await writeFile(globalAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'global-selected' },
+      unrelated: { type: 'api', key: 'global-unrelated' },
+    }))
+    await writeFile(sourceAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'local-selected' },
+      another: { type: 'oauth', access: 'local-unrelated' },
+    }))
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    await writeFile(sourceAuthPath, JSON.stringify({
+      custom: { type: 'api', key: 'changed-after-resolve' },
+    }))
+    const profile = await manager.prepareProfile(projectPath, { profileScope })
+    expect(JSON.parse(await readFile(profile.managedAuthPath, 'utf8'))).toEqual({
+      custom: { type: 'api', key: 'global-selected' },
+    })
+    expect(profile.selectedSourceAuthIdentity).toStartWith('known:')
+    expect(profile.selectedManagedAuthIdentity).toBe(profile.selectedSourceAuthIdentity)
+    expect(profile.profileRootPath).toContain(profile.profileRootKey)
+    const changedScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const changedProfile = await manager.prepareProfile(projectPath, { profileScope: changedScope })
+    expect(changedProfile.profileRootPath).toBe(profile.profileRootPath)
+    expect(JSON.parse(await readFile(changedProfile.managedAuthPath, 'utf8'))).toEqual({
+      custom: { type: 'api', key: 'global-selected' },
+    })
+  })
+
+  test('canonicalizes symlink retargets into distinct profile roots', async () => {
+    if (process.platform === 'win32') return
+    const projectA = path.join(tempDir, 'project-a')
+    const projectB = path.join(tempDir, 'project-b')
+    const projectLink = path.join(tempDir, 'project-link')
+    await Promise.all([mkdir(projectA), mkdir(projectB)])
+    await symlink(projectA, projectLink, 'dir')
+    const manager = new OpenCodeProfileManager()
+    const firstScope = await resolveOpenCodeProfileScope({
+      projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const first = await manager.prepareProfile(projectLink, { profileScope: firstScope })
+    await rm(projectLink)
+    await symlink(projectB, projectLink, 'dir')
+    await expect(manager.prepareProfile(projectLink, { profileScope: firstScope }))
+      .rejects.toThrow('canonical project path changed')
+    const secondScope = await resolveOpenCodeProfileScope({
+      projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
+    })
+    const second = await manager.prepareProfile(projectLink, { profileScope: secondScope })
+    expect(first.projectPath).toBe(projectA)
+    expect(second.projectPath).toBe(projectB)
+    expect(second.profileRootPath).not.toBe(first.profileRootPath)
+  })
+
+  test('fails closed for a scoped preparation without its resolver-issued snapshot', async () => {
+    const projectPath = path.join(tempDir, 'forged-scope-project')
+    await mkdir(projectPath)
+    await expect(new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: {
+        purpose: 'catalog',
+        providerId: 'custom',
+        configFingerprint: 'forged',
+        selectedAuthIdentity: 'absent',
+        scopeToken: 'forged',
+      },
+    })).rejects.toThrow('exact resolver-issued snapshot')
   })
 
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
@@ -1045,7 +1295,12 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const appCacheHome = path.join(tempDir, 'app-cache-config-import')
     const xdgConfigHome = path.join(tempDir, 'real-xdg-config')
     const customConfigPath = path.join(tempDir, 'custom-opencode.jsonc')
+    const projectPath = path.join(tempDir, 'project-config-import')
     await mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+    await mkdir(projectPath, { recursive: true })
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
+      plugin: ['project-user-plugin', 'opencode-kiro@0.4.0', '@rama_nigg/open-cursor@2.5.2'],
+    }))
     await writeFile(
       path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
       `{
@@ -1097,7 +1352,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
     try {
       const manager = new OpenCodeProfileManager()
-      const profile = await manager.prepareProfile(path.join(tempDir, 'project-config-import'))
+      const profile = await manager.prepareProfile(projectPath)
       const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
       const providers = managedConfig.provider as Record<string, unknown>
       const agents = managedConfig.agent as Record<string, unknown>
@@ -1118,6 +1373,35 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
       expect(managedConfig.plugin).toEqual([
         'opencode-kiro@0.4.0',
+        '@rama_nigg/open-cursor@2.5.2',
+      ])
+      const catalogScope = (providerId: string) => resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'catalog',
+        selectedModel: `${providerId}/catalog`,
+      })
+      const scopedProfile = await manager.prepareProfile(projectPath, {
+        profileScope: await catalogScope('deepinfra'),
+      })
+      expect(scopedProfile.managedConfig.plugin).toEqual([])
+      expect(scopedProfile.managedConfig.provider).toEqual({})
+      expect(scopedProfile.workingDirectoryPath).not.toBe(projectPath)
+      const kiroProfile = await manager.prepareProfile(
+        projectPath,
+        {
+          profileScope: await catalogScope('kiro'),
+        },
+      )
+      expect(kiroProfile.managedConfig.plugin).toEqual([
+        'opencode-kiro@0.4.0',
+      ])
+      const cursorProfile = await manager.prepareProfile(
+        projectPath,
+        {
+          profileScope: await catalogScope('cursor-acp'),
+        },
+      )
+      expect(cursorProfile.managedConfig.plugin).toEqual([
         '@rama_nigg/open-cursor@2.5.2',
       ])
       expect(managedConfig).not.toHaveProperty('permission')
@@ -1278,6 +1562,62 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env.XDG_DATA_HOME = previousXdgDataHome
       }
     }
+  })
+
+  test('captures the freshest competing OAuth credential with the managed-auth policy', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'oauth-catalog-project')
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      upsertOpenCodeAuthCredential({
+        authPath: globalAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'older', refresh: 'older-refresh', expires: 100 },
+      }),
+      upsertOpenCodeAuthCredential({
+        authPath: sourceAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'newer', refresh: 'newer-refresh', expires: 200 },
+      }),
+    ])
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'openai/catalog',
+    })
+    const prepared = await manager.prepareProfile(projectPath, { profileScope })
+
+    expect(await readOpenCodeAuthCredential({
+      authPath: prepared.managedAuthPath, providerId: 'openai',
+    })).toMatchObject({ access: 'newer', expires: 200 })
+  })
+
+  test('captures an app-global API credential ahead of competing user auth', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'global-api-catalog-project')
+    const globalAuthPath = manager.getGlobalAuthPath()
+    const sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      upsertOpenCodeAuthCredential({
+        authPath: globalAuthPath,
+        providerId: 'openai',
+        credential: { type: 'api', key: 'app-global-key' },
+      }),
+      upsertOpenCodeAuthCredential({
+        authPath: sourceAuthPath,
+        providerId: 'openai',
+        credential: { type: 'oauth', access: 'user-oauth', refresh: 'refresh', expires: 999 },
+      }),
+    ])
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'openai/catalog',
+    })
+    const prepared = await manager.prepareProfile(projectPath, { profileScope })
+
+    expect(await readOpenCodeAuthCredential({
+      authPath: prepared.managedAuthPath, providerId: 'openai',
+    })).toEqual({ type: 'api', key: 'app-global-key' })
   })
 
   test('keeps generated OpenCode dependency caches outside per-profile HOME', async () => {

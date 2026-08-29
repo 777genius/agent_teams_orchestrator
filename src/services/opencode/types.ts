@@ -20,12 +20,27 @@ export type OpenCodePrepareProfileOptions = {
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
+  profileScope?: OpenCodeProfileScope
+}
+
+export type OpenCodeProfilePurpose = 'catalog' | 'execution_probe' | 'launch_runtime'
+
+export type OpenCodeProfileScope = {
+  purpose: OpenCodeProfilePurpose
+  providerId: string
+  configFingerprint: string
+  selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
+  scopeToken: string
 }
 
 export type OpenCodePreparedProfile = {
   projectPath: string
+  canonicalProjectPath: string
+  workingDirectoryPath: string
+  scopeToken: string | null
   profileRootKey: string
   profileRootPath: string
+  profileScope?: OpenCodeProfileScope | null
   projectDefaultModelId?: string | null
   allProjectsDefaultModelId?: string | null
   importedConfigDefaultModelId?: string | null
@@ -45,6 +60,8 @@ export type OpenCodePreparedProfile = {
   sourceAuthPath: string | null
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
+  selectedSourceAuthIdentity?: 'absent' | 'error' | `known:${string}`
+  selectedManagedAuthIdentity?: 'absent' | 'error' | `known:${string}`
   authState: OpenCodeAuthState
   env: NodeJS.ProcessEnv
 }
@@ -613,6 +630,7 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  profileScope?: OpenCodeProfileScope | null
   toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null

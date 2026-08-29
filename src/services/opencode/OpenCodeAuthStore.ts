@@ -381,6 +381,23 @@ export async function upsertOpenCodeAuthCredential(input: {
   })
 }
 
+export async function materializeOpenCodeSelectedAuthCredential(input: {
+  authPath: string
+  providerId: string
+  credential: OpenCodeAuthCredential | null
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    await writeOpenCodeAuthStore(
+      input.authPath,
+      input.credential ? { [providerId]: { ...input.credential } } : {},
+    )
+  })
+}
+
 export async function upsertOpenCodeApiAuth(
   authPath: string,
   rawProviderId: string,

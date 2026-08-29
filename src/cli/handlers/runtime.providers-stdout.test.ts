@@ -73,6 +73,7 @@ function minimalProviderModels(): RuntimeProviderModelsView {
     models: [],
     defaultModelId: null,
     diagnostics: [],
+    catalogState: 'fresh',
   }
 }
 

@@ -1,13 +1,23 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
+import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+} from './OpenCodeManagedPaths.js'
 
 import type {
   OpenCodeHostHandle,
+  OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionRecord,
@@ -15,6 +25,9 @@ import type {
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-v1',
@@ -64,6 +77,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
     projectPath: '/tmp/project',
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
+    profileScope: profile.profileScope ?? null,
     resolvedBehaviorFingerprint: 'resolved-fingerprint',
     opencodeSessionId: 'session-1',
     lastCanonicalCursor: null,
@@ -102,8 +116,37 @@ function buildPreviewSummary(
 }
 
 describe('OpenCodeSessionBridge', () => {
-  beforeEach(() => {
+  let isolatedRoot: string
+  const originalDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+  const originalCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+  const originalHome = process.env.HOME
+  const originalXdgDataHome = process.env.XDG_DATA_HOME
+
+  beforeEach(async () => {
     resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
+    isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-bridge-'))
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(isolatedRoot, 'data')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(isolatedRoot, 'cache')
+    process.env.HOME = path.join(isolatedRoot, 'home')
+    process.env.XDG_DATA_HOME = path.join(isolatedRoot, 'xdg-data')
+    profile.profileScope = await resolveOpenCodeProfileScope({
+      projectPath: profile.projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
+    profile.scopeToken = profile.profileScope.scopeToken
+  })
+
+  afterEach(async () => {
+    await rm(isolatedRoot, { recursive: true, force: true })
+    if (originalDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = originalDataHome
+    if (originalCacheHome === undefined) delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    else process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = originalCacheHome
+    if (originalHome === undefined) delete process.env.HOME
+    else process.env.HOME = originalHome
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = originalXdgDataHome
   })
 
   test('reuses an existing clean session record', async () => {
@@ -191,7 +234,24 @@ describe('OpenCodeSessionBridge', () => {
   test('uses a caller-provided prepared profile without preparing it again', async () => {
     let prepareProfileCalls = 0
     let createSessionCalls = 0
-    const existing = buildRecord()
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: '/tmp/project',
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
+    const preparedProfile: OpenCodePreparedProfile = {
+      ...profile,
+      profileScope,
+      scopeToken: profileScope.scopeToken,
+      managedConfig: { agent: { teammate: { permission: { '*': 'ask' } } } },
+    }
+    const existing = {
+      ...buildRecord(),
+      profileScope,
+      toolApprovalMode: 'auto' as const,
+      managedConfigFingerprint: preparedProfile.managedConfigFingerprint,
+    }
+    let updated: OpenCodeSessionRecord | null = null
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => {
         prepareProfileCalls += 1
@@ -199,13 +259,16 @@ describe('OpenCodeSessionBridge', () => {
       },
       sessionStore: {
         get: async () => existing,
-        upsert: async () => 'unchanged',
+        upsert: async record => {
+          updated = record
+          return 'updated'
+        },
         markStale: async () => existing,
       },
       hostManager: {
         ensureHost: async input => {
-          expect(input?.preparedProfile).toBe(profile)
-          return host
+          expect(input?.preparedProfile).toBe(preparedProfile)
+          return { ...host, profile: preparedProfile }
         },
         releaseHost: async () => {},
         retainHostLease: async () => {},
@@ -250,12 +313,45 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
       projectPath: '/tmp/project',
-      preparedProfile: profile,
+      preparedProfile,
     })
 
-    expect(record).toEqual({ ...existing, runtimePid: 123 })
+    expect(record).toEqual({
+      ...existing,
+      toolApprovalMode: 'manual',
+      runtimePid: 123,
+      updatedAt: expect.any(String),
+    })
+    expect(updated?.toolApprovalMode).toBe('manual')
     expect(prepareProfileCalls).toBe(0)
     expect(createSessionCalls).toBe(0)
+  })
+
+  test('rejects caller-provided profiles without the exact resolver scope token', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'created',
+        markStale: async () => null,
+      },
+    })
+    await expect(bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      preparedProfile: {
+        ...profile,
+        profileScope: {
+          purpose: 'launch_runtime',
+          providerId: 'openai',
+          configFingerprint: 'forged',
+          selectedAuthIdentity: 'absent',
+          scopeToken: 'forged',
+        },
+        scopeToken: 'forged',
+      },
+    })).rejects.toThrow('scope token is invalid or expired')
   })
 
   test('persists manual tool approval mode in fresh session records', async () => {
@@ -328,8 +424,15 @@ describe('OpenCodeSessionBridge', () => {
 
   test('infers manual tool approval mode from caller-provided prepared profile', async () => {
     const upserts: OpenCodeSessionRecord[] = []
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: '/tmp/project',
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
     const manualProfile: OpenCodePreparedProfile = {
       ...profile,
+      profileScope,
+      scopeToken: profileScope.scopeToken,
       managedConfig: {
         agent: {
           teammate: {
@@ -417,6 +520,7 @@ describe('OpenCodeSessionBridge', () => {
     const upserts: OpenCodeSessionRecord[] = []
     const staleReasons: string[] = []
     const prepareProfileModes: Array<string | undefined> = []
+    const prepareProfileScopes: Array<OpenCodePrepareProfileOptions['profileScope']> = []
     const ensuredProfileFingerprints: string[] = []
     let createSessionCalls = 0
     const manualProfile: OpenCodePreparedProfile = {
@@ -440,6 +544,7 @@ describe('OpenCodeSessionBridge', () => {
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async (_projectPath, options) => {
         prepareProfileModes.push(options?.toolApprovalMode)
+        prepareProfileScopes.push(options?.profileScope)
         return options?.toolApprovalMode === 'manual' ? manualProfile : autoProfile
       },
       sessionStore: {
@@ -506,6 +611,10 @@ describe('OpenCodeSessionBridge', () => {
     })
 
     expect(prepareProfileModes).toEqual(['auto', 'manual'])
+    expect(prepareProfileScopes).toEqual([
+      expect.objectContaining({ purpose: 'launch_runtime', providerId: 'openai' }),
+      expect.objectContaining({ purpose: 'launch_runtime', providerId: 'openai' }),
+    ])
     expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
     expect(createSessionCalls).toBe(0)
     expect(staleReasons).toEqual([])
@@ -2058,6 +2167,88 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.staleReason).toBe('project_behavior_changed')
     expect(result.summary.messageCount).toBe(0)
   })
+
+  test('resolves a fresh scope after restart and safely stales the old process identity', async () => {
+    const oldScope = {
+      ...profile.profileScope!,
+      selectedAuthIdentity: 'known:old-process-auth' as const,
+      scopeToken: 'old-process-opaque-token',
+    }
+    let preparedScope: OpenCodePrepareProfileOptions['profileScope']
+    const staleMarks: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        preparedScope = options?.profileScope
+        return {
+          ...profile,
+          profileScope: options?.profileScope,
+          scopeToken: options?.profileScope?.scopeToken ?? null,
+        }
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('stale restart must not start the old host') },
+        releaseHost: async () => {},
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'unchanged',
+        markStale: async (_teamId, _laneId, _memberName, reason) => {
+          staleMarks.push(reason)
+          return buildRecord({ profileScope: oldScope, staleReason: reason })
+        },
+      },
+      clientFactory: { create: () => { throw new Error('stale restart must not create a client') } },
+    })
+
+    const result = await bridge.reconcileSession(buildRecord({ profileScope: oldScope }))
+
+    expect(preparedScope?.scopeToken).not.toBe(oldScope.scopeToken)
+    expect(result.summary.reconcileOutcome).toBe('stale')
+    expect(staleMarks).toEqual(['profile_scope_changed'])
+  })
+
+  test.each(['absent', 'error'] as const)(
+    'does not reuse a persisted host after restart when credential identity is %s',
+    async credentialIdentity => {
+      if (credentialIdentity === 'error') {
+        const authPath = path.join(process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]!, 'opencode', 'auth.json')
+        await mkdir(path.dirname(authPath), { recursive: true })
+        await writeFile(authPath, '{invalid-json')
+      }
+      const currentScope = await resolveOpenCodeProfileScope({
+        projectPath: profile.projectPath,
+        purpose: 'launch_runtime',
+        selectedModel: 'openai/gpt-5.4-mini',
+      })
+      expect(currentScope.selectedAuthIdentity).toBe(credentialIdentity)
+      const oldScope = { ...currentScope, scopeToken: `old-process-${credentialIdentity}` }
+      const staleReasons: string[] = []
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async (_projectPath, options) => ({
+          ...profile,
+          profileScope: options?.profileScope,
+          scopeToken: options?.profileScope?.scopeToken ?? null,
+        }),
+        hostManager: {
+          ensureHost: async () => { throw new Error('old persisted host must not be reused') },
+          releaseHost: async () => {},
+        },
+        sessionStore: {
+          get: async () => null,
+          upsert: async () => 'unchanged',
+          markStale: async (_teamId, _laneId, _memberName, reason) => {
+            staleReasons.push(reason)
+            return buildRecord({ profileScope: oldScope, staleReason: reason })
+          },
+        },
+      })
+
+      const result = await bridge.reconcileSession(buildRecord({ profileScope: oldScope }))
+
+      expect(result.summary.reconcileOutcome).toBe('stale')
+      expect(staleReasons).toEqual(['profile_scope_changed'])
+    },
+  )
 
   test('marks session stale when resolved runtime behavior changes unexpectedly', async () => {
     const staleMarks: Array<{ laneId: string; staleReason: string }> = []

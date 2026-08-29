@@ -1,9 +1,7 @@
-import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { withTimeout } from '../../utils/sleep.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
@@ -24,6 +22,7 @@ import {
   ensureOpenCodeNativeCliCredentialBridge,
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
+  resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import {
   type OpenCodePhaseContext,
@@ -49,10 +48,6 @@ const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
 const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 120_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
-const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 40_000
-const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
-const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
-const OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS = 300_000
 const OPEN_CODE_EXECUTION_PROMPT_START_TIMEOUT_MS = 5_000
 const OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS = 5_000
 const OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS = 150
@@ -90,17 +85,6 @@ type OpenCodeExecutionProbeDeps = {
   }) => Promise<void>
   withOAuthRefreshLock?: typeof withOpenCodeOAuthRefreshLock
   cursorNativeFailureProbe?: Pick<typeof openCodeCursorNativeFailureProbe, 'probe'>
-}
-
-type ProbeCacheFile = {
-  version: 1
-  expiresAtMs: number
-  result: OpenCodeExecutionProbeResult
-}
-
-type PersistentProbeCachePaths = {
-  cacheFilePath: string
-  lockDirPath: string
 }
 
 type ProbeModelParams = {
@@ -543,19 +527,6 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
   return null
 }
 
-function buildProbeCacheKey(params: ProbeModelParams): string {
-  return [
-    params.projectPath?.trim() || '<default-project>',
-    params.selectedModel.trim(),
-    params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT,
-    params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT,
-    String(params.contextTokens ?? ''),
-    String(params.outputTokens ?? ''),
-    params.cursorNativePreflightBeforeHost === true ? 'native-before-host' : 'host-first',
-    params.cursorNativePreflightOnly === true ? 'native-only' : 'opencode-fallback',
-  ].join('\u0000')
-}
-
 function cloneProbeResult(result: OpenCodeExecutionProbeResult): OpenCodeExecutionProbeResult {
   return {
     ...result,
@@ -563,121 +534,7 @@ function cloneProbeResult(result: OpenCodeExecutionProbeResult): OpenCodeExecuti
   }
 }
 
-function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number {
-  if (result.outcome === 'available') {
-    return OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS
-  }
-  const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
-  if (result.outcome === 'unavailable' && isUsageLimitFailureMessage(lower)) {
-    return OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS
-  }
-  return 0
-}
-
-function hashProbeCacheKey(value: string): string {
-  return createHash('sha256').update(value).digest('hex')
-}
-
-function buildPersistentProbeCacheKey(cacheKey: string, host: OpenCodeHostHandle): string {
-  // The resolved host config contains runtime-only values that can change when
-  // the app MCP attachment or a local provider proxy is refreshed. The managed
-  // config/auth fingerprints already cover durable launch inputs, so including
-  // the resolved fingerprint made a successful wizard probe invisible to the
-  // later teammate launch process.
-  return [
-    cacheKey,
-    host.profile.profileRootKey,
-    host.profile.projectBehaviorFingerprint,
-    host.profile.managedAuthFingerprint ?? 'no-auth',
-    host.profile.managedConfigFingerprint,
-    host.version ?? 'unknown-version',
-  ].join('\u0000')
-}
-
-function getPersistentProbeCachePaths(
-  params: {
-    cacheKey: string
-    host: OpenCodeHostHandle
-    rootDir?: string
-  },
-): PersistentProbeCachePaths {
-  const rootDir = params.rootDir?.trim()
-    || path.join(params.host.profile.profileRootPath, '.agent-teams-cache')
-  const cacheDir = path.join(rootDir, 'execution-probes')
-  const keyHash = hashProbeCacheKey(buildPersistentProbeCacheKey(params.cacheKey, params.host))
-  return {
-    cacheFilePath: path.join(cacheDir, `${keyHash}.json`),
-    lockDirPath: path.join(cacheDir, `${keyHash}.lock`),
-  }
-}
-
-function isProbeCacheFile(value: unknown): value is ProbeCacheFile {
-  if (!value || typeof value !== 'object') {
-    return false
-  }
-  const record = value as Record<string, unknown>
-  const result = record.result as Partial<OpenCodeExecutionProbeResult> | undefined
-  if (!result || typeof result !== 'object') {
-    return false
-  }
-  return (
-    record.version === 1
-    && typeof record.expiresAtMs === 'number'
-    && Number.isFinite(record.expiresAtMs)
-    && result.providerId === 'opencode'
-    && typeof result.modelId === 'string'
-    && (result.outcome === 'available'
-      || result.outcome === 'unavailable'
-      || result.outcome === 'not_authenticated'
-      || result.outcome === 'unknown')
-    && Array.isArray(result.diagnostics)
-  )
-}
-
-async function readPersistentProbeCache(
-  cacheFilePath: string,
-): Promise<OpenCodeExecutionProbeResult | null> {
-  try {
-    const parsed = JSON.parse(await readFile(cacheFilePath, 'utf8')) as unknown
-    if (!isProbeCacheFile(parsed)) {
-      return null
-    }
-    if (parsed.expiresAtMs <= nowMs()) {
-      await rm(cacheFilePath, { force: true }).catch(() => undefined)
-      return null
-    }
-    return cloneProbeResult(parsed.result)
-  } catch {
-    return null
-  }
-}
-
-async function writePersistentProbeCache(
-  cacheFilePath: string,
-  result: OpenCodeExecutionProbeResult,
-  ttlMs: number,
-): Promise<void> {
-  if (ttlMs <= 0) {
-    return
-  }
-  const cacheFile: ProbeCacheFile = {
-    version: 1,
-    expiresAtMs: nowMs() + ttlMs,
-    result: cloneProbeResult(result),
-  }
-  await writeFileAtomic(cacheFilePath, `${JSON.stringify(cacheFile)}\n`)
-}
-
 export class OpenCodeExecutionProbe {
-  private readonly inFlightProbes = new Map<string, {
-    promise: Promise<OpenCodeExecutionProbeResult>
-    deadlineAtMs: number | null
-  }>()
-  private readonly probeCache = new Map<
-    string,
-    { expiresAtMs: number, result: OpenCodeExecutionProbeResult }
-  >()
-
   constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
 
   private async prepareProbeProfile(
@@ -696,6 +553,11 @@ export class OpenCodeExecutionProbe {
         },
       ],
       ...(context ? { abortSignal: context.signal } : {}),
+      profileScope: await resolveOpenCodeProfileScope({
+        projectPath: params.projectPath,
+        purpose: 'execution_probe',
+        selectedModel: params.selectedModel,
+      }),
     }
     return this.deps.prepareProfile
       ? this.deps.prepareProfile(params.projectPath, options)
@@ -790,10 +652,6 @@ export class OpenCodeExecutionProbe {
 
   private get sleep() {
     return this.deps.sleep ?? sleep
-  }
-
-  private get persistentCacheEnabled() {
-    return this.deps.persistentCache ?? (this.deps.clientFactory == null)
   }
 
   private runPhase<T>(
@@ -931,75 +789,12 @@ export class OpenCodeExecutionProbe {
   }
 
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
-    const cacheKey = buildProbeCacheKey(params)
-    let shouldRegisterInFlight = !params.bypassCache
-    if (!params.bypassCache) {
-      const cached = this.probeCache.get(cacheKey)
-      if (cached && cached.expiresAtMs > nowMs()) {
-        return cloneProbeResult(cached.result)
-      }
-      if (cached) {
-        this.probeCache.delete(cacheKey)
-      }
-
-      const inFlight = this.inFlightProbes.get(cacheKey)
-      if (inFlight) {
-        const callerDeadlineAtMs = params.runtimeDeadline
-          ? performance.now() + params.runtimeDeadline.remainingMs()
-          : null
-        const ownerDeadlineCoversCaller = inFlight.deadlineAtMs === null
-          || (
-            callerDeadlineAtMs !== null
-            && inFlight.deadlineAtMs + 5 >= callerDeadlineAtMs
-          )
-        if (ownerDeadlineCoversCaller) {
-          const joined = params.runtimeDeadline
-            ? this.runPhase(params.runtimeDeadline, 'execution_poll', () => inFlight.promise)
-            : inFlight.promise
-          return cloneProbeResult(await joined)
-        }
-        // A shorter owner deadline must not abort a caller with a longer (or
-        // unbounded) budget. Run independently without replacing the owner.
-        shouldRegisterInFlight = false
-      }
-    }
-
-    const request = this.runProbeModel({ ...params, cacheKey })
-      .then(result => {
-        if (!params.bypassCache) {
-          const ttlMs = getProbeResultCacheTtlMs(result)
-          if (ttlMs > 0) {
-            this.probeCache.set(cacheKey, {
-              expiresAtMs: nowMs() + ttlMs,
-              result: cloneProbeResult(result),
-            })
-          }
-        }
-        return result
-      })
-      .finally(() => {
-        if (
-          shouldRegisterInFlight
-          && this.inFlightProbes.get(cacheKey)?.promise === request
-        ) {
-          this.inFlightProbes.delete(cacheKey)
-        }
-      })
-
-    if (shouldRegisterInFlight) {
-      this.inFlightProbes.set(cacheKey, {
-        promise: request,
-        deadlineAtMs: params.runtimeDeadline
-          ? performance.now() + params.runtimeDeadline.remainingMs()
-          : null,
-      })
-    }
-    return cloneProbeResult(await request)
+    // A generic probe key cannot prove the exact prepared host identity. Until
+    // that identity is available here, every proof is deliberately fresh.
+    return cloneProbeResult(await this.runProbeModel({ ...params, bypassCache: true }))
   }
 
-  private async runProbeModel(params: ProbeModelParams & {
-    cacheKey?: string
-  }): Promise<OpenCodeExecutionProbeResult> {
+  private async runProbeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const startedAtMs = nowMs()
     const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
     const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
@@ -1094,6 +889,11 @@ export class OpenCodeExecutionProbe {
                     resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
                 },
               ],
+              profileScope: await resolveOpenCodeProfileScope({
+                projectPath: params.projectPath,
+                purpose: 'execution_probe',
+                selectedModel: params.selectedModel,
+              }),
             },
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
             ...(context ? { abortSignal: context.signal } : {}),
@@ -1132,101 +932,6 @@ export class OpenCodeExecutionProbe {
     await this.hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
 
     try {
-      const cachePaths = this.persistentCacheEnabled && !params.bypassCache
-        ? getPersistentProbeCachePaths({
-          cacheKey: params.cacheKey ?? buildProbeCacheKey(params),
-          host,
-          rootDir: this.deps.persistentCacheRoot,
-        })
-        : null
-      if (cachePaths) {
-        params.runtimeDeadline?.throwIfExpired('execution_submit')
-        const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
-        if (cached) {
-          return cached
-        }
-
-        const lockStaleMs = Math.max(
-          probeTimeoutMs,
-          OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS,
-          params.runtimeDeadline?.commandBudgetMs ?? 0,
-        ) + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS
-        const lockWaitMs = Math.min(
-          lockStaleMs,
-          params.runtimeDeadline?.remainingMs()
-            ?? probeTimeoutMs + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS,
-        )
-        const acquiredLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
-        if (!acquiredLock) {
-          const sharedResult = await this.waitForPersistentProbeResult(
-            cachePaths,
-            lockWaitMs,
-            params.runtimeDeadline,
-          )
-          if (sharedResult) {
-            return sharedResult
-          }
-
-          const retryLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
-          if (retryLock) {
-            try {
-              return await this.runProbeModelWithHost({
-                params,
-                host,
-                startedAtMs,
-                prompt,
-                expectedOutput,
-                probeTimeoutMs,
-                pollIntervalMs,
-                diagnostics,
-                cacheFilePath: cachePaths.cacheFilePath,
-              })
-            } finally {
-              await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
-                undefined
-              )
-            }
-          }
-
-          return {
-            providerId: 'opencode',
-            modelId: params.selectedModel,
-            probePrompt: prompt,
-            expectedOutput,
-            outcome: 'unknown',
-            reason: 'OpenCode selected model verification is already in progress',
-            durationMs: buildDurationMs(startedAtMs),
-            rawStatus: null,
-            durableState: 'unknown',
-            latestAssistantText: null,
-            latestAssistantPreview: null,
-            toolCallCount: 0,
-            errorCount: 0,
-            diagnostics: [
-              'OpenCode selected model verification is already in progress; retry shortly',
-            ],
-          }
-        } else {
-          try {
-            return await this.runProbeModelWithHost({
-              params,
-              host,
-              startedAtMs,
-              prompt,
-              expectedOutput,
-              probeTimeoutMs,
-              pollIntervalMs,
-              diagnostics,
-              cacheFilePath: cachePaths.cacheFilePath,
-            })
-          } finally {
-            await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
-              undefined
-            )
-          }
-        }
-      }
-
       return await this.runProbeModelWithHost({
         params,
         host,
@@ -1236,7 +941,6 @@ export class OpenCodeExecutionProbe {
         probeTimeoutMs,
         pollIntervalMs,
         diagnostics,
-        cacheFilePath: null,
       })
     } finally {
       await this.hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
@@ -1244,64 +948,6 @@ export class OpenCodeExecutionProbe {
         await this.hostManager.releaseHost(host.hostKey)
       }
     }
-  }
-
-  private async tryAcquirePersistentProbeLock(
-    cachePaths: PersistentProbeCachePaths,
-    staleMs: number,
-  ): Promise<boolean> {
-    try {
-      await mkdir(path.dirname(cachePaths.lockDirPath), { recursive: true })
-      await mkdir(cachePaths.lockDirPath)
-      return true
-    } catch (error) {
-      const code = (error as { code?: unknown }).code
-      if (code !== 'EEXIST') {
-        return false
-      }
-    }
-
-    try {
-      const lockStat = await stat(cachePaths.lockDirPath)
-      if (nowMs() - lockStat.mtimeMs > staleMs) {
-        await rm(cachePaths.lockDirPath, { recursive: true, force: true })
-        await mkdir(cachePaths.lockDirPath)
-        return true
-      }
-    } catch {
-      return false
-    }
-
-    return false
-  }
-
-  private async waitForPersistentProbeResult(
-    cachePaths: PersistentProbeCachePaths,
-    timeoutMs: number,
-    runtimeDeadline?: OpenCodeRuntimeDeadline,
-  ): Promise<OpenCodeExecutionProbeResult | null> {
-    runtimeDeadline?.throwIfExpired('execution_submit')
-    const deadlineMs = nowMs() + Math.min(
-      timeoutMs,
-      runtimeDeadline?.remainingMs() ?? timeoutMs,
-    )
-    while (nowMs() < deadlineMs) {
-      runtimeDeadline?.throwIfExpired('execution_submit')
-      const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
-      if (cached) {
-        return cached
-      }
-      try {
-        await stat(cachePaths.lockDirPath)
-      } catch {
-        return null
-      }
-      await this.sleep(
-        Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, Math.max(0, deadlineMs - nowMs())),
-      )
-    }
-    runtimeDeadline?.throwIfExpired('execution_submit')
-    return readPersistentProbeCache(cachePaths.cacheFilePath)
   }
 
   private async runProbeModelWithHost(input: {
@@ -1313,7 +959,6 @@ export class OpenCodeExecutionProbe {
     probeTimeoutMs: number
     pollIntervalMs: number
     diagnostics: Set<string>
-    cacheFilePath: string | null
   }): Promise<OpenCodeExecutionProbeResult> {
     const providerId = parseProviderScopedModel(input.params.selectedModel).providerID
     if (providerId !== 'xai') {
@@ -1340,7 +985,6 @@ export class OpenCodeExecutionProbe {
     probeTimeoutMs: number
     pollIntervalMs: number
     diagnostics: Set<string>
-    cacheFilePath: string | null
   }): Promise<OpenCodeExecutionProbeResult> {
     const {
       params,
@@ -1351,7 +995,6 @@ export class OpenCodeExecutionProbe {
       probeTimeoutMs,
       pollIntervalMs,
       diagnostics,
-      cacheFilePath,
     } = input
     const finish = async (
       result: OpenCodeExecutionProbeResult,
@@ -1365,13 +1008,6 @@ export class OpenCodeExecutionProbe {
             `OpenCode xAI OAuth credential sync failed: ${error instanceof Error ? error.message : String(error)}`,
           )
         })
-      }
-      if (cacheFilePath) {
-        await writePersistentProbeCache(
-          cacheFilePath,
-          result,
-          getProbeResultCacheTtlMs(result),
-        ).catch(() => undefined)
       }
       return result
     }
