@@ -2715,6 +2715,84 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
+  test('bounds post-coordinator owner release by the original absolute deadline', async () => {
+    const realNow = Date.now
+    const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
+    let now = 1_000
+    Date.now = () => now
+    try {
+      await withManualTimers(async timers => {
+        const releaseStarted = createDeferred<void>()
+        let materializeCalls = 0
+        let hostReleaseCalls = 0
+        let ownerReleaseCalls = 0
+        let sessionReleaseCalls = 0
+        openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+          snapshot,
+          host: snapshot.host,
+          release: async () => { hostReleaseCalls += 1 },
+        })) as typeof openCodeProvisioningProbe.probeRetainingHost
+        openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
+        openCodeSessionBridge.materializeSessionOnHost = (async input => {
+          materializeCalls += 1
+          return {
+            created: true,
+            record: buildRecord({
+              memberName: input.memberName,
+              opencodeSessionId: 'session-owner-release',
+              expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+            }),
+          }
+        }) as typeof openCodeSessionBridge.materializeSessionOnHost
+        openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => ({
+          messageID: input.messageID,
+          runtimeSessionId: record.opencodeSessionId,
+          contextHash: input.contextHash,
+          briefingHash: input.briefingHash,
+          injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+          alreadyPresent: false,
+        })) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+        openCodeSessionBridge.releaseSession = (async () => {
+          sessionReleaseCalls += 1
+        }) as typeof openCodeSessionBridge.releaseSession
+        openCodeSessionStore.releaseMaterializationOwner = (async () => {
+          ownerReleaseCalls += 1
+          now = 1_250
+          releaseStarted.resolve()
+          return new Promise<boolean>(() => {})
+        }) as typeof openCodeSessionStore.releaseMaterializationOwner
+
+        const envelope = buildEnvelope('opencode.launchTeam', {
+          runId: 'run-owner-release-deadline', laneId: 'primary', teamId: 'team-a',
+          selectedModel: 'openrouter/minimax-m2.5-free', members: [{ name: 'alice' }],
+        })
+        envelope.timeoutMs = 1_000
+        const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
+        await releaseStarted.promise
+
+        const ownerReleaseTimer = [...timers].reverse().find(timer =>
+          !timer.cancelled && timer.timeoutMs < envelope.timeoutMs)
+        expect(ownerReleaseTimer).toBeDefined()
+        expect(ownerReleaseTimer!.timeoutMs).toBeGreaterThan(0)
+        expect(ownerReleaseTimer!.timeoutMs).toBeLessThanOrEqual(750)
+        now = 2_000
+        ownerReleaseTimer!.callback()
+        const result = await resultPromise
+
+        expect(result.ok).toBe(true)
+        if (!result.ok) return
+        expect(Object.keys(result.data.members)).toEqual(['alice'])
+        expect(materializeCalls).toBe(1)
+        expect(hostReleaseCalls).toBe(1)
+        expect(ownerReleaseCalls).toBe(1)
+        expect(sessionReleaseCalls).toBe(0)
+      })
+    } finally {
+      Date.now = realNow
+      openCodeSessionStore.releaseMaterializationOwner = originalReleaseMaterializationOwner
+    }
+  })
+
   test('refreshes authority after MCP readiness and cleans only the uncommitted attempt member', async () => {
     const events: string[] = []
     let authorityCurrent = true
