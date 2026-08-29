@@ -2008,6 +2008,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     for (const testCase of cases) {
       let probeScope: OpenCodeProfileScope | undefined
       let hostScope: OpenCodeProfileScope | undefined
+      let prewarmManagedSubscriptionPlugins: boolean | undefined
       let probePolicy: ReturnType<typeof planOpenCodeProfilePolicy> | undefined
       const adapter = new OpenCodeProviderManagementAdapter({
         inventoryService: {
@@ -2023,6 +2024,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         hostManager: {
           ensureHost: async options => {
             hostScope = options.profileOptions?.profileScope
+            prewarmManagedSubscriptionPlugins = options.prewarmManagedSubscriptionPlugins
             return host()
           },
           releaseHost: async () => {},
@@ -2056,6 +2058,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(typeof probeScope?.configFingerprint).toBe('string')
       expect(typeof probeScope?.scopeToken).toBe('string')
       expect(hostScope).toEqual(probeScope)
+      expect(prewarmManagedSubscriptionPlugins).toBe(false)
       expect(probePolicy?.reconcileAuth).toBe(false)
       expect(probePolicy?.managedSubscriptionPlugins).toEqual(testCase.managedPlugins)
     }
