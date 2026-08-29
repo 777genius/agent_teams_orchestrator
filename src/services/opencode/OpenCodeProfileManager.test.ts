@@ -14,6 +14,7 @@ import {
   ensureOpenCodeCursorPluginAuthCredential,
   ensureOpenCodeKiroPluginAuthCredential,
   ensureOpenCodeNativeCliCredentialBridge,
+  ensureOpenCodeNativePluginAuthCredentials,
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
@@ -1023,6 +1024,38 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(cursorBridgeSource).toContain('NODE_OPTIONS=--require="')
     expect(cursorBridgeSource).not.toContain('NODE_OPTIONS=--require=\\"')
     expect(cursorBridgeSource).toContain(`call "${cursorAgentExecutable}" %*`)
+  })
+
+  test('prepares only Kiro native credentials for a Kiro-scoped profile', async () => {
+    const calls: string[] = []
+    await ensureOpenCodeNativePluginAuthCredentials({
+      selectedProviderId: 'kiro',
+      prepareKiro: async () => {
+        calls.push('kiro')
+      },
+      prepareCursor: async () => {
+        calls.push('cursor-mutated')
+        throw new Error('poisoned unrelated Cursor auth path')
+      },
+    })
+
+    expect(calls).toEqual(['kiro'])
+  })
+
+  test('prepares only Cursor native credentials for a Cursor-scoped profile', async () => {
+    const calls: string[] = []
+    await ensureOpenCodeNativePluginAuthCredentials({
+      selectedProviderId: 'cursor-acp',
+      prepareCursor: async () => {
+        calls.push('cursor')
+      },
+      prepareKiro: async () => {
+        calls.push('kiro-mutated')
+        throw new Error('poisoned unrelated Kiro auth path')
+      },
+    })
+
+    expect(calls).toEqual(['cursor'])
   })
 
   test('seeds the Cursor plugin marker after the official CLI reports authenticated', async () => {

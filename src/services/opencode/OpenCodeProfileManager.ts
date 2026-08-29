@@ -1102,6 +1102,33 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   return true
 }
 
+export async function ensureOpenCodeNativePluginAuthCredentials(input: {
+  selectedProviderId?: string | null
+  prepareCursor: () => Promise<unknown>
+  prepareKiro: () => Promise<unknown>
+}): Promise<void> {
+  const selectedProviderId = input.selectedProviderId
+    ? canonicalizeOpenCodeProviderId(input.selectedProviderId)
+    : null
+
+  if (selectedProviderId === 'cursor-acp') {
+    await input.prepareCursor()
+    return
+  }
+  if (selectedProviderId === 'kiro') {
+    await input.prepareKiro()
+    return
+  }
+  if (selectedProviderId) {
+    return
+  }
+
+  await Promise.all([
+    input.prepareCursor(),
+    input.prepareKiro(),
+  ])
+}
+
 function quotePosixShellValue(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
@@ -2044,18 +2071,19 @@ export class OpenCodeProfileManager {
       })
     }
     if (nativeCliCredentialBridge) {
-      await Promise.all([
-        ensureOpenCodeCursorPluginAuthCredential({
+      await ensureOpenCodeNativePluginAuthCredentials({
+        selectedProviderId: policy?.scope.providerId,
+        prepareCursor: () => ensureOpenCodeCursorPluginAuthCredential({
           globalAuthPath,
           managedAuthPath,
           cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
         }),
-        ensureOpenCodeKiroPluginAuthCredential({
+        prepareKiro: () => ensureOpenCodeKiroPluginAuthCredential({
           globalAuthPath,
           managedAuthPath,
           kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
         }),
-      ])
+      })
     }
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
