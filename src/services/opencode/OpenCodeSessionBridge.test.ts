@@ -943,6 +943,92 @@ describe('OpenCodeSessionBridge', () => {
     expect(createCalls).toBe(1)
   })
 
+  test('allows only one concurrent create for replayed requests from the same attempt', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let releaseCreate!: () => void
+    const createGate = new Promise<void>(resolve => { releaseCreate = resolve })
+    let signalCreateStarted!: () => void
+    const createStarted = new Promise<void>(resolve => { signalCreateStarted = resolve })
+    let createCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => {
+            createCalls += 1
+            signalCreateStarted()
+            await createGate
+            return { id: 'session-winner' }
+          },
+        }) as never,
+      },
+    })
+    const controller = new AbortController()
+    const input = {
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    }
+
+    const winner = bridge.materializeSessionOnHost(input)
+    await createStarted
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow(
+      'already claimed by this launch attempt',
+    )
+    releaseCreate()
+    expect((await winner).record.opencodeSessionId).toBe('session-winner')
+    expect(createCalls).toBe(1)
+  })
+
+  test('does not create again after an unknown outcome is replayed by the same attempt', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let createCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => {
+            createCalls += 1
+            throw new Error('transport closed after request write')
+          },
+        }) as never,
+      },
+    })
+    const controller = new AbortController()
+    const input = {
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    }
+
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow(
+      'transport closed after request write',
+    )
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow(
+      'already claimed by this launch attempt',
+    )
+    expect(createCalls).toBe(1)
+    expect(await store.get('team-a', 'primary', 'alice')).toBeNull()
+  })
+
   test('durably records a known create side effect before observing cancellation', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const controller = new AbortController()

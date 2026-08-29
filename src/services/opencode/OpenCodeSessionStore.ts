@@ -18,6 +18,7 @@ type SessionStoreShape = {
 type UpsertResult = 'created' | 'updated' | 'unchanged'
 export type MaterializationClaimResult =
   | { kind: 'claimed' }
+  | { kind: 'already_owned' }
   | { kind: 'existing'; record: OpenCodeSessionRecord }
   | { kind: 'owned_by_other' }
 
@@ -139,7 +140,7 @@ export class OpenCodeSessionStore {
       store.materializationClaims ??= {}
       const owner = store.materializationClaims[key]
       if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
-      if (owner === attemptId) return { kind: 'claimed' }
+      if (owner === attemptId) return { kind: 'already_owned' }
       store.materializationClaims[key] = attemptId
       await this.writeStore(store)
       return { kind: 'claimed' }

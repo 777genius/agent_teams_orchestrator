@@ -111,6 +111,19 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.get(baseRecord.teamId, baseRecord.memberName)).toEqual(baseRecord)
   })
 
+  test('distinguishes a newly acquired claim from a replay by the same attempt', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'claimed' })
+    expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'already_owned' })
+    expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'owned_by_other' })
+  })
+
   test('conditional cleanup never mutates or deletes a replacement session', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const replacement = { ...baseRecord, opencodeSessionId: 'session-winner' }

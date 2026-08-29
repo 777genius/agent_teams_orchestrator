@@ -1012,6 +1012,9 @@ export class OpenCodeSessionBridge {
     if (claim?.kind === 'owned_by_other') {
       throw new Error('OpenCode session materialization is owned by another launch attempt')
     }
+    if (claim?.kind === 'already_owned') {
+      throw new Error('OpenCode session materialization was already claimed by this launch attempt')
+    }
     if (params.signal.aborted) {
       await this.sessionStore.releaseMaterializationClaim?.(identity, attemptId)
       throwOpenCodeAbortReason(params.signal)
