@@ -1,8 +1,20 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
-import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import {
+  buildManagedConfigFingerprint,
+  OpenCodeProfileManager,
+  resolveOpenCodeProfileScope,
+} from './OpenCodeProfileManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import {
+  removeOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
+} from './OpenCodeAuthStore.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -74,7 +86,9 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
-  for (const selectedModel of ['deepinfra/chosen', 'custom-provider/nested/model']) {
+  for (const selectedModel of [
+    'deepinfra/chosen', 'custom-provider/nested/model', 'kiro/auto', 'cursor-acp/auto',
+  ]) {
     test(`keeps strict ${selectedModel} provisioning selected-provider scoped`, async () => {
       const commandLog: string[] = []
       let inventoryInput: Record<string, unknown> | null = null
@@ -155,6 +169,87 @@ describe('OpenCodeProvisioningProbe', () => {
       expect(releasedHosts).toEqual([retainedHost!.hostKey])
     })
   }
+
+  test('refreshes selected config/project/auth/MCP authority and fails closed on each mutation', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-selected-refresh-'))
+    const keys = [
+      'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+      'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY',
+    ] as const
+    const original = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    try {
+      const projectPath = path.join(tempDir, 'project')
+      const mcpEntry = path.join(tempDir, 'fake-mcp.js')
+      await mkdir(projectPath, { recursive: true })
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
+      await writeFile(mcpEntry, 'process.stdin.resume()')
+      process.env.HOME = path.join(tempDir, 'home')
+      process.env.USERPROFILE = process.env.HOME
+      process.env.XDG_CONFIG_HOME = path.join(tempDir, 'config')
+      process.env.XDG_DATA_HOME = path.join(tempDir, 'data')
+      process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(tempDir, 'app-data')
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(tempDir, 'app-cache')
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = mcpEntry
+      const scope = await resolveOpenCodeProfileScope({
+        projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
+      })
+      const prepared = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+        profileScope: scope,
+      })
+      const retainedHost = {
+        ...host, projectPath, profileRootKey: prepared.profileRootKey, profile: prepared,
+        resolvedConfigFingerprint: prepared.managedConfigFingerprint,
+      }
+      let liveConfig = structuredClone(prepared.managedConfig)
+      let connected = true
+      const probe = new OpenCodeProvisioningProbe({
+        clientFactory: { create: () => ({ getConfig: async () => liveConfig }) as never },
+        mcpManager: { ensureAppMcp: async () => ({
+          mcp: { 'agent-teams': { connected } },
+          summary: {
+            serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
+            connected, launchSource: 'env-override', availableServerNames: ['agent-teams'],
+            diagnostics: [],
+          },
+        }) },
+      })
+      const evidence = await buildOpenCodeExpectedBehaviorEvidence({
+        profile: prepared, fullModelId: 'deepinfra/chosen',
+        effectiveConfigFingerprint: prepared.managedConfigFingerprint,
+      })
+      const refresh = () => probe.refreshSelectedProfileAuthority({
+        host: retainedHost, selectedModel: 'deepinfra/chosen',
+        expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint,
+      })
+
+      expect(await refresh()).not.toBeNull()
+      liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
+      expect(await refresh()).toBeNull()
+      liveConfig = structuredClone(prepared.managedConfig)
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
+      expect(await refresh()).toBeNull()
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
+      await upsertOpenCodeAuthCredential({
+        authPath: prepared.managedAuthPath, providerId: 'deepinfra',
+        credential: { type: 'api', key: 'mutated-secret' },
+      })
+      expect(await refresh()).toBeNull()
+      await removeOpenCodeAuthCredential({
+        authPath: prepared.managedAuthPath, providerId: 'deepinfra',
+      })
+      connected = false
+      expect(await refresh()).toBeNull()
+    } finally {
+      for (const key of keys) {
+        if (original[key] === undefined) delete process.env[key]
+        else process.env[key] = original[key]
+      }
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
 
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({

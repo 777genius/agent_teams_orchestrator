@@ -8,10 +8,10 @@ import type {
   OpenCodePreparedProfile,
 } from './types.js'
 
-export const OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION = 1
+export const OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION = 2
 export const OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_RE = /^[a-f0-9]{64}$/
-const EXPECTED_BEHAVIOR_DOMAIN = 'agent-teams.opencode.expected-behavior/v1'
-const SELECTED_AUTH_DOMAIN = 'agent-teams.opencode.effective-selected-auth/v1'
+const EXPECTED_BEHAVIOR_DOMAIN = 'agent-teams.opencode.expected-behavior/v2'
+const SELECTED_AUTH_DOMAIN = 'agent-teams.opencode.effective-selected-auth/v2'
 const EXPECTED_BEHAVIOR_EVIDENCE_KEYS = [
   'canonicalProjectPathFingerprint',
   'modelProviderId',

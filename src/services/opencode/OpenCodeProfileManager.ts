@@ -1361,6 +1361,8 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
 
 const openCodeProfileScopeKey = randomBytes(32)
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
+const OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN =
+  'agent-teams.opencode.semantic-secret-identity/v2'
 
 function freezeConfigSnapshot<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -1370,9 +1372,19 @@ function freezeConfigSnapshot<T>(value: T): T {
   return value
 }
 
-function keyedIdentity(value: unknown): string {
+function localScopeIdentity(value: unknown): string {
   return createHmac('sha256', openCodeProfileScopeKey)
     .update(JSON.stringify(value) ?? '')
+    .digest('hex')
+}
+
+// Cross-process equality needs no stored key: the identity is a versioned,
+// domain-separated digest of canonical typed JSON. It is secret-safe for the
+// high-entropy credentials/config secrets supported here, but is deliberately
+// not a password KDF and must never be used to conceal low-entropy user input.
+function semanticSecretIdentity(domain: string, value: unknown): string {
+  return createHash('sha256')
+    .update(JSON.stringify([OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN, domain, value]) ?? '')
     .digest('hex')
 }
 
@@ -1447,7 +1459,7 @@ function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
       {},
     )
   }
-  return `[secret:${keyedIdentity(resolve(value))}]`
+  return `[secret:${semanticSecretIdentity('config-secret', resolve(value))}]`
 }
 
 export async function resolveOpenCodeProfileScope(input: {
@@ -1473,6 +1485,7 @@ export async function resolveOpenCodeProfileScope(input: {
     buildManagedConfig(null, { managedProviderId: providerId }),
   )
   const identity = redactConfigIdentity({
+    providerId,
     provider: asRecord(effective.provider)[providerId] ?? null,
     model: effective.model ?? null,
     small_model: effective.small_model ?? null,
@@ -1490,7 +1503,7 @@ export async function resolveOpenCodeProfileScope(input: {
       path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
     ])),
   })
-  const scopeToken = keyedIdentity({
+  const scopeToken = localScopeIdentity({
     projectPath,
     purpose: input.purpose,
     providerId,
@@ -1623,10 +1636,16 @@ export function orderOpenCodeAuthSyncSources(input: {
 
 type OpenCodeIdentityComponent = 'absent' | 'error' | `known:${string}`
 
-function authCredentialIdentity(credential: unknown): OpenCodeIdentityComponent {
+function authCredentialIdentity(
+  providerId: string,
+  credential: unknown,
+): OpenCodeIdentityComponent {
   return credential === null
     ? 'absent'
-    : `known:${keyedIdentity(credential)}`
+    : `known:${semanticSecretIdentity('selected-auth', {
+        providerId: canonicalizeOpenCodeProviderId(providerId),
+        credential: redactConfigIdentity(credential, {}),
+      })}`
 }
 
 async function readSelectedAuthFromSources(input: {
@@ -1646,7 +1665,7 @@ async function readSelectedAuthFromSources(input: {
       globalAuthPath: input.globalAuthPath,
     })
     selected = merged[input.providerId] ?? null
-    return { credential: selected, identity: authCredentialIdentity(selected) }
+    return { credential: selected, identity: authCredentialIdentity(input.providerId, selected) }
   } catch {
     return { credential: null, identity: 'error' }
   }
@@ -1657,7 +1676,7 @@ async function readSelectedManagedAuthIdentity(
   providerId: string,
 ): Promise<OpenCodeIdentityComponent> {
   try {
-    return authCredentialIdentity(await readOpenCodeAuthCredential({
+    return authCredentialIdentity(providerId, await readOpenCodeAuthCredential({
       authPath: managedAuthPath,
       providerId,
     }))

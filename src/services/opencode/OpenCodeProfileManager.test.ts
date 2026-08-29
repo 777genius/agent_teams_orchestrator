@@ -203,6 +203,50 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
+  test('keeps semantic config/auth identities stable across CLI processes and secret-safe', async () => {
+    const projectPath = path.join(tempDir, 'cross-process-project')
+    await mkdir(projectPath, { recursive: true })
+    const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await mkdir(path.dirname(authPath), { recursive: true })
+    const moduleUrl = pathToFileURL(path.join(
+      process.cwd(), 'src/services/opencode/OpenCodeProfileManager.ts',
+    )).href
+    const script = [
+      `const {resolveOpenCodeProfileScope:r}=await import(${JSON.stringify(moduleUrl)});`,
+      'const s=await r({projectPath:process.argv[1],purpose:"launch_runtime",',
+      'selectedModel:process.argv[2],env:{...process.env,OPENCODE_CONFIG_CONTENT:process.argv[3]}});',
+      'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity}))',
+    ].join('')
+    const run = async (provider: string, secret: unknown) => JSON.parse(
+      await runCommandCapture(process.execPath, [
+        '-e', script, projectPath, `${provider}/model`, JSON.stringify({
+          provider: { [provider]: { options: { apiKey: secret } } },
+        }),
+      ], process.env),
+    ) as { config: string; auth: string }
+    await writeFile(authPath, JSON.stringify({
+      deepinfra: { type: 'api', key: 'selected-auth-secret' },
+    }))
+    const first = await run('deepinfra', 'config-secret')
+    const second = await run('deepinfra', 'config-secret')
+    const valueChanged = await run('deepinfra', 'other-config-secret')
+    const typeChanged = await run('deepinfra', 7)
+    const providerChanged = await run('custom', 'config-secret')
+    await writeFile(authPath, JSON.stringify({
+      deepinfra: { type: 'api', key: 'changed-auth-secret' },
+    }))
+    const authChanged = await run('deepinfra', 'config-secret')
+
+    expect(second).toEqual(first)
+    expect(valueChanged.config).not.toBe(first.config)
+    expect(typeChanged.config).not.toBe(first.config)
+    expect(providerChanged.config).not.toBe(first.config)
+    expect(providerChanged.auth).not.toBe(first.auth)
+    expect(authChanged.auth).not.toBe(first.auth)
+    expect(JSON.stringify([first, second, valueChanged, typeChanged, providerChanged, authChanged]))
+      .not.toContain('secret')
+  })
+
   test('fingerprints query, limit, header, and non-secret env behavior while redacting credentials', async () => {
     const projectPath = path.join(tempDir, 'identity-project')
     await mkdir(projectPath, { recursive: true })

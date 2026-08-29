@@ -96,6 +96,7 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodeMessage,
+  OpenCodeMcpServerConfig,
   OpenCodeExecutionProof,
   OpenCodeHostHandle,
   OpenCodePendingPermission,
@@ -1254,6 +1255,7 @@ type AppMcpToolProof = {
   missingTools: string[]
   diagnostics: string[]
   route: string | null
+  contractConfigIdentity: string | null
 }
 
 // Cold workspace/source MCP startup can take longer than a model turn on dev
@@ -1264,7 +1266,7 @@ const SOURCE_APP_MCP_PREFLIGHT_TIMEOUT_MS = 90_000
 const APP_MCP_PREFLIGHT_TIMEOUT_ENV = 'AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS'
 const APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS = 2_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
-const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 1
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 2
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_TTL_MS = 10 * 60_000
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_PATH_ENV =
   'AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH'
@@ -1434,6 +1436,7 @@ function normalizeAppMcpToolProof(value: Record<string, unknown>): AppMcpToolPro
   const missingTools = asStringArray(value.missingTools).sort()
   const diagnostics = asStringArray(value.diagnostics)
   const route = asString(value.route)
+  const contractConfigIdentity = asString(value.contractConfigIdentity)
   if (!ok) {
     return null
   }
@@ -1443,6 +1446,7 @@ function normalizeAppMcpToolProof(value: Record<string, unknown>): AppMcpToolPro
     missingTools,
     diagnostics,
     route,
+    contractConfigIdentity,
   }
 }
 
@@ -1492,6 +1496,7 @@ async function proveAppMcpTools(
       missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
       diagnostics: ['OpenCode host is unavailable; app MCP tools cannot be proven'],
       route: null,
+      contractConfigIdentity: null,
     }
   }
 
@@ -1500,8 +1505,15 @@ async function proveAppMcpTools(
 
 async function proveAppMcpToolsFromLaunchConfig(
   phaseContext?: OpenCodePhaseContext,
+  preparedHost?: OpenCodeHostHandle,
 ): Promise<AppMcpToolProof> {
-  const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+  const resolved = await resolveOpenCodeAppMcpLaunchConfig()
+  const preparedConfig = preparedHost
+    ? asRecord(preparedHost.profile.managedConfig.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
+    : null
+  const launchConfig: ResolvedAppMcpLaunchConfig = preparedConfig
+    ? { ...resolved, config: preparedConfig as OpenCodeMcpServerConfig }
+    : resolved
   const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) {
@@ -1529,7 +1541,8 @@ async function proveAppMcpToolsFromLaunchConfig(
         launchConfig,
         phaseContext,
       )
-      const proof = matchAppMcpTools(observedTools, 'mcp:tools/list')
+      const proof = matchAppMcpTools(observedTools, 'direct-contract:mcp/tools/list')
+      proof.contractConfigIdentity = hashStable(launchConfig.config)
       if (proof.ok) {
         appMcpToolProofCache.set(cacheKey, {
           expiresAt: Date.now() + APP_MCP_TOOL_PROOF_CACHE_TTL_MS,
@@ -1547,10 +1560,11 @@ async function proveAppMcpToolsFromLaunchConfig(
         observedTools: [],
         missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
         diagnostics: [
-          `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Agent Teams MCP direct contract tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
           'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
         ],
-        route: 'mcp:tools/list',
+        route: 'direct-contract:mcp/tools/list',
+        contractConfigIdentity: hashStable(launchConfig.config),
       }
     } finally {
       if (appMcpToolProofInFlight.get(cacheKey) === proofPromise) {
@@ -1728,8 +1742,9 @@ function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolPro
     missingTools,
     diagnostics: missingTools.length === 0
       ? []
-      : [`OpenCode app MCP tools missing from ${route}: ${missingTools.join(', ')}`],
+      : [`Agent Teams MCP direct contract tools missing from ${route}: ${missingTools.join(', ')}`],
     route,
+    contractConfigIdentity: null,
   }
 }
 
@@ -1740,6 +1755,7 @@ function readinessData(
   toolProof: AppMcpToolProof,
   requireSelectedModel: boolean,
   executionProof?: OpenCodeExecutionProof,
+  expectedBehaviorEvidence = executionProof?.expectedBehaviorEvidence,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
   const models = getOpenCodeAccessPolicyModels(snapshot)
@@ -1788,8 +1804,8 @@ function readinessData(
     launchAllowed = false
     missing.push(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   } else if (executionOutcome && executionOutcome.outcome !== 'available') {
     state = 'model_unavailable'
@@ -1808,8 +1824,8 @@ function readinessData(
     launchAllowed = false
     missing.push(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   } else if (
     selectedModelAccess.kind === 'configured_authless'
@@ -1850,8 +1866,8 @@ function readinessData(
       observedMcpTools: toolProof.observedTools,
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
-    ...(executionProof
-      ? { expectedBehaviorEvidence: executionProof.expectedBehaviorEvidence }
+    ...(expectedBehaviorEvidence
+      ? { expectedBehaviorEvidence }
       : {}),
     ...(executionProof ? { executionProof } : {}),
   }
@@ -2255,6 +2271,7 @@ function skippedAppMcpToolProof(): AppMcpToolProof {
     missingTools: [],
     diagnostics: [],
     route: null,
+    contractConfigIdentity: null,
   }
 }
 
@@ -2269,8 +2286,8 @@ function mcpUnavailableReadinessData(input: {
   diagnostics?: string[]
 }) {
   const missingMessage = input.toolProof.missingTools.length > 0
-    ? `Agent Teams MCP tools are not visible in OpenCode: ${input.toolProof.missingTools.join(', ')}`
-    : 'Agent Teams MCP tools are not visible in OpenCode'
+    ? `Agent Teams MCP direct server contract is missing required tools: ${input.toolProof.missingTools.join(', ')}`
+    : 'Agent Teams MCP direct server contract is unavailable'
   const diagnostics = uniqueSortedStrings([
     ...(input.diagnostics ?? []),
     ...input.toolProof.diagnostics,
@@ -2351,6 +2368,10 @@ async function runReadiness(
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
+  const qualifiedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (shouldProbeSelectedModel && !qualifiedSelectedModel) {
+    throw new Error('OpenCode readiness requires a provider-qualified selectedModel')
+  }
   const runProvisioningPhase = async (
     phase: 'host_start' | 'post_probe_refresh',
     options: Parameters<typeof openCodeProvisioningProbe.probe>[1],
@@ -2371,12 +2392,12 @@ async function runReadiness(
       throw error
     }
   }
-  const runDirectToolProof = async (): Promise<AppMcpToolProof> => {
+  const runDirectToolProof = async (preparedHost?: OpenCodeHostHandle): Promise<AppMcpToolProof> => {
     let pending: Promise<AppMcpToolProof> | null = null
     try {
       return await runtimeDeadline.runPhase('mcp_preflight', context => {
         context.throwIfExpired()
-        pending = proveAppMcpToolsFromLaunchConfig(context)
+        pending = proveAppMcpToolsFromLaunchConfig(context, preparedHost)
         return pending.then(proof => {
           context.throwIfExpired()
           return proof
@@ -2389,10 +2410,102 @@ async function runReadiness(
       throw error
     }
   }
+  if (shouldProbeSelectedModel && qualifiedSelectedModel) {
+    let retained: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>> | null = null
+    try {
+      retained = await runtimeDeadline.runPhase('host_start', context =>
+        openCodeProvisioningProbe.probeRetainingHost(projectPath, {
+          selectedModel: qualifiedSelectedModel.raw,
+          toolApprovalMode: resolveLaunchToolApprovalMode(envelope.body),
+          phaseContext: context,
+        }))
+      if (!retained.snapshot.detected || !retained.snapshot.hostHealthy) {
+        return {
+          snapshot: retained.snapshot,
+          data: readinessData(
+            retained.snapshot, qualifiedSelectedModel.raw, undefined,
+            skippedAppMcpToolProof(), true,
+          ),
+        }
+      }
+      assertOpenCodeLaunchRuntimeAvailable(retained.snapshot)
+      if (!retained.host) throw new Error('OpenCode readiness retained host is unavailable')
+      const initialEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+        profile: retained.host.profile,
+        fullModelId: qualifiedSelectedModel.raw,
+        effectiveConfigFingerprint: retained.host.profile.managedConfigFingerprint,
+      })
+      const toolProof = await runDirectToolProof(retained.host)
+      if (!toolProof.ok) {
+        return {
+          snapshot: retained.snapshot,
+          data: readinessData(
+            retained.snapshot, qualifiedSelectedModel.raw, undefined, toolProof, true,
+          ),
+        }
+      }
+      const refreshedBefore = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        contractConfigIdentity: toolProof.contractConfigIdentity,
+      })
+      if (!refreshedBefore) {
+        throw new Error('OpenCode selected readiness host/config/auth/project/MCP authority is unavailable')
+      }
+      const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        runtimeDeadline,
+        cleanupSuccessfulSession: true,
+      })
+      const refreshedAfter = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        contractConfigIdentity: toolProof.contractConfigIdentity,
+      })
+      if (!refreshedAfter) {
+        throw new Error('OpenCode selected readiness authority changed during execution proof')
+      }
+      const snapshot = {
+        ...retained.snapshot,
+        profile: refreshedAfter,
+        host: retained.snapshot.host ? { ...retained.snapshot.host, profile: refreshedAfter } : null,
+      }
+      const executionProof = executionOutcome.outcome === 'available' && executionOutcome.verifiedAt
+        ? await buildOpenCodeExecutionProof({
+            selectedModel: qualifiedSelectedModel.raw,
+            snapshot,
+            capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId,
+            verifiedAt: executionOutcome.verifiedAt,
+          }).catch(error => {
+            executionOutcome.diagnostics.push(
+              `OpenCode execution proof could not be created: ${strictPublicError(error)}`,
+            )
+            return undefined
+          })
+        : undefined
+      return {
+        snapshot,
+        data: readinessData(
+          snapshot,
+          qualifiedSelectedModel.raw,
+          executionOutcome,
+          toolProof,
+          true,
+          executionProof,
+          initialEvidence,
+        ),
+      }
+    } finally {
+      await retained?.release().catch(() => undefined)
+    }
+  }
   let earlyCursorExecutionOutcome: Awaited<ReturnType<
     typeof openCodeExecutionProbe.probeModel
   >> | undefined
-  const parsedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
+  const parsedSelectedModel = qualifiedSelectedModel
   const openCodeBinaryPath = shouldProbeSelectedModel
     && parsedSelectedModel?.providerId === 'cursor-acp'
     ? resolveOpenCodeBinaryPath()
@@ -2703,8 +2816,8 @@ async function assertOpenCodeLaunchMcpReady(
   if (!isAppMcpConnected(snapshot) || !toolProof.ok) {
     throw new Error(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   }
 }
@@ -2954,6 +3067,14 @@ async function runLaunch(
     await retainedProbe.release().catch(() => undefined)
     throw new Error('OpenCode strict launch behavior precondition mismatch')
   }
+  if (!await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+    host,
+    selectedModel: apiSelectedModel,
+    expectedBehaviorFingerprint,
+  })) {
+    await retainedProbe.release().catch(() => undefined)
+    throw new Error('OpenCode strict launch live authority is unavailable')
+  }
 
   const memberInputs = new Map<string, {
     name: string
@@ -2982,21 +3103,14 @@ async function runLaunch(
 
   const resources = new Map<string, OpenCodeSessionRecord>()
   const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  let requiredMcpContractConfigIdentity: string | null = null
   const matchesCurrentExpectedBehavior = async (): Promise<boolean> => {
-    const currentConfigFingerprint = buildManagedConfigFingerprint(
-      host.profile.managedConfig,
-      host.profile.env,
-    )
-    if (
-      currentConfigFingerprint !== host.profile.managedConfigFingerprint
-      || currentConfigFingerprint !== host.resolvedConfigFingerprint
-    ) return false
-    const currentEvidence = await buildOpenCodeExpectedBehaviorEvidence({
-      profile: host.profile,
-      fullModelId: apiSelectedModel,
-      effectiveConfigFingerprint: currentConfigFingerprint,
-    }).catch(() => null)
-    return currentEvidence?.expectedBehaviorFingerprint === expectedBehaviorFingerprint
+    return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+      host,
+      selectedModel: apiSelectedModel,
+      expectedBehaviorFingerprint,
+      contractConfigIdentity: requiredMcpContractConfigIdentity,
+    })) !== null
   }
   const ports: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft> = {
     snapshotProjection: projection => structuredClone(projection),
@@ -3025,13 +3139,22 @@ async function runLaunch(
           if (remainingMs() <= 0) throw new Error('OpenCode strict launch proof deadline expired')
         },
       })
-      const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+      const resolvedLaunchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+      const launchConfig = {
+        ...resolvedLaunchConfig,
+        config: (asRecord(host.profile.managedConfig.mcp)
+          ?.[OPEN_CODE_APP_MCP_SERVER_NAME] as OpenCodeMcpServerConfig | undefined)
+          ?? resolvedLaunchConfig.config,
+      }
       const appMcpProof = await listAppMcpToolsFromResolvedLaunchConfig(
         launchConfig,
         phaseContext('mcp_preflight'),
-      ).then(tools => matchAppMcpTools(tools, 'mcp:tools/list'))
-      if (!isAppMcpConnected(snapshot) || !appMcpProof.ok) {
-        return { kind: 'failure', error: 'Agent Teams MCP tools are not visible in OpenCode' }
+      ).then(tools => matchAppMcpTools(tools, 'direct-contract:mcp/tools/list'))
+      appMcpProof.contractConfigIdentity = hashStable(launchConfig.config)
+      requiredMcpContractConfigIdentity = appMcpProof.contractConfigIdentity
+      if (!isAppMcpConnected(snapshot)
+        || !appMcpProof.ok || !await matchesCurrentExpectedBehavior()) {
+        return { kind: 'failure', error: 'Agent Teams MCP retained connection/contract proof is unavailable' }
       }
       const expectedOutput = `STRICT_LAUNCH_${request.nonce}`
       const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({

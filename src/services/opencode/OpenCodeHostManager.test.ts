@@ -127,7 +127,7 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
-  test('isolates scoped hosts by process-keyed selected auth identity', () => {
+  test('isolates scoped hosts by process-local resolver scope token', () => {
     const scoped = {
       ...baseProfile,
       scopeToken: 'current-token',

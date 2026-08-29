@@ -14,7 +14,7 @@ type Fixture = {
 }
 
 const fixture = JSON.parse(await readFile(
-  new URL('./fixtures/expected-behavior-fingerprint-v1.json', import.meta.url),
+  new URL('./fixtures/expected-behavior-fingerprint-v2.json', import.meta.url),
   'utf8',
 )) as Fixture
 
@@ -44,7 +44,7 @@ function profile(): OpenCodePreparedProfile {
   }
 }
 
-describe('OpenCode expected behavior fingerprint v1', () => {
+describe('OpenCode expected behavior fingerprint v2', () => {
   test('matches every committed literal golden vector', () => {
     for (const vector of fixture.cases) {
       const { name: _name, ...evidence } = vector
@@ -66,7 +66,7 @@ describe('OpenCode expected behavior fingerprint v1', () => {
     }
   })
 
-  test('rejects evidence with fields outside the exact v1 schema', () => {
+  test('rejects evidence with fields outside the exact v2 schema', () => {
     const { name: _name, ...baseline } = fixture.cases[0]!
     expect(validateOpenCodeExpectedBehaviorEvidence({
       ...baseline,

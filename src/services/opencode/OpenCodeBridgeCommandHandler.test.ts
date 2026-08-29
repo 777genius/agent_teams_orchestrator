@@ -20,6 +20,7 @@ import {
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -427,6 +428,8 @@ function mockUnavailableExactProof(reason = 'selected execution unavailable'): v
 
 const originalProbe = openCodeProvisioningProbe.probe
 const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
+const originalRefreshSelectedProfileAuthority =
+  openCodeProvisioningProbe.refreshSelectedProfileAuthority
 const originalInventoryProbe = openCodeInventoryService.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalProbeModelOnHost = openCodeExecutionProbe.probeModelOnHost
@@ -549,7 +552,13 @@ beforeEach(async () => {
       release: async () => {},
     }
   }) as typeof openCodeProvisioningProbe.probeRetainingHost
-  openCodeExecutionProbe.probeModelOnHost = (async input => ({
+  openCodeExecutionProbe.probeModelOnHost = (async input => {
+    if (openCodeExecutionProbe.probeModel !== originalProbeModel) {
+      return openCodeExecutionProbe.probeModel({
+        ...input, disposeHostOnRelease: false, bypassCache: true,
+      })
+    }
+    return {
     providerId: 'opencode',
     modelId: input.selectedModel,
     probePrompt: input.prompt ?? '',
@@ -565,7 +574,12 @@ beforeEach(async () => {
     errorCount: 0,
     diagnostics: [],
     verifiedAt: '2026-04-21T12:00:00.000Z',
-  })) as typeof openCodeExecutionProbe.probeModelOnHost
+    }
+  }) as typeof openCodeExecutionProbe.probeModelOnHost
+  openCodeProvisioningProbe.refreshSelectedProfileAuthority = (async input =>
+    buildManagedConfigFingerprint(input.host.profile.managedConfig, input.host.profile.env)
+      === input.host.profile.managedConfigFingerprint ? input.host.profile : null
+  ) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
   openCodeSessionBridge.materializeSessionOnHost = (async input => ({
     record: {
       ...await openCodeSessionBridge.ensureSession({
@@ -729,6 +743,8 @@ afterEach(async () => {
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
   openCodeProvisioningProbe.probeRetainingHost = originalProbeRetainingHost
+  openCodeProvisioningProbe.refreshSelectedProfileAuthority =
+    originalRefreshSelectedProfileAuthority
   openCodeInventoryService.probe = originalInventoryProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
   openCodeExecutionProbe.probeModelOnHost = originalProbeModelOnHost
@@ -834,7 +850,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)
-    expect(result.data.server.bridgeProtocol.expectedBehaviorFingerprintSchemaVersion).toBe(1)
+    expect(result.data.server.bridgeProtocol.expectedBehaviorFingerprintSchemaVersion).toBe(2)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
@@ -1074,6 +1090,74 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
+  test('selected readiness uses one retained launch host and releases it without broad fallback', async () => {
+    let released = 0
+    let provenHost: string | null = null
+    const selected = parseOpenCodeProviderScopedModelRef('deepinfra/chosen')!
+    const retainedHost = {
+      ...snapshot.host!,
+      profile: {
+        ...snapshot.host!.profile,
+        scopeToken: 'selected-readiness',
+        profileScope: {
+          purpose: 'launch_runtime' as const,
+          providerId: selected.providerId,
+          configFingerprint: 'selected-config',
+          selectedAuthIdentity: 'absent' as const,
+          scopeToken: 'selected-readiness',
+        },
+      },
+    }
+    openCodeProvisioningProbe.probe = async () => {
+      throw new Error('broad readiness poison path must not run')
+    }
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot: { ...snapshot, models: [selected.raw], host: retainedHost,
+        profile: retainedHost.profile },
+      host: retainedHost,
+      release: async () => { released += 1 },
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeExecutionProbe.probeModel = (async () => {
+      throw new Error('separate execution host poison path must not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
+      provenHost = input.host.hostKey
+      return {
+        providerId: 'opencode', modelId: input.selectedModel,
+        probePrompt: 'PONG', expectedOutput: 'PONG', outcome: 'available', reason: null,
+        durationMs: 1, rawStatus: 'idle', durableState: 'idle', latestAssistantText: 'PONG',
+        latestAssistantPreview: 'PONG', toolCallCount: 0, errorCount: 0, diagnostics: [],
+        verifiedAt: '2026-04-21T12:00:00.000Z',
+      }
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw, requireExecutionProbe: true,
+    }))
+
+    expect(result.ok).toBe(true)
+    expect(provenHost).toBe('host-key')
+    expect(released).toBe(1)
+    if (result.ok) expect(result.data.expectedBehaviorEvidence.fullModelId).toBe(selected.raw)
+  })
+
+  test('selected execution readiness rejects raw models before host or MCP effects', async () => {
+    let effects = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => {
+      effects += 1
+      throw new Error('host effect')
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    Client.prototype.connect = (async () => { effects += 1 }) as typeof Client.prototype.connect
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: 'raw-model', requireExecutionProbe: true,
+    }))
+
+    expect(result.ok).toBe(false)
+    expect(effects).toBe(0)
+    if (!result.ok) expect(result.error.message).toContain('provider-qualified')
+  })
+
   test('compatibility mode without execution probe still rejects unknown provider-scoped model ids', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
@@ -1286,24 +1370,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
-    expect(probedBypassCache).toBe(false)
-    expect(provisioningOptions.map(({ phaseContext: _phaseContext, ...options }) => options)).toEqual([
-      {
-        disposeHostOnRelease: process.platform !== 'win32',
-        ensureAppMcp: false,
-        bypassCache: true,
-      },
-      {
-        disposeHostOnRelease: process.platform !== 'win32',
-        ensureAppMcp: true,
-        bypassCache: true,
-      },
-    ])
-    expect(provisioningOptions.map(options => options.phaseContext?.phase)).toEqual([
-      'host_start',
-      'post_probe_refresh',
-    ])
+    expect(probedDisposeHostOnRelease).toBe(false)
+    expect(probedBypassCache).toBe(true)
+    expect(provisioningOptions).toEqual([{}])
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
   })
@@ -1421,11 +1490,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.state).toBe('model_unavailable')
       expect(result.data.launchAllowed).toBe(false)
       expect(result.data.missing[0]).toBe(`Local model probe ended as ${outcome}`)
-      expect(provisioningProbeCalls).toBe(outcome === 'unavailable' ? 1 : 2)
+      expect(provisioningProbeCalls).toBe(1)
     })
   }
 
-  test('deep readiness returns MCP unavailable before probing a configured authless local model when MCP proof fails', async () => {
+  test('deep readiness starts the retained host but skips its model when MCP contract proof fails', async () => {
     ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
       throw new Error('Connection closed')
     }
@@ -1437,7 +1506,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     let provisioningProbeCalled = false
     openCodeProvisioningProbe.probe = (async () => {
       provisioningProbeCalled = true
-      throw new Error('OpenCode host startup should not run when MCP proof already failed')
+      return buildReadinessSnapshot()
     }) as typeof openCodeProvisioningProbe.probe
     let executionProbeCalled = false
     openCodeExecutionProbe.probeModel = (async () => {
@@ -1459,14 +1528,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(result.data.state).toBe('mcp_unavailable')
     expect(result.data.launchAllowed).toBe(false)
-    expect(result.data.hostHealthy).toBe(false)
+    expect(result.data.hostHealthy).toBe(true)
     expect(result.data.requiredToolsPresent).toBe(false)
-    expect(result.data.missing.join('\n')).toContain('Agent Teams MCP tools are not visible')
+    expect(result.data.missing.join('\n')).toContain('direct server contract')
     expect(result.data.diagnostics.join('\n')).toContain('Connection closed')
     expect(result.data.diagnostics.join('\n')).toContain(
-      'Skipped OpenCode host startup and model verification because Agent Teams MCP direct preflight failed',
+      'Agent Teams MCP direct contract tools/list preflight failed',
     )
-    expect(provisioningProbeCalled).toBe(false)
+    expect(provisioningProbeCalled).toBe(true)
     expect(executionProbeCalled).toBe(false)
   })
 
@@ -1484,6 +1553,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         tools: [],
       })
     ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
@@ -1820,34 +1890,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
-  test('deep readiness still resolves the raw model id and uses the execution probe', async () => {
-    mockRequiredMcpTools()
-    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
-    let probedModelId: string | null = null
-    let probedDisposeHostOnRelease: boolean | undefined
-    let probedBypassCache: boolean | undefined
-    openCodeExecutionProbe.probeModel = (async input => {
-      probedModelId = input.selectedModel
-      probedDisposeHostOnRelease = input.disposeHostOnRelease
-      probedBypassCache = input.bypassCache
-      return {
-        providerId: 'opencode' as const,
-        modelId: input.selectedModel,
-        probePrompt: 'Output only the single word PONG.',
-        expectedOutput: 'PONG',
-        outcome: 'available' as const,
-        reason: null,
-        durationMs: 1,
-        rawStatus: 'idle',
-        durableState: 'idle',
-        latestAssistantText: 'PONG',
-        latestAssistantPreview: 'PONG',
-        toolCallCount: 0,
-        errorCount: 0,
-        diagnostics: [],
-      }
+  test('deep readiness rejects a raw model before provisioning or execution', async () => {
+    let sideEffects = 0
+    openCodeProvisioningProbe.probe = async () => { sideEffects += 1; return snapshot }
+    openCodeExecutionProbe.probeModel = (async () => {
+      sideEffects += 1
+      throw new Error('must not execute')
     }) as typeof openCodeExecutionProbe.probeModel
-
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
@@ -1856,18 +1905,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       }),
     )
 
-    expect(result.ok).toBe(true)
-    if (!result.ok) {
-      return
-    }
-    expect(probedModelId).toBe('openrouter/minimax-m2.5-free')
-    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
-    expect(probedBypassCache).toBe(false)
-    expect(result.data.state).toBe('ready')
-    expect(result.data.launchAllowed).toBe(true)
+    expect(result.ok).toBe(false)
+    expect(sideEffects).toBe(0)
   })
 
-  test('returns terminal Cursor native preflight before provisioning an OpenCode host', async () => {
+  test('returns terminal Cursor proof from the retained selected-profile host', async () => {
     mockRequiredMcpTools()
     const previousBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
@@ -1880,9 +1922,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeExecutionProbe.probeModel = (async input => {
       executionProbeCalls += 1
       expect(input.selectedModel).toBe('cursor-acp/auto')
-      expect(input.cursorNativePreflightBeforeHost).toBe(true)
-      expect(input.cursorNativePreflightOnly).toBe(true)
-      expect(input.bypassCache).toBeUndefined()
+      expect(input.bypassCache).toBe(true)
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -1914,12 +1954,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       if (!result.ok) return
       expect(result.data.state).toBe('model_unavailable')
       expect(result.data.launchAllowed).toBe(false)
-      expect(result.data.hostHealthy).toBe(false)
-      expect(result.data.appMcpConnected).toBe(false)
+      expect(result.data.hostHealthy).toBe(true)
+      expect(result.data.appMcpConnected).toBe(true)
       expect(result.data.missing).toEqual(["You've hit your Cursor usage limit"])
-      expect(result.data.diagnostics.join('\n')).toContain('Skipped OpenCode host startup')
       expect(executionProbeCalls).toBe(1)
-      expect(provisioningCalls).toBe(0)
+      expect(provisioningCalls).toBe(1)
     } finally {
       if (previousBinaryPath == null) {
         delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
@@ -1929,7 +1968,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
-  test('does not fall back to OpenCode after bounded Cursor native preflight timeout', async () => {
+  test('does not fall back after a bounded Cursor retained-host proof timeout', async () => {
     const previousBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
     let provisioningCalls = 0
@@ -1971,8 +2010,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.missing).toEqual([
         'Cursor native execution preflight timed out after 65000ms',
       ])
-      expect(result.data.diagnostics.join('\n')).toContain('native preflight timed out')
-      expect(provisioningCalls).toBe(0)
+      expect(result.data.diagnostics.join('\n')).toContain('execution preflight timed out')
+      expect(provisioningCalls).toBe(1)
     } finally {
       if (previousBinaryPath == null) {
         delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
@@ -4453,7 +4492,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain(
-      'Agent Teams MCP tools are not visible in OpenCode',
+      'Agent Teams MCP retained connection/contract proof is unavailable',
     )
     expect(ensureSessionCalls).toBe(0)
     expect(promptCalls).toBe(0)
