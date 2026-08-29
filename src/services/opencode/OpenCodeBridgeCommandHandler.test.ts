@@ -561,6 +561,8 @@ beforeEach(async () => {
     return {
     providerId: 'opencode',
     modelId: input.selectedModel,
+    observedProviderId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.providerId,
+    observedModelId: parseOpenCodeProviderScopedModelRef(input.selectedModel)!.modelId,
     probePrompt: input.prompt ?? '',
     expectedOutput: input.expectedOutput ?? '',
     outcome: 'available',
@@ -1035,7 +1037,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'ghost-model',
+        selectedModel: 'openrouter/ghost-model',
         requireExecutionProbe: false,
       }),
     )
@@ -1093,6 +1095,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('selected readiness uses one retained launch host and releases it without broad fallback', async () => {
     let released = 0
     let provenHost: string | null = null
+    let observedProviderId = 'deepinfra'
     const selected = parseOpenCodeProviderScopedModelRef('deepinfra/chosen')!
     const retainedHost = {
       ...snapshot.host!,
@@ -1124,6 +1127,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       provenHost = input.host.hostKey
       return {
         providerId: 'opencode', modelId: input.selectedModel,
+        observedProviderId, observedModelId: selected.modelId,
         probePrompt: 'PONG', expectedOutput: 'PONG', outcome: 'available', reason: null,
         durationMs: 1, rawStatus: 'idle', durableState: 'idle', latestAssistantText: 'PONG',
         latestAssistantPreview: 'PONG', toolCallCount: 0, errorCount: 0, diagnostics: [],
@@ -1139,6 +1143,16 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(provenHost).toBe('host-key')
     expect(released).toBe(1)
     if (result.ok) expect(result.data.expectedBehaviorEvidence.fullModelId).toBe(selected.raw)
+
+    observedProviderId = 'other'
+    const mismatch = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw, requireExecutionProbe: true,
+    }))
+    expect(mismatch.ok).toBe(true)
+    if (mismatch.ok) {
+      expect(mismatch.data.launchAllowed).toBe(false)
+      expect(mismatch.data.executionProof).toBeUndefined()
+    }
   })
 
   test('selected execution readiness rejects raw models before host or MCP effects', async () => {
@@ -1149,13 +1163,40 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }) as typeof openCodeProvisioningProbe.probeRetainingHost
     Client.prototype.connect = (async () => { effects += 1 }) as typeof Client.prototype.connect
 
-    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
-      projectPath: '/tmp/project', selectedModel: 'raw-model', requireExecutionProbe: true,
-    }))
-
-    expect(result.ok).toBe(false)
+    for (const requireExecutionProbe of [false, true]) {
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project', selectedModel: 'raw-model', requireExecutionProbe,
+      }))
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error.message).toContain('provider-qualified')
+    }
     expect(effects).toBe(0)
-    if (!result.ok) expect(result.error.message).toContain('provider-qualified')
+  })
+
+  test('selected readiness without execution proof stays on the retained provider seam', async () => {
+    let retainedCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      throw new Error('broad readiness poison path must not run')
+    }
+    openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
+      retainedCalls += 1
+      expect(options.selectedModel).toBe('deepinfra/chosen')
+      return { snapshot, host: snapshot.host, release: async () => {} }
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeExecutionProbe.probeModelOnHost = (async () => {
+      throw new Error('model execution must not run')
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: 'deepinfra/chosen',
+      requireExecutionProbe: false,
+    }))
+    expect(result.ok).toBe(true)
+    expect(retainedCalls).toBe(1)
+    if (result.ok) {
+      expect(result.data.launchAllowed).toBe(false)
+      expect(result.data.executionProof).toBeUndefined()
+    }
   })
 
   test('compatibility mode without execution probe still rejects unknown provider-scoped model ids', async () => {
@@ -1342,6 +1383,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
+        observedProviderId: 'llama.cpp',
+        observedModelId: 'qwen-test:0.5b',
         probePrompt: 'Output only the single word PONG.',
         expectedOutput: 'PONG',
         outcome: 'available' as const,
@@ -1597,7 +1640,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       const result = await executeOpenCodeBridgeCommandEnvelope(
         buildEnvelope('opencode.readiness', {
           projectPath: '/tmp/project',
-          selectedModel: 'minimax-m2.5-free',
+          selectedModel: 'openrouter/minimax-m2.5-free',
           requireExecutionProbe: false,
         }),
       )
@@ -1642,7 +1685,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         requireExecutionProbe: false,
       }),
     )
@@ -1651,8 +1694,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.state).toBe('ready')
-    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
     expect(result.data.modelId).toBe('opencode/big-pickle')
     expect(executionProbeCalled).toBe(false)
   })
@@ -1681,7 +1724,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         requireExecutionProbe: false,
       }),
     )
@@ -1717,7 +1760,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'big-pickle',
+        selectedModel: 'opencode/big-pickle',
         requireExecutionProbe: false,
       }),
     )
@@ -1812,7 +1855,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
-  test('compatibility mode without execution probe still rejects ambiguous raw model ids', async () => {
+  test('qualified non-proof readiness stays conservative when raw model ids are ambiguous', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({
@@ -1842,7 +1885,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -1853,7 +1896,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(result.data.state).toBe('model_unavailable')
     expect(result.data.launchAllowed).toBe(false)
-    expect(result.data.missing[0]).toContain('is ambiguous')
+    expect(result.data.missing[0]).toContain('execution proof was not requested')
   })
 
   test('compatibility mode without a selected model ignores unrelated provider defaults', async () => {
@@ -1900,7 +1943,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: true,
       }),
     )
@@ -2033,7 +2076,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2062,7 +2105,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2071,8 +2114,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.state).toBe('ready')
-    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
     expect(result.data.requiredToolsPresent).toBe(true)
     expect(result.data.missing.join('\n')).not.toContain('runtime_bootstrap_checkin')
     expect(result.data.missing.join('\n')).not.toContain('member_briefing')
@@ -2085,7 +2128,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2115,7 +2158,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2125,8 +2168,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.state).toBe('ready')
-    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
     expect(result.data.requiredToolsPresent).toBe(true)
   })
 
@@ -2221,7 +2264,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2254,14 +2297,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const firstResult = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
     const secondResult = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2291,7 +2334,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const firstResult = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2312,7 +2355,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const secondResult = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2321,7 +2364,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!secondResult.ok) {
       return
     }
-    expect(secondResult.data.state).toBe('ready')
+    expect(secondResult.data.state).toBe('model_unavailable')
     expect(secondResult.data.diagnostics).toContain(
       'opencode_app_mcp_tool_proof_persisted_cache_hit',
     )
@@ -2345,14 +2388,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const firstPromise = executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
     const secondPromise = executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
         projectPath: '/tmp/project',
-        selectedModel: 'minimax-m2.5-free',
+        selectedModel: 'openrouter/minimax-m2.5-free',
         requireExecutionProbe: false,
       }),
     )
@@ -2530,6 +2573,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return {
         providerId: 'opencode',
         modelId: input.selectedModel,
+        observedProviderId: 'openrouter',
+        observedModelId: 'minimax-m2.5-free',
         probePrompt: input.prompt ?? '',
         expectedOutput: input.expectedOutput ?? '',
         outcome: 'available',
@@ -2721,12 +2766,15 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )) as typeof openCodeProvisioningProbe.probeRetainingHost
     const noMember = async () => { memberCalls += 1; throw new Error('member must not run') }
     openCodeSessionBridge.materializeSessionOnHost = noMember as typeof openCodeSessionBridge.materializeSessionOnHost
-    for (const mismatch of ['full-model', 'nonce'] as const) {
+    for (const mismatch of ['full-model', 'observed-provider', 'observed-model', 'nonce'] as const) {
       openCodeExecutionProbe.probeModelOnHost = (async input => {
         const proof = await prove(input)
-        return mismatch === 'full-model'
-          ? { ...proof, modelId: 'deepinfra/not-chosen' }
-          : { ...proof, latestAssistantText: 'STRICT_LAUNCH_wrong-nonce' }
+        if (mismatch === 'full-model') return { ...proof, modelId: 'deepinfra/not-chosen' }
+        if (mismatch === 'observed-provider') {
+          return { ...proof, observedProviderId: 'other' }
+        }
+        if (mismatch === 'observed-model') return { ...proof, observedModelId: 'not-chosen' }
+        return { ...proof, latestAssistantText: 'STRICT_LAUNCH_wrong-nonce' }
       }) as typeof openCodeExecutionProbe.probeModelOnHost
       const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
         runId: `run-mismatched-${mismatch}`, laneId: 'primary', teamId: 'team-a',
@@ -2844,6 +2892,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       input.host.profile.managedConfig = { changed: true }
       return {
         providerId: 'opencode', modelId: input.selectedModel,
+        observedProviderId: 'openrouter', observedModelId: 'minimax-m2.5-free',
         probePrompt: input.prompt ?? '', expectedOutput: input.expectedOutput ?? '',
         outcome: 'available', reason: null, durationMs: 1, rawStatus: 'idle',
         durableState: 'idle', latestAssistantText: input.expectedOutput ?? '',
@@ -4615,6 +4664,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
+        observedProviderId: 'llama.cpp',
+        observedModelId: 'qwen-test:0.5b',
         probePrompt: 'Output only the single word PONG.',
         expectedOutput: input.expectedOutput ?? '',
         outcome: 'available' as const,

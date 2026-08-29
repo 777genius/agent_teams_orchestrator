@@ -207,6 +207,16 @@ function parseProviderScopedModel(selectedModel: string): {
   }
 }
 
+function getObservedAssistantModel(
+  summary: OpenCodeSessionReconcileSummary,
+): { providerId: string; modelId: string } | null {
+  const assistant = [...summary.messages]
+    .reverse()
+    .find(message => message.id === summary.latestAssistantMessageId && message.role === 'assistant')
+  if (!assistant?.providerId || !assistant.modelId) return null
+  return { providerId: assistant.providerId, modelId: assistant.modelId }
+}
+
 export function resolveOpenCodeExecutionProbeContextTokens(selectedModel: string): number {
   return selectedModel.startsWith('cursor-acp/') || selectedModel.startsWith('kiro/')
     ? OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT
@@ -370,25 +380,9 @@ function buildCursorNativeExecutionOutcome(input: {
   const { nativeResult, diagnostics } = input
   if (nativeResult?.outcome === 'available') {
     diagnostics.add(
-      `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
+      `Cursor native execution probe completed in ${nativeResult.durationMs}ms without canonical assistant provider/model evidence`,
     )
-    return {
-      providerId: 'opencode',
-      modelId: input.selectedModel,
-      probePrompt: input.prompt,
-      expectedOutput: input.expectedOutput,
-      outcome: 'available',
-      reason: null,
-      durationMs: buildDurationMs(input.startedAtMs),
-      rawStatus: null,
-      durableState: 'idle',
-      latestAssistantText: null,
-      latestAssistantPreview: null,
-      toolCallCount: 0,
-      errorCount: 0,
-      diagnostics: Array.from(diagnostics),
-      verifiedAt: new Date().toISOString(),
-    }
+    return null
   }
 
   if (nativeResult?.outcome !== 'failure') return null
@@ -1046,6 +1040,31 @@ export class OpenCodeExecutionProbe {
       }
       return result
     }
+    const finishObservedAssistantResult = (
+      result: OpenCodeExecutionProbeResult,
+      summary: OpenCodeSessionReconcileSummary,
+    ): Promise<OpenCodeExecutionProbeResult> => {
+      const observed = getObservedAssistantModel(summary)
+      const selected = parseProviderScopedModel(params.selectedModel)
+      if (observed) {
+        result.observedProviderId = observed.providerId
+        result.observedModelId = observed.modelId
+      }
+      if (
+        !observed
+        || observed.providerId !== selected.providerID
+        || observed.modelId !== selected.modelID
+      ) {
+        const actual = observed
+          ? `"${observed.providerId}/${observed.modelId}"`
+          : 'unavailable'
+        result.outcome = 'unavailable'
+        result.reason = `OpenCode canonical assistant provider/model was ${actual}; expected "${params.selectedModel}"`
+        delete result.verifiedAt
+        result.diagnostics.push(result.reason)
+      }
+      return finish(result)
+    }
 
     const nativeFailureProbe = this.cursorNativeFailureProbe
     if (
@@ -1369,7 +1388,7 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'OpenCode original probe recovered before the auxiliary Cursor failure was applied',
               )
-              return finish({
+              return finishObservedAssistantResult({
                 providerId: 'opencode',
                 modelId: params.selectedModel,
                 probePrompt: prompt,
@@ -1385,7 +1404,7 @@ export class OpenCodeExecutionProbe {
                 errorCount: recovered.errorCount,
                 diagnostics: Array.from(diagnostics),
                 verifiedAt: new Date().toISOString(),
-              })
+              }, recovered)
             }
             diagnostics.add(
               `Cursor native failure probe confirmed a terminal provider error in ${nativeTerminalFailure.durationMs}ms`,
@@ -1588,7 +1607,7 @@ export class OpenCodeExecutionProbe {
             )
           ) {
             sessionRequiresCleanup = false
-            return finish({
+            return finishObservedAssistantResult({
               providerId: 'opencode',
               modelId: params.selectedModel,
               probePrompt: prompt,
@@ -1604,7 +1623,7 @@ export class OpenCodeExecutionProbe {
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
               verifiedAt: new Date().toISOString(),
-            })
+            }, summary)
           }
 
           const latestAssistantError = getLatestAssistantMessageError(
@@ -1727,7 +1746,7 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
               )
-              return finish({
+              return finishObservedAssistantResult({
                 providerId: 'opencode',
                 modelId: params.selectedModel,
                 probePrompt: prompt,
@@ -1743,7 +1762,7 @@ export class OpenCodeExecutionProbe {
                 errorCount: summary.errorCount,
                 diagnostics: Array.from(diagnostics),
                 verifiedAt: new Date().toISOString(),
-              })
+              }, summary)
             }
 
             if (summary.durableState === 'idle') sessionRequiresCleanup = false

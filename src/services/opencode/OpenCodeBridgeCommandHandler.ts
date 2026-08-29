@@ -2365,11 +2365,13 @@ async function runReadiness(
 ) {
   const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
+  const hasSelectedModel = envelope.body.selectedModel !== undefined
+    && envelope.body.selectedModel !== null
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
   const qualifiedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
-  if (shouldProbeSelectedModel && !qualifiedSelectedModel) {
+  if (hasSelectedModel && !qualifiedSelectedModel) {
     throw new Error('OpenCode readiness requires a provider-qualified selectedModel')
   }
   const runProvisioningPhase = async (
@@ -2410,7 +2412,7 @@ async function runReadiness(
       throw error
     }
   }
-  if (shouldProbeSelectedModel && qualifiedSelectedModel) {
+  if (qualifiedSelectedModel) {
     let retained: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>> | null = null
     try {
       retained = await runtimeDeadline.runPhase('host_start', context =>
@@ -2430,6 +2432,22 @@ async function runReadiness(
       }
       assertOpenCodeLaunchRuntimeAvailable(retained.snapshot)
       if (!retained.host) throw new Error('OpenCode readiness retained host is unavailable')
+      if (!shouldProbeSelectedModel) {
+        const toolProof = await runDirectToolProof(retained.host)
+        const data = readinessData(
+          retained.snapshot, qualifiedSelectedModel.raw, undefined, toolProof, true,
+        )
+        if (data.launchAllowed) {
+          data.state = 'model_unavailable'
+          data.launchAllowed = false
+          data.supportLevel = null
+          data.missing.push('OpenCode selected model execution proof was not requested')
+        }
+        return {
+          snapshot: retained.snapshot,
+          data,
+        }
+      }
       const initialEvidence = await buildOpenCodeExpectedBehaviorEvidence({
         profile: retained.host.profile,
         fullModelId: qualifiedSelectedModel.raw,
@@ -2472,6 +2490,15 @@ async function runReadiness(
         ...retained.snapshot,
         profile: refreshedAfter,
         host: retained.snapshot.host ? { ...retained.snapshot.host, profile: refreshedAfter } : null,
+      }
+      const observedModelMatches =
+        executionOutcome.observedProviderId === qualifiedSelectedModel.providerId
+        && executionOutcome.observedModelId === qualifiedSelectedModel.modelId
+      if (executionOutcome.outcome === 'available' && !observedModelMatches) {
+        executionOutcome.outcome = 'unavailable'
+        executionOutcome.reason = 'OpenCode selected readiness observed provider/model was unavailable or mismatched'
+        executionOutcome.diagnostics.push(executionOutcome.reason)
+        delete executionOutcome.verifiedAt
       }
       const executionProof = executionOutcome.outcome === 'available' && executionOutcome.verifiedAt
         ? await buildOpenCodeExecutionProof({
@@ -3180,6 +3207,8 @@ async function runLaunch(
       if (
         executionOutcome.providerId !== 'opencode'
         || executionOutcome.modelId !== apiSelectedModel
+        || executionOutcome.observedProviderId !== selectedModelRef.providerId
+        || executionOutcome.observedModelId !== selectedModelRef.modelId
         || executionOutcome.latestAssistantText?.trim() !== expectedOutput
       ) {
         return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }

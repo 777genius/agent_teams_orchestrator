@@ -125,6 +125,8 @@ describe('OpenCodeExecutionProbe', () => {
     const releasedLeaseTeamIds: string[] = []
     let releaseHostCount = 0
     let promptAgent: string | null = null
+    let observedProviderId: string | undefined = 'opencode'
+    let observedModelId: string | undefined = 'big-pickle'
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -183,6 +185,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: observedProviderId,
+                modelID: observedModelId,
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -213,6 +217,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toBeNull()
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
+    expect(result).toMatchObject({
+      observedProviderId: 'opencode',
+      observedModelId: 'big-pickle',
+    })
     expect(promptAsyncCount).toBe(1)
     expect(promptAgent).toBe(OPEN_CODE_MODEL_PROBE_AGENT_NAME)
     expect(sendMessageCount).toBe(0)
@@ -233,6 +241,16 @@ describe('OpenCodeExecutionProbe', () => {
       },
       hostLifetime: 'process',
     })
+
+    observedProviderId = 'other'
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable', observedProviderId: 'other' })
+    observedProviderId = undefined
+    observedModelId = undefined
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable' })
   })
 
   async function expectCompletedAssistantResponseWithoutTextFailsFast(
@@ -626,6 +644,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -726,6 +746,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -898,6 +920,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'ollama',
+                modelID: 'qwen2.5-coder:0.5b',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -1371,6 +1395,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1485,6 +1511,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1546,6 +1574,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'cursor-acp',
+              modelID: 'auto',
               sessionID: 'session-1',
               time: { created: 101, completed: 110 },
             },
@@ -1611,6 +1641,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1857,7 +1889,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(ensureHostCalls).toBe(0)
   })
 
-  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+  test('does not accept native Cursor success without canonical assistant model evidence', async () => {
     let createSessionCalls = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1900,12 +1932,14 @@ describe('OpenCodeExecutionProbe', () => {
     const result = await probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.verifiedAt).toBeTruthy()
+    expect(result.outcome).toBe('unknown')
+    expect(result.verifiedAt).toBeUndefined()
     expect(result.diagnostics.join('\n')).toContain(
-      'native execution probe confirmed model availability',
+      'without canonical assistant provider/model evidence',
     )
     expect(createSessionCalls).toBe(0)
   })
@@ -1933,6 +1967,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'cursor-acp',
+                modelID: 'auto',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -2016,6 +2052,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2101,6 +2139,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'big-pickle',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2388,6 +2428,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2455,6 +2497,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2527,6 +2571,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'opencode',
+              modelID: 'minimax-m2.5-free',
               sessionID: `session-${createSessionCount}`,
               time: { created: 101, completed: 110 },
             },
@@ -2600,6 +2646,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: `msg-assistant-${createSessionCount}`,
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: `msg-user-${createSessionCount}`,
                 sessionID: `session-${createSessionCount}`,
                 time: { created: 101, completed: 110 },
@@ -2692,6 +2740,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2797,6 +2847,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2926,6 +2978,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-runtime-deadline',
                   role: 'assistant',
+                  providerID: 'ollama',
+                  modelID: 'gemma4:12b',
                   parentID: 'msg-user-runtime-deadline',
                   sessionID: 'session-runtime-deadline',
                   time: { created: 101, completed: 110 },

@@ -543,6 +543,8 @@ export type OpenCodeExecutionProbeOutcome =
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'
   modelId: string
+  observedProviderId?: string
+  observedModelId?: string
   probePrompt: string
   expectedOutput: string
   outcome: OpenCodeExecutionProbeOutcome
