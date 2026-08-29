@@ -1502,6 +1502,17 @@ function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
   return `[secret:${semanticSecretIdentity('config-secret', resolve(value))}]`
 }
 
+function selectedProviderApiKeyIdentity(
+  providerId: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const envName = `${providerId.replace(/[^A-Za-z0-9]+/g, '_').toUpperCase()}_API_KEY`
+  const value = env[envName]
+  return value === undefined
+    ? null
+    : semanticSecretIdentity('selected-provider-api-key-environment', { providerId, value })
+}
+
 export async function resolveOpenCodeProfileScope(input: {
   projectPath?: string | null
   purpose: OpenCodeProfilePurpose
@@ -1554,16 +1565,7 @@ export async function resolveOpenCodeProfileScope(input: {
     configFingerprint,
     selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
-    runtimeAuthEnvironment: Object.keys(env)
-      .filter(isClassifiedIdentityKey)
-      .sort()
-      .map(name => [
-        name,
-        semanticSecretIdentity('profile-scope-auth-environment', {
-          name,
-          value: env[name] ?? null,
-        }),
-      ]),
+    selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
   })
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,

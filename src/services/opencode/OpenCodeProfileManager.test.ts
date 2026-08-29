@@ -205,7 +205,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
-  test('keeps semantic config/auth identities stable across CLI processes and secret-safe', async () => {
+  test('keeps selected-provider scope stable across processes and unrelated credential rotation', async () => {
     const projectPath = path.join(tempDir, 'cross-process-project')
     await mkdir(projectPath, { recursive: true })
     const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
@@ -251,11 +251,17 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const envRotated = await run('deepinfra', envReference, {
       [envName]: rotatedEnvValue,
     })
-    const runtimeAuthFirst = await run('deepinfra', 'config-secret', {
+    const unrelatedCredentialFirst = await run('deepinfra', 'config-secret', {
       OPENAI_API_KEY: randomBytes(32).toString('hex'),
     })
-    const runtimeAuthRotated = await run('deepinfra', 'config-secret', {
+    const unrelatedCredentialRotated = await run('deepinfra', 'config-secret', {
       OPENAI_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const selectedCredentialFirst = await run('deepinfra', 'config-secret', {
+      DEEPINFRA_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const selectedCredentialRotated = await run('deepinfra', 'config-secret', {
+      DEEPINFRA_API_KEY: randomBytes(32).toString('hex'),
     })
 
     expect(second).toEqual(first)
@@ -268,17 +274,20 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(authChanged.scope).not.toBe(first.scope)
     expect(envSecond.config).toBe(envFirst.config)
     expect(envRotated.config).not.toBe(envFirst.config)
-    expect(runtimeAuthRotated.config).toBe(runtimeAuthFirst.config)
-    expect(runtimeAuthRotated.scope).not.toBe(runtimeAuthFirst.scope)
+    expect(unrelatedCredentialRotated.config).toBe(unrelatedCredentialFirst.config)
+    expect(unrelatedCredentialRotated.scope).toBe(unrelatedCredentialFirst.scope)
+    expect(selectedCredentialRotated.config).toBe(selectedCredentialFirst.config)
+    expect(selectedCredentialRotated.scope).not.toBe(selectedCredentialFirst.scope)
     const output = JSON.stringify([
       first, second, valueChanged, typeChanged, providerChanged, authChanged,
-      envFirst, envSecond, envRotated, runtimeAuthFirst, runtimeAuthRotated,
+      envFirst, envSecond, envRotated, unrelatedCredentialFirst, unrelatedCredentialRotated,
+      selectedCredentialFirst, selectedCredentialRotated,
     ])
     expect(output).not.toContain('secret')
     expect(output).not.toContain(envName)
     expect(output).not.toContain(envValue)
     expect(output).not.toContain(rotatedEnvValue)
-  })
+  }, 60_000)
 
   test('binds semantic config identity to effective secret environment references', async () => {
     const projectPath = path.join(tempDir, 'env-secret-identity-project')
