@@ -487,6 +487,88 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(JSON.stringify([azure])).not.toContain(googlePath)
   })
 
+  test('binds explicit exact-model authority for built-in-free and configured authless routes', async () => {
+    const projectPath = path.join(tempDir, 'strict-authless-authority-project')
+    await mkdir(projectPath, { recursive: true })
+    const resolve = (
+      selectedModel: string,
+      purpose: 'execution_probe' | 'launch_runtime',
+      config: Record<string, unknown> = {},
+    ) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose,
+      selectedModel,
+      env: {
+        ...process.env,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+      },
+    })
+
+    const builtin = await resolve('opencode/big-pickle', 'execution_probe')
+    const builtinSame = await resolve('opencode/big-pickle', 'execution_probe')
+    const builtinLaunch = await resolve('opencode/big-pickle', 'launch_runtime')
+    const ollama = await resolve('ollama/qwen3:8b', 'execution_probe')
+    const ollamaOtherModel = await resolve('ollama/llama3.2:3b', 'execution_probe')
+    const loopback = await resolve('custom-local/exact-model', 'execution_probe', {
+      provider: {
+        'custom-local': {
+          npm: '@ai-sdk/openai-compatible',
+          options: { baseURL: 'http://127.0.0.1:11434/v1' },
+        },
+      },
+    })
+    const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await mkdir(path.dirname(authPath), { recursive: true })
+    await writeFile(authPath, JSON.stringify({
+      opencode: { type: 'api', key: 'selected-built-in-key' },
+    }))
+    const credentialBacked = await resolve('opencode/big-pickle', 'execution_probe')
+
+    expect(builtinSame).toEqual(builtin)
+    expect(builtin.selectedAuthIdentity).toBe('absent')
+    expect(ollama.selectedAuthIdentity).toBe('absent')
+    expect(loopback.selectedAuthIdentity).toBe('absent')
+    expect(ollamaOtherModel.configFingerprint).not.toBe(ollama.configFingerprint)
+    expect(ollamaOtherModel.scopeToken).not.toBe(ollama.scopeToken)
+    expect(credentialBacked.selectedAuthIdentity).toMatch(/^known:[a-f0-9]{64}$/)
+    expect(credentialBacked.configFingerprint).not.toBe(builtin.configFingerprint)
+    expect(credentialBacked.scopeToken).not.toBe(builtin.scopeToken)
+    expect(builtinLaunch.scopeToken).not.toBe(builtin.scopeToken)
+  })
+
+  test('does not let authless authority mask authenticated missing, invalid, or error auth state', async () => {
+    const projectPath = path.join(tempDir, 'strict-authless-fail-closed-project')
+    const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      mkdir(path.dirname(authPath), { recursive: true }),
+    ])
+    const resolve = (selectedModel: string) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'execution_probe',
+      selectedModel,
+      env: { ...process.env },
+    })
+
+    await expect(resolve('deepinfra/model'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await expect(resolve('opencode/not-a-catalog-model-free'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await writeFile(authPath, JSON.stringify({
+      opencode: { type: 'api', key: '' },
+      deepinfra: { type: 'oauth', access: '', refresh: '', token: '' },
+    }))
+    await expect(resolve('opencode/big-pickle'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await expect(resolve('deepinfra/model'))
+      .rejects.toThrow('requires explicit selected authentication')
+
+    await rm(authPath)
+    await mkdir(authPath)
+    await expect(resolve('opencode/big-pickle'))
+      .rejects.toThrow('selected authentication is unavailable')
+  })
+
   test('rejects both extension-bound providers for both strict purposes despite near-marker credentials', async () => {
     const projectPath = path.join(tempDir, 'strict-authority-allowlist-project')
     const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
