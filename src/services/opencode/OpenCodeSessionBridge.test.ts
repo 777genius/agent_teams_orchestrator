@@ -118,6 +118,7 @@ function buildPreviewSummary(
 
 describe('OpenCodeSessionBridge', () => {
   let isolatedRoot: string
+  const originalAppMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
   const originalDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
   const originalCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
   const originalHome = process.env.HOME
@@ -130,6 +131,26 @@ describe('OpenCodeSessionBridge', () => {
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(isolatedRoot, 'cache')
     process.env.HOME = path.join(isolatedRoot, 'home')
     process.env.XDG_DATA_HOME = path.join(isolatedRoot, 'xdg-data')
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = path.join(
+      isolatedRoot,
+      'agent-teams-mcp.js',
+    )
+    await writeFile(process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY, '')
+    await mkdir(path.join(process.env.XDG_DATA_HOME, 'opencode'), { recursive: true })
+    await writeFile(
+      path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'),
+      JSON.stringify({
+        openai: { type: 'api', key: 'test-openai-key' },
+        opencode: { type: 'api', key: 'test-opencode-key' },
+        xai: {
+          type: 'oauth',
+          access: 'test-xai-access-token',
+          refresh: 'test-xai-refresh-token',
+          expires: 4_102_444_800_000,
+        },
+        'kimi-for-coding': { type: 'api', key: 'test-kimi-key' },
+      }),
+    )
     profile.profileScope = await resolveOpenCodeProfileScope({
       projectPath: profile.projectPath,
       purpose: 'launch_runtime',
@@ -148,6 +169,9 @@ describe('OpenCodeSessionBridge', () => {
     else process.env.HOME = originalHome
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
     else process.env.XDG_DATA_HOME = originalXdgDataHome
+    if (originalAppMcpEntry === undefined) {
+      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+    } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = originalAppMcpEntry
   })
 
   test('strict compatibility rejects stale, different-effort, behavior, bootstrap, and member identities', () => {
@@ -2592,46 +2616,25 @@ describe('OpenCodeSessionBridge', () => {
     expect(staleMarks).toEqual(['profile_scope_changed'])
   })
 
-  test.each(['absent', 'error'] as const)(
-    'does not reuse a persisted host after restart when credential identity is %s',
-    async credentialIdentity => {
-      if (credentialIdentity === 'error') {
+  test.each([
+    ['absent', 'OpenCode strict profile requires explicit selected authentication'],
+    ['error', 'OpenCode strict profile selected authentication is unavailable'],
+  ] as const)(
+    'rejects persisted host restart when credential identity is %s',
+    async (credentialIdentity, expectedError) => {
+      if (credentialIdentity === 'absent') {
+        await writeFile(path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json'), '{}')
+      } else {
         const authPath = path.join(process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]!, 'opencode', 'auth.json')
         await mkdir(path.dirname(authPath), { recursive: true })
         await writeFile(authPath, '{invalid-json')
       }
-      const currentScope = await resolveOpenCodeProfileScope({
+
+      await expect(resolveOpenCodeProfileScope({
         projectPath: profile.projectPath,
         purpose: 'launch_runtime',
         selectedModel: 'openai/gpt-5.4-mini',
-      })
-      expect(currentScope.selectedAuthIdentity).toBe(credentialIdentity)
-      const oldScope = { ...currentScope, scopeToken: `old-process-${credentialIdentity}` }
-      const staleReasons: string[] = []
-      const bridge = new OpenCodeSessionBridge({
-        prepareProfile: async (_projectPath, options) => ({
-          ...profile,
-          profileScope: options?.profileScope,
-          scopeToken: options?.profileScope?.scopeToken ?? null,
-        }),
-        hostManager: {
-          ensureHost: async () => { throw new Error('old persisted host must not be reused') },
-          releaseHost: async () => {},
-        },
-        sessionStore: {
-          get: async () => null,
-          upsert: async () => 'unchanged',
-          markStale: async (_teamId, _laneId, _memberName, reason) => {
-            staleReasons.push(reason)
-            return buildRecord({ profileScope: oldScope, staleReason: reason })
-          },
-        },
-      })
-
-      const result = await bridge.reconcileSession(buildRecord({ profileScope: oldScope }))
-
-      expect(result.summary.reconcileOutcome).toBe('stale')
-      expect(staleReasons).toEqual(['profile_scope_changed'])
+      })).rejects.toThrow(expectedError)
     },
   )
 
