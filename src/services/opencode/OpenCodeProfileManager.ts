@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
   chmod,
@@ -536,7 +536,10 @@ async function collectBehaviorDirectoryEntries(
   return entries
 }
 
-export async function collectProjectBehaviorMetadata(projectPath: string): Promise<{
+export async function collectProjectBehaviorMetadata(
+  projectPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{
   projectBehaviorFingerprint: string
   behaviorSources: string[]
 }> {
@@ -550,7 +553,13 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
     }
 
     const content = await readFile(absolutePath)
-    entries.push(`${relativePath}:${hashBuffer(content)}`)
+    const fingerprint = relativePath === 'opencode.json' || relativePath === 'opencode.jsonc'
+      ? hashString(JSON.stringify(redactConfigIdentity(
+          safeParseJSONC(content.toString('utf8')),
+          env,
+        )))
+      : hashBuffer(content)
+    entries.push(`${relativePath}:${fingerprint}`)
     behaviorSources.add(relativePath)
   }
 
@@ -1297,20 +1306,20 @@ function redactConfigIdentity(
   env: NodeJS.ProcessEnv,
   classified = false,
 ): unknown {
-  if (classified) return '[redacted]'
+  if (classified) return secretIdentity(value, env)
   if (Array.isArray(value)) return value.map(item => redactConfigIdentity(item, env))
   if (typeof value === 'string') {
     const resolved = resolveIdentityEnvironment(value, env)
     if (!/^https?:\/\//i.test(resolved)) return resolved
     try {
       const url = new URL(resolved)
-      if (url.username) url.username = '[redacted]'
-      if (url.password) url.password = '[redacted]'
+      if (url.username) url.username = secretIdentity(url.username, env)
+      if (url.password) url.password = secretIdentity(url.password, env)
       const query = Array.from(url.searchParams.entries())
         .map(([key, queryValue]) => [
           key,
           isClassifiedIdentityKey(key)
-            ? '[redacted]'
+            ? secretIdentity(queryValue, env)
             : resolveIdentityEnvironment(queryValue, env),
         ] as const)
         .sort(([leftKey, leftValue], [rightKey, rightValue]) =>
@@ -1340,12 +1349,16 @@ function redactConfigIdentity(
 type OpenCodeEffectiveConfigSnapshot = Readonly<{
   projectPath: string
   importedRuntimeConfig: Readonly<Record<string, unknown>>
+  runtimeEnv: Readonly<NodeJS.ProcessEnv>
+  scopeIdentity: Readonly<{
+    purpose: OpenCodeProfilePurpose
+    providerId: string
+    configFingerprint: string
+  }>
 }>
 
-const openCodeEffectiveConfigSnapshots = new WeakMap<
-  OpenCodeProfileScope,
-  OpenCodeEffectiveConfigSnapshot
->()
+const openCodeProfileScopeKey = randomBytes(32)
+const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
 
 function freezeConfigSnapshot<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -1353,6 +1366,72 @@ function freezeConfigSnapshot<T>(value: T): T {
     Object.freeze(value)
   }
   return value
+}
+
+function keyedIdentity(value: unknown): string {
+  return createHmac('sha256', openCodeProfileScopeKey)
+    .update(JSON.stringify(value) ?? '')
+    .digest('hex')
+}
+
+function buildScopeIdentity(scope: OpenCodeProfileScope): {
+  purpose: OpenCodeProfilePurpose
+  providerId: string
+  configFingerprint: string
+} {
+  return {
+    purpose: scope.purpose,
+    providerId: scope.providerId,
+    configFingerprint: scope.configFingerprint,
+  }
+}
+
+function isolateCatalogRuntimeConfig(
+  config: Record<string, unknown>,
+  providerId: string,
+): Record<string, unknown> {
+  const selectedProvider = asRecord(config.provider)[providerId]
+  const selectedManagedPlugins = planOpenCodeProfilePolicy({
+    purpose: 'catalog', providerId, configFingerprint: 'isolation', scopeToken: 'isolation',
+  }).managedSubscriptionPlugins
+  const isolated: Record<string, unknown> = {}
+  if (selectedProvider !== undefined) isolated.provider = { [providerId]: selectedProvider }
+  for (const key of ['model', 'small_model'] as const) {
+    const value = typeof config[key] === 'string' ? config[key].trim() : ''
+    if (value.startsWith(`${providerId}/`)) isolated[key] = value
+  }
+  if (selectedManagedPlugins.length > 0) isolated.plugin = [...selectedManagedPlugins]
+  return isolated
+}
+
+function enforceCatalogProviderIsolation(
+  config: Record<string, unknown>,
+  providerId: string,
+  managedPlugins: readonly string[],
+): void {
+  const selectedProvider = asRecord(config.provider)[providerId]
+  config.provider = selectedProvider === undefined ? {} : { [providerId]: selectedProvider }
+  for (const key of ['model', 'small_model'] as const) {
+    const value = typeof config[key] === 'string' ? config[key].trim() : ''
+    if (!value.startsWith(`${providerId}/`)) delete config[key]
+  }
+  config.plugin = [...managedPlugins]
+}
+
+function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
+  const resolve = (item: unknown): unknown => {
+    if (typeof item === 'string') return resolveIdentityEnvironment(item, env)
+    if (Array.isArray(item)) return item.map(resolve)
+    if (!item || typeof item !== 'object') return item
+    return Object.keys(item as Record<string, unknown>).sort().reduce<Record<string, unknown>>(
+      (result, key) => {
+        result[key] = resolve((item as Record<string, unknown>)[key])
+        return result
+      },
+      {},
+    )
+  }
+  return `[secret:${keyedIdentity(resolve(value))}]`
 }
 
 export async function resolveOpenCodeProfileScope(input: {
@@ -1369,7 +1448,10 @@ export async function resolveOpenCodeProfileScope(input: {
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const imported = await readSafeOpenCodeRuntimeConfigImport(env)
   const project = await readProjectOpenCodeRuntimeConfig(projectPath)
-  const importedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
+  const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
+  const importedRuntimeConfig = input.purpose === 'catalog'
+    ? isolateCatalogRuntimeConfig(mergedRuntimeConfig, providerId)
+    : mergedRuntimeConfig
   const effective = deepMergeOpenCodeConfig(
     importedRuntimeConfig,
     buildManagedConfig(null, { managedProviderId: providerId }),
@@ -1380,16 +1462,51 @@ export async function resolveOpenCodeProfileScope(input: {
     small_model: effective.small_model ?? null,
     plugin: effective.plugin ?? null,
   }, env)
+  const configFingerprint = hashString(JSON.stringify(identity))
+  const scopeToken = keyedIdentity({
+    projectPath,
+    purpose: input.purpose,
+    providerId,
+    configFingerprint,
+    effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
+    runtimeEnvironment: Object.keys(env).sort().map(key => [key, env[key] ?? null]),
+  })
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,
     providerId,
-    configFingerprint: hashString(JSON.stringify(identity)),
+    configFingerprint,
+    scopeToken,
   }
-  openCodeEffectiveConfigSnapshots.set(scope, freezeConfigSnapshot({
-    projectPath,
-    importedRuntimeConfig,
-  }))
+  if (!openCodeEffectiveConfigSnapshots.has(scopeToken)) {
+    openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
+      projectPath,
+      importedRuntimeConfig,
+      runtimeEnv: { ...env },
+      scopeIdentity: buildScopeIdentity(scope),
+    }))
+  }
   return scope
+}
+
+export async function assertOpenCodePreparedProfileScope(
+  profile: OpenCodePreparedProfile,
+  projectPath?: string | null,
+): Promise<void> {
+  if (!profile.profileScope) return
+  const snapshot = openCodeEffectiveConfigSnapshots.get(profile.scopeToken ?? '')
+  if (
+    !snapshot
+    || profile.scopeToken !== profile.profileScope.scopeToken
+    || JSON.stringify(snapshot.scopeIdentity)
+      !== JSON.stringify(buildScopeIdentity(planOpenCodeProfilePolicy(profile.profileScope).scope))
+    || profile.canonicalProjectPath !== snapshot.projectPath
+  ) {
+    throw new Error('OpenCode prepared profile scope token is invalid or expired')
+  }
+  const currentCanonicalPath = await canonicalizeOpenCodeProjectPath(projectPath ?? profile.projectPath)
+  if (currentCanonicalPath !== snapshot.projectPath) {
+    throw new Error('OpenCode prepared profile canonical project path changed')
+  }
 }
 
 function applyManagedPathEnvironmentToMcpConfig(
@@ -1437,8 +1554,14 @@ function normalizeManagedConfigForFingerprint(value: unknown): unknown {
   }, {})
 }
 
-export function buildManagedConfigFingerprint(managedConfig: Record<string, unknown>): string {
-  return hashString(JSON.stringify(normalizeManagedConfigForFingerprint(managedConfig)))
+export function buildManagedConfigFingerprint(
+  managedConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return hashString(JSON.stringify(redactConfigIdentity(
+    normalizeManagedConfigForFingerprint(managedConfig),
+    env,
+  )))
 }
 
 export function orderOpenCodeAuthSyncSources(input: {
@@ -1473,7 +1596,7 @@ type OpenCodeIdentityComponent = 'absent' | 'error' | `known:${string}`
 function authCredentialIdentity(credential: unknown): OpenCodeIdentityComponent {
   return credential === null
     ? 'absent'
-    : `known:${hashString(JSON.stringify(credential))}`
+    : `known:${keyedIdentity(credential)}`
 }
 
 async function readSelectedAuthFromSources(input: {
@@ -1569,7 +1692,10 @@ export class OpenCodeProfileManager {
   }> {
     const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
     const policy = planOpenCodeProfilePolicy(input.profileScope)
-    const profileRootKey = hashString(JSON.stringify({ projectPath, ...policy.scope })).slice(0, 16)
+    const profileRootKey = hashString(JSON.stringify({
+      projectPath,
+      ...buildScopeIdentity(policy.scope),
+    })).slice(0, 16)
     const managedAuthPath = path.join(
       this.paths.data,
       'opencode',
@@ -1651,15 +1777,31 @@ export class OpenCodeProfileManager {
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
     const configSnapshot = options.profileScope
-      ? openCodeEffectiveConfigSnapshots.get(options.profileScope)
+      ? openCodeEffectiveConfigSnapshots.get(options.profileScope.scopeToken)
       : undefined
-    const resolvedProjectPath = configSnapshot?.projectPath
-      ?? await canonicalizeOpenCodeProjectPath(projectPath)
+    if (options.profileScope && !configSnapshot) {
+      throw new Error('OpenCode scoped profile preparation requires an exact resolver-issued snapshot')
+    }
+    if (
+      options.profileScope
+      && JSON.stringify(configSnapshot?.scopeIdentity)
+        !== JSON.stringify(buildScopeIdentity(planOpenCodeProfilePolicy(options.profileScope).scope))
+    ) {
+      throw new Error('OpenCode scoped profile preparation token does not match its snapshot')
+    }
+    const currentProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
+    if (configSnapshot && currentProjectPath !== configSnapshot.projectPath) {
+      throw new Error('OpenCode scoped profile canonical project path changed')
+    }
+    const resolvedProjectPath = configSnapshot?.projectPath ?? currentProjectPath
     const policy = options.profileScope
       ? planOpenCodeProfilePolicy(options.profileScope)
       : null
     const profileRootKey = policy
-      ? hashString(JSON.stringify({ projectPath: resolvedProjectPath, ...policy.scope })).slice(0, 16)
+      ? hashString(JSON.stringify({
+          projectPath: resolvedProjectPath,
+          ...buildScopeIdentity(policy.scope),
+        })).slice(0, 16)
       : this.getProfileRootKey(resolvedProjectPath)
     return this.withProfilePreparationLock(profileRootKey, async () => {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
@@ -1670,7 +1812,10 @@ export class OpenCodeProfileManager {
       profileRootKey,
     )
     const { projectBehaviorFingerprint, behaviorSources } =
-      await collectProjectBehaviorMetadata(resolvedProjectPath)
+      await collectProjectBehaviorMetadata(
+        resolvedProjectPath,
+        configSnapshot?.runtimeEnv ?? process.env,
+      )
     const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
     const globalRuntimePreferences = await readOpenCodeGlobalManagedRuntimePreferences(
       this.paths.data,
@@ -1720,7 +1865,7 @@ export class OpenCodeProfileManager {
     const managedConfig = deepMergeOpenCodeConfig(
       importedRuntimeConfig,
       buildManagedConfig(appMcpConfig, {
-        allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
+        allowAutoUpdate: isOpenCodeAutoUpdateAllowed(configSnapshot?.runtimeEnv ?? process.env),
         defaultModelId: effectiveManagedDefaultModelId,
         managedProviderId: policy?.scope.providerId,
         toolApprovalMode: options.toolApprovalMode,
@@ -1734,11 +1879,21 @@ export class OpenCodeProfileManager {
     if (policy || managedSubscriptionPlugins.length > 0) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
+    if (policy?.scope.purpose === 'catalog') {
+      enforceCatalogProviderIsolation(
+        managedConfig,
+        policy.scope.providerId,
+        managedSubscriptionPlugins,
+      )
+    }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
     })
-    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
+    const managedConfigFingerprint = buildManagedConfigFingerprint(
+      managedConfig,
+      configSnapshot?.runtimeEnv ?? process.env,
+    )
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
     const xdgConfigHome = path.join(profileRootPath, 'config')
@@ -1748,6 +1903,9 @@ export class OpenCodeProfileManager {
     const sharedToolCachePath = path.join(xdgCacheHome, 'tools')
     const sharedOpenCodeNodeModulesPath = path.join(xdgCacheHome, 'config-node_modules')
     const profileOpenCodeNodeModulesPath = path.join(xdgConfigHome, 'opencode', 'node_modules')
+    const workingDirectoryPath = policy?.scope.purpose === 'catalog'
+      ? path.join(profileRootPath, 'catalog-workspace')
+      : resolvedProjectPath
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const globalAuthPath = this.getGlobalAuthPath()
     const sourceAuthSources = await Promise.all(
@@ -1769,6 +1927,7 @@ export class OpenCodeProfileManager {
       mkdir(xdgCacheHome, { recursive: true }),
       mkdir(sharedNpmCachePath, { recursive: true }),
       mkdir(sharedToolCachePath, { recursive: true }),
+      mkdir(workingDirectoryPath, { recursive: true }),
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
@@ -1861,7 +2020,7 @@ export class OpenCodeProfileManager {
     })()
 
     const env: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...(configSnapshot?.runtimeEnv ?? process.env),
       HOME: homePath,
       USERPROFILE: homePath,
       TMPDIR: tmpPath,
@@ -1895,6 +2054,9 @@ export class OpenCodeProfileManager {
 
     return {
       projectPath: resolvedProjectPath,
+      canonicalProjectPath: resolvedProjectPath,
+      workingDirectoryPath,
+      scopeToken: policy?.scope.scopeToken ?? null,
       profileRootKey,
       profileRootPath,
       profileScope: policy?.scope ?? null,

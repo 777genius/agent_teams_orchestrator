@@ -8,6 +8,7 @@ describe('OpenCode profile policy', () => {
       purpose: 'catalog',
       providerId,
       configFingerprint: 'catalog-v1',
+      scopeToken: 'resolver-token',
     })
 
     expect(plan('Amazon Q Developer / Kiro')).toMatchObject({
@@ -28,11 +29,13 @@ describe('OpenCode profile policy', () => {
       purpose: 'execution_probe',
       providerId: 'kiro',
       configFingerprint: 'probe-v1',
+      scopeToken: 'resolver-token',
     }).includeAppMcp).toBe(false)
     expect(planOpenCodeProfilePolicy({
       purpose: 'launch_runtime',
       providerId: 'kiro',
       configFingerprint: 'launch-v1',
+      scopeToken: 'resolver-token',
     }).includeAppMcp).toBe(true)
   })
 })

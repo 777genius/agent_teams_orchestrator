@@ -29,10 +29,14 @@ export type OpenCodeProfileScope = {
   purpose: OpenCodeProfilePurpose
   providerId: string
   configFingerprint: string
+  scopeToken: string
 }
 
 export type OpenCodePreparedProfile = {
   projectPath: string
+  canonicalProjectPath: string
+  workingDirectoryPath: string
+  scopeToken: string | null
   profileRootKey: string
   profileRootPath: string
   profileScope?: OpenCodeProfileScope | null
@@ -625,6 +629,7 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  profileScope?: OpenCodeProfileScope | null
   toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null

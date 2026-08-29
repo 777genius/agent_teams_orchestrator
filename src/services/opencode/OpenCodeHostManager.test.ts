@@ -14,11 +14,15 @@ import {
   resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
+import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
 
 const baseProfile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-v1',
@@ -189,6 +193,39 @@ describe('OpenCodeHostManager', () => {
       stdio: 'ignore',
       windowsHide: true,
     })
+  })
+
+  test('starts catalog hosts from the isolated profile-owned working directory', () => {
+    const profile = {
+      ...baseProfile,
+      workingDirectoryPath: '/managed/catalog-workspace',
+    }
+    expect(buildOpenCodeHostSpawnOptions(profile, 'linux').cwd)
+      .toBe('/managed/catalog-workspace')
+  })
+
+  test('rejects prepared host reuse when the resolver scope token differs', async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-scope-'))
+    try {
+      const profileScope = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'catalog',
+        selectedModel: 'custom/catalog',
+      })
+      await expect(new OpenCodeHostManager().ensureHost({
+        projectPath,
+        preparedProfile: {
+          ...baseProfile,
+          projectPath,
+          canonicalProjectPath: projectPath,
+          workingDirectoryPath: path.join(projectPath, 'catalog'),
+          profileScope,
+          scopeToken: 'different-token',
+        },
+      })).rejects.toThrow('scope token is invalid or expired')
+    } finally {
+      await rm(projectPath, { recursive: true, force: true })
+    }
   })
 
   test('keeps process-scoped OpenCode hosts attached on Windows to avoid console popup detachment', () => {

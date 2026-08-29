@@ -664,8 +664,22 @@ function redactDiagnostic(message: string): string {
   return message
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted]')
     .replace(/tp-[A-Za-z0-9_-]{5,}/g, '[redacted]')
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, '$1[redacted]')
-    .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"']+/gi, '$1[redacted]')
+    .replace(
+      /((?:authorization|proxy-authorization)\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s,"'}]+/gi,
+      '$1[redacted]',
+    )
+    .replace(
+      /((?:cookie|set-cookie|(?:[a-z0-9-]+-)?api[-_]?key|[a-z0-9-]*token)\s*[:=]\s*)[^\n,}"']+/gi,
+      '$1[redacted]',
+    )
+    .replace(
+      /([?&](?:key|token|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|auth)=)[^&\s"']+/gi,
+      '$1[redacted]',
+    )
+    .replace(
+      /("[^"]*(?:authorization|cookie|api[-_]?key|token|secret)[^"]*"\s*:\s*")[^"]*/gi,
+      '$1[redacted]',
+    )
     .slice(0, 1_600)
 }
 
@@ -3057,7 +3071,10 @@ export class OpenCodeProviderManagementAdapter
         selectedModel: `${input.providerId}/catalog`,
       })
       config = input.expectedScope
-        && input.expectedScope.configFingerprint !== profileScope.configFingerprint
+        && (
+          input.expectedScope.configFingerprint !== profileScope.configFingerprint
+          || input.expectedScope.scopeToken !== profileScope.scopeToken
+        )
         ? { state: 'error' }
         : { state: 'known', value: profileScope.configFingerprint }
     } catch {
@@ -3065,6 +3082,7 @@ export class OpenCodeProviderManagementAdapter
         purpose: 'catalog',
         providerId: input.providerId,
         configFingerprint: 'identity-read-error',
+        scopeToken: 'identity-read-error',
       }
       config = { state: 'error' }
     }
@@ -3103,6 +3121,9 @@ export class OpenCodeProviderManagementAdapter
       providerId: input.providerId,
       binary,
       config,
+      scopeToken: config.state === 'known'
+        ? catalogIdentityComponent(profileScope.scopeToken)
+        : { state: 'error' } as CatalogIdentityComponent,
       preferences,
       sourceAuth,
       managedSelectedAuth,
@@ -3597,7 +3618,7 @@ export class OpenCodeProviderManagementAdapter
         )
       }
       host = await hostManager.ensureHost({
-        projectPath: inventory.projectPath,
+        projectPath: projectPath ?? inventory.projectPath,
         preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
         profileOptions: options.profileScope ? { profileScope: options.profileScope } : undefined,
         hostLifetime,
@@ -3617,7 +3638,7 @@ export class OpenCodeProviderManagementAdapter
       const rawMessage = error instanceof Error ? error.message : String(error)
       return providerManagementError(
         options.failureCode ?? 'runtime-unhealthy',
-        redactSecret(rawMessage, options.secretToRedact),
+        redactDiagnostic(redactSecret(rawMessage, options.secretToRedact)),
       )
     } finally {
       if (host) {
@@ -4054,7 +4075,7 @@ export class OpenCodeProviderManagementAdapter
       input.projectPath,
       async ({ inventory, client }) => {
         const identity = await this.readCatalogIdentity({
-          projectPath: inventory.projectPath,
+          projectPath: input.projectPath ?? inventory.projectPath,
           providerId,
           expectedScope: profileScope,
           expectedBinaryPath: inventory.binaryPath,
@@ -4073,12 +4094,16 @@ export class OpenCodeProviderManagementAdapter
           ...safeReadDiagnostics(configProvidersResult),
           ...safeReadDiagnostics(providersResult),
         ]
+        const sanitizedInventory = {
+          ...inventory,
+          diagnostics: redactDiagnostics(inventory.diagnostics),
+        }
         const entry: ProviderCatalogCacheEntry = {
           identity: identity.key,
-          inventory,
+          inventory: sanitizedInventory,
           configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
           providers: providersResult.ok ? providersResult.value : null,
-          diagnostics,
+          diagnostics: redactDiagnostics(diagnostics),
           managedModelLimitOverrides:
             preferencesResult.ok && preferencesResult.value
               ? preferencesResult.value.modelLimitOverrides
@@ -4134,7 +4159,7 @@ export class OpenCodeProviderManagementAdapter
           let identityTimeout: ReturnType<typeof setTimeout> | undefined
           const timeoutIdentity = await Promise.race([
             this.readCatalogIdentity({
-              projectPath: canonicalProjectPath,
+              projectPath: input.projectPath ?? canonicalProjectPath,
               providerId,
             }).catch(() => null),
             new Promise<null>(resolve => {

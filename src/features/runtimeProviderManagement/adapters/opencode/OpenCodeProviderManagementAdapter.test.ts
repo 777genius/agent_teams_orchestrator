@@ -24,6 +24,9 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
     projectPath: '/tmp/project',
     profile: {
       projectPath: '/tmp/project',
+      canonicalProjectPath: '/tmp/project',
+      workingDirectoryPath: '/tmp/project',
+      scopeToken: null,
       profileRootKey: 'profile-key',
       profileRootPath: '/tmp/profile',
       projectDefaultModelId: null,
@@ -35,6 +38,7 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
       managedConfig: {},
       managedConfigFingerprint: 'managed-config',
       homePath: '/tmp/profile/home',
+      tmpPath: '/tmp/profile/tmp',
       xdgConfigHome: '/tmp/profile/config',
       xdgDataHome: '/tmp/profile/data',
       xdgCacheHome: '/tmp/profile/cache',
@@ -7462,6 +7466,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let resolveSlow!: (value: ProviderResult) => void
     let releaseCount = 0
     let requestSignal: AbortSignal | undefined
+    const diagnosticSecrets = [
+      'fake-auth-sentinel',
+      'fake-cookie-sentinel',
+      'fake-api-key-sentinel',
+      'fake-token-sentinel',
+    ]
     const slowProviders = new Promise<ProviderResult>(resolve => {
       resolveSlow = resolve
     })
@@ -7475,7 +7485,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
           source: 'absent', managed: 'absent', preferences: 'known:preferences-a',
         }),
       },
-      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      inventoryService: { probe: async () => inventory({
+        models: [],
+        availableProviders: [],
+        diagnostics: [
+          'Authorization: Bearer fake-auth-sentinel',
+          'Cookie: session=fake-cookie-sentinel',
+          'X-API-Key: fake-api-key-sentinel',
+          'request failed?access_token=fake-token-sentinel',
+        ],
+      }) },
       hostManager: {
         ensureHost: async () => host(),
         releaseHost: async () => { releaseCount += 1 },
@@ -7502,12 +7521,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     const initial = await adapter.loadModels(input)
     expect(initial.ok && initial.value.models.map(model => model.modelId)).toEqual(['local/initial'])
+    expect(diagnosticSecrets.every(secret => !JSON.stringify(initial).includes(secret))).toBe(true)
     mode = 'slow'
     const stale = await adapter.loadModels(input)
     expect(stale.ok).toBe(true)
     if (!stale.ok) return
     expect(stale.value).toMatchObject({ catalogState: 'stale' })
     expect(stale.value.models.map(model => model.modelId)).toEqual(['local/initial'])
+    expect(diagnosticSecrets.every(secret => !JSON.stringify(stale).includes(secret))).toBe(true)
     expect(requestSignal?.aborted).toBe(true)
     expect(releaseCount).toBe(2)
 

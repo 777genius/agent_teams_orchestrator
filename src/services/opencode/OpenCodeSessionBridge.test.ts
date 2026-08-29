@@ -25,6 +25,9 @@ import type {
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-v1',
@@ -74,6 +77,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
     projectPath: '/tmp/project',
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
+    profileScope: profile.profileScope ?? null,
     resolvedBehaviorFingerprint: 'resolved-fingerprint',
     opencodeSessionId: 'session-1',
     lastCanonicalCursor: null,
@@ -130,6 +134,7 @@ describe('OpenCodeSessionBridge', () => {
       purpose: 'launch_runtime',
       selectedModel: 'openai/gpt-5.4-mini',
     })
+    profile.scopeToken = profile.profileScope.scopeToken
   })
 
   afterEach(async () => {
@@ -229,7 +234,17 @@ describe('OpenCodeSessionBridge', () => {
   test('uses a caller-provided prepared profile without preparing it again', async () => {
     let prepareProfileCalls = 0
     let createSessionCalls = 0
-    const existing = buildRecord()
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: '/tmp/project',
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
+    const preparedProfile: OpenCodePreparedProfile = {
+      ...profile,
+      profileScope,
+      scopeToken: profileScope.scopeToken,
+    }
+    const existing = { ...buildRecord(), profileScope }
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => {
         prepareProfileCalls += 1
@@ -242,8 +257,8 @@ describe('OpenCodeSessionBridge', () => {
       },
       hostManager: {
         ensureHost: async input => {
-          expect(input?.preparedProfile).toBe(profile)
-          return host
+          expect(input?.preparedProfile).toBe(preparedProfile)
+          return { ...host, profile: preparedProfile }
         },
         releaseHost: async () => {},
         retainHostLease: async () => {},
@@ -288,12 +303,38 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
       projectPath: '/tmp/project',
-      preparedProfile: profile,
+      preparedProfile,
     })
 
     expect(record).toEqual({ ...existing, runtimePid: 123 })
     expect(prepareProfileCalls).toBe(0)
     expect(createSessionCalls).toBe(0)
+  })
+
+  test('rejects caller-provided profiles without the exact resolver scope token', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'created',
+        markStale: async () => null,
+      },
+    })
+    await expect(bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      preparedProfile: {
+        ...profile,
+        profileScope: {
+          purpose: 'launch_runtime',
+          providerId: 'openai',
+          configFingerprint: 'forged',
+          scopeToken: 'forged',
+        },
+        scopeToken: 'forged',
+      },
+    })).rejects.toThrow('scope token is invalid or expired')
   })
 
   test('persists manual tool approval mode in fresh session records', async () => {
@@ -366,8 +407,15 @@ describe('OpenCodeSessionBridge', () => {
 
   test('infers manual tool approval mode from caller-provided prepared profile', async () => {
     const upserts: OpenCodeSessionRecord[] = []
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath: '/tmp/project',
+      purpose: 'launch_runtime',
+      selectedModel: 'openai/gpt-5.4-mini',
+    })
     const manualProfile: OpenCodePreparedProfile = {
       ...profile,
+      profileScope,
+      scopeToken: profileScope.scopeToken,
       managedConfig: {
         agent: {
           teammate: {

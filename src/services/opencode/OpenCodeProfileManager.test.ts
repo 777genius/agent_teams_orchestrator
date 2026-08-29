@@ -129,14 +129,26 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const manager = new OpenCodeProfileManager()
     const projectPath = path.join(tempDir, 'project')
     await mkdir(projectPath, { recursive: true })
-    const prepare = (
+    const prepare = async (
       purpose: 'catalog' | 'execution_probe' | 'launch_runtime',
       providerId: string,
       configFingerprint: string,
-    ) =>
-      manager.prepareProfile(path.join(projectPath, '.'), {
-        profileScope: { purpose, providerId, configFingerprint },
+    ) => {
+      const profileScope = await resolveOpenCodeProfileScope({
+        projectPath,
+        purpose,
+        selectedModel: `${providerId}/model`,
+        env: {
+          ...process.env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            provider: { [providerId.toLowerCase()]: { options: { route: configFingerprint } } },
+          }),
+        },
       })
+      return manager.prepareProfile(path.join(projectPath, '.'), {
+        profileScope,
+      })
+    }
 
     const catalog = await prepare('catalog', 'DeepInfra', 'config-a')
     const sameCatalog = await prepare('catalog', 'deepinfra', 'config-a')
@@ -179,7 +191,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const secretChanged = await scope('https://one.example/v1', 'secret-two')
     const endpointChanged = await scope('https://two.example/v1', 'secret-one')
 
-    expect(secretChanged.configFingerprint).toBe(first.configFingerprint)
+    expect(secretChanged.configFingerprint).not.toBe(first.configFingerprint)
     expect(endpointChanged.configFingerprint).not.toBe(first.configFingerprint)
     const manager = new OpenCodeProfileManager()
     const [firstProfile, secretProfile, endpointProfile] = await Promise.all([
@@ -187,7 +199,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       manager.prepareProfile(projectPath, { profileScope: secretChanged }),
       manager.prepareProfile(projectPath, { profileScope: endpointChanged }),
     ])
-    expect(secretProfile.profileRootPath).toBe(firstProfile.profileRootPath)
+    expect(secretProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
     expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
@@ -235,7 +247,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const limit = await scope({ limit: 2000, env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
     const header = await scope({ route: 'green', env: { CUSTOM_BASE_URL: 'https://example.test/v1?region=one' } })
 
-    expect(credentialOnly.configFingerprint).toBe(base.configFingerprint)
+    expect(credentialOnly.configFingerprint).not.toBe(base.configFingerprint)
     expect(query.configFingerprint).not.toBe(base.configFingerprint)
     expect(limit.configFingerprint).not.toBe(base.configFingerprint)
     expect(header.configFingerprint).not.toBe(base.configFingerprint)
@@ -309,6 +321,8 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const first = await manager.prepareProfile(projectLink, { profileScope: firstScope })
     await rm(projectLink)
     await symlink(projectB, projectLink, 'dir')
+    await expect(manager.prepareProfile(projectLink, { profileScope: firstScope }))
+      .rejects.toThrow('canonical project path changed')
     const secondScope = await resolveOpenCodeProfileScope({
       projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
     })
@@ -316,6 +330,19 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(first.projectPath).toBe(projectA)
     expect(second.projectPath).toBe(projectB)
     expect(second.profileRootPath).not.toBe(first.profileRootPath)
+  })
+
+  test('fails closed for a scoped preparation without its resolver-issued snapshot', async () => {
+    const projectPath = path.join(tempDir, 'forged-scope-project')
+    await mkdir(projectPath)
+    await expect(new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: {
+        purpose: 'catalog',
+        providerId: 'custom',
+        configFingerprint: 'forged',
+        scopeToken: 'forged',
+      },
+    })).rejects.toThrow('exact resolver-issued snapshot')
   })
 
   test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
@@ -1335,45 +1362,33 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         'opencode-kiro@0.4.0',
         '@rama_nigg/open-cursor@2.5.2',
       ])
-      const scopedProfile = await manager.prepareProfile(
+      const catalogScope = (providerId: string) => resolveOpenCodeProfileScope({
         projectPath,
-        {
-          profileScope: {
-            purpose: 'catalog',
-            providerId: 'deepinfra',
-            configFingerprint: 'catalog-v1',
-          },
-        },
-      )
-      expect(scopedProfile.managedConfig.plugin).toEqual(['unsafe-plugin', 'project-user-plugin'])
+        purpose: 'catalog',
+        selectedModel: `${providerId}/catalog`,
+      })
+      const scopedProfile = await manager.prepareProfile(projectPath, {
+        profileScope: await catalogScope('deepinfra'),
+      })
+      expect(scopedProfile.managedConfig.plugin).toEqual([])
+      expect(scopedProfile.managedConfig.provider).toEqual({})
+      expect(scopedProfile.workingDirectoryPath).not.toBe(projectPath)
       const kiroProfile = await manager.prepareProfile(
         projectPath,
         {
-          profileScope: {
-            purpose: 'catalog',
-            providerId: 'kiro',
-            configFingerprint: 'catalog-v1',
-          },
+          profileScope: await catalogScope('kiro'),
         },
       )
       expect(kiroProfile.managedConfig.plugin).toEqual([
-        'unsafe-plugin',
-        'project-user-plugin',
         'opencode-kiro@0.4.0',
       ])
       const cursorProfile = await manager.prepareProfile(
         projectPath,
         {
-          profileScope: {
-            purpose: 'catalog',
-            providerId: 'cursor-acp',
-            configFingerprint: 'catalog-v1',
-          },
+          profileScope: await catalogScope('cursor-acp'),
         },
       )
       expect(cursorProfile.managedConfig.plugin).toEqual([
-        'unsafe-plugin',
-        'project-user-plugin',
         '@rama_nigg/open-cursor@2.5.2',
       ])
       expect(managedConfig).not.toHaveProperty('permission')
