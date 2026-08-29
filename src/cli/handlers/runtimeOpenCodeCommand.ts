@@ -36,11 +36,13 @@ export async function runtimeOpenCodeCommand(opts: {
   json?: boolean
   output?: string
 }): Promise<void> {
+  const commandController = new AbortController()
   let signalCleanupPromise: Promise<void> | null = null
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
     if (signalCleanupPromise) {
       return
     }
+    commandController.abort(new Error(`OpenCode runtime command cancelled by signal (${exitCode})`))
     const watchdog = setTimeout(() => process.exit(exitCode), 5_000)
     watchdog.unref?.()
     signalCleanupPromise = openCodeHostManager.disposeUnregisteredOwnedHosts()
@@ -59,7 +61,9 @@ export async function runtimeOpenCodeCommand(opts: {
   try {
     const raw = await readFile(opts.input, 'utf8')
     const envelope = JSON.parse(raw) as unknown
-    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope, {
+      signal: commandController.signal,
+    })
     if (signalCleanupPromise) {
       await signalCleanupPromise
       return

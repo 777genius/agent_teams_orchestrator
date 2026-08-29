@@ -1,11 +1,23 @@
+import { createHash } from 'node:crypto'
+
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
-import { openCodeMcpManager } from './OpenCodeMcpManager.js'
+import {
+  OPEN_CODE_APP_MCP_SERVER_NAME,
+  openCodeMcpManager,
+} from './OpenCodeMcpManager.js'
+import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  buildManagedConfigFingerprint,
+  collectProjectBehaviorMetadata,
+  resolveOpenCodeProfileScope,
+} from './OpenCodeProfileManager.js'
+import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
@@ -44,9 +56,10 @@ type OpenCodeProvisioningProbeOptions = {
   phaseContext?: OpenCodePhaseContext
 }
 
-type RetainedProvisioningProbe = {
+export type RetainedOpenCodeProvisioningProbe = {
   snapshot: OpenCodeProvisioningSnapshot
-  release: () => Promise<void>
+  host: OpenCodeHostHandle | null
+  release: (keepAlive?: boolean) => Promise<void>
 }
 
 function cloneHost(handle: NonNullable<OpenCodeProvisioningSnapshot['host']>): NonNullable<OpenCodeProvisioningSnapshot['host']> {
@@ -77,6 +90,88 @@ export class OpenCodeProvisioningProbe {
 
   constructor(private readonly deps: OpenCodeProvisioningProbeDeps = {}) {}
 
+  async refreshSelectedProfileAuthority(input: {
+    host: OpenCodeHostHandle
+    selectedModel: string
+    expectedBehaviorFingerprint: string
+    contractConfigIdentity?: string | null
+    phaseContext?: OpenCodePhaseContext
+  }): Promise<OpenCodeHostHandle['profile'] | null> {
+    const selected = parseOpenCodeProviderScopedModelRef(input.selectedModel)
+    const profile = input.host.profile
+    if (!selected || profile.profileScope?.purpose !== 'launch_runtime') return null
+    const stable = (value: unknown): unknown => Array.isArray(value) ? value.map(stable)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+            .map(key => [key, stable((value as Record<string, unknown>)[key])]))
+        : value
+    const identity = (value: unknown) => createHash('sha256')
+      .update(JSON.stringify(stable(value))).digest('hex')
+    const selectedConfigIdentity = (config: Record<string, unknown>) => {
+      const provider = config.provider as Record<string, unknown> | undefined
+      const mcp = config.mcp as Record<string, unknown> | undefined
+      return buildManagedConfigFingerprint({
+        provider: { [selected.providerId]: provider?.[selected.providerId] ?? null },
+        model: config.model ?? null,
+        small_model: config.small_model ?? null,
+        plugin: config.plugin ?? null,
+        agent: config.agent ?? null,
+        default_agent: config.default_agent ?? null,
+        permission: config.permission ?? null,
+        command: config.command ?? null,
+        share: config.share ?? null,
+        snapshot: config.snapshot ?? null,
+        autoupdate: config.autoupdate ?? null,
+        mcp: { [OPEN_CODE_APP_MCP_SERVER_NAME]: mcp?.[OPEN_CODE_APP_MCP_SERVER_NAME] ?? null },
+      }, profile.env)
+    }
+    try {
+      input.phaseContext?.throwIfExpired()
+      const requestContext = input.phaseContext
+        ? { signal: input.phaseContext.signal, remainingMs: input.phaseContext.remainingMs }
+        : undefined
+      const client = (this.deps.clientFactory ?? openCodeClientFactory).create(
+        input.host.baseUrl,
+        requestContext,
+      )
+      const [liveConfig, appMcp, behavior, scope] = await Promise.all([
+        client.getConfig(),
+        (this.deps.mcpManager ?? openCodeMcpManager).ensureAppMcp({
+          baseUrl: input.host.baseUrl, attachIfMissing: false,
+          requestContext,
+        }),
+        collectProjectBehaviorMetadata(profile.canonicalProjectPath, profile.env),
+        resolveOpenCodeProfileScope({
+          projectPath: profile.canonicalProjectPath, purpose: 'launch_runtime',
+          selectedModel: selected.raw, env: profile.env,
+        }),
+      ])
+      input.phaseContext?.throwIfExpired()
+      const live = liveConfig as Record<string, unknown>
+      const liveMcp = (live.mcp as Record<string, unknown> | undefined)
+        ?.[OPEN_CODE_APP_MCP_SERVER_NAME]
+      const preparedMcp = (profile.managedConfig.mcp as Record<string, unknown> | undefined)
+        ?.[OPEN_CODE_APP_MCP_SERVER_NAME]
+      if (appMcp.summary.matchedServerName !== OPEN_CODE_APP_MCP_SERVER_NAME
+        || appMcp.summary.connected !== true || !liveMcp
+        || identity(liveMcp) !== identity(preparedMcp)
+        || (input.contractConfigIdentity && identity(liveMcp) !== input.contractConfigIdentity)
+        || selectedConfigIdentity(live) !== selectedConfigIdentity(profile.managedConfig)
+        || scope.scopeToken !== profile.profileScope.scopeToken
+        || scope.configFingerprint !== profile.profileScope.configFingerprint
+        || scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity) return null
+      const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }
+      const evidence = await buildOpenCodeExpectedBehaviorEvidence({
+        profile: refreshed, fullModelId: selected.raw,
+        effectiveConfigFingerprint: profile.managedConfigFingerprint,
+      })
+      return evidence.expectedBehaviorFingerprint === input.expectedBehaviorFingerprint
+        ? refreshed : null
+    } catch {
+      return null
+    }
+  }
+
   async probe(
     projectPath?: string | null,
     options: OpenCodeProvisioningProbeOptions = {},
@@ -94,13 +189,18 @@ export class OpenCodeProvisioningProbe {
 
   async probeRetainingHost(
     projectPath?: string | null,
-    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> = {},
-  ): Promise<RetainedProvisioningProbe> {
+    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> & {
+      selectedModel?: string
+      leaseId?: string
+    } = {},
+  ): Promise<RetainedOpenCodeProvisioningProbe> {
     return this.probeWithHost(projectPath, {
       retainHost: true,
       useCache: false,
       toolApprovalMode: options.toolApprovalMode,
       phaseContext: options.phaseContext,
+      selectedModel: options.selectedModel,
+      leaseId: options.leaseId,
     })
   }
 
@@ -113,15 +213,62 @@ export class OpenCodeProvisioningProbe {
       ensureAppMcp?: boolean
       toolApprovalMode?: OpenCodeToolApprovalMode
       phaseContext?: OpenCodePhaseContext
+      selectedModel?: string
+      leaseId?: string
     },
-  ): Promise<RetainedProvisioningProbe> {
+  ): Promise<RetainedOpenCodeProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+    const selectedModel = options.selectedModel
+      ? parseOpenCodeProviderScopedModelRef(options.selectedModel)
+      : null
+    if (options.selectedModel && !selectedModel) {
+      throw new Error('OpenCode strict launch requires a provider-qualified selected model')
+    }
+    const profileScope = selectedModel
+      ? await resolveOpenCodeProfileScope({
+          projectPath,
+          purpose: 'launch_runtime',
+          selectedModel: selectedModel.raw,
+        })
+      : undefined
     const inventory = await inventoryService.probe(projectPath, {
       bypassCache: !options.useCache,
+      ...(profileScope ? { mode: 'profile' as const } : {}),
       includeAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
       abortSignal: options.phaseContext?.signal,
+      ...(profileScope ? { profileScope } : {}),
     })
+    if (profileScope && inventory.detected) {
+      const prepared = inventory.profile
+      const preparedScope = prepared?.profileScope
+      const authIdentity = prepared?.selectedSourceAuthIdentity
+      if (
+        !prepared
+        || !preparedScope
+        || inventory.projectPath !== prepared.canonicalProjectPath
+        || prepared.projectPath !== prepared.canonicalProjectPath
+        || prepared.scopeToken !== profileScope.scopeToken
+        || preparedScope.scopeToken !== profileScope.scopeToken
+        || preparedScope.purpose !== 'launch_runtime'
+        || preparedScope.providerId !== selectedModel!.providerId
+        || preparedScope.configFingerprint !== profileScope.configFingerprint
+        || preparedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
+        || !prepared.managedConfig
+        || Array.isArray(prepared.managedConfig)
+        || buildManagedConfigFingerprint(prepared.managedConfig, prepared.env)
+          !== prepared.managedConfigFingerprint
+        || authIdentity === undefined
+        || authIdentity === 'error'
+        || prepared.selectedManagedAuthIdentity === undefined
+        || prepared.selectedManagedAuthIdentity === 'error'
+        || authIdentity !== prepared.selectedManagedAuthIdentity
+        || authIdentity !== profileScope.selectedAuthIdentity
+        || prepared.authState !== 'ok'
+      ) {
+        throw new Error('OpenCode strict launch profile scope evidence is invalid')
+      }
+    }
     const cacheKey = [
       inventory.projectPath,
       inventory.profile?.projectBehaviorFingerprint ?? 'none',
@@ -134,6 +281,7 @@ export class OpenCodeProvisioningProbe {
     if (cached && cached.expiresAt > Date.now()) {
       return {
         snapshot: cached.snapshot,
+        host: cached.snapshot.host,
         release: async () => {},
       }
     }
@@ -163,6 +311,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host: null,
         release: async () => {},
       }
     }
@@ -172,16 +321,18 @@ export class OpenCodeProvisioningProbe {
     const mcpManager = this.deps.mcpManager ?? openCodeMcpManager
 
     let host: OpenCodeHostHandle | undefined
-    const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      options.leaseId ? `strict-launch-${options.leaseId}` : 'readiness',
+    )
     let released = false
-    const release = async () => {
+    const release = async (keepAlive = false) => {
       if (released || !host) {
         return
       }
       released = true
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (options.disposeHostOnRelease !== false) {
-        await hostManager.releaseHost(host.hostKey)
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive })
       }
     }
     try {
@@ -195,6 +346,10 @@ export class OpenCodeProvisioningProbe {
         hostLifetime: options.retainHost || options.disposeHostOnRelease === false
           ? 'persistent'
           : 'process',
+        ...(profileScope ? {
+          prewarmManagedSubscriptionPlugins: false,
+          resolveConfigFingerprint: false,
+        } : {}),
       })
       host = await ensurePromise
       if (options.phaseContext?.signal.aborted) {
@@ -236,6 +391,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host: null,
         release,
       }
     }
@@ -246,6 +402,62 @@ export class OpenCodeProvisioningProbe {
           remainingMs: options.phaseContext.remainingMs,
         }
       : undefined
+    if (profileScope) {
+      try {
+        if (
+          host.projectPath !== inventory.projectPath
+          || host.profile.profileRootKey !== inventory.profile?.profileRootKey
+          || host.profile.profileScope?.scopeToken !== profileScope.scopeToken
+          || host.profile.profileScope?.purpose !== 'launch_runtime'
+          || host.profile.profileScope?.providerId !== selectedModel!.providerId
+          || host.profile.profileScope?.configFingerprint !== profileScope.configFingerprint
+          || host.profile.selectedSourceAuthIdentity
+            !== inventory.profile?.selectedSourceAuthIdentity
+          || host.profile.selectedManagedAuthIdentity
+            !== inventory.profile?.selectedManagedAuthIdentity
+          || host.profile.authState !== 'ok'
+          || host.profile.managedConfigFingerprint !== inventory.profile?.managedConfigFingerprint
+          || buildManagedConfigFingerprint(host.profile.managedConfig, host.profile.env)
+            !== host.profile.managedConfigFingerprint
+          || host.resolvedConfigFingerprint !== inventory.profile?.managedConfigFingerprint
+        ) {
+          throw new Error('OpenCode strict launch retained host/profile fingerprint mismatch')
+        }
+        const appMcp = await mcpManager.ensureAppMcp({
+          baseUrl: host.baseUrl,
+          attachIfMissing: true,
+          requestContext,
+        })
+        const appMcpReady = appMcp.summary.status === 'attached'
+          || appMcp.summary.status === 'present'
+        return {
+          snapshot: {
+            detected: true,
+            hostHealthy: host.state === 'healthy' && appMcpReady,
+            projectPath: inventory.projectPath,
+            models: [selectedModel!.raw],
+            modelMetadata: [],
+            profile: inventory.profile,
+            host: cloneHost(host),
+            config: null,
+            configProviders: null,
+            providers: null,
+            providerAuth: null,
+            agents: [],
+            mcp: appMcp.mcp,
+            appMcp: appMcp.summary,
+            probeError: appMcpReady ? null : 'OpenCode App MCP is unavailable',
+            diagnostics: [...inventory.diagnostics, ...appMcp.summary.diagnostics],
+          },
+          host,
+          release,
+        }
+      } catch (error) {
+        await release()
+        throw error
+      }
+    }
+
     const client = clientFactory.create(host.baseUrl, requestContext)
 
     try {
@@ -351,6 +563,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host,
         release,
       }
     } catch (error) {
@@ -388,6 +601,7 @@ export class OpenCodeProvisioningProbe {
       })
       return {
         snapshot,
+        host,
         release,
       }
     } finally {

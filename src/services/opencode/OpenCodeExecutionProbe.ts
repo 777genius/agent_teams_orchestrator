@@ -96,7 +96,12 @@ type ProbeModelParams = {
   outputTokens?: number
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
-  runtimeDeadline?: OpenCodeRuntimeDeadline
+  runtimeDeadline?: Pick<
+    OpenCodeRuntimeDeadline,
+    'signal' | 'remainingMs' | 'throwIfExpired' | 'runPhase'
+  >
+  requireExactOutput?: boolean
+  cleanupSuccessfulSession?: boolean
   cursorNativePreflightBeforeHost?: boolean
   cursorNativePreflightOnly?: boolean
 }
@@ -202,6 +207,16 @@ function parseProviderScopedModel(selectedModel: string): {
   }
 }
 
+function getObservedAssistantModel(
+  summary: OpenCodeSessionReconcileSummary,
+): { providerId: string; modelId: string } | null {
+  const assistant = [...summary.messages]
+    .reverse()
+    .find(message => message.id === summary.latestAssistantMessageId && message.role === 'assistant')
+  if (!assistant?.providerId || !assistant.modelId) return null
+  return { providerId: assistant.providerId, modelId: assistant.modelId }
+}
+
 export function resolveOpenCodeExecutionProbeContextTokens(selectedModel: string): number {
   return selectedModel.startsWith('cursor-acp/') || selectedModel.startsWith('kiro/')
     ? OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT
@@ -222,6 +237,17 @@ function buildDurationMs(startedAtMs: number): number {
 
 function isProbeSuccessOutput(value: string | null | undefined): boolean {
   return /\bPONG\b/i.test(value?.trim() ?? '')
+}
+
+function isExpectedProbeOutput(
+  value: string | null | undefined,
+  expectedOutput: string,
+  requireExactOutput: boolean,
+): boolean {
+  const normalized = value?.trim() ?? ''
+  return requireExactOutput
+    ? normalized === expectedOutput
+    : isProbeSuccessOutput(normalized)
 }
 
 function normalizeFailureMessage(value: string): string {
@@ -354,25 +380,9 @@ function buildCursorNativeExecutionOutcome(input: {
   const { nativeResult, diagnostics } = input
   if (nativeResult?.outcome === 'available') {
     diagnostics.add(
-      `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
+      `Cursor native execution probe completed in ${nativeResult.durationMs}ms without canonical assistant provider/model evidence`,
     )
-    return {
-      providerId: 'opencode',
-      modelId: input.selectedModel,
-      probePrompt: input.prompt,
-      expectedOutput: input.expectedOutput,
-      outcome: 'available',
-      reason: null,
-      durationMs: buildDurationMs(input.startedAtMs),
-      rawStatus: null,
-      durableState: 'idle',
-      latestAssistantText: null,
-      latestAssistantPreview: null,
-      toolCallCount: 0,
-      errorCount: 0,
-      diagnostics: Array.from(diagnostics),
-      verifiedAt: new Date().toISOString(),
-    }
+    return null
   }
 
   if (nativeResult?.outcome !== 'failure') return null
@@ -655,7 +665,7 @@ export class OpenCodeExecutionProbe {
   }
 
   private runPhase<T>(
-    deadline: OpenCodeRuntimeDeadline | undefined,
+    deadline: ProbeModelParams['runtimeDeadline'],
     phase: OpenCodePhaseContext['phase'],
     operation: (context?: OpenCodePhaseContext) => Promise<T>,
   ): Promise<T> {
@@ -792,6 +802,25 @@ export class OpenCodeExecutionProbe {
     // A generic probe key cannot prove the exact prepared host identity. Until
     // that identity is available here, every proof is deliberately fresh.
     return cloneProbeResult(await this.runProbeModel({ ...params, bypassCache: true }))
+  }
+
+  async probeModelOnHost(
+    params: ProbeModelParams & { host: OpenCodeHostHandle },
+  ): Promise<OpenCodeExecutionProbeResult> {
+    const startedAtMs = nowMs()
+    const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
+    const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
+    parseProviderScopedModel(params.selectedModel)
+    return cloneProbeResult(await this.runProbeModelWithHost({
+      params: { ...params, bypassCache: true },
+      host: params.host,
+      startedAtMs,
+      prompt,
+      expectedOutput,
+      probeTimeoutMs: Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS),
+      pollIntervalMs: Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS),
+      diagnostics: new Set<string>(),
+    }))
   }
 
   private async runProbeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
@@ -1010,6 +1039,31 @@ export class OpenCodeExecutionProbe {
         })
       }
       return result
+    }
+    const finishObservedAssistantResult = (
+      result: OpenCodeExecutionProbeResult,
+      summary: OpenCodeSessionReconcileSummary,
+    ): Promise<OpenCodeExecutionProbeResult> => {
+      const observed = getObservedAssistantModel(summary)
+      const selected = parseProviderScopedModel(params.selectedModel)
+      if (observed) {
+        result.observedProviderId = observed.providerId
+        result.observedModelId = observed.modelId
+      }
+      if (
+        !observed
+        || observed.providerId !== selected.providerID
+        || observed.modelId !== selected.modelID
+      ) {
+        const actual = observed
+          ? `"${observed.providerId}/${observed.modelId}"`
+          : 'unavailable'
+        result.outcome = 'unavailable'
+        result.reason = `OpenCode canonical assistant provider/model was ${actual}; expected "${params.selectedModel}"`
+        delete result.verifiedAt
+        result.diagnostics.push(result.reason)
+      }
+      return finish(result)
     }
 
     const nativeFailureProbe = this.cursorNativeFailureProbe
@@ -1334,7 +1388,7 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'OpenCode original probe recovered before the auxiliary Cursor failure was applied',
               )
-              return finish({
+              return finishObservedAssistantResult({
                 providerId: 'opencode',
                 modelId: params.selectedModel,
                 probePrompt: prompt,
@@ -1350,7 +1404,7 @@ export class OpenCodeExecutionProbe {
                 errorCount: recovered.errorCount,
                 diagnostics: Array.from(diagnostics),
                 verifiedAt: new Date().toISOString(),
-              })
+              }, recovered)
             }
             diagnostics.add(
               `Cursor native failure probe confirmed a terminal provider error in ${nativeTerminalFailure.durationMs}ms`,
@@ -1540,12 +1594,20 @@ export class OpenCodeExecutionProbe {
           if (
             summary.durableState === 'idle'
             && (
-              isProbeSuccessOutput(summary.latestAssistantText)
-              || isProbeSuccessOutput(summary.latestAssistantPreview)
+              isExpectedProbeOutput(
+                summary.latestAssistantText,
+                expectedOutput,
+                params.requireExactOutput === true,
+              )
+              || isExpectedProbeOutput(
+                summary.latestAssistantPreview,
+                expectedOutput,
+                params.requireExactOutput === true,
+              )
             )
           ) {
             sessionRequiresCleanup = false
-            return finish({
+            return finishObservedAssistantResult({
               providerId: 'opencode',
               modelId: params.selectedModel,
               probePrompt: prompt,
@@ -1561,7 +1623,7 @@ export class OpenCodeExecutionProbe {
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
               verifiedAt: new Date().toISOString(),
-            })
+            }, summary)
           }
 
           const latestAssistantError = getLatestAssistantMessageError(
@@ -1674,6 +1736,8 @@ export class OpenCodeExecutionProbe {
               )
             }
             if (
+              params.requireExactOutput !== true
+              &&
               summary.durableState === 'idle'
               && classified.outcome === 'unknown'
               && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
@@ -1682,7 +1746,7 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
               )
-              return finish({
+              return finishObservedAssistantResult({
                 providerId: 'opencode',
                 modelId: params.selectedModel,
                 probePrompt: prompt,
@@ -1698,7 +1762,7 @@ export class OpenCodeExecutionProbe {
                 errorCount: summary.errorCount,
                 diagnostics: Array.from(diagnostics),
                 verifiedAt: new Date().toISOString(),
-              })
+              }, summary)
             }
 
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
@@ -1743,7 +1807,7 @@ export class OpenCodeExecutionProbe {
         nativeFailureController?.abort()
       })
     } finally {
-      if (sessionId && sessionRequiresCleanup) {
+      if (sessionId && (sessionRequiresCleanup || params.cleanupSuccessfulSession === true)) {
         await this.cleanupProbeSession(host, sessionId).catch(() => undefined)
       }
     }

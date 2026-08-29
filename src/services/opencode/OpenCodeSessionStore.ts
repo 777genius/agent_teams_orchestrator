@@ -11,9 +11,16 @@ import type { OpenCodeSessionRecord } from './types.js'
 type SessionStoreShape = {
   schemaVersion: 1
   records: Record<string, OpenCodeSessionRecord>
+  materializationClaims?: Record<string, string>
+  materializationOwners?: Record<string, { attemptId: string; sessionId: string }>
 }
 
 type UpsertResult = 'created' | 'updated' | 'unchanged'
+export type MaterializationClaimResult =
+  | { kind: 'claimed' }
+  | { kind: 'already_owned' }
+  | { kind: 'existing'; record: OpenCodeSessionRecord }
+  | { kind: 'owned_by_other' }
 
 const LOCK_OPTIONS = {
   retries: {
@@ -118,6 +125,108 @@ export class OpenCodeSessionStore {
       store.records[key] = record
       await this.writeStore(store)
       return previous ? 'updated' : 'created'
+    })
+  }
+
+  async claimMaterialization(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+    attemptId: string,
+  ): Promise<MaterializationClaimResult> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(identity)
+      const existing = store.records[key]
+      if (existing) return { kind: 'existing', record: existing }
+      store.materializationClaims ??= {}
+      const owner = store.materializationClaims[key]
+      if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
+      if (owner === attemptId) return { kind: 'already_owned' }
+      store.materializationClaims[key] = attemptId
+      await this.writeStore(store)
+      return { kind: 'claimed' }
+    })
+  }
+
+  async commitMaterialization(record: OpenCodeSessionRecord, attemptId: string): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      if (store.materializationClaims?.[key] !== attemptId || store.records[key]) return false
+      store.records[key] = record
+      delete store.materializationClaims[key]
+      store.materializationOwners ??= {}
+      store.materializationOwners[key] = { attemptId, sessionId: record.opencodeSessionId }
+      await this.writeStore(store)
+      return true
+    })
+  }
+
+  async releaseMaterializationClaim(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+    attemptId: string,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(identity)
+      if (store.materializationClaims?.[key] !== attemptId) return false
+      delete store.materializationClaims[key]
+      await this.writeStore(store)
+      return true
+    })
+  }
+
+  async markStaleIfSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>,
+    staleReason: string,
+    attemptId?: string,
+  ): Promise<OpenCodeSessionRecord | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const previous = store.records[key]
+      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId) return null
+      const owner = store.materializationOwners?.[key]
+      if (attemptId && (owner?.attemptId !== attemptId || owner.sessionId !== record.opencodeSessionId)) {
+        return null
+      }
+      const next = { ...previous, staleReason, updatedAt: new Date().toISOString() }
+      store.records[key] = next
+      await this.writeStore(store)
+      return next
+    })
+  }
+
+  async deleteIfSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>,
+    attemptId?: string,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      if (store.records[key]?.opencodeSessionId !== record.opencodeSessionId) return false
+      const owner = store.materializationOwners?.[key]
+      if (attemptId && (owner?.attemptId !== attemptId || owner.sessionId !== record.opencodeSessionId)) {
+        return false
+      }
+      delete store.records[key]
+      if (store.materializationOwners) delete store.materializationOwners[key]
+      await this.writeStore(store)
+      return true
+    })
+  }
+
+  async releaseMaterializationOwner(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>,
+    attemptId: string,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const owner = store.materializationOwners?.[key]
+      if (owner?.attemptId !== attemptId || owner.sessionId !== record.opencodeSessionId) return false
+      delete store.materializationOwners[key]
+      await this.writeStore(store)
+      return true
     })
   }
 

@@ -4,11 +4,13 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
+import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
 
 import type {
   OpenCodeExecutionProbeResult,
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
+  OpenCodeProfileScope,
 } from '../../../../services/opencode/types.js'
 import type {
   OpenCodeHostLeaseInput,
@@ -1994,6 +1996,72 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     })
     expect(result.value.prompts.map(prompt => prompt.key)).toEqual(['accountId', 'gatewayId'])
+  })
+
+  test('loads setup through a read-only selected-provider profile without native auth or unrelated plugin fanout', async () => {
+    const cases = [
+      { providerId: 'openai', managedPlugins: [] },
+      { providerId: 'kiro', managedPlugins: ['opencode-kiro@0.4.0'] },
+      { providerId: 'cursor-acp', managedPlugins: ['@rama_nigg/open-cursor@2.5.2'] },
+    ] as const
+
+    for (const testCase of cases) {
+      let probeScope: OpenCodeProfileScope | undefined
+      let hostScope: OpenCodeProfileScope | undefined
+      let prewarmManagedSubscriptionPlugins: boolean | undefined
+      let probePolicy: ReturnType<typeof planOpenCodeProfilePolicy> | undefined
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async (_projectPath, options) => {
+            probeScope = options?.profileScope
+            probePolicy = probeScope ? planOpenCodeProfilePolicy(probeScope) : undefined
+            return inventory({
+              availableProviders: [testCase.providerId],
+              models: [`${testCase.providerId}/test-model`],
+            })
+          },
+        },
+        hostManager: {
+          ensureHost: async options => {
+            hostScope = options.profileOptions?.profileScope
+            prewarmManagedSubscriptionPlugins = options.prewarmManagedSubscriptionPlugins
+            return host()
+          },
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({ providers: [], default: {} }),
+            getProviders: async () => ({
+              all: [{ id: testCase.providerId, name: testCase.providerId }],
+              connected: [],
+              default: {},
+            }),
+            getProviderAuth: async () => ({
+              [testCase.providerId]: [{ type: 'api' }],
+            }),
+          }),
+        },
+      })
+
+      const result = await adapter.loadSetupForm({
+        runtimeId: 'opencode',
+        providerId: testCase.providerId,
+        projectPath: '/tmp/fake-provider-setup-project',
+      })
+
+      expect(result.ok).toBe(true)
+      expect(probeScope).toMatchObject({
+        purpose: 'catalog',
+        providerId: testCase.providerId,
+      })
+      expect(typeof probeScope?.configFingerprint).toBe('string')
+      expect(typeof probeScope?.scopeToken).toBe('string')
+      expect(hostScope).toEqual(probeScope)
+      expect(prewarmManagedSubscriptionPlugins).toBe(false)
+      expect(probePolicy?.reconcileAuth).toBe(false)
+      expect(probePolicy?.managedSubscriptionPlugins).toEqual(testCase.managedPlugins)
+    }
   })
 
   test('exposes every live OpenCode OAuth and API auth method through one setup form', async () => {

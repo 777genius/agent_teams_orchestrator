@@ -26,6 +26,18 @@ export type OpenCodeBridgeCommandEvidence = {
   }
 }
 
+export function requireOpenCodeExpectedBehaviorFingerprint(
+  preconditions: OpenCodeBridgeCommandPreconditions | null,
+): string {
+  const value = preconditions?.expectedBehaviorFingerprint
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(
+      'OpenCode strict launch expectedBehaviorFingerprint must be lowercase SHA-256',
+    )
+  }
+  return value
+}
+
 type ValidationInput = {
   body: Record<string, unknown>
   runtime: OpenCodeBridgePreconditionRuntime
@@ -124,7 +136,7 @@ export function parseOpenCodeBridgePreconditions(
       record.expectedCapabilitySnapshotId,
       'expectedCapabilitySnapshotId',
     ),
-    expectedBehaviorFingerprint: requireNullableString(
+    expectedBehaviorFingerprint: requireNullableExactString(
       record.expectedBehaviorFingerprint,
       'expectedBehaviorFingerprint',
     ),
@@ -176,6 +188,14 @@ function requireNullableString(value: unknown, field: string): string | null {
     return null
   }
   return requireString(value, field)
+}
+
+function requireNullableExactString(value: unknown, field: string): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`OpenCode bridge precondition ${field} must be a non-empty string`)
+  }
+  return value
 }
 
 function requireNullableNumber(value: unknown, field: string): number | null {

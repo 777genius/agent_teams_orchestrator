@@ -85,4 +85,52 @@ describe('OpenCodeSessionStore', () => {
     ).toEqual(secondary)
     expect(await store.list()).toHaveLength(2)
   })
+
+  test('atomically assigns materialization to one attempt and commits only its claim', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    const claims = await Promise.all([
+      store.claimMaterialization(identity, 'attempt-a'),
+      store.claimMaterialization(identity, 'attempt-b'),
+    ])
+    expect(claims).toEqual(expect.arrayContaining([
+      { kind: 'claimed' },
+      { kind: 'owned_by_other' },
+    ]))
+    const winner = claims[0]?.kind === 'claimed' ? 'attempt-a' : 'attempt-b'
+    const loser = winner === 'attempt-a' ? 'attempt-b' : 'attempt-a'
+    expect(await store.commitMaterialization(baseRecord, loser)).toBe(false)
+    expect(await store.commitMaterialization(baseRecord, winner)).toBe(true)
+    expect(await store.markStaleIfSession(baseRecord, 'launch_failed', loser)).toBeNull()
+    expect(await store.deleteIfSession(baseRecord, loser)).toBe(false)
+    expect(await store.get(baseRecord.teamId, baseRecord.memberName)).toEqual(baseRecord)
+  })
+
+  test('distinguishes a newly acquired claim from a replay by the same attempt', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'claimed' })
+    expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'already_owned' })
+    expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'owned_by_other' })
+  })
+
+  test('conditional cleanup never mutates or deletes a replacement session', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const replacement = { ...baseRecord, opencodeSessionId: 'session-winner' }
+    await store.upsert(replacement)
+
+    expect(await store.markStaleIfSession(baseRecord, 'launch_failed')).toBeNull()
+    expect(await store.deleteIfSession(baseRecord)).toBe(false)
+    expect(await store.get(baseRecord.teamId, baseRecord.memberName)).toEqual(replacement)
+  })
 })

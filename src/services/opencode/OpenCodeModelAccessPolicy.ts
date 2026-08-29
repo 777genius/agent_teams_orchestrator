@@ -4,6 +4,7 @@ import {
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
 import { isOpenCodeBuiltinFreeModelId } from './OpenCodeInventoryService.js'
+import { isLiteralLoopbackOpenCodeUrl } from './OpenCodeProviderIdentity.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -117,25 +118,6 @@ function getProviderEntryBaseUrl(entry: OpenCodeProviderListEntry): string | nul
   return asString(options?.baseURL) ?? asString(options?.baseUrl)
 }
 
-function isLoopbackOpenCodeBaseUrl(value: string | null): boolean {
-  if (!value) {
-    return false
-  }
-  try {
-    const url = new URL(value)
-    const hostname = url.hostname.toLowerCase()
-    return (
-      hostname === 'localhost'
-      || hostname === '0.0.0.0'
-      || hostname === '::1'
-      || hostname === '[::1]'
-      || hostname.startsWith('127.')
-    )
-  } catch {
-    return false
-  }
-}
-
 function isOpenAiCompatibleProviderEntry(entry: OpenCodeProviderListEntry): boolean {
   const record = asRecord(entry)
   return asString(record?.npm) === '@ai-sdk/openai-compatible'
@@ -147,7 +129,7 @@ function isAuthlessCapableProviderEntry(entry: OpenCodeProviderListEntry): boole
     return true
   }
   return isOpenAiCompatibleProviderEntry(entry)
-    && isLoopbackOpenCodeBaseUrl(getProviderEntryBaseUrl(entry))
+    && isLiteralLoopbackOpenCodeUrl(getProviderEntryBaseUrl(entry))
 }
 
 function findProviderEntries(

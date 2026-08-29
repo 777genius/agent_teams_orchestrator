@@ -1,7 +1,20 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
+import {
+  buildManagedConfigFingerprint,
+  OpenCodeProfileManager,
+  resolveOpenCodeProfileScope,
+} from './OpenCodeProfileManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import {
+  removeOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
+} from './OpenCodeAuthStore.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -73,6 +86,224 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
+  for (const selectedModel of [
+    'deepinfra/chosen', 'custom-provider/nested/model',
+  ]) {
+    test(`keeps strict ${selectedModel} provisioning selected-provider scoped`, async () => {
+      const authorityEnvName = selectedModel.startsWith('deepinfra/')
+        ? 'DEEPINFRA_API_KEY'
+        : 'CUSTOM_PROVIDER_API_KEY'
+      const previousAuthority = process.env[authorityEnvName]
+      const previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+      const previousMcpArgs = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+      process.env[authorityEnvName] = 'focused-test-static-authority'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = JSON.stringify([
+        '-e', 'process.stdin.resume()',
+      ])
+      try {
+      const commandLog: string[] = []
+      let inventoryInput: Record<string, unknown> | null = null
+      let ensureInput: Record<string, unknown> | null = null
+      const mcpUrls: string[] = []
+      const releasedHosts: string[] = []
+      let prepared: OpenCodePreparedProfile | null = null
+      let retainedHost: OpenCodeHostHandle | null = null
+      const probe = new OpenCodeProvisioningProbe({
+        inventoryService: {
+          probe: async (projectPath, options) => {
+            inventoryInput = options
+            const scope = options.profileScope!
+            prepared = {
+              ...profile, projectPath: projectPath!, canonicalProjectPath: projectPath!,
+              scopeToken: scope.scopeToken, profileScope: scope, managedConfig: {},
+              managedConfigFingerprint: buildManagedConfigFingerprint({}),
+              selectedSourceAuthIdentity: scope.selectedAuthIdentity,
+              selectedManagedAuthIdentity: scope.selectedAuthIdentity,
+              authState: 'ok',
+            }
+            return {
+              ...inventory, projectPath: projectPath!, profile: prepared,
+              connectedProviders: [], availableProviders: [], models: [], agents: [],
+            }
+          },
+        },
+        hostManager: {
+          ensureHost: async input => {
+            ensureInput = input
+            const preparedProfile = input.preparedProfile!
+            retainedHost = {
+              ...host, projectPath: preparedProfile.projectPath,
+              profileRootKey: preparedProfile.profileRootKey, profile: preparedProfile,
+              resolvedConfigFingerprint: preparedProfile.managedConfigFingerprint,
+            }
+            return retainedHost
+          },
+          retainHostLease: async () => {},
+          releaseHostLease: async () => {},
+          releaseHost: async hostKey => { releasedHosts.push(hostKey) },
+          refreshResolvedConfigFingerprint: async () => { throw new Error('broad refresh') },
+        },
+        clientFactory: { create: () => { throw new Error('broad live client') } },
+        mcpManager: {
+          ensureAppMcp: async input => {
+            mcpUrls.push(input.baseUrl)
+            return {
+              mcp: { 'agent-teams': { connected: true } },
+              summary: {
+                serverName: 'agent-teams', matchedServerName: 'agent-teams',
+                status: 'present' as const, connected: true, launchSource: null,
+                availableServerNames: ['agent-teams'], diagnostics: [],
+              },
+            }
+          },
+        },
+      })
+
+      const retained = await probe.probeRetainingHost('/tmp/project', {
+        selectedModel, leaseId: 'lease-scoped',
+      })
+      expect(inventoryInput).toEqual(expect.objectContaining({
+        mode: 'profile',
+        profileScope: expect.objectContaining({
+          purpose: 'launch_runtime',
+          providerId: selectedModel.slice(0, selectedModel.indexOf('/')),
+        }),
+      }))
+      expect(ensureInput).toEqual(expect.objectContaining({
+        preparedProfile: prepared,
+        prewarmManagedSubscriptionPlugins: false,
+        resolveConfigFingerprint: false,
+      }))
+      expect(mcpUrls).toEqual([retainedHost!.baseUrl])
+      expect(commandLog).toEqual([])
+      await retained.release()
+      expect(releasedHosts).toEqual([retainedHost!.hostKey])
+      } finally {
+        if (previousAuthority === undefined) delete process.env[authorityEnvName]
+        else process.env[authorityEnvName] = previousAuthority
+        if (previousMcpCommand === undefined) {
+          delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+        } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+        if (previousMcpArgs === undefined) {
+          delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+        } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = previousMcpArgs
+      }
+    })
+  }
+
+  test('refreshes selected config/project/auth/MCP authority and fails closed on each mutation', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-selected-refresh-'))
+    const keys = [
+      'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+      'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON',
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
+      'OPENCODE_CONFIG_CONTENT', 'SELECTED_ROUTE_AUTHORITY', 'DEEPINFRA_API_KEY',
+    ] as const
+    const original = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    try {
+      const projectPath = path.join(tempDir, 'project')
+      const mcpEntry = path.join(tempDir, 'fake-mcp.js')
+      await mkdir(projectPath, { recursive: true })
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
+      await writeFile(mcpEntry, 'process.stdin.resume()')
+      process.env.HOME = path.join(tempDir, 'home')
+      process.env.USERPROFILE = process.env.HOME
+      process.env.XDG_CONFIG_HOME = path.join(tempDir, 'config')
+      process.env.XDG_DATA_HOME = path.join(tempDir, 'data')
+      process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(tempDir, 'app-data')
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(tempDir, 'app-cache')
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = mcpEntry
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
+      process.env.DEEPINFRA_API_KEY = 'focused-test-static-authority'
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        provider: { deepinfra: { options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' } } },
+      })
+      const scope = await resolveOpenCodeProfileScope({
+        projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
+      })
+      const prepared = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+        profileScope: scope,
+      })
+      const retainedHost = {
+        ...host, projectPath, profileRootKey: prepared.profileRootKey, profile: prepared,
+        resolvedConfigFingerprint: prepared.managedConfigFingerprint,
+      }
+      let liveConfig = structuredClone(prepared.managedConfig)
+      let connected = true
+      const probe = new OpenCodeProvisioningProbe({
+        clientFactory: { create: () => ({ getConfig: async () => liveConfig }) as never },
+        mcpManager: { ensureAppMcp: async () => ({
+          mcp: { 'agent-teams': { connected } },
+          summary: {
+            serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
+            connected, launchSource: null, availableServerNames: ['agent-teams'],
+            diagnostics: [],
+          },
+        }) },
+      })
+      const evidence = await buildOpenCodeExpectedBehaviorEvidence({
+        profile: prepared, fullModelId: 'deepinfra/chosen',
+        effectiveConfigFingerprint: prepared.managedConfigFingerprint,
+      })
+      const refresh = () => probe.refreshSelectedProfileAuthority({
+        host: retainedHost, selectedModel: 'deepinfra/chosen',
+        expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint,
+      })
+
+      const recomputedScope = await resolveOpenCodeProfileScope({
+        projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
+        env: prepared.env,
+      })
+      expect(prepared.appMcpLaunchSource).toBe('env-override')
+      expect(recomputedScope).toEqual(scope)
+      expect(await refresh()).not.toBeNull()
+      const liveMcp = (liveConfig.mcp as Record<string, unknown>)['agent-teams']
+      liveConfig = {
+        ...liveConfig,
+        mcp: {
+          ...(liveConfig.mcp as object),
+          'agent-teams': { ...liveMcp as object, url: 'https://mismatch.example/mcp' },
+        },
+      }
+      expect(await refresh()).toBeNull()
+      liveConfig = structuredClone(prepared.managedConfig)
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-two'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'mutated-command'
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify({ ROUTE: 'mutated' })
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'https://mutated.example/mcp'
+      expect(await refresh()).not.toBeNull()
+      process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
+      liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
+      expect(await refresh()).toBeNull()
+      liveConfig = structuredClone(prepared.managedConfig)
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
+      expect(await refresh()).toBeNull()
+      await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
+      await upsertOpenCodeAuthCredential({
+        authPath: prepared.managedAuthPath, providerId: 'deepinfra',
+        credential: { type: 'api', key: 'mutated-secret' },
+      })
+      expect(await refresh()).toBeNull()
+      await removeOpenCodeAuthCredential({
+        authPath: prepared.managedAuthPath, providerId: 'deepinfra',
+      })
+      connected = false
+      expect(await refresh()).toBeNull()
+    } finally {
+      for (const key of keys) {
+        if (original[key] === undefined) delete process.env[key]
+        else process.env[key] = original[key]
+      }
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({
       inventoryService: {

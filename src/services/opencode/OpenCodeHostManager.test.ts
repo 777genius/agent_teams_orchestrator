@@ -127,7 +127,7 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
-  test('isolates scoped hosts by process-keyed selected auth identity', () => {
+  test('isolates scoped hosts by the bound resolver scope token', () => {
     const scoped = {
       ...baseProfile,
       scopeToken: 'current-token',
@@ -2548,7 +2548,7 @@ describe('OpenCodeHostManager', () => {
     expect(refreshedFingerprint).toBe(initialFingerprint)
   })
 
-  test('preserves the previous resolved fingerprint when refresh probing fails', async () => {
+  test('makes live config unavailable when any refresh component fails', async () => {
     const spawned = createMockChildProcess()
     let phase: 'initial' | 'refresh' = 'initial'
 
@@ -2564,7 +2564,7 @@ describe('OpenCodeHostManager', () => {
           }
         }
         if (phase === 'refresh' && url.endsWith('/config')) {
-          throw new Error('fingerprint refresh unavailable')
+          return { status: 503, data: { error: 'unavailable' } }
         }
         if (url.endsWith('/config')) {
           return {
@@ -2609,7 +2609,7 @@ describe('OpenCodeHostManager', () => {
     const refreshedFingerprint = await manager.refreshResolvedConfigFingerprint('host-key')
 
     expect(initialFingerprint).not.toBeNull()
-    expect(refreshedFingerprint).toBe(initialFingerprint)
-    expect(manager.getHost('host-key')?.resolvedConfigFingerprint).toBe(initialFingerprint)
+    expect(refreshedFingerprint).toBeNull()
+    expect(manager.getHost('host-key')?.resolvedConfigFingerprint).toBeNull()
   })
 })

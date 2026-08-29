@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -79,6 +79,56 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
 })
 
 describe('OpenCodeExecutionProbe', () => {
+  let isolatedAuthorityRoot: string
+  const originalAuthorityEnv = {
+    HOME: process.env.HOME,
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    CLAUDE_MULTIMODEL_DATA_HOME: process.env.CLAUDE_MULTIMODEL_DATA_HOME,
+    CLAUDE_MULTIMODEL_CACHE_HOME: process.env.CLAUDE_MULTIMODEL_CACHE_HOME,
+    CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY:
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY,
+  }
+
+  beforeEach(async () => {
+    isolatedAuthorityRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-execution-probe-authority-'))
+    process.env.HOME = path.join(isolatedAuthorityRoot, 'home')
+    process.env.XDG_DATA_HOME = path.join(isolatedAuthorityRoot, 'xdg-data')
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(isolatedAuthorityRoot, 'data')
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(isolatedAuthorityRoot, 'cache')
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = path.join(
+      isolatedAuthorityRoot,
+      'agent-teams-mcp.js',
+    )
+    await writeFile(process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY, '')
+    const authDirectory = path.join(process.env.XDG_DATA_HOME, 'opencode')
+    await mkdir(authDirectory, { recursive: true })
+    await writeFile(
+      path.join(authDirectory, 'auth.json'),
+      JSON.stringify({
+        opencode: { type: 'api', key: 'test-opencode-key' },
+        openai: { type: 'api', key: 'test-openai-key' },
+        anthropic: { type: 'api', key: 'test-anthropic-key' },
+        google: { type: 'api', key: 'test-google-key' },
+        'kimi-for-coding': { type: 'api', key: 'test-kimi-key' },
+        ollama: { type: 'api', key: 'test-ollama-key' },
+        xai: {
+          type: 'oauth',
+          access: 'test-xai-access-token',
+          refresh: 'test-xai-refresh-token',
+          expires: 4_102_444_800_000,
+        },
+      }),
+    )
+  })
+
+  afterEach(async () => {
+    await rm(isolatedAuthorityRoot, { recursive: true, force: true })
+    for (const [name, value] of Object.entries(originalAuthorityEnv)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+
   test('classifies retired Google models as unavailable for the current account', () => {
     const message =
       'This model models/gemini-2.5-flash-lite is no longer available to new users.'
@@ -125,6 +175,8 @@ describe('OpenCodeExecutionProbe', () => {
     const releasedLeaseTeamIds: string[] = []
     let releaseHostCount = 0
     let promptAgent: string | null = null
+    let observedProviderId: string | undefined = 'opencode'
+    let observedModelId: string | undefined = 'big-pickle'
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -183,6 +235,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: observedProviderId,
+                modelID: observedModelId,
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -213,6 +267,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toBeNull()
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
+    expect(result).toMatchObject({
+      observedProviderId: 'opencode',
+      observedModelId: 'big-pickle',
+    })
     expect(promptAsyncCount).toBe(1)
     expect(promptAgent).toBe(OPEN_CODE_MODEL_PROBE_AGENT_NAME)
     expect(sendMessageCount).toBe(0)
@@ -233,6 +291,16 @@ describe('OpenCodeExecutionProbe', () => {
       },
       hostLifetime: 'process',
     })
+
+    observedProviderId = 'other'
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable', observedProviderId: 'other' })
+    observedProviderId = undefined
+    observedModelId = undefined
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable' })
   })
 
   async function expectCompletedAssistantResponseWithoutTextFailsFast(
@@ -528,7 +596,8 @@ describe('OpenCodeExecutionProbe', () => {
         sessionCleanupTimeoutMs: 5,
       })
 
-      const result = await probe.probeModel({
+      const result = await probe.probeModelOnHost({
+        host,
         selectedModel: 'cursor-acp/auto',
         projectPath: '/tmp/project',
         bypassCache: true,
@@ -626,6 +695,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -726,6 +797,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -852,9 +925,13 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {
+    let strictHostOnly = false
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async () => {
+          if (strictHostOnly) throw new Error('strict proof must not acquire another host')
+          return host
+        },
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -894,6 +971,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'ollama',
+                modelID: 'qwen2.5-coder:0.5b',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -920,6 +999,18 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.diagnostics.join('\n')).toContain(
       'Model verification completed with non-matching assistant output',
     )
+
+    strictHostOnly = true
+    const strictResult = await probe.probeModelOnHost({
+      host,
+      selectedModel: 'ollama/qwen2.5-coder:0.5b',
+      prompt: 'Output only this exact token: PONG',
+      expectedOutput: 'PONG',
+      requireExactOutput: true,
+      cleanupSuccessfulSession: true,
+    })
+    expect(strictResult.outcome).toBe('unknown')
+    expect(strictResult.latestAssistantText).toBe('PING')
   })
 
   test('does not treat a plain-text Cursor authentication error as execution proof', async () => {
@@ -961,7 +1052,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1009,7 +1101,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1113,7 +1206,8 @@ describe('OpenCodeExecutionProbe', () => {
     const runtimeDeadline = new OpenCodeRuntimeDeadline(250)
     const result = await (async () => {
       try {
-        return await probe.probeModel({
+        return await probe.probeModelOnHost({
+          host: managedHost,
           selectedModel: 'cursor-acp/auto',
           projectPath: '/tmp/project',
           runtimeDeadline,
@@ -1136,7 +1230,8 @@ describe('OpenCodeExecutionProbe', () => {
     expect(hungStatusSignal?.aborted).toBe(true)
     expect(abortCalls).toBeGreaterThan(0)
 
-    const freshResult = await probe.probeModel({
+    const freshResult = await probe.probeModelOnHost({
+      host: managedHost,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1193,7 +1288,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1256,7 +1352,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
@@ -1309,7 +1406,8 @@ describe('OpenCodeExecutionProbe', () => {
         },
       })
 
-      const result = await probe.probeModel({
+      const result = await probe.probeModelOnHost({
+        host,
         selectedModel: 'cursor-acp/auto',
         projectPath: '/tmp/project',
         bypassCache: true,
@@ -1355,6 +1453,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1375,7 +1475,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1431,7 +1532,8 @@ describe('OpenCodeExecutionProbe', () => {
       probeTimeoutMs: 1_000,
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1469,6 +1571,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1495,7 +1599,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1530,6 +1635,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'cursor-acp',
+              modelID: 'auto',
               sessionID: 'session-1',
               time: { created: 101, completed: 110 },
             },
@@ -1556,7 +1663,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1595,6 +1703,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1615,7 +1725,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1669,7 +1780,8 @@ describe('OpenCodeExecutionProbe', () => {
       probeTimeoutMs: 1_000,
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1721,15 +1833,14 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       cursorNativePreflightBeforeHost: true,
-    })
-
-    expect(result.outcome).toBe('unavailable')
-    expect(result.reason).toContain('RESOURCE_EXHAUSTED')
-    expect(prepareProfileCalls).toBe(1)
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
+    expect(prepareProfileCalls).toBe(0)
     expect(ensureHostCalls).toBe(0)
   })
 
@@ -1791,16 +1902,15 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
       cursorNativePreflightBeforeHost: true,
       cursorNativePreflightOnly: true,
-    })
-
-    expect(result.outcome).toBe('unknown')
-    expect(result.diagnostics.join('\n')).toContain('was inconclusive before OpenCode startup')
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
     expect(ensureHostCalls).toBe(0)
   })
 
@@ -1825,23 +1935,19 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
       cursorNativePreflightBeforeHost: true,
       cursorNativePreflightOnly: true,
-    })
-
-    expect(result).toMatchObject({
-      outcome: 'unknown',
-      failureCode: 'execution_timeout',
-      reason: 'Cursor native execution preflight timed out after 65000ms',
-    })
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
     expect(ensureHostCalls).toBe(0)
   })
 
-  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+  test('does not accept native Cursor success without canonical assistant model evidence', async () => {
     let createSessionCalls = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1884,12 +1990,14 @@ describe('OpenCodeExecutionProbe', () => {
     const result = await probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.verifiedAt).toBeTruthy()
+    expect(result.outcome).toBe('unknown')
+    expect(result.verifiedAt).toBeUndefined()
     expect(result.diagnostics.join('\n')).toContain(
-      'native execution probe confirmed model availability',
+      'without canonical assistant provider/model evidence',
     )
     expect(createSessionCalls).toBe(0)
   })
@@ -1917,6 +2025,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'cursor-acp',
+                modelID: 'auto',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -1937,7 +2047,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -2000,6 +2111,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2085,6 +2198,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'big-pickle',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2372,6 +2487,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2439,6 +2556,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2511,6 +2630,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'opencode',
+              modelID: 'minimax-m2.5-free',
               sessionID: `session-${createSessionCount}`,
               time: { created: 101, completed: 110 },
             },
@@ -2584,6 +2705,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: `msg-assistant-${createSessionCount}`,
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: `msg-user-${createSessionCount}`,
                 sessionID: `session-${createSessionCount}`,
                 time: { created: 101, completed: 110 },
@@ -2676,6 +2799,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2781,6 +2906,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2910,6 +3037,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-runtime-deadline',
                   role: 'assistant',
+                  providerID: 'ollama',
+                  modelID: 'gemma4:12b',
                   parentID: 'msg-user-runtime-deadline',
                   sessionID: 'session-runtime-deadline',
                   time: { created: 101, completed: 110 },
@@ -2976,13 +3105,31 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test('releases a host that finishes startup after the runtime deadline', async () => {
-    let resolveHost: ((value: OpenCodeHostHandle) => void) | null = null
+    let now = 0
+    let expireDeadline = () => {
+      throw new Error('runtime deadline timer was not installed')
+    }
+    let resolveHost = (_value: OpenCodeHostHandle) => {
+      throw new Error('host startup did not begin')
+    }
+    let markHostStartupStarted!: () => void
+    const hostStartupStarted = new Promise<void>(resolve => {
+      markHostStartupStarted = resolve
+    })
     let releaseHostCount = 0
-    const runtimeDeadline = new OpenCodeRuntimeDeadline(10)
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(10, {
+      monotonicNow: () => now,
+      setTimer: callback => {
+        expireDeadline = callback
+        return { unref() {} } as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => new Promise<OpenCodeHostHandle>(resolve => {
           resolveHost = resolve
+          markHostStartupStarted()
         }),
         releaseHost: async () => {
           releaseHostCount += 1
@@ -2998,7 +3145,10 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
         runtimeDeadline,
       })
-      setTimeout(() => resolveHost?.(host), 25)
+      await hostStartupStarted
+      now = 10
+      expireDeadline()
+      resolveHost(host)
 
       await expect(result).rejects.toBeInstanceOf(OpenCodeRuntimeDeadlineError)
       expect(releaseHostCount).toBe(1)

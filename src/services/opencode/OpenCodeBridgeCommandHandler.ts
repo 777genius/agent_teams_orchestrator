@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
 
@@ -18,8 +18,14 @@ import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
+  parseOpenCodeBridgePreconditions,
+  requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
+import {
+  buildOpenCodeExpectedBehaviorEvidence,
+  OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 import {
   hasOpenCodeBuiltinFreeModel,
   openCodeInventoryService,
@@ -36,6 +42,8 @@ import {
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -48,9 +56,20 @@ import {
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
-import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import {
+  isOpenCodeStrictSessionCompatible,
+  openCodeSessionBridge,
+} from './OpenCodeSessionBridge.js'
 import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import {
+  coordinateStrictLaunch,
+  type StrictCommittedMember,
+  type StrictLaunchPorts,
+  type StrictMember,
+  type StrictPortResult,
+  type StrictResource,
+} from './OpenCodeStrictLaunchCoordinator.js'
 import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
@@ -81,7 +100,9 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodeMessage,
+  OpenCodeMcpServerConfig,
   OpenCodeExecutionProof,
+  OpenCodeHostHandle,
   OpenCodePendingPermission,
   OpenCodeProvisioningSnapshot,
   OpenCodeNormalizedPermission,
@@ -962,6 +983,8 @@ function createBridgeServerIdentity(
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
       opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,
       opencodeFilePartsContractVersion: OPENCODE_FILE_PARTS_CONTRACT_VERSION,
+      expectedBehaviorFingerprintSchemaVersion:
+        OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
@@ -1236,6 +1259,7 @@ type AppMcpToolProof = {
   missingTools: string[]
   diagnostics: string[]
   route: string | null
+  contractConfigIdentity: string | null
 }
 
 // Cold workspace/source MCP startup can take longer than a model turn on dev
@@ -1246,7 +1270,7 @@ const SOURCE_APP_MCP_PREFLIGHT_TIMEOUT_MS = 90_000
 const APP_MCP_PREFLIGHT_TIMEOUT_ENV = 'AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS'
 const APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS = 2_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
-const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 1
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 2
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_TTL_MS = 10 * 60_000
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_PATH_ENV =
   'AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH'
@@ -1416,6 +1440,7 @@ function normalizeAppMcpToolProof(value: Record<string, unknown>): AppMcpToolPro
   const missingTools = asStringArray(value.missingTools).sort()
   const diagnostics = asStringArray(value.diagnostics)
   const route = asString(value.route)
+  const contractConfigIdentity = asString(value.contractConfigIdentity)
   if (!ok) {
     return null
   }
@@ -1425,6 +1450,7 @@ function normalizeAppMcpToolProof(value: Record<string, unknown>): AppMcpToolPro
     missingTools,
     diagnostics,
     route,
+    contractConfigIdentity,
   }
 }
 
@@ -1474,16 +1500,30 @@ async function proveAppMcpTools(
       missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
       diagnostics: ['OpenCode host is unavailable; app MCP tools cannot be proven'],
       route: null,
+      contractConfigIdentity: null,
     }
   }
 
   return proveAppMcpToolsFromLaunchConfig(phaseContext)
 }
 
+function getRetainedAppMcpLaunchConfig(host: OpenCodeHostHandle): ResolvedAppMcpLaunchConfig {
+  const source = host.profile.appMcpLaunchSource
+  const config = asRecord(host.profile.managedConfig.mcp)
+    ?.[OPEN_CODE_APP_MCP_SERVER_NAME] as OpenCodeMcpServerConfig | undefined
+  if (!source || !config) {
+    throw new Error('OpenCode retained App MCP launch source/config is unavailable')
+  }
+  return { source, config }
+}
+
 async function proveAppMcpToolsFromLaunchConfig(
   phaseContext?: OpenCodePhaseContext,
+  preparedHost?: OpenCodeHostHandle,
 ): Promise<AppMcpToolProof> {
-  const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+  const launchConfig: ResolvedAppMcpLaunchConfig = preparedHost
+    ? getRetainedAppMcpLaunchConfig(preparedHost)
+    : await resolveOpenCodeAppMcpLaunchConfig()
   const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) {
@@ -1510,8 +1550,10 @@ async function proveAppMcpToolsFromLaunchConfig(
       const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(
         launchConfig,
         phaseContext,
+        preparedHost?.profile.env,
       )
-      const proof = matchAppMcpTools(observedTools, 'mcp:tools/list')
+      const proof = matchAppMcpTools(observedTools, 'direct-contract:mcp/tools/list')
+      proof.contractConfigIdentity = hashStable(launchConfig.config)
       if (proof.ok) {
         appMcpToolProofCache.set(cacheKey, {
           expiresAt: Date.now() + APP_MCP_TOOL_PROOF_CACHE_TTL_MS,
@@ -1529,10 +1571,11 @@ async function proveAppMcpToolsFromLaunchConfig(
         observedTools: [],
         missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
         diagnostics: [
-          `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Agent Teams MCP direct contract tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
           'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
         ],
-        route: 'mcp:tools/list',
+        route: 'direct-contract:mcp/tools/list',
+        contractConfigIdentity: hashStable(launchConfig.config),
       }
     } finally {
       if (appMcpToolProofInFlight.get(cacheKey) === proofPromise) {
@@ -1548,6 +1591,7 @@ async function proveAppMcpToolsFromLaunchConfig(
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
   phaseContext?: OpenCodePhaseContext,
+  baseEnv: NodeJS.ProcessEnv = process.env,
 ): Promise<string[]> {
   const preflightTimeoutMs = Math.min(
     appMcpPreflightTimeoutMs(launchConfig),
@@ -1615,7 +1659,7 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   const transport = new StdioClientTransport({
     command: binary,
     args,
-    env: buildMcpPreflightEnv(launchConfig.config.environment),
+    env: buildMcpPreflightEnv(baseEnv, launchConfig.config.environment),
     stderr: 'pipe',
   })
   let stderr = ''
@@ -1644,9 +1688,12 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
-function buildMcpPreflightEnv(extra?: Record<string, string>): Record<string, string> {
+function buildMcpPreflightEnv(
+  base: NodeJS.ProcessEnv,
+  extra?: Record<string, string>,
+): Record<string, string> {
   const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(base)) {
     if (typeof value === 'string') {
       env[key] = value
     }
@@ -1710,8 +1757,9 @@ function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolPro
     missingTools,
     diagnostics: missingTools.length === 0
       ? []
-      : [`OpenCode app MCP tools missing from ${route}: ${missingTools.join(', ')}`],
+      : [`Agent Teams MCP direct contract tools missing from ${route}: ${missingTools.join(', ')}`],
     route,
+    contractConfigIdentity: null,
   }
 }
 
@@ -1722,6 +1770,7 @@ function readinessData(
   toolProof: AppMcpToolProof,
   requireSelectedModel: boolean,
   executionProof?: OpenCodeExecutionProof,
+  expectedBehaviorEvidence = executionProof?.expectedBehaviorEvidence,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
   const models = getOpenCodeAccessPolicyModels(snapshot)
@@ -1770,8 +1819,8 @@ function readinessData(
     launchAllowed = false
     missing.push(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   } else if (executionOutcome && executionOutcome.outcome !== 'available') {
     state = 'model_unavailable'
@@ -1790,8 +1839,8 @@ function readinessData(
     launchAllowed = false
     missing.push(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   } else if (
     selectedModelAccess.kind === 'configured_authless'
@@ -1832,6 +1881,9 @@ function readinessData(
       observedMcpTools: toolProof.observedTools,
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
+    ...(expectedBehaviorEvidence
+      ? { expectedBehaviorEvidence }
+      : {}),
     ...(executionProof ? { executionProof } : {}),
   }
 }
@@ -2028,6 +2080,7 @@ function buildTeamLaunchData(params: {
   diagnostics: TeamDiagnostic[]
   warnings?: TeamWarning[]
   commandEvidence?: OpenCodeBridgeCommandEvidence
+  expectedBehaviorFingerprint?: string
 }) {
   const states = Object.values(params.members).map(member => member.launchState)
   const now = nowIso()
@@ -2050,6 +2103,9 @@ function buildTeamLaunchData(params: {
         : 'launching'
   return {
     runId: params.runId,
+    ...(params.expectedBehaviorFingerprint
+      ? { expectedBehaviorFingerprint: params.expectedBehaviorFingerprint }
+      : {}),
     teamLaunchState,
     members: Object.fromEntries(
       Object.entries(params.members).map(([memberName, member]) => [
@@ -2230,6 +2286,7 @@ function skippedAppMcpToolProof(): AppMcpToolProof {
     missingTools: [],
     diagnostics: [],
     route: null,
+    contractConfigIdentity: null,
   }
 }
 
@@ -2244,8 +2301,8 @@ function mcpUnavailableReadinessData(input: {
   diagnostics?: string[]
 }) {
   const missingMessage = input.toolProof.missingTools.length > 0
-    ? `Agent Teams MCP tools are not visible in OpenCode: ${input.toolProof.missingTools.join(', ')}`
-    : 'Agent Teams MCP tools are not visible in OpenCode'
+    ? `Agent Teams MCP direct server contract is missing required tools: ${input.toolProof.missingTools.join(', ')}`
+    : 'Agent Teams MCP direct server contract is unavailable'
   const diagnostics = uniqueSortedStrings([
     ...(input.diagnostics ?? []),
     ...input.toolProof.diagnostics,
@@ -2323,9 +2380,22 @@ async function runReadiness(
 ) {
   const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
+  const hasSelectedModel = envelope.body.selectedModel !== undefined
+    && envelope.body.selectedModel !== null
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
+  const qualifiedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (hasSelectedModel && !qualifiedSelectedModel) {
+    throw new Error('OpenCode readiness requires a provider-qualified selectedModel')
+  }
+  if (qualifiedSelectedModel
+    && (qualifiedSelectedModel.providerId === 'kiro'
+      || qualifiedSelectedModel.providerId === 'cursor-acp')) {
+    throw new Error(
+      `OpenCode execution_probe does not support extension-bound provider ${qualifiedSelectedModel.providerId}`,
+    )
+  }
   const runProvisioningPhase = async (
     phase: 'host_start' | 'post_probe_refresh',
     options: Parameters<typeof openCodeProvisioningProbe.probe>[1],
@@ -2346,12 +2416,12 @@ async function runReadiness(
       throw error
     }
   }
-  const runDirectToolProof = async (): Promise<AppMcpToolProof> => {
+  const runDirectToolProof = async (preparedHost?: OpenCodeHostHandle): Promise<AppMcpToolProof> => {
     let pending: Promise<AppMcpToolProof> | null = null
     try {
       return await runtimeDeadline.runPhase('mcp_preflight', context => {
         context.throwIfExpired()
-        pending = proveAppMcpToolsFromLaunchConfig(context)
+        pending = proveAppMcpToolsFromLaunchConfig(context, preparedHost)
         return pending.then(proof => {
           context.throwIfExpired()
           return proof
@@ -2364,10 +2434,152 @@ async function runReadiness(
       throw error
     }
   }
+  if (qualifiedSelectedModel) {
+    let retained: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>> | null = null
+    try {
+      retained = await runtimeDeadline.runPhase('host_start', context =>
+        openCodeProvisioningProbe.probeRetainingHost(projectPath, {
+          selectedModel: qualifiedSelectedModel.raw,
+          toolApprovalMode: resolveLaunchToolApprovalMode(envelope.body),
+          phaseContext: context,
+        }))
+      if (!retained.snapshot.detected || !retained.snapshot.hostHealthy) {
+        return {
+          snapshot: retained.snapshot,
+          data: readinessData(
+            retained.snapshot, qualifiedSelectedModel.raw, undefined,
+            skippedAppMcpToolProof(), true,
+          ),
+        }
+      }
+      assertOpenCodeLaunchRuntimeAvailable(retained.snapshot)
+      if (!retained.host) throw new Error('OpenCode readiness retained host is unavailable')
+      const selectedAccess = evaluateOpenCodeModelAccess({
+        selectedModel: qualifiedSelectedModel.raw,
+        catalog: getOpenCodeAccessPolicyCatalog(retained.snapshot),
+      })
+      const selectedProviderCatalogued = retained.snapshot.configProviders?.providers
+        ?.some(provider => canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
+          === qualifiedSelectedModel.providerId) === true
+      if (selectedProviderCatalogued && (selectedAccess.kind === 'unknown_model'
+        || selectedAccess.kind === 'not_authenticated')) {
+        const data = readinessData(
+          retained.snapshot, qualifiedSelectedModel.raw, undefined,
+          skippedAppMcpToolProof(), true,
+        )
+        data.state = selectedAccess.kind === 'unknown_model'
+          ? 'model_unavailable' : 'not_authenticated'
+        data.launchAllowed = false
+        data.supportLevel = null
+        data.missing = [selectedAccess.reason ?? (selectedAccess.kind === 'unknown_model'
+          ? 'OpenCode selected model is unavailable'
+          : 'OpenCode selected model provider is not connected')]
+        return {
+          snapshot: retained.snapshot,
+          data,
+        }
+      }
+      if (!shouldProbeSelectedModel) {
+        const toolProof = await runDirectToolProof(retained.host)
+        const data = readinessData(
+          retained.snapshot, qualifiedSelectedModel.raw, undefined, toolProof, true,
+        )
+        if (data.launchAllowed) {
+          data.state = 'model_unavailable'
+          data.launchAllowed = false
+          data.supportLevel = null
+          data.missing.push('OpenCode selected model execution proof was not requested')
+        }
+        return {
+          snapshot: retained.snapshot,
+          data,
+        }
+      }
+      const initialEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+        profile: retained.host.profile,
+        fullModelId: qualifiedSelectedModel.raw,
+        effectiveConfigFingerprint: retained.host.profile.managedConfigFingerprint,
+      })
+      const toolProof = await runDirectToolProof(retained.host)
+      if (!toolProof.ok) {
+        return {
+          snapshot: retained.snapshot,
+          data: readinessData(
+            retained.snapshot, qualifiedSelectedModel.raw, undefined, toolProof, true,
+          ),
+        }
+      }
+      const refreshedBefore = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        contractConfigIdentity: toolProof.contractConfigIdentity,
+      })
+      if (!refreshedBefore) {
+        throw new Error('OpenCode selected readiness host/config/auth/project/MCP authority is unavailable')
+      }
+      const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        runtimeDeadline,
+        cleanupSuccessfulSession: true,
+      })
+      const refreshedAfter = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        contractConfigIdentity: toolProof.contractConfigIdentity,
+      })
+      if (!refreshedAfter) {
+        throw new Error('OpenCode selected readiness authority changed during execution proof')
+      }
+      const snapshot = {
+        ...retained.snapshot,
+        profile: refreshedAfter,
+        host: retained.snapshot.host ? { ...retained.snapshot.host, profile: refreshedAfter } : null,
+      }
+      const observedModelMatches =
+        executionOutcome.observedProviderId === qualifiedSelectedModel.providerId
+        && executionOutcome.observedModelId === qualifiedSelectedModel.modelId
+      if (executionOutcome.outcome === 'available' && !observedModelMatches) {
+        executionOutcome.outcome = 'unavailable'
+        executionOutcome.reason = 'OpenCode selected readiness observed provider/model was unavailable or mismatched'
+        executionOutcome.diagnostics.push(executionOutcome.reason)
+        delete executionOutcome.verifiedAt
+      }
+      const executionProof = executionOutcome.outcome === 'available' && executionOutcome.verifiedAt
+        ? await buildOpenCodeExecutionProof({
+            selectedModel: qualifiedSelectedModel.raw,
+            snapshot,
+            capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId,
+            verifiedAt: executionOutcome.verifiedAt,
+          }).catch(error => {
+            executionOutcome.diagnostics.push(
+              `OpenCode execution proof could not be created: ${strictPublicError(error)}`,
+            )
+            return undefined
+          })
+        : undefined
+      return {
+        snapshot,
+        data: readinessData(
+          snapshot,
+          qualifiedSelectedModel.raw,
+          executionOutcome,
+          toolProof,
+          true,
+          executionProof,
+          initialEvidence,
+        ),
+      }
+    } finally {
+      await retained?.release().catch(() => undefined)
+    }
+  }
   let earlyCursorExecutionOutcome: Awaited<ReturnType<
     typeof openCodeExecutionProbe.probeModel
   >> | undefined
-  const parsedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
+  const parsedSelectedModel = qualifiedSelectedModel
   const openCodeBinaryPath = shouldProbeSelectedModel
     && parsedSelectedModel?.providerId === 'cursor-acp'
     ? resolveOpenCodeBinaryPath()
@@ -2678,23 +2890,20 @@ async function assertOpenCodeLaunchMcpReady(
   if (!isAppMcpConnected(snapshot) || !toolProof.ok) {
     throw new Error(
       toolProof.missingTools.length > 0
-        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
-        : 'Agent Teams MCP tools are not visible in OpenCode',
+        ? `Agent Teams MCP direct server contract is missing required tools: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP direct server contract is unavailable',
     )
   }
 }
 
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
+  attemptId?: string,
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
+  let owned = false
   try {
-    await openCodeSessionStore.markStale(
-      record.teamId,
-      record.laneId,
-      record.memberName,
-      'launch_failed',
-    )
+    owned = Boolean(await openCodeSessionStore.markStaleIfSession(record, 'launch_failed', attemptId))
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_mark_stale_failed',
@@ -2703,6 +2912,7 @@ async function cleanupFailedLaunchSession(
     ))
   }
 
+  if (!owned) return diagnostics
   try {
     await openCodeSessionBridge.releaseSession(record)
   } catch (error) {
@@ -2714,7 +2924,7 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionStore.delete(record.teamId, record.laneId, record.memberName)
+    await openCodeSessionStore.deleteIfSession(record, attemptId)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_delete_failed',
@@ -2758,9 +2968,71 @@ async function markStaleAndReleaseSession(
   return diagnostics
 }
 
+function strictPublicError(error: unknown): string {
+  const message = (error instanceof Error ? error.message : String(error))
+    .replace(
+      /("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|passwords?|credentials?|client[_-]?secret|secret)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+      '$1"[redacted]"',
+    )
+    .replace(/\bBearer\s+[^\s"',;}\]]+/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|passwords?|credentials?|client[_-]?secret|secret)\s*[:=]\s*[^\s,;]+/gi,
+      '$1=[redacted]',
+    )
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+  return (message || 'OpenCode strict launch failed').slice(0, 512)
+}
+
+function strictLaunchProjection(
+  record: OpenCodeSessionRecord,
+  member: { name: string; fingerprint: string },
+  teamId: string,
+  runId: string,
+  laneId: string,
+  fallbackRuntimePid?: number,
+): LaunchMemberDraft {
+  const bootstrap = record.appManagedBootstrap
+  if (!bootstrap) {
+    throw new Error('OpenCode strict launch committed projection is missing bootstrap evidence')
+  }
+  return {
+    sessionId: record.opencodeSessionId,
+    launchState: 'created',
+    bootstrapEvidenceSource: 'app_managed_bootstrap',
+    bootstrapMode: 'app_managed_context',
+    appManagedBootstrapCandidate: {
+      schemaVersion: 1,
+      source: 'app_managed_bootstrap',
+      teamName: teamId,
+      memberName: member.name,
+      runId,
+      laneId,
+      runtimeSessionId: record.opencodeSessionId,
+      messageID: bootstrap.messageID,
+      contextHash: bootstrap.contextHash,
+      briefingHash: member.fingerprint,
+      injectionVerifiedAt: bootstrap.injectionVerifiedAt,
+      candidateAt: record.updatedAt,
+      model: record.selectedModel,
+      agent: bootstrap.agent,
+    },
+    ...((typeof record.runtimePid === 'number' && record.runtimePid > 0)
+      || (typeof fallbackRuntimePid === 'number' && fallbackRuntimePid > 0)
+      ? { runtimePid: record.runtimePid ?? fallbackRuntimePid }
+      : {}),
+    evidence: [{
+      kind: 'app_managed_bootstrap_context_injected',
+      observedAt: bootstrap.injectionVerifiedAt,
+    }],
+    diagnostics: ['OpenCode app-managed bootstrap context was injected and verified.'],
+  }
+}
+
 async function runLaunch(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
+  externalSignal?: AbortSignal,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -2772,39 +3044,562 @@ async function runLaunch(
     throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
   }
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
+  const preconditions = parseOpenCodeBridgePreconditions(body.preconditions)
+  const expectedBehaviorFingerprint = requireOpenCodeExpectedBehaviorFingerprint(preconditions)
+  if (preconditions?.laneId && preconditions.laneId !== laneId) {
+    throw new Error('OpenCode bridge expected laneId precondition does not match command laneId')
+  }
+  if (preconditions?.expectedRunId && preconditions.expectedRunId !== runId) {
+    throw new Error('OpenCode bridge expectedRunId precondition does not match command runId')
+  }
+  if ((preconditions?.expectedManifestHighWatermark ?? 0) > RUNTIME_STORE_MANIFEST_HIGH_WATERMARK) {
+    throw new Error('OpenCode bridge runtime manifest high watermark precondition is stale')
+  }
+  if (!preconditions?.commandLeaseId) {
+    throw new Error('OpenCode strict launch requires full preconditions and commandLeaseId')
+  }
+  const selectedModelRef = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!selectedModelRef) {
+    throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
+  }
+  if (selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp') {
+    throw new Error(
+      `OpenCode launch_runtime does not support extension-bound provider ${selectedModelRef.providerId}`,
+    )
+  }
+  const apiSelectedModel = selectedModelRef.raw
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
-
+  const deadlineAt = Date.now() + runtimeDeadline.remainingMs()
+  const cleanupReserveMs = Math.min(
+    5_000,
+    Math.max(250, Math.floor(runtimeDeadline.remainingMs() / 10)),
+  )
+  const workDeadlineAt = deadlineAt - cleanupReserveMs
   const probeStartedAt = Date.now()
   let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
   let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
+  const launchSignal = externalSignal
+    ? AbortSignal.any([runtimeDeadline.signal, externalSignal])
+    : runtimeDeadline.signal
+  const provisioningController = new AbortController()
+  const provisioningSignal = AbortSignal.any([launchSignal, provisioningController.signal])
+  const provisioningTimer = setTimeout(() => provisioningController.abort(
+    new Error('OpenCode strict launch provisioning deadline expired'),
+  ), Math.max(0, workDeadlineAt - Date.now()))
+  provisioningTimer.unref?.()
   try {
-    retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
-      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
-        asString(body.projectPath) ?? envelope.cwd,
-        { toolApprovalMode, phaseContext: context },
-      )
-      return pendingProbe
-    })
+    const phaseContext: OpenCodePhaseContext = {
+      phase: 'host_start',
+      signal: provisioningSignal,
+      remainingMs: () => Math.max(0, workDeadlineAt - Date.now()),
+      throwIfExpired: () => {
+        if (provisioningSignal.aborted) throwOpenCodeAbortReason(provisioningSignal)
+        if (Date.now() >= workDeadlineAt) throw new Error(
+          'OpenCode strict launch provisioning deadline expired',
+        )
+      },
+    }
+    phaseContext.throwIfExpired()
+    pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+      asString(body.projectPath) ?? envelope.cwd,
+      { toolApprovalMode, phaseContext, selectedModel: apiSelectedModel,
+        leaseId: preconditions.commandLeaseId },
+    )
+    retainedProbe = await raceOpenCodeAbortSignal(pendingProbe, provisioningSignal)
   } catch (error) {
-    if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
-      const cleanup = pendingProbe
-        .then(probe => probe.release())
-        .catch(() => undefined)
+    provisioningController.abort(error)
+    if (pendingProbe) {
+      const cleanup = pendingProbe.then(async probe => {
+        // An abort-ignoring provisioner still transfers this exact caller-owned
+        // lease when it eventually resolves. Release it on a fresh bounded
+        // cleanup budget even when the command's absolute deadline is exhausted.
+        await withTimeout(probe.release(), cleanupReserveMs)
+      }).catch(() => undefined)
       void cleanup
-      await withTimeout(cleanup, 5_000).catch(() => undefined)
     }
     throw error
+  } finally {
+    clearTimeout(provisioningTimer)
   }
   const provisioningProbeMs = elapsedMs(probeStartedAt)
+  const snapshot = retainedProbe.snapshot
+  const host = retainedProbe.host
+  let attemptOwnsRetainedProbe = true
+  const releaseAttemptOwnedProbe = async () => {
+    if (!attemptOwnsRetainedProbe) return
+    attemptOwnsRetainedProbe = false
+    await retainedProbe.release()
+  }
+
+  const diagnostics: TeamDiagnostic[] = []
+  let commandEvidence: ReturnType<typeof validateOpenCodeBridgeStateChangingPreconditions>
   try {
-    return await runLaunchWithProvisioningSnapshot(
-      envelope,
-      retainedProbe.snapshot,
-      runtimeDeadline,
-      { provisioningProbeMs },
-    )
-  } finally {
-    await retainedProbe.release().catch(() => undefined)
+    assertOpenCodeLaunchRuntimeAvailable(snapshot)
+    if (!host || !snapshot.host || snapshot.host.hostKey !== host.hostKey) {
+      throw new Error('OpenCode strict launch retained host is unavailable')
+    }
+    commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+      body,
+      runtime: createRuntimePreconditionSnapshot(snapshot),
+      allowCapabilitySnapshotRecovery: true,
+    })
+    const initialExpectedBehaviorEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+      profile: host.profile,
+      fullModelId: apiSelectedModel,
+      effectiveConfigFingerprint: host.resolvedConfigFingerprint,
+    }).catch(() => null)
+    if (initialExpectedBehaviorEvidence?.expectedBehaviorFingerprint
+      !== expectedBehaviorFingerprint) {
+      throw new Error('OpenCode strict launch behavior precondition mismatch')
+    }
+  } catch (error) {
+    await releaseAttemptOwnedProbe().catch(() => undefined)
+    throw error
+  }
+  if (commandEvidence.capabilitySnapshotRecovery) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_capability_snapshot_recovery',
+      'Accepted a fresh OpenCode capability snapshot for the explicit recovery attempt.',
+      'warning',
+    ))
+  }
+  const memberInputs = new Map<string, {
+    name: string
+    prompt: string
+    selectedVariant?: string
+    fingerprint: string
+  }>()
+  const strictMembers: StrictMember[] = []
+  for (const item of membersRaw) {
+    const member = asRecord(item)!
+    const name = asString(member.name)!
+    const prompt = asString(member.prompt)
+      ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
+    const selectedVariant = asString(member.effort) ?? asString(body.effort) ?? undefined
+    const fingerprint = hashStable({
+      purpose: 'opencode-app-managed-bootstrap-briefing-v1',
+      teamName: teamId,
+      memberName: name,
+      runId,
+      laneId,
+      prompt,
+    })
+    memberInputs.set(name, { name, prompt, selectedVariant, fingerprint })
+    strictMembers.push({ memberId: name, memberFingerprint: fingerprint })
+  }
+
+  const resources = new Map<string, OpenCodeSessionRecord>()
+  const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  const strictSessionCompatibility = (
+    sessionId: string,
+    input: NonNullable<ReturnType<typeof memberInputs.get>>,
+  ) => {
+    const contextText = buildOpenCodeAppManagedBootstrapContextText({
+      teamName: teamId,
+      memberName: input.name,
+      runId,
+      laneId,
+      runtimeSessionId: sessionId,
+      prompt: input.prompt,
+    })
+    const contextHash = hashText(contextText)
+    return {
+      teamId,
+      laneId,
+      memberName: input.name,
+      selectedModel: apiSelectedModel,
+      selectedVariant: input.selectedVariant,
+      host,
+      toolApprovalMode,
+      expectedBehaviorFingerprint,
+      bootstrap: {
+        messageID: buildOpenCodeAppManagedBootstrapMessageID({
+          teamName: teamId,
+          memberName: input.name,
+          runId,
+          laneId,
+          runtimeSessionId: sessionId,
+          contextHash,
+        }),
+        contextHash,
+        briefingHash: input.fingerprint,
+        agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+      },
+    }
+  }
+  let requiredMcpContractConfigIdentity: string | null = null
+  const matchesCurrentExpectedBehavior = async (signal: AbortSignal): Promise<boolean> => {
+    return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+      host,
+      selectedModel: apiSelectedModel,
+      expectedBehaviorFingerprint,
+      contractConfigIdentity: requiredMcpContractConfigIdentity,
+      phaseContext: {
+        phase: 'post_probe_refresh',
+        signal,
+        remainingMs: () => Math.max(0, workDeadlineAt - Date.now()),
+        throwIfExpired: () => {
+          if (signal.aborted) throwOpenCodeAbortReason(signal)
+          if (Date.now() >= workDeadlineAt) {
+            throw new Error('OpenCode strict launch authority refresh deadline expired')
+          }
+        },
+      },
+    })) !== null
+  }
+  const ports: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft> = {
+    snapshotProjection: projection => structuredClone(projection),
+    acquireHost: async (_context, _identity, lease, signal) => {
+      // The coordinator has set leaseUsed before invoking this port, so its
+      // finally block exclusively owns release from this point forward.
+      attemptOwnsRetainedProbe = false
+      if (signal.aborted) throwOpenCodeAbortReason(signal)
+      if (lease.expectedHostId !== host.hostKey) {
+        return { kind: 'failure', error: 'retained host identity mismatch' }
+      }
+      return { kind: 'ok', value: { hostId: host.hostKey } }
+    },
+    requestProof: async (_context, strictHost, request, signal) => {
+      if (strictHost.hostId !== host.hostKey || signal.aborted) {
+        if (signal.aborted) throwOpenCodeAbortReason(signal)
+        return { kind: 'failure', error: 'retained host identity mismatch' }
+      }
+      if (!await matchesCurrentExpectedBehavior(signal)) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before proof' }
+      }
+      const remainingMs = () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs)
+      const phaseContext = (phase: OpenCodePhaseContext['phase']): OpenCodePhaseContext => ({
+        phase,
+        signal,
+        remainingMs,
+        throwIfExpired: () => {
+          if (signal.aborted) throwOpenCodeAbortReason(signal)
+          if (remainingMs() <= 0) throw new Error('OpenCode strict launch proof deadline expired')
+        },
+      })
+      const launchConfig = getRetainedAppMcpLaunchConfig(host)
+      const appMcpProof = await listAppMcpToolsFromResolvedLaunchConfig(
+        launchConfig,
+        phaseContext('mcp_preflight'),
+        host.profile.env,
+      ).then(tools => matchAppMcpTools(tools, 'direct-contract:mcp/tools/list'))
+      appMcpProof.contractConfigIdentity = hashStable(launchConfig.config)
+      requiredMcpContractConfigIdentity = appMcpProof.contractConfigIdentity
+      if (!isAppMcpConnected(snapshot)
+        || !appMcpProof.ok || !await matchesCurrentExpectedBehavior(signal)) {
+        return { kind: 'failure', error: 'Agent Teams MCP retained connection/contract proof is unavailable' }
+      }
+      const expectedOutput = `STRICT_LAUNCH_${request.nonce}`
+      const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
+        host,
+        selectedModel: apiSelectedModel,
+        prompt: `Output only this exact token: ${expectedOutput}`,
+        expectedOutput,
+        requireExactOutput: true,
+        cleanupSuccessfulSession: true,
+        runtimeDeadline: {
+          signal,
+          remainingMs,
+          throwIfExpired: phase => phaseContext(phase).throwIfExpired(),
+          runPhase: (phase, operation) => operation(phaseContext(phase)),
+        },
+      })
+      if (executionOutcome.outcome !== 'available') {
+        return {
+          kind: executionOutcome.outcome === 'unknown' ? 'unknown' : 'failure',
+          error: executionOutcome.reason ?? 'OpenCode exact-model execution proof failed',
+        }
+      }
+      if (
+        executionOutcome.providerId !== 'opencode'
+        || executionOutcome.modelId !== apiSelectedModel
+        || executionOutcome.observedProviderId !== selectedModelRef.providerId
+        || executionOutcome.observedModelId !== selectedModelRef.modelId
+        || executionOutcome.latestAssistantText?.trim() !== expectedOutput
+      ) {
+        return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }
+      }
+      // The exact-model probe can take long enough for config or credentials to
+      // rotate. Seal the proof only after a final fresh read on this retained host.
+      if (!await matchesCurrentExpectedBehavior(signal)) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed during proof' }
+      }
+      return {
+        kind: 'ok',
+        value: {
+          attemptId: request.attemptId,
+          generation: request.generation,
+          nonce: request.nonce,
+          hostId: host.hostKey,
+          providerId: request.providerId,
+          modelId: apiSelectedModel,
+          behaviorFingerprint: expectedBehaviorFingerprint,
+          mcpTools: [...request.mcpTools],
+        },
+      }
+    },
+    findCommitted: async (_context, member, signal) => {
+      if (signal.aborted) throwOpenCodeAbortReason(signal)
+      if (!await matchesCurrentExpectedBehavior(signal)) {
+        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
+      }
+      const input = memberInputs.get(member.memberId)!
+      const record = await openCodeSessionStore.get(teamId, laneId, input.name)
+      if (
+        !record
+        || !isOpenCodeStrictSessionCompatible(
+          record,
+          strictSessionCompatibility(record.opencodeSessionId, input),
+        )
+      ) return { kind: 'ok', value: null }
+      return {
+        kind: 'ok',
+        value: {
+          memberId: input.name,
+          memberFingerprint: input.fingerprint,
+          behaviorFingerprint: expectedBehaviorFingerprint,
+          projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
+        },
+      }
+    },
+    projectCommitted: async () => ({ kind: 'ok', value: undefined }),
+    materialize: async (_context, strictHost, member, identity, signal) => {
+      const input = memberInputs.get(member.memberId)!
+      if (strictHost.hostId !== host.hostKey) {
+        return { kind: 'failure', error: 'materialization host identity mismatch' }
+      }
+      if (!await matchesCurrentExpectedBehavior(signal)) {
+        return {
+          kind: 'failure',
+          error: 'OpenCode strict launch behavior changed before materialization',
+        }
+      }
+      let record: OpenCodeSessionRecord | null = null
+      try {
+        const materialized = await openCodeSessionBridge.materializeSessionOnHost({
+          teamId,
+          laneId,
+          memberName: input.name,
+          selectedModel: apiSelectedModel,
+          selectedVariant: input.selectedVariant,
+          title: `${teamId} - ${input.name}`,
+          runId,
+          attemptId: identity.attemptId,
+          host,
+          signal,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
+          toolApprovalMode,
+          expectedBehaviorFingerprint,
+          expectedBootstrapForSession: sessionId =>
+            strictSessionCompatibility(sessionId, input).bootstrap,
+        })
+        record = materialized.record
+        if (!materialized.created && !materialized.resumeBootstrap) {
+          return {
+            kind: 'unknown',
+            error: 'OpenCode compatible committed session appeared during materialization',
+          }
+        }
+        if (materialized.created) resources.set(record.opencodeSessionId, record)
+        const ownedUncommittedResources = materialized.created ? {
+          resources: [{
+            ...identity,
+            resourceId: record.opencodeSessionId,
+            committed: false as const,
+          }],
+        } : {}
+        const sessionMcp = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
+          attachIfMissing: false,
+          host,
+          signal,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
+        })
+        if (!sessionMcp.ok) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode app MCP is unavailable on the retained member host',
+            ...ownedUncommittedResources,
+          }
+        }
+        if (!await matchesCurrentExpectedBehavior(signal)) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode strict launch behavior changed before bootstrap',
+            ...ownedUncommittedResources,
+          }
+        }
+        const contextText = buildOpenCodeAppManagedBootstrapContextText({
+          teamName: teamId,
+          memberName: input.name,
+          runId,
+          laneId,
+          runtimeSessionId: record.opencodeSessionId,
+          prompt: input.prompt,
+        })
+        const contextHash = hashText(contextText)
+        const messageID = buildOpenCodeAppManagedBootstrapMessageID({
+          teamName: teamId,
+          memberName: input.name,
+          runId,
+          laneId,
+          runtimeSessionId: record.opencodeSessionId,
+          contextHash,
+        })
+        const injected = await openCodeSessionBridge.injectAppManagedBootstrapContext(record, {
+          messageID,
+          text: contextText,
+          agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+          contextHash,
+          briefingHash: input.fingerprint,
+          host,
+          signal,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
+        })
+        const candidateAt = nowIso()
+        record = {
+          ...record,
+          bootstrapMode: 'app_managed_context',
+          bootstrapEvidenceSource: 'app_managed_bootstrap',
+          appManagedBootstrap: {
+            schemaVersion: 1,
+            messageID: injected.messageID,
+            contextHash: injected.contextHash,
+            briefingHash: injected.briefingHash,
+            injectionVerifiedAt: injected.injectionVerifiedAt,
+            model: apiSelectedModel,
+            agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+          },
+          updatedAt: candidateAt,
+        }
+        if (!await matchesCurrentExpectedBehavior(signal)) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode strict launch behavior changed during bootstrap',
+            ...ownedUncommittedResources,
+          }
+        }
+        await openCodeSessionStore.upsert(record)
+        const resource: StrictResource = {
+          ...identity,
+          resourceId: record.opencodeSessionId,
+          committed: true,
+        }
+        return {
+          kind: 'ok',
+          value: {
+            ...identity,
+            memberId: input.name,
+            memberFingerprint: input.fingerprint,
+            behaviorFingerprint: expectedBehaviorFingerprint,
+            projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
+            resource,
+          },
+        }
+      } catch (error) {
+        if (signal.aborted) throwOpenCodeAbortReason(signal)
+        return {
+          kind: 'unknown',
+          error: strictPublicError(error),
+        }
+      }
+    },
+    cleanup: async (_context, cleanupResources) => {
+      for (const resource of cleanupResources) {
+        const record = resources.get(resource.resourceId)
+        if (record && !resource.committed) {
+          await cleanupFailedLaunchSession(record, envelope.requestId)
+        }
+      }
+    },
+    releaseHost: async (_context, lease, keepAlive) => {
+      if (lease.leaseId === preconditions.commandLeaseId) {
+        await retainedProbe.release(keepAlive)
+      }
+    },
+  }
+
+  const result = await coordinateStrictLaunch({
+    attemptId: envelope.requestId,
+    generation: 1,
+    nonce: randomUUID(),
+    providerId: selectedModelRef.providerId,
+    modelId: apiSelectedModel,
+    behaviorFingerprint: expectedBehaviorFingerprint,
+    mcpTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
+    members: strictMembers,
+    workContext,
+    cleanupContext: workContext,
+    hostLease: { leaseId: preconditions.commandLeaseId, expectedHostId: host.hostKey },
+    deadlineAt,
+    cleanupReserveMs,
+    signal: launchSignal,
+    scheduler: {
+      now: () => Date.now(),
+      waitUntil: (at, signal) => new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          signal.removeEventListener('abort', abort)
+          resolve()
+        }
+        const timer = setTimeout(finish, Math.max(0, at - Date.now()))
+        const abort = () => {
+          clearTimeout(timer)
+          signal.removeEventListener('abort', abort)
+          reject(signal.reason ?? new Error('OpenCode strict launch wait cancelled'))
+        }
+        signal.addEventListener('abort', abort, { once: true })
+      }),
+    },
+  }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
+  await withTimeout(
+    Promise.all([...resources.values()].map(record =>
+      openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId)
+        .catch(() => false))),
+    Math.max(0, deadlineAt - Date.now()),
+    launchSignal,
+  ).catch(() => undefined)
+  diagnostics.push(teamDiagnostic(
+    `opencode_strict_launch_${result.status.replaceAll('-', '_')}`,
+    result.status === 'committed'
+      ? 'OpenCode strict launch proof and materialization completed.'
+      : strictPublicError(result.reason ?? `OpenCode strict launch ${result.status}`),
+    result.status === 'committed' ? 'info' : 'error',
+  ))
+  for (const memberId of result.committedMemberIds) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_app_managed_bootstrap_context_verified',
+      `${memberId}: OpenCode app-managed bootstrap context was injected and verified.`,
+      'info',
+    ))
+    diagnostics.push(teamDiagnostic(
+      'opencode_launch_member_timing',
+      `member=${memberId} materialized_under_absolute_deadline=true`,
+      'info',
+    ))
+  }
+  diagnostics.push(teamDiagnostic(
+    'opencode_launch_total_timing',
+    `total=${formatMs(elapsedMs(probeStartedAt))} provisioningProbe=${formatMs(provisioningProbeMs)} members=${result.committedMemberIds.length}`,
+    'info',
+  ))
+  if (result.status !== 'committed' && result.committedMemberIds.length === 0) {
+    throw new Error(strictPublicError(result.reason ?? `OpenCode strict launch ${result.status}`))
+  }
+  const members = Object.fromEntries(result.projections.map(projection => [
+    projection.appManagedBootstrapCandidate?.memberName ?? projection.sessionId,
+    projection,
+  ]))
+  return {
+    snapshot,
+    data: buildTeamLaunchData({
+      runId,
+      selectedModel: apiSelectedModel,
+      members,
+      expectedMemberNames: strictMembers.map(member => member.memberId),
+      diagnostics,
+      commandEvidence,
+      expectedBehaviorFingerprint,
+      warnings: [],
+    }),
   }
 }
 
@@ -4367,6 +5162,7 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
 async function handleEnvelope(
   envelope: BridgeEnvelope,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  externalSignal?: AbortSignal,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -4408,7 +5204,7 @@ async function handleEnvelope(
       if (!runtimeDeadline) {
         throw new Error('OpenCode launch preflight deadline was not initialized')
       }
-      return runLaunch(envelope, runtimeDeadline)
+      return runLaunch(envelope, runtimeDeadline, externalSignal)
     case 'opencode.reconcileTeam':
       return runReconcile(envelope)
     case 'opencode.stopTeam':
@@ -4456,7 +5252,10 @@ async function handleEnvelope(
   }
 }
 
-export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
+export async function executeOpenCodeBridgeCommandEnvelope(
+  input: unknown,
+  options: { signal?: AbortSignal } = {},
+) {
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
   try {
@@ -4487,7 +5286,7 @@ export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
   try {
-    const result = await handleEnvelope(envelope, runtimeDeadline)
+    const result = await handleEnvelope(envelope, runtimeDeadline, options.signal)
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
     }
