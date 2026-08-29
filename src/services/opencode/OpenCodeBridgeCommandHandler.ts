@@ -3367,13 +3367,13 @@ async function runLaunch(
             strictSessionCompatibility(sessionId, input).bootstrap,
         })
         record = materialized.record
-        if (!materialized.created) {
+        if (!materialized.created && !materialized.resumeBootstrap) {
           return {
             kind: 'unknown',
             error: 'OpenCode compatible committed session appeared during materialization',
           }
         }
-        resources.set(record.opencodeSessionId, record)
+        if (materialized.created) resources.set(record.opencodeSessionId, record)
         const sessionMcp = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
           attachIfMissing: false,
           host,
@@ -3384,11 +3384,13 @@ async function runLaunch(
           return {
             kind: 'failure',
             error: 'OpenCode app MCP is unavailable on the retained member host',
-            resources: [{
-              ...identity,
-              resourceId: record.opencodeSessionId,
-              committed: false,
-            }],
+            ...(materialized.created ? {
+              resources: [{
+                ...identity,
+                resourceId: record.opencodeSessionId,
+                committed: false,
+              }],
+            } : {}),
           }
         }
         const contextText = buildOpenCodeAppManagedBootstrapContextText({

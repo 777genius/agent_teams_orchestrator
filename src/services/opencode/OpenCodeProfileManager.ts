@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { createHash, createHmac, randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
   chmod,
@@ -1406,7 +1406,6 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
   selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
 }>
 
-const openCodeProfileScopeKey = randomBytes(32)
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
 const OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN =
   'agent-teams.opencode.semantic-secret-identity/v2'
@@ -1417,12 +1416,6 @@ function freezeConfigSnapshot<T>(value: T): T {
     Object.freeze(value)
   }
   return value
-}
-
-function localScopeIdentity(value: unknown): string {
-  return createHmac('sha256', openCodeProfileScopeKey)
-    .update(JSON.stringify(value) ?? '')
-    .digest('hex')
 }
 
 // Cross-process equality needs no stored key: the identity is a versioned,
@@ -1509,6 +1502,17 @@ function secretIdentity(value: unknown, env: NodeJS.ProcessEnv): string {
   return `[secret:${semanticSecretIdentity('config-secret', resolve(value))}]`
 }
 
+function selectedProviderApiKeyIdentity(
+  providerId: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const envName = `${providerId.replace(/[^A-Za-z0-9]+/g, '_').toUpperCase()}_API_KEY`
+  const value = env[envName]
+  return value === undefined
+    ? null
+    : semanticSecretIdentity('selected-provider-api-key-environment', { providerId, value })
+}
+
 export async function resolveOpenCodeProfileScope(input: {
   projectPath?: string | null
   purpose: OpenCodeProfilePurpose
@@ -1550,14 +1554,18 @@ export async function resolveOpenCodeProfileScope(input: {
       path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
     ])),
   })
-  const scopeToken = localScopeIdentity({
+  // The token is persisted in session and host identities, so it must survive a
+  // one-shot bridge process exit. Bind only the effective, redacted inputs that
+  // can affect this scoped profile; the local snapshot map below still proves
+  // that callers in this process possess the exact prepared snapshot.
+  const scopeToken = semanticSecretIdentity('profile-scope', {
     projectPath,
     purpose: input.purpose,
     providerId,
     configFingerprint,
     selectedAuthIdentity: selectedAuth.identity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
-    runtimeEnvironment: Object.keys(env).sort().map(key => [key, env[key] ?? null]),
+    selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
   })
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,

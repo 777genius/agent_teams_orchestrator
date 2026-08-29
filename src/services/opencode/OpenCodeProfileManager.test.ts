@@ -205,7 +205,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(endpointProfile.profileRootPath).not.toBe(firstProfile.profileRootPath)
   })
 
-  test('keeps semantic config/auth identities stable across CLI processes and secret-safe', async () => {
+  test('keeps selected-provider scope stable across processes and unrelated credential rotation', async () => {
     const projectPath = path.join(tempDir, 'cross-process-project')
     await mkdir(projectPath, { recursive: true })
     const authPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
@@ -217,7 +217,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       `const {resolveOpenCodeProfileScope:r}=await import(${JSON.stringify(moduleUrl)});`,
       'const s=await r({projectPath:process.argv[1],purpose:"launch_runtime",',
       'selectedModel:process.argv[2],env:{...process.env,OPENCODE_CONFIG_CONTENT:process.argv[3]}});',
-      'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity}))',
+      'console.log(JSON.stringify({config:s.configFingerprint,auth:s.selectedAuthIdentity,scope:s.scopeToken}))',
     ].join('')
     const run = async (
       provider: string,
@@ -229,7 +229,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           provider: { [provider]: { options: { apiKey: secret } } },
         }),
       ], { ...process.env, ...effectiveEnv }),
-    ) as { config: string; auth: string }
+    ) as { config: string; auth: string; scope: string }
     await writeFile(authPath, JSON.stringify({
       deepinfra: { type: 'api', key: 'selected-auth-secret' },
     }))
@@ -251,24 +251,43 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const envRotated = await run('deepinfra', envReference, {
       [envName]: rotatedEnvValue,
     })
+    const unrelatedCredentialFirst = await run('deepinfra', 'config-secret', {
+      OPENAI_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const unrelatedCredentialRotated = await run('deepinfra', 'config-secret', {
+      OPENAI_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const selectedCredentialFirst = await run('deepinfra', 'config-secret', {
+      DEEPINFRA_API_KEY: randomBytes(32).toString('hex'),
+    })
+    const selectedCredentialRotated = await run('deepinfra', 'config-secret', {
+      DEEPINFRA_API_KEY: randomBytes(32).toString('hex'),
+    })
 
     expect(second).toEqual(first)
     expect(valueChanged.config).not.toBe(first.config)
+    expect(valueChanged.scope).not.toBe(first.scope)
     expect(typeChanged.config).not.toBe(first.config)
     expect(providerChanged.config).not.toBe(first.config)
     expect(providerChanged.auth).not.toBe(first.auth)
     expect(authChanged.auth).not.toBe(first.auth)
+    expect(authChanged.scope).not.toBe(first.scope)
     expect(envSecond.config).toBe(envFirst.config)
     expect(envRotated.config).not.toBe(envFirst.config)
+    expect(unrelatedCredentialRotated.config).toBe(unrelatedCredentialFirst.config)
+    expect(unrelatedCredentialRotated.scope).toBe(unrelatedCredentialFirst.scope)
+    expect(selectedCredentialRotated.config).toBe(selectedCredentialFirst.config)
+    expect(selectedCredentialRotated.scope).not.toBe(selectedCredentialFirst.scope)
     const output = JSON.stringify([
       first, second, valueChanged, typeChanged, providerChanged, authChanged,
-      envFirst, envSecond, envRotated,
+      envFirst, envSecond, envRotated, unrelatedCredentialFirst, unrelatedCredentialRotated,
+      selectedCredentialFirst, selectedCredentialRotated,
     ])
     expect(output).not.toContain('secret')
     expect(output).not.toContain(envName)
     expect(output).not.toContain(envValue)
     expect(output).not.toContain(rotatedEnvValue)
-  })
+  }, 60_000)
 
   test('binds semantic config identity to effective secret environment references', async () => {
     const projectPath = path.join(tempDir, 'env-secret-identity-project')

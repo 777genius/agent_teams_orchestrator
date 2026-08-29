@@ -2751,6 +2751,80 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
+  test('strict launch resumes bootstrap for an exact persisted materialization', async () => {
+    const writes: OpenCodeSessionRecord[] = []
+    let createCalls = 0
+    let injectionCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot,
+      host: snapshot.host,
+      release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
+    openCodeSessionStore.upsert = (async record => {
+      writes.push(record)
+      return 'updated'
+    }) as typeof openCodeSessionStore.upsert
+    openCodeSessionBridge.materializeSessionOnHost = (async input => {
+      createCalls += 1
+      return {
+        created: false,
+        resumeBootstrap: true,
+        record: buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          selectedVariant: input.selectedVariant,
+          hostKey: input.host.hostKey,
+          profileScope: input.host.profile.profileScope ?? null,
+          toolApprovalMode: input.toolApprovalMode ?? 'auto',
+          resolvedBehaviorFingerprint: input.host.resolvedConfigFingerprint,
+          projectBehaviorFingerprint: input.host.projectBehaviorFingerprint,
+          managedConfigFingerprint: input.host.profile.managedConfigFingerprint,
+          expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+          opencodeSessionId: 'session-known',
+        }),
+      }
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async () => ({
+      ok: true,
+      status: 'present',
+      connected: true,
+      runtimePid: 123,
+      diagnostics: [],
+    })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+      injectionCalls += 1
+      return {
+        messageID: input.messageID,
+        runtimeSessionId: record.opencodeSessionId,
+        contextHash: input.contextHash,
+        briefingHash: input.briefingHash,
+        injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+        alreadyPresent: false,
+      }
+    }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+      runId: 'run-bootstrap-retry',
+      laneId: 'primary',
+      teamId: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'openrouter/minimax-m2.5-free',
+      members: [{ name: 'alice', prompt: 'Alice join' }],
+    }))
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(createCalls).toBe(1)
+    expect(injectionCalls).toBe(1)
+    expect(result.data.members.alice?.sessionId).toBe('session-known')
+    expect(writes.at(-1)?.appManagedBootstrap).toMatchObject({
+      model: 'openrouter/minimax-m2.5-free',
+      agent: 'teammate-bootstrap',
+    })
+  })
+
   test('strict launch keeps a compatible materialization race non-owned and untouched', async () => {
     const calls = { readiness: 0, injection: 0, writes: 0, cleanup: 0 }
     openCodeProvisioningProbe.probeRetainingHost = (async () => ({
