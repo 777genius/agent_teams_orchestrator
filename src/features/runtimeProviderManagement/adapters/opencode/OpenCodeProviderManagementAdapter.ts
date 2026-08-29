@@ -4065,7 +4065,11 @@ export class OpenCodeProviderManagementAdapter
           }),
         }
       },
-      { inventoryMode: 'profile', profileScope },
+      {
+        inventoryMode: 'profile',
+        profileScope,
+        prewarmManagedSubscriptionPlugins: false,
+      },
     )
   }
 
