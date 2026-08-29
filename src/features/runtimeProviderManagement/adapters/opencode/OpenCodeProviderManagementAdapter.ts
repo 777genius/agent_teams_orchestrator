@@ -4008,6 +4008,20 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
+    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
+    try {
+      profileScope = await resolveOpenCodeProfileScope({
+        projectPath: input.projectPath,
+        purpose: 'catalog',
+        selectedModel: `${providerId}/catalog`,
+      })
+    } catch (error) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        'OpenCode provider setup could not prepare a provider-scoped profile.',
+      )
+    }
+
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
@@ -4051,7 +4065,7 @@ export class OpenCodeProviderManagementAdapter
           }),
         }
       },
-      { inventoryMode: 'profile' },
+      { inventoryMode: 'profile', profileScope },
     )
   }
 
