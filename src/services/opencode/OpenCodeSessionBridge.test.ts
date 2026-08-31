@@ -8,9 +8,10 @@ import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
-import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
+import { canonicalizeOpenCodeProjectPath, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
@@ -151,12 +152,11 @@ describe('OpenCodeSessionBridge', () => {
         'kimi-for-coding': { type: 'api', key: 'test-kimi-key' },
       }),
     )
-    profile.profileScope = await resolveOpenCodeProfileScope({
-      projectPath: profile.projectPath,
-      purpose: 'launch_runtime',
-      selectedModel: 'openai/gpt-5.4-mini',
-    })
-    profile.scopeToken = profile.profileScope.scopeToken
+    profile.canonicalProjectPath = await canonicalizeOpenCodeProjectPath(profile.projectPath)
+    // These general session tests exercise the legacy unscoped contract.
+    // Scoped sessions need real sealed behavior evidence (covered separately).
+    profile.profileScope = null
+    profile.scopeToken = null
   })
 
   afterEach(async () => {
@@ -182,6 +182,7 @@ describe('OpenCodeSessionBridge', () => {
       model: 'openai/gpt-5.4-mini', agent: 'teammate',
     }
     const compatible = buildRecord({
+      runId: 'run-1',
       selectedVariant: 'high',
       profileScope: profile.profileScope,
       toolApprovalMode: 'auto',
@@ -193,7 +194,7 @@ describe('OpenCodeSessionBridge', () => {
       appManagedBootstrap: bootstrap,
     })
     const expected = {
-      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      teamId: 'team-a', runId: 'run-1', laneId: 'primary', memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini', selectedVariant: 'high', host,
       toolApprovalMode: 'auto' as const, expectedBehaviorFingerprint: 'a'.repeat(64),
       bootstrap: {
@@ -203,6 +204,7 @@ describe('OpenCodeSessionBridge', () => {
     expect(isOpenCodeStrictSessionCompatible(compatible, expected)).toBe(true)
 
     const incompatible: Array<Partial<OpenCodeSessionRecord>> = [
+      { runId: undefined }, { runId: 'stale-run' },
       { staleReason: 'old_attempt' },
       { teamId: 'other-team' }, { laneId: 'other-lane' }, { memberName: 'bob' },
       { selectedModel: 'openai/other' }, { selectedVariant: 'low' },
@@ -304,7 +306,7 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
-  test('uses a caller-provided prepared profile without preparing it again', async () => {
+  test('rejects scoped prepared-profile reuse without sealed session authority', async () => {
     let prepareProfileCalls = 0
     let createSessionCalls = 0
     const profileScope = await resolveOpenCodeProfileScope({
@@ -381,21 +383,14 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const record = await bridge.ensureSession({
+    await expect(bridge.ensureSession({
       teamId: 'team-a',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
       projectPath: '/tmp/project',
       preparedProfile,
-    })
-
-    expect(record).toEqual({
-      ...existing,
-      toolApprovalMode: 'manual',
-      runtimePid: 123,
-      updatedAt: expect.any(String),
-    })
-    expect(updated?.toolApprovalMode).toBe('manual')
+    })).rejects.toThrow('relaunch the lane')
+    expect(updated).toBeNull()
     expect(prepareProfileCalls).toBe(0)
     expect(createSessionCalls).toBe(0)
   })
@@ -919,6 +914,8 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(materialized.record.expectedBehaviorFingerprint).toBe(digest)
     expect(persisted?.expectedBehaviorFingerprint).toBe(digest)
+    expect(materialized.record.runId).toBe('run-1')
+    expect(persisted?.runId).toBe('run-1')
   })
 
   test('allows only one compatible concurrent attempt to create a remote session', async () => {
@@ -1013,6 +1010,61 @@ describe('OpenCodeSessionBridge', () => {
     expect(createCalls).toBe(1)
   })
 
+  test('confirmed stop propagates persistent lease release failure without weakening legacy best effort', async () => {
+    let attempts = 0
+    const bridge = new OpenCodeSessionBridge({ hostManager: {
+      ensureHost: async () => { throw new Error('release must not start a host') },
+      releaseHost: async () => { throw new Error('lease failure must precede host release') },
+      releaseHostLease: async () => { attempts += 1; throw new Error('registry write failed') },
+    } })
+    await expect(bridge.releaseSession(buildRecord(), { strictLeaseRelease: true }))
+      .rejects.toThrow('registry write failed')
+    await bridge.releaseSession(buildRecord())
+    expect(attempts).toBe(2)
+  })
+
+  test('confirmed stop fails on a real registry lock filesystem error', async () => {
+    const blockedParent = path.join(isolatedRoot, 'not-a-directory')
+    await writeFile(blockedParent, 'sandbox fixture')
+    const bridge = new OpenCodeSessionBridge({ hostManager: new OpenCodeHostManager({
+      persistentRegistryPath: path.join(blockedParent, 'host-registry.json'),
+      spawnHostProcess: () => { throw new Error('stop must not create a host') },
+    }) })
+    await expect(bridge.releaseSession(buildRecord(), { strictLeaseRelease: true })).rejects.toThrow()
+    await bridge.releaseSession(buildRecord())
+  })
+
+  test('strict stopped session rejects same-run replay and materializes a new run exactly once', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let creates = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: { ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {}, retainHostLease: async () => {} },
+      clientFactory: { create: () => ({ createSession: async () => ({ id: `session-${++creates}` }) }) as never },
+    })
+    const input = { teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context',
+        briefingHash: 'briefing', agent: 'teammate' }) }
+    const first = await bridge.materializeSessionOnHost(input)
+    const stopped = await store.markStoppedIfSession(first.record)
+    expect(stopped?.stoppedAt).toBeDefined()
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow('session is stopped')
+    expect(creates).toBe(1)
+    const next = await bridge.materializeSessionOnHost({ ...input, runId: 'run-2' })
+    expect(next.created).toBe(true)
+    expect(next.record.runId).toBe('run-2')
+    expect(next.record.stoppedAt).toBeUndefined()
+    expect(next.record.opencodeSessionId).not.toBe(first.record.opencodeSessionId)
+    expect(creates).toBe(2)
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow('committed session identity')
+    expect(await store.markStoppedIfSession(first.record)).toBeNull()
+    expect(creates).toBe(2)
+  })
+
   test('does not create again after an unknown outcome is replayed by the same attempt', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     let createCalls = 0
@@ -1104,15 +1156,19 @@ describe('OpenCodeSessionBridge', () => {
         }) as never,
       },
     })
-    const resumed = await restartedBridge.materializeSessionOnHost({
+    const resumeInput = {
       teamId: 'team-a', laneId: 'primary', memberName: 'alice',
-      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-2', attemptId: 'attempt-b', host,
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-b', host,
       signal: retryController.signal, remainingMs: () => 1_000,
       expectedBehaviorFingerprint: 'a'.repeat(64),
       expectedBootstrapForSession: () => ({
         messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
       }),
-    })
+    }
+    await expect(restartedBridge.materializeSessionOnHost({
+      ...resumeInput, runId: 'run-2',
+    })).rejects.toThrow('committed session identity does not match strict launch')
+    const resumed = await restartedBridge.materializeSessionOnHost(resumeInput)
     expect(resumed).toMatchObject({
       created: false,
       resumeBootstrap: true,
