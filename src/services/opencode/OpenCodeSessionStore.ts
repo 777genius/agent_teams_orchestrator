@@ -5,6 +5,7 @@ import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 
 import type { OpenCodeSessionRecord, OpenCodeSessionStopAuthority } from './types.js'
 
@@ -22,12 +23,19 @@ export type MaterializationClaimResult =
   | { kind: 'existing'; record: OpenCodeSessionRecord }
   | { kind: 'owned_by_other' }
 
+const LOCK_RETRY_OPTIONS = {
+  retries: 30,
+  minTimeout: 5,
+  maxTimeout: 100,
+}
 const LOCK_OPTIONS = {
-  retries: {
-    retries: 30,
-    minTimeout: 5,
-    maxTimeout: 100,
-  },
+  retries: LOCK_RETRY_OPTIONS,
+}
+
+type OpenCodeSessionStoreDeps = {
+  lock?: typeof lockfile.lock
+  setTimer?: typeof setTimeout
+  clearTimer?: typeof clearTimeout
 }
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
@@ -49,14 +57,59 @@ export function isOpenCodeSessionStopped(record: Pick<OpenCodeSessionRecord, 'st
     && new Date(value).toISOString() === value
 }
 
+function isLockContention(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === 'ELOCKED',
+  )
+}
+
+async function waitForLockRetry(
+  timeoutMs: number,
+  signal: AbortSignal,
+  setTimer: typeof setTimeout,
+  clearTimer: typeof clearTimeout,
+): Promise<void> {
+  if (signal.aborted) throwOpenCodeAbortReason(signal)
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimer(timer)
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => finish(() => {
+      try {
+        throwOpenCodeAbortReason(signal)
+      } catch (error) {
+        reject(error)
+      }
+    })
+    const timer = setTimer(() => finish(resolve), timeoutMs)
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+  })
+}
+
 export class OpenCodeSessionStore {
   private readonly filePath: string
   private readonly lockPath: string
+  private readonly lock: typeof lockfile.lock
+  private readonly setTimer: typeof setTimeout
+  private readonly clearTimer: typeof clearTimeout
 
-  constructor(filePath?: string) {
+  constructor(filePath?: string, deps: OpenCodeSessionStoreDeps = {}) {
     const paths = resolveClaudeMultimodelPaths()
     this.filePath = filePath ?? path.join(paths.data, 'opencode', 'session-store.json')
     this.lockPath = `${this.filePath}.lock`
+    this.lock = deps.lock ?? lockfile.lock
+    this.setTimer = deps.setTimer ?? setTimeout
+    this.clearTimer = deps.clearTimer ?? clearTimeout
   }
 
   private async ensureParentDir(): Promise<void> {
@@ -68,12 +121,52 @@ export class OpenCodeSessionStore {
     await writeFile(this.lockPath, '', { flag: 'a' })
   }
 
-  private async withStoreLock<T>(callback: () => Promise<T>): Promise<T> {
+  private async acquireStoreLock(signal?: AbortSignal): Promise<() => Promise<void>> {
+    if (!signal) {
+      return this.lock(this.lockPath, LOCK_OPTIONS)
+    }
+
+    let retryDelayMs = LOCK_RETRY_OPTIONS.minTimeout
+    for (let attempt = 0; ; attempt += 1) {
+      if (signal.aborted) throwOpenCodeAbortReason(signal)
+      let release: (() => Promise<void>) | undefined
+      try {
+        release = await this.lock(this.lockPath, { ...LOCK_OPTIONS, retries: 0 })
+      } catch (error) {
+        if (isLockContention(error) && signal.aborted) {
+          throwOpenCodeAbortReason(signal)
+        }
+        if (!isLockContention(error) || attempt >= LOCK_RETRY_OPTIONS.retries) {
+          throw error
+        }
+        await waitForLockRetry(
+          retryDelayMs,
+          signal,
+          this.setTimer,
+          this.clearTimer,
+        )
+        retryDelayMs = Math.min(LOCK_RETRY_OPTIONS.maxTimeout, retryDelayMs * 2)
+        continue
+      }
+      if (signal.aborted) {
+        await release()
+        throwOpenCodeAbortReason(signal)
+      }
+      return release
+    }
+  }
+
+  private async withStoreLock<T>(
+    callback: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
     await this.ensureLockFile()
 
     let release: (() => Promise<void>) | undefined
     try {
-      release = await lockfile.lock(this.lockPath, LOCK_OPTIONS)
+      release = await this.acquireStoreLock(signal)
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
       return await callback()
     } finally {
       if (release) {
@@ -145,6 +238,7 @@ export class OpenCodeSessionStore {
     identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
     attemptId: string,
     requestedRunId?: string,
+    signal?: AbortSignal,
   ): Promise<MaterializationClaimResult> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
@@ -166,10 +260,14 @@ export class OpenCodeSessionStore {
       store.materializationClaims[key] = attemptId
       await this.writeStore(store)
       return { kind: 'claimed' }
-    })
+    }, signal)
   }
 
-  async commitMaterialization(record: OpenCodeSessionRecord, attemptId: string): Promise<boolean> {
+  async commitMaterialization(
+    record: OpenCodeSessionRecord,
+    attemptId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
@@ -180,7 +278,7 @@ export class OpenCodeSessionStore {
       store.materializationOwners[key] = { attemptId, sessionId: record.opencodeSessionId }
       await this.writeStore(store)
       return true
-    })
+    }, signal)
   }
 
   async releaseMaterializationClaim(

@@ -918,6 +918,59 @@ describe('OpenCodeSessionBridge', () => {
     expect(persisted?.runId).toBe('run-1')
   })
 
+  test('propagates claim cancellation and releases a boundary-acquired claim without the cancelled signal', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after claim acquisition')
+    let claimRunId: string | undefined
+    let claimSignal: AbortSignal | undefined
+    let cleanupSignal: AbortSignal | undefined
+    let releaseCalls = 0
+    let clientCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => { throw new Error('must not upsert after cancellation') },
+        markStale: async () => null,
+        claimMaterialization: async (_identity, _attemptId, requestedRunId, signal) => {
+          claimRunId = requestedRunId
+          claimSignal = signal
+          controller.abort(abortReason)
+          return { kind: 'claimed' }
+        },
+        releaseMaterializationClaim: async (_identity, _attemptId, signal?: AbortSignal) => {
+          releaseCalls += 1
+          cleanupSignal = signal
+          return true
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clientCalls += 1
+          throw new Error('must not create a client after cancellation')
+        },
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toBe(abortReason)
+    expect(claimRunId).toBe('run-1')
+    expect(claimSignal).toBe(controller.signal)
+    expect(releaseCalls).toBe(1)
+    expect(cleanupSignal).toBeUndefined()
+    expect(clientCalls).toBe(0)
+  })
+
   test('allows only one compatible concurrent attempt to create a remote session', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     let releaseCreate!: () => void
@@ -1108,6 +1161,20 @@ describe('OpenCodeSessionBridge', () => {
   test('resumes bootstrap for a persisted known create after cancellation with a fresh bridge', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const controller = new AbortController()
+    const claimRunIds: Array<string | undefined> = []
+    const claimSignals: Array<AbortSignal | undefined> = []
+    const commitSignals: Array<AbortSignal | undefined> = []
+    const claimMaterialization = store.claimMaterialization.bind(store)
+    const commitMaterialization = store.commitMaterialization.bind(store)
+    store.claimMaterialization = async (identity, attemptId, requestedRunId, signal) => {
+      claimRunIds.push(requestedRunId)
+      claimSignals.push(signal)
+      return claimMaterialization(identity, attemptId, requestedRunId, signal)
+    }
+    store.commitMaterialization = async (record, attemptId, signal) => {
+      commitSignals.push(signal)
+      return commitMaterialization(record, attemptId, signal)
+    }
     let createCalls = 0
     const bridge = new OpenCodeSessionBridge({
       sessionStore: store,
@@ -1137,6 +1204,9 @@ describe('OpenCodeSessionBridge', () => {
       }),
     })).rejects.toThrow('cancelled after create')
     expect(createCalls).toBe(1)
+    expect(claimRunIds).toEqual(['run-1'])
+    expect(claimSignals).toEqual([controller.signal])
+    expect(commitSignals).toEqual([controller.signal, undefined])
     expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
 
     const retryController = new AbortController()

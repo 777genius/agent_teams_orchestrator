@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import * as lockfile from '../../utils/lockfile.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 const baseRecord = {
@@ -122,6 +123,130 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'claimed' })
     expect(await store.claimMaterialization(identity, 'attempt-a')).toEqual({ kind: 'already_owned' })
     expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'owned_by_other' })
+  })
+
+  test('rejects an already-aborted claim before touching the store and preserves no-signal callers', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const store = new OpenCodeSessionStore(filePath)
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+    const controller = new AbortController()
+    const abortReason = new Error('claim already cancelled')
+    controller.abort(abortReason)
+
+    await expect(
+      store.claimMaterialization(identity, 'attempt-a', undefined, controller.signal),
+    ).rejects.toBe(abortReason)
+    expect(await Bun.file(`${filePath}.lock`).exists()).toBe(false)
+    expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'claimed' })
+  })
+
+  test('aborts a contended materialization claim promptly without a late claim', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const lockPath = `${filePath}.lock`
+    const store = new OpenCodeSessionStore(filePath)
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+    const successfulMember = {
+      ...baseRecord,
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+    }
+    await store.upsert(successfulMember)
+    await writeFile(lockPath, '')
+    const releaseBlocker = await lockfile.lock(lockPath, { retries: 0 })
+    const controller = new AbortController()
+    const abortReason = new Error('cancel contended claim')
+    const pendingClaim = store.claimMaterialization(identity, 'attempt-a', undefined, controller.signal)
+    const outcomePromise = pendingClaim.then(
+      value => ({ kind: 'resolved' as const, value }),
+      error => ({ kind: 'rejected' as const, error }),
+    )
+
+    await new Promise(resolve => setTimeout(resolve, 20))
+    controller.abort(abortReason)
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let outcome: Awaited<typeof outcomePromise> | { kind: 'timeout' }
+    try {
+      outcome = await Promise.race([
+        outcomePromise,
+        new Promise<{ kind: 'timeout' }>(resolve => {
+          timeout = setTimeout(() => resolve({ kind: 'timeout' }), 100)
+        }),
+      ])
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      await releaseBlocker()
+    }
+    await outcomePromise
+    await new Promise(resolve => setTimeout(resolve, 125))
+
+    expect(outcome).toEqual({ kind: 'rejected', error: abortReason })
+    expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'claimed' })
+    expect(await store.get('team-a', 'primary', 'bob')).toEqual(successfulMember)
+  })
+
+  test('releases a lock acquired at the abort boundary without running the claim callback', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel at acquisition boundary')
+    let lockCalls = 0
+    let releaseCalls = 0
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), {
+      lock: async () => {
+        lockCalls += 1
+        if (lockCalls === 1) controller.abort(abortReason)
+        return async () => { releaseCalls += 1 }
+      },
+    })
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    await expect(
+      store.claimMaterialization(identity, 'attempt-a', undefined, controller.signal),
+    ).rejects.toBe(abortReason)
+    expect(releaseCalls).toBe(1)
+    expect(await store.claimMaterialization(identity, 'attempt-b')).toEqual({ kind: 'claimed' })
+    expect(releaseCalls).toBe(2)
+  })
+
+  test('clears the pending retry timer when lock acquisition is aborted', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel retry timer')
+    const timerHandle = {} as ReturnType<typeof setTimeout>
+    let signalTimerScheduled!: () => void
+    const timerScheduled = new Promise<void>(resolve => { signalTimerScheduled = resolve })
+    let clearedTimer: ReturnType<typeof setTimeout> | undefined
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), {
+      lock: async () => {
+        throw Object.assign(new Error('contended'), { code: 'ELOCKED' })
+      },
+      setTimer: (() => {
+        signalTimerScheduled()
+        return timerHandle
+      }) as typeof setTimeout,
+      clearTimer: (timer) => { clearedTimer = timer },
+    })
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    const pendingClaim = store.claimMaterialization(identity, 'attempt-a', undefined, controller.signal)
+    await timerScheduled
+    controller.abort(abortReason)
+
+    await expect(pendingClaim).rejects.toBe(abortReason)
+    expect(clearedTimer).toBe(timerHandle)
   })
 
   test('conditional cleanup never mutates or deletes a replacement session', async () => {

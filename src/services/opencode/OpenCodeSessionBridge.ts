@@ -1074,7 +1074,7 @@ export class OpenCodeSessionBridge {
     const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
     const attemptId = params.attemptId ?? params.runId
     const claim = this.sessionStore.claimMaterialization
-      ? await this.sessionStore.claimMaterialization(identity, attemptId, params.runId)
+      ? await this.sessionStore.claimMaterialization(identity, attemptId, params.runId, params.signal)
       : null
     const existing = claim?.kind === 'existing'
       ? claim.record
@@ -1172,9 +1172,24 @@ export class OpenCodeSessionBridge {
       sessionId: session.id,
     })
     try {
-      const committed = this.sessionStore.commitMaterialization
-        ? await this.sessionStore.commitMaterialization(record, attemptId)
-        : (await this.sessionStore.upsert(record)) !== 'unchanged'
+      let committed: boolean
+      if (this.sessionStore.commitMaterialization) {
+        try {
+          committed = await this.sessionStore.commitMaterialization(
+            record,
+            attemptId,
+            params.signal,
+          )
+        } catch (error) {
+          if (!params.signal.aborted) throw error
+          // The remote session id is known and this attempt still owns its
+          // persisted claim. Finish that idempotent commit without reusing the
+          // cancelled work signal so a retry cannot duplicate the session.
+          committed = await this.sessionStore.commitMaterialization(record, attemptId)
+        }
+      } else {
+        committed = (await this.sessionStore.upsert(record)) !== 'unchanged'
+      }
       if (!committed) {
         throw new Error('OpenCode session materialization claim was lost before commit')
       }
