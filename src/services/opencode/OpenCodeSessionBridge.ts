@@ -18,6 +18,7 @@ import {
   resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
 import type {
@@ -188,7 +189,7 @@ function profileScopeMetadataMatches(
   left: OpenCodeProfileScope | null | undefined,
   right: OpenCodeProfileScope | null | undefined,
 ): boolean {
-  return Boolean(
+  return (!left && !right) || Boolean(
     left
     && right
     && left.purpose === right.purpose
@@ -201,6 +202,7 @@ function profileScopeMetadataMatches(
 
 export type OpenCodeStrictSessionCompatibility = {
   teamId: string
+  runId: string
   laneId: string
   memberName: string
   selectedModel: string
@@ -235,8 +237,9 @@ function isOpenCodeStrictMaterializedSessionCompatible(
   record: OpenCodeSessionRecord,
   expected: OpenCodeStrictSessionCompatibility,
 ): boolean {
-  return !record.staleReason
+  return !record.stoppedAt && !record.staleReason
     && record.teamId === expected.teamId
+    && record.runId === expected.runId
     && record.laneId === expected.laneId
     && record.memberName === expected.memberName
     && record.hostKey === expected.host.hostKey
@@ -557,6 +560,52 @@ export class OpenCodeSessionBridge {
     return `${identity.teamId}::${identity.laneId?.trim() || 'primary'}::${identity.memberName}`
   }
 
+  private async ensureSessionAuthorityHost(record: OpenCodeSessionRecord, profile: OpenCodePreparedProfile) {
+    if (record.stoppedAt) throw new Error('OpenCode session is stopped; launch a new run')
+    const scoped = record.profileScope?.purpose === 'launch_runtime'
+    if (scoped) {
+      const current = await this.sessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
+      if (!current || current.stoppedAt || current.runId !== record.runId
+        || current.opencodeSessionId !== record.opencodeSessionId) {
+        throw new Error('OpenCode selected session is no longer active; launch a new run')
+      }
+    }
+    if (scoped && (!record.runId || !record.expectedBehaviorFingerprint
+      || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint)
+      || !record.managedConfigFingerprint
+      || record.resolvedBehaviorFingerprint !== record.managedConfigFingerprint
+      || this.buildSessionProfileStaleReason(record, profile))) {
+      throw new Error('OpenCode selected session authority is stale or unavailable; relaunch the lane')
+    }
+    const host = await this.hostManager.ensureHost({
+      projectPath: record.projectPath,
+      hostKey: record.hostKey,
+      preparedProfile: profile,
+      ...(scoped ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false } : {}),
+    })
+    if (!scoped) return host
+    try {
+      // A selected launch seals the managed-config domain, not the broad
+      // provider inventory hash. Revalidate its live authority before reuse.
+      if (host.hostKey !== record.hostKey
+        || host.resolvedConfigFingerprint !== record.managedConfigFingerprint) {
+        throw new Error('OpenCode selected session fingerprint domain changed; relaunch the lane')
+      }
+      const refreshed = await refreshSelectedProfileAuthority({
+        host,
+        selectedModel: record.selectedModel,
+        expectedBehaviorFingerprint: record.expectedBehaviorFingerprint!,
+      }, { clientFactory: this.clientFactory, mcpManager: this.mcpManager })
+      if (!refreshed || refreshed.managedConfigFingerprint !== record.managedConfigFingerprint) {
+        throw new Error('OpenCode selected session live authority changed; relaunch the lane')
+      }
+      return host
+    } catch (error) {
+      await this.hostManager.releaseHost(host.hostKey)
+      throw error
+    }
+  }
+
   private async retainSessionHost(
     record: OpenCodeSessionRecord,
     runId?: string | null,
@@ -564,6 +613,11 @@ export class OpenCodeSessionBridge {
   ) {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
+      if (record.profileScope?.purpose === 'launch_runtime') {
+        const prepared = profile ?? (await this.prepareProfileForSessionRecord(record)).profile
+        const checkedHost = await this.ensureSessionAuthorityHost(record, prepared)
+        await this.hostManager.releaseHost(checkedHost.hostKey)
+      }
       await this.hostManager.retainHostLease?.(record.hostKey, {
         teamId: record.teamId,
         laneId: record.laneId,
@@ -580,11 +634,7 @@ export class OpenCodeSessionBridge {
         toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
       }
       : await this.prepareProfileForSessionRecord(record)
-    const host = await this.hostManager.ensureHost({
-      projectPath: record.projectPath,
-      hostKey: record.hostKey,
-      preparedProfile: sessionProfile.profile,
-    })
+    const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile)
     await this.hostManager.retainHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
@@ -596,14 +646,22 @@ export class OpenCodeSessionBridge {
     return host
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
+  async releaseSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>,
+    options: { strictLeaseRelease?: boolean } = {},
+  ): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
-    await this.hostManager.releaseHostLease?.(record.hostKey, {
+    if (options.strictLeaseRelease && !this.hostManager.releaseHostLease) {
+      throw new Error('OpenCode confirmed stop requires persistent lease release')
+    }
+    const releaseLease = this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
-    }).catch(() => undefined)
+    })
+    if (options.strictLeaseRelease) await releaseLease
+    else await releaseLease?.catch(() => undefined)
     if (!retainedHostKey) {
       return
     }
@@ -680,11 +738,7 @@ export class OpenCodeSessionBridge {
         toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
       }
       : await this.prepareProfileForSessionRecord(record)
-    const host = await this.hostManager.ensureHost({
-      projectPath: record.projectPath,
-      hostKey: record.hostKey,
-      preparedProfile: sessionProfile.profile,
-    })
+    const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile)
     await this.hostManager.retainHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
@@ -764,6 +818,7 @@ export class OpenCodeSessionBridge {
             params.record.laneId ?? 'primary',
             params.record.memberName,
             params.staleReason,
+            params.record,
           )) ?? {
             ...params.record,
             staleReason: params.staleReason,
@@ -815,6 +870,7 @@ export class OpenCodeSessionBridge {
             params.record.laneId ?? 'primary',
             params.record.memberName,
             params.staleReason,
+            params.record,
           )) ?? {
             ...params.record,
             staleReason: params.staleReason,
@@ -863,6 +919,11 @@ export class OpenCodeSessionBridge {
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    if (existing?.stoppedAt) throw new Error('OpenCode session is stopped; launch a new run')
+    if (existing?.profileScope?.purpose === 'launch_runtime' && params.runId
+      && existing.runId !== params.runId) {
+      throw new Error('OpenCode selected session run changed; relaunch the lane')
+    }
     const profileScope = await resolveOpenCodeProfileScope({
       projectPath: params.projectPath,
       purpose: 'launch_runtime',
@@ -926,6 +987,9 @@ export class OpenCodeSessionBridge {
       return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
     }
 
+    if (existing?.profileScope?.purpose === 'launch_runtime') {
+      throw new Error('OpenCode selected session cannot be recreated without strict launch proof; relaunch the lane')
+    }
     if (existing) {
       const staleReason =
         params.fresh === true
@@ -951,6 +1015,7 @@ export class OpenCodeSessionBridge {
         laneId,
         params.memberName,
         staleReason,
+        existing,
       )
       await this.releaseSession(existing)
     }
@@ -1009,7 +1074,7 @@ export class OpenCodeSessionBridge {
     const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
     const attemptId = params.attemptId ?? params.runId
     const claim = this.sessionStore.claimMaterialization
-      ? await this.sessionStore.claimMaterialization(identity, attemptId)
+      ? await this.sessionStore.claimMaterialization(identity, attemptId, params.runId)
       : null
     const existing = claim?.kind === 'existing'
       ? claim.record
@@ -1027,9 +1092,11 @@ export class OpenCodeSessionBridge {
       throwOpenCodeAbortReason(params.signal)
     }
     if (existing) {
+      if (existing.stoppedAt) throw new Error('OpenCode session is stopped; launch a new run')
       const selectedVariant = params.selectedVariant?.trim() || undefined
       const expected = {
         teamId: params.teamId,
+        runId: params.runId,
         laneId: params.laneId,
         memberName: params.memberName,
         selectedModel: params.selectedModel,
@@ -1069,6 +1136,7 @@ export class OpenCodeSessionBridge {
     const now = buildNowIso()
     const record: OpenCodeSessionRecord = {
       teamId: params.teamId,
+      runId: params.runId,
       laneId: params.laneId,
       memberName: params.memberName,
       providerId: 'opencode',
@@ -1124,6 +1192,11 @@ export class OpenCodeSessionBridge {
   }
 
   async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
+    if (record.profileScope?.purpose === 'launch_runtime') {
+      // Never repair a scoped record by overwriting its sealed evidence with
+      // the broad host fingerprint. An incompatible record needs a new launch.
+      return this.withSessionHost(record, async () => record)
+    }
     const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
       this.prepareProfileForSessionRecord(record),
       this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null),

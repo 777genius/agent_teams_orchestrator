@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto'
-
+import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
+export type { OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   createOpenCodePreflightHostLeaseInput,
@@ -7,17 +7,14 @@ import {
 } from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import {
-  OPEN_CODE_APP_MCP_SERVER_NAME,
   openCodeMcpManager,
 } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import {
   buildManagedConfigFingerprint,
-  collectProjectBehaviorMetadata,
   resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
-import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
@@ -90,86 +87,10 @@ export class OpenCodeProvisioningProbe {
 
   constructor(private readonly deps: OpenCodeProvisioningProbeDeps = {}) {}
 
-  async refreshSelectedProfileAuthority(input: {
-    host: OpenCodeHostHandle
-    selectedModel: string
-    expectedBehaviorFingerprint: string
-    contractConfigIdentity?: string | null
-    phaseContext?: OpenCodePhaseContext
-  }): Promise<OpenCodeHostHandle['profile'] | null> {
-    const selected = parseOpenCodeProviderScopedModelRef(input.selectedModel)
-    const profile = input.host.profile
-    if (!selected || profile.profileScope?.purpose !== 'launch_runtime') return null
-    const stable = (value: unknown): unknown => Array.isArray(value) ? value.map(stable)
-      : value && typeof value === 'object'
-        ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
-            .map(key => [key, stable((value as Record<string, unknown>)[key])]))
-        : value
-    const identity = (value: unknown) => createHash('sha256')
-      .update(JSON.stringify(stable(value))).digest('hex')
-    const selectedConfigIdentity = (config: Record<string, unknown>) => {
-      const provider = config.provider as Record<string, unknown> | undefined
-      const mcp = config.mcp as Record<string, unknown> | undefined
-      return buildManagedConfigFingerprint({
-        provider: { [selected.providerId]: provider?.[selected.providerId] ?? null },
-        model: config.model ?? null,
-        small_model: config.small_model ?? null,
-        plugin: config.plugin ?? null,
-        agent: config.agent ?? null,
-        default_agent: config.default_agent ?? null,
-        permission: config.permission ?? null,
-        command: config.command ?? null,
-        share: config.share ?? null,
-        snapshot: config.snapshot ?? null,
-        autoupdate: config.autoupdate ?? null,
-        mcp: { [OPEN_CODE_APP_MCP_SERVER_NAME]: mcp?.[OPEN_CODE_APP_MCP_SERVER_NAME] ?? null },
-      }, profile.env)
-    }
-    try {
-      input.phaseContext?.throwIfExpired()
-      const requestContext = input.phaseContext
-        ? { signal: input.phaseContext.signal, remainingMs: input.phaseContext.remainingMs }
-        : undefined
-      const client = (this.deps.clientFactory ?? openCodeClientFactory).create(
-        input.host.baseUrl,
-        requestContext,
-      )
-      const [liveConfig, appMcp, behavior, scope] = await Promise.all([
-        client.getConfig(),
-        (this.deps.mcpManager ?? openCodeMcpManager).ensureAppMcp({
-          baseUrl: input.host.baseUrl, attachIfMissing: false,
-          requestContext,
-        }),
-        collectProjectBehaviorMetadata(profile.canonicalProjectPath, profile.env),
-        resolveOpenCodeProfileScope({
-          projectPath: profile.canonicalProjectPath, purpose: 'launch_runtime',
-          selectedModel: selected.raw, env: profile.env,
-        }),
-      ])
-      input.phaseContext?.throwIfExpired()
-      const live = liveConfig as Record<string, unknown>
-      const liveMcp = (live.mcp as Record<string, unknown> | undefined)
-        ?.[OPEN_CODE_APP_MCP_SERVER_NAME]
-      const preparedMcp = (profile.managedConfig.mcp as Record<string, unknown> | undefined)
-        ?.[OPEN_CODE_APP_MCP_SERVER_NAME]
-      if (appMcp.summary.matchedServerName !== OPEN_CODE_APP_MCP_SERVER_NAME
-        || appMcp.summary.connected !== true || !liveMcp
-        || identity(liveMcp) !== identity(preparedMcp)
-        || (input.contractConfigIdentity && identity(liveMcp) !== input.contractConfigIdentity)
-        || selectedConfigIdentity(live) !== selectedConfigIdentity(profile.managedConfig)
-        || scope.scopeToken !== profile.profileScope.scopeToken
-        || scope.configFingerprint !== profile.profileScope.configFingerprint
-        || scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity) return null
-      const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }
-      const evidence = await buildOpenCodeExpectedBehaviorEvidence({
-        profile: refreshed, fullModelId: selected.raw,
-        effectiveConfigFingerprint: profile.managedConfigFingerprint,
-      })
-      return evidence.expectedBehaviorFingerprint === input.expectedBehaviorFingerprint
-        ? refreshed : null
-    } catch {
-      return null
-    }
+  async refreshSelectedProfileAuthority(
+    input: Parameters<typeof refreshSelectedProfileAuthority>[0],
+  ): Promise<OpenCodeHostHandle['profile'] | null> {
+    return refreshSelectedProfileAuthority(input, this.deps)
   }
 
   async probe(

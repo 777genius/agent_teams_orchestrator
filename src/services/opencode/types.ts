@@ -635,8 +635,22 @@ export type OpenCodeSessionPreviewSummary = {
   diagnostics: string[]
 }
 
+export type OpenCodeSessionStopAuthority = {
+  runtime: {
+    providerId: 'opencode'
+    binaryPath: string | null
+    binaryFingerprint: string | null
+    version: string | null
+    capabilitySnapshotId: string
+  }
+  expectedBehaviorFingerprint: string
+}
+
 export type OpenCodeSessionRecord = {
   teamId: string
+  runId?: string
+  stoppedAt?: string
+  stopAuthority?: OpenCodeSessionStopAuthority
   laneId?: string
   memberName: string
   providerId: 'opencode'

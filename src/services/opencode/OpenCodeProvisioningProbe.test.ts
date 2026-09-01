@@ -9,7 +9,7 @@ import {
   OpenCodeProfileManager,
   resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
-import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { OpenCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import {
   removeOpenCodeAuthCredential,
@@ -86,6 +86,23 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
+  test('keeps authority rejection fail-closed even if the diagnostic observer throws', async () => {
+    const probe = new OpenCodeProvisioningProbe()
+    for (const [selectedModel, check] of [
+      ['unqualified', 'selected_model'], ['deepinfra/chosen', 'profile_scope'],
+    ] as const) {
+      let reported: OpenCodeAuthorityRejection | undefined
+      expect(await probe.refreshSelectedProfileAuthority({
+        host, selectedModel, expectedBehaviorFingerprint: 'unused',
+        onRejection: diagnostic => {
+          reported = diagnostic
+          throw new Error('observer-secret')
+        },
+      })).toBeNull()
+      expect(reported).toEqual({ check })
+    }
+  })
+
   for (const selectedModel of [
     'deepinfra/chosen', 'custom-provider/nested/model',
   ]) {
@@ -236,12 +253,17 @@ describe('OpenCodeProvisioningProbe', () => {
       }
       let liveConfig = structuredClone(prepared.managedConfig)
       let connected = true
+      let matchedServerName = 'agent-teams'
+      let configError: unknown = null
       const probe = new OpenCodeProvisioningProbe({
-        clientFactory: { create: () => ({ getConfig: async () => liveConfig }) as never },
+        clientFactory: { create: () => ({ getConfig: async () => {
+          if (configError) throw configError
+          return liveConfig
+        } }) as never },
         mcpManager: { ensureAppMcp: async () => ({
           mcp: { 'agent-teams': { connected } },
           summary: {
-            serverName: 'agent-teams', matchedServerName: 'agent-teams', status: 'present',
+            serverName: 'agent-teams', matchedServerName, status: 'present',
             connected, launchSource: null, availableServerNames: ['agent-teams'],
             diagnostics: [],
           },
@@ -251,9 +273,12 @@ describe('OpenCodeProvisioningProbe', () => {
         profile: prepared, fullModelId: 'deepinfra/chosen',
         effectiveConfigFingerprint: prepared.managedConfigFingerprint,
       })
-      const refresh = () => probe.refreshSelectedProfileAuthority({
+      const diagnostics: OpenCodeAuthorityRejection[] = []
+      const refresh = (contractConfigIdentity?: string) => probe.refreshSelectedProfileAuthority({
         host: retainedHost, selectedModel: 'deepinfra/chosen',
         expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint,
+        contractConfigIdentity,
+        onRejection: diagnostic => { diagnostics.push(diagnostic) },
       })
 
       const recomputedScope = await resolveOpenCodeProfileScope({
@@ -263,6 +288,75 @@ describe('OpenCodeProvisioningProbe', () => {
       expect(prepared.appMcpLaunchSource).toBe('env-override')
       expect(recomputedScope).toEqual(scope)
       expect(await refresh()).not.toBeNull()
+      expect(diagnostics).toEqual([])
+      // Fixture follows OpenCode v1.18.4 core/src/v1/config/agent.ts normalize()
+      // and packages/opencode/src/config/config.ts command initialization.
+      const normalizedAgents = Object.fromEntries(Object.entries(
+        prepared.managedConfig.agent as Record<string, Record<string, unknown>>,
+      ).map(([name, agent]) => [name, { ...agent, options: {} }]))
+      const normalizedLiveConfig = {
+        ...structuredClone(prepared.managedConfig), agent: normalizedAgents, command: {},
+      }
+      const preparedBeforeNormalization = structuredClone(prepared)
+      liveConfig = normalizedLiveConfig
+      const refreshedNormalized = await refresh()
+      expect(refreshedNormalized).not.toBeNull()
+      expect(prepared).toEqual(preparedBeforeNormalization)
+      expect(await buildOpenCodeExpectedBehaviorEvidence({
+        profile: refreshedNormalized!, fullModelId: 'deepinfra/chosen',
+        effectiveConfigFingerprint: prepared.managedConfigFingerprint,
+      })).toEqual(evidence)
+      expect(diagnostics).toEqual([])
+      for (const [field, value] of [
+        ['command', { injected: { template: 'unexpected-command' } }],
+        ['command', null],
+        ['command', []],
+        ['agent', { ...normalizedAgents, teammate: { ...normalizedAgents.teammate, options: { route: 'changed' } } }],
+        ['agent', { ...normalizedAgents, teammate: { ...normalizedAgents.teammate, options: null } }],
+        ['agent', { ...normalizedAgents, teammate: { ...normalizedAgents.teammate, permission: { '*': 'allow' } } }],
+        ['agent', { ...normalizedAgents, teammate: { ...normalizedAgents.teammate, prompt: 'changed' } }],
+        ['agent', { ...normalizedAgents, teammate: { ...normalizedAgents.teammate, unknown: 'changed' } }],
+        ['agent', {}],
+        ['agent', { ...normalizedAgents, teammate: null }],
+      ] as const) {
+        liveConfig = { ...normalizedLiveConfig, [field]: value }
+        expect(await refresh()).toBeNull()
+        expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: [field] })
+      }
+      liveConfig = structuredClone(prepared.managedConfig)
+      matchedServerName = 'secret-server-name'
+      expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'mcp_name' })
+      matchedServerName = 'agent-teams'
+      expect(await refresh('secret-contract-identity')).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'contract_config_match' })
+      const configWithMcp = liveConfig
+      liveConfig = { ...liveConfig, mcp: {} }
+      expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'live_mcp_present' })
+      liveConfig = configWithMcp
+      for (const error of [Object.assign(new TypeError('secret-auth-token'), {
+        name: 'secret-provider-identity',
+      }), 'secret-config-error']) {
+        configError = error
+        expect(await refresh()).toBeNull()
+        expect(diagnostics.pop()).toEqual({
+          check: 'exception', phase: 'live_config',
+          errorClass: typeof error === 'string' ? 'non_error' : 'TypeError',
+        })
+      }
+      configError = null
+      for (const [field, check] of [
+        ['scopeToken', 'scope_token_match'],
+        ['configFingerprint', 'scope_config_match'],
+        ['selectedAuthIdentity', 'selected_auth_identity_match'],
+      ] as const) {
+        const originalScope = retainedHost.profile.profileScope!
+        retainedHost.profile.profileScope = { ...originalScope, [field]: 'secret-mutated-identity' }
+        expect(await refresh()).toBeNull()
+        expect(diagnostics.pop()).toEqual({ check })
+        retainedHost.profile.profileScope = originalScope
+      }
       const liveMcp = (liveConfig.mcp as Record<string, unknown>)['agent-teams']
       liveConfig = {
         ...liveConfig,
@@ -272,6 +366,7 @@ describe('OpenCodeProvisioningProbe', () => {
         },
       }
       expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'mcp_config_match' })
       liveConfig = structuredClone(prepared.managedConfig)
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-two'
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'mutated-command'
@@ -281,9 +376,11 @@ describe('OpenCodeProvisioningProbe', () => {
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
       liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
       expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: ['permission'] })
       liveConfig = structuredClone(prepared.managedConfig)
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
       expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'behavior_match' })
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
       await upsertOpenCodeAuthCredential({
         authPath: prepared.managedAuthPath, providerId: 'deepinfra',
@@ -295,6 +392,7 @@ describe('OpenCodeProvisioningProbe', () => {
       })
       connected = false
       expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'mcp_connected' })
     } finally {
       for (const key of keys) {
         if (original[key] === undefined) delete process.env[key]

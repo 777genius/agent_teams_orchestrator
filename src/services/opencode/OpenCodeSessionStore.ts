@@ -6,7 +6,7 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
-import type { OpenCodeSessionRecord } from './types.js'
+import type { OpenCodeSessionRecord, OpenCodeSessionStopAuthority } from './types.js'
 
 type SessionStoreShape = {
   schemaVersion: 1
@@ -41,6 +41,12 @@ async function fileExists(filePath: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+export function isOpenCodeSessionStopped(record: Pick<OpenCodeSessionRecord, 'stoppedAt'>): boolean {
+  const value = record.stoppedAt
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value
 }
 
 export class OpenCodeSessionStore {
@@ -117,9 +123,16 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
-
-      if (previous && jsonStringify(previous) === jsonStringify(record)) {
-        return 'unchanged'
+      if (store.materializationClaims?.[key]) {
+        throw new Error('OpenCode session write is fenced by a materialization claim')
+      }
+      if (previous && jsonStringify(previous) === jsonStringify(record)) return 'unchanged'
+      if (previous && isOpenCodeSessionStopped(previous)) {
+        throw new Error('OpenCode stopped session can only be replaced by a new launch claim')
+      }
+      if (previous?.profileScope?.purpose === 'launch_runtime'
+        && (previous.runId !== record.runId || previous.opencodeSessionId !== record.opencodeSessionId)) {
+        throw new Error('OpenCode session write does not match the committed run and session')
       }
 
       store.records[key] = record
@@ -131,16 +144,25 @@ export class OpenCodeSessionStore {
   async claimMaterialization(
     identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
     attemptId: string,
+    requestedRunId?: string,
   ): Promise<MaterializationClaimResult> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(identity)
       const existing = store.records[key]
-      if (existing) return { kind: 'existing', record: existing }
+      const replacingStopped = existing && isOpenCodeSessionStopped(existing)
+        && existing.runId && requestedRunId?.trim() && requestedRunId !== existing.runId
+      if (existing && !replacingStopped) return { kind: 'existing', record: existing }
       store.materializationClaims ??= {}
       const owner = store.materializationClaims[key]
       if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
       if (owner === attemptId) return { kind: 'already_owned' }
+      if (replacingStopped) {
+        delete store.records[key]
+        if (store.materializationOwners?.[key]?.sessionId === existing.opencodeSessionId) {
+          delete store.materializationOwners[key]
+        }
+      }
       store.materializationClaims[key] = attemptId
       await this.writeStore(store)
       return { kind: 'claimed' }
@@ -175,8 +197,30 @@ export class OpenCodeSessionStore {
     })
   }
 
+  async markStoppedIfSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
+    stopAuthority?: OpenCodeSessionStopAuthority,
+  ): Promise<OpenCodeSessionRecord | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const previous = store.records[key]
+      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
+        || previous.runId !== record.runId) return null
+      if (isOpenCodeSessionStopped(previous)) {
+        if (stopAuthority && jsonStringify(previous.stopAuthority) !== jsonStringify(stopAuthority)) return null
+        return previous
+      }
+      const stoppedAt = new Date().toISOString()
+      const next = { ...previous, stoppedAt, ...(stopAuthority ? { stopAuthority } : {}), updatedAt: stoppedAt }
+      store.records[key] = next
+      await this.writeStore(store)
+      return next
+    })
+  }
+
   async markStaleIfSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>,
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
     staleReason: string,
     attemptId?: string,
   ): Promise<OpenCodeSessionRecord | null> {
@@ -184,7 +228,8 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
-      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId) return null
+      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
+        || previous.runId !== record.runId || isOpenCodeSessionStopped(previous)) return null
       const owner = store.materializationOwners?.[key]
       if (attemptId && (owner?.attemptId !== attemptId || owner.sessionId !== record.opencodeSessionId)) {
         return null
@@ -197,13 +242,15 @@ export class OpenCodeSessionStore {
   }
 
   async deleteIfSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>,
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
     attemptId?: string,
   ): Promise<boolean> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
-      if (store.records[key]?.opencodeSessionId !== record.opencodeSessionId) return false
+      const previous = store.records[key]
+      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
+        || previous.runId !== record.runId || isOpenCodeSessionStopped(previous)) return false
       const owner = store.materializationOwners?.[key]
       if (attemptId && (owner?.attemptId !== attemptId || owner.sessionId !== record.opencodeSessionId)) {
         return false
@@ -235,6 +282,7 @@ export class OpenCodeSessionStore {
     laneIdOrMemberName: string,
     memberNameOrStaleReason: string,
     staleReasonMaybe?: string,
+    expectedIdentity?: Pick<OpenCodeSessionRecord, 'runId' | 'opencodeSessionId'>,
   ): Promise<OpenCodeSessionRecord | null> {
     const laneId = staleReasonMaybe ? laneIdOrMemberName : 'primary'
     const memberName = staleReasonMaybe ? memberNameOrStaleReason : laneIdOrMemberName
@@ -243,9 +291,9 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey({ teamId, laneId, memberName })
       const previous = store.records[key]
-      if (!previous) {
-        return null
-      }
+      if (!previous || isOpenCodeSessionStopped(previous)
+        || (expectedIdentity && (previous.runId !== expectedIdentity.runId
+          || previous.opencodeSessionId !== expectedIdentity.opencodeSessionId))) return null
 
       if (previous.staleReason === staleReason) {
         return previous
