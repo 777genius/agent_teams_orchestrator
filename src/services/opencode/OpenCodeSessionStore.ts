@@ -251,12 +251,6 @@ export class OpenCodeSessionStore {
       const owner = store.materializationClaims[key]
       if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
       if (owner === attemptId) return { kind: 'already_owned' }
-      if (replacingStopped) {
-        delete store.records[key]
-        if (store.materializationOwners?.[key]?.sessionId === existing.opencodeSessionId) {
-          delete store.materializationOwners[key]
-        }
-      }
       store.materializationClaims[key] = attemptId
       await this.writeStore(store)
       return { kind: 'claimed' }
@@ -271,7 +265,11 @@ export class OpenCodeSessionStore {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
-      if (store.materializationClaims?.[key] !== attemptId || store.records[key]) return false
+      if (store.materializationClaims?.[key] !== attemptId) return false
+      const previous = store.records[key]
+      const replacingStopped = Boolean(previous && isOpenCodeSessionStopped(previous)
+        && record.runId?.trim() && record.runId !== previous.runId && !record.stoppedAt)
+      if (previous && !replacingStopped) return false
       store.records[key] = record
       delete store.materializationClaims[key]
       store.materializationOwners ??= {}

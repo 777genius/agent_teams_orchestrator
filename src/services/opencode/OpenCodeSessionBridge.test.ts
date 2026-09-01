@@ -1118,6 +1118,60 @@ describe('OpenCodeSessionBridge', () => {
     expect(creates).toBe(2)
   })
 
+  test('aborting after a different-run replacement claim preserves stop authority for an exact-once retry', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let creates = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: { ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {}, retainHostLease: async () => {} },
+      clientFactory: { create: () => ({ createSession: async () => ({ id: `session-${++creates}` }) }) as never },
+    })
+    const baseInput = { teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'old-attempt', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context',
+        briefingHash: 'briefing', agent: 'teammate' }) }
+    const first = await bridge.materializeSessionOnHost(baseInput)
+    const stopped = await store.markStoppedIfSession(first.record)
+    expect(stopped?.stoppedAt).toBeDefined()
+
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after different-run replacement claim')
+    const claimMaterialization = store.claimMaterialization.bind(store)
+    let abortedReplacementClaim = false
+    store.claimMaterialization = async (identity, attemptId, requestedRunId, signal) => {
+      const result = await claimMaterialization(identity, attemptId, requestedRunId, signal)
+      if (!abortedReplacementClaim && requestedRunId === 'run-2' && result.kind === 'claimed') {
+        abortedReplacementClaim = true
+        controller.abort(abortReason)
+      }
+      return result
+    }
+
+    await expect(bridge.materializeSessionOnHost({
+      ...baseInput, runId: 'run-2', attemptId: 'cancelled-attempt', signal: controller.signal,
+    })).rejects.toBe(abortReason)
+    expect(await store.get('team-a', 'primary', 'alice')).toEqual(stopped)
+    expect(creates).toBe(1)
+    await expect(bridge.materializeSessionOnHost({
+      ...baseInput, attemptId: 'same-run-replay', signal: new AbortController().signal,
+    })).rejects.toThrow('session is stopped')
+    expect(creates).toBe(1)
+
+    const retryInput = { ...baseInput, runId: 'run-2', attemptId: 'retry-attempt',
+      signal: new AbortController().signal }
+    const successor = await bridge.materializeSessionOnHost(retryInput)
+    expect(successor).toMatchObject({ created: true, record: { runId: 'run-2', opencodeSessionId: 'session-2' } })
+    expect(creates).toBe(2)
+    const replay = await bridge.materializeSessionOnHost({
+      ...retryInput, attemptId: 'retry-replay', signal: new AbortController().signal,
+    })
+    expect(replay).toMatchObject({ created: false, record: { runId: 'run-2', opencodeSessionId: 'session-2' } })
+    expect(creates).toBe(2)
+  })
+
   test('does not create again after an unknown outcome is replayed by the same attempt', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     let createCalls = 0

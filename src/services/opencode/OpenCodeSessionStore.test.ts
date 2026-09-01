@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -275,6 +275,70 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.markStoppedIfSession(record)).toBeNull()
     expect((await store.get('team-a', 'primary', 'alice'))?.stoppedAt).toBeUndefined()
     expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
+  })
+
+  test('cancelled different-run replacement preserves the stopped record and old owner until retry commit', async () => {
+    const filePath = path.join(tempDir, 'sessions.json')
+    const store = new OpenCodeSessionStore(filePath)
+    const record = { ...baseRecord, runId: 'run-1' }
+    const identity = {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+    }
+    expect(await store.claimMaterialization(identity, 'old-attempt', 'run-1')).toEqual({ kind: 'claimed' })
+    expect(await store.commitMaterialization(record, 'old-attempt')).toBe(true)
+    const stopped = await store.markStoppedIfSession(record)
+    expect(stopped?.stoppedAt).toBeDefined()
+
+    const controller = new AbortController()
+    expect(await store.claimMaterialization(identity, 'cancelled-attempt', 'run-2', controller.signal))
+      .toEqual({ kind: 'claimed' })
+    controller.abort(new Error('cancel immediately after replacement claim'))
+    const claimedState = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(claimedState.records['team-a::primary::alice']).toEqual(stopped)
+    expect(claimedState.materializationClaims['team-a::primary::alice']).toBe('cancelled-attempt')
+    expect(claimedState.materializationOwners['team-a::primary::alice']).toEqual({
+      attemptId: 'old-attempt',
+      sessionId: 'session-1',
+    })
+
+    expect(await store.releaseMaterializationClaim(identity, 'cancelled-attempt')).toBe(true)
+    const cancelledState = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(cancelledState.records['team-a::primary::alice']).toEqual(stopped)
+    expect(cancelledState.materializationClaims['team-a::primary::alice']).toBeUndefined()
+    expect(cancelledState.materializationOwners['team-a::primary::alice']).toEqual({
+      attemptId: 'old-attempt',
+      sessionId: 'session-1',
+    })
+    expect(await store.claimMaterialization(identity, 'same-run-attempt', 'run-1'))
+      .toEqual({ kind: 'existing', record: stopped })
+    expect(await store.claimMaterialization(identity, 'missing-run-attempt'))
+      .toEqual({ kind: 'existing', record: stopped })
+
+    expect(await store.claimMaterialization(identity, 'retry-attempt', 'run-2')).toEqual({ kind: 'claimed' })
+    expect(await store.commitMaterialization({
+      ...record, runId: 'run-2', opencodeSessionId: 'wrong-owner',
+    }, 'other-attempt'))
+      .toBe(false)
+    expect(await store.commitMaterialization({ ...record, opencodeSessionId: 'same-run' }, 'retry-attempt'))
+      .toBe(false)
+    expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(stopped)
+    const fencedState = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(fencedState.materializationClaims['team-a::primary::alice']).toBe('retry-attempt')
+    expect(fencedState.materializationOwners['team-a::primary::alice']).toEqual({
+      attemptId: 'old-attempt',
+      sessionId: 'session-1',
+    })
+    const successor = { ...record, runId: 'run-2', opencodeSessionId: 'session-2' }
+    expect(await store.commitMaterialization(successor, 'retry-attempt')).toBe(true)
+    const committedState = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(committedState.records['team-a::primary::alice']).toEqual(successor)
+    expect(committedState.materializationClaims['team-a::primary::alice']).toBeUndefined()
+    expect(committedState.materializationOwners['team-a::primary::alice']).toEqual({
+      attemptId: 'retry-attempt',
+      sessionId: 'session-2',
+    })
   })
 
   test('stopped replacement keeps unknown create claims fenced and malformed markers inactive', async () => {
