@@ -171,6 +171,7 @@ function incompleteRecord(
 ): OpenCodeSessionRecord {
   return {
     teamId,
+    runId,
     laneId,
     memberName: member,
     providerId: 'opencode',
