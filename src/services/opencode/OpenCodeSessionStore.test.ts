@@ -247,8 +247,14 @@ describe('OpenCodeSessionStore', () => {
     controller.abort(abortReason)
     await expect(pendingClaim).rejects.toBe(abortReason)
 
+    let drainSettled = false
+    const drain = store.drainPendingLateLockReleases().then(() => { drainSettled = true })
+    await Promise.resolve()
+    expect(drainSettled).toBe(false)
+
     resolveLock(async () => { releaseCalls += 1 })
-    await new Promise(resolve => setTimeout(resolve, 0))
+    await drain
+    expect(drainSettled).toBe(true)
     expect(releaseCalls).toBe(1)
   })
 

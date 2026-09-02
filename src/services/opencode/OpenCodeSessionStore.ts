@@ -101,7 +101,7 @@ async function waitForLockRetry(
 async function waitForLockAttempt(
   attempt: Promise<() => Promise<void>>,
   signal: AbortSignal,
-  onLateLockReleaseError: (error: unknown) => void,
+  trackLateLockRelease: (attempt: Promise<() => Promise<void>>) => void,
 ): Promise<() => Promise<void>> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -112,6 +112,7 @@ async function waitForLockAttempt(
       callback()
     }
     const onAbort = () => finish(() => {
+      trackLateLockRelease(attempt)
       try {
         throwOpenCodeAbortReason(signal)
       } catch (error) {
@@ -123,7 +124,6 @@ async function waitForLockAttempt(
     void attempt.then(
       release => {
         if (settled) {
-          void release().catch(onLateLockReleaseError)
           return
         }
         finish(() => resolve(release))
@@ -141,6 +141,7 @@ export class OpenCodeSessionStore {
   private readonly setTimer: typeof setTimeout
   private readonly clearTimer: typeof clearTimeout
   private readonly onLateLockReleaseError: (error: unknown) => void
+  private readonly pendingLateLockReleases = new Set<Promise<void>>()
 
   constructor(filePath?: string, deps: OpenCodeSessionStoreDeps = {}) {
     const paths = resolveClaudeMultimodelPaths()
@@ -163,6 +164,27 @@ export class OpenCodeSessionStore {
     await writeFile(this.lockPath, '', { flag: 'a' })
   }
 
+  private trackLateLockRelease(attempt: Promise<() => Promise<void>>): void {
+    const pendingRelease = attempt.then(
+      release => release(),
+      () => undefined,
+    )
+    this.pendingLateLockReleases.add(pendingRelease)
+    void pendingRelease.then(
+      () => this.pendingLateLockReleases.delete(pendingRelease),
+      error => {
+        this.pendingLateLockReleases.delete(pendingRelease)
+        this.onLateLockReleaseError(error)
+      },
+    )
+  }
+
+  async drainPendingLateLockReleases(): Promise<void> {
+    while (this.pendingLateLockReleases.size > 0) {
+      await Promise.allSettled([...this.pendingLateLockReleases])
+    }
+  }
+
   private async acquireStoreLock(signal?: AbortSignal): Promise<() => Promise<void>> {
     if (!signal) {
       return this.lock(this.lockPath, LOCK_OPTIONS)
@@ -176,7 +198,7 @@ export class OpenCodeSessionStore {
         release = await waitForLockAttempt(
           this.lock(this.lockPath, { ...LOCK_OPTIONS, retries: 0 }),
           signal,
-          this.onLateLockReleaseError,
+          attempt => this.trackLateLockRelease(attempt),
         )
       } catch (error) {
         if (isLockContention(error) && signal.aborted) {

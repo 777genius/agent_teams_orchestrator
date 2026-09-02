@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 
+import { jsonStringify } from '../../utils/slowOperations.js'
+
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -1183,10 +1185,25 @@ export class OpenCodeSessionBridge {
             params.signal,
           )
         } catch (error) {
-          if (!params.signal.aborted) throw error
+          if (!params.signal.aborted) {
+            let persisted: OpenCodeSessionRecord | null
+            try {
+              persisted = await this.sessionStore.get(
+                record.teamId,
+                record.laneId,
+                record.memberName,
+              )
+            } catch {
+              throw error
+            }
+            if (!persisted || jsonStringify(persisted) !== jsonStringify(record)) {
+              throw error
+            }
+          }
           // The remote session id is known and this attempt still owns its
-          // persisted claim. Finish that idempotent commit without reusing the
-          // cancelled work signal so a retry cannot duplicate the session.
+          // persisted claim, or the exact attempted record may already have
+          // committed before an ambiguous failure. Reconcile without reusing
+          // the work signal; commitMaterialization still verifies exact owner.
           committed = await this.sessionStore.commitMaterialization(record, attemptId)
         }
       } else {

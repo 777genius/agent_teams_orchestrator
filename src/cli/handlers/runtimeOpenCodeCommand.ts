@@ -4,15 +4,23 @@ import { readFile } from 'node:fs/promises'
 
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
+import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
 export const OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS = 1_000
+export const OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS = 5_000
+export const OPENCODE_COMMAND_FORCE_EXIT_RESERVE_MS = 500
+export const OPENCODE_COMMAND_CLEANUP_TIMEOUT_MS = OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS
+  - OPENCODE_COMMAND_FORCE_EXIT_RESERVE_MS
 
 type RuntimeCommandTimer = ReturnType<typeof setInterval>
 type RuntimeCommandSetInterval = (callback: () => void, ms: number) => RuntimeCommandTimer
 type RuntimeCommandClearInterval = (timer: RuntimeCommandTimer) => void
+type RuntimeCommandTimeout = ReturnType<typeof setTimeout>
+type RuntimeCommandSetTimeout = (callback: () => void, ms: number) => RuntimeCommandTimeout
+type RuntimeCommandClearTimeout = (timer: RuntimeCommandTimeout) => void
 
 export function startRuntimeCommandKeepAlive(deps: {
   setInterval?: RuntimeCommandSetInterval
@@ -31,6 +39,43 @@ export function startRuntimeCommandKeepAlive(deps: {
   }
 }
 
+export async function drainRuntimeOpenCodeCommandCleanup(deps: {
+  disposeUnregisteredOwnedHosts?: () => Promise<void>
+  drainPendingLateLockReleases?: () => Promise<void>
+  setTimeout?: RuntimeCommandSetTimeout
+  clearTimeout?: RuntimeCommandClearTimeout
+  timeoutMs?: number
+  onTimeout?: (timeoutMs: number) => void
+} = {}): Promise<void> {
+  const disposeUnregisteredOwnedHosts = deps.disposeUnregisteredOwnedHosts
+    ?? (() => openCodeHostManager.disposeUnregisteredOwnedHosts())
+  const drainPendingLateLockReleases = deps.drainPendingLateLockReleases
+    ?? (() => openCodeSessionStore.drainPendingLateLockReleases())
+  const setTimeoutFn = deps.setTimeout ?? setTimeout
+  const clearTimeoutFn = deps.clearTimeout ?? clearTimeout
+  const timeoutMs = deps.timeoutMs ?? OPENCODE_COMMAND_CLEANUP_TIMEOUT_MS
+  const onTimeout = deps.onTimeout ?? (elapsedMs => {
+    console.warn('[opencode-command] Cancellation cleanup timed out after ' + elapsedMs + 'ms')
+  })
+  let timeout: RuntimeCommandTimeout | undefined
+
+  try {
+    const outcome = await Promise.race([
+      Promise.all([
+        disposeUnregisteredOwnedHosts().catch(() => undefined),
+        drainPendingLateLockReleases(),
+      ]).then(() => 'completed' as const),
+      new Promise<'timed_out'>(resolve => {
+        timeout = setTimeoutFn(() => resolve('timed_out'), timeoutMs)
+        timeout.unref?.()
+      }),
+    ])
+    if (outcome === 'timed_out') onTimeout(timeoutMs)
+  } finally {
+    if (timeout) clearTimeoutFn(timeout)
+  }
+}
+
 export async function runtimeOpenCodeCommand(opts: {
   input: string
   json?: boolean
@@ -43,10 +88,9 @@ export async function runtimeOpenCodeCommand(opts: {
       return
     }
     commandController.abort(new Error(`OpenCode runtime command cancelled by signal (${exitCode})`))
-    const watchdog = setTimeout(() => process.exit(exitCode), 5_000)
+    const watchdog = setTimeout(() => process.exit(exitCode), OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
     watchdog.unref?.()
-    signalCleanupPromise = openCodeHostManager.disposeUnregisteredOwnedHosts()
-      .catch(() => undefined)
+    signalCleanupPromise = drainRuntimeOpenCodeCommandCleanup()
       .finally(() => {
         clearTimeout(watchdog)
         process.exit(exitCode)
