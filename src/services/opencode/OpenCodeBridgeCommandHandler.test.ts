@@ -3482,7 +3482,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('strict launch keeps a compatible materialization race non-owned and untouched', async () => {
-    const calls = { readiness: 0, injection: 0, writes: 0, cleanup: 0 }
+    const calls = { readiness: 0, injection: 0, writes: 0, cleanup: 0, materialize: 0,
+      ownerRelease: 0 }
+    let racedRecord: OpenCodeSessionRecord | null = null
+    const releaseOwner = openCodeSessionStore.releaseMaterializationOwner
+    openCodeSessionStore.releaseMaterializationOwner = (async () => {
+      calls.ownerRelease += 1
+      return true
+    }) as typeof openCodeSessionStore.releaseMaterializationOwner
     openCodeProvisioningProbe.probeRetainingHost = (async () => ({
       snapshot, host: snapshot.host, release: async () => {},
     })) as typeof openCodeProvisioningProbe.probeRetainingHost
@@ -3494,31 +3501,57 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeSessionBridge.ensureSessionAppMcpReady = (async () => { calls.readiness += 1; throw new Error('must not mutate') }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
     openCodeSessionBridge.injectAppManagedBootstrapContext = (async () => { calls.injection += 1; throw new Error('must not reinject') }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
     openCodeSessionBridge.materializeSessionOnHost = (async input => {
+      calls.materialize += 1
       const bootstrap = input.expectedBootstrapForSession('session-existing')
+      racedRecord = buildRecord({
+        laneId: input.laneId, memberName: input.memberName, runId: input.runId,
+        selectedModel: input.selectedModel, selectedVariant: input.selectedVariant,
+        hostKey: input.host.hostKey, profileScope: input.host.profile.profileScope ?? null,
+        toolApprovalMode: input.toolApprovalMode ?? 'auto',
+        resolvedBehaviorFingerprint: input.host.resolvedConfigFingerprint,
+        projectBehaviorFingerprint: input.host.projectBehaviorFingerprint,
+        managedConfigFingerprint: input.host.profile.managedConfigFingerprint,
+        expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+        opencodeSessionId: 'session-existing', bootstrapMode: 'app_managed_context',
+        bootstrapEvidenceSource: 'app_managed_bootstrap',
+        appManagedBootstrap: {
+          schemaVersion: 1, ...bootstrap, injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+          model: input.selectedModel,
+        },
+      })
       return {
         created: false,
-        record: buildRecord({
-          laneId: input.laneId, memberName: input.memberName,
-          selectedModel: input.selectedModel, selectedVariant: input.selectedVariant,
-          opencodeSessionId: 'session-existing', expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
-          bootstrapMode: 'app_managed_context', bootstrapEvidenceSource: 'app_managed_bootstrap',
-          appManagedBootstrap: {
-            schemaVersion: 1, ...bootstrap, injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
-            model: input.selectedModel,
-          },
-        }),
+        record: racedRecord,
       }
     }) as typeof openCodeSessionBridge.materializeSessionOnHost
 
-    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
+    const body = {
       runId: 'run-raced-commit', laneId: 'primary', teamId: 'team-a',
       projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free',
       members: [{ name: 'alice', prompt: 'Alice join' }],
-    }))
+    }
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('materialization race must not be reported committed')
     expect(result.error.message).toContain('appeared during materialization')
-    expect(calls).toEqual({ readiness: 0, injection: 0, writes: 0, cleanup: 0 })
+    expect(calls).toEqual({ readiness: 0, injection: 0, writes: 0, cleanup: 0,
+      materialize: 1, ownerRelease: 0 })
+
+    openCodeSessionStore.observeMaterialization = (async () => ({
+      record: racedRecord!,
+      ownerToken: { attemptId: 'active-attempt', sessionId: 'session-existing', version: 7 },
+    })) as typeof openCodeSessionStore.observeMaterialization
+    calls.materialize = 0
+    const owned = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
+    openCodeSessionStore.releaseMaterializationOwner = releaseOwner
+    expect(owned.ok).toBe(false)
+    if (!owned.ok) expect(owned.error.message).toContain('owned by an active launch attempt')
+    expect(calls).toEqual({ readiness: 0, injection: 0, writes: 0, cleanup: 0,
+      materialize: 0, ownerRelease: 0 })
   })
 
   test('strict launch rejects missing or malformed behavior digests before host or member effects', async () => {

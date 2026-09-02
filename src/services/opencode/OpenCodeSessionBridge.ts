@@ -782,6 +782,7 @@ export class OpenCodeSessionBridge {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      runId: record.runId ?? null,
       sessionId: record.opencodeSessionId,
     }).catch(() => undefined)
 

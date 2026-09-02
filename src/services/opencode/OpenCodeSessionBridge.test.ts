@@ -1779,6 +1779,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('ensureSessionAppMcpReady verifies app MCP on the session host', async () => {
     const ensureCalls: Array<{ baseUrl: string; attachIfMissing?: boolean }> = []
+    const retainedLeases: unknown[] = []
     let releaseHostCalls = 0
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -1790,7 +1791,7 @@ describe('OpenCodeSessionBridge', () => {
         releaseHost: async () => {
           releaseHostCalls += 1
         },
-        retainHostLease: async () => {},
+        retainHostLease: async (_hostKey, input) => { retainedLeases.push(input) },
       },
       mcpManager: {
         ensureAppMcp: async input => {
@@ -1811,7 +1812,7 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.ensureSessionAppMcpReady(buildRecord(), {
+    const result = await bridge.ensureSessionAppMcpReady(buildRecord({ runId: 'run-1' }), {
       attachIfMissing: true,
     })
 
@@ -1823,6 +1824,13 @@ describe('OpenCodeSessionBridge', () => {
       diagnostics: [],
     })
     expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }])
+    expect(retainedLeases).toEqual([{
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      runId: 'run-1',
+      sessionId: 'session-1',
+    }])
     expect(releaseHostCalls).toBe(1)
   })
 

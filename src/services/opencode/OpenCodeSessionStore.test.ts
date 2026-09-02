@@ -551,6 +551,37 @@ describe('OpenCodeSessionStore', () => {
     expect(changed?.staleReason).toBe('new-state')
   })
 
+  test('normalizes legacy owner tokens and preserves their fencing version', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const store = new OpenCodeSessionStore(filePath)
+    const record = { ...baseRecord, runId: 'run-1' }
+    const key = 'team-a::primary::alice'
+    await writeFile(filePath, JSON.stringify({
+      schemaVersion: 1,
+      records: { [key]: record },
+      materializationOwners: {
+        [key]: { attemptId: 'legacy-attempt', sessionId: record.opencodeSessionId },
+      },
+      materializationOwnerVersions: { [key]: 4 },
+    }))
+
+    const legacyOwner = token('legacy-attempt', 5, record.opencodeSessionId)
+    expect(await store.observeMaterialization(record)).toEqual({ record, ownerToken: legacyOwner })
+    expect(await store.upsert({ ...record, updatedAt: '2026-04-21T00:01:00.000Z' }, legacyOwner))
+      .toBe('updated')
+    const persisted = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(persisted.materializationOwners[key]).toEqual(legacyOwner)
+    expect(persisted.materializationOwnerVersions[key]).toBe(5)
+
+    expect(await store.releaseMaterializationOwner(record, legacyOwner)).toBe(true)
+    expect(await store.acquireMaterializationOwner(
+      { ...record, updatedAt: '2026-04-21T00:01:00.000Z' },
+      'new-attempt',
+      undefined,
+      null,
+    )).toEqual(token('new-attempt', 6, record.opencodeSessionId))
+  })
+
   test('keeps concurrent same-attempt replays fenced while the original owner is active', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const record = { ...baseRecord, runId: 'run-1' }

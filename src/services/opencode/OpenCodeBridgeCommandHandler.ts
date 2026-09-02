@@ -3452,7 +3452,10 @@ async function runLaunch(
         )
       ) return { kind: 'ok', value: null }
       if (observation.ownerToken) {
-        await openCodeSessionStore.releaseMaterializationOwner(record, observation.ownerToken)
+        return {
+          kind: 'failure',
+          error: 'OpenCode compatible committed session is owned by an active launch attempt',
+        }
       }
       return {
         kind: 'ok',

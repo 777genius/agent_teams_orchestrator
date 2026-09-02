@@ -18,6 +18,8 @@ type SessionStoreShape = {
   materializationOwnerVersions?: Record<string, number>
 }
 
+type LegacyMaterializationOwnerToken = Omit<MaterializationOwnerToken, 'version'>
+
 type UpsertResult = 'created' | 'updated' | 'unchanged'
 export type MaterializationClaimResult =
   | { kind: 'claimed'; ownerToken: MaterializationOwnerToken }
@@ -36,6 +38,37 @@ function isMaterializationOwnerToken(value: unknown): value is MaterializationOw
   const token = value as Partial<MaterializationOwnerToken>
   return typeof token.attemptId === 'string' && typeof token.sessionId === 'string'
     && Number.isSafeInteger(token.version) && token.version > 0
+}
+
+function isLegacyMaterializationOwnerToken(
+  value: unknown,
+): value is LegacyMaterializationOwnerToken {
+  if (!value || typeof value !== 'object') return false
+  const token = value as Partial<LegacyMaterializationOwnerToken>
+  return typeof token.attemptId === 'string' && typeof token.sessionId === 'string'
+}
+
+function normalizeMaterializationOwners(store: SessionStoreShape): SessionStoreShape {
+  if (!store.materializationOwners) return store
+  const owners = store.materializationOwners as Record<string, unknown>
+  store.materializationOwnerVersions ??= {}
+  for (const [key, value] of Object.entries(owners)) {
+    const highWatermark = store.materializationOwnerVersions[key]
+    const currentVersion = typeof highWatermark === 'number'
+      && Number.isSafeInteger(highWatermark) && highWatermark > 0
+      ? highWatermark
+      : 0
+    if (isMaterializationOwnerToken(value)) {
+      store.materializationOwnerVersions[key] = Math.max(currentVersion, value.version)
+    } else if (isLegacyMaterializationOwnerToken(value)) {
+      const version = currentVersion + 1
+      owners[key] = { ...value, version }
+      store.materializationOwnerVersions[key] = version
+    } else {
+      delete owners[key]
+    }
+  }
+  return store
 }
 
 function ownerTokensEqual(left: unknown, right: unknown): boolean {
@@ -301,7 +334,7 @@ export class OpenCodeSessionStore {
       }
     }
 
-    return parsed
+    return normalizeMaterializationOwners(parsed)
   }
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
