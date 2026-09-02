@@ -303,6 +303,8 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
   openCodeSessionStore.get = store.get.bind(store)
   openCodeSessionStore.observeMaterialization = store.observeMaterialization.bind(store)
   openCodeSessionStore.isMaterializationOwnerActive = store.isMaterializationOwnerActive.bind(store)
+  openCodeSessionStore.releaseInactiveMaterializationOwner =
+    store.releaseInactiveMaterializationOwner.bind(store)
   openCodeSessionStore.upsert = store.upsert.bind(store)
   openCodeSessionStore.releaseMaterializationOwner = store.releaseMaterializationOwner.bind(store)
   openCodeSessionStore.markStaleIfSession = store.markStaleIfSession.bind(store)

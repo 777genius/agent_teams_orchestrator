@@ -585,6 +585,29 @@ export class OpenCodeSessionStore {
     }, signal)
   }
 
+  async releaseInactiveMaterializationOwner(
+    record: OpenCodeSessionRecord,
+    ownerToken: MaterializationOwnerToken,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const existing = store.records[key]
+      if (!existing || jsonStringify(existing) !== jsonStringify(record)) return false
+      if (!ownerTokensEqual(store.materializationOwners?.[key], ownerToken)) return false
+      // Liveness is checked while holding the same lock as the exact-token
+      // removal. A concurrently replaced or still-live owner is never cleared.
+      if (await this.materializationOwnerIsActive(
+        store.materializationOwnerProcesses?.[key],
+      )) return false
+      delete store.materializationOwners![key]
+      if (store.materializationOwnerProcesses) delete store.materializationOwnerProcesses[key]
+      await this.writeStore(store)
+      return true
+    }, signal)
+  }
+
   async releaseMaterializationClaim(
     identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
     ownerToken: MaterializationOwnerToken,

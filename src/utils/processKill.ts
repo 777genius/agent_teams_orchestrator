@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
@@ -34,6 +35,14 @@ export function isProcessAlive(pid: number): boolean {
 function parseProcessStartTime(value: string): number | null {
   const parsed = Date.parse(value.trim())
   return Number.isFinite(parsed) ? parsed : null
+}
+
+export function parseLinuxProcessStartTicks(value: string): number | null {
+  const close = value.lastIndexOf(')')
+  if (close < 0) return null
+  const fieldsAfterComm = value.slice(close + 1).trim().split(/\s+/)
+  const ticks = Number(fieldsAfterComm[19])
+  return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
 }
 
 function readProcessQueryOutput(
@@ -96,9 +105,16 @@ export async function readProcessStartTimeMs(
     return null
   }
 
-  const command = platform === 'win32' ? 'powershell.exe' : 'ps'
-  const args = platform === 'win32'
-    ? [
+  if (platform === 'linux') {
+    // Linux exposes starttime in clock ticks, avoiding the one-second
+    // truncation of ps lstart. The value is an opaque identity here.
+    const stat = await readFile(`/proc/${normalizedPid}/stat`, 'utf8').catch(() => null)
+    return stat === null ? null : parseLinuxProcessStartTicks(stat)
+  }
+  if (platform !== 'win32') return null
+
+  const command = 'powershell.exe'
+  const args = [
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy',
@@ -110,7 +126,6 @@ export async function readProcessStartTimeMs(
           '$process.StartTime.ToUniversalTime().ToString("o")',
         ].join('; '),
       ]
-    : ['-p', String(normalizedPid), '-o', 'lstart=']
 
   const output = await readProcessQueryOutput(
     command,

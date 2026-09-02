@@ -660,12 +660,17 @@ describe('OpenCodeSessionStore', () => {
     expect(await retry.isMaterializationOwnerActive(record, originalOwner!)).toBe(true)
     expect(await retry.acquireMaterializationOwner(record, 'attempt-b', undefined, originalOwner))
       .toBeNull()
+    expect(await retry.releaseInactiveMaterializationOwner(record, originalOwner!)).toBe(false)
 
     // The PID still exists, but a different start time proves it was reused.
     startedAt.set(111, 1_001)
     expect(await retry.isMaterializationOwnerActive(record, originalOwner!)).toBe(false)
-    expect(await retry.acquireMaterializationOwner(record, 'attempt-b', undefined, originalOwner))
-      .toEqual(token('attempt-b', 2, record.opencodeSessionId))
+    expect(await retry.releaseInactiveMaterializationOwner(record, originalOwner!)).toBe(true)
+    expect(await retry.observeMaterialization(record)).toEqual({ record, ownerToken: null })
+    const successor = await retry.acquireMaterializationOwner(record, 'attempt-b', undefined, null)
+    expect(successor).toEqual(token('attempt-b', 2, record.opencodeSessionId))
+    expect(await retry.releaseInactiveMaterializationOwner(record, originalOwner!)).toBe(false)
+    expect(await retry.observeMaterialization(record)).toEqual({ record, ownerToken: successor })
   })
 
 })

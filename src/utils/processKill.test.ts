@@ -5,6 +5,7 @@ import {
   buildWindowsTaskkillInvocation,
   isProcessAlive,
   killProcessTreeAndWait,
+  parseLinuxProcessStartTicks,
   readProcessCommandLine,
   readProcessStartTimeMs,
 } from './processKill.js'
@@ -51,5 +52,13 @@ describe('processKill', () => {
   it('does not spawn an identity query for an invalid pid', async () => {
     await expect(readProcessStartTimeMs(0, 'win32')).resolves.toBeNull()
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
+  })
+
+  it('parses precise Linux start ticks when command names contain delimiters', () => {
+    const fields = Array.from({ length: 19 }, (_, index) => String(index + 1))
+    fields[18] = '987654321'
+    expect(parseLinuxProcessStartTicks(`123 (worker ) name) S ${fields.join(' ')}`))
+      .toBe(987654321)
+    expect(parseLinuxProcessStartTicks('malformed')).toBeNull()
   })
 })

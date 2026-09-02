@@ -3439,9 +3439,9 @@ async function runLaunch(
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
       }
       const input = memberInputs.get(member.memberId)!
-      const observation = await openCodeSessionStore.observeMaterialization(
-        { teamId, laneId, memberName: input.name },
-        signal,
+      const materializationIdentity = { teamId, laneId, memberName: input.name }
+      let observation = await openCodeSessionStore.observeMaterialization(
+        materializationIdentity, signal,
       )
       if (!observation) return { kind: 'ok', value: null }
       const record = observation.record
@@ -3451,24 +3451,33 @@ async function runLaunch(
           strictSessionCompatibility(record.opencodeSessionId, input),
         )
       ) return { kind: 'ok', value: null }
-      if (observation.ownerToken && await openCodeSessionStore.isMaterializationOwnerActive(
-        record,
-        observation.ownerToken,
-        signal,
-      )) {
-        return {
-          kind: 'failure',
-          error: 'OpenCode compatible committed session is owned by an active launch attempt',
+      if (observation.ownerToken) {
+        await openCodeSessionStore.releaseInactiveMaterializationOwner(
+          record, observation.ownerToken, signal,
+        )
+        // Whether the CAS succeeded or lost, re-observe authoritative state.
+        observation = await openCodeSessionStore.observeMaterialization(
+          materializationIdentity, signal,
+        )
+        if (observation?.ownerToken) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode compatible committed session is owned by an active launch attempt',
+          }
         }
+        if (!observation || !isOpenCodeStrictSessionCompatible(
+          observation.record,
+          strictSessionCompatibility(observation.record.opencodeSessionId, input),
+        )) return { kind: 'ok', value: null }
       }
-      if (observation.ownerToken) return { kind: 'ok', value: null }
+      const committedRecord = observation.record
       return {
         kind: 'ok',
         value: {
           memberId: input.name,
           memberFingerprint: input.fingerprint,
           behaviorFingerprint: expectedBehaviorFingerprint,
-          projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
+          projection: strictLaunchProjection(committedRecord, input, teamId, runId, laneId, host.pid),
         },
       }
     },
@@ -3622,14 +3631,15 @@ async function runLaunch(
         }
       }
     },
-    cleanup: async (_context, cleanupResources) => {
-      for (const resource of cleanupResources) {
-        const owned = resources.get(resource.resourceId)
-        if (owned && !resource.committed) {
-          await cleanupFailedLaunchSession(owned.record, owned.ownerToken)
+    cleanup: (_context, cleanupResources) =>
+      openCodeSessionStore.trackPendingMaterializationReconciliation((async () => {
+        for (const resource of cleanupResources) {
+          const owned = resources.get(resource.resourceId)
+          if (owned && !resource.committed) {
+            await cleanupFailedLaunchSession(owned.record, owned.ownerToken)
+          }
         }
-      }
-    },
+      })()),
     releaseHost: async (_context, lease, keepAlive) => {
       if (lease.leaseId === preconditions.commandLeaseId) {
         await retainedProbe.release(keepAlive)
@@ -3669,13 +3679,14 @@ async function runLaunch(
       }),
     },
   }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
-  const releaseMaterializationOwners = Promise.all(
-    [...resources.values()].map(({ record, ownerToken }) =>
-      openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
-        .catch(() => false))
-  )
+  const releaseMaterializationOwners = openCodeSessionStore.drainPendingLateLockReleases()
+    .then(() => openCodeSessionStore.trackPendingMaterializationReconciliation(Promise.all(
+      [...resources.values()].map(({ record, ownerToken }) =>
+        openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
+          .catch(() => false)),
+    )))
   await withTimeout(
-    openCodeSessionStore.trackPendingMaterializationReconciliation(releaseMaterializationOwners),
+    releaseMaterializationOwners,
     Math.max(0, deadlineAt - Date.now()),
   ).catch(() => undefined)
   diagnostics.push(teamDiagnostic(

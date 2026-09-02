@@ -2165,6 +2165,8 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-new',
       },
     ])
     expect(releaseHostCalls).toBe(1)

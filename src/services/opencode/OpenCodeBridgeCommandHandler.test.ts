@@ -3116,7 +3116,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
-  test('bounds post-coordinator owner release by the original absolute deadline', async () => {
+  test('waits for tracked cancellation cleanup before bounded owner release', async () => {
     const realNow = Date.now
     const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
     let now = 1_000
@@ -3124,6 +3124,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     try {
       await withManualTimers(async timers => {
         const releaseStarted = createDeferred<void>()
+        const hostReleased = createDeferred<void>()
+        const cancellationCleanupCompleted = createDeferred<void>()
+        openCodeSessionStore.trackPendingMaterializationReconciliation(
+          cancellationCleanupCompleted.promise,
+        )
         const ownerReleaseCompleted = createDeferred<boolean>()
         let materializeCalls = 0
         let hostReleaseCalls = 0
@@ -3132,7 +3137,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         openCodeProvisioningProbe.probeRetainingHost = (async () => ({
           snapshot,
           host: snapshot.host,
-          release: async () => { hostReleaseCalls += 1 },
+          release: async () => { hostReleaseCalls += 1; hostReleased.resolve() },
         })) as typeof openCodeProvisioningProbe.probeRetainingHost
         openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
         openCodeSessionBridge.materializeSessionOnHost = (async input => {
@@ -3171,6 +3176,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
         })
         envelope.timeoutMs = 1_000
         const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
+        await hostReleased.promise
+        await Promise.resolve()
+        expect(ownerReleaseCalls).toBe(0)
+        cancellationCleanupCompleted.resolve()
         await releaseStarted.promise
 
         const ownerReleaseTimer = [...timers].reverse().find(timer =>
@@ -3486,6 +3495,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ownerRelease: 0 }
     let racedRecord: OpenCodeSessionRecord | null = null
     const releaseOwner = openCodeSessionStore.releaseMaterializationOwner
+    const observeMaterialization = openCodeSessionStore.observeMaterialization
+    const releaseInactiveOwner = openCodeSessionStore.releaseInactiveMaterializationOwner
     openCodeSessionStore.releaseMaterializationOwner = (async () => {
       calls.ownerRelease += 1
       return true
@@ -3543,15 +3554,39 @@ describe('OpenCodeBridgeCommandHandler', () => {
       record: racedRecord!,
       ownerToken: { attemptId: 'active-attempt', sessionId: 'session-existing', version: 7 },
     })) as typeof openCodeSessionStore.observeMaterialization
+    openCodeSessionStore.releaseInactiveMaterializationOwner = (async () => false) as
+      typeof openCodeSessionStore.releaseInactiveMaterializationOwner
     calls.materialize = 0
     const owned = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.launchTeam', body),
     )
-    openCodeSessionStore.releaseMaterializationOwner = releaseOwner
     expect(owned.ok).toBe(false)
     if (!owned.ok) expect(owned.error.message).toContain('owned by an active launch attempt')
     expect(calls).toEqual({ readiness: 0, injection: 0, writes: 0, cleanup: 0,
       materialize: 0, ownerRelease: 0 })
+
+    let observations = 0
+    let deadOwnerReleases = 0
+    openCodeSessionStore.observeMaterialization = (async () => ({
+      record: racedRecord!,
+      ownerToken: observations++ === 0
+        ? { attemptId: 'dead-attempt', sessionId: 'session-existing', version: 8 }
+        : null,
+    })) as typeof openCodeSessionStore.observeMaterialization
+    openCodeSessionStore.releaseInactiveMaterializationOwner = (async () => {
+      deadOwnerReleases += 1
+      return true
+    }) as typeof openCodeSessionStore.releaseInactiveMaterializationOwner
+    const recovered = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', body),
+    )
+    openCodeSessionStore.releaseMaterializationOwner = releaseOwner
+    openCodeSessionStore.observeMaterialization = observeMaterialization
+    openCodeSessionStore.releaseInactiveMaterializationOwner = releaseInactiveOwner
+    expect(recovered.ok).toBe(true)
+    if (recovered.ok) expect(recovered.data.members.alice?.sessionId).toBe('session-existing')
+    expect(deadOwnerReleases).toBe(1)
+    expect(calls.materialize).toBe(0)
   })
 
   test('strict launch rejects missing or malformed behavior digests before host or member effects', async () => {
