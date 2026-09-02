@@ -3008,6 +3008,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeSessionStore.get = (async (_teamId, _laneId, memberName) =>
       records.get(memberName ?? _laneId) ?? null) as typeof openCodeSessionStore.get
+    openCodeSessionStore.observeMaterialization = (async identity => {
+      const record = records.get(identity.memberName) ?? null
+      return record ? { record, ownerToken: null } : null
+    }) as typeof openCodeSessionStore.observeMaterialization
     openCodeSessionStore.upsert = (async record => {
       records.set(record.memberName, record)
       return 'updated'
@@ -3120,6 +3124,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     try {
       await withManualTimers(async timers => {
         const releaseStarted = createDeferred<void>()
+        const ownerReleaseCompleted = createDeferred<boolean>()
         let materializeCalls = 0
         let hostReleaseCalls = 0
         let ownerReleaseCalls = 0
@@ -3157,7 +3162,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           ownerReleaseCalls += 1
           now = 1_250
           releaseStarted.resolve()
-          return new Promise<boolean>(() => {})
+          return ownerReleaseCompleted.promise
         }) as typeof openCodeSessionStore.releaseMaterializationOwner
 
         const envelope = buildEnvelope('opencode.launchTeam', {
@@ -3184,6 +3189,16 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(hostReleaseCalls).toBe(1)
         expect(ownerReleaseCalls).toBe(1)
         expect(sessionReleaseCalls).toBe(0)
+
+        let drained = false
+        const drain = openCodeSessionStore.drainPendingLateLockReleases().then(() => {
+          drained = true
+        })
+        await Promise.resolve()
+        expect(drained).toBe(false)
+        ownerReleaseCompleted.resolve(true)
+        await drain
+        expect(drained).toBe(true)
       })
     } finally {
       Date.now = realNow

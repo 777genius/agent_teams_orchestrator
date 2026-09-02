@@ -1207,6 +1207,8 @@ describe('OpenCodeSessionBridge', () => {
     const successor = await bridge.materializeSessionOnHost(retryInput)
     expect(successor).toMatchObject({ created: true, record: { runId: 'run-2', opencodeSessionId: 'session-2' } })
     expect(creates).toBe(2)
+    expect(successor.ownerToken).toBeDefined()
+    expect(await store.releaseMaterializationOwner(successor.record, successor.ownerToken!)).toBe(true)
     const replay = await bridge.materializeSessionOnHost({
       ...retryInput, attemptId: 'retry-replay', signal: new AbortController().signal,
     })
@@ -1768,6 +1770,8 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: null,
+        sessionId: 'session-1',
       },
     ])
     expect(releaseHostCalls).toBe(0)

@@ -503,8 +503,8 @@ describe('OpenCodeSessionStore', () => {
     await expect(store.upsert(old)).rejects.toThrow('materialization claim')
     const next = { ...old, runId: 'run-2', opencodeSessionId: 'session-2' }
     expect(await store.commitMaterialization(next, token('new-attempt'))).not.toBeNull()
-    await expect(store.upsert(old)).rejects.toThrow('committed run and session')
-    await expect(store.upsert({ ...next, runId: undefined })).rejects.toThrow('committed run and session')
+    await expect(store.upsert(old)).rejects.toThrow('materialization owner')
+    await expect(store.upsert({ ...next, runId: undefined })).rejects.toThrow('materialization owner')
     expect(await store.markStale('team-a', 'primary', 'alice', 'late-observer', old)).toBeNull()
     expect(await store.get('team-a', 'primary', 'alice')).toEqual(next)
   })
@@ -525,7 +525,7 @@ describe('OpenCodeSessionStore', () => {
     expect(drained).toBe(true)
   })
 
-  test('atomically transfers incomplete-session cleanup ownership and fences the old attempt', async () => {
+  test('keeps an active owner and rejects its stale token after exact release', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const record = { ...baseRecord, runId: 'run-1' }
     expect(await store.claimMaterialization(record, 'old-attempt', 'run-1'))
@@ -534,26 +534,24 @@ describe('OpenCodeSessionStore', () => {
 
     const oldOwner = token('old-attempt', 1, record.opencodeSessionId)
     expect(await store.acquireMaterializationOwner(record, 'new-attempt', undefined, oldOwner))
-      .toEqual(token('new-attempt', 2, record.opencodeSessionId))
-    expect(await store.acquireMaterializationOwner(record, 'new-attempt', undefined, oldOwner)).toBeNull()
-    const staleSameAttempt = token('new-attempt', 1, record.opencodeSessionId)
-    expect(await store.releaseMaterializationOwner(record, staleSameAttempt)).toBe(false)
-    expect(await store.markStaleIfSession(record, 'stale-token', staleSameAttempt)).toBeNull()
-    await expect(store.upsert({ ...record, updatedAt: '2026-04-21T00:02:00.000Z' }, staleSameAttempt))
+      .toBeNull()
+    expect(await store.observeMaterialization(record)).toEqual({ record, ownerToken: oldOwner })
+    expect(await store.releaseMaterializationOwner(record, oldOwner)).toBe(true)
+    expect(await store.releaseMaterializationOwner(record, oldOwner)).toBe(false)
+    expect(await store.markStaleIfSession(record, 'stale-token', oldOwner)).toBeNull()
+    await expect(store.upsert({ ...record, updatedAt: '2026-04-21T00:02:00.000Z' }, oldOwner))
       .rejects.toThrow('fenced by a materialization owner')
-    expect(await store.markStaleIfSession(record, 'old-cleanup', token('old-attempt', 1, record.opencodeSessionId))).toBeNull()
-    expect(await store.deleteIfSession(record, token('old-attempt', 1, record.opencodeSessionId))).toBe(false)
+    expect(await store.deleteIfSession(record, oldOwner)).toBe(false)
     expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(record)
 
-    const changed = await store.markStaleIfSession(record, 'new-state', token('new-attempt', 2, record.opencodeSessionId))
+    const newOwner = token('new-attempt', 2, record.opencodeSessionId)
+    expect(await store.acquireMaterializationOwner(record, 'new-attempt', undefined, null))
+      .toEqual(newOwner)
+    const changed = await store.markStaleIfSession(record, 'new-state', newOwner)
     expect(changed?.staleReason).toBe('new-state')
-    expect(await store.acquireMaterializationOwner(record, 'third-attempt', undefined, {
-      attemptId: 'new-attempt', sessionId: record.opencodeSessionId, version: 2,
-    })).toBeNull()
-    expect(await store.deleteIfSession(record, token('old-attempt', 1, record.opencodeSessionId))).toBe(false)
   })
 
-  test('consumes an owner observation for concurrent same-attempt replay', async () => {
+  test('keeps concurrent same-attempt replays fenced while the original owner is active', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const record = { ...baseRecord, runId: 'run-1' }
     expect(await store.claimMaterialization(record, 'attempt-a', 'run-1'))
@@ -574,14 +572,14 @@ describe('OpenCodeSessionStore', () => {
       store.acquireMaterializationOwner(record, 'attempt-a', undefined, firstObservation.ownerToken),
       store.acquireMaterializationOwner(record, 'attempt-a', undefined, secondObservation.ownerToken),
     ])
-    expect(transfers.filter(Boolean)).toHaveLength(1)
+    expect(transfers.filter(Boolean)).toHaveLength(0)
     const consumed = await store.claimMaterialization(record, 'attempt-a', 'run-1')
     expect(consumed).toMatchObject({ kind: 'existing', ownerToken: {
-      attemptId: 'attempt-a', sessionId: record.opencodeSessionId, version: 2,
+      attemptId: 'attempt-a', sessionId: record.opencodeSessionId, version: 1,
     } })
   })
 
-  test('allows only one retry to CAS incomplete-session bootstrap ownership', async () => {
+  test('does not let concurrent retries take over an active incomplete-session owner', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const record = { ...baseRecord, runId: 'run-1' }
     expect(await store.claimMaterialization(record, 'attempt-a', 'run-1'))
@@ -603,7 +601,11 @@ describe('OpenCodeSessionStore', () => {
       store.acquireMaterializationOwner(record, 'attempt-b', undefined, observedByB.ownerToken),
       store.acquireMaterializationOwner(record, 'attempt-c', undefined, observedByC.ownerToken),
     ])
-    expect(transfers.filter(Boolean)).toHaveLength(1)
+    expect(transfers.filter(Boolean)).toHaveLength(0)
+    expect(await store.observeMaterialization(record)).toEqual({
+      record,
+      ownerToken: token('attempt-a', 1, record.opencodeSessionId),
+    })
   })
 
 })

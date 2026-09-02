@@ -3439,14 +3439,21 @@ async function runLaunch(
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
       }
       const input = memberInputs.get(member.memberId)!
-      const record = await openCodeSessionStore.get(teamId, laneId, input.name)
+      const observation = await openCodeSessionStore.observeMaterialization(
+        { teamId, laneId, memberName: input.name },
+        signal,
+      )
+      if (!observation) return { kind: 'ok', value: null }
+      const record = observation.record
       if (
-        !record
-        || !isOpenCodeStrictSessionCompatible(
+        !isOpenCodeStrictSessionCompatible(
           record,
           strictSessionCompatibility(record.opencodeSessionId, input),
         )
       ) return { kind: 'ok', value: null }
+      if (observation.ownerToken) {
+        await openCodeSessionStore.releaseMaterializationOwner(record, observation.ownerToken)
+      }
       return {
         kind: 'ok',
         value: {
@@ -3654,12 +3661,14 @@ async function runLaunch(
       }),
     },
   }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
-  await withTimeout(
-    Promise.all([...resources.values()].map(({ record, ownerToken }) =>
+  const releaseMaterializationOwners = Promise.all(
+    [...resources.values()].map(({ record, ownerToken }) =>
       openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
-        .catch(() => false))),
+        .catch(() => false))
+  )
+  await withTimeout(
+    openCodeSessionStore.trackPendingMaterializationReconciliation(releaseMaterializationOwners),
     Math.max(0, deadlineAt - Date.now()),
-    launchSignal,
   ).catch(() => undefined)
   diagnostics.push(teamDiagnostic(
     `opencode_strict_launch_${result.status.replaceAll('-', '_')}`,

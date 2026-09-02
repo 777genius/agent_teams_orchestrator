@@ -683,7 +683,8 @@ export class OpenCodeSessionBridge {
   }
 
   async releaseSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>,
+    record: Pick<OpenCodeSessionRecord,
+      'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'runId' | 'opencodeSessionId'>,
     options: { strictLeaseRelease?: boolean } = {},
   ): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
@@ -695,6 +696,8 @@ export class OpenCodeSessionBridge {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      runId: record.runId ?? null,
+      sessionId: record.opencodeSessionId,
     })
     if (options.strictLeaseRelease) await releaseLease
     else await releaseLease?.catch(() => undefined)
