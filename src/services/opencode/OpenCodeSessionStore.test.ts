@@ -640,6 +640,30 @@ describe('OpenCodeSessionStore', () => {
     })
   })
 
+  test('persists owner PID when start time is unavailable and reclaims a dead owner', async () => {
+    const filePath = path.join(tempDir, 'session-store-no-start-time.json')
+    const record = { ...baseRecord, runId: 'run-no-start-time' }
+    let alive = true
+    let startTimeRead: number | null = null
+    const store = new OpenCodeSessionStore(filePath, {
+      ownerPid: 111,
+      isProcessAlive: () => alive,
+      readProcessStartTimeMs: async () => startTimeRead,
+    })
+    const claim = await store.claimMaterialization(record, 'attempt-a', record.runId)
+    if (claim.kind !== 'claimed') throw new Error('expected materialization claim')
+    const owner = await store.commitMaterialization(record, claim.ownerToken)
+    expect(owner).not.toBeNull()
+    const persisted = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(persisted.materializationOwnerProcesses['team-a::primary::alice']).toEqual({
+      pid: 111, startedAtMs: null,
+    })
+    startTimeRead = 2_222
+    expect(await store.releaseInactiveMaterializationOwner(record, owner!)).toBe(false)
+    alive = false
+    expect(await store.releaseInactiveMaterializationOwner(record, owner!)).toBe(true)
+  })
+
   test('takes over only after persisted process identity proves the owner exited or changed', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
     const record = { ...baseRecord, runId: 'run-1' }

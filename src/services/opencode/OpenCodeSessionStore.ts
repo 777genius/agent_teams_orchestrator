@@ -37,7 +37,7 @@ export type MaterializationOwnerToken = {
 
 type MaterializationOwnerProcessIdentity = {
   pid: number
-  startedAtMs: number
+  startedAtMs: number | null
 }
 
 function isMaterializationOwnerToken(value: unknown): value is MaterializationOwnerToken {
@@ -116,7 +116,8 @@ function isMaterializationOwnerProcessIdentity(
   if (!value || typeof value !== 'object') return false
   const identity = value as Partial<MaterializationOwnerProcessIdentity>
   return Number.isSafeInteger(identity.pid) && Number(identity.pid) > 0
-    && typeof identity.startedAtMs === 'number' && Number.isFinite(identity.startedAtMs)
+    && (identity.startedAtMs === null
+      || (typeof identity.startedAtMs === 'number' && Number.isFinite(identity.startedAtMs)))
 }
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
@@ -246,8 +247,7 @@ export class OpenCodeSessionStore {
     this.ownerProcessIdentityPromise ??= (async () => {
       if (!this.isProcessAlive(this.ownerPid)) return null
       const startedAtMs = await this.readProcessStartTimeMs(this.ownerPid).catch(() => null)
-      if (!Number.isFinite(startedAtMs) || startedAtMs === null
-        || !this.isProcessAlive(this.ownerPid)) return null
+      if (!this.isProcessAlive(this.ownerPid)) return null
       return { pid: this.ownerPid, startedAtMs }
     })()
     return this.ownerProcessIdentityPromise
@@ -257,6 +257,10 @@ export class OpenCodeSessionStore {
     // Missing or unreadable process identity is not proof that an owner died.
     if (!isMaterializationOwnerProcessIdentity(identity)) return true
     if (!this.isProcessAlive(identity.pid)) return false
+    // A persisted null start time means the original identity is unknown. PID
+    // liveness is the only safe signal; a later successful read must not turn
+    // this into a false PID-reuse conclusion.
+    if (identity.startedAtMs === null) return true
     const startedAtMs = await this.readProcessStartTimeMs(identity.pid).catch(() => null)
     if (!Number.isFinite(startedAtMs) || startedAtMs === null) return true
     if (!this.isProcessAlive(identity.pid)) return false

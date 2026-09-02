@@ -1086,8 +1086,10 @@ export class OpenCodeHostManager {
       if (!lease) return
       const expectedRunId = input.runId?.trim()
       const expectedSessionId = input.sessionId?.trim()
-      if ((expectedRunId && lease.runId && lease.runId !== expectedRunId)
-        || (expectedSessionId && lease.sessionId && lease.sessionId !== expectedSessionId)) return
+      // Every persisted identity field must be qualified independently. A
+      // caller supplying only one identity cannot release a lease qualified by both.
+      if ((lease.runId && (!expectedRunId || lease.runId !== expectedRunId))
+        || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return
       delete leases[leaseKey]
       registry.hosts[hostKey] = {
         ...record,
@@ -1685,25 +1687,44 @@ export class OpenCodeHostManager {
       return false
     }
 
-    await this.terminatePersistentHostRecord(
-      {
-        hostKey,
-        profileRootKey: entry.handle.profileRootKey,
-        projectPath: entry.handle.projectPath,
-        projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
-        baseUrl: entry.handle.baseUrl,
-        port: entry.handle.port,
-        pid: entry.handle.pid,
-        processStartedAtMs: entry.handle.processStartedAtMs,
-        version: entry.handle.version,
-        resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
-        updatedAt: this.nowIso(),
-        leases: {},
-      },
-      { force: true },
-    )
-    await this.removePersistentHost(hostKey).catch(() => undefined)
-    return true
+    return this.withPersistentHostStartupLock(hostKey, async () => {
+      return this.withPersistentRegistryLock(async () => {
+        const registry = await this.readPersistentRegistryUnlocked()
+        const persisted = registry.hosts[hostKey] ?? null
+        if (persisted && Object.keys(normalizePersistentHostLeases(persisted.leases)).length > 0) {
+          return false
+        }
+        const record = persisted ?? {
+          hostKey,
+          profileRootKey: entry.handle.profileRootKey,
+          projectPath: entry.handle.projectPath,
+          projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
+          baseUrl: entry.handle.baseUrl,
+          port: entry.handle.port,
+          pid: entry.handle.pid,
+          processStartedAtMs: entry.handle.processStartedAtMs,
+          version: entry.handle.version,
+          resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
+          updatedAt: this.nowIso(),
+          leases: {},
+        }
+        await this.terminatePersistentHostRecord(record, { force: true })
+        // Delete only the exact record we terminated; a concurrent startup or
+        // registry writer must not have its replacement removed.
+        const current = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
+        if (current && current.pid === record.pid
+          && current.processStartedAtMs === record.processStartedAtMs) {
+          const latest = await this.readPersistentRegistryUnlocked()
+          delete latest.hosts[hostKey]
+          if (Object.keys(latest.hosts).length === 0) {
+            await unlink(this.persistentRegistryPath!).catch(() => undefined)
+          } else {
+            await this.writePersistentRegistryUnlocked(latest)
+          }
+        }
+        return true
+      })
+    })
   }
 
   async disposeUnregisteredOwnedHosts(): Promise<{
