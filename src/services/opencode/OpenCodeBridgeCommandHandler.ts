@@ -3597,6 +3597,7 @@ async function runLaunch(
         const candidateAt = nowIso()
         record = {
           ...record,
+          staleReason: null,
           bootstrapMode: 'app_managed_context',
           bootstrapEvidenceSource: 'app_managed_bootstrap',
           appManagedBootstrap: {

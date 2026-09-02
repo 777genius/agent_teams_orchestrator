@@ -1305,7 +1305,10 @@ describe('OpenCodeSessionBridge', () => {
     expect(claimRunIds).toEqual(['run-1'])
     expect(claimSignals).toEqual([controller.signal])
     expect(commitSignals).toEqual([controller.signal, undefined])
-    expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
+    const interrupted = await store.get('team-a', 'primary', 'alice')
+    expect(interrupted?.opencodeSessionId).toBe('session-known')
+    expect(await store.markStaleIfSession(interrupted!, 'launch_failed')).not.toBeNull()
+
 
     const retryController = new AbortController()
     const restartedStore = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))

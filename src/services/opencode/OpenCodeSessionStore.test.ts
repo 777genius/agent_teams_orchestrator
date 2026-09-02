@@ -506,6 +506,7 @@ describe('OpenCodeSessionStore', () => {
     await expect(store.upsert(old)).rejects.toThrow('materialization owner')
     await expect(store.upsert({ ...next, runId: undefined })).rejects.toThrow('materialization owner')
     expect(await store.markStale('team-a', 'primary', 'alice', 'late-observer', old)).toBeNull()
+    expect(await store.markStale('team-a', 'primary', 'alice', 'generic-observer', next)).toBeNull()
     expect(await store.get('team-a', 'primary', 'alice')).toEqual(next)
   })
 
@@ -671,6 +672,70 @@ describe('OpenCodeSessionStore', () => {
     expect(successor).toEqual(token('attempt-b', 2, record.opencodeSessionId))
     expect(await retry.releaseInactiveMaterializationOwner(record, originalOwner!)).toBe(false)
     expect(await retry.observeMaterialization(record)).toEqual({ record, ownerToken: successor })
+  })
+
+  test('aborts owner takeover and release after asynchronous liveness checks', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const record = { ...baseRecord, runId: 'run-1' }
+    const key = 'team-a::primary::alice'
+    const owner = token('attempt-a', 1, record.opencodeSessionId)
+
+    const exercise = async (operation: 'acquire' | 'release') => {
+      await writeFile(filePath, JSON.stringify({
+        schemaVersion: 1,
+        records: { [key]: record },
+        materializationOwners: { [key]: owner },
+        materializationOwnerVersions: { [key]: 1 },
+        materializationOwnerProcesses: { [key]: { pid: 111, startedAtMs: 1_000 } },
+      }))
+      let notifyOwnerRead!: () => void
+      const ownerReadStarted = new Promise<void>(resolve => { notifyOwnerRead = resolve })
+      let resolveOwnerRead!: (value: number) => void
+      const store = new OpenCodeSessionStore(filePath, {
+        ownerPid: 222,
+        isProcessAlive: pid => pid === 111 || pid === 222,
+        readProcessStartTimeMs: async pid => {
+          if (pid === 222) return 2_000
+          notifyOwnerRead()
+          return new Promise<number>(resolve => { resolveOwnerRead = resolve })
+        },
+      })
+      const controller = new AbortController()
+      const abortReason = new Error(`cancel owner ${operation}`)
+      const pending = operation === 'acquire'
+        ? store.acquireMaterializationOwner(record, 'attempt-b', controller.signal, owner)
+        : store.releaseInactiveMaterializationOwner(record, owner, controller.signal)
+      await ownerReadStarted
+      controller.abort(abortReason)
+      resolveOwnerRead(1_001)
+      await expect(pending).rejects.toBe(abortReason)
+      expect(await store.observeMaterialization(record)).toEqual({ record, ownerToken: owner })
+    }
+
+    await exercise('acquire')
+    await exercise('release')
+  })
+
+  test('generic stale marking proceeds after a materialization owner process is proven inactive', async () => {
+    const filePath = path.join(tempDir, 'inactive-owner.json')
+    const record = { ...baseRecord, runId: 'run-1' }
+    const key = 'team-a::primary::alice'
+    const owner = token('attempt-a', 1, record.opencodeSessionId)
+    await writeFile(filePath, JSON.stringify({
+      schemaVersion: 1,
+      records: { [key]: record },
+      materializationOwners: { [key]: owner },
+      materializationOwnerVersions: { [key]: 1 },
+      materializationOwnerProcesses: { [key]: { pid: 111, startedAtMs: 1_000 } },
+    }))
+    const store = new OpenCodeSessionStore(filePath, {
+      isProcessAlive: pid => pid === 111,
+      readProcessStartTimeMs: async () => 2_000,
+    })
+
+    expect(await store.markStale(
+      record.teamId, record.laneId!, record.memberName, 'inactive-owner', record,
+    )).toMatchObject({ staleReason: 'inactive-owner' })
   })
 
 })

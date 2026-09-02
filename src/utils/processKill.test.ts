@@ -5,6 +5,7 @@ import {
   buildWindowsTaskkillInvocation,
   isProcessAlive,
   killProcessTreeAndWait,
+  parseDarwinProcessStartTime,
   parseLinuxProcessStartTicks,
   readProcessCommandLine,
   readProcessStartTimeMs,
@@ -49,6 +50,15 @@ describe('processKill', () => {
     await expect(killProcessTreeAndWait(-1)).resolves.toBe(true)
   })
 
+  it('refuses to signal a process whose start identity does not match', async () => {
+    const startedAtMs = await readProcessStartTimeMs(process.pid)
+    expect(startedAtMs).not.toBeNull()
+    await expect(killProcessTreeAndWait(process.pid, 'SIGTERM', {
+      expectedStartedAtMs: startedAtMs! + 1,
+    })).resolves.toBe(false)
+    expect(isProcessAlive(process.pid)).toBe(true)
+  })
+
   it('does not spawn an identity query for an invalid pid', async () => {
     await expect(readProcessStartTimeMs(0, 'win32')).resolves.toBeNull()
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
@@ -60,5 +70,11 @@ describe('processKill', () => {
     expect(parseLinuxProcessStartTicks(`123 (worker ) name) S ${fields.join(' ')}`))
       .toBe(987654321)
     expect(parseLinuxProcessStartTicks('malformed')).toBeNull()
+  })
+
+  it('parses Darwin ps lstart output as an epoch timestamp', () => {
+    expect(parseDarwinProcessStartTime('Tue Sep  2 18:12:34 2026\n'))
+      .toBe(Date.parse('Tue Sep  2 18:12:34 2026'))
+    expect(parseDarwinProcessStartTime('not a process start time')).toBeNull()
   })
 })

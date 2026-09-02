@@ -37,6 +37,10 @@ function parseProcessStartTime(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+export function parseDarwinProcessStartTime(value: string): number | null {
+  return parseProcessStartTime(value)
+}
+
 export function parseLinuxProcessStartTicks(value: string): number | null {
   const close = value.lastIndexOf(')')
   if (close < 0) return null
@@ -111,6 +115,16 @@ export async function readProcessStartTimeMs(
     const stat = await readFile(`/proc/${normalizedPid}/stat`, 'utf8').catch(() => null)
     return stat === null ? null : parseLinuxProcessStartTicks(stat)
   }
+
+  if (platform === 'darwin') {
+    const output = await readProcessQueryOutput(
+      'ps',
+      ['-p', String(normalizedPid), '-o', 'lstart='],
+      PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+    )
+    return output === null ? null : parseDarwinProcessStartTime(output)
+  }
+
   if (platform !== 'win32') return null
 
   const command = 'powershell.exe'
@@ -270,6 +284,13 @@ export async function killProcessTreeAndWait(
 
   const timeoutMs = options.timeoutMs ?? 2_500
   const pollMs = options.pollMs ?? 50
+
+  if (Number.isFinite(options.expectedStartedAtMs) && options.expectedStartedAtMs !== null) {
+    const currentStartedAtMs = await readProcessStartTimeMs(pid)
+    if (currentStartedAtMs !== options.expectedStartedAtMs) {
+      return false
+    }
+  }
 
   if (process.platform === 'win32') {
     await runWindowsTaskkill(pid, options.taskkillTimeoutMs ?? timeoutMs)

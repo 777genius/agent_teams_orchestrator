@@ -545,9 +545,11 @@ export class OpenCodeSessionStore {
         if (owner !== undefined) return null
       } else {
         if (!ownerTokensEqual(owner, expectedOwnerToken)) return null
-        if (await this.materializationOwnerIsActive(
+        const ownerIsActive = await this.materializationOwnerIsActive(
           store.materializationOwnerProcesses?.[key],
-        )) return null
+        )
+        if (signal?.aborted) throwOpenCodeAbortReason(signal)
+        if (ownerIsActive) return null
       }
       const currentVersion = store.materializationOwnerVersions?.[key]
       const nextVersion = Math.max(
@@ -598,9 +600,11 @@ export class OpenCodeSessionStore {
       if (!ownerTokensEqual(store.materializationOwners?.[key], ownerToken)) return false
       // Liveness is checked while holding the same lock as the exact-token
       // removal. A concurrently replaced or still-live owner is never cleared.
-      if (await this.materializationOwnerIsActive(
+      const ownerIsActive = await this.materializationOwnerIsActive(
         store.materializationOwnerProcesses?.[key],
-      )) return false
+      )
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
+      if (ownerIsActive) return false
       delete store.materializationOwners![key]
       if (store.materializationOwnerProcesses) delete store.materializationOwnerProcesses[key]
       await this.writeStore(store)
@@ -721,6 +725,11 @@ export class OpenCodeSessionStore {
       if (!previous || isOpenCodeSessionStopped(previous)
         || (expectedIdentity && (previous.runId !== expectedIdentity.runId
           || previous.opencodeSessionId !== expectedIdentity.opencodeSessionId))) return null
+
+      const owner = store.materializationOwners?.[key]
+      if (owner && await this.materializationOwnerIsActive(
+        store.materializationOwnerProcesses?.[key],
+      )) return null
 
       if (previous.staleReason === staleReason) {
         return previous
