@@ -184,11 +184,14 @@ export async function runtimeOpenCodeCommand(opts: {
   } finally {
     settleCommandExecution()
     stopKeepAlive()
-    offSignal('SIGTERM', onSigterm)
-    offSignal('SIGINT', onSigint)
-    await (signalCleanupPromise ?? drainCleanupOnce())
+    try {
+      await (signalCleanupPromise ?? drainCleanupOnce())
+    } finally {
+      offSignal('SIGTERM', onSigterm)
+      offSignal('SIGINT', onSigint)
+    }
   }
-  exit(0)
+  if (!signalCleanupPromise) exit(0)
 }
 
 async function writeOutputFileAtomically(outputPath: string, payload: string): Promise<void> {

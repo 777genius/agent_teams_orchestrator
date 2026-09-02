@@ -326,6 +326,11 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
     }
     const existing = claim.kind === 'existing' ? claim.record : null
     if (existing) {
+      const ownerToken = await store.acquireMaterializationOwner(
+        existing, attemptId, input.signal,
+        claim.kind === 'existing' ? claim.ownerToken : undefined,
+      )
+      if (!ownerToken) throw new Error('fake resume reservation unavailable')
       const expectedBootstrap = input.expectedBootstrapForSession(existing.opencodeSessionId)
       await recordEvent({
         type: 'member', requestId, hostId: input.host.hostKey, member: input.memberName,
@@ -333,7 +338,7 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
         providerId, modelId, fingerprint: input.expectedBehaviorFingerprint,
         memberFingerprint: expectedBootstrap.briefingHash,
       })
-      return { record: existing, created: false, resumeBootstrap: true }
+      return { record: existing, ownerToken, created: false, resumeBootstrap: true }
     }
     const next = await readState()
     const sessionId = `session-${input.memberName}-${next.creates.length + 1}`
@@ -347,13 +352,14 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
       memberFingerprint: expectedBootstrap.briefingHash,
     })
     await writeState(next)
-    if (!(await store.commitMaterialization(record, attemptId, input.signal))) {
-      throw new Error('fake materialization claim was lost before commit')
-    }
+    const ownerToken = claim.kind === 'claimed'
+      ? await store.commitMaterialization(record, claim.ownerToken, input.signal)
+      : null
+    if (!ownerToken) throw new Error('fake materialization claim was lost before commit')
     if (mode === 'first-unknown' && input.memberName === 'two') {
       throw new Error('fake create acknowledgement unknown')
     }
-    return { record, created: true }
+    return { record, ownerToken, created: true }
   }) as typeof openCodeSessionBridge.materializeSessionOnHost
 
   openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({

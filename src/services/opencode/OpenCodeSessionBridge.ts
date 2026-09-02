@@ -20,6 +20,7 @@ import {
   resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import type { MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
@@ -51,7 +52,7 @@ type OpenCodeSessionBridgeDeps = {
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
     & Partial<Pick<typeof openCodeSessionStore,
       'claimMaterialization' | 'commitMaterialization' | 'releaseMaterializationClaim'
-      | 'acquireMaterializationOwner' | 'trackPendingMaterializationReconciliation'>>
+      | 'acquireMaterializationOwner' | 'releaseMaterializationOwner' | 'trackPendingMaterializationReconciliation'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -242,6 +243,7 @@ type OpenCodeMaterializeSessionOnHostParams = {
 
 type OpenCodeMaterializeSessionOnHostResult = {
   record: OpenCodeSessionRecord
+  ownerToken?: MaterializationOwnerToken
   created: boolean
   resumeBootstrap?: boolean
 }
@@ -261,8 +263,10 @@ export function isOpenCodeStrictSessionCompatible(
     && bootstrap.agent === expected.bootstrap.agent
 }
 
-function hasOpenCodeStrictBootstrapEvidence(record: OpenCodeSessionRecord): boolean {
-  return Boolean(record.bootstrapEvidenceSource || record.appManagedBootstrap)
+function canResumeOpenCodeStrictBootstrap(record: OpenCodeSessionRecord): boolean {
+  return (record.bootstrapMode === undefined || record.bootstrapMode === 'app_managed_context')
+    && record.bootstrapEvidenceSource === undefined
+    && record.appManagedBootstrap === undefined
 }
 
 function isOpenCodeStrictMaterializedSessionCompatible(
@@ -1115,7 +1119,7 @@ export class OpenCodeSessionBridge {
     }
     if (params.signal.aborted) {
       if (claim?.kind === 'claimed') {
-        await this.sessionStore.releaseMaterializationClaim?.(identity, attemptId, params.runId)
+        await this.sessionStore.releaseMaterializationClaim?.(identity, claim.ownerToken, params.runId)
       }
       throwOpenCodeAbortReason(params.signal)
     }
@@ -1140,22 +1144,31 @@ export class OpenCodeSessionBridge {
       if (!isOpenCodeStrictMaterializedSessionCompatible(existing, expected)) {
         throw new Error('OpenCode committed session identity does not match strict launch')
       }
-      if (hasOpenCodeStrictBootstrapEvidence(existing)) {
+      if (!canResumeOpenCodeStrictBootstrap(existing)) {
         throw new Error('OpenCode committed session bootstrap evidence does not match strict launch')
       }
       // createSession returned a known id and the exact bound record was
       // committed before bootstrap was interrupted. Resume only that session;
       // an unknown create outcome has no record and remains fenced by its claim.
-      if (!this.sessionStore.acquireMaterializationOwner
-        || !await this.sessionStore.acquireMaterializationOwner(
+      const ownerToken = await this.sessionStore.acquireMaterializationOwner?.(
           existing,
           attemptId,
           params.signal,
           claim?.kind === 'existing' ? claim.ownerToken : undefined,
-        )) {
+        )
+      if (!ownerToken) {
         throw new Error('OpenCode committed session changed before bootstrap ownership transfer')
       }
-      return { record: existing, created: false, resumeBootstrap: true }
+      try {
+        await this.hostManager.retainHostLease?.(existing.hostKey, {
+          teamId: existing.teamId, laneId: existing.laneId, memberName: existing.memberName,
+          runId: existing.runId, sessionId: existing.opencodeSessionId,
+        })
+      } catch (error) {
+        await this.sessionStore.releaseMaterializationOwner?.(existing, ownerToken)
+        throw error
+      }
+      return { record: existing, ownerToken, created: false, resumeBootstrap: true }
     }
 
     const selectedVariant = params.selectedVariant?.trim() || undefined
@@ -1204,64 +1217,67 @@ export class OpenCodeSessionBridge {
       createdAt: now,
       updatedAt: now,
     }
-    await this.hostManager.retainHostLease?.(params.host.hostKey, {
-      teamId: params.teamId,
-      laneId: params.laneId,
-      memberName: params.memberName,
-      runId: params.runId,
-      sessionId: session.id,
-    })
+    const claimToken = claim?.kind === 'claimed' ? claim.ownerToken : undefined
+    const commitKnownRecord = async (signal?: AbortSignal): Promise<MaterializationOwnerToken | undefined> => {
+      if (!this.sessionStore.commitMaterialization) {
+        await this.sessionStore.upsert(record)
+        return undefined
+      }
+      if (!claimToken) throw new Error('OpenCode materialization reservation token is missing')
+      return await this.sessionStore.commitMaterialization(record, claimToken, signal) ?? undefined
+    }
     try {
-      let committed: boolean
-      if (this.sessionStore.commitMaterialization) {
-        try {
-          committed = await this.sessionStore.commitMaterialization(
-            record,
-            attemptId,
-            params.signal,
-          )
-        } catch (error) {
-          if (!params.signal.aborted) {
-            let persisted: OpenCodeSessionRecord | null
-            try {
-              persisted = await this.sessionStore.get(
-                record.teamId,
-                record.laneId,
-                record.memberName,
-              )
-            } catch {
-              throw error
-            }
-            if (!persisted || jsonStringify(persisted) !== jsonStringify(record)) {
-              throw error
-            }
-          }
-          // The remote session id is known and this attempt still owns its
-          // persisted claim, or the exact attempted record may already have
-          // committed before an ambiguous failure. Reconcile without reusing
-          // the work signal; commitMaterialization still verifies exact owner.
-          const reconciliation = this.sessionStore.commitMaterialization(record, attemptId)
-          committed = await (this.sessionStore.trackPendingMaterializationReconciliation
-            ? this.sessionStore.trackPendingMaterializationReconciliation(reconciliation)
-            : reconciliation)
-        }
-      } else {
-        committed = (await this.sessionStore.upsert(record)) !== 'unchanged'
-      }
-      if (!committed) {
-        throw new Error('OpenCode session materialization claim was lost before commit')
-      }
+      await this.hostManager.retainHostLease?.(params.host.hostKey, {
+        teamId: params.teamId, laneId: params.laneId, memberName: params.memberName,
+        runId: params.runId, sessionId: session.id,
+      })
     } catch (error) {
-      await this.hostManager.releaseHostLease?.(params.host.hostKey, {
-        teamId: params.teamId,
-        laneId: params.laneId,
-        memberName: params.memberName,
-      }).catch(() => undefined)
+      // Persist a known remote identity even when lease persistence is ambiguous.
+      // A retry will restore the exact lease before resuming bootstrap.
+      let reconciledOwner: MaterializationOwnerToken | undefined
+      try {
+        reconciledOwner = await commitKnownRecord()
+      } catch {
+        reconciledOwner = await commitKnownRecord()
+      }
+      if (reconciledOwner) {
+        await this.sessionStore.releaseMaterializationOwner?.(record, reconciledOwner)
+      }
       throw error
     }
+    const releaseLeaseUnlessSameSessionWon = async (): Promise<void> => {
+      const winner = await this.sessionStore.get(record.teamId, record.laneId, record.memberName)
+        .catch(() => null)
+      if (winner && jsonStringify(winner) === jsonStringify(record)) return
+      await this.hostManager.releaseHostLease?.(params.host.hostKey, {
+        teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+        runId: record.runId, sessionId: record.opencodeSessionId,
+      }).catch(() => undefined)
+    }
+    let ownerToken: MaterializationOwnerToken | undefined
+    try {
+      ownerToken = await commitKnownRecord(params.signal)
+    } catch (error) {
+      try {
+        ownerToken = await commitKnownRecord()
+      } catch {
+        ownerToken = undefined
+      }
+      if (!ownerToken) {
+        await releaseLeaseUnlessSameSessionWon()
+        throw error
+      }
+    }
+    if (this.sessionStore.commitMaterialization && !ownerToken) {
+      await releaseLeaseUnlessSameSessionWon()
+      throw new Error('OpenCode session materialization claim was lost before commit')
+    }
     this.retainedSessionHosts.set(this.buildSessionKey(record), params.host.hostKey)
-    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
-    return { record, created: true }
+    if (params.signal.aborted) {
+      if (ownerToken) await this.sessionStore.releaseMaterializationOwner?.(record, ownerToken)
+      throwOpenCodeAbortReason(params.signal)
+    }
+    return { record, ownerToken, created: true }
   }
 
   async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {

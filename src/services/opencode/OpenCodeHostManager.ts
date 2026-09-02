@@ -1038,9 +1038,12 @@ export class OpenCodeHostManager {
         return
       }
       const leases = normalizePersistentHostLeases(record.leases)
-      if (!leases[leaseKey]) {
-        return
-      }
+      const lease = leases[leaseKey]
+      if (!lease) return
+      const expectedRunId = input.runId?.trim()
+      const expectedSessionId = input.sessionId?.trim()
+      if ((expectedRunId && lease.runId !== expectedRunId)
+        || (expectedSessionId && lease.sessionId !== expectedSessionId)) return
       delete leases[leaseKey]
       registry.hosts[hostKey] = {
         ...record,

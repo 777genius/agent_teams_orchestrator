@@ -304,4 +304,38 @@ describe('runtimeOpenCodeCommand terminal cleanup', () => {
     expect(cleanupCalls).toBe(1)
     expect(exits).toEqual([143])
   })
+
+  test('keeps signal handlers active through terminal drain and selects the signal exit', async () => {
+    const listeners = new Map<string, () => void>()
+    let finishDrain!: () => void
+    const drainGate = new Promise<void>(resolve => { finishDrain = resolve })
+    let drainStarted!: () => void
+    const draining = new Promise<void>(resolve => { drainStarted = resolve })
+    const exits: number[] = []
+    let cleanupCalls = 0
+    const command = runtimeOpenCodeCommand({ input: 'ignored' }, {
+      ...baseDeps(),
+      onSignal: (signal, listener) => { listeners.set(signal, listener) },
+      offSignal: (signal, listener) => {
+        if (listeners.get(signal) === listener) listeners.delete(signal)
+      },
+      executeEnvelope: (async () => ({ ok: true })) as never,
+      drainCleanup: async () => {
+        cleanupCalls += 1
+        drainStarted()
+        await drainGate
+      },
+      exit: code => { exits.push(code) },
+    })
+
+    await draining
+    listeners.get('SIGINT')?.()
+    finishDrain()
+    await command
+    await Promise.resolve()
+
+    expect(cleanupCalls).toBe(1)
+    expect(exits).toEqual([130])
+    expect(listeners.size).toBe(0)
+  })
 })

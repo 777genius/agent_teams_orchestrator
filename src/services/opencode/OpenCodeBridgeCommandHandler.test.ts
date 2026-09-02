@@ -643,6 +643,7 @@ beforeEach(async () => {
       expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
       runId: input.runId,
     },
+    ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
     created: true,
   })) as typeof openCodeSessionBridge.materializeSessionOnHost
   openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
@@ -3040,6 +3041,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         throw new Error(`transport result unknown authorization=secret ${'x'.repeat(600)}`)
       }
       return {
+        ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
         created: true,
         record: buildRecord({
           laneId: input.laneId,
@@ -3131,6 +3133,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         openCodeSessionBridge.materializeSessionOnHost = (async input => {
           materializeCalls += 1
           return {
+            ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
             created: true,
             record: buildRecord({
               memberName: input.memberName,
@@ -3203,6 +3206,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       openCodeSessionBridge.materializeSessionOnHost = (async input => {
         events.push(`materialize:${input.memberName}`)
         return {
+          ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
           created: true,
           record: buildRecord({
             memberName: input.memberName,
@@ -3292,6 +3296,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ) as typeof openCodeProvisioningProbe.refreshSelectedProfileAuthority
       openCodeSessionStore.get = (async () => null) as typeof openCodeSessionStore.get
       openCodeSessionBridge.materializeSessionOnHost = (async input => ({
+        ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
         created: true,
         record: buildRecord({
           memberName: input.memberName,
@@ -3380,6 +3385,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     const writes: OpenCodeSessionRecord[] = []
     let createCalls = 0
     let injectionCalls = 0
+    const releasedOwners: unknown[] = []
+    const releaseOwner = openCodeSessionStore.releaseMaterializationOwner
+    openCodeSessionStore.releaseMaterializationOwner = (async (_record, token) => {
+      releasedOwners.push(token)
+      return true
+    }) as typeof openCodeSessionStore.releaseMaterializationOwner
     openCodeProvisioningProbe.probeRetainingHost = (async () => ({
       snapshot,
       host: snapshot.host,
@@ -3394,6 +3405,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       createCalls += 1
       return {
         created: false,
+        ownerToken: { attemptId: 'test-owner', sessionId: 'session-known', version: 1 },
         resumeBootstrap: true,
         record: buildRecord({
           laneId: input.laneId,
@@ -3448,6 +3460,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       model: 'openrouter/minimax-m2.5-free',
       agent: 'teammate-bootstrap',
     })
+    expect(releasedOwners).toEqual([
+      { attemptId: 'test-owner', sessionId: 'session-known', version: 1 },
+    ])
+    openCodeSessionStore.releaseMaterializationOwner = releaseOwner
   })
 
   test('strict launch keeps a compatible materialization race non-owned and untouched', async () => {
@@ -3572,6 +3588,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
             selectedModel: input.selectedModel, opencodeSessionId: `session-${input.memberName}`,
             expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
           }),
+          ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
           created: true,
         }
       }) as typeof openCodeSessionBridge.materializeSessionOnHost

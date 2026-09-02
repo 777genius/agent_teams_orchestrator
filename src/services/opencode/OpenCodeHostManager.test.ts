@@ -1910,6 +1910,15 @@ describe('OpenCodeHostManager', () => {
       })
 
       await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'stale-run', sessionId: 'stale-session',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
+
+      await manager.releaseHostLease(handle.hostKey, {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
