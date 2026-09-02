@@ -252,6 +252,37 @@ describe('OpenCodeSessionStore', () => {
     expect(releaseCalls).toBe(1)
   })
 
+  test('reports a failed late release after cancellation', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel pending lock operation')
+    const releaseError = new Error('late lock release failed')
+    let resolveLock!: (release: () => Promise<void>) => void
+    let notifyLockStarted!: () => void
+    const lockStarted = new Promise<void>(resolve => { notifyLockStarted = resolve })
+    let notifyReleaseError!: () => void
+    const releaseErrorReported = new Promise<void>(resolve => { notifyReleaseError = resolve })
+    const reportedErrors: unknown[] = []
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), {
+      lock: (() => {
+        notifyLockStarted()
+        return new Promise(resolve => { resolveLock = resolve })
+      }) as typeof lockfile.lock,
+      onLateLockReleaseError: error => {
+        reportedErrors.push(error)
+        notifyReleaseError()
+      },
+    })
+
+    const pendingClaim = store.claimMaterialization(baseRecord, 'attempt-a', 'run-a', controller.signal)
+    await lockStarted
+    controller.abort(abortReason)
+    await expect(pendingClaim).rejects.toBe(abortReason)
+    resolveLock(async () => { throw releaseError })
+    await releaseErrorReported
+
+    expect(reportedErrors).toEqual([releaseError])
+  })
+
   test('keeps a completed claim fenced when lock release reports an unknown outcome', async () => {
     const filePath = path.join(tempDir, 'session-store.json')
     const releaseError = new Error('lock release failed')
@@ -270,6 +301,25 @@ describe('OpenCodeSessionStore', () => {
     const persisted = JSON.parse(await readFile(filePath, 'utf8'))
     expect(persisted.materializationClaims['team-a::primary::alice']).toBe('attempt-a')
     expect(persisted.materializationClaimRuns['team-a::primary::alice']).toBe('run-a')
+  })
+
+  test('treats an exact committed owner replay as an idempotent commit', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const releaseError = new Error('commit lock release failed')
+    let releaseCalls = 0
+    const store = new OpenCodeSessionStore(filePath, {
+      lock: (async () => async () => {
+        releaseCalls += 1
+        if (releaseCalls === 2) throw releaseError
+      }) as typeof lockfile.lock,
+    })
+    const record = { ...baseRecord, runId: 'run-a' }
+
+    expect(await store.claimMaterialization(record, 'attempt-a', 'run-a')).toEqual({ kind: 'claimed' })
+    await expect(store.commitMaterialization(record, 'attempt-a')).rejects.toBe(releaseError)
+    expect(await store.commitMaterialization(record, 'attempt-a')).toBe(true)
+    expect(await store.commitMaterialization({ ...record, selectedModel: 'foreign/model' }, 'attempt-a'))
+      .toBe(false)
   })
 
   test('clears the pending retry timer when lock acquisition is aborted', async () => {

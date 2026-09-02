@@ -37,6 +37,7 @@ type OpenCodeSessionStoreDeps = {
   lock?: typeof lockfile.lock
   setTimer?: typeof setTimeout
   clearTimer?: typeof clearTimeout
+  onLateLockReleaseError?: (error: unknown) => void
 }
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
@@ -100,6 +101,7 @@ async function waitForLockRetry(
 async function waitForLockAttempt(
   attempt: Promise<() => Promise<void>>,
   signal: AbortSignal,
+  onLateLockReleaseError: (error: unknown) => void,
 ): Promise<() => Promise<void>> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -121,7 +123,7 @@ async function waitForLockAttempt(
     void attempt.then(
       release => {
         if (settled) {
-          void release().catch(() => undefined)
+          void release().catch(onLateLockReleaseError)
           return
         }
         finish(() => resolve(release))
@@ -138,6 +140,7 @@ export class OpenCodeSessionStore {
   private readonly lock: typeof lockfile.lock
   private readonly setTimer: typeof setTimeout
   private readonly clearTimer: typeof clearTimeout
+  private readonly onLateLockReleaseError: (error: unknown) => void
 
   constructor(filePath?: string, deps: OpenCodeSessionStoreDeps = {}) {
     const paths = resolveClaudeMultimodelPaths()
@@ -146,6 +149,9 @@ export class OpenCodeSessionStore {
     this.lock = deps.lock ?? lockfile.lock
     this.setTimer = deps.setTimer ?? setTimeout
     this.clearTimer = deps.clearTimer ?? clearTimeout
+    this.onLateLockReleaseError = deps.onLateLockReleaseError ?? (error => {
+      console.warn('[OpenCodeSessionStore] Late lock release failed after cancellation', error)
+    })
   }
 
   private async ensureParentDir(): Promise<void> {
@@ -170,6 +176,7 @@ export class OpenCodeSessionStore {
         release = await waitForLockAttempt(
           this.lock(this.lockPath, { ...LOCK_OPTIONS, retries: 0 }),
           signal,
+          this.onLateLockReleaseError,
         )
       } catch (error) {
         if (isLockContention(error) && signal.aborted) {
@@ -314,7 +321,16 @@ export class OpenCodeSessionStore {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
-      if (store.materializationClaims?.[key] !== attemptId) return false
+      if (store.materializationClaims?.[key] !== attemptId) {
+        const existing = store.records[key]
+        const owner = store.materializationOwners?.[key]
+        return Boolean(
+          existing
+          && owner?.attemptId === attemptId
+          && owner.sessionId === record.opencodeSessionId
+          && jsonStringify(existing) === jsonStringify(record),
+        )
+      }
       const claimedRunId = store.materializationClaimRuns?.[key]
       if (claimedRunId && claimedRunId !== record.runId?.trim()) return false
       const previous = store.records[key]
