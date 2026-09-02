@@ -639,4 +639,33 @@ describe('OpenCodeSessionStore', () => {
     })
   })
 
+  test('takes over only after persisted process identity proves the owner exited or changed', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const record = { ...baseRecord, runId: 'run-1' }
+    const alive = new Map([[111, true], [222, true]])
+    const startedAt = new Map([[111, 1_000], [222, 2_000]])
+    const storeFor = (ownerPid: number) => new OpenCodeSessionStore(filePath, {
+      ownerPid,
+      isProcessAlive: pid => alive.get(pid) ?? false,
+      readProcessStartTimeMs: async pid => startedAt.get(pid) ?? null,
+    })
+    const original = storeFor(111)
+    const claim = await original.claimMaterialization(record, 'attempt-a', 'run-1')
+    expect(claim.kind).toBe('claimed')
+    if (claim.kind !== 'claimed') throw new Error('expected original materialization claim')
+    const originalOwner = await original.commitMaterialization(record, claim.ownerToken)
+    expect(originalOwner).not.toBeNull()
+
+    const retry = storeFor(222)
+    expect(await retry.isMaterializationOwnerActive(record, originalOwner!)).toBe(true)
+    expect(await retry.acquireMaterializationOwner(record, 'attempt-b', undefined, originalOwner))
+      .toBeNull()
+
+    // The PID still exists, but a different start time proves it was reused.
+    startedAt.set(111, 1_001)
+    expect(await retry.isMaterializationOwnerActive(record, originalOwner!)).toBe(false)
+    expect(await retry.acquireMaterializationOwner(record, 'attempt-b', undefined, originalOwner))
+      .toEqual(token('attempt-b', 2, record.opencodeSessionId))
+  })
+
 })

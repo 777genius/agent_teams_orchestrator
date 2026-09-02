@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
+import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
@@ -16,6 +17,7 @@ type SessionStoreShape = {
   materializationClaimRuns?: Record<string, string>
   materializationOwners?: Record<string, MaterializationOwnerToken>
   materializationOwnerVersions?: Record<string, number>
+  materializationOwnerProcesses?: Record<string, MaterializationOwnerProcessIdentity>
 }
 
 type LegacyMaterializationOwnerToken = Omit<MaterializationOwnerToken, 'version'>
@@ -31,6 +33,11 @@ export type MaterializationOwnerToken = {
   attemptId: string
   sessionId: string
   version: number
+}
+
+type MaterializationOwnerProcessIdentity = {
+  pid: number
+  startedAtMs: number
 }
 
 function isMaterializationOwnerToken(value: unknown): value is MaterializationOwnerToken {
@@ -98,6 +105,18 @@ type OpenCodeSessionStoreDeps = {
   setTimer?: typeof setTimeout
   clearTimer?: typeof clearTimeout
   onLateLockReleaseError?: (error: unknown) => void
+  ownerPid?: number
+  isProcessAlive?: typeof isProcessAlive
+  readProcessStartTimeMs?: typeof readProcessStartTimeMs
+}
+
+function isMaterializationOwnerProcessIdentity(
+  value: unknown,
+): value is MaterializationOwnerProcessIdentity {
+  if (!value || typeof value !== 'object') return false
+  const identity = value as Partial<MaterializationOwnerProcessIdentity>
+  return Number.isSafeInteger(identity.pid) && Number(identity.pid) > 0
+    && typeof identity.startedAtMs === 'number' && Number.isFinite(identity.startedAtMs)
 }
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
@@ -201,6 +220,10 @@ export class OpenCodeSessionStore {
   private readonly setTimer: typeof setTimeout
   private readonly clearTimer: typeof clearTimeout
   private readonly onLateLockReleaseError: (error: unknown) => void
+  private readonly ownerPid: number
+  private readonly isProcessAlive: typeof isProcessAlive
+  private readonly readProcessStartTimeMs: typeof readProcessStartTimeMs
+  private ownerProcessIdentityPromise?: Promise<MaterializationOwnerProcessIdentity | null>
   private readonly pendingLateLockReleases = new Set<Promise<void>>()
   private readonly pendingMaterializationReconciliations = new Set<Promise<unknown>>()
 
@@ -211,9 +234,33 @@ export class OpenCodeSessionStore {
     this.lock = deps.lock ?? lockfile.lock
     this.setTimer = deps.setTimer ?? setTimeout
     this.clearTimer = deps.clearTimer ?? clearTimeout
+    this.ownerPid = deps.ownerPid ?? process.pid
+    this.isProcessAlive = deps.isProcessAlive ?? isProcessAlive
+    this.readProcessStartTimeMs = deps.readProcessStartTimeMs ?? readProcessStartTimeMs
     this.onLateLockReleaseError = deps.onLateLockReleaseError ?? (error => {
       console.warn('[OpenCodeSessionStore] Late lock release failed after cancellation', error)
     })
+  }
+
+  private currentOwnerProcessIdentity(): Promise<MaterializationOwnerProcessIdentity | null> {
+    this.ownerProcessIdentityPromise ??= (async () => {
+      if (!this.isProcessAlive(this.ownerPid)) return null
+      const startedAtMs = await this.readProcessStartTimeMs(this.ownerPid).catch(() => null)
+      if (!Number.isFinite(startedAtMs) || startedAtMs === null
+        || !this.isProcessAlive(this.ownerPid)) return null
+      return { pid: this.ownerPid, startedAtMs }
+    })()
+    return this.ownerProcessIdentityPromise
+  }
+
+  private async materializationOwnerIsActive(identity: unknown): Promise<boolean> {
+    // Missing or unreadable process identity is not proof that an owner died.
+    if (!isMaterializationOwnerProcessIdentity(identity)) return true
+    if (!this.isProcessAlive(identity.pid)) return false
+    const startedAtMs = await this.readProcessStartTimeMs(identity.pid).catch(() => null)
+    if (!Number.isFinite(startedAtMs) || startedAtMs === null) return true
+    if (!this.isProcessAlive(identity.pid)) return false
+    return startedAtMs === identity.startedAtMs
   }
 
   private async ensureParentDir(): Promise<void> {
@@ -440,6 +487,7 @@ export class OpenCodeSessionStore {
     ownerToken: MaterializationOwnerToken,
     signal?: AbortSignal,
   ): Promise<MaterializationOwnerToken | null> {
+    const ownerProcessIdentity = await this.currentOwnerProcessIdentity()
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
@@ -466,6 +514,12 @@ export class OpenCodeSessionStore {
       if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
       store.materializationOwners ??= {}
       store.materializationOwners[key] = committedOwner
+      if (ownerProcessIdentity) {
+        store.materializationOwnerProcesses ??= {}
+        store.materializationOwnerProcesses[key] = ownerProcessIdentity
+      } else if (store.materializationOwnerProcesses) {
+        delete store.materializationOwnerProcesses[key]
+      }
       await this.writeStore(store)
       return committedOwner
     }, signal)
@@ -477,6 +531,7 @@ export class OpenCodeSessionStore {
     signal?: AbortSignal,
     expectedOwnerToken?: MaterializationOwnerToken | null,
   ): Promise<MaterializationOwnerToken | null> {
+    const nextOwnerProcessIdentity = await this.currentOwnerProcessIdentity()
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
@@ -486,9 +541,14 @@ export class OpenCodeSessionStore {
       if (owner !== undefined && !isMaterializationOwnerToken(owner)) return null
       if (expectedOwnerToken === undefined
         || (expectedOwnerToken !== null && !isMaterializationOwnerToken(expectedOwnerToken))) return null
-      // The store has no authoritative liveness proof. An extant owner remains
-      // active until its exact token explicitly releases it.
-      if (owner !== undefined || expectedOwnerToken !== null) return null
+      if (expectedOwnerToken === null) {
+        if (owner !== undefined) return null
+      } else {
+        if (!ownerTokensEqual(owner, expectedOwnerToken)) return null
+        if (await this.materializationOwnerIsActive(
+          store.materializationOwnerProcesses?.[key],
+        )) return null
+      }
       const currentVersion = store.materializationOwnerVersions?.[key]
       const nextVersion = Math.max(
         typeof currentVersion === 'number' && Number.isSafeInteger(currentVersion) ? currentVersion : 0,
@@ -499,8 +559,29 @@ export class OpenCodeSessionStore {
       store.materializationOwners[key] = nextOwner
       store.materializationOwnerVersions ??= {}
       store.materializationOwnerVersions[key] = nextVersion
+      if (nextOwnerProcessIdentity) {
+        store.materializationOwnerProcesses ??= {}
+        store.materializationOwnerProcesses[key] = nextOwnerProcessIdentity
+      } else if (store.materializationOwnerProcesses) {
+        delete store.materializationOwnerProcesses[key]
+      }
       await this.writeStore(store)
       return nextOwner
+    }, signal)
+  }
+
+  async isMaterializationOwnerActive(
+    record: OpenCodeSessionRecord,
+    ownerToken: MaterializationOwnerToken,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const existing = store.records[key]
+      if (!existing || jsonStringify(existing) !== jsonStringify(record)) return true
+      if (!ownerTokensEqual(store.materializationOwners?.[key], ownerToken)) return true
+      return this.materializationOwnerIsActive(store.materializationOwnerProcesses?.[key])
     }, signal)
   }
 
@@ -578,6 +659,7 @@ export class OpenCodeSessionStore {
       if (!ownerTokenAuthorizes(owner, ownerToken)) return false
       delete store.records[key]
       if (store.materializationOwners) delete store.materializationOwners[key]
+      if (store.materializationOwnerProcesses) delete store.materializationOwnerProcesses[key]
       await this.writeStore(store)
       return true
     })
@@ -593,6 +675,7 @@ export class OpenCodeSessionStore {
       const owner = store.materializationOwners?.[key]
       if (!ownerTokensEqual(owner, ownerToken)) return false
       delete store.materializationOwners[key]
+      if (store.materializationOwnerProcesses) delete store.materializationOwnerProcesses[key]
       await this.writeStore(store)
       return true
     })

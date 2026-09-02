@@ -301,6 +301,8 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
   }) as typeof openCodeExecutionProbe.probeModelOnHost
 
   openCodeSessionStore.get = store.get.bind(store)
+  openCodeSessionStore.observeMaterialization = store.observeMaterialization.bind(store)
+  openCodeSessionStore.isMaterializationOwnerActive = store.isMaterializationOwnerActive.bind(store)
   openCodeSessionStore.upsert = store.upsert.bind(store)
   openCodeSessionStore.releaseMaterializationOwner = store.releaseMaterializationOwner.bind(store)
   openCodeSessionStore.markStaleIfSession = store.markStaleIfSession.bind(store)
