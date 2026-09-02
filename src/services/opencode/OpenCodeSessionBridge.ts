@@ -1088,7 +1088,9 @@ export class OpenCodeSessionBridge {
       throw new Error('OpenCode session materialization was already claimed by this launch attempt')
     }
     if (params.signal.aborted) {
-      await this.sessionStore.releaseMaterializationClaim?.(identity, attemptId)
+      if (claim?.kind === 'claimed') {
+        await this.sessionStore.releaseMaterializationClaim?.(identity, attemptId, params.runId)
+      }
       throwOpenCodeAbortReason(params.signal)
     }
     if (existing) {

@@ -13,6 +13,7 @@ type SessionStoreShape = {
   schemaVersion: 1
   records: Record<string, OpenCodeSessionRecord>
   materializationClaims?: Record<string, string>
+  materializationClaimRuns?: Record<string, string>
   materializationOwners?: Record<string, { attemptId: string; sessionId: string }>
 }
 
@@ -96,6 +97,41 @@ async function waitForLockRetry(
   })
 }
 
+async function waitForLockAttempt(
+  attempt: Promise<() => Promise<void>>,
+  signal: AbortSignal,
+): Promise<() => Promise<void>> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => finish(() => {
+      try {
+        throwOpenCodeAbortReason(signal)
+      } catch (error) {
+        reject(error)
+      }
+    })
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    void attempt.then(
+      release => {
+        if (settled) {
+          void release().catch(() => undefined)
+          return
+        }
+        finish(() => resolve(release))
+      },
+      error => finish(() => reject(error)),
+    )
+    if (signal.aborted) onAbort()
+  })
+}
+
 export class OpenCodeSessionStore {
   private readonly filePath: string
   private readonly lockPath: string
@@ -131,7 +167,10 @@ export class OpenCodeSessionStore {
       if (signal.aborted) throwOpenCodeAbortReason(signal)
       let release: (() => Promise<void>) | undefined
       try {
-        release = await this.lock(this.lockPath, { ...LOCK_OPTIONS, retries: 0 })
+        release = await waitForLockAttempt(
+          this.lock(this.lockPath, { ...LOCK_OPTIONS, retries: 0 }),
+          signal,
+        )
       } catch (error) {
         if (isLockContention(error) && signal.aborted) {
           throwOpenCodeAbortReason(signal)
@@ -250,8 +289,18 @@ export class OpenCodeSessionStore {
       store.materializationClaims ??= {}
       const owner = store.materializationClaims[key]
       if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
-      if (owner === attemptId) return { kind: 'already_owned' }
+      const normalizedRunId = requestedRunId?.trim() || undefined
+      const ownerRunId = store.materializationClaimRuns?.[key]
+      if (owner === attemptId) {
+        return ownerRunId && normalizedRunId && ownerRunId !== normalizedRunId
+          ? { kind: 'owned_by_other' }
+          : { kind: 'already_owned' }
+      }
       store.materializationClaims[key] = attemptId
+      if (normalizedRunId) {
+        store.materializationClaimRuns ??= {}
+        store.materializationClaimRuns[key] = normalizedRunId
+      }
       await this.writeStore(store)
       return { kind: 'claimed' }
     }, signal)
@@ -266,12 +315,15 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       if (store.materializationClaims?.[key] !== attemptId) return false
+      const claimedRunId = store.materializationClaimRuns?.[key]
+      if (claimedRunId && claimedRunId !== record.runId?.trim()) return false
       const previous = store.records[key]
       const replacingStopped = Boolean(previous && isOpenCodeSessionStopped(previous)
         && record.runId?.trim() && record.runId !== previous.runId && !record.stoppedAt)
       if (previous && !replacingStopped) return false
       store.records[key] = record
       delete store.materializationClaims[key]
+      if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
       store.materializationOwners ??= {}
       store.materializationOwners[key] = { attemptId, sessionId: record.opencodeSessionId }
       await this.writeStore(store)
@@ -282,12 +334,18 @@ export class OpenCodeSessionStore {
   async releaseMaterializationClaim(
     identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
     attemptId: string,
+    requestedRunId?: string,
   ): Promise<boolean> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(identity)
       if (store.materializationClaims?.[key] !== attemptId) return false
+      const claimedRunId = store.materializationClaimRuns?.[key]
+      if (claimedRunId && requestedRunId?.trim() && claimedRunId !== requestedRunId.trim()) {
+        return false
+      }
       delete store.materializationClaims[key]
+      if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
       await this.writeStore(store)
       return true
     })

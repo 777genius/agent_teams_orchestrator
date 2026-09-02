@@ -218,6 +218,60 @@ describe('OpenCodeSessionStore', () => {
     expect(releaseCalls).toBe(2)
   })
 
+  test('aborts while a lock attempt is still pending and releases a late acquisition once', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel pending lock operation')
+    let resolveLock!: (release: () => Promise<void>) => void
+    let notifyLockStarted!: () => void
+    const lockStarted = new Promise<void>(resolve => { notifyLockStarted = resolve })
+    let releaseCalls = 0
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), {
+      lock: (() => {
+        notifyLockStarted()
+        return new Promise(resolve => { resolveLock = resolve })
+      }) as typeof lockfile.lock,
+    })
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    const pendingClaim = store.claimMaterialization(
+      identity,
+      'attempt-a',
+      'run-a',
+      controller.signal,
+    )
+    await lockStarted
+    controller.abort(abortReason)
+    await expect(pendingClaim).rejects.toBe(abortReason)
+
+    resolveLock(async () => { releaseCalls += 1 })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(releaseCalls).toBe(1)
+  })
+
+  test('keeps a completed claim fenced when lock release reports an unknown outcome', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const releaseError = new Error('lock release failed')
+    const store = new OpenCodeSessionStore(filePath, {
+      lock: (async () => async () => { throw releaseError }) as typeof lockfile.lock,
+    })
+    const identity = {
+      teamId: baseRecord.teamId,
+      laneId: baseRecord.laneId,
+      memberName: baseRecord.memberName,
+    }
+
+    await expect(store.claimMaterialization(identity, 'attempt-a', 'run-a'))
+      .rejects.toBe(releaseError)
+
+    const persisted = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(persisted.materializationClaims['team-a::primary::alice']).toBe('attempt-a')
+    expect(persisted.materializationClaimRuns['team-a::primary::alice']).toBe('run-a')
+  })
+
   test('clears the pending retry timer when lock acquisition is aborted', async () => {
     const controller = new AbortController()
     const abortReason = new Error('cancel retry timer')
@@ -298,6 +352,7 @@ describe('OpenCodeSessionStore', () => {
     const claimedState = JSON.parse(await readFile(filePath, 'utf8'))
     expect(claimedState.records['team-a::primary::alice']).toEqual(stopped)
     expect(claimedState.materializationClaims['team-a::primary::alice']).toBe('cancelled-attempt')
+    expect(claimedState.materializationClaimRuns['team-a::primary::alice']).toBe('run-2')
     expect(claimedState.materializationOwners['team-a::primary::alice']).toEqual({
       attemptId: 'old-attempt',
       sessionId: 'session-1',
@@ -307,6 +362,7 @@ describe('OpenCodeSessionStore', () => {
     const cancelledState = JSON.parse(await readFile(filePath, 'utf8'))
     expect(cancelledState.records['team-a::primary::alice']).toEqual(stopped)
     expect(cancelledState.materializationClaims['team-a::primary::alice']).toBeUndefined()
+    expect(cancelledState.materializationClaimRuns['team-a::primary::alice']).toBeUndefined()
     expect(cancelledState.materializationOwners['team-a::primary::alice']).toEqual({
       attemptId: 'old-attempt',
       sessionId: 'session-1',
@@ -326,6 +382,7 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(stopped)
     const fencedState = JSON.parse(await readFile(filePath, 'utf8'))
     expect(fencedState.materializationClaims['team-a::primary::alice']).toBe('retry-attempt')
+    expect(fencedState.materializationClaimRuns['team-a::primary::alice']).toBe('run-2')
     expect(fencedState.materializationOwners['team-a::primary::alice']).toEqual({
       attemptId: 'old-attempt',
       sessionId: 'session-1',
@@ -335,10 +392,32 @@ describe('OpenCodeSessionStore', () => {
     const committedState = JSON.parse(await readFile(filePath, 'utf8'))
     expect(committedState.records['team-a::primary::alice']).toEqual(successor)
     expect(committedState.materializationClaims['team-a::primary::alice']).toBeUndefined()
+    expect(committedState.materializationClaimRuns['team-a::primary::alice']).toBeUndefined()
     expect(committedState.materializationOwners['team-a::primary::alice']).toEqual({
       attemptId: 'retry-attempt',
       sessionId: 'session-2',
     })
+  })
+
+  test('binds a materialization claim to its requested run', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'sessions.json'))
+    const record = { ...baseRecord, runId: 'run-1' }
+    const identity = {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+    }
+
+    expect(await store.claimMaterialization(identity, 'shared-attempt', 'run-1'))
+      .toEqual({ kind: 'claimed' })
+    expect(await store.claimMaterialization(identity, 'shared-attempt', 'run-2'))
+      .toEqual({ kind: 'owned_by_other' })
+    expect(await store.commitMaterialization({ ...record, runId: 'run-2' }, 'shared-attempt'))
+      .toBe(false)
+    expect(await store.releaseMaterializationClaim(identity, 'shared-attempt', 'run-2'))
+      .toBe(false)
+    expect(await store.releaseMaterializationClaim(identity, 'shared-attempt', 'run-1'))
+      .toBe(true)
   })
 
   test('stopped replacement keeps unknown create claims fenced and malformed markers inactive', async () => {

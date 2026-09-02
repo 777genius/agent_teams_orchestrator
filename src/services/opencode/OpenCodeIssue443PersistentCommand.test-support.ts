@@ -313,7 +313,18 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
     if (!proof || proof.hostId !== state.host.hostKey || proof.modelId !== modelId || !proof.nonce) {
       throw new Error('member side effect attempted before exact retained-host proof')
     }
-    const existing = await store.get(teamId, laneId, input.memberName)
+    const attemptId = input.attemptId ?? input.runId
+    const identity = { teamId, laneId, memberName: input.memberName }
+    const claim = await store.claimMaterialization(
+      identity,
+      attemptId,
+      input.runId,
+      input.signal,
+    )
+    if (claim.kind === 'owned_by_other' || claim.kind === 'already_owned') {
+      throw new Error(`fake materialization claim unavailable: ${claim.kind}`)
+    }
+    const existing = claim.kind === 'existing' ? claim.record : null
     if (existing) {
       const expectedBootstrap = input.expectedBootstrapForSession(existing.opencodeSessionId)
       await recordEvent({
@@ -336,7 +347,9 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
       memberFingerprint: expectedBootstrap.briefingHash,
     })
     await writeState(next)
-    await store.upsert(record)
+    if (!(await store.commitMaterialization(record, attemptId, input.signal))) {
+      throw new Error('fake materialization claim was lost before commit')
+    }
     if (mode === 'first-unknown' && input.memberName === 'two') {
       throw new Error('fake create acknowledgement unknown')
     }

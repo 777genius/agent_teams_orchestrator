@@ -937,9 +937,10 @@ describe('OpenCodeSessionBridge', () => {
           controller.abort(abortReason)
           return { kind: 'claimed' }
         },
-        releaseMaterializationClaim: async (_identity, _attemptId, signal?: AbortSignal) => {
+        releaseMaterializationClaim: async (_identity, _attemptId, requestedRunId) => {
           releaseCalls += 1
-          cleanupSignal = signal
+          expect(requestedRunId).toBe('run-1')
+          cleanupSignal = undefined
           return true
         },
       },
@@ -969,6 +970,46 @@ describe('OpenCodeSessionBridge', () => {
     expect(releaseCalls).toBe(1)
     expect(cleanupSignal).toBeUndefined()
     expect(clientCalls).toBe(0)
+  })
+
+  test('does not release another run claim when cancellation follows an existing-record result', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after observing existing record')
+    let releaseCalls = 0
+    const existing = buildRecord({ runId: 'run-1' })
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => existing,
+        upsert: async () => 'unchanged',
+        markStale: async () => null,
+        claimMaterialization: async () => {
+          controller.abort(abortReason)
+          return { kind: 'existing', record: existing }
+        },
+        releaseMaterializationClaim: async () => {
+          releaseCalls += 1
+          return true
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => { throw new Error('must not create a client after cancellation') },
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'shared-attempt', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toBe(abortReason)
+    expect(releaseCalls).toBe(0)
   })
 
   test('allows only one compatible concurrent attempt to create a remote session', async () => {
