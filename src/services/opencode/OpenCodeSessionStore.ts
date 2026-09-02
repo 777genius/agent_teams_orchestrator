@@ -14,7 +14,7 @@ type SessionStoreShape = {
   records: Record<string, OpenCodeSessionRecord>
   materializationClaims?: Record<string, string>
   materializationClaimRuns?: Record<string, string>
-  materializationOwners?: Record<string, { attemptId: string; sessionId: string }>
+  materializationOwners?: Record<string, MaterializationOwnerToken>
 }
 
 type UpsertResult = 'created' | 'updated' | 'unchanged'
@@ -24,7 +24,20 @@ export type MaterializationClaimResult =
   | { kind: 'existing'; record: OpenCodeSessionRecord; ownerToken?: MaterializationOwnerToken | null }
   | { kind: 'owned_by_other' }
 
-export type MaterializationOwnerToken = { attemptId: string; sessionId: string }
+export type MaterializationOwnerToken = {
+  attemptId: string
+  sessionId: string
+  /** Added on transfer so even an unchanged attempt id consumes its observation. */
+  version?: number
+}
+
+function isMaterializationOwnerToken(value: unknown): value is MaterializationOwnerToken {
+  if (!value || typeof value !== 'object') return false
+  const token = value as Partial<MaterializationOwnerToken>
+  return typeof token.attemptId === 'string' && typeof token.sessionId === 'string'
+    && (token.version === undefined
+      || (Number.isSafeInteger(token.version) && token.version >= 0))
+}
 
 const LOCK_RETRY_OPTIONS = {
   retries: 30,
@@ -403,12 +416,16 @@ export class OpenCodeSessionStore {
       const existing = store.records[key]
       if (!existing || jsonStringify(existing) !== jsonStringify(record)) return false
       const owner = store.materializationOwners?.[key]
+      if (owner && !isMaterializationOwnerToken(owner)) return false
+      if (expectedOwnerToken && !isMaterializationOwnerToken(expectedOwnerToken)) return false
       if (jsonStringify(owner ?? null) !== jsonStringify(expectedOwnerToken ?? null)) return false
       if (owner && (owner.sessionId !== record.opencodeSessionId || existing.runId !== record.runId)) return false
+      const nextVersion = (owner?.version ?? 0) + 1
       store.materializationOwners ??= {}
       store.materializationOwners[key] = {
         attemptId,
         sessionId: record.opencodeSessionId,
+        version: nextVersion,
       }
       await this.writeStore(store)
       return true

@@ -159,16 +159,16 @@ describe('runtimeOpenCodeCommand terminal cleanup', () => {
   })
 
   test('drains exactly once before normal success exits', async () => {
-    let cleanupCalls = 0
+    const cleanupBudgets: Array<number | undefined> = []
     const exits: number[] = []
     await runtimeOpenCodeCommand({ input: 'ignored' }, {
       ...baseDeps(),
       executeEnvelope: (async () => ({ ok: true })) as never,
-      drainCleanup: async () => { cleanupCalls += 1 },
+      drainCleanup: async timeoutMs => { cleanupBudgets.push(timeoutMs) },
       exit: code => { exits.push(code) },
     })
 
-    expect(cleanupCalls).toBe(1)
+    expect(cleanupBudgets).toEqual([undefined])
     expect(exits).toEqual([0])
   })
 
@@ -228,6 +228,53 @@ describe('runtimeOpenCodeCommand terminal cleanup', () => {
     expect(cleanupCalls).toBe(1)
     expect(exits).toEqual([143])
   })
+
+  for (const { name, unwindMs, expectedCleanupMs } of [
+    { name: 'subtracts signal unwind elapsed from cleanup budget', unwindMs: 1_500, expectedCleanupMs: 3_000 },
+    { name: 'passes an exhausted signal cleanup budget as zero', unwindMs: 4_700, expectedCleanupMs: 0 },
+  ]) {
+    test(name, async () => {
+      const listeners = new Map<string, () => void>()
+      let nowMs = 10_000
+      let notifyExecuting!: () => void
+      const executing = new Promise<void>(resolve => { notifyExecuting = resolve })
+      const cleanupBudgets: Array<number | undefined> = []
+      const watchdog = { unref: mock(() => undefined) } as unknown as ReturnType<typeof setTimeout>
+      const setTimeoutMock = mock((_callback: () => void, timeoutMs: number) => {
+        expect(timeoutMs).toBe(OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
+        return watchdog
+      })
+      const clearTimeoutMock = mock((timer: ReturnType<typeof setTimeout>) => {
+        expect(timer).toBe(watchdog)
+      })
+      const exits: number[] = []
+      const command = runtimeOpenCodeCommand({ input: 'ignored' }, {
+        ...baseDeps(),
+        now: () => nowMs,
+        onSignal: (signal, listener) => { listeners.set(signal, listener) },
+        executeEnvelope: (async (_envelope: unknown, options: { signal?: AbortSignal }) => {
+          notifyExecuting()
+          await new Promise<void>(resolve => {
+            options.signal?.addEventListener('abort', () => resolve(), { once: true })
+          })
+          nowMs += unwindMs
+          throw options.signal?.reason
+        }) as never,
+        drainCleanup: async timeoutMs => { cleanupBudgets.push(timeoutMs) },
+        setTimeout: setTimeoutMock,
+        clearTimeout: clearTimeoutMock,
+        exit: code => { exits.push(code) },
+      })
+
+      await executing
+      listeners.get('SIGTERM')?.()
+      await expect(command).rejects.toThrow('cancelled by signal (143)')
+      expect(cleanupBudgets).toEqual([expectedCleanupMs])
+      expect(watchdog.unref).toHaveBeenCalledTimes(1)
+      expect(clearTimeoutMock).toHaveBeenCalledTimes(1)
+      expect(exits).toEqual([143])
+    })
+  }
 
   test('shares signal-owned cleanup with terminal finally without duplicate disposal', async () => {
     const listeners = new Map<string, () => void>()

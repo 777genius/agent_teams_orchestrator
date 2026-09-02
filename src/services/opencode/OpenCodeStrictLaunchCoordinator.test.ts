@@ -335,6 +335,9 @@ describe('strict launch invariants', () => {
 
     expect(result.status).toBe('failure')
     expect(result.committedMemberIds).toEqual(['one'])
+    expect(result.projections).toEqual([
+      { member: 'one', source: 'new', nested: { label: 'one' } },
+    ])
     expect(ports.cleanupCalls[0]?.resources).toEqual([resource('owned', false)])
     expect(ports.releaseCalls[0]?.keepAlive).toBe(true)
   })

@@ -554,6 +554,34 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
   })
 
+  test('consumes an owner observation for concurrent same-attempt replay', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const record = { ...baseRecord, runId: 'run-1' }
+    expect(await store.claimMaterialization(record, 'attempt-a', 'run-1'))
+      .toEqual({ kind: 'claimed' })
+    expect(await store.commitMaterialization(record, 'attempt-a')).toBe(true)
+
+    const [firstObservation, secondObservation] = await Promise.all([
+      store.claimMaterialization(record, 'attempt-a', 'run-1'),
+      store.claimMaterialization(record, 'attempt-a', 'run-1'),
+    ])
+    expect(firstObservation.kind).toBe('existing')
+    expect(secondObservation.kind).toBe('existing')
+    if (firstObservation.kind !== 'existing' || secondObservation.kind !== 'existing') {
+      throw new Error('both replays must observe the incomplete record')
+    }
+
+    const transfers = await Promise.all([
+      store.acquireMaterializationOwner(record, 'attempt-a', undefined, firstObservation.ownerToken),
+      store.acquireMaterializationOwner(record, 'attempt-a', undefined, secondObservation.ownerToken),
+    ])
+    expect(transfers.filter(Boolean)).toHaveLength(1)
+    const consumed = await store.claimMaterialization(record, 'attempt-a', 'run-1')
+    expect(consumed).toMatchObject({ kind: 'existing', ownerToken: {
+      attemptId: 'attempt-a', sessionId: record.opencodeSessionId, version: 1,
+    } })
+  })
+
   test('allows only one retry to CAS incomplete-session bootstrap ownership', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
     const record = { ...baseRecord, runId: 'run-1' }

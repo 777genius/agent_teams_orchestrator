@@ -221,6 +221,31 @@ export type OpenCodeStrictSessionCompatibility = {
   }
 }
 
+type OpenCodeMaterializeSessionOnHostParams = {
+  teamId: string
+  laneId: string
+  memberName: string
+  selectedModel: string
+  selectedVariant?: string
+  title?: string | null
+  runId: string
+  attemptId?: string
+  host: OpenCodeHostHandle
+  signal: AbortSignal
+  remainingMs: () => number
+  toolApprovalMode?: OpenCodeToolApprovalMode
+  expectedBehaviorFingerprint: string
+  expectedBootstrapForSession: (
+    sessionId: string,
+  ) => OpenCodeStrictSessionCompatibility['bootstrap']
+}
+
+type OpenCodeMaterializeSessionOnHostResult = {
+  record: OpenCodeSessionRecord
+  created: boolean
+  resumeBootstrap?: boolean
+}
+
 export function isOpenCodeStrictSessionCompatible(
   record: OpenCodeSessionRecord,
   expected: OpenCodeStrictSessionCompatibility,
@@ -234,6 +259,10 @@ export function isOpenCodeStrictSessionCompatible(
     && bootstrap.briefingHash === expected.bootstrap.briefingHash
     && bootstrap.model === expected.selectedModel
     && bootstrap.agent === expected.bootstrap.agent
+}
+
+function hasOpenCodeStrictBootstrapEvidence(record: OpenCodeSessionRecord): boolean {
+  return Boolean(record.bootstrapEvidenceSource || record.appManagedBootstrap)
 }
 
 function isOpenCodeStrictMaterializedSessionCompatible(
@@ -1055,24 +1084,18 @@ export class OpenCodeSessionBridge {
   }
 
   /** Strict launch path: one create request on the caller-retained exact host. */
-  async materializeSessionOnHost(params: {
-    teamId: string
-    laneId: string
-    memberName: string
-    selectedModel: string
-    selectedVariant?: string
-    title?: string | null
-    runId: string
-    attemptId?: string
-    host: OpenCodeHostHandle
-    signal: AbortSignal
-    remainingMs: () => number
-    toolApprovalMode?: OpenCodeToolApprovalMode
-    expectedBehaviorFingerprint: string
-    expectedBootstrapForSession: (
-      sessionId: string,
-    ) => OpenCodeStrictSessionCompatibility['bootstrap']
-  }): Promise<{ record: OpenCodeSessionRecord; created: boolean; resumeBootstrap?: boolean }> {
+  materializeSessionOnHost(
+    params: OpenCodeMaterializeSessionOnHostParams,
+  ): Promise<OpenCodeMaterializeSessionOnHostResult> {
+    const observed = this.materializeSessionOnHostObserved(params)
+    return this.sessionStore.trackPendingMaterializationReconciliation
+      ? this.sessionStore.trackPendingMaterializationReconciliation(observed)
+      : observed
+  }
+
+  private async materializeSessionOnHostObserved(
+    params: OpenCodeMaterializeSessionOnHostParams,
+  ): Promise<OpenCodeMaterializeSessionOnHostResult> {
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
     const attemptId = params.attemptId ?? params.runId
@@ -1116,6 +1139,9 @@ export class OpenCodeSessionBridge {
       }
       if (!isOpenCodeStrictMaterializedSessionCompatible(existing, expected)) {
         throw new Error('OpenCode committed session identity does not match strict launch')
+      }
+      if (hasOpenCodeStrictBootstrapEvidence(existing)) {
+        throw new Error('OpenCode committed session bootstrap evidence does not match strict launch')
       }
       // createSession returned a known id and the exact bound record was
       // committed before bootstrap was interrupted. Resume only that session;

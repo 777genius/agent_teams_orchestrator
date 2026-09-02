@@ -89,7 +89,8 @@ type RuntimeOpenCodeCommandDeps = {
   readInput?: (path: string) => Promise<string>
   executeEnvelope?: typeof executeOpenCodeBridgeCommandEnvelope
   writePayload?: (opts: { output?: string }, payload: string) => Promise<void>
-  drainCleanup?: () => Promise<void>
+  drainCleanup?: (timeoutMs?: number) => Promise<void>
+  now?: () => number
   exit?: (code: number) => void
   setTimeout?: RuntimeCommandSetTimeout
   clearTimeout?: RuntimeCommandClearTimeout
@@ -111,7 +112,9 @@ export async function runtimeOpenCodeCommand(opts: {
       await writeStdoutAndDrain(payload)
     }
   })
-  const drainCleanup = deps.drainCleanup ?? drainRuntimeOpenCodeCommandCleanup
+  const drainCleanup = deps.drainCleanup ?? ((timeoutMs?: number) =>
+    drainRuntimeOpenCodeCommandCleanup(timeoutMs === undefined ? {} : { timeoutMs }))
+  const now = deps.now ?? Date.now
   const exit = deps.exit ?? (code => process.exit(code))
   const setTimeoutFn = deps.setTimeout ?? setTimeout
   const clearTimeoutFn = deps.clearTimeout ?? clearTimeout
@@ -129,20 +132,25 @@ export async function runtimeOpenCodeCommand(opts: {
     resolveCommandExecutionSettled()
   }
   let signalCleanupPromise: Promise<void> | null = null
+  let signalReceivedAt: number | null = null
   let cleanupPromise: Promise<void> | null = null
-  const drainCleanupOnce = (): Promise<void> => {
-    cleanupPromise ??= drainCleanup()
+  const drainCleanupOnce = (timeoutMs?: number): Promise<void> => {
+    cleanupPromise ??= drainCleanup(timeoutMs)
     return cleanupPromise
   }
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
     if (signalCleanupPromise) {
       return
     }
+    signalReceivedAt = now()
     commandController.abort(new Error(`OpenCode runtime command cancelled by signal (${exitCode})`))
     const watchdog = setTimeoutFn(() => exit(exitCode), OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
     watchdog.unref?.()
     signalCleanupPromise = commandExecutionSettled
-      .then(() => drainCleanupOnce())
+      .then(() => {
+        const elapsedMs = signalReceivedAt === null ? 0 : Math.max(0, now() - signalReceivedAt)
+        return drainCleanupOnce(Math.max(0, OPENCODE_COMMAND_CLEANUP_TIMEOUT_MS - elapsedMs))
+      })
       .finally(() => {
         clearTimeoutFn(watchdog)
         exit(exitCode)
