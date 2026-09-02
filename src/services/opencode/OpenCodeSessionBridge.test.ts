@@ -1306,8 +1306,9 @@ describe('OpenCodeSessionBridge', () => {
     expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
 
     const retryController = new AbortController()
+    const restartedStore = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const restartedBridge = new OpenCodeSessionBridge({
-      sessionStore: new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json')),
+      sessionStore: restartedStore,
       hostManager: {
         ensureHost: async () => { throw new Error('must use retained host') },
         releaseHost: async () => {},
@@ -1334,15 +1335,36 @@ describe('OpenCodeSessionBridge', () => {
     await expect(restartedBridge.materializeSessionOnHost({
       ...resumeInput, runId: 'run-2',
     })).rejects.toThrow('committed session identity does not match strict launch')
-    const resumed = await restartedBridge.materializeSessionOnHost(resumeInput)
-    expect(resumed).toMatchObject({
+    const acquireMaterializationOwner = restartedStore.acquireMaterializationOwner.bind(restartedStore)
+    let ownerTransferArrivals = 0
+    let releaseOwnerTransfers!: () => void
+    const ownerTransferBarrier = new Promise<void>(resolve => { releaseOwnerTransfers = resolve })
+    restartedStore.acquireMaterializationOwner = async (...args) => {
+      ownerTransferArrivals += 1
+      if (ownerTransferArrivals === 2) releaseOwnerTransfers()
+      await ownerTransferBarrier
+      return acquireMaterializationOwner(...args)
+    }
+    const resumeAttempts = await Promise.allSettled([
+      restartedBridge.materializeSessionOnHost(resumeInput),
+      restartedBridge.materializeSessionOnHost({ ...resumeInput, attemptId: 'attempt-c' }),
+    ])
+    const resumed = resumeAttempts.find(result => result.status === 'fulfilled')
+    const rejected = resumeAttempts.find(result => result.status === 'rejected')
+    expect(resumeAttempts.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(resumeAttempts.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(resumed).toMatchObject({ value: {
       created: false,
       resumeBootstrap: true,
       record: { opencodeSessionId: 'session-known' },
-    })
+    } })
+    expect(rejected).toMatchObject({ reason: expect.objectContaining({
+      message: 'OpenCode committed session changed before bootstrap ownership transfer',
+    }) })
     expect(createCalls).toBe(1)
-    expect(await store.markStaleIfSession(resumed.record, 'old-cleanup', 'attempt-a')).toBeNull()
-    expect(await store.deleteIfSession(resumed.record, 'attempt-a')).toBe(false)
+    if (!resumed || resumed.status !== 'fulfilled') throw new Error('one retry must resume bootstrap')
+    expect(await store.markStaleIfSession(resumed.value.record, 'old-cleanup', 'attempt-a')).toBeNull()
+    expect(await store.deleteIfSession(resumed.value.record, 'attempt-a')).toBe(false)
   })
 
   test('tracks signal-free commit reconciliation so command cleanup drains it', async () => {

@@ -111,6 +111,23 @@ describe('runtimeOpenCodeCommand cancellation cleanup', () => {
     expect(lateReleasesDrained).toBe(true)
   })
 
+  test('reports fulfilled host disposal diagnostics without exposing their details', async () => {
+    const reported: unknown[] = []
+
+    await drainRuntimeOpenCodeCommandCleanup({
+      disposeUnregisteredOwnedHosts: async () => ({
+        disposed: 0,
+        kept: 1,
+        diagnostics: ['https://example.test/private?token=secret'],
+      }),
+      drainPendingLateLockReleases: async () => {},
+      onDisposeError: error => { reported.push(error) },
+      timeoutMs: 10_000,
+    })
+
+    expect(reported).toEqual([undefined])
+  })
+
   test('default disposal diagnostic omits error details', async () => {
     const originalWarn = console.warn
     const warnings: unknown[][] = []
@@ -168,6 +185,48 @@ describe('runtimeOpenCodeCommand terminal cleanup', () => {
 
     expect(cleanupCalls).toBe(1)
     expect(exits).toEqual([])
+  })
+
+  test('waits for aborted command unwind to register reconciliation before signal drain starts', async () => {
+    const listeners = new Map<string, () => void>()
+    let notifyExecuting!: () => void
+    const executing = new Promise<void>(resolve => { notifyExecuting = resolve })
+    let finishLateRegistration!: () => void
+    const lateRegistrationBarrier = new Promise<void>(resolve => { finishLateRegistration = resolve })
+    let lateRegistrationCompleted = false
+    let cleanupCalls = 0
+    const exits: number[] = []
+
+    const command = runtimeOpenCodeCommand({ input: 'ignored' }, {
+      ...baseDeps(),
+      onSignal: (signal, listener) => { listeners.set(signal, listener) },
+      offSignal: () => {},
+      executeEnvelope: (async (_envelope: unknown, options: { signal?: AbortSignal }) => {
+        notifyExecuting()
+        await new Promise<void>(resolve => {
+          options.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+        await lateRegistrationBarrier
+        lateRegistrationCompleted = true
+        throw options.signal?.reason
+      }) as never,
+      drainCleanup: async () => {
+        expect(lateRegistrationCompleted).toBe(true)
+        cleanupCalls += 1
+      },
+      exit: code => { exits.push(code) },
+    })
+
+    await executing
+    listeners.get('SIGTERM')?.()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(cleanupCalls).toBe(0)
+
+    finishLateRegistration()
+    await expect(command).rejects.toThrow('cancelled by signal (143)')
+    expect(cleanupCalls).toBe(1)
+    expect(exits).toEqual([143])
   })
 
   test('shares signal-owned cleanup with terminal finally without duplicate disposal', async () => {

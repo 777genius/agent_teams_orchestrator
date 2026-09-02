@@ -378,8 +378,8 @@ describe('OpenCodeSessionStore', () => {
     const stopped = await store.markStoppedIfSession(record)
     expect(stopped?.stoppedAt).toBeDefined()
     expect(await store.markStoppedIfSession(record)).toEqual(stopped)
-    expect(await store.claimMaterialization(record, 'same-run-attempt', 'run-1')).toEqual({ kind: 'existing', record: stopped })
-    expect(await store.claimMaterialization(record, 'legacy-attempt')).toEqual({ kind: 'existing', record: stopped })
+    expect(await store.claimMaterialization(record, 'same-run-attempt', 'run-1')).toEqual({ kind: 'existing', record: stopped, ownerToken: { attemptId: 'old-attempt', sessionId: 'session-1' } })
+    expect(await store.claimMaterialization(record, 'legacy-attempt')).toEqual({ kind: 'existing', record: stopped, ownerToken: { attemptId: 'old-attempt', sessionId: 'session-1' } })
     expect(await store.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual({ kind: 'claimed' })
     expect(await store.commitMaterialization({ ...record, runId: 'run-2', opencodeSessionId: 'session-2' }, 'new-attempt')).toBe(true)
     expect(await store.markStoppedIfSession(record)).toBeNull()
@@ -424,9 +424,9 @@ describe('OpenCodeSessionStore', () => {
       sessionId: 'session-1',
     })
     expect(await store.claimMaterialization(identity, 'same-run-attempt', 'run-1'))
-      .toEqual({ kind: 'existing', record: stopped })
+      .toEqual({ kind: 'existing', record: stopped, ownerToken: { attemptId: 'old-attempt', sessionId: 'session-1' } })
     expect(await store.claimMaterialization(identity, 'missing-run-attempt'))
-      .toEqual({ kind: 'existing', record: stopped })
+      .toEqual({ kind: 'existing', record: stopped, ownerToken: { attemptId: 'old-attempt', sessionId: 'session-1' } })
 
     expect(await store.claimMaterialization(identity, 'retry-attempt', 'run-2')).toEqual({ kind: 'claimed' })
     expect(await store.commitMaterialization({
@@ -490,7 +490,7 @@ describe('OpenCodeSessionStore', () => {
     for (const stoppedAt of ['', 'invalid', '1']) {
       const malformed = { ...record, stoppedAt }
       await malformedStore.upsert(malformed)
-      expect(await malformedStore.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual({ kind: 'existing', record: malformed })
+      expect(await malformedStore.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual({ kind: 'existing', record: malformed, ownerToken: null })
     }
   })
 
@@ -539,16 +539,44 @@ describe('OpenCodeSessionStore', () => {
       .toEqual({ kind: 'claimed' })
     expect(await store.commitMaterialization(record, 'old-attempt')).toBe(true)
 
-    expect(await store.acquireMaterializationOwner(record, 'new-attempt')).toBe(true)
-    expect(await store.acquireMaterializationOwner(record, 'new-attempt')).toBe(true)
+    const oldOwner = { attemptId: 'old-attempt', sessionId: record.opencodeSessionId }
+    expect(await store.acquireMaterializationOwner(record, 'new-attempt', undefined, oldOwner)).toBe(true)
+    expect(await store.acquireMaterializationOwner(record, 'new-attempt', undefined, oldOwner)).toBe(false)
     expect(await store.markStaleIfSession(record, 'old-cleanup', 'old-attempt')).toBeNull()
     expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
     expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(record)
 
     const changed = await store.markStaleIfSession(record, 'new-state', 'new-attempt')
     expect(changed?.staleReason).toBe('new-state')
-    expect(await store.acquireMaterializationOwner(record, 'third-attempt')).toBe(false)
+    expect(await store.acquireMaterializationOwner(record, 'third-attempt', undefined, {
+      attemptId: 'new-attempt', sessionId: record.opencodeSessionId,
+    })).toBe(false)
     expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
+  })
+
+  test('allows only one retry to CAS incomplete-session bootstrap ownership', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const record = { ...baseRecord, runId: 'run-1' }
+    expect(await store.claimMaterialization(record, 'attempt-a', 'run-1'))
+      .toEqual({ kind: 'claimed' })
+    expect(await store.commitMaterialization(record, 'attempt-a')).toBe(true)
+
+    const [observedByB, observedByC] = await Promise.all([
+      store.claimMaterialization(record, 'attempt-b', 'run-1'),
+      store.claimMaterialization(record, 'attempt-c', 'run-1'),
+    ])
+    expect(observedByB.kind).toBe('existing')
+    expect(observedByC.kind).toBe('existing')
+    if (observedByB.kind !== 'existing' || observedByC.kind !== 'existing') {
+      throw new Error('both retries must observe the incomplete record')
+    }
+    expect(observedByB.ownerToken).toEqual(observedByC.ownerToken)
+
+    const transfers = await Promise.all([
+      store.acquireMaterializationOwner(record, 'attempt-b', undefined, observedByB.ownerToken),
+      store.acquireMaterializationOwner(record, 'attempt-c', undefined, observedByC.ownerToken),
+    ])
+    expect(transfers.filter(Boolean)).toHaveLength(1)
   })
 
 })

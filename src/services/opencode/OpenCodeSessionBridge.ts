@@ -1121,7 +1121,12 @@ export class OpenCodeSessionBridge {
       // committed before bootstrap was interrupted. Resume only that session;
       // an unknown create outcome has no record and remains fenced by its claim.
       if (!this.sessionStore.acquireMaterializationOwner
-        || !await this.sessionStore.acquireMaterializationOwner(existing, attemptId, params.signal)) {
+        || !await this.sessionStore.acquireMaterializationOwner(
+          existing,
+          attemptId,
+          params.signal,
+          claim?.kind === 'existing' ? claim.ownerToken : undefined,
+        )) {
         throw new Error('OpenCode committed session changed before bootstrap ownership transfer')
       }
       return { record: existing, created: false, resumeBootstrap: true }

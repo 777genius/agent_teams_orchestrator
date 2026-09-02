@@ -21,8 +21,10 @@ type UpsertResult = 'created' | 'updated' | 'unchanged'
 export type MaterializationClaimResult =
   | { kind: 'claimed' }
   | { kind: 'already_owned' }
-  | { kind: 'existing'; record: OpenCodeSessionRecord }
+  | { kind: 'existing'; record: OpenCodeSessionRecord; ownerToken?: MaterializationOwnerToken | null }
   | { kind: 'owned_by_other' }
+
+export type MaterializationOwnerToken = { attemptId: string; sessionId: string }
 
 const LOCK_RETRY_OPTIONS = {
   retries: 30,
@@ -328,7 +330,13 @@ export class OpenCodeSessionStore {
       const existing = store.records[key]
       const replacingStopped = existing && isOpenCodeSessionStopped(existing)
         && existing.runId && requestedRunId?.trim() && requestedRunId !== existing.runId
-      if (existing && !replacingStopped) return { kind: 'existing', record: existing }
+      if (existing && !replacingStopped) {
+        return {
+          kind: 'existing',
+          record: existing,
+          ownerToken: store.materializationOwners?.[key] ?? null,
+        }
+      }
       store.materializationClaims ??= {}
       const owner = store.materializationClaims[key]
       if (owner && owner !== attemptId) return { kind: 'owned_by_other' }
@@ -387,6 +395,7 @@ export class OpenCodeSessionStore {
     record: OpenCodeSessionRecord,
     attemptId: string,
     signal?: AbortSignal,
+    expectedOwnerToken?: MaterializationOwnerToken | null,
   ): Promise<boolean> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
@@ -394,7 +403,8 @@ export class OpenCodeSessionStore {
       const existing = store.records[key]
       if (!existing || jsonStringify(existing) !== jsonStringify(record)) return false
       const owner = store.materializationOwners?.[key]
-      if (owner && owner.sessionId !== record.opencodeSessionId) return false
+      if (jsonStringify(owner ?? null) !== jsonStringify(expectedOwnerToken ?? null)) return false
+      if (owner && (owner.sessionId !== record.opencodeSessionId || existing.runId !== record.runId)) return false
       store.materializationOwners ??= {}
       store.materializationOwners[key] = {
         attemptId,

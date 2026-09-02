@@ -40,7 +40,7 @@ export function startRuntimeCommandKeepAlive(deps: {
 }
 
 export async function drainRuntimeOpenCodeCommandCleanup(deps: {
-  disposeUnregisteredOwnedHosts?: () => Promise<void>
+  disposeUnregisteredOwnedHosts?: () => Promise<unknown>
   drainPendingLateLockReleases?: () => Promise<void>
   setTimeout?: RuntimeCommandSetTimeout
   clearTimeout?: RuntimeCommandClearTimeout
@@ -66,7 +66,12 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
   try {
     const outcome = await Promise.race([
       Promise.all([
-        disposeUnregisteredOwnedHosts().catch(error => { onDisposeError(error) }),
+        disposeUnregisteredOwnedHosts().then(result => {
+          if (result && typeof result === 'object' && 'diagnostics' in result
+            && Array.isArray(result.diagnostics) && result.diagnostics.length > 0) {
+            onDisposeError(undefined)
+          }
+        }, error => { onDisposeError(error) }),
         drainPendingLateLockReleases(),
       ]).then(() => 'completed' as const),
       new Promise<'timed_out'>(resolve => {
@@ -113,6 +118,16 @@ export async function runtimeOpenCodeCommand(opts: {
   const onSignal = deps.onSignal ?? ((signal, listener) => process.once(signal, listener))
   const offSignal = deps.offSignal ?? ((signal, listener) => process.off(signal, listener))
   const commandController = new AbortController()
+  let resolveCommandExecutionSettled!: () => void
+  const commandExecutionSettled = new Promise<void>(resolve => {
+    resolveCommandExecutionSettled = resolve
+  })
+  let commandExecutionWasSettled = false
+  const settleCommandExecution = (): void => {
+    if (commandExecutionWasSettled) return
+    commandExecutionWasSettled = true
+    resolveCommandExecutionSettled()
+  }
   let signalCleanupPromise: Promise<void> | null = null
   let cleanupPromise: Promise<void> | null = null
   const drainCleanupOnce = (): Promise<void> => {
@@ -126,7 +141,8 @@ export async function runtimeOpenCodeCommand(opts: {
     commandController.abort(new Error(`OpenCode runtime command cancelled by signal (${exitCode})`))
     const watchdog = setTimeoutFn(() => exit(exitCode), OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
     watchdog.unref?.()
-    signalCleanupPromise = drainCleanupOnce()
+    signalCleanupPromise = commandExecutionSettled
+      .then(() => drainCleanupOnce())
       .finally(() => {
         clearTimeoutFn(watchdog)
         exit(exitCode)
@@ -141,9 +157,16 @@ export async function runtimeOpenCodeCommand(opts: {
   try {
     const raw = await readInput(opts.input)
     const envelope = JSON.parse(raw) as unknown
-    const result = await executeEnvelope(envelope, {
-      signal: commandController.signal,
-    })
+    let result: Awaited<ReturnType<typeof executeEnvelope>>
+    try {
+      result = await executeEnvelope(envelope, {
+        signal: commandController.signal,
+      })
+    } finally {
+      // Cancellation can register signal-free reconciliation while the command
+      // unwinds. Do not snapshot cleanup tracking until that registration is done.
+      settleCommandExecution()
+    }
     if (signalCleanupPromise) {
       await signalCleanupPromise
       return
@@ -151,10 +174,11 @@ export async function runtimeOpenCodeCommand(opts: {
     const payload = jsonStringify(result) + '\n'
     await writePayload(opts, payload)
   } finally {
+    settleCommandExecution()
     stopKeepAlive()
     offSignal('SIGTERM', onSigterm)
     offSignal('SIGINT', onSigint)
-    await drainCleanupOnce()
+    await (signalCleanupPromise ?? drainCleanupOnce())
   }
   exit(0)
 }
