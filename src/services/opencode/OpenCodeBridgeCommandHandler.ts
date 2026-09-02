@@ -3283,7 +3283,24 @@ async function runLaunch(
   }
 
   const resources = new Map<string, { record: OpenCodeSessionRecord; ownerToken: MaterializationOwnerToken }>()
+  const pendingAttemptReconciliations = new Set<Promise<unknown>>()
+  const trackAttemptReconciliation = <T>(operation: Promise<T>): Promise<T> => {
+    pendingAttemptReconciliations.add(operation)
+    void operation.then(
+      () => pendingAttemptReconciliations.delete(operation),
+      () => pendingAttemptReconciliations.delete(operation),
+    )
+    return operation
+  }
+  const drainAttemptReconciliations = async (): Promise<void> => {
+    while (pendingAttemptReconciliations.size > 0) {
+      await Promise.allSettled([...pendingAttemptReconciliations])
+    }
+  }
   const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  const trackAttemptMaterialization = (
+    operation: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft>['materialize'],
+  ): typeof operation => (...args) => trackAttemptReconciliation(operation(...args))
   const strictSessionCompatibility = (
     sessionId: string,
     input: NonNullable<ReturnType<typeof memberInputs.get>>,
@@ -3482,7 +3499,7 @@ async function runLaunch(
       }
     },
     projectCommitted: async () => ({ kind: 'ok', value: undefined }),
-    materialize: async (_context, strictHost, member, identity, signal) => {
+    materialize: trackAttemptMaterialization(async (_context, strictHost, member, identity, signal) => {
       const input = memberInputs.get(member.memberId)!
       if (strictHost.hostId !== host.hostKey) {
         return { kind: 'failure', error: 'materialization host identity mismatch' }
@@ -3630,9 +3647,9 @@ async function runLaunch(
             committed: false as const }] } : {}),
         }
       }
-    },
+    }),
     cleanup: (_context, cleanupResources) =>
-      openCodeSessionStore.trackPendingMaterializationReconciliation((async () => {
+      trackAttemptReconciliation((async () => {
         for (const resource of cleanupResources) {
           const owned = resources.get(resource.resourceId)
           if (owned && !resource.committed) {
@@ -3679,12 +3696,14 @@ async function runLaunch(
       }),
     },
   }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
-  const releaseMaterializationOwners = openCodeSessionStore.drainPendingLateLockReleases()
-    .then(() => openCodeSessionStore.trackPendingMaterializationReconciliation(Promise.all(
-      [...resources.values()].map(({ record, ownerToken }) =>
-        openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
-          .catch(() => false)),
-    )))
+  const releaseMaterializationOwners = openCodeSessionStore
+    .trackPendingMaterializationReconciliation(
+      drainAttemptReconciliations().then(() => Promise.all(
+        [...resources.values()].map(({ record, ownerToken }) =>
+          openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
+            .catch(() => false)),
+      )),
+    )
   await withTimeout(
     releaseMaterializationOwners,
     Math.max(0, deadlineAt - Date.now()),

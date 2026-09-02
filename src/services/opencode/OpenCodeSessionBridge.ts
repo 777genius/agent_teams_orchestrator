@@ -546,6 +546,7 @@ export class OpenCodeSessionBridge {
       const now = buildNowIso()
       const record: OpenCodeSessionRecord = {
         teamId: params.identity.teamId,
+        ...(params.runId ? { runId: params.runId } : {}),
         laneId: params.identity.laneId,
         memberName: params.identity.memberName,
         providerId: 'opencode',

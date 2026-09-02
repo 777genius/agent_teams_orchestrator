@@ -494,6 +494,12 @@ const originalUpsert = openCodeSessionStore.upsert
 const originalMarkStale = openCodeSessionStore.markStale
 const originalMarkStoppedIfSession = openCodeSessionStore.markStoppedIfSession
 const originalDelete = openCodeSessionStore.delete
+const originalObserveMaterialization = openCodeSessionStore.observeMaterialization
+const originalReleaseInactiveMaterializationOwner =
+  openCodeSessionStore.releaseInactiveMaterializationOwner
+const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
+const originalMarkStaleIfSession = openCodeSessionStore.markStaleIfSession
+const originalDeleteIfSession = openCodeSessionStore.deleteIfSession
 const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
 const originalOutcomeQuery = openCodeCommandOutcomeStore.query
 const originalOutcomePrune = openCodeCommandOutcomeStore.prune
@@ -825,6 +831,12 @@ afterEach(async () => {
   openCodeSessionStore.markStale = originalMarkStale
   openCodeSessionStore.markStoppedIfSession = originalMarkStoppedIfSession
   openCodeSessionStore.delete = originalDelete
+  openCodeSessionStore.observeMaterialization = originalObserveMaterialization
+  openCodeSessionStore.releaseInactiveMaterializationOwner =
+    originalReleaseInactiveMaterializationOwner
+  openCodeSessionStore.releaseMaterializationOwner = originalReleaseMaterializationOwner
+  openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
+  openCodeSessionStore.deleteIfSession = originalDeleteIfSession
   openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
   openCodeCommandOutcomeStore.query = originalOutcomeQuery
   openCodeCommandOutcomeStore.prune = originalOutcomePrune
@@ -3119,16 +3131,17 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('waits for tracked cancellation cleanup before bounded owner release', async () => {
     const realNow = Date.now
     const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
+    const originalMarkStaleIfSession = openCodeSessionStore.markStaleIfSession
+    const originalDeleteIfSession = openCodeSessionStore.deleteIfSession
     let now = 1_000
     Date.now = () => now
     try {
       await withManualTimers(async timers => {
         const releaseStarted = createDeferred<void>()
         const hostReleased = createDeferred<void>()
+        const injectionStarted = createDeferred<void>()
+        const cancellationCleanupStarted = createDeferred<void>()
         const cancellationCleanupCompleted = createDeferred<void>()
-        openCodeSessionStore.trackPendingMaterializationReconciliation(
-          cancellationCleanupCompleted.promise,
-        )
         const ownerReleaseCompleted = createDeferred<boolean>()
         let materializeCalls = 0
         let hostReleaseCalls = 0
@@ -3152,20 +3165,28 @@ describe('OpenCodeBridgeCommandHandler', () => {
             }),
           }
         }) as typeof openCodeSessionBridge.materializeSessionOnHost
-        openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => ({
-          messageID: input.messageID,
-          runtimeSessionId: record.opencodeSessionId,
-          contextHash: input.contextHash,
-          briefingHash: input.briefingHash,
-          injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
-          alreadyPresent: false,
-        })) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+        openCodeSessionBridge.injectAppManagedBootstrapContext = ((record, input) => {
+          injectionStarted.resolve()
+          return new Promise<never>((_resolve, reject) => {
+            const cancel = () => {
+              cancellationCleanupStarted.resolve()
+              void cancellationCleanupCompleted.promise.then(() => reject(input.signal.reason))
+            }
+            if (input.signal.aborted) cancel()
+            else input.signal.addEventListener('abort', cancel, { once: true })
+          })
+        }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+        openCodeSessionStore.markStaleIfSession = (async record => ({
+          ...record, staleReason: 'launch_failed',
+        })) as typeof openCodeSessionStore.markStaleIfSession
+        openCodeSessionStore.deleteIfSession = (async () => true) as
+          typeof openCodeSessionStore.deleteIfSession
         openCodeSessionBridge.releaseSession = (async () => {
           sessionReleaseCalls += 1
         }) as typeof openCodeSessionBridge.releaseSession
         openCodeSessionStore.releaseMaterializationOwner = (async () => {
           ownerReleaseCalls += 1
-          now = 1_250
+          now = 1_800
           releaseStarted.resolve()
           return ownerReleaseCompleted.promise
         }) as typeof openCodeSessionStore.releaseMaterializationOwner
@@ -3176,8 +3197,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
         })
         envelope.timeoutMs = 1_000
         const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-        await hostReleased.promise
-        await Promise.resolve()
+        await injectionStarted.promise
+        const workTimer = timers.find(timer => !timer.cancelled && timer.timeoutMs === 750)
+        expect(workTimer).toBeDefined()
+        now = 1_750
+        workTimer!.callback()
+        await Promise.all([hostReleased.promise, cancellationCleanupStarted.promise])
         expect(ownerReleaseCalls).toBe(0)
         cancellationCleanupCompleted.resolve()
         await releaseStarted.promise
@@ -3191,13 +3216,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
         ownerReleaseTimer!.callback()
         const result = await resultPromise
 
-        expect(result.ok).toBe(true)
-        if (!result.ok) return
-        expect(Object.keys(result.data.members)).toEqual(['alice'])
+        expect(result.ok).toBe(false)
         expect(materializeCalls).toBe(1)
         expect(hostReleaseCalls).toBe(1)
         expect(ownerReleaseCalls).toBe(1)
-        expect(sessionReleaseCalls).toBe(0)
+        expect(sessionReleaseCalls).toBe(1)
 
         let drained = false
         const drain = openCodeSessionStore.drainPendingLateLockReleases().then(() => {
@@ -3212,6 +3235,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     } finally {
       Date.now = realNow
       openCodeSessionStore.releaseMaterializationOwner = originalReleaseMaterializationOwner
+      openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
+      openCodeSessionStore.deleteIfSession = originalDeleteIfSession
     }
   })
 
