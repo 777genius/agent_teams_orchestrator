@@ -1341,6 +1341,69 @@ describe('OpenCodeSessionBridge', () => {
       record: { opencodeSessionId: 'session-known' },
     })
     expect(createCalls).toBe(1)
+    expect(await store.markStaleIfSession(resumed.record, 'old-cleanup', 'attempt-a')).toBeNull()
+    expect(await store.deleteIfSession(resumed.record, 'attempt-a')).toBe(false)
+  })
+
+  test('tracks signal-free commit reconciliation so command cleanup drains it', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    const commitMaterialization = store.commitMaterialization.bind(store)
+    let commitCalls = 0
+    let notifyReconciliationStarted!: () => void
+    const reconciliationStarted = new Promise<void>(resolve => { notifyReconciliationStarted = resolve })
+    let finishReconciliation!: () => void
+    const reconciliationGate = new Promise<void>(resolve => { finishReconciliation = resolve })
+    store.commitMaterialization = async (record, attemptId, signal) => {
+      commitCalls += 1
+      if (signal) return commitMaterialization(record, attemptId, signal)
+      notifyReconciliationStarted()
+      await reconciliationGate
+      return commitMaterialization(record, attemptId)
+    }
+    const retainedLeases: unknown[] = []
+    const releasedLeases: unknown[] = []
+    const controller = new AbortController()
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async (_hostKey, input) => { retainedLeases.push(input) },
+        releaseHostLease: async (_hostKey, input) => { releasedLeases.push(input) },
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => {
+            controller.abort(new Error('deadline after remote create'))
+            return { id: 'session-known' }
+          },
+        }) as never,
+      },
+    })
+
+    const materialization = bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 0,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })
+    await reconciliationStarted
+    let cleanupDrained = false
+    const cleanup = store.drainPendingLateLockReleases().then(() => { cleanupDrained = true })
+    await Promise.resolve()
+    expect(cleanupDrained).toBe(false)
+
+    finishReconciliation()
+    await expect(materialization).rejects.toThrow('deadline after remote create')
+    await cleanup
+    expect(cleanupDrained).toBe(true)
+    expect(commitCalls).toBe(2)
+    expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
+    expect(retainedLeases).toHaveLength(1)
+    expect(releasedLeases).toEqual([])
   })
 
   test('keeps the retained lease when a live commit writes before lock release fails', async () => {

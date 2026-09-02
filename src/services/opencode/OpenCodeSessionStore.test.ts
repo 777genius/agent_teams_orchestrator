@@ -516,4 +516,39 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.get('team-a', 'primary', 'alice')).toEqual(next)
   })
 
+  test('drains a tracked materialization reconciliation before command cleanup completes', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    let resolveReconciliation!: () => void
+    const reconciliation = new Promise<void>(resolve => { resolveReconciliation = resolve })
+    store.trackPendingMaterializationReconciliation(reconciliation)
+
+    let drained = false
+    const drain = store.drainPendingLateLockReleases().then(() => { drained = true })
+    await Promise.resolve()
+    expect(drained).toBe(false)
+
+    resolveReconciliation()
+    await drain
+    expect(drained).toBe(true)
+  })
+
+  test('atomically transfers incomplete-session cleanup ownership and fences the old attempt', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const record = { ...baseRecord, runId: 'run-1' }
+    expect(await store.claimMaterialization(record, 'old-attempt', 'run-1'))
+      .toEqual({ kind: 'claimed' })
+    expect(await store.commitMaterialization(record, 'old-attempt')).toBe(true)
+
+    expect(await store.acquireMaterializationOwner(record, 'new-attempt')).toBe(true)
+    expect(await store.acquireMaterializationOwner(record, 'new-attempt')).toBe(true)
+    expect(await store.markStaleIfSession(record, 'old-cleanup', 'old-attempt')).toBeNull()
+    expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
+    expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(record)
+
+    const changed = await store.markStaleIfSession(record, 'new-state', 'new-attempt')
+    expect(changed?.staleReason).toBe('new-state')
+    expect(await store.acquireMaterializationOwner(record, 'third-attempt')).toBe(false)
+    expect(await store.deleteIfSession(record, 'old-attempt')).toBe(false)
+  })
+
 })

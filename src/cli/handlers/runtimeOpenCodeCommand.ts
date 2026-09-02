@@ -46,6 +46,7 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
   clearTimeout?: RuntimeCommandClearTimeout
   timeoutMs?: number
   onTimeout?: (timeoutMs: number) => void
+  onDisposeError?: (error: unknown) => void
 } = {}): Promise<void> {
   const disposeUnregisteredOwnedHosts = deps.disposeUnregisteredOwnedHosts
     ?? (() => openCodeHostManager.disposeUnregisteredOwnedHosts())
@@ -57,12 +58,15 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
   const onTimeout = deps.onTimeout ?? (elapsedMs => {
     console.warn('[opencode-command] Cancellation cleanup timed out after ' + elapsedMs + 'ms')
   })
+  const onDisposeError = deps.onDisposeError ?? (() => {
+    console.warn('[opencode-command] Failed to dispose unregistered owned OpenCode hosts')
+  })
   let timeout: RuntimeCommandTimeout | undefined
 
   try {
     const outcome = await Promise.race([
       Promise.all([
-        disposeUnregisteredOwnedHosts().catch(() => undefined),
+        disposeUnregisteredOwnedHosts().catch(error => { onDisposeError(error) }),
         drainPendingLateLockReleases(),
       ]).then(() => 'completed' as const),
       new Promise<'timed_out'>(resolve => {
@@ -76,36 +80,68 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
   }
 }
 
+type RuntimeOpenCodeCommandDeps = {
+  readInput?: (path: string) => Promise<string>
+  executeEnvelope?: typeof executeOpenCodeBridgeCommandEnvelope
+  writePayload?: (opts: { output?: string }, payload: string) => Promise<void>
+  drainCleanup?: () => Promise<void>
+  exit?: (code: number) => void
+  setTimeout?: RuntimeCommandSetTimeout
+  clearTimeout?: RuntimeCommandClearTimeout
+  onSignal?: (signal: 'SIGTERM' | 'SIGINT', listener: () => void) => void
+  offSignal?: (signal: 'SIGTERM' | 'SIGINT', listener: () => void) => void
+}
+
 export async function runtimeOpenCodeCommand(opts: {
   input: string
   json?: boolean
   output?: string
-}): Promise<void> {
+}, deps: RuntimeOpenCodeCommandDeps = {}): Promise<void> {
+  const readInput = deps.readInput ?? (path => readFile(path, 'utf8'))
+  const executeEnvelope = deps.executeEnvelope ?? executeOpenCodeBridgeCommandEnvelope
+  const writePayload = deps.writePayload ?? (async (commandOpts, payload) => {
+    if (commandOpts.output?.trim()) {
+      await writeOutputFileAtomically(commandOpts.output.trim(), payload)
+    } else {
+      await writeStdoutAndDrain(payload)
+    }
+  })
+  const drainCleanup = deps.drainCleanup ?? drainRuntimeOpenCodeCommandCleanup
+  const exit = deps.exit ?? (code => process.exit(code))
+  const setTimeoutFn = deps.setTimeout ?? setTimeout
+  const clearTimeoutFn = deps.clearTimeout ?? clearTimeout
+  const onSignal = deps.onSignal ?? ((signal, listener) => process.once(signal, listener))
+  const offSignal = deps.offSignal ?? ((signal, listener) => process.off(signal, listener))
   const commandController = new AbortController()
   let signalCleanupPromise: Promise<void> | null = null
+  let cleanupPromise: Promise<void> | null = null
+  const drainCleanupOnce = (): Promise<void> => {
+    cleanupPromise ??= drainCleanup()
+    return cleanupPromise
+  }
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
     if (signalCleanupPromise) {
       return
     }
     commandController.abort(new Error(`OpenCode runtime command cancelled by signal (${exitCode})`))
-    const watchdog = setTimeout(() => process.exit(exitCode), OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
+    const watchdog = setTimeoutFn(() => exit(exitCode), OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS)
     watchdog.unref?.()
-    signalCleanupPromise = drainRuntimeOpenCodeCommandCleanup()
+    signalCleanupPromise = drainCleanupOnce()
       .finally(() => {
-        clearTimeout(watchdog)
-        process.exit(exitCode)
+        clearTimeoutFn(watchdog)
+        exit(exitCode)
       })
   }
   const onSigterm = () => cleanupUnregisteredHostsAndExit(143)
   const onSigint = () => cleanupUnregisteredHostsAndExit(130)
-  process.once('SIGTERM', onSigterm)
-  process.once('SIGINT', onSigint)
+  onSignal('SIGTERM', onSigterm)
+  onSignal('SIGINT', onSigint)
   const stopKeepAlive = startRuntimeCommandKeepAlive()
 
   try {
-    const raw = await readFile(opts.input, 'utf8')
+    const raw = await readInput(opts.input)
     const envelope = JSON.parse(raw) as unknown
-    const result = await executeOpenCodeBridgeCommandEnvelope(envelope, {
+    const result = await executeEnvelope(envelope, {
       signal: commandController.signal,
     })
     if (signalCleanupPromise) {
@@ -113,17 +149,14 @@ export async function runtimeOpenCodeCommand(opts: {
       return
     }
     const payload = jsonStringify(result) + '\n'
-    if (opts.output?.trim()) {
-      await writeOutputFileAtomically(opts.output.trim(), payload)
-    } else {
-      await writeStdoutAndDrain(payload)
-    }
+    await writePayload(opts, payload)
   } finally {
     stopKeepAlive()
-    process.off('SIGTERM', onSigterm)
-    process.off('SIGINT', onSigint)
+    offSignal('SIGTERM', onSigterm)
+    offSignal('SIGINT', onSigint)
+    await drainCleanupOnce()
   }
-  process.exit(0)
+  exit(0)
 }
 
 async function writeOutputFileAtomically(outputPath: string, payload: string): Promise<void> {

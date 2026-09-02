@@ -7,6 +7,7 @@ import {
   OPENCODE_COMMAND_FORCE_EXIT_TIMEOUT_MS,
   OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS,
   startRuntimeCommandKeepAlive,
+  runtimeOpenCodeCommand,
 } from './runtimeOpenCodeCommand.js'
 
 describe('runtimeOpenCodeCommand keepalive', () => {
@@ -92,5 +93,109 @@ describe('runtimeOpenCodeCommand cancellation cleanup', () => {
     expect(timer.unref).toHaveBeenCalledTimes(1)
     expect(clearTimeoutMock).toHaveBeenCalledTimes(1)
     expect(onTimeout).toHaveBeenCalledTimes(1)
+  })
+
+  test('reports host disposal failures without preventing the remaining drain', async () => {
+    const disposalError = new Error('credential-bearing failure')
+    const reported: unknown[] = []
+    let lateReleasesDrained = false
+
+    await drainRuntimeOpenCodeCommandCleanup({
+      disposeUnregisteredOwnedHosts: async () => { throw disposalError },
+      drainPendingLateLockReleases: async () => { lateReleasesDrained = true },
+      onDisposeError: error => { reported.push(error) },
+      timeoutMs: 10_000,
+    })
+
+    expect(reported).toEqual([disposalError])
+    expect(lateReleasesDrained).toBe(true)
+  })
+
+  test('default disposal diagnostic omits error details', async () => {
+    const originalWarn = console.warn
+    const warnings: unknown[][] = []
+    console.warn = ((...args: unknown[]) => { warnings.push(args) }) as typeof console.warn
+    try {
+      await drainRuntimeOpenCodeCommandCleanup({
+        disposeUnregisteredOwnedHosts: async () => {
+          throw new Error('https://example.test/private?token=secret')
+        },
+        drainPendingLateLockReleases: async () => {},
+        timeoutMs: 10_000,
+      })
+    } finally {
+      console.warn = originalWarn
+    }
+
+    expect(warnings).toEqual([[
+      '[opencode-command] Failed to dispose unregistered owned OpenCode hosts',
+    ]])
+  })
+})
+
+describe('runtimeOpenCodeCommand terminal cleanup', () => {
+  const baseDeps = () => ({
+    readInput: async () => '{}',
+    writePayload: async () => {},
+    onSignal: () => {},
+    offSignal: () => {},
+  })
+
+  test('drains exactly once before normal success exits', async () => {
+    let cleanupCalls = 0
+    const exits: number[] = []
+    await runtimeOpenCodeCommand({ input: 'ignored' }, {
+      ...baseDeps(),
+      executeEnvelope: (async () => ({ ok: true })) as never,
+      drainCleanup: async () => { cleanupCalls += 1 },
+      exit: code => { exits.push(code) },
+    })
+
+    expect(cleanupCalls).toBe(1)
+    expect(exits).toEqual([0])
+  })
+
+  test('drains exactly once when the internal command deadline rejects', async () => {
+    const deadlineError = new Error('OpenCode command deadline exceeded')
+    let cleanupCalls = 0
+    const exits: number[] = []
+    await expect(runtimeOpenCodeCommand({ input: 'ignored' }, {
+      ...baseDeps(),
+      executeEnvelope: (async () => { throw deadlineError }) as never,
+      drainCleanup: async () => { cleanupCalls += 1 },
+      exit: code => { exits.push(code) },
+    })).rejects.toBe(deadlineError)
+
+    expect(cleanupCalls).toBe(1)
+    expect(exits).toEqual([])
+  })
+
+  test('shares signal-owned cleanup with terminal finally without duplicate disposal', async () => {
+    const listeners = new Map<string, () => void>()
+    let cleanupCalls = 0
+    const exits: number[] = []
+    let notifyExecuting: () => void = () => {}
+    const executing = new Promise<void>(resolve => { notifyExecuting = resolve })
+    const command = runtimeOpenCodeCommand({ input: 'ignored' }, {
+      ...baseDeps(),
+      onSignal: (signal, listener) => { listeners.set(signal, listener) },
+      offSignal: (signal, listener) => {
+        if (listeners.get(signal) === listener) listeners.delete(signal)
+      },
+      executeEnvelope: (async (_envelope: unknown, options: { signal?: AbortSignal }) => {
+        notifyExecuting()
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+        })
+      }) as never,
+      drainCleanup: async () => { cleanupCalls += 1 },
+      exit: code => { exits.push(code) },
+    })
+    await executing
+    listeners.get('SIGTERM')?.()
+    await expect(command).rejects.toThrow('cancelled by signal (143)')
+
+    expect(cleanupCalls).toBe(1)
+    expect(exits).toEqual([143])
   })
 })

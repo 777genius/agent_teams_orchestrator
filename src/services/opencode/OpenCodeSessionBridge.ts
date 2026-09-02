@@ -50,7 +50,8 @@ type OpenCodeSessionBridgeDeps = {
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
     & Partial<Pick<typeof openCodeSessionStore,
-      'claimMaterialization' | 'commitMaterialization' | 'releaseMaterializationClaim'>>
+      'claimMaterialization' | 'commitMaterialization' | 'releaseMaterializationClaim'
+      | 'acquireMaterializationOwner' | 'trackPendingMaterializationReconciliation'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -1119,6 +1120,10 @@ export class OpenCodeSessionBridge {
       // createSession returned a known id and the exact bound record was
       // committed before bootstrap was interrupted. Resume only that session;
       // an unknown create outcome has no record and remains fenced by its claim.
+      if (!this.sessionStore.acquireMaterializationOwner
+        || !await this.sessionStore.acquireMaterializationOwner(existing, attemptId, params.signal)) {
+        throw new Error('OpenCode committed session changed before bootstrap ownership transfer')
+      }
       return { record: existing, created: false, resumeBootstrap: true }
     }
 
@@ -1204,7 +1209,10 @@ export class OpenCodeSessionBridge {
           // persisted claim, or the exact attempted record may already have
           // committed before an ambiguous failure. Reconcile without reusing
           // the work signal; commitMaterialization still verifies exact owner.
-          committed = await this.sessionStore.commitMaterialization(record, attemptId)
+          const reconciliation = this.sessionStore.commitMaterialization(record, attemptId)
+          committed = await (this.sessionStore.trackPendingMaterializationReconciliation
+            ? this.sessionStore.trackPendingMaterializationReconciliation(reconciliation)
+            : reconciliation)
         }
       } else {
         committed = (await this.sessionStore.upsert(record)) !== 'unchanged'

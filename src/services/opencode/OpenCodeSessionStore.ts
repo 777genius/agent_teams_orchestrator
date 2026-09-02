@@ -142,6 +142,7 @@ export class OpenCodeSessionStore {
   private readonly clearTimer: typeof clearTimeout
   private readonly onLateLockReleaseError: (error: unknown) => void
   private readonly pendingLateLockReleases = new Set<Promise<void>>()
+  private readonly pendingMaterializationReconciliations = new Set<Promise<unknown>>()
 
   constructor(filePath?: string, deps: OpenCodeSessionStoreDeps = {}) {
     const paths = resolveClaudeMultimodelPaths()
@@ -180,9 +181,22 @@ export class OpenCodeSessionStore {
   }
 
   async drainPendingLateLockReleases(): Promise<void> {
-    while (this.pendingLateLockReleases.size > 0) {
-      await Promise.allSettled([...this.pendingLateLockReleases])
+    while (this.pendingLateLockReleases.size > 0
+      || this.pendingMaterializationReconciliations.size > 0) {
+      await Promise.allSettled([
+        ...this.pendingLateLockReleases,
+        ...this.pendingMaterializationReconciliations,
+      ])
     }
+  }
+
+  trackPendingMaterializationReconciliation<T>(operation: Promise<T>): Promise<T> {
+    this.pendingMaterializationReconciliations.add(operation)
+    void operation.then(
+      () => this.pendingMaterializationReconciliations.delete(operation),
+      () => this.pendingMaterializationReconciliations.delete(operation),
+    )
+    return operation
   }
 
   private async acquireStoreLock(signal?: AbortSignal): Promise<() => Promise<void>> {
@@ -364,6 +378,28 @@ export class OpenCodeSessionStore {
       if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
       store.materializationOwners ??= {}
       store.materializationOwners[key] = { attemptId, sessionId: record.opencodeSessionId }
+      await this.writeStore(store)
+      return true
+    }, signal)
+  }
+
+  async acquireMaterializationOwner(
+    record: OpenCodeSessionRecord,
+    attemptId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(record)
+      const existing = store.records[key]
+      if (!existing || jsonStringify(existing) !== jsonStringify(record)) return false
+      const owner = store.materializationOwners?.[key]
+      if (owner && owner.sessionId !== record.opencodeSessionId) return false
+      store.materializationOwners ??= {}
+      store.materializationOwners[key] = {
+        attemptId,
+        sessionId: record.opencodeSessionId,
+      }
       await this.writeStore(store)
       return true
     }, signal)
