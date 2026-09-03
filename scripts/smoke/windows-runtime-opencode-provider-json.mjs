@@ -235,7 +235,7 @@ try {
             opencodeStateChangingCommands: true,
           },
         },
-        requiredCommand: 'opencode.reconcileTeam',
+        requiredCommand: 'opencode.readiness',
         expectedRunId: null,
         expectedCapabilitySnapshotId: null,
         expectedManifestHighWatermark: 0,
