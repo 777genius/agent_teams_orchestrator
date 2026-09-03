@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import * as lockfile from '../../utils/lockfile.js'
 import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
@@ -918,6 +919,100 @@ describe('OpenCodeSessionBridge', () => {
     expect(persisted?.runId).toBe('run-1')
   })
 
+  test('propagates claim cancellation and releases a boundary-acquired claim without the cancelled signal', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after claim acquisition')
+    let claimRunId: string | undefined
+    let claimSignal: AbortSignal | undefined
+    let cleanupSignal: AbortSignal | undefined
+    let releaseCalls = 0
+    let clientCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => { throw new Error('must not upsert after cancellation') },
+        markStale: async () => null,
+        claimMaterialization: async (_identity, _attemptId, requestedRunId, signal) => {
+          claimRunId = requestedRunId
+          claimSignal = signal
+          controller.abort(abortReason)
+          return { kind: 'claimed', ownerToken: { attemptId: 'test', sessionId: '', version: 1 } }
+        },
+        releaseMaterializationClaim: async (_identity, _attemptId, requestedRunId) => {
+          releaseCalls += 1
+          expect(requestedRunId).toBe('run-1')
+          cleanupSignal = undefined
+          return true
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clientCalls += 1
+          throw new Error('must not create a client after cancellation')
+        },
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toBe(abortReason)
+    expect(claimRunId).toBe('run-1')
+    expect(claimSignal).toBe(controller.signal)
+    expect(releaseCalls).toBe(1)
+    expect(cleanupSignal).toBeUndefined()
+    expect(clientCalls).toBe(0)
+  })
+
+  test('does not release another run claim when cancellation follows an existing-record result', async () => {
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after observing existing record')
+    let releaseCalls = 0
+    const existing = buildRecord({ runId: 'run-1' })
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => existing,
+        upsert: async () => 'unchanged',
+        markStale: async () => null,
+        claimMaterialization: async () => {
+          controller.abort(abortReason)
+          return { kind: 'existing', record: existing }
+        },
+        releaseMaterializationClaim: async () => {
+          releaseCalls += 1
+          return true
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => { throw new Error('must not create a client after cancellation') },
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'shared-attempt', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toBe(abortReason)
+    expect(releaseCalls).toBe(0)
+  })
+
   test('allows only one compatible concurrent attempt to create a remote session', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     let releaseCreate!: () => void
@@ -1003,7 +1098,7 @@ describe('OpenCodeSessionBridge', () => {
     const winner = bridge.materializeSessionOnHost(input)
     await createStarted
     await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow(
-      'already claimed by this launch attempt',
+      'owned by another launch attempt',
     )
     releaseCreate()
     expect((await winner).record.opencodeSessionId).toBe('session-winner')
@@ -1065,6 +1160,62 @@ describe('OpenCodeSessionBridge', () => {
     expect(creates).toBe(2)
   })
 
+  test('aborting after a different-run replacement claim preserves stop authority for an exact-once retry', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let creates = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: { ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {}, retainHostLease: async () => {} },
+      clientFactory: { create: () => ({ createSession: async () => ({ id: `session-${++creates}` }) }) as never },
+    })
+    const baseInput = { teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'old-attempt', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context',
+        briefingHash: 'briefing', agent: 'teammate' }) }
+    const first = await bridge.materializeSessionOnHost(baseInput)
+    const stopped = await store.markStoppedIfSession(first.record)
+    expect(stopped?.stoppedAt).toBeDefined()
+
+    const controller = new AbortController()
+    const abortReason = new Error('cancel after different-run replacement claim')
+    const claimMaterialization = store.claimMaterialization.bind(store)
+    let abortedReplacementClaim = false
+    store.claimMaterialization = async (identity, attemptId, requestedRunId, signal) => {
+      const result = await claimMaterialization(identity, attemptId, requestedRunId, signal)
+      if (!abortedReplacementClaim && requestedRunId === 'run-2' && result.kind === 'claimed') {
+        abortedReplacementClaim = true
+        controller.abort(abortReason)
+      }
+      return result
+    }
+
+    await expect(bridge.materializeSessionOnHost({
+      ...baseInput, runId: 'run-2', attemptId: 'cancelled-attempt', signal: controller.signal,
+    })).rejects.toBe(abortReason)
+    expect(await store.get('team-a', 'primary', 'alice')).toEqual(stopped)
+    expect(creates).toBe(1)
+    await expect(bridge.materializeSessionOnHost({
+      ...baseInput, attemptId: 'same-run-replay', signal: new AbortController().signal,
+    })).rejects.toThrow('session is stopped')
+    expect(creates).toBe(1)
+
+    const retryInput = { ...baseInput, runId: 'run-2', attemptId: 'retry-attempt',
+      signal: new AbortController().signal }
+    const successor = await bridge.materializeSessionOnHost(retryInput)
+    expect(successor).toMatchObject({ created: true, record: { runId: 'run-2', opencodeSessionId: 'session-2' } })
+    expect(creates).toBe(2)
+    expect(successor.ownerToken).toBeDefined()
+    expect(await store.releaseMaterializationOwner(successor.record, successor.ownerToken!)).toBe(true)
+    const replay = await bridge.materializeSessionOnHost({
+      ...retryInput, attemptId: 'retry-replay', signal: new AbortController().signal,
+    })
+    expect(replay).toMatchObject({ created: false, record: { runId: 'run-2', opencodeSessionId: 'session-2' } })
+    expect(creates).toBe(2)
+  })
+
   test('does not create again after an unknown outcome is replayed by the same attempt', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     let createCalls = 0
@@ -1099,7 +1250,7 @@ describe('OpenCodeSessionBridge', () => {
       'transport closed after request write',
     )
     await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow(
-      'already claimed by this launch attempt',
+      'owned by another launch attempt',
     )
     expect(createCalls).toBe(1)
     expect(await store.get('team-a', 'primary', 'alice')).toBeNull()
@@ -1108,6 +1259,20 @@ describe('OpenCodeSessionBridge', () => {
   test('resumes bootstrap for a persisted known create after cancellation with a fresh bridge', async () => {
     const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const controller = new AbortController()
+    const claimRunIds: Array<string | undefined> = []
+    const claimSignals: Array<AbortSignal | undefined> = []
+    const commitSignals: Array<AbortSignal | undefined> = []
+    const claimMaterialization = store.claimMaterialization.bind(store)
+    const commitMaterialization = store.commitMaterialization.bind(store)
+    store.claimMaterialization = async (identity, attemptId, requestedRunId, signal) => {
+      claimRunIds.push(requestedRunId)
+      claimSignals.push(signal)
+      return claimMaterialization(identity, attemptId, requestedRunId, signal)
+    }
+    store.commitMaterialization = async (record, attemptId, signal) => {
+      commitSignals.push(signal)
+      return commitMaterialization(record, attemptId, signal)
+    }
     let createCalls = 0
     const bridge = new OpenCodeSessionBridge({
       sessionStore: store,
@@ -1137,11 +1302,18 @@ describe('OpenCodeSessionBridge', () => {
       }),
     })).rejects.toThrow('cancelled after create')
     expect(createCalls).toBe(1)
-    expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
+    expect(claimRunIds).toEqual(['run-1'])
+    expect(claimSignals).toEqual([controller.signal])
+    expect(commitSignals).toEqual([controller.signal, undefined])
+    const interrupted = await store.get('team-a', 'primary', 'alice')
+    expect(interrupted?.opencodeSessionId).toBe('session-known')
+    expect(await store.markStaleIfSession(interrupted!, 'launch_failed')).not.toBeNull()
+
 
     const retryController = new AbortController()
+    const restartedStore = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
     const restartedBridge = new OpenCodeSessionBridge({
-      sessionStore: new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json')),
+      sessionStore: restartedStore,
       hostManager: {
         ensureHost: async () => { throw new Error('must use retained host') },
         releaseHost: async () => {},
@@ -1168,13 +1340,347 @@ describe('OpenCodeSessionBridge', () => {
     await expect(restartedBridge.materializeSessionOnHost({
       ...resumeInput, runId: 'run-2',
     })).rejects.toThrow('committed session identity does not match strict launch')
-    const resumed = await restartedBridge.materializeSessionOnHost(resumeInput)
-    expect(resumed).toMatchObject({
+    const acquireMaterializationOwner = restartedStore.acquireMaterializationOwner.bind(restartedStore)
+    let ownerTransferArrivals = 0
+    let releaseOwnerTransfers!: () => void
+    const ownerTransferBarrier = new Promise<void>(resolve => { releaseOwnerTransfers = resolve })
+    restartedStore.acquireMaterializationOwner = async (...args) => {
+      ownerTransferArrivals += 1
+      if (ownerTransferArrivals === 2) releaseOwnerTransfers()
+      await ownerTransferBarrier
+      return acquireMaterializationOwner(...args)
+    }
+    const resumeAttempts = await Promise.allSettled([
+      restartedBridge.materializeSessionOnHost(resumeInput),
+      restartedBridge.materializeSessionOnHost({ ...resumeInput, attemptId: 'attempt-c' }),
+    ])
+    const resumed = resumeAttempts.find(result => result.status === 'fulfilled')
+    const rejected = resumeAttempts.find(result => result.status === 'rejected')
+    expect(resumeAttempts.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(resumeAttempts.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(resumed).toMatchObject({ value: {
       created: false,
       resumeBootstrap: true,
       record: { opencodeSessionId: 'session-known' },
-    })
+    } })
+    expect(rejected).toMatchObject({ reason: expect.objectContaining({
+      message: 'OpenCode committed session changed before bootstrap ownership transfer',
+    }) })
     expect(createCalls).toBe(1)
+    if (!resumed || resumed.status !== 'fulfilled') throw new Error('one retry must resume bootstrap')
+    expect(await store.markStaleIfSession(resumed.value.record, 'old-cleanup', { attemptId: 'attempt-a', sessionId: '', version: 1 })).toBeNull()
+    expect(await store.deleteIfSession(resumed.value.record, { attemptId: 'attempt-a', sessionId: '', version: 1 })).toBe(false)
+  })
+
+  test('fails closed when completed bootstrap evidence differs from retry evidence', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    const completed = buildRecord({
+      runId: 'run-1',
+      toolApprovalMode: 'auto',
+      managedConfigFingerprint: profile.managedConfigFingerprint,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      bootstrapMode: 'app_managed_context',
+      bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: {
+        schemaVersion: 1, messageID: 'msg_e1', contextHash: 'context-e1',
+        briefingHash: 'briefing-e1', injectionVerifiedAt: '2026-04-21T00:01:00.000Z',
+        model: 'openai/gpt-5.4-mini', agent: 'teammate',
+      },
+    })
+    await store.upsert(completed)
+    let createCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => { createCalls += 1; return { id: 'session-new' } },
+        }) as never,
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-b', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_e2', contextHash: 'context-e2',
+        briefingHash: 'briefing-e2', agent: 'teammate',
+      }),
+    })).rejects.toThrow('bootstrap evidence does not match strict launch')
+    expect(createCalls).toBe(0)
+    expect(await store.get('team-a', 'primary', 'alice')).toEqual(completed)
+  })
+
+  test.each([
+    ['partial source-only evidence', {
+      bootstrapEvidenceSource: 'app_managed_bootstrap' as const,
+    }],
+    ['malformed payload-only evidence', {
+      appManagedBootstrap: {
+        schemaVersion: 1 as const, messageID: 'msg_partial', contextHash: '', briefingHash: '',
+        injectionVerifiedAt: '', model: '', agent: '',
+      },
+    }],
+    ['alternate-source evidence', {
+      bootstrapEvidenceSource: 'runtime_bootstrap_checkin' as const,
+    }],
+    ['legacy bootstrap mode', { bootstrapMode: 'model_tool_checkin' as never }],
+    ['null bootstrap mode', { bootstrapMode: null as never }],
+    ['empty bootstrap mode', { bootstrapMode: '' as never }],
+    ['null evidence source', { bootstrapEvidenceSource: null as never }],
+    ['null managed evidence', { appManagedBootstrap: null as never }],
+  ])('fails closed for %s after strict compatibility fails', async (_label, evidence) => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    const persisted = buildRecord({
+      runId: 'run-1',
+      toolApprovalMode: 'auto',
+      managedConfigFingerprint: profile.managedConfigFingerprint,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      bootstrapMode: 'app_managed_context',
+      ...evidence,
+    })
+    await store.upsert(persisted)
+    let createCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => { createCalls += 1; return { id: 'session-new' } },
+        }) as never,
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-b', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context',
+        briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toThrow('bootstrap evidence does not match strict launch')
+    expect(createCalls).toBe(0)
+    expect(await store.get('team-a', 'primary', 'alice')).toEqual(persisted)
+  })
+
+  test('records a known session after ambiguous lease retention and restores its exact lease on resume', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    let createCalls = 0
+    const retained: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async (_hostKey, lease) => {
+          retained.push(lease)
+          if (retained.length === 1) throw new Error('lease write acknowledgement lost')
+        },
+      },
+      clientFactory: { create: () => ({ createSession: async () => {
+        createCalls += 1
+        return { id: 'session-known' }
+      } }) as never },
+    })
+    const input = {
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: new AbortController().signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context',
+        briefingHash: 'briefing', agent: 'teammate' }),
+    }
+
+    await expect(bridge.materializeSessionOnHost(input)).rejects.toThrow('acknowledgement lost')
+    expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
+    const resumed = await bridge.materializeSessionOnHost({ ...input, attemptId: 'attempt-b' })
+    expect(resumed).toMatchObject({ created: false, resumeBootstrap: true,
+      record: { opencodeSessionId: 'session-known' } })
+    expect(createCalls).toBe(1)
+    expect(retained).toEqual([
+      { teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', sessionId: 'session-known' },
+      { teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', sessionId: 'session-known' },
+    ])
+  })
+
+  test('tracks signal-free commit reconciliation so command cleanup drains it', async () => {
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'))
+    const commitMaterialization = store.commitMaterialization.bind(store)
+    let commitCalls = 0
+    let notifyReconciliationStarted!: () => void
+    const reconciliationStarted = new Promise<void>(resolve => { notifyReconciliationStarted = resolve })
+    let finishReconciliation!: () => void
+    const reconciliationGate = new Promise<void>(resolve => { finishReconciliation = resolve })
+    store.commitMaterialization = async (record, attemptId, signal) => {
+      commitCalls += 1
+      if (signal) return commitMaterialization(record, attemptId, signal)
+      notifyReconciliationStarted()
+      await reconciliationGate
+      return commitMaterialization(record, attemptId)
+    }
+    const retainedLeases: unknown[] = []
+    const releasedLeases: unknown[] = []
+    const controller = new AbortController()
+    let notifyRemoteAborted!: () => void
+    const remoteAborted = new Promise<void>(resolve => { notifyRemoteAborted = resolve })
+    let finishRemoteCreate!: () => void
+    const remoteCreateGate = new Promise<void>(resolve => { finishRemoteCreate = resolve })
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async (_hostKey, input) => { retainedLeases.push(input) },
+        releaseHostLease: async (_hostKey, input) => { releasedLeases.push(input) },
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => {
+            controller.abort(new Error('deadline after remote create'))
+            notifyRemoteAborted()
+            await remoteCreateGate
+            return { id: 'session-known' }
+          },
+        }) as never,
+      },
+    })
+
+    const materialization = bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 0,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })
+    await remoteAborted
+    let cleanupDrained = false
+    const cleanup = store.drainPendingLateLockReleases().then(() => { cleanupDrained = true })
+    await Promise.resolve()
+    expect(cleanupDrained).toBe(false)
+
+    finishRemoteCreate()
+    await reconciliationStarted
+    await Promise.resolve()
+    expect(cleanupDrained).toBe(false)
+    finishReconciliation()
+    await expect(materialization).rejects.toThrow('deadline after remote create')
+    await cleanup
+    expect(cleanupDrained).toBe(true)
+    expect(commitCalls).toBe(2)
+    expect((await store.get('team-a', 'primary', 'alice'))?.opencodeSessionId).toBe('session-known')
+    expect(retainedLeases).toHaveLength(1)
+    expect(releasedLeases).toEqual([])
+  })
+
+  test('keeps the retained lease when a live commit writes before lock release fails', async () => {
+    const releaseError = new Error('commit lock release failed')
+    let lockReleaseCalls = 0
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'sessions.json'), {
+      lock: (async () => async () => {
+        lockReleaseCalls += 1
+        if (lockReleaseCalls === 2) throw releaseError
+      }) as typeof lockfile.lock,
+    })
+    const retainedLeases: unknown[] = []
+    const releasedLeases: unknown[] = []
+    const controller = new AbortController()
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async (_hostKey, input) => { retainedLeases.push(input) },
+        releaseHostLease: async (_hostKey, input) => { releasedLeases.push(input) },
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => ({ id: 'session-known' }),
+        }) as never,
+      },
+    })
+
+    const result = await bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })
+
+    expect(controller.signal.aborted).toBe(false)
+    expect(result).toMatchObject({
+      created: true,
+      record: { runId: 'run-1', opencodeSessionId: 'session-known' },
+    })
+    expect(await store.get('team-a', 'primary', 'alice')).toEqual(result.record)
+    expect(lockReleaseCalls).toBe(3)
+    expect(retainedLeases).toHaveLength(1)
+    expect(releasedLeases).toEqual([])
+  })
+
+  test('fails closed and releases the lease when live commit reconciliation finds a mismatch', async () => {
+    const commitError = new Error('ambiguous commit failure')
+    let attemptedRecord: OpenCodeSessionRecord | null = null
+    let commitCalls = 0
+    const releasedLeases: unknown[] = []
+    const controller = new AbortController()
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => attemptedRecord
+          ? { ...attemptedRecord, selectedModel: 'foreign/model' }
+          : null,
+        upsert: async () => { throw new Error('must use materialization commit') },
+        markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: { attemptId: 'test', sessionId: '', version: 1 } }),
+        commitMaterialization: async record => {
+          commitCalls += 1
+          attemptedRecord = record
+          throw commitError
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('must use retained host') },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+        releaseHostLease: async (_hostKey, input) => { releasedLeases.push(input) },
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => ({ id: 'session-known' }),
+        }) as never,
+      },
+    })
+
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini', runId: 'run-1', attemptId: 'attempt-a', host,
+      signal: controller.signal, remainingMs: () => 1_000,
+      expectedBehaviorFingerprint: 'a'.repeat(64),
+      expectedBootstrapForSession: () => ({
+        messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate',
+      }),
+    })).rejects.toBe(commitError)
+
+    expect(controller.signal.aborted).toBe(false)
+    expect(commitCalls).toBe(2)
+    expect(releasedLeases).toEqual([{
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      runId: 'run-1', sessionId: 'session-known',
+    }])
   })
 
   test('does not retry fresh session creation after a non-transient OpenCode error', async () => {
@@ -1267,6 +1773,8 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: null,
+        sessionId: 'session-1',
       },
     ])
     expect(releaseHostCalls).toBe(0)
@@ -1274,6 +1782,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('ensureSessionAppMcpReady verifies app MCP on the session host', async () => {
     const ensureCalls: Array<{ baseUrl: string; attachIfMissing?: boolean }> = []
+    const retainedLeases: unknown[] = []
     let releaseHostCalls = 0
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -1285,7 +1794,7 @@ describe('OpenCodeSessionBridge', () => {
         releaseHost: async () => {
           releaseHostCalls += 1
         },
-        retainHostLease: async () => {},
+        retainHostLease: async (_hostKey, input) => { retainedLeases.push(input) },
       },
       mcpManager: {
         ensureAppMcp: async input => {
@@ -1306,7 +1815,7 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.ensureSessionAppMcpReady(buildRecord(), {
+    const result = await bridge.ensureSessionAppMcpReady(buildRecord({ runId: 'run-1' }), {
       attachIfMissing: true,
     })
 
@@ -1318,6 +1827,13 @@ describe('OpenCodeSessionBridge', () => {
       diagnostics: [],
     })
     expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }])
+    expect(retainedLeases).toEqual([{
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      runId: 'run-1',
+      sessionId: 'session-1',
+    }])
     expect(releaseHostCalls).toBe(1)
   })
 
@@ -1652,6 +2168,8 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-new',
       },
     ])
     expect(releaseHostCalls).toBe(1)

@@ -58,6 +58,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
     let messageReads = 0
     let contaminatedHost = false
     let sessionsCreated = 0
+    let replaceDuringRetain = false
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
       sessionStore: { get: async () => saved, upsert: async record => {
@@ -73,7 +74,11 @@ test('materialized selected sessions preserve sealed authority across repeated s
           return { ...host, resolvedConfigFingerprint: contaminatedHost
             || input?.resolveConfigFingerprint !== false ? 'broad-live-digest' : profile.managedConfigFingerprint }
         },
-        releaseHost: async () => { released += 1 }, retainHostLease: async () => {},
+        releaseHost: async () => { released += 1 }, retainHostLease: async () => {
+          if (replaceDuringRetain && saved) {
+            saved = { ...saved, runId: 'run-2', opencodeSessionId: 'replacement-session' }
+          }
+        },
         refreshResolvedConfigFingerprint: async () => { broadReads += 1; return 'broad-live-digest' },
       },
       clientFactory: { create: () => ({
@@ -121,6 +126,11 @@ test('materialized selected sessions preserve sealed authority across repeated s
     expect(previews).toBe(5)
     expect(broadReads).toBe(0)
     expect(record).toEqual(sealed)
+    replaceDuringRetain = true
+    await expect(bridge.promptAsync(record, { text: 'must not cross replacement' }))
+      .rejects.toThrow('no longer active')
+    replaceDuringRetain = false
+    saved = record
     const effects = () => [prompts, previews, messageReads, writes]
     const before = effects()
     await expect(bridge.ensureSession({ ...reuseInput, fresh: true })).rejects.toThrow('relaunch the lane')
@@ -148,7 +158,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
     expect(effects()).toEqual(before)
     expect(record).toEqual(sealed)
     expect(broadReads).toBe(0)
-    expect(released).toBe(26)
+    expect(released).toBe(27)
     const readsBeforeStop = reads
     for (const current of [{ ...record, stoppedAt: new Date().toISOString() },
       null, { ...record, runId: 'next-run', opencodeSessionId: 'next-session' }]) {
@@ -157,7 +167,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
         .rejects.toThrow('no longer active')
     }
     expect(reads).toBe(readsBeforeStop)
-    expect(released).toBe(26)
+    expect(released).toBe(27)
     expect(effects()).toEqual(before)
   } finally {
     for (const key of keys) {

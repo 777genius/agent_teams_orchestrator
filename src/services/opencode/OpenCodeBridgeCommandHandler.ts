@@ -61,7 +61,7 @@ import {
   openCodeSessionBridge,
 } from './OpenCodeSessionBridge.js'
 import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
-import { isOpenCodeSessionStopped, openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { isOpenCodeSessionStopped, openCodeSessionStore, type MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import {
   coordinateStrictLaunch,
   type StrictCommittedMember,
@@ -2989,12 +2989,12 @@ async function assertOpenCodeLaunchMcpReady(
 
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
-  attemptId?: string,
+  ownerToken?: MaterializationOwnerToken,
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
   let owned = false
   try {
-    owned = Boolean(await openCodeSessionStore.markStaleIfSession(record, 'launch_failed', attemptId))
+    owned = Boolean(await openCodeSessionStore.markStaleIfSession(record, 'launch_failed', ownerToken))
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_mark_stale_failed',
@@ -3015,7 +3015,7 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionStore.deleteIfSession(record, attemptId)
+    await openCodeSessionStore.deleteIfSession(record, ownerToken)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_delete_failed',
@@ -3282,8 +3282,25 @@ async function runLaunch(
     strictMembers.push({ memberId: name, memberFingerprint: fingerprint })
   }
 
-  const resources = new Map<string, OpenCodeSessionRecord>()
+  const resources = new Map<string, { record: OpenCodeSessionRecord; ownerToken: MaterializationOwnerToken }>()
+  const pendingAttemptReconciliations = new Set<Promise<unknown>>()
+  const trackAttemptReconciliation = <T>(operation: Promise<T>): Promise<T> => {
+    pendingAttemptReconciliations.add(operation)
+    void operation.then(
+      () => pendingAttemptReconciliations.delete(operation),
+      () => pendingAttemptReconciliations.delete(operation),
+    )
+    return operation
+  }
+  const drainAttemptReconciliations = async (): Promise<void> => {
+    while (pendingAttemptReconciliations.size > 0) {
+      await Promise.allSettled([...pendingAttemptReconciliations])
+    }
+  }
   const workContext = { snapshot, host, memberInputs, expectedBehaviorFingerprint }
+  const trackAttemptMaterialization = (
+    operation: StrictLaunchPorts<typeof workContext, typeof workContext, LaunchMemberDraft>['materialize'],
+  ): typeof operation => (...args) => trackAttemptReconciliation(operation(...args))
   const strictSessionCompatibility = (
     sessionId: string,
     input: NonNullable<ReturnType<typeof memberInputs.get>>,
@@ -3439,26 +3456,50 @@ async function runLaunch(
         return { kind: 'failure', error: 'OpenCode strict launch behavior changed before reuse' }
       }
       const input = memberInputs.get(member.memberId)!
-      const record = await openCodeSessionStore.get(teamId, laneId, input.name)
+      const materializationIdentity = { teamId, laneId, memberName: input.name }
+      let observation = await openCodeSessionStore.observeMaterialization(
+        materializationIdentity, signal,
+      )
+      if (!observation) return { kind: 'ok', value: null }
+      const record = observation.record
       if (
-        !record
-        || !isOpenCodeStrictSessionCompatible(
+        !isOpenCodeStrictSessionCompatible(
           record,
           strictSessionCompatibility(record.opencodeSessionId, input),
         )
       ) return { kind: 'ok', value: null }
+      if (observation.ownerToken) {
+        await openCodeSessionStore.releaseInactiveMaterializationOwner(
+          record, observation.ownerToken, signal,
+        )
+        // Whether the CAS succeeded or lost, re-observe authoritative state.
+        observation = await openCodeSessionStore.observeMaterialization(
+          materializationIdentity, signal,
+        )
+        if (observation?.ownerToken) {
+          return {
+            kind: 'failure',
+            error: 'OpenCode compatible committed session is owned by an active launch attempt',
+          }
+        }
+        if (!observation || !isOpenCodeStrictSessionCompatible(
+          observation.record,
+          strictSessionCompatibility(observation.record.opencodeSessionId, input),
+        )) return { kind: 'ok', value: null }
+      }
+      const committedRecord = observation.record
       return {
         kind: 'ok',
         value: {
           memberId: input.name,
           memberFingerprint: input.fingerprint,
           behaviorFingerprint: expectedBehaviorFingerprint,
-          projection: strictLaunchProjection(record, input, teamId, runId, laneId, host.pid),
+          projection: strictLaunchProjection(committedRecord, input, teamId, runId, laneId, host.pid),
         },
       }
     },
     projectCommitted: async () => ({ kind: 'ok', value: undefined }),
-    materialize: async (_context, strictHost, member, identity, signal) => {
+    materialize: trackAttemptMaterialization(async (_context, strictHost, member, identity, signal) => {
       const input = memberInputs.get(member.memberId)!
       if (strictHost.hostId !== host.hostKey) {
         return { kind: 'failure', error: 'materialization host identity mismatch' }
@@ -3495,14 +3536,17 @@ async function runLaunch(
             error: 'OpenCode compatible committed session appeared during materialization',
           }
         }
-        if (materialized.created) resources.set(record.opencodeSessionId, record)
-        const ownedUncommittedResources = materialized.created ? {
+        if (!materialized.ownerToken) {
+          throw new Error('OpenCode materialization owner token is missing')
+        }
+        resources.set(record.opencodeSessionId, { record, ownerToken: materialized.ownerToken })
+        const ownedUncommittedResources = {
           resources: [{
             ...identity,
             resourceId: record.opencodeSessionId,
             committed: false as const,
           }],
-        } : {}
+        }
         const sessionMcp = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
           attachIfMissing: false,
           host,
@@ -3553,6 +3597,7 @@ async function runLaunch(
         const candidateAt = nowIso()
         record = {
           ...record,
+          staleReason: null,
           bootstrapMode: 'app_managed_context',
           bootstrapEvidenceSource: 'app_managed_bootstrap',
           appManagedBootstrap: {
@@ -3573,7 +3618,7 @@ async function runLaunch(
             ...ownedUncommittedResources,
           }
         }
-        await openCodeSessionStore.upsert(record)
+        await openCodeSessionStore.upsert(record, materialized.ownerToken)
         const resource: StrictResource = {
           ...identity,
           resourceId: record.opencodeSessionId,
@@ -3591,21 +3636,28 @@ async function runLaunch(
           },
         }
       } catch (error) {
-        if (signal.aborted) throwOpenCodeAbortReason(signal)
+        const owned = record ? resources.get(record.opencodeSessionId) : undefined
+        if (signal.aborted) {
+          if (owned) await cleanupFailedLaunchSession(owned.record, owned.ownerToken)
+          throwOpenCodeAbortReason(signal)
+        }
         return {
           kind: 'unknown',
           error: strictPublicError(error),
+          ...(owned ? { resources: [{ ...identity, resourceId: owned.record.opencodeSessionId,
+            committed: false as const }] } : {}),
         }
       }
-    },
-    cleanup: async (_context, cleanupResources) => {
-      for (const resource of cleanupResources) {
-        const record = resources.get(resource.resourceId)
-        if (record && !resource.committed) {
-          await cleanupFailedLaunchSession(record, envelope.requestId)
+    }),
+    cleanup: (_context, cleanupResources) =>
+      trackAttemptReconciliation((async () => {
+        for (const resource of cleanupResources) {
+          const owned = resources.get(resource.resourceId)
+          if (owned && !resource.committed) {
+            await cleanupFailedLaunchSession(owned.record, owned.ownerToken)
+          }
         }
-      }
-    },
+      })()),
     releaseHost: async (_context, lease, keepAlive) => {
       if (lease.leaseId === preconditions.commandLeaseId) {
         await retainedProbe.release(keepAlive)
@@ -3645,12 +3697,17 @@ async function runLaunch(
       }),
     },
   }, ports).finally(() => releaseAttemptOwnedProbe().catch(() => undefined))
+  const releaseMaterializationOwners = openCodeSessionStore
+    .trackPendingMaterializationReconciliation(
+      drainAttemptReconciliations().then(() => Promise.all(
+        [...resources.values()].map(({ record, ownerToken }) =>
+          openCodeSessionStore.releaseMaterializationOwner(record, ownerToken)
+            .catch(() => false)),
+      )),
+    )
   await withTimeout(
-    Promise.all([...resources.values()].map(record =>
-      openCodeSessionStore.releaseMaterializationOwner(record, envelope.requestId)
-        .catch(() => false))),
+    releaseMaterializationOwners,
     Math.max(0, deadlineAt - Date.now()),
-    launchSignal,
   ).catch(() => undefined)
   diagnostics.push(teamDiagnostic(
     `opencode_strict_launch_${result.status.replaceAll('-', '_')}`,

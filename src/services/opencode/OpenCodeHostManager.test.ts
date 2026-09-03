@@ -343,11 +343,12 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
-  test('captures process identity before releasing a process-scoped host', async () => {
+  test('captures Darwin-style process identity before releasing a healthy process-scoped host', async () => {
     const spawned = createMockChildProcess(43140)
     const killedSignals: NodeJS.Signals[] = []
     let processAlive = true
     let identityReadCalls = 0
+    const darwinStartedAtMs = Date.parse('Tue Sep  2 18:12:34 2026')
 
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
@@ -368,7 +369,7 @@ describe('OpenCodeHostManager', () => {
       isProcessAlive: pid => pid === spawned.child.pid && processAlive,
       readProcessStartTimeMs: async pid => {
         identityReadCalls += 1
-        return pid === spawned.child.pid && identityReadCalls >= 3 ? 1_000 : null
+        return pid === spawned.child.pid && identityReadCalls >= 3 ? darwinStartedAtMs : null
       },
       killProcess: (_pid, signal) => {
         killedSignals.push(signal)
@@ -379,7 +380,7 @@ describe('OpenCodeHostManager', () => {
     })
 
     const handle = await manager.ensureHost({ hostLifetime: 'process' })
-    expect(handle.processStartedAtMs).toBe(1_000)
+    expect(handle.processStartedAtMs).toBe(darwinStartedAtMs)
     expect(identityReadCalls).toBe(3)
 
     await manager.releaseHost(handle.hostKey)
@@ -797,6 +798,41 @@ describe('OpenCodeHostManager', () => {
     expect(manager.getHost('host-key')).toBeNull()
   })
 
+  test('does not let a delayed old child exit delete a replacement process identity', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43142)
+    try {
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43142,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true, version: '1.4.0' } }
+          : { status: 200, data: { ok: true } },
+        readProcessStartTimeMs: async () => 1_000,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+      await manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false })
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { processStartedAtMs?: number }>
+      }
+      registry.hosts['host-key']!.processStartedAtMs = 2_000
+      await writeFile(registryPath, JSON.stringify(registry))
+
+      spawned.child.emit('exit', 1, null)
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const persisted = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { processStartedAtMs?: number }>
+      }
+      expect(persisted.hosts['host-key']?.processStartedAtMs).toBe(2_000)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('adopts a healthy host from the persistent registry instead of spawning another serve process', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
@@ -887,8 +923,10 @@ describe('OpenCodeHostManager', () => {
         adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host')),
       ).toBe(true)
       const migratedRegistry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        processIdentityFormat?: string
         hosts: Record<string, { processStartedAtMs?: number }>
       }
+      expect(migratedRegistry.processIdentityFormat).toBe('platform-native-v2')
       expect(migratedRegistry.hosts['host-key']?.processStartedAtMs).toBe(1_000)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
@@ -1291,6 +1329,77 @@ describe('OpenCodeHostManager', () => {
       expect(
         second.diagnostics.some(message => message.includes('adopted persistent OpenCode host')),
       ).toBe(true)
+    } finally {
+      allowHealthProbe.resolve()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup reconciliation does not remove a host while another manager adopts it', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const healthProbeStarted = createDeferred()
+    const allowHealthProbe = createDeferred()
+    try {
+      await writeFile(registryPath, JSON.stringify({
+        schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2',
+        hosts: {
+          'host-key': {
+            hostKey: 'host-key',
+            profileRootKey: baseProfile.profileRootKey,
+            projectPath: baseProfile.projectPath,
+            projectBehaviorFingerprint: baseProfile.projectBehaviorFingerprint,
+            managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+            baseUrl: 'http://127.0.0.1:43143',
+            port: 43143,
+            pid: 43143,
+            processStartedAtMs: 1_000,
+            version: '1.4.0',
+            resolvedConfigFingerprint: baseProfile.managedConfigFingerprint,
+            updatedAt: '2026-04-24T09:00:00.000Z',
+            leases: {},
+          },
+        },
+      }))
+      const adoptingManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        fetchJson: async url => {
+          if (url.endsWith('/global/health')) {
+            healthProbeStarted.resolve()
+            await allowHealthProbe.promise
+            return { status: 200, data: { healthy: true, version: '1.4.0' } }
+          }
+          return { status: 200, data: { ok: true } }
+        },
+        isProcessAlive: pid => pid === 43143,
+        readProcessStartTimeMs: async () => 1_000,
+        persistentRegistryPath: registryPath,
+      })
+      const adoption = adoptingManager.ensureHost({
+        hostKey: 'host-key',
+        resolveConfigFingerprint: false,
+      })
+      await healthProbeStarted.promise
+
+      const reconciliation = await new OpenCodeHostManager({
+        isProcessAlive: () => false,
+        persistentRegistryPath: registryPath,
+      }).reconcilePersistentHosts({ reason: 'startup' })
+
+      expect(reconciliation.hosts).toEqual([
+        expect.objectContaining({
+          hostKey: 'host-key',
+          action: 'kept_active',
+          reason: 'host startup or adoption is in progress',
+        }),
+      ])
+      expect((JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>
+      }).hosts['host-key']).toBeDefined()
+
+      allowHealthProbe.resolve()
+      expect((await adoption).pid).toBe(43143)
     } finally {
       allowHealthProbe.resolve()
       await rm(tempDir, { recursive: true, force: true })
@@ -1841,6 +1950,50 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
+  test('keeps externally leased hosts and does not delete a replacement registry identity', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43138)
+    const killedSignals: Array<{ pid: number, signal: NodeJS.Signals }> = []
+    let oldProcessAlive = true
+    let replaceRegistryOnDispose = false
+    try {
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile, allocateLoopbackPort: async () => 43138,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: async url => {
+          if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true, version: '1.4.0' } }
+          if (url.endsWith('/config')) return { status: 200, data: { server: { port: 43138 } } }
+          if (url.endsWith('/global/dispose') && replaceRegistryOnDispose) {
+            const registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
+            registry.hosts['host-key'] = { ...registry.hosts['host-key']!, pid: 53138, processStartedAtMs: 2_000, leases: {} }
+            await writeFile(registryPath, JSON.stringify(registry))
+          }
+          return { status: 200, data: { ok: true } }
+        },
+        isProcessAlive: pid => pid === spawned.child.pid && oldProcessAlive,
+        readProcessStartTimeMs: async pid => pid === spawned.child.pid ? 1_000 : 2_000,
+        killProcess: (pid, signal) => { killedSignals.push({ pid, signal }); oldProcessAlive = false },
+        sleepMs: async () => {}, persistentRegistryPath: registryPath,
+      })
+      await manager.ensureHost({ hostKey: 'host-key' })
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
+      registry.hosts['host-key']!.leases = { 'external-team::primary::alice': { leaseKey: 'external-team::primary::alice', teamId: 'external-team', laneId: 'primary', memberName: 'alice', runId: 'external-run', sessionId: 'external-session', createdAt: '2026-09-02T20:00:00.000Z', updatedAt: '2026-09-02T20:00:00.000Z' } }
+      await writeFile(registryPath, JSON.stringify(registry))
+      await manager.releaseHost('host-key')
+      expect(manager.getHost('host-key')?.pid).toBe(43138)
+      expect(killedSignals).toEqual([])
+      expect(spawned.killedSignals).toEqual([])
+      const unleased = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
+      unleased.hosts['host-key']!.leases = {}
+      await writeFile(registryPath, JSON.stringify(unleased))
+      replaceRegistryOnDispose = true
+      expect(await manager.disposeHost('host-key')).toBe(true)
+      expect(killedSignals).toEqual([{ pid: 43138, signal: 'SIGTERM' }])
+      const after = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
+      expect(after.hosts['host-key']).toMatchObject({ pid: 53138, processStartedAtMs: 2_000 })
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
   test('persists and releases team leases for a managed host', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
@@ -1909,10 +2062,57 @@ describe('OpenCodeHostManager', () => {
         updatedAt: '2026-04-24T10:00:00.000Z',
       })
 
+      await expect(manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'run-2', sessionId: 'session-2',
+      })).rejects.toThrow('different run or session')
+
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'stale-run', sessionId: 'stale-session',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
+
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1'
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, { leases?: Record<string, unknown> }> }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
+
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice', sessionId: 'session-1'
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, { leases?: Record<string, unknown> }> }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
+
       await manager.releaseHostLease(handle.hostKey, {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
+
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'run-1', sessionId: 'session-1',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(registry.hosts['host-key']?.leases).toEqual({})
+
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+      })
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'run-legacy', sessionId: 'session-legacy',
       })
       registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
         hosts: Record<string, { leases?: Record<string, unknown> }>
