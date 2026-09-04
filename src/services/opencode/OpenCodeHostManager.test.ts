@@ -2076,6 +2076,19 @@ describe('OpenCodeHostManager', () => {
       }
       expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
 
+      expect(await manager.releaseHostLeaseStrict(handle.hostKey, {
+        teamId: 'team-a', laneId: 'primary', memberName: 'alice',
+        runId: 'stale-run', sessionId: 'stale-session',
+      })).toBe(false)
+
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-legacy', laneId: 'primary', memberName: 'legacy',
+      })
+      expect(await manager.releaseHostLeaseStrict(handle.hostKey, {
+        teamId: 'team-legacy', laneId: 'primary', memberName: 'legacy',
+        runId: 'run-legacy', sessionId: 'session-legacy',
+      })).toBe(false)
+
       await manager.releaseHostLease(handle.hostKey, {
         teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1'
       })
@@ -2098,14 +2111,23 @@ describe('OpenCodeHostManager', () => {
       }
       expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toBeDefined()
 
-      await manager.releaseHostLease(handle.hostKey, {
+      expect(await manager.releaseHostLeaseStrict(handle.hostKey, {
         teamId: 'team-a', laneId: 'primary', memberName: 'alice',
         runId: 'run-1', sessionId: 'session-1',
-      })
+      })).toBe(true)
       registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
         hosts: Record<string, { leases?: Record<string, unknown> }>
       }
-      expect(registry.hosts['host-key']?.leases).toEqual({})
+      expect(registry.hosts['host-key']?.leases).toEqual(expect.objectContaining({
+        'team-legacy::primary::legacy': expect.objectContaining({
+          runId: null,
+          sessionId: null,
+        }),
+      }))
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-legacy', laneId: 'primary', memberName: 'legacy',
+        runId: 'run-legacy', sessionId: 'session-legacy',
+      })
 
       await manager.retainHostLease(handle.hostKey, {
         teamId: 'team-a', laneId: 'primary', memberName: 'alice',

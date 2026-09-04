@@ -113,7 +113,7 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
-function normalizeOpenCodeSessionStatus(
+export function normalizeOpenCodeSessionStatus(
   rawStatus: OpenCodeSessionStatusInput | null,
 ): {
   status: OpenCodeSessionStatus | null

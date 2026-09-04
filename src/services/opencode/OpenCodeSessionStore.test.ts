@@ -380,6 +380,7 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.commitMaterialization(record, token('old-attempt'))).not.toBeNull()
     expect(await store.markStoppedIfSession({ ...record, runId: 'older-run' })).toBeNull()
     expect(await store.markStoppedIfSession({ ...record, opencodeSessionId: 'other-session' })).toBeNull()
+    expect(await store.markStoppedIfSession({ ...record, hostKey: 'other-host' })).toBeNull()
     const stopped = await store.markStoppedIfSession(record)
     expect(stopped?.stoppedAt).toBeDefined()
     expect(await store.markStoppedIfSession(record)).toEqual(stopped)

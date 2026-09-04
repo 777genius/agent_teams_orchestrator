@@ -13,7 +13,7 @@ import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
-import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
+import { raceOpenCodeAbortSignal, throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 import {
   assertOpenCodePreparedProfileScope,
   openCodeProfileManager,
@@ -23,6 +23,7 @@ import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import type { MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
+import { startOpenCodeStopObserver, type OpenCodeStopObserver } from './OpenCodeStopObserver.js'
 
 import type {
   OpenCodeAuthState,
@@ -47,7 +48,7 @@ type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
-      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
+      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'releaseHostLeaseStrict' | 'retainHostLease'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
     & Partial<Pick<typeof openCodeSessionStore,
@@ -60,6 +61,7 @@ type OpenCodeSessionBridgeDeps = {
   offlineReader?: Pick<typeof openCodeOfflineSessionReader, 'readSession'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
   turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
+  stopObserverFactory?: typeof startOpenCodeStopObserver
   oauthRefreshCoordinator?: Pick<
     typeof openCodeOAuthRefreshCoordinator,
     'ensureFreshForPrompt'
@@ -85,6 +87,11 @@ type SessionIdentity = {
 type PreparedSessionProfile = {
   profile: OpenCodePreparedProfile
   toolApprovalMode: OpenCodeToolApprovalMode
+}
+
+export type OpenCodeStopRequestOptions = {
+  signal?: AbortSignal
+  remainingMs?: () => number
 }
 
 export type OpenCodePromptPart =
@@ -423,30 +430,36 @@ export class OpenCodeSessionBridge {
   private async prepareProfileForSessionRecord(
     record: OpenCodeSessionRecord,
     projectPath: string | null | undefined = record.projectPath,
+    options: OpenCodeStopRequestOptions = {},
   ): Promise<PreparedSessionProfile> {
     // A stored scope token belongs to the process that created the record. Resolve
     // a new snapshot before preparing so restart reconciliation never consumes it.
-    const profileScope = await resolveOpenCodeProfileScope({
+    const profileScope = await raceOpenCodeAbortSignal(resolveOpenCodeProfileScope({
         projectPath,
         purpose: 'launch_runtime',
         selectedModel: record.selectedModel,
-      })
+      }), options.signal)
     if (record.toolApprovalMode) {
       return {
         profile: await this.prepareProfile(projectPath, {
           toolApprovalMode: record.toolApprovalMode,
           profileScope,
+          abortSignal: options.signal,
         }),
         toolApprovalMode: record.toolApprovalMode,
       }
     }
 
-    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto', profileScope })
+    const autoProfile = await this.prepareProfile(projectPath, {
+      toolApprovalMode: 'auto', profileScope, abortSignal: options.signal,
+    })
     if (this.sessionProfileMatchesStoredConfig(record, autoProfile)) {
       return { profile: autoProfile, toolApprovalMode: 'auto' }
     }
 
-    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual', profileScope })
+    const manualProfile = await this.prepareProfile(projectPath, {
+      toolApprovalMode: 'manual', profileScope, abortSignal: options.signal,
+    })
     if (this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
       return { profile: manualProfile, toolApprovalMode: 'manual' }
     }
@@ -633,7 +646,12 @@ export class OpenCodeSessionBridge {
     }
   }
 
-  private async ensureSessionAuthorityHost(record: OpenCodeSessionRecord, profile: OpenCodePreparedProfile) {
+  private async ensureSessionAuthorityHost(
+    record: OpenCodeSessionRecord,
+    profile: OpenCodePreparedProfile,
+    options: OpenCodeStopRequestOptions = {},
+    mode: 'default' | 'stop' = 'default',
+  ) {
     if (record.stoppedAt) throw new Error('OpenCode session is stopped; launch a new run')
     const scoped = record.profileScope?.purpose === 'launch_runtime'
     if (scoped) {
@@ -651,6 +669,7 @@ export class OpenCodeSessionBridge {
       hostKey: record.hostKey,
       preparedProfile: profile,
       ...(scoped ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false } : {}),
+      abortSignal: options.signal,
     })
     if (!scoped) return host
     try {
@@ -660,10 +679,23 @@ export class OpenCodeSessionBridge {
         || host.resolvedConfigFingerprint !== record.managedConfigFingerprint) {
         throw new Error('OpenCode selected session fingerprint domain changed; relaunch the lane')
       }
-      const refreshed = await refreshSelectedProfileAuthority({
+      // Stop uses exact store/session/host identity and the sealed config fingerprint.
+      // It must remain available when the app MCP is disconnected because abort,
+      // status, and SSE are direct OpenCode HTTP operations.
+      const refreshed = mode === 'stop' ? profile : await refreshSelectedProfileAuthority({
         host,
         selectedModel: record.selectedModel,
         expectedBehaviorFingerprint: record.expectedBehaviorFingerprint!,
+        ...(options.signal ? {
+          phaseContext: {
+            phase: 'stop_abort',
+            signal: options.signal,
+            remainingMs: options.remainingMs ?? (() => Number.POSITIVE_INFINITY),
+            throwIfExpired: () => {
+              if (options.signal?.aborted) throwOpenCodeAbortReason(options.signal)
+            },
+          },
+        } : {}),
       }, { clientFactory: this.clientFactory, mcpManager: this.mcpManager })
       if (!refreshed || refreshed.managedConfigFingerprint !== record.managedConfigFingerprint) {
         throw new Error('OpenCode selected session live authority changed; relaunch the lane')
@@ -722,24 +754,48 @@ export class OpenCodeSessionBridge {
   ): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
-    if (options.strictLeaseRelease && !this.hostManager.releaseHostLease) {
+    if (options.strictLeaseRelease && !this.hostManager.releaseHostLeaseStrict) {
       throw new Error('OpenCode confirmed stop requires persistent lease release')
     }
-    const releaseLease = this.hostManager.releaseHostLease?.(record.hostKey, {
+    const leaseIdentity = {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+      runId: record.runId ?? null,
+      sessionId: record.opencodeSessionId,
+    }
+    if (options.strictLeaseRelease) {
+      const released = await this.hostManager.releaseHostLeaseStrict!(record.hostKey, leaseIdentity)
+      if (!released) {
+        throw new Error('OpenCode confirmed stop could not prove persistent lease release')
+      }
+    } else {
+      await this.hostManager.releaseHostLease?.(record.hostKey, leaseIdentity).catch(() => undefined)
+    }
+    if (!retainedHostKey) {
+      return
+    }
+
+    this.retainedSessionHosts.delete(sessionKey)
+    await this.hostManager.releaseHost(retainedHostKey, {
+      keepPersistentAlive: options.strictLeaseRelease === true,
+    })
+  }
+
+  async restoreSessionLease(
+    record: Pick<OpenCodeSessionRecord,
+      'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'runId' | 'opencodeSessionId'>,
+  ): Promise<void> {
+    if (!this.hostManager.retainHostLease) {
+      throw new Error('OpenCode stop compensation requires persistent lease retention')
+    }
+    await this.hostManager.retainHostLease(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
       runId: record.runId ?? null,
       sessionId: record.opencodeSessionId,
     })
-    if (options.strictLeaseRelease) await releaseLease
-    else await releaseLease?.catch(() => undefined)
-    if (!retainedHostKey) {
-      return
-    }
-
-    this.retainedSessionHosts.delete(sessionKey)
-    await this.hostManager.releaseHost(retainedHostKey)
   }
 
   async ensureSessionAppMcpReady(
@@ -803,14 +859,16 @@ export class OpenCodeSessionBridge {
       runtimePid: number | null
     }) => Promise<T>,
     profile?: OpenCodePreparedProfile,
+    options: OpenCodeStopRequestOptions = {},
+    mode: 'default' | 'stop' = 'default',
   ): Promise<T> {
     const sessionProfile = profile
       ? {
         profile,
         toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
       }
-      : await this.prepareProfileForSessionRecord(record)
-    const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile)
+      : await this.prepareProfileForSessionRecord(record, record.projectPath, options)
+    const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile, options, mode)
 
     try {
       await this.retainSessionHostLease(record, record.runId)
@@ -1696,11 +1754,53 @@ export class OpenCodeSessionBridge {
     })
   }
 
-  async abort(record: OpenCodeSessionRecord): Promise<boolean> {
+  async abort(
+    record: OpenCodeSessionRecord,
+    options: OpenCodeStopRequestOptions = {},
+  ): Promise<boolean> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(baseUrl, options)
       return client.abortSession(record.opencodeSessionId)
-    })
+    }, undefined, options, 'stop')
+  }
+
+  async observeStopIdle(
+    record: OpenCodeSessionRecord,
+    options: OpenCodeStopRequestOptions = {},
+  ): Promise<OpenCodeStopObserver> {
+    const sessionProfile = await this.prepareProfileForSessionRecord(
+      record,
+      record.projectPath,
+      options,
+    )
+    const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile, options, 'stop')
+    try {
+      await this.retainSessionHostLease(record, record.runId)
+      const observer = await (this.deps.stopObserverFactory ?? startOpenCodeStopObserver)({
+        baseUrl: host.baseUrl,
+        sessionId: record.opencodeSessionId,
+        signal: options.signal,
+      })
+      let disposed = false
+      const hostManager = this.hostManager
+      return {
+        arm: () => observer.arm(),
+        currentStatus: () => observer.currentStatus(),
+        waitForIdle: timeoutMs => observer.waitForIdle(timeoutMs),
+        async dispose(): Promise<void> {
+          if (disposed) return
+          disposed = true
+          try {
+            await observer.dispose()
+          } finally {
+            await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: true })
+          }
+        },
+      }
+    } catch (error) {
+      await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: true })
+      throw error
+    }
   }
 
   async answerPermission(
@@ -1727,12 +1827,15 @@ export class OpenCodeSessionBridge {
     })
   }
 
-  async getRawStatus(record: OpenCodeSessionRecord): Promise<OpenCodeSessionStatusInput | null> {
+  async getRawStatus(
+    record: OpenCodeSessionRecord,
+    options: OpenCodeStopRequestOptions = {},
+  ): Promise<OpenCodeSessionStatusInput | null> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(baseUrl, options)
       const statusMap = await client.getSessionStatus()
       return statusMap[record.opencodeSessionId] ?? null
-    })
+    }, undefined, options, 'stop')
   }
 
   async promptAsyncUntilAccepted(

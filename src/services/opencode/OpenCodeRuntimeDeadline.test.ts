@@ -1,11 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  OPEN_CODE_READINESS_PHASES,
   OpenCodeRuntimeDeadline,
   OpenCodeRuntimeDeadlineError,
 } from './OpenCodeRuntimeDeadline.js'
 
 describe('OpenCodeRuntimeDeadline', () => {
+  test('includes the stop abort, verification, and cleanup phases', () => {
+    expect(OPEN_CODE_READINESS_PHASES).toContain('stop_abort')
+    expect(OPEN_CODE_READINESS_PHASES).toContain('stop_verify')
+    expect(OPEN_CODE_READINESS_PHASES).toContain('stop_cleanup')
+  })
+
   test('derives every phase from one monotonic command budget', async () => {
     let now = 100
     let expire: (() => void) | null = null
