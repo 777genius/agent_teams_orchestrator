@@ -19,7 +19,7 @@ import type {
 
 export type OpenCodeClient = {
   getConfig(): Promise<OpenCodeConfigResponse>
-  getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
+  getConfigProviders(options?: { initializeInstance?: boolean }): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc(): Promise<OpenCodeServerDocResponse>
@@ -103,6 +103,9 @@ type OpenCodeClientFactoryDeps = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+// /global/health does not initialize the directory-scoped native instance.
+// Give the first scoped request the same budget as native host startup.
+export const OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS = 30_000
 const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
@@ -212,7 +215,13 @@ export class OpenCodeClientFactory {
 
     return {
       getConfig: () => request<OpenCodeConfigResponse>('/config'),
-      getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
+      getConfigProviders: options => request<OpenCodeConfigProvidersResponse>(
+        '/config/providers',
+        undefined,
+        options?.initializeInstance
+          ? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          : DEFAULT_REQUEST_TIMEOUT_MS,
+      ),
       getProviders: () => request<OpenCodeProviderResponse>('/provider'),
       getProviderAuth: () =>
         request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),

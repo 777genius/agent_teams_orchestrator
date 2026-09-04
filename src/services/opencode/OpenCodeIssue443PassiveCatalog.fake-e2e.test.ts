@@ -146,7 +146,8 @@ describe('issue #443 passive status/catalog fake E2E', () => {
     harness.catalogGate = lateGate
     const staleRequest = catalog.loadModels(input)
     await harness.catalogGateEntered.promise
-    expect(jest.getTimerCount()).toBe(1)
+    // A prepared host starts the query timer without removing the overall guard.
+    expect(jest.getTimerCount()).toBe(2)
     jest.advanceTimersByTime(100)
     await timeoutIdentityRead.promise
     for (let index = 0; index < 10; index += 1) {

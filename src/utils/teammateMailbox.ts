@@ -71,6 +71,7 @@ export type RuntimeRecoveryNudgeMetadataV1 = {
 export type TeammateMessage = {
   messageId: string
   from: string
+  source?: string
   text: string
   timestamp: string
   read: boolean

@@ -177,6 +177,21 @@ describe('teammateMailbox', () => {
     })
   })
 
+  it('preserves system notification source through persisted mailbox reads', async () => {
+    await writeToMailbox('alice', {
+      from: 'user', source: 'system_notification',
+      text: 'Task assigned: taskId: "f12fdf20"',
+      timestamp: '2026-09-04T14:11:38.387Z',
+    }, 'sandbox-team')
+    const [message] = await readMailbox('alice', 'sandbox-team')
+    expect(message).toMatchObject({ from: 'user', source: 'system_notification', read: false })
+    const [claimed] = await claimUnreadRegularMessages('alice', 'session-a', 'sandbox-team')
+    expect(claimed).toMatchObject({
+      messageId: message!.messageId, from: 'user', source: 'system_notification',
+      claimedBySessionId: 'session-a',
+    })
+  })
+
   it('verifies mailbox writes by reading back the canonical row', async () => {
     const receipt = await writeToMailboxVerified(
       'atlas',

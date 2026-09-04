@@ -354,6 +354,7 @@ export type AppState = DeepImmutable<{
       messageId?: string
       mailboxClaimedBySessionId?: string
       from: string
+      source?: string
       text: string
       timestamp: string
       status: 'pending' | 'processing' | 'processed'

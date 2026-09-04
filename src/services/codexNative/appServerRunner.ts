@@ -450,11 +450,6 @@ function mapNotificationToEvents(
     }
     case 'turn/started':
       return [{ type: 'turn_started' }]
-    case 'item/agentMessage/delta': {
-      const itemId = stringValue(params.itemId) ?? 'agent-message'
-      const text = stringValue(params.delta)
-      return text ? [{ type: 'assistant_text', itemId, text }] : []
-    }
     case 'thread/tokenUsage/updated': {
       const event = mapTokenUsageNotification(params)
       return event ? [event] : []
@@ -492,6 +487,74 @@ function mapNotificationToEvents(
     default:
       return []
   }
+}
+
+/** Normalize app-server deltas to the same complete-item contract as exec JSONL. */
+export function createCodexAppServerNotificationMapper(): {
+  (method: string, params: Record<string, unknown>): CodexNativeNormalizedEvent[]
+  flushPending(): CodexNativeNormalizedEvent[]
+} {
+  const textByItem = new Map<string, { scope: string; itemId: string; text: string }>()
+  const completedItems = new Set<string>()
+  const deferredUsage = new Map<string, CodexNativeNormalizedEvent[]>()
+  const flushPending = (scope?: string): CodexNativeNormalizedEvent[] => {
+    const events: CodexNativeNormalizedEvent[] = []
+    for (const [key, pending] of textByItem) {
+      if (scope !== undefined && pending.scope !== scope) continue
+      events.push({ type: 'assistant_text', itemId: pending.itemId, text: pending.text })
+      textByItem.delete(key)
+      completedItems.add(key)
+    }
+    for (const [pendingScope, usage] of deferredUsage) {
+      if (scope !== undefined && pendingScope !== scope) continue
+      events.push(...usage)
+      deferredUsage.delete(pendingScope)
+    }
+    return events
+  }
+  const map = (method: string, params: Record<string, unknown>): CodexNativeNormalizedEvent[] => {
+    const scope = JSON.stringify([
+      stringValue(params.threadId),
+      stringValue(params.turnId) ?? stringValue(asRecord(params.turn).id),
+    ])
+    const item = asRecord(params.item)
+    const itemId = stringValue(params.itemId) ?? stringValue(item.id) ?? 'agent-message'
+    const key = JSON.stringify([scope, itemId])
+    if (method === 'item/agentMessage/delta') {
+      if (typeof params.delta === 'string' && !completedItems.has(key)) {
+        const previous = textByItem.get(key)?.text ?? ''
+        textByItem.set(key, { scope, itemId, text: previous + params.delta })
+      }
+      return []
+    }
+
+    const events: CodexNativeNormalizedEvent[] = []
+    if (method === 'item/completed' && item.type === 'agentMessage') {
+      if (completedItems.has(key)) return []
+      const text = typeof item.text === 'string' ? item.text : textByItem.get(key)?.text
+      textByItem.delete(key)
+      completedItems.add(key)
+      if (text !== undefined) events.push({ type: 'assistant_text', itemId, text })
+    } else if (method === 'turn/completed') {
+      // Retain a delta-only completion fallback when no item snapshot arrives.
+      events.push(...flushPending(scope))
+    } else {
+      const mapped = mapNotificationToEvents(method, params)
+      if (mapped.some(event => event.type === 'usage_updated')
+        && [...textByItem.values()].some(pending => pending.scope === scope)) {
+        deferredUsage.set(scope, [...(deferredUsage.get(scope) ?? []), ...mapped])
+        return []
+      }
+      return mapped
+    }
+    if (![...textByItem.values()].some(pending => pending.scope === scope)) {
+      events.push(...(deferredUsage.get(scope) ?? []))
+      deferredUsage.delete(scope)
+    }
+    if (method === 'turn/completed') events.push(...mapNotificationToEvents(method, params))
+    return events
+  }
+  return Object.assign(map, { flushPending: () => flushPending() })
 }
 
 export async function* runCodexNativeAppServer(
@@ -564,6 +627,8 @@ export async function* runCodexNativeAppServer(
   let threadId: string | null = null
   let completed = false
   let cleanupStarted = false
+  const mapNotification = createCodexAppServerNotificationMapper()
+  let refreshIdleDeadline = (): void => {}
 
   const enqueueEvent = (event: CodexNativeNormalizedEvent): void => {
     if (event.type === 'thread_started') {
@@ -694,7 +759,9 @@ export async function* runCodexNativeAppServer(
     }
 
     if (typeof message.method === 'string') {
-      for (const event of mapNotificationToEvents(
+      // Buffered text deltas are still activity even before their item completes.
+      refreshIdleDeadline()
+      for (const event of mapNotification(
         message.method,
         asRecord(message.params),
       )) {
@@ -777,6 +844,7 @@ export async function* runCodexNativeAppServer(
         })
       }, idleTimeoutMs)
     }
+    refreshIdleDeadline = resetIdleTimeout
     if (absoluteTimeoutMs) {
       absoluteTimeoutHandle = setTimeout(() => {
         observations.push({
@@ -816,10 +884,16 @@ export async function* runCodexNativeAppServer(
         }
       }
     } finally {
+      refreshIdleDeadline = (): void => {}
       if (idleTimeoutHandle) clearTimeout(idleTimeoutHandle)
       if (absoluteTimeoutHandle) clearTimeout(absoluteTimeoutHandle)
     }
   } catch (error) {
+    // Preserve already-received partial output without manufacturing turn success.
+    cleanup()
+    for (const event of mapNotification.flushPending()) {
+      yield { type: 'normalized_event', event }
+    }
     const classified = classifyCodexAppServerApprovalFailure(error)
     if (classified.unsupported) {
       throw new Error(classified.message)

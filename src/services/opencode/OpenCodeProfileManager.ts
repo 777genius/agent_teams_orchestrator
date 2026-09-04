@@ -57,6 +57,7 @@ import {
 import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
+  waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
@@ -350,16 +351,53 @@ const OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS = {
   },
 }
 
-async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
+async function acquireProfileSymlinkLock(
+  lockPath: string,
+  signal?: AbortSignal,
+): Promise<() => Promise<void>> {
+  // Keep the existing bounded retry policy, but do not leave proper-lockfile's
+  // retry queue running after the caller's deadline expires.
+  for (let attempt = 0; ; attempt += 1) {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
+    try {
+      const release = await lockfile.lock(lockPath, {
+        ...OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+        retries: 0,
+      })
+      if (signal?.aborted) {
+        await release()
+        throwOpenCodeAbortReason(signal)
+      }
+      return release
+    } catch (error) {
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
+      if (getErrnoCode(error) !== 'ELOCKED' || attempt >= 120) throw error
+      await waitForOpenCodeAbortableDelay(Math.min(25 * 2 ** attempt, 250), signal)
+    }
+  }
+}
+
+type ProfileSymlinkOptions = {
+  abortSignal?: AbortSignal
+  enterStep?: (label: string) => void
+}
+
+export async function ensureDirectorySymlink(
+  linkPath: string,
+  targetPath: string,
+  options: ProfileSymlinkOptions = {},
+): Promise<void> {
+  if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
   const lockPath = `${linkPath}.prepare-lock`
   await writeFile(lockPath, '', { flag: 'a' })
-  const release = await lockfile.lock(lockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  options.enterStep?.('wait for node_modules symlink lock')
+  const release = await acquireProfileSymlinkLock(lockPath, options.abortSignal)
 
   try {
-    await ensureDirectorySymlinkUnlocked(linkPath, targetPath)
+    await ensureDirectorySymlinkUnlocked(linkPath, targetPath, options)
   } finally {
     await release()
   }
@@ -368,11 +406,20 @@ async function ensureDirectorySymlink(linkPath: string, targetPath: string): Pro
 async function copyDirectoryContentsPreservingExisting(
   sourcePath: string,
   targetPath: string,
+  options: ProfileSymlinkOptions,
 ): Promise<void> {
+  if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
   const entries = await readdir(sourcePath, { withFileTypes: true })
+  const targetEntries = new Map((await readdir(targetPath, { withFileTypes: true }))
+    .map(entry => [entry.name, entry]))
   for (const entry of entries) {
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const sourceEntry = path.join(sourcePath, entry.name)
     const targetEntry = path.join(targetPath, entry.name)
+    const existing = targetEntries.get(entry.name)
+    // Existing files/symlinks always win. Still descend into real directories
+    // to preserve missing nested files; COPYFILE_EXCL remains the race guard.
+    if (existing && (!entry.isDirectory() || !existing.isDirectory())) continue
 
     if (entry.isDirectory()) {
       await mkdir(targetEntry, { recursive: true }).catch(error => {
@@ -387,13 +434,14 @@ async function copyDirectoryContentsPreservingExisting(
         throw error
       })
       if (targetStat?.isDirectory() && !targetStat.isSymbolicLink()) {
-        await copyDirectoryContentsPreservingExisting(sourceEntry, targetEntry)
+        await copyDirectoryContentsPreservingExisting(sourceEntry, targetEntry, options)
       }
       continue
     }
 
     if (entry.isSymbolicLink()) {
       const linkTarget = await readlink(sourceEntry)
+      if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
       await symlink(linkTarget, targetEntry).catch(error => {
         if (getErrnoCode(error) !== 'EEXIST') {
           throw error
@@ -415,6 +463,7 @@ async function copyDirectoryContentsPreservingExisting(
 async function preserveRealDirectoryContents(
   sourcePath: string,
   targetPath: string,
+  options: ProfileSymlinkOptions,
 ): Promise<void> {
   const sourceStat = await lstat(sourcePath).catch(error => {
     if (getErrnoCode(error) === 'ENOENT') {
@@ -427,10 +476,13 @@ async function preserveRealDirectoryContents(
   }
 
   const migrationLockPath = `${targetPath}.migration-lock`
+  if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
   await writeFile(migrationLockPath, '', { flag: 'a' })
-  const release = await lockfile.lock(migrationLockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  options.enterStep?.('wait for shared node_modules migration lock')
+  const release = await acquireProfileSymlinkLock(migrationLockPath, options.abortSignal)
   try {
-    await copyDirectoryContentsPreservingExisting(sourcePath, targetPath)
+    options.enterStep?.('merge legacy node_modules directory')
+    await copyDirectoryContentsPreservingExisting(sourcePath, targetPath, options)
   } finally {
     await release()
   }
@@ -439,25 +491,41 @@ async function preserveRealDirectoryContents(
 async function ensureDirectorySymlinkUnlocked(
   linkPath: string,
   targetPath: string,
+  options: ProfileSymlinkOptions,
 ): Promise<void> {
+  let replacementStarted = false
+  const finishReplacement = () => {
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
+  }
   for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (!replacementStarted) finishReplacement()
     if (await isDirectorySymlinkTo(linkPath, targetPath)) {
+      finishReplacement()
       return
     }
 
     try {
+      if (!replacementStarted) finishReplacement()
       await symlink(targetPath, linkPath, 'dir')
+      finishReplacement()
       return
     } catch (error) {
       if (getErrnoCode(error) !== 'EEXIST') {
         throw error
       }
       if (await isDirectorySymlinkTo(linkPath, targetPath)) {
+        finishReplacement()
         return
       }
     }
 
-    await preserveRealDirectoryContents(linkPath, targetPath)
+    await preserveRealDirectoryContents(linkPath, targetPath,
+      replacementStarted ? { ...options, abortSignal: undefined } : options)
+    options.enterStep?.('replace legacy node_modules directory')
+    if (!replacementStarted) finishReplacement()
+    // Once removal starts, finish the bounded replacement before observing
+    // cancellation. Otherwise an abort during rm leaves node_modules missing.
+    replacementStarted = true
     await rm(linkPath, { recursive: true, force: true }).catch(error => {
       const code = getErrnoCode(error)
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
@@ -469,14 +537,18 @@ async function ensureDirectorySymlinkUnlocked(
   }
 
   if (await isDirectorySymlinkTo(linkPath, targetPath)) {
+    finishReplacement()
     return
   }
 
   try {
+    if (!replacementStarted) finishReplacement()
     await symlink(targetPath, linkPath, 'dir')
+    finishReplacement()
     return
   } catch (error) {
     if (getErrnoCode(error) === 'EEXIST' && await isDirectorySymlinkTo(linkPath, targetPath)) {
+      finishReplacement()
       return
     }
     throw error
@@ -813,6 +885,7 @@ interface OpenCodeNativeCliCredentialBridge {
 type KiroCliAuthProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
+  abortSignal?: AbortSignal,
 ) => Promise<boolean>
 
 interface KiroCliWhoamiResult {
@@ -824,6 +897,7 @@ interface KiroCliWhoamiResult {
 type CursorAgentAuthProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
+  abortSignal?: AbortSignal,
 ) => Promise<boolean>
 
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
@@ -888,12 +962,13 @@ export function isKiroCliWhoamiAuthenticated(result: KiroCliWhoamiResult): boole
     || hasAuthenticatedKiroAccount(result.stderr)
 }
 
-const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
+const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform, abortSignal) =>
   await new Promise<boolean>(resolve => {
     execFile(
       executablePath,
       ['status'],
       {
+        signal: abortSignal,
         timeout: 15_000,
         windowsHide: true,
         shell: platform === 'win32',
@@ -904,12 +979,13 @@ const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platfo
     )
   })
 
-const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
+const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform, abortSignal) =>
   await new Promise<boolean>(resolve => {
     execFile(
       executablePath,
       ['whoami', '--format', 'json'],
       {
+        signal: abortSignal,
         timeout: 15_000,
         windowsHide: true,
         shell: platform === 'win32',
@@ -942,7 +1018,9 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   platform?: NodeJS.Platform
   probe?: CursorAgentAuthProbe
   now?: () => number
+  abortSignal?: AbortSignal
 }): Promise<boolean> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const now = (input.now ?? Date.now)()
   const [globalCredential, managedCredential] = await Promise.all([
     readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
@@ -957,6 +1035,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.globalAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
             credential: explicitCredential,
           }),
@@ -964,6 +1043,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.managedAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
             credential: explicitCredential,
           }),
@@ -981,6 +1061,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.globalAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
             credential: freshMarker,
           }),
@@ -988,6 +1069,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.managedAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
             credential: freshMarker,
           }),
@@ -998,18 +1080,22 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   const authenticated = await (input.probe ?? probeCursorAgentAuth)(
     input.cursorAgentExecutablePath,
     input.platform ?? process.platform,
+    input.abortSignal,
   ).catch(() => false)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (!authenticated) {
     await Promise.all([
       isCursorAgentAuthMarker(globalCredential)
         ? removeOpenCodeAuthCredential({
             authPath: input.globalAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
           })
         : Promise.resolve(),
       isCursorAgentAuthMarker(managedCredential)
         ? removeOpenCodeAuthCredential({
             authPath: input.managedAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'cursor-acp',
           })
         : Promise.resolve(),
@@ -1027,6 +1113,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
       ? Promise.resolve()
       : upsertOpenCodeAuthCredential({
           authPath: input.globalAuthPath,
+          abortSignal: input.abortSignal,
           providerId: 'cursor-acp',
           credential,
         }),
@@ -1034,6 +1121,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
       ? Promise.resolve()
       : upsertOpenCodeAuthCredential({
           authPath: input.managedAuthPath,
+          abortSignal: input.abortSignal,
           providerId: 'cursor-acp',
           credential,
         }),
@@ -1048,7 +1136,9 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   platform?: NodeJS.Platform
   probe?: KiroCliAuthProbe
   now?: () => number
+  abortSignal?: AbortSignal
 }): Promise<boolean> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const now = (input.now ?? Date.now)()
   const [globalCredential, managedCredential] = await Promise.all([
     readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
@@ -1058,12 +1148,14 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   const authenticated = await (input.probe ?? probeKiroCliAuth)(
     input.kiroCliExecutablePath,
     input.platform ?? process.platform,
+    input.abortSignal,
   ).catch(() => false)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (!authenticated) {
     if (existingCredential) {
       await Promise.all([
-        removeOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
-        removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
+        removeOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro', abortSignal: input.abortSignal }),
+        removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro', abortSignal: input.abortSignal }),
       ])
     }
     return false
@@ -1082,6 +1174,7 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.globalAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'kiro',
             credential: existingCredential,
           }),
@@ -1089,6 +1182,7 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
         ? Promise.resolve()
         : upsertOpenCodeAuthCredential({
             authPath: input.managedAuthPath,
+            abortSignal: input.abortSignal,
             providerId: 'kiro',
             credential: existingCredential,
           }),
@@ -1107,11 +1201,13 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   await Promise.all([
     upsertOpenCodeAuthCredential({
       authPath: input.globalAuthPath,
+      abortSignal: input.abortSignal,
       providerId: 'kiro',
       credential,
     }),
     upsertOpenCodeAuthCredential({
       authPath: input.managedAuthPath,
+      abortSignal: input.abortSignal,
       providerId: 'kiro',
       credential,
     }),
@@ -2315,6 +2411,13 @@ export class OpenCodeProfileManager {
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
+    let leaveStep: (() => void) | undefined
+    const enterStep = (label: string): void => {
+      leaveStep?.()
+      leaveStep = options.progress?.enterStep(`prepare managed OpenCode profile: ${label}`)
+    }
+    enterStep('resolve project and scope')
+    try {
     const configSnapshot = options.profileScope
       ? openCodeEffectiveConfigSnapshots.get(options.profileScope.scopeToken)
       : undefined
@@ -2345,8 +2448,10 @@ export class OpenCodeProfileManager {
           ...buildScopeIdentity(policy.scope),
         })).slice(0, 16)
       : this.getProfileRootKey(resolvedProjectPath)
-    return this.withProfilePreparationLock(profileRootKey, async () => {
+    enterStep('wait for profile preparation lock')
+    return await this.withProfilePreparationLock(profileRootKey, async () => {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
+    enterStep('fingerprint project behavior')
     const profileRootPath = path.join(
       managedPaths.data,
       'opencode',
@@ -2358,6 +2463,7 @@ export class OpenCodeProfileManager {
         resolvedProjectPath,
         configSnapshot?.runtimeEnv ?? process.env,
       )
+    enterStep('read preferences and build config')
     const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
     const globalRuntimePreferences = await readOpenCodeGlobalManagedRuntimePreferences(
       managedPaths.data,
@@ -2451,6 +2557,7 @@ export class OpenCodeProfileManager {
       : resolvedProjectPath
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const globalAuthPath = this.getGlobalAuthPath(managedPaths.data)
+    enterStep('fingerprint auth sources')
     const sourceAuthSources = await Promise.all(
       this.getSourceAuthPaths(runtimeEnv, snapshotHome).map(async sourceAuthPath => {
         const exists = await fileExists(sourceAuthPath)
@@ -2462,6 +2569,7 @@ export class OpenCodeProfileManager {
     )
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
+    enterStep('create profile directories')
     await Promise.all([
       mkdir(homePath, { recursive: true }),
       mkdir(tmpPath, { recursive: true }),
@@ -2474,15 +2582,21 @@ export class OpenCodeProfileManager {
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
+      enterStep('repair plugin caches and native bridge')
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
         profileRootPath,
         runtimeEnv,
       )
     }
-    await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
+    enterStep('coordinate shared node_modules')
+    await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath, {
+      abortSignal: options.abortSignal,
+      enterStep,
+    })
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
+    enterStep('reconcile managed auth stores')
     const globalAuthExists = await fileExists(globalAuthPath)
     const globalAuthFingerprint = globalAuthExists
       ? await readFingerprint(globalAuthPath)
@@ -2502,6 +2616,7 @@ export class OpenCodeProfileManager {
     if (policy) {
       selectedSourceAuthIdentity = configSnapshot!.scopeIdentity.selectedAuthIdentity
       await materializeOpenCodeSelectedAuthCredential({
+        abortSignal: options.abortSignal,
         authPath: managedAuthPath,
         providerId: policy.scope.providerId,
         credential: configSnapshot!.selectedAuthCredential,
@@ -2516,14 +2631,17 @@ export class OpenCodeProfileManager {
       })
     }
     if (nativeCliCredentialBridge) {
+      enterStep('probe native provider credentials')
       await ensureOpenCodeNativePluginAuthCredentials({
         selectedProviderId: policy?.scope.providerId,
         prepareCursor: () => ensureOpenCodeCursorPluginAuthCredential({
+          abortSignal: options.abortSignal,
           globalAuthPath,
           managedAuthPath,
           cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
         }),
         prepareKiro: () => ensureOpenCodeKiroPluginAuthCredential({
+          abortSignal: options.abortSignal,
           globalAuthPath,
           managedAuthPath,
           kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
@@ -2532,6 +2650,7 @@ export class OpenCodeProfileManager {
     }
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
+    enterStep('verify auth and finalize environment')
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
     const selectedManagedAuthIdentity = policy
       ? await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
@@ -2639,6 +2758,9 @@ export class OpenCodeProfileManager {
       env: applyOpenCodeAutoUpdatePolicy(env),
     }
     }, options.abortSignal)
+    } finally {
+      leaveStep?.()
+    }
   }
 }
 

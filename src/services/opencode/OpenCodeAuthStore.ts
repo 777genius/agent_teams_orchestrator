@@ -363,6 +363,7 @@ export async function upsertOpenCodeAuthCredential(input: {
   authPath: string
   providerId: string
   credential: OpenCodeAuthCredential
+  abortSignal?: AbortSignal
 }): Promise<void> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -377,14 +378,16 @@ export async function upsertOpenCodeAuthCredential(input: {
   await withAuthStoreWriteLock(input.authPath, async () => {
     const authStore = await readOpenCodeAuthStore(input.authPath)
     authStore[providerId] = { ...input.credential, type: credentialType }
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     await writeOpenCodeAuthStore(input.authPath, authStore)
-  })
+  }, input.abortSignal)
 }
 
 export async function materializeOpenCodeSelectedAuthCredential(input: {
   authPath: string
   providerId: string
   credential: OpenCodeAuthCredential | null
+  abortSignal?: AbortSignal
 }): Promise<void> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -395,7 +398,7 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
       input.authPath,
       input.credential ? { [providerId]: { ...input.credential } } : {},
     )
-  })
+  }, input.abortSignal)
 }
 
 export async function upsertOpenCodeApiAuth(
@@ -436,6 +439,7 @@ export async function upsertOpenCodeApiAuth(
 export async function removeOpenCodeAuthCredential(input: {
   authPath: string
   providerId: string
+  abortSignal?: AbortSignal
 }): Promise<void> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -448,8 +452,9 @@ export async function removeOpenCodeAuthCredential(input: {
       return
     }
     delete authStore[providerId]
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     await writeOpenCodeAuthStore(input.authPath, authStore)
-  })
+  }, input.abortSignal)
 }
 
 export async function readOpenCodeAuthProviderSummaries(
