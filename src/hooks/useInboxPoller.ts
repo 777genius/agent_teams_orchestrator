@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useInterval } from 'usehooks-ts'
+import { createPendingMailboxMirrorMessage, isHumanDirectMailboxMessage } from './ordinaryMailboxMessage.js'
 import { getSessionId } from '../bootstrap/state.js'
 import type { ToolUseConfirm } from '../components/permissions/PermissionRequest.js'
 import { useTerminalNotification } from '../ink/useTerminalNotification.js'
@@ -235,7 +236,7 @@ type PendingInboxMirrorMessage = Pick<
   | 'timestamp'
   | 'status'
 > &
-  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind'>>
+  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind' | 'source'>>
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
 
@@ -475,6 +476,7 @@ export function shouldSkipBootstrapReadinessWait(params: {
 
 export function getOrdinaryInlineHandoffPrompt({
   from,
+  source,
   memberName,
   messageId,
   replyProtocol = resolveOrdinaryUserDirectReplyProtocol(),
@@ -483,6 +485,7 @@ export function getOrdinaryInlineHandoffPrompt({
   timestamp,
 }: {
   from: string
+  source?: string
   memberName?: string
   messageId?: string
   replyProtocol?: OrdinaryUserDirectReplyProtocol
@@ -490,7 +493,7 @@ export function getOrdinaryInlineHandoffPrompt({
   teamName?: string
   timestamp: string
 }): string {
-  const isUserMessage = from.trim().toLowerCase() === 'user'
+  const isUserMessage = isHumanDirectMailboxMessage({ from, source })
   const normalizedTeamName = teamName?.trim()
   const normalizedMemberName = memberName?.trim()
   const normalizedMessageId = messageId?.trim()
@@ -513,7 +516,9 @@ export function getOrdinaryInlineHandoffPrompt({
     'Process this queued mailbox message now.',
     `Sender: "${from}".`,
     `Timestamp: "${timestamp}".`,
-    isUserMessage
+    source === 'system_notification'
+      ? 'This is a system notification, not a human direct message. Process its instructions; no direct reply to the initiating user is required.'
+      : isUserMessage
       ? canExplainMcpReply
         ? `If this is a human direct message, reply via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${normalizedTeamName}", to="user", from="${normalizedMemberName}", text, summary, source="runtime_delivery", and relayOfMessageId="${normalizedMessageId}". Do not use SendMessage for this Codex-native handoff. If neither MCP tool name is available before any visible-message tool attempt, write exactly the concise reply text as normal assistant text so the runtime can relay it. This handoff delivery rule supersedes older SendMessage-only wording inside queued_mailbox_message.`
         : 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
@@ -1908,7 +1913,7 @@ export function getOrdinaryProcessingAction({
     submitUserMessageUuid: attempt.submitUserMessageUuid,
   })
   const requiresUserReply =
-    processingOrdinaryMessage.from.trim().toLowerCase() === 'user'
+    isHumanDirectMailboxMessage(processingOrdinaryMessage)
   const requiresWorkSyncReport =
     processingOrdinaryMessage.messageKind === 'member_work_sync_nudge'
   const workSyncOutcome = requiresWorkSyncReport
@@ -2940,18 +2945,7 @@ export function useInboxPoller({
           )
           const additions = messages
             .filter(message => !seenMessageIds.has(message.messageId))
-            .map(message => ({
-              id: randomUUID(),
-              messageId: message.messageId,
-              messageKind: message.messageKind,
-              mailboxClaimedBySessionId: options.claimedBySessionId,
-              from: message.from,
-              text: message.text,
-              timestamp: message.timestamp,
-              status: 'pending' as const,
-              color: message.color,
-              summary: message.summary,
-            }))
+            .map(message => createPendingMailboxMirrorMessage(message, options.claimedBySessionId))
           if (additions.length === 0) {
             return prev
           }
@@ -3868,6 +3862,7 @@ export function useInboxPoller({
               })
             : getOrdinaryInlineHandoffPrompt({
                 from: ordinaryPendingMessage.from,
+                source: ordinaryPendingMessage.source,
                 memberName: agentName,
                 messageId: ordinaryPendingMessage.messageId,
                 text: ordinaryPendingMessage.text,

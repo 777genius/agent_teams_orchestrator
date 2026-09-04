@@ -16,6 +16,8 @@ export type OpenCodeToolApprovalMode = 'auto' | 'manual'
 
 export type OpenCodePrepareProfileOptions = {
   abortSignal?: AbortSignal
+  /** Fixed preparation labels only; never include paths, config, or credentials. */
+  progress?: { enterStep(label: string): () => void }
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean

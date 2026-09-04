@@ -1,8 +1,33 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
 describe('OpenCodeClientFactory permissions API', () => {
+  test('only explicit instance initialization receives the startup transport budget', async () => {
+    const requests: string[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async input => {
+        requests.push(String(input))
+        return new Response('{}')
+      },
+    })
+    const timers = spyOn(globalThis, 'setTimeout')
+    try {
+      const client = factory.create('http://127.0.0.1:4096')
+      await client.getConfigProviders({ initializeInstance: true })
+      await client.getProviders()
+      await client.getConfigProviders()
+      await factory.create('http://127.0.0.1:4096', { remainingMs: () => 5_000 })
+        .getConfigProviders({ initializeInstance: true })
+      expect(timers.mock.calls.map(call => call[1])).toEqual([30_000, 15_000, 15_000, 5_000])
+      expect(requests).toEqual([
+        'http://127.0.0.1:4096/config/providers',
+        'http://127.0.0.1:4096/provider',
+        'http://127.0.0.1:4096/config/providers',
+        'http://127.0.0.1:4096/config/providers',
+      ])
+    } finally { timers.mockRestore() }
+  })
   test('delegates generic provider OAuth authorization and callback to OpenCode', async () => {
     const requests: Array<{
       url: string

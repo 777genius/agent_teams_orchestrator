@@ -1004,10 +1004,10 @@ export class OpenCodeInventoryService {
       return missingSnapshot
     }
 
-    const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
     const profile = await raceOpenCodeAbortSignal(
       openCodeProfileManager.prepareProfile(resolvedProjectPath, {
         abortSignal: options.abortSignal,
+        progress: options.progress,
         includeAppMcp: options.includeAppMcp !== false,
         includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
@@ -1015,9 +1015,6 @@ export class OpenCodeInventoryService {
       }),
       options.abortSignal,
     )
-      .finally(() => {
-        leaveProfileStep?.()
-      })
     return withOpenCodeInventoryCommandLock(profile, () =>
       this.probePreparedProfile({
         mode,

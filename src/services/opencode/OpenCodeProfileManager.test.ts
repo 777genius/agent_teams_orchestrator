@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -189,6 +189,80 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       legacy.profileRootPath,
     ]).size).toBe(6)
   })
+
+  test('reports fixed preparation substeps and closes each step exactly once', async () => {
+    const labels: string[] = []
+    const closed: string[] = []
+    let active: string | null = null
+    const progress = {
+      enterStep(label: string) {
+        expect(active).toBeNull()
+        active = label
+        labels.push(label)
+        return () => {
+          expect(active).toBe(label)
+          closed.push(label)
+          active = null
+        }
+      },
+    }
+    await new OpenCodeProfileManager().prepareProfile(path.join(tempDir, 'progress-project'), {
+      includeAppMcp: false,
+      includeManagedSubscriptionPlugins: false,
+      progress,
+    })
+    expect(labels).toEqual([
+      'resolve project and scope',
+      'wait for profile preparation lock',
+      'fingerprint project behavior',
+      'read preferences and build config',
+      'fingerprint auth sources',
+      'create profile directories',
+      'coordinate shared node_modules',
+      'wait for node_modules symlink lock',
+      'reconcile managed auth stores',
+      'verify auth and finalize environment',
+    ].map(label => `prepare managed OpenCode profile: ${label}`))
+    expect(closed).toEqual(labels)
+    expect(active).toBeNull()
+
+    const controller = new AbortController()
+    controller.abort(new Error('test preparation deadline'))
+    await expect(new OpenCodeProfileManager().prepareProfile(tempDir, {
+      abortSignal: controller.signal,
+      progress,
+    })).rejects.toThrow('test preparation deadline')
+    expect(closed).toEqual(labels)
+    expect(active).toBeNull()
+  })
+
+  for (const providerId of ['cursor-acp', 'kiro'] as const) {
+    test(`does not treat an aborted ${providerId} probe as logout or update credentials`, async () => {
+      const authPath = path.join(tempDir, 'cancelled-auth.json')
+      const credential = providerId === 'kiro'
+        ? { type: 'oauth', access: 'authenticated', refresh: '', expires: 1 }
+        : { type: 'api', key: 'cursor-agent', expires: 1 }
+      await upsertOpenCodeAuthCredential({ authPath, providerId, credential })
+      const controller = new AbortController()
+      const reason = new Error('inventory deadline expired')
+      const probe = async (_executable: string, _platform: NodeJS.Platform, signal?: AbortSignal) => {
+        expect(signal).toBe(controller.signal)
+        controller.abort(reason)
+        return false
+      }
+      const input = {
+        globalAuthPath: authPath,
+        managedAuthPath: authPath,
+        abortSignal: controller.signal,
+        probe,
+      }
+      const result = providerId === 'kiro'
+        ? ensureOpenCodeKiroPluginAuthCredential({ ...input, kiroCliExecutablePath: 'unused' })
+        : ensureOpenCodeCursorPluginAuthCredential({ ...input, cursorAgentExecutablePath: 'unused' })
+      await expect(result).rejects.toBe(reason)
+      expect(await readOpenCodeAuthCredential({ authPath, providerId })).toEqual(credential)
+    })
+  }
 
   test('fingerprints effective selected-provider endpoints without secret material', async () => {
     const projectPath = path.join(tempDir, 'fingerprint-project')
@@ -1069,8 +1143,8 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       projectPath: projectLink, purpose: 'catalog', selectedModel: 'custom/model',
     })
     const second = await manager.prepareProfile(projectLink, { profileScope: secondScope })
-    expect(first.projectPath).toBe(projectA)
-    expect(second.projectPath).toBe(projectB)
+    expect(first.projectPath).toBe(await realpath(projectA))
+    expect(second.projectPath).toBe(await realpath(projectB))
     expect(second.profileRootPath).not.toBe(first.profileRootPath)
   })
 

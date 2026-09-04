@@ -1,6 +1,9 @@
 import path from 'node:path'
 
-import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
+import {
+  openCodeClientFactory,
+  OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
+} from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
   getOpenCodeCuratedSubscriptionProviderIds,
@@ -35,6 +38,7 @@ import {
   openCodeInventoryService,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
+  type OpenCodeInventoryProbeProgressTracker,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
 import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
@@ -52,6 +56,7 @@ import { resolveOpenCodeBinaryPath } from '../../../../services/opencode/OpenCod
 import {
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
+  throwOpenCodeAbortReason,
 } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
@@ -145,7 +150,7 @@ type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | '
   >
 
 type OpenCodeProviderManagementClient = {
-  getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
+  getConfigProviders(options?: { initializeInstance?: boolean }): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc?(): Promise<OpenCodeServerDocResponse>
@@ -228,7 +233,11 @@ type OpenCodeProviderManagementAdapterDeps = {
   inventoryTimeoutMs?: number
   resolveBinaryPath?: () => string | null
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
+  /** Query, model normalization, and identity-publication budget after host readiness. */
   catalogTimeoutMs?: number
+  catalogInstanceTimeoutMs?: number
+  /** Includes preparation, host startup, query, and cleanup; defaults to the existing 60s inventory budget. */
+  catalogOverallTimeoutMs?: number
 }
 
 type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
@@ -2242,7 +2251,7 @@ function buildSummaryConfigProviders(
   const providers = Object.entries(managedProviders).flatMap(([rawProviderId, rawConfig]) => {
     const providerId = normalizeProviderId(rawProviderId)
     const config = asRecord(rawConfig)
-    if (!providerId || !config || !SUMMARY_PROVIDER_IDS.has(providerId)) {
+    if (!providerId || !config) {
       return []
     }
     const name = asString(config.name)
@@ -2271,14 +2280,16 @@ function buildSummaryProviderDirectory(input: {
   limit?: number | null
   cursor?: string | null
 }): ProviderDirectoryView {
+  const configProviders = buildSummaryConfigProviders(input.inventory)
+  const providerIds = new Set([
+    ...SUMMARY_PROVIDER_IDS, 'opencode',
+    ...input.inventory.connectedProviders.map(provider => provider.id),
+    ...(configProviders?.providers ?? []).map(provider => provider.id),
+  ])
   const inventory: OpenCodeInventorySnapshot = {
     ...input.inventory,
-    availableProviders: Array.from(new Set([
-      ...input.inventory.availableProviders,
-      ...SUMMARY_PROVIDER_IDS,
-    ])),
+    availableProviders: [...providerIds],
   }
-  const configProviders = buildSummaryConfigProviders(inventory)
   const source = {
     inventory,
     configProviders,
@@ -2289,13 +2300,10 @@ function buildSummaryProviderDirectory(input: {
   }
   const unpagedDirectory = buildProviderDirectory({
     ...source,
-    query: null,
-    filter: 'all',
-    limit: Number.MAX_SAFE_INTEGER,
-    cursor: null,
+    query: null, filter: 'all', limit: Number.MAX_SAFE_INTEGER, cursor: null,
   })
   const entries = unpagedDirectory.entries.filter(entry =>
-    SUMMARY_PROVIDER_IDS.has(entry.providerId),
+    providerIds.has(entry.providerId),
   )
   const summaryDirectory: ProviderDirectoryView = {
     ...unpagedDirectory,
@@ -3062,6 +3070,21 @@ function getModelAccessError(input: {
   return null
 }
 
+function catalogTimeoutDiagnostic(
+  prefix: string,
+  progress: OpenCodeInventoryProbeProgressTracker,
+): string {
+  const snapshot = progress.snapshot()
+  let message = snapshot.currentStep
+    ? `${prefix} during ${snapshot.currentStep} (${snapshot.currentStepElapsedMs}ms)`
+    : prefix
+  if (snapshot.completedSteps.length > 0) {
+    message += `; completed: ${snapshot.completedSteps
+      .map(step => `${step.label} (${step.durationMs}ms)`).join(', ')}`
+  }
+  return message
+}
+
 export class OpenCodeProviderManagementAdapter
   implements
     ProviderManagementQueryPort,
@@ -3254,7 +3277,7 @@ export class OpenCodeProviderManagementAdapter
   ): Promise<OpenCodeInventorySnapshot> {
     const canonicalProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const abortController = new AbortController()
-    const progress = createOpenCodeInventoryProbeProgressTracker()
+    const progress = options?.progress ?? createOpenCodeInventoryProbeProgressTracker()
     const abortFromCaller = () => abortController.abort(options?.abortSignal?.reason)
     options?.abortSignal?.addEventListener('abort', abortFromCaller, { once: true })
     if (options?.abortSignal?.aborted) abortFromCaller()
@@ -3611,6 +3634,7 @@ export class OpenCodeProviderManagementAdapter
       prewarmManagedSubscriptionPlugins?: boolean
       abortSignal?: AbortSignal
       catalogFailureSanitization?: boolean
+      progress?: OpenCodeInventoryProbeProgressTracker
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3633,6 +3657,7 @@ export class OpenCodeProviderManagementAdapter
         mode: options.inventoryMode ?? 'full',
         profileScope: options.profileScope,
         abortSignal: options.abortSignal,
+        progress: options.progress,
       })
       if (!inventory.detected) {
         return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
@@ -3645,6 +3670,7 @@ export class OpenCodeProviderManagementAdapter
             : inventory.probeError ?? 'OpenCode inventory probe timed out',
         )
       }
+      const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
       host = await hostManager.ensureHost({
         projectPath: projectPath ?? inventory.projectPath,
         preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
@@ -3654,9 +3680,12 @@ export class OpenCodeProviderManagementAdapter
         prewarmManagedSubscriptionPlugins: options.prewarmManagedSubscriptionPlugins,
         abortSignal: options.abortSignal,
       })
+      leaveHostStep?.()
+      const leaveLeaseStep = options.progress?.enterStep('retain catalog host lease')
       if (hostLifetime === 'persistent') {
         hostLease = await this.retainProviderManagementHost(hostManager, host)
       }
+      leaveLeaseStep?.()
       const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
       return await raceOpenCodeAbortSignal(
         run({ inventory, inventoryService, host, client }),
@@ -3672,12 +3701,14 @@ export class OpenCodeProviderManagementAdapter
       )
     } finally {
       if (host) {
+        const leaveReleaseStep = options.progress?.enterStep('release catalog host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, {
             keepPersistentAlive: hostLifetime === 'persistent',
           })
           .catch(() => undefined)
+        leaveReleaseStep?.()
       }
     }
   }
@@ -4076,6 +4107,29 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+    const deadline = new OpenCodeRuntimeDeadline(
+      this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+    )
+    const progress = createOpenCodeInventoryProbeProgressTracker()
+    try {
+      return await raceOpenCodeAbortSignal(this.loadModelsWithinDeadline(input, deadline, progress), deadline.signal)
+    } catch {
+      return providerManagementError(
+        'runtime-unhealthy',
+        deadline.signal.aborted
+          ? catalogTimeoutDiagnostic(`OpenCode catalog overall deadline exceeded after ${deadline.commandBudgetMs}ms`, progress)
+          : OPEN_CODE_CATALOG_FAILURE_MESSAGE,
+      )
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async loadModelsWithinDeadline(
+    input: LoadProviderModelsInput,
+    deadline: OpenCodeRuntimeDeadline,
+    progress: OpenCodeInventoryProbeProgressTracker,
+  ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
     const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
     if (!providerId) {
       return providerManagementError('provider-missing', 'Provider id is invalid')
@@ -4084,12 +4138,14 @@ export class OpenCodeProviderManagementAdapter
     let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
     let canonicalProjectPath: string
     try {
-      canonicalProjectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
-      profileScope = await resolveOpenCodeProfileScope({
+      canonicalProjectPath = await raceOpenCodeAbortSignal(
+        canonicalizeOpenCodeProjectPath(input.projectPath), deadline.signal,
+      )
+      profileScope = await raceOpenCodeAbortSignal(resolveOpenCodeProfileScope({
         projectPath: canonicalProjectPath,
         purpose: 'catalog',
         selectedModel: `${providerId}/catalog`,
-      })
+      }), deadline.signal)
     } catch (error) {
       return providerManagementError(
         'runtime-unhealthy',
@@ -4106,11 +4162,11 @@ export class OpenCodeProviderManagementAdapter
     this.catalogGenerationByScope.set(scopeKey, generation)
     let prePreparationIdentity: CatalogIdentity
     try {
-      prePreparationIdentity = await this.readCatalogIdentity({
+      prePreparationIdentity = await raceOpenCodeAbortSignal(this.readCatalogIdentity({
         projectPath: canonicalProjectPath,
         providerId,
         expectedScope: profileScope,
-      })
+      }), deadline.signal)
     } catch {
       return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
     }
@@ -4122,6 +4178,16 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
     }
     const abortController = new AbortController()
+    const abortFromDeadline = () => {
+      abortController.abort(deadline.signal.reason)
+      if (this.catalogGenerationByScope.get(scopeKey) === generation) {
+        this.catalogGenerationByScope.set(scopeKey, generation + 1)
+      }
+    }
+    deadline.signal.addEventListener('abort', abortFromDeadline, { once: true })
+    if (deadline.signal.aborted) abortFromDeadline()
+    const timeoutMs = this.deps.catalogTimeoutMs ?? 15_000
+    let timeoutMessage = `OpenCode catalog refresh timed out after ${timeoutMs}ms`
     const render = (entry: ProviderCatalogCacheEntry, stale: boolean) => buildProviderModelsView({
       providerId,
       inventory: entry.inventory,
@@ -4131,20 +4197,50 @@ export class OpenCodeProviderManagementAdapter
       limit: input.limit,
       cursor: input.cursor,
       diagnostics: stale
-        ? [...entry.diagnostics, 'OpenCode catalog refresh timed out; showing stale selectable evidence.']
+        ? [...entry.diagnostics, `${timeoutMessage}; showing stale selectable evidence.`]
         : entry.diagnostics,
       managedModelLimitOverrides: entry.managedModelLimitOverrides,
     })
+    const readReusableStaleCatalog = async () => {
+      let identityTimeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        const identity = await Promise.race([
+          this.readCatalogIdentity({
+            projectPath: input.projectPath ?? canonicalProjectPath,
+            providerId,
+            expectedScope: profileScope,
+          }).catch(() => null),
+          new Promise<null>(resolve => {
+            identityTimeout = setTimeout(() => resolve(null), CATALOG_IDENTITY_RECHECK_TIMEOUT_MS)
+          }),
+        ])
+        return identity?.reusable
+          && identity.managedAuthConsistent
+          && identity.key === prePreparationIdentity.key
+          ? this.catalogCache.get(identity.key)
+          : undefined
+      } finally {
+        if (identityTimeout) clearTimeout(identityTimeout)
+      }
+    }
+    let catalogInstanceStarted = false
+    let startPhaseTimeout = (_phase: 'instance' | 'query'): void => {}
     const operation = this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
       async ({ inventory, client }) => {
+        catalogInstanceStarted = true
+        // Native cold startup owns the existing host budget, not the query budget.
+        deadline.throwIfExpired()
+        startPhaseTimeout('instance')
+        const leaveIdentityStep = progress.enterStep('verify prepared catalog identity')
         const identity = await this.readCatalogIdentity({
           projectPath: canonicalProjectPath,
           providerId,
           expectedScope: profileScope,
           expectedBinaryPath: inventory.binaryPath,
         })
+        leaveIdentityStep()
         if (!identity.reusable) {
           return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
         }
@@ -4154,14 +4250,24 @@ export class OpenCodeProviderManagementAdapter
         ) {
           return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
         }
+        // Health only proves the server is listening. Its first directory-scoped
+        // request also initializes plugins/config, so do that once under the
+        // startup phase, without consuming the subsequent query's budget.
+        const leaveInstanceStep = progress.enterStep('initialize catalog instance and read config providers')
+        const configProvidersResult = await safeRead(() => client.getConfigProviders({ initializeInstance: true }))
+        leaveInstanceStep()
+        if (abortController.signal.aborted) throwOpenCodeAbortReason(abortController.signal)
+        deadline.throwIfExpired()
+        startPhaseTimeout('query')
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
-        const [configProvidersResult, providersResult, preferencesResult] = await Promise.all([
-          safeRead(() => client.getConfigProviders()),
+        const leaveHttpStep = progress.enterStep('read catalog HTTP endpoints and preferences')
+        const [providersResult, preferencesResult] = await Promise.all([
           safeRead(() => client.getProviders()),
           managedPreferencesResult,
         ])
+        leaveHttpStep()
         const diagnostics = [
           ...inventory.diagnostics,
           ...safeReadDiagnostics(configProvidersResult),
@@ -4198,12 +4304,14 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
+        const leavePublishStep = progress.enterStep('verify catalog publish identity')
         const publishIdentity = await this.readCatalogIdentity({
           projectPath: canonicalProjectPath,
           providerId,
           expectedScope: profileScope,
           expectedBinaryPath: inventory.binaryPath,
         }).catch(() => null)
+        leavePublishStep()
         if (
           !publishIdentity?.reusable
           || !publishIdentity.managedAuthConsistent
@@ -4233,44 +4341,52 @@ export class OpenCodeProviderManagementAdapter
         prewarmManagedSubscriptionPlugins: false,
         abortSignal: abortController.signal,
         catalogFailureSanitization: true,
+        progress,
       },
     )
-    const timeoutMs = this.deps.catalogTimeoutMs ?? 15_000
     let timeout: ReturnType<typeof setTimeout> | undefined
-    const result = await Promise.race([
-      operation.then(value => abortController.signal.aborted
-        ? new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(() => {})
-        : value),
+    try {
+    return await raceOpenCodeAbortSignal(Promise.race([
+      operation.then(async value => {
+        if (abortController.signal.aborted) {
+          return new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(() => {})
+        }
+        if (!value.ok && value.error.code === 'runtime-unhealthy' && !catalogInstanceStarted
+          && this.catalogGenerationByScope.get(scopeKey) === generation) {
+          const cached = await readReusableStaleCatalog()
+          if (cached && !abortController.signal.aborted && deadline.remainingMs() > 0
+            && this.catalogGenerationByScope.get(scopeKey) === generation) {
+            timeoutMessage = catalogTimeoutDiagnostic('OpenCode catalog preparation or host startup failed', progress)
+            return { ok: true as const, value: { ...render(cached, true), catalogState: 'stale' as const } }
+          }
+        }
+        return value
+      }),
       new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(resolve => {
+        startPhaseTimeout = phase => {
+        if (abortController.signal.aborted) return
+        if (timeout) clearTimeout(timeout)
+        const phaseTimeoutMs = phase === 'instance'
+          ? this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          : timeoutMs
+        timeoutMessage = phase === 'instance'
+          ? `OpenCode catalog instance initialization timed out after ${phaseTimeoutMs}ms`
+          : `OpenCode catalog refresh timed out after ${phaseTimeoutMs}ms`
         timeout = setTimeout(async () => {
-          abortController.abort(new Error(`OpenCode catalog refresh timed out after ${timeoutMs}ms`))
-          if (this.catalogGenerationByScope.get(scopeKey) === generation) {
+          timeoutMessage = catalogTimeoutDiagnostic(timeoutMessage, progress)
+          abortController.abort(new Error(timeoutMessage))
+          const ownsGeneration = this.catalogGenerationByScope.get(scopeKey) === generation
+          if (ownsGeneration) {
             this.catalogGenerationByScope.set(scopeKey, generation + 1)
           }
-          let identityTimeout: ReturnType<typeof setTimeout> | undefined
-          const timeoutIdentity = await Promise.race([
-            this.readCatalogIdentity({
-              projectPath: input.projectPath ?? canonicalProjectPath,
-              providerId,
-              expectedScope: profileScope,
-            }).catch(() => null),
-            new Promise<null>(resolve => {
-              identityTimeout = setTimeout(() => resolve(null), CATALOG_IDENTITY_RECHECK_TIMEOUT_MS)
-            }),
-          ])
-          if (identityTimeout) clearTimeout(identityTimeout)
+          const cached = await readReusableStaleCatalog()
           let cleanupTimeout: ReturnType<typeof setTimeout> | undefined
           await Promise.race([
             operation.then(() => undefined),
             new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
           ])
           if (cleanupTimeout) clearTimeout(cleanupTimeout)
-          const cached = timeoutIdentity?.reusable
-            && timeoutIdentity.managedAuthConsistent
-            && timeoutIdentity.key === prePreparationIdentity.key
-            ? this.catalogCache.get(timeoutIdentity.key)
-            : undefined
-          resolve(cached
+          resolve(cached && ownsGeneration && this.catalogGenerationByScope.get(scopeKey) === generation + 1
             ? {
                 ok: true,
                 value: {
@@ -4280,13 +4396,16 @@ export class OpenCodeProviderManagementAdapter
               }
             : providerManagementError(
                 'runtime-unhealthy',
-                `OpenCode catalog refresh timed out after ${timeoutMs}ms`,
+                timeoutMessage,
               ))
-        }, timeoutMs)
+        }, phaseTimeoutMs)
+        }
       }),
-    ])
-    if (timeout) clearTimeout(timeout)
-    return result
+    ]), deadline.signal)
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      deadline.signal.removeEventListener('abort', abortFromDeadline)
+    }
   }
 
   async connectWithApiKey(

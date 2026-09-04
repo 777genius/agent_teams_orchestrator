@@ -1463,6 +1463,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'kimi-for-coding',
       'kiro',
       'minimax-coding-plan',
+      'opencode',
       'xai',
       'xiaomi-token-plan-ams',
       'xiaomi-token-plan-cn',
@@ -1508,6 +1509,72 @@ describe('OpenCodeProviderManagementAdapter', () => {
       state: 'connected',
       metadata: { configuredAuthless: true },
     })
+  })
+
+  test('summary includes credential and configured sources plus free Zen without a live catalog', async () => {
+    const projectPath = '/tmp/summary-sandbox-project'
+    const probeCalls: unknown[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (requestedProjectPath, options) => {
+          probeCalls.push({ projectPath: requestedProjectPath, ...options })
+          return inventory({
+            projectPath,
+            profile: {
+              ...inventory().profile!,
+              managedConfig: {
+                provider: {
+                  'project-local': { name: 'Project Local', models: { local: {} } },
+                  'custom-remote': { name: 'Custom Remote', options: { apiKey: 'fixture-key' } },
+                  'invalid/provider': { models: { hidden: {} } },
+                  malformed: null,
+                },
+              },
+            },
+            connectedProviders: ['google', 'openai', 'openrouter'].map(id => ({
+              id, source: 'credentials', authHint: 'api', credentialScopes: ['local'],
+            })),
+            availableProviders: ['unconnected-models-dev-provider'],
+            models: [],
+            modelMetadata: [],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { throw new Error('Summary must not start a host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => { throw new Error('Summary must not read a live catalog') },
+      },
+    })
+    const input = { runtimeId: 'opencode' as const, projectPath, summary: true, limit: 100 }
+    const result = await adapter.loadDirectory(input)
+    expect(probeCalls).toHaveLength(1)
+    expect(probeCalls[0]).toMatchObject({
+      projectPath, mode: 'summary', bypassCache: false, refreshModels: false, includeAppMcp: false,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const entry = (id: string) => result.value.entries.find(value => value.providerId === id)
+    for (const id of ['google', 'openai', 'openrouter']) {
+      expect(entry(id)).toMatchObject({ state: 'connected', modelCount: null, ownership: ['local'] })
+    }
+    expect(entry('opencode')).toMatchObject({ displayName: 'OpenCode Zen', state: 'not-connected', modelCount: null })
+    expect(entry('project-local')).toMatchObject({ displayName: 'Project Local', modelCount: 1 })
+    expect(entry('project-local')?.sources).toContain('config-provider')
+    expect(entry('custom-remote')).toMatchObject({ displayName: 'Custom Remote', state: 'not-connected' })
+    for (const id of ['unconnected-models-dev-provider', 'invalid/provider', 'malformed']) {
+      expect(entry(id)).toBeUndefined()
+    }
+    const configured = await adapter.loadDirectory({ ...input, filter: 'configured' })
+    expect(configured.ok && configured.value.entries.map(value => value.providerId).sort())
+      .toEqual(['custom-remote', 'project-local'])
+    const searched = await adapter.loadDirectory({ ...input, query: 'openai' })
+    expect(searched.ok && searched.value.entries.map(value => value.providerId)).toEqual(['openai'])
+    const paged = await adapter.loadDirectory({ ...input, limit: 2 })
+    expect(paged.ok && paged.value.returnedCount).toBe(2)
+    expect(paged.ok && paged.value.totalCount).toBe(result.value.totalCount)
   })
 
   test('does not infer companion connectivity from summary config alone', async () => {
@@ -7622,6 +7689,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(stale.ok).toBe(true)
     if (!stale.ok) return
     expect(stale.value).toMatchObject({ catalogState: 'stale' })
+    expect(stale.value.diagnostics.join(' ')).toContain('during read catalog HTTP endpoints and preferences')
     expect(stale.value.models.map(model => model.modelId)).toEqual(['local/initial'])
     expect(diagnosticSecrets.every(secret => !JSON.stringify(stale).includes(secret))).toBe(true)
     expect(requestSignal?.aborted).toBe(true)
@@ -7650,6 +7718,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let hostStarts = 0
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 500,
+      catalogOverallTimeoutMs: 500,
       inventoryTimeoutMs: 5_000,
       resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
       resolveBinaryIdentity: async () => 'binary-a',
@@ -7661,6 +7730,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       inventoryService: {
         probe: async (_projectPath, options) => new Promise<OpenCodeInventorySnapshot>((_resolve, reject) => {
+          const leaveFingerprint = options?.progress?.enterStep('fingerprint project behavior')
+          leaveFingerprint?.()
+          options?.progress?.enterStep('reconcile managed auth stores')
           options?.abortSignal?.addEventListener('abort', () => {
             rejectionObserved = true
             reject(new Error('inventory rejected during abort cleanup'))
@@ -7685,9 +7757,107 @@ describe('OpenCodeProviderManagementAdapter', () => {
       runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
     })
     expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error.message).toContain('during reconcile managed auth stores')
+      expect(result.error.message).toContain('completed: fingerprint project behavior (')
+      expect(result.error.message).not.toContain('inventory rejected during abort cleanup')
+    }
     expect(rejectionObserved).toBe(true)
     expect(hostStarts).toBe(0)
   })
+
+  for (const phaseCase of ['slow host succeeds', 'slow instance succeeds', 'instance is bounded', 'query is bounded', 'host is bounded', 'overall rejects late publication'] as const) {
+    test(`catalog phase budget: ${phaseCase}`, async () => {
+      let requestSignal: AbortSignal | undefined
+      let releaseCount = 0
+      let providersRead = 0
+      let resolveInstance!: (value: { providers: []; default: {} }) => void
+      const lateInstance = new Promise<{ providers: []; default: {} }>(resolve => { resolveInstance = resolve })
+      const providerResult = { all: [{ id: 'local', name: 'Local', models: { ready: {} } }], connected: [], default: {} }
+      let resolveLate!: (value: typeof providerResult) => void
+      const lateResult = new Promise<typeof providerResult>(resolve => { resolveLate = resolve })
+      const adapter = new OpenCodeProviderManagementAdapter({
+        catalogTimeoutMs: phaseCase === 'overall rejects late publication' ? 500 : 20,
+        catalogInstanceTimeoutMs: phaseCase === 'instance is bounded' ? 20 : 500,
+        catalogOverallTimeoutMs: phaseCase === 'host is bounded' || phaseCase === 'overall rejects late publication' ? 50 : 500,
+        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryIdentity: async () => 'test-binary',
+        profileManager: {
+          listManagedAuthPaths: async () => [],
+          readCatalogSelectedAuthIdentity: async () => ({
+            source: 'absent', managed: 'absent', preferences: 'known:preferences',
+          }),
+        },
+        inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+        hostManager: {
+          ensureHost: async options => {
+            requestSignal = options.abortSignal
+            if (phaseCase === 'host is bounded') {
+              return new Promise((_resolve, reject) => options.abortSignal?.addEventListener(
+                'abort', () => reject(options.abortSignal?.reason), { once: true },
+              ))
+            }
+            await new Promise(resolve => setTimeout(resolve, phaseCase === 'overall rejects late publication' ? 1 : 60))
+            return host()
+          },
+          releaseHost: async () => { releaseCount += 1 },
+        },
+        clientFactory: { create: () => ({
+          getConfigProviders: async options => {
+            expect(options).toEqual({ initializeInstance: true })
+            if (phaseCase === 'instance is bounded') return lateInstance
+            if (phaseCase === 'slow instance succeeds') await new Promise(resolve => setTimeout(resolve, 60))
+            return { providers: [], default: {} }
+          },
+          getProviders: async () => {
+            providersRead += 1
+            return phaseCase === 'query is bounded'
+              ? new Promise<never>(() => {})
+              : phaseCase === 'overall rejects late publication' ? lateResult : providerResult
+          },
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+      // Phase timing is independent of filesystem identity throughput. Identity
+      // invalidation is exercised by the adjacent auth/config/symlink tests.
+      const timingAdapter = adapter as unknown as {
+        readCatalogIdentity(): Promise<{
+          key: string; reusable: boolean; managedAuthConsistent: boolean; managedAuthAbsent: boolean
+        }>
+      }
+      timingAdapter.readCatalogIdentity = async () => ({
+        key: 'phase-budget-fixture', reusable: true, managedAuthConsistent: true, managedAuthAbsent: true,
+      })
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/project',
+      })
+      if (phaseCase === 'slow host succeeds' || phaseCase === 'slow instance succeeds') {
+        expect(result.ok).toBe(true)
+        expect(result.ok && result.value.models.map(model => model.modelId)).toEqual(['local/ready'])
+        expect(requestSignal?.aborted).toBe(false)
+      } else {
+        expect(result.ok).toBe(false)
+        expect(requestSignal?.aborted).toBe(true)
+        if (!result.ok) expect(result.error.message).toContain(phaseCase === 'host is bounded' || phaseCase === 'overall rejects late publication'
+          ? 'overall deadline exceeded after 50ms'
+          : phaseCase === 'instance is bounded'
+          ? 'initialization timed out after 20ms during initialize catalog instance'
+          : 'timed out after 20ms during read catalog HTTP endpoints')
+      }
+      if (phaseCase === 'overall rejects late publication') {
+        resolveLate(providerResult)
+        await new Promise(resolve => setTimeout(resolve, 20))
+        expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
+      }
+      if (phaseCase === 'instance is bounded') {
+        resolveInstance({ providers: [], default: {} })
+        await new Promise(resolve => setTimeout(resolve, 20))
+        expect(providersRead).toBe(0)
+        expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
+      }
+      expect(releaseCount).toBe(phaseCase === 'host is bounded' ? 0 : 1)
+    })
+  }
 
   test('keeps a late catalog write on symlink target A out of retargeted project B', async () => {
     if (process.platform === 'win32') return
@@ -7934,24 +8104,36 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(probeCalls).toBe(1)
   })
 
-  test.each(['profile preparation', 'host startup'] as const)(
-    'reuses identity-proven stale catalog evidence during early %s timeout',
-    async stage => {
+  test.each((['profile preparation', 'host startup'] as const).flatMap(stage =>
+    (['unchanged', 'auth changed', 'superseded', 'overall expired'] as const).map(evidence => [stage, evidence] as const),
+  ))(
+    'early %s timeout stale evidence: %s',
+    async (stage, evidence) => {
       let blocked = false
+      let authChanged = false
+      const changeEvidence = () => {
+        if (evidence === 'auth changed') authChanged = true
+        if (evidence === 'superseded') {
+          const generations = (adapter as unknown as { catalogGenerationByScope: Map<string, number> }).catalogGenerationByScope
+          for (const [key, value] of generations) generations.set(key, value + 1)
+        }
+      }
       const adapter = new OpenCodeProviderManagementAdapter({
         catalogTimeoutMs: 500,
-        inventoryTimeoutMs: 5_000,
+        inventoryTimeoutMs: evidence === 'overall expired' ? 5_000 : 100,
+        catalogOverallTimeoutMs: evidence === 'overall expired' ? 500 : 5_000,
         resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
         resolveBinaryIdentity: async () => 'binary-a',
         profileManager: {
           listManagedAuthPaths: async () => [],
           readCatalogSelectedAuthIdentity: async () => ({
-            source: 'absent', managed: 'absent', preferences: 'known:preferences-a',
+            source: authChanged ? 'known:changed-source' : 'absent', managed: 'absent', preferences: 'known:preferences-a',
           }),
         },
         inventoryService: {
           probe: async (_projectPath, options) => {
             if (blocked && stage === 'profile preparation') {
+              changeEvidence()
               return new Promise<OpenCodeInventorySnapshot>((_resolve, reject) => {
                 options?.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason), { once: true })
               })
@@ -7962,9 +8144,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
         hostManager: {
           ensureHost: async options => {
             if (blocked && stage === 'host startup') {
-              return new Promise<OpenCodeHostHandle>((_resolve, reject) => {
-                options.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason), { once: true })
-              })
+              changeEvidence()
+              if (evidence === 'overall expired') {
+                return new Promise<OpenCodeHostHandle>((_resolve, reject) => {
+                  options.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason), { once: true })
+                })
+              }
+              // The host manager owns its startup timeout, independently of the query budget.
+              throw new Error('Test host startup deadline exceeded')
             }
             return host()
           },
@@ -7983,8 +8170,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect((await adapter.loadModels(input)).ok).toBe(true)
       blocked = true
       const stale = await adapter.loadModels(input)
-      expect(stale.ok).toBe(true)
+      expect(stale.ok).toBe(evidence === 'unchanged')
       if (stale.ok) expect(stale.value.catalogState).toBe('stale')
+      if (!stale.ok && evidence === 'overall expired') {
+        expect(stale.error.message).toContain('overall deadline exceeded after 500ms')
+      }
     },
   )
 
