@@ -4,6 +4,9 @@ export const OPEN_CODE_READINESS_PHASES = [
   'execution_submit',
   'execution_poll',
   'post_probe_refresh',
+  'stop_abort',
+  'stop_verify',
+  'stop_cleanup',
 ] as const
 
 export type OpenCodeReadinessPhase = typeof OPEN_CODE_READINESS_PHASES[number]

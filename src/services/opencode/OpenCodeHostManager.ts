@@ -1069,27 +1069,41 @@ export class OpenCodeHostManager {
   }
 
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    await this.releaseHostLeaseExact(hostKey, input, false)
+  }
+
+  async releaseHostLeaseStrict(hostKey: string, input: OpenCodeHostLeaseInput): Promise<boolean> {
+    return this.releaseHostLeaseExact(hostKey, input, true)
+  }
+
+  private async releaseHostLeaseExact(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput,
+    strict: boolean,
+  ): Promise<boolean> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
-      return
+      return false
     }
 
-    await this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[hostKey]
       if (!record) {
-        return
+        return false
       }
       const leases = normalizePersistentHostLeases(record.leases)
       const lease = leases[leaseKey]
-      if (!lease) return
+      if (!lease) return false
       const expectedRunId = input.runId?.trim()
       const expectedSessionId = input.sessionId?.trim()
+      if (strict && (!expectedRunId || !expectedSessionId
+        || lease.runId !== expectedRunId || lease.sessionId !== expectedSessionId)) return false
       // Every persisted identity field must be qualified independently. A
       // caller supplying only one identity cannot release a lease qualified by both.
       if ((lease.runId && (!expectedRunId || lease.runId !== expectedRunId))
-        || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return
+        || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return false
       delete leases[leaseKey]
       registry.hosts[hostKey] = {
         ...record,
@@ -1097,6 +1111,7 @@ export class OpenCodeHostManager {
         updatedAt: this.nowIso(),
       }
       await this.writePersistentRegistryUnlocked(registry)
+      return true
     })
   }
 

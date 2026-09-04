@@ -221,6 +221,9 @@ export async function readOpenCodeSseEndpoint(params: {
   let reachedEof = false
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
+  const cancelReader = () => { void reader.cancel(params.signal?.reason).catch(() => undefined) }
+  params.signal?.addEventListener('abort', cancelReader, { once: true })
+  if (params.signal?.aborted) cancelReader()
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -274,6 +277,7 @@ export async function readOpenCodeSseEndpoint(params: {
       )
     }
   } finally {
+    params.signal?.removeEventListener('abort', cancelReader)
     reader.releaseLock()
   }
 

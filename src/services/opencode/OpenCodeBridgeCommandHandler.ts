@@ -55,6 +55,7 @@ import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import { normalizeOpenCodeSessionStatus } from './OpenCodeEventTranslator.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import {
   isOpenCodeStrictSessionCompatible,
@@ -972,7 +973,11 @@ function expectedCapabilitySnapshotId(body: Record<string, unknown>): string | n
     ?? asString(body.expectedCapabilitySnapshotId)
 }
 
-async function probeStoredLaneAuthority(envelope: BridgeEnvelope, command: string) {
+async function probeStoredLaneAuthority(
+  envelope: BridgeEnvelope,
+  command: string,
+  phaseContext?: OpenCodePhaseContext,
+) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
@@ -1001,15 +1006,27 @@ async function probeStoredLaneAuthority(envelope: BridgeEnvelope, command: strin
   }
   const runId = asString(body.runId) ?? asString(body.expectedRunId)
   if (!runId) throw new Error('OpenCode lifecycle authority requires runId')
+  const authorityRecords = command === 'opencode.stopTeam'
+    ? records.filter(record => record.runId === runId)
+    : records
+  if (
+    command === 'opencode.stopTeam'
+    && records.some(record => record.runId !== runId && !isOpenCodeSessionStopped(record))
+  ) {
+    throw new Error('OpenCode lifecycle stored run authority mismatch; another run is active')
+  }
+  if (authorityRecords.length === 0) {
+    throw new Error('OpenCode lifecycle selected run authority is unavailable')
+  }
   const projectPath = await canonicalizeOpenCodeProjectPath(asString(body.projectPath) ?? envelope.cwd)
-  const selectedModel = parseOpenCodeProviderScopedModelRef(records[0].selectedModel)
-  const mode = records[0].toolApprovalMode
-  const scope = records[0].profileScope
+  const selectedModel = parseOpenCodeProviderScopedModelRef(authorityRecords[0].selectedModel)
+  const mode = authorityRecords[0].toolApprovalMode
+  const scope = authorityRecords[0].profileScope
   if (!selectedModel || scope?.purpose !== 'launch_runtime'
     || (mode !== 'auto' && mode !== 'manual')) {
     throw new Error('OpenCode lifecycle selected lane scope is unavailable')
   }
-  for (const record of records) {
+  for (const record of authorityRecords) {
     if (!record.runId || record.runId !== runId) {
       throw new Error('OpenCode lifecycle stored run authority mismatch; relaunch the lane with current runtime')
     }
@@ -1023,25 +1040,30 @@ async function probeStoredLaneAuthority(envelope: BridgeEnvelope, command: strin
       throw new Error('OpenCode lifecycle lane scope is ambiguous')
     }
   }
-  if (command === 'opencode.stopTeam' && records.every(isOpenCodeSessionStopped)) {
-    const authority = records[0].stopAuthority
+  if (command === 'opencode.stopTeam' && authorityRecords.every(isOpenCodeSessionStopped)) {
+    const authority = authorityRecords[0].stopAuthority
     if (!authority || authority.runtime.providerId !== 'opencode'
       || !/^opencode:[a-f0-9]{32}$/.test(authority.runtime.capabilitySnapshotId)
-      || records.some(record => !record.stopAuthority
+      || authorityRecords.some(record => !record.stopAuthority
         || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
         || record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
         || hashStable(record.stopAuthority.runtime) !== hashStable(authority.runtime))
       || expectedCapabilitySnapshotId(body) !== authority.runtime.capabilitySnapshotId
       || (preconditions?.expectedBehaviorFingerprint
-        && records.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
+        && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
       throw new Error('OpenCode confirmed stop authority mismatch')
     }
-    return { snapshot: null, records, confirmedStopRuntime: authority.runtime, release: async () => {} }
+    return {
+      snapshot: null,
+      records: authorityRecords,
+      confirmedStopRuntime: authority.runtime,
+      release: async () => {},
+    }
   }
   const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
-    selectedModel: selectedModel.raw, toolApprovalMode: mode,
+    selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
   })
-  return { snapshot: retained.snapshot, records, release: retained.release }
+  return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
 }
 
 function createBridgeServerIdentity(
@@ -4185,7 +4207,34 @@ async function runReconcile(envelope: BridgeEnvelope) {
   }
 }
 
-async function runStop(envelope: BridgeEnvelope) {
+const OPEN_CODE_STOP_CONCURRENCY = 4
+const OPEN_CODE_STOP_STATUS_ATTEMPTS = 3
+const OPEN_CODE_STOP_STATUS_DELAYS_MS = [100, 250] as const
+const OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS = 1_000
+const OPEN_CODE_STOP_HOST_CLEANUP_RESERVE_MS = 5_000
+
+function isExactStopSession(
+  current: OpenCodeSessionRecord | null,
+  expected: OpenCodeSessionRecord,
+): current is OpenCodeSessionRecord {
+  return current !== null
+    && current.runId === expected.runId
+    && current.opencodeSessionId === expected.opencodeSessionId
+    && current.hostKey === expected.hostKey
+}
+
+function isExactActiveStopSession(
+  current: OpenCodeSessionRecord | null,
+  expected: OpenCodeSessionRecord,
+): current is OpenCodeSessionRecord {
+  return isExactStopSession(current, expected) && !isOpenCodeSessionStopped(current)
+}
+
+async function runStop(
+  envelope: BridgeEnvelope,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+  externalSignal?: AbortSignal,
+) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -4193,9 +4242,18 @@ async function runStop(envelope: BridgeEnvelope) {
   if (!runId || !laneId || !teamId) {
     throw new Error('opencode.stopTeam requires runId, laneId and teamId/teamName')
   }
+  const stopSignal = externalSignal
+    ? AbortSignal.any([runtimeDeadline.signal, externalSignal])
+    : runtimeDeadline.signal
+  const stopPreflightContext: OpenCodePhaseContext = {
+    phase: 'stop_abort',
+    signal: stopSignal,
+    remainingMs: () => runtimeDeadline.remainingMs(),
+    throwIfExpired: () => runtimeDeadline.throwIfExpired('stop_abort'),
+  }
   const retained = expectedCapabilitySnapshotId(body) || asRecord(body.preconditions)
     || body.allowEmptyLaneStop === true
-    ? await probeStoredLaneAuthority(envelope, 'opencode.stopTeam')
+    ? await probeStoredLaneAuthority(envelope, 'opencode.stopTeam', stopPreflightContext)
     : null
   let authorityReleased = false
   const releaseAuthority = async () => {
@@ -4204,42 +4262,268 @@ async function runStop(envelope: BridgeEnvelope) {
     await retained?.release(true)
   }
   try {
-  const records = retained?.records ?? (await openCodeSessionStore.list()).filter(
+  const laneRecords = retained?.records ?? (await openCodeSessionStore.list()).filter(
     record => record.teamId === teamId && record.laneId === laneId,
   )
+  const conflictingActiveRecords = laneRecords.filter(
+    record => record.runId !== runId && !isOpenCodeSessionStopped(record),
+  )
+  if (conflictingActiveRecords.length > 0) {
+    const diagnostics = [teamDiagnostic(
+      'opencode_stop_identity_changed',
+      `OpenCode lane ${teamId}/${laneId} belongs to another active run`,
+      'error',
+    )]
+    return {
+      snapshot: retained?.snapshot ?? null,
+      confirmedStopRuntime: retained?.confirmedStopRuntime,
+      data: {
+        runId,
+        stopped: false,
+        members: {},
+        warnings: [],
+        diagnostics,
+        manifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+        runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+      },
+    }
+  }
+  const records = laneRecords.filter(record => record.runId === runId)
   const snapshot = retained ? retained.snapshot
-    : records.length ? await openCodeProvisioningProbe.probe(envelope.cwd) : null
+    : records.length ? await openCodeProvisioningProbe.probe(envelope.cwd, {
+      phaseContext: stopPreflightContext,
+    }) : null
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot, { confirmedStopRuntime: retained?.confirmedStopRuntime }),
   })
-  const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   const diagnostics: TeamDiagnostic[] = []
-  for (const record of records) {
+  const requestOptions = {
+    signal: stopSignal,
+    remainingMs: () => runtimeDeadline.remainingMs(),
+  }
+  const memberResults = await mapWithConcurrency(
+    records,
+    OPEN_CODE_STOP_CONCURRENCY,
+    async record => {
     let stopped = false
     const memberDiagnostics: string[] = []
     try {
       if (isOpenCodeSessionStopped(record)) {
         stopped = true
-      } else if (await openCodeSessionBridge.abort(record)) {
+      } else {
+        runtimeDeadline.throwIfExpired('stop_abort')
+        const beforeAbort = await raceOpenCodeAbortSignal(
+          openCodeSessionStore.get(teamId, laneId, record.memberName),
+          stopSignal,
+        )
+        if (!isExactStopSession(beforeAbort, record)) {
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before abort`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before abort')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        const stopObserver = await runtimeDeadline.runPhase(
+          'stop_verify',
+          () => openCodeSessionBridge.observeStopIdle(record, requestOptions),
+        )
+        try {
+          runtimeDeadline.throwIfExpired('stop_abort')
+          const finalBeforeAbort = await raceOpenCodeAbortSignal(
+            openCodeSessionStore.get(teamId, laneId, record.memberName),
+            stopSignal,
+          )
+          if (!isExactStopSession(finalBeforeAbort, record)) {
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_identity_changed',
+              `${record.memberName}: session identity changed before abort`,
+              'error',
+            ))
+            memberDiagnostics.push('identity changed before abort')
+            return { record, stopped: false, diagnostics: memberDiagnostics }
+          }
+          stopObserver.arm()
+          const abortAccepted = await runtimeDeadline.runPhase(
+            'stop_abort',
+            () => openCodeSessionBridge.abort(record, requestOptions),
+          )
+        let observedStatus: 'idle' | 'busy' | 'retry' | 'missing' | 'unrecognized' = 'missing'
+        for (let attempt = 0; attempt < OPEN_CODE_STOP_STATUS_ATTEMPTS; attempt += 1) {
+          runtimeDeadline.throwIfExpired('stop_verify')
+          if (await stopObserver.waitForIdle(0)) {
+            observedStatus = 'idle'
+            break
+          }
+          const rawStatus = await runtimeDeadline.runPhase(
+            'stop_verify',
+            () => openCodeSessionBridge.getRawStatus(record, requestOptions),
+          )
+          const normalized = normalizeOpenCodeSessionStatus(rawStatus)
+          observedStatus = rawStatus === null
+            ? 'missing'
+            : normalized.status ?? 'unrecognized'
+          if (observedStatus === 'idle') break
+          const delayMs = Math.min(
+            OPEN_CODE_STOP_STATUS_DELAYS_MS[attempt] ?? 500,
+            runtimeDeadline.remainingMs(),
+          )
+          if (delayMs <= 0) runtimeDeadline.throwIfExpired('stop_verify')
+          if (await stopObserver.waitForIdle(delayMs)) {
+            observedStatus = 'idle'
+            break
+          }
+        }
+        if (observedStatus !== 'idle') {
+          if (!abortAccepted) {
+            memberDiagnostics.push('abort rejected')
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_abort_rejected',
+              `${record.memberName}: OpenCode abort was rejected`,
+              'warning',
+            ))
+          }
+          const statusReason = observedStatus === 'busy'
+            ? 'still busy'
+            : observedStatus === 'retry'
+              ? 'retrying'
+              : observedStatus === 'missing'
+                ? 'status missing'
+                : 'status unrecognized'
+          memberDiagnostics.push(statusReason)
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_status_unconfirmed',
+            `${record.memberName}: ${statusReason}`,
+            'warning',
+          ))
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        if (!abortAccepted) memberDiagnostics.push('already idle')
+        runtimeDeadline.throwIfExpired('stop_cleanup')
+        const beforeConfirmation = await raceOpenCodeAbortSignal(
+          openCodeSessionStore.get(teamId, laneId, record.memberName),
+          stopSignal,
+        )
+        if (!isExactStopSession(beforeConfirmation, record)) {
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before confirmation`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before confirmation')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        if (stopObserver.currentStatus() === 'busy' || stopObserver.currentStatus() === 'retry') {
+          const reason = stopObserver.currentStatus() === 'busy' ? 'still busy' : 'retrying'
+          memberDiagnostics.push(reason)
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_status_unconfirmed',
+            `${record.memberName}: ${reason} after idle observation`,
+            'warning',
+          ))
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        if (runtimeDeadline.remainingMs() < OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS) {
+          memberDiagnostics.push('deadline expired')
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_deadline',
+            `${record.memberName}: insufficient budget for strict lease release; remaining=${runtimeDeadline.remainingMs()}ms`,
+            'error',
+          ))
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        // Once the atomic lease mutation starts, await it to completion. Racing an
+        // uncancellable registry write could remove a lease after a timeout response.
         await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
         const runtime = createRuntimeSnapshot(snapshot)
-        const terminal = await openCodeSessionStore.markStoppedIfSession(record,
-          runtime.capabilitySnapshotId && record.expectedBehaviorFingerprint
-            ? { runtime: { ...runtime, capabilitySnapshotId: runtime.capabilitySnapshotId },
-              expectedBehaviorFingerprint: record.expectedBehaviorFingerprint }
-            : undefined)
-        if (!terminal) throw new Error('OpenCode stopped session identity changed before confirmation')
+        let terminal: OpenCodeSessionRecord | null
+        try {
+          terminal = await openCodeSessionStore.markStoppedIfSession(record,
+            runtime.capabilitySnapshotId && record.expectedBehaviorFingerprint
+              ? { runtime: { ...runtime, capabilitySnapshotId: runtime.capabilitySnapshotId },
+                expectedBehaviorFingerprint: record.expectedBehaviorFingerprint }
+              : undefined)
+        } catch (casError) {
+          try {
+            const afterCasFailure = await openCodeSessionStore.get(
+              teamId,
+              laneId,
+              record.memberName,
+            )
+            if (isExactActiveStopSession(afterCasFailure, record)) {
+              await openCodeSessionBridge.restoreSessionLease(record)
+              diagnostics.push(teamDiagnostic(
+                'opencode_stop_lease_restored',
+                `${record.memberName}: restored the exact session lease after terminal CAS failed`,
+                'warning',
+              ))
+            }
+          } catch (compensationError) {
+            const casMessage = casError instanceof Error ? casError.message : String(casError)
+            const compensationMessage = compensationError instanceof Error
+              ? compensationError.message
+              : String(compensationError)
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_compensation_failed',
+              `${record.memberName}: terminal CAS failed (${casMessage}) and exact lease restoration failed (${compensationMessage})`,
+              'error',
+            ))
+            throw new Error(
+              `OpenCode terminal CAS failed: ${casMessage}; lease restoration failed: ${compensationMessage}`,
+              { cause: casError },
+            )
+          }
+          throw casError
+        }
+        if (!terminal) {
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before confirmation`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before confirmation')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
         stopped = true
+        if (runtimeDeadline.remainingMs() <= 0) {
+          stopped = false
+          memberDiagnostics.push('deadline expired')
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_deadline',
+            `${record.memberName}: deadline expired while completing the atomic lease/CAS transition`,
+            'error',
+          ))
+        }
+        } finally {
+          await stopObserver.dispose()
+        }
       }
     } catch (error) {
       stopped = false
-      memberDiagnostics.push(error instanceof Error ? error.message : String(error))
+      if (isOpenCodeRuntimeDeadlineError(error)) {
+        memberDiagnostics.push('deadline expired')
+        diagnostics.push(teamDiagnostic(
+          'opencode_stop_deadline',
+          `${record.memberName}: ${error.message}; remaining=${error.remainingMs}ms`,
+          'error',
+        ))
+      } else {
+        memberDiagnostics.push(error instanceof Error ? error.message : String(error))
+      }
     }
-    members[record.memberName] = {
-      sessionId: record.opencodeSessionId,
-      stopped,
-      diagnostics: memberDiagnostics,
+    return { record, stopped, diagnostics: memberDiagnostics }
+  })
+  if (externalSignal?.aborted) {
+    throwOpenCodeAbortReason(externalSignal)
+  }
+  const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
+  for (const result of memberResults) {
+    members[result.record.memberName] = {
+      sessionId: result.record.opencodeSessionId,
+      stopped: result.stopped,
+      diagnostics: result.diagnostics,
     }
   }
 
@@ -4247,12 +4531,22 @@ async function runStop(envelope: BridgeEnvelope) {
   // Keep the process alive on release so cleanup can honor other lanes' leases.
   await releaseAuthority()
 
+  const cleanupAllowed = runtimeDeadline.remainingMs() >= OPEN_CODE_STOP_HOST_CLEANUP_RESERVE_MS
+    && !stopSignal.aborted
+  if (!cleanupAllowed) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_stop_deadline',
+      `OpenCode host cleanup skipped because only ${runtimeDeadline.remainingMs()}ms remained`,
+      'warning',
+    ))
+  }
+
   const cleanupProjectPaths = new Set(
     records
       .map(record => record.projectPath.trim())
       .filter(projectPath => projectPath.length > 0),
   )
-  for (const projectPath of cleanupProjectPaths) {
+  for (const projectPath of cleanupAllowed ? cleanupProjectPaths : []) {
     try {
       const cleanup = await openCodeHostManager.reconcilePersistentHosts({
         mode: 'stale',
@@ -5440,7 +5734,10 @@ async function handleEnvelope(
     case 'opencode.reconcileTeam':
       return runReconcile(envelope)
     case 'opencode.stopTeam':
-      return runStop(envelope)
+      if (!runtimeDeadline) {
+        throw new Error('OpenCode stop deadline was not initialized')
+      }
+      return runStop(envelope, runtimeDeadline, externalSignal)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery':
@@ -5514,6 +5811,7 @@ export async function executeOpenCodeBridgeCommandEnvelope(
   const runtimeDeadline = (
     envelope.command === 'opencode.readiness'
     || envelope.command === 'opencode.launchTeam'
+    || envelope.command === 'opencode.stopTeam'
   )
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
