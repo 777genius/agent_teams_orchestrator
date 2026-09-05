@@ -34,6 +34,9 @@ concurrency:
 
 env:
   DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
+  # --version reports the Fable 5.1 compatibility workaround, not the 0.0.x release label.
+  # Keep this aligned with scripts/build.ts: https://github.com/777genius/agent-teams-ai/issues/569
+  EXPECTED_CLAUDE_CODE_VERSION: '2.1.251'
 
 jobs:
   prepare-release:
@@ -84,6 +87,11 @@ jobs:
           fi
           if [[ "$target_tag" != "runtime-v${runtime_version}" ]]; then
             echo "Public runtime tag must be runtime-v${runtime_version}, got ${target_tag}" >&2
+            exit 1
+          fi
+          package_version="$(jq -er '.version' package.json)"
+          if [[ "$package_version" != "$runtime_version" ]]; then
+            echo "Runtime package version mismatch: expected $runtime_version, got $package_version" >&2
             exit 1
           fi
 
@@ -193,27 +201,26 @@ jobs:
 
       - name: Verify compiled runtime
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
-        env:
-          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
         run: |
           set -euo pipefail
           actual_version="$(./dist/cli --version | awk '{print $1}')"
-          if [[ "$actual_version" != "$EXPECTED_RUNTIME_VERSION" ]]; then
-            echo "Compiled runtime version mismatch: expected $EXPECTED_RUNTIME_VERSION, got $actual_version" >&2
+          if [[ "$actual_version" != "$EXPECTED_CLAUDE_CODE_VERSION" ]]; then
+            echo "Compiled Claude Code version mismatch: expected $EXPECTED_CLAUDE_CODE_VERSION, got $actual_version" >&2
             exit 1
           fi
           ./dist/cli --version
 
       - name: Verify compiled runtime (Windows)
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
-        env:
-          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: pwsh
         run: |
           $actualVersion = (& .\dist\cli.exe --version).Split(" ")[0]
-          if ($actualVersion -ne $env:EXPECTED_RUNTIME_VERSION) {
-            throw "Compiled runtime version mismatch: expected $env:EXPECTED_RUNTIME_VERSION, got $actualVersion"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compiled runtime --version failed with exit code $LASTEXITCODE"
+          }
+          if ($actualVersion -ne $env:EXPECTED_CLAUDE_CODE_VERSION) {
+            throw "Compiled Claude Code version mismatch: expected $env:EXPECTED_CLAUDE_CODE_VERSION, got $actualVersion"
           }
           .\dist\cli.exe --version
           node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
