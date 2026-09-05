@@ -344,7 +344,8 @@ export function canonicalHostedApprovalJson(value: unknown): string {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalHostedApprovalJson).join(',')}]`
   const record = value as Record<string, unknown>
-  return `{${Object.keys(record).filter(key => record[key] !== undefined).sort().map(key =>
+  return `{${Object.keys(record).filter(key => record[key] !== undefined).sort((a, b) =>
+    Buffer.from(a).compare(Buffer.from(b))).map(key =>
     `${JSON.stringify(key)}:${canonicalHostedApprovalJson(record[key])}`,
   ).join(',')}}`
 }

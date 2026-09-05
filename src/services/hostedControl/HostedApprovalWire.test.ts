@@ -238,6 +238,15 @@ describe('HostedApprovalWireDispatcher', () => {
       ownerId: 'owner_approval-wire', leaseToken: 'lease_approval-wire',
       leaseDurationMs: 30_000, limit: 1,
     })).rejects.toThrow('payload')
+
+    for (const changed of [
+      { ...ingressRecord(), outboxVersion: 1 },
+      { ...ingressRecord(), deliveryRef: `delivery_ref_opencode-${'6'.repeat(64)}` },
+    ]) {
+      await expect(dispatch(dispatcher({
+        ...ports(), claimIngress: async () => [changed as never],
+      }), 'approval_ingress_claim', claimRequest())).rejects.toThrow()
+    }
   })
 
   test('never serializes a stable delivery ID fingerprint conflict', async () => {
@@ -433,10 +442,14 @@ describe('HostedApprovalWireDispatcher', () => {
   test('accepts a maximal aggregate claim below the reserved frame budget', async () => {
     const records = Array.from({ length: 30 }, (_, index) => {
       const hex = index.toString(16).padStart(64, '0')
+      const deliveryRef = `delivery_ref_opencode-${hex}`
+      const base = ingressRecord('\\'.repeat(64 * 1024), `record ${index}`)
       return {
-        ...ingressRecord('\\'.repeat(64 * 1024), `record ${index}`),
+        ...base,
         outboxId: `runtime_permission:effect:${hex}`,
         effectRef: `effect:${hex}`,
+        deliveryRef,
+        payloadJson: JSON.stringify({ ...JSON.parse(base.payloadJson), deliveryRef }),
       }
     })
     expect(Buffer.byteLength(JSON.stringify(records), 'utf8'))
@@ -562,9 +575,9 @@ function alternateAuthorityField(field: keyof HostedApprovalIngressAuthority): s
 }
 
 function ingressRecord(content = 'bun test', summary = 'Run the bounded test command?') {
-  const deliveryRef = 'delivery_ref_approval-wire'
+  const deliveryRef = `delivery_ref_opencode-${'5'.repeat(64)}`
   return {
-    outboxVersion: 1 as const,
+    outboxVersion: 2 as const,
     outboxId: `runtime_permission:effect:${'5'.repeat(64)}`,
     commandId: 'request_approval-wire',
     effectRef: `effect:${'5'.repeat(64)}`,

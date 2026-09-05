@@ -35,17 +35,17 @@ export class HostedApprovalOwnerStore {
       const retiredIngress = [...retiredByOutbox.values()]
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
       const published = await this.wal.publish(state, {
-        schemaVersion: 2, admissionGeneration: admission.admissionGeneration,
+        schemaVersion: 3, admissionGeneration: admission.admissionGeneration,
         admissionDigest: admission.digest, routes: [...admission.routes],
         actorMembers: { ...admission.actorMembers }, ingress, retiredIngress,
-        deliveries: state?.deliveries ?? [],
+        bindings: state?.bindings ?? [], deliveries: state?.deliveries ?? [],
       })
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
       return published
     })
   }
 
-  admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay'> {
+  admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay' | 'quarantined'> {
     return this.wal.locked(async state => {
       if (!state || state.admissionDigest !== admission.digest || !(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
       const route = admission.routes.find(route => isDeepStrictEqual(route.authority, record.authority))
@@ -58,8 +58,30 @@ export class HostedApprovalOwnerStore {
         if (!isDeepStrictEqual(intent(prior), intent(record))) throw new Error('Hosted approval ingress conflict')
         return 'replay'
       }
+      const digest = record.outboxId.slice('runtime_permission:effect:'.length)
+      const sameTuple = state.bindings.filter(binding => binding.teamId === record.authority.teamId &&
+        binding.runId === record.authority.runId && binding.requestId === record.commandId)
+      const sameSemantic = sameTuple.filter(binding => binding.effectRef === null || binding.effectRef === record.effectRef)
+      const exactBinding = sameSemantic.find(binding => binding.effectRef === record.effectRef &&
+        binding.bindingDigest === digest && !binding.quarantined)
+      // The full acknowledged ingress may have aged out, but the permanent
+      // exposure ledger still makes the exact private intent an idempotent replay.
+      if (exactBinding) return 'replay'
+      if (sameSemantic.length > 0) {
+        if (!sameSemantic.some(binding => binding.effectRef === record.effectRef && binding.bindingDigest === digest)) {
+          if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
+          await this.wal.publish(state, { ...withoutRevision(state), bindings: [...state.bindings, {
+            teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
+            effectRef: record.effectRef, bindingDigest: digest, quarantined: true,
+          }] })
+        }
+        return 'quarantined'
+      }
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
-      await this.wal.publish(state, { ...withoutRevision(state), ingress: [...state.ingress, record] })
+      await this.wal.publish(state, { ...withoutRevision(state), ingress: [...state.ingress, record], bindings: [...state.bindings, {
+        teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
+        effectRef: record.effectRef, bindingDigest: digest, quarantined: false,
+      }] })
       return 'admitted'
     })
   }
@@ -164,7 +186,7 @@ export class HostedApprovalOwnerStore {
 export function withoutRevision(state: HostedApprovalOwnerState): Omit<HostedApprovalOwnerState, 'revision' | 'writerFence'> {
   const { revision: _revision, writerFence: _writerFence, ...rest } = state; return rest
 }
-function intent(record: HostedApprovalIngressRecord): unknown {
+function intent(record: HostedApprovalIngressRecord | HostedApprovalOwnerState['retiredIngress'][number]): unknown {
   const { lease: _lease, acknowledgedAtIso: _ack, observedAtIso: _observed, acceptedAtIso: _accepted, ...rest } = record
   return rest
 }

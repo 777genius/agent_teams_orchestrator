@@ -635,6 +635,12 @@ describe('OpenCodeClientFactory permissions API', () => {
     })).toBe('04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca')
     expect(canonicalHostedApprovalDigest({ a: 1, omitted: undefined }))
       .toBe(canonicalHostedApprovalDigest({ a: 1 }))
+    expect(canonicalHostedApprovalDigest({ '\u{10000}': 1, '\uE000': 2 }))
+      .toBe('daec79d8b6582badd3b46bd783a72379bc0b5ae29f5d59f6133025aad69bc8d4')
+    expect(canonicalHostedApprovalDigest({ '\uE000': 2, '\u{10000}': 1 }))
+      .toBe(canonicalHostedApprovalDigest({ '\u{10000}': 1, '\uE000': 2 }))
+    expect(canonicalHostedApprovalDigest({ '\uE001': 2, '\u{10000}': 1 }))
+      .not.toBe(canonicalHostedApprovalDigest({ '\uE000': 2, '\u{10000}': 1 }))
   })
 
   test('lists experimental tool ids from the OpenCode endpoint used by readiness', async () => {

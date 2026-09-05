@@ -2,7 +2,11 @@ import { describe, expect, test } from 'bun:test'
 
 import type { OpenCodeNormalizedPermission, OpenCodeSessionRecord } from '../opencode/types.js'
 import { canonicalHostedApprovalDigest } from '../opencode/OpenCodeClientFactory.js'
-import { OpenCodePermissionEffectNotAuthorizedError, type OpenCodePermissionEffectContext } from '../opencode/OpenCodeSessionBridge.js'
+import {
+  OpenCodePermissionEffectNotAuthorizedError,
+  type OpenCodeHostedApprovalObservedPermission,
+  type OpenCodePermissionEffectContext,
+} from '../opencode/OpenCodeSessionBridge.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import {
   fingerprintOpenCodeApprovalSessionRecord,
@@ -26,7 +30,7 @@ const record = {
   managedAuthFingerprint: 'managed-auth-v1', runtimePid: 1234,
   openCodeArtifactDigest,
   createdAt: '2026-08-13T09:00:00.000Z',
-} as OpenCodeSessionRecord
+} as unknown as OpenCodeSessionRecord
 const effectContext: OpenCodePermissionEffectContext = {
   record,
   profile: {
@@ -90,7 +94,7 @@ const permission: OpenCodeNormalizedPermission = {
   requestId: 'permission_1', sessionId: 'session_1', tool: 'bash', title: 'Run tests', kind: 'tool',
   raw: { requestID: 'permission_1', sessionID: 'session_1', tool: 'bash', title: 'Run tests' },
 }
-const providerObservation = {
+const providerObservation: OpenCodeHostedApprovalObservedPermission = {
   capability: hostedCapability,
   permission: {
     requestId: permission.requestId,
@@ -98,24 +102,26 @@ const providerObservation = {
     sessionIncarnation: `session_incarnation_${'d'.repeat(32)}`,
     requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
     permissionDigest: canonicalHostedApprovalDigest(permission.raw),
-    rawPermission: permission.raw,
+    rawPermission: permission.raw as never,
   },
   normalized: permission,
 }
-const observed = (value: OpenCodeNormalizedPermission = permission) => ({
+const observed = (value: OpenCodeNormalizedPermission = permission): OpenCodeHostedApprovalObservedPermission => ({
   ...providerObservation,
   permission: {
     ...providerObservation.permission,
     requestId: value.requestId,
     sessionId: value.sessionId!,
     permissionDigest: canonicalHostedApprovalDigest(value.raw),
-    rawPermission: value.raw,
+    rawPermission: value.raw as never,
   },
   normalized: value,
 })
-const expectedEffectRef = ingressRecordForObservedPermission({
+const expectedRecord = ingressRecordForObservedPermission({
   route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z',
-}).effectRef
+})
+const expectedEffectRef = expectedRecord.effectRef
+const expectedDeliveryRef = expectedRecord.deliveryRef
 const matchingArtifacts = {
   prepareEffectToken: (expectedDigest: string) => expectedDigest === openCodeArtifactDigest
     ? { consume: () => true }
@@ -151,6 +157,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       route,
       requestId: permission.requestId,
       expectedEffectRef,
+      expectedDeliveryRef,
       decision: 'allow',
       revalidate: async () => true,
     })).toBe('unavailable')
@@ -237,6 +244,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       route,
       requestId: permission.requestId,
       expectedEffectRef,
+      expectedDeliveryRef,
       decision: 'allow',
       revalidate: async () => true,
     })).toBe('not_started')
@@ -263,11 +271,11 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         } as never,
       )
     }
-    expect(await make({}).deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'allow', revalidate: async () => false })).toBe('not_started')
+    expect(await make({}).deliver({ route, requestId: 'permission_1', expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => false })).toBe('not_started')
     expect(answers).toBe(0)
-    expect(await make({ permissions: [[]] }).deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'allow', revalidate: async () => true })).toBe('not_started')
-    expect(await make({ answerThrows: true }).deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'allow', revalidate: async () => true })).toBe('ambiguous')
-    expect(await make({}).deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'allow', revalidate: async () => true })).toBe('delivered')
+    expect(await make({ permissions: [[]] }).deliver({ route, requestId: 'permission_1', expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => true })).toBe('not_started')
+    expect(await make({ answerThrows: true }).deliver({ route, requestId: 'permission_1', expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => true })).toBe('ambiguous')
+    expect(await make({}).deliver({ route, requestId: 'permission_1', expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => true })).toBe('delivered')
   })
 
   test('fences after delayed host preparation and performs zero POSTs for rotated or replacement hosts', async () => {
@@ -293,7 +301,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
           },
         } as never,
       )
-      const pending = adapter.deliver({ route, requestId: permission.requestId, expectedEffectRef, decision: 'allow', revalidate: async () => true })
+      const pending = adapter.deliver({ route, requestId: permission.requestId, expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => true })
       await Promise.resolve(); release()
       expect(await pending).toBe('not_started')
       expect(posts).toBe(0)
@@ -306,24 +314,27 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       { get: async () => ++reads === 1 ? record : null } as never,
       { observeHostedApprovalPermissions: async () => [observed()], answerPermission: async () => { answers += 1 } } as never,
     )
-    expect(await adapter.deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'deny', revalidate: async () => true })).toBe('unavailable')
+    expect(await adapter.deliver({ route, requestId: 'permission_1', expectedEffectRef, expectedDeliveryRef, decision: 'deny', revalidate: async () => true })).toBe('unavailable')
     expect(answers).toBe(0)
+    const unsafePermission = { ...permission, title: 'Read /Users/alice/secret.txt' }
     const unsafe = ingressRecordForObservedPermission({
       route, observedAtIso: '2026-08-13T10:00:00.000Z',
-      permission: { ...permission, title: 'Read /Users/alice/secret.txt' },
+      permission: unsafePermission, providerObservation: observed(unsafePermission),
     })
     expect(JSON.parse(unsafe.payloadJson)).toMatchObject({ summary: 'OpenCode permission requested' })
   })
 
   test('binds canonical raw permission incarnation while ignoring object key order', () => {
-    const first = ingressRecordForObservedPermission({ route, permission, observedAtIso: '2026-08-13T10:00:00.000Z' })
+    const first = ingressRecordForObservedPermission({ route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z' })
+    const reorderedPermission = { ...permission, raw: { title: 'Run tests', tool: 'bash', sessionID: 'session_1', requestID: 'permission_1' } }
     const reordered = ingressRecordForObservedPermission({
       route, observedAtIso: '2026-08-13T10:00:01.000Z',
-      permission: { ...permission, raw: { title: 'Run tests', tool: 'bash', sessionID: 'session_1', requestID: 'permission_1' } },
+      permission: reorderedPermission, providerObservation: observed(reorderedPermission),
     })
+    const replacedPermission = { ...permission, raw: { ...permission.raw, metadata: { permission: 'write' } } }
     const replaced = ingressRecordForObservedPermission({
       route, observedAtIso: '2026-08-13T10:00:02.000Z',
-      permission: { ...permission, raw: { ...permission.raw, metadata: { permission: 'write' } } },
+      permission: replacedPermission, providerObservation: observed(replacedPermission),
     })
     expect(reordered).toMatchObject({ outboxId: first.outboxId, effectRef: first.effectRef, deliveryRef: first.deliveryRef })
     expect(replaced).not.toMatchObject({ outboxId: first.outboxId, effectRef: first.effectRef, deliveryRef: first.deliveryRef })
@@ -333,13 +344,19 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     const first = ingressRecordForObservedPermission({
       route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z',
     })
+    const replacementRuntimeInstanceId = `runtime_instance_${'d'.repeat(32)}`
+    const restartedRoute = {
+      ...route,
+      authority: { ...route.authority, runtimeInstanceId: replacementRuntimeInstanceId },
+      openCodeBinding: { ...route.openCodeBinding, runtimeInstanceId: replacementRuntimeInstanceId },
+    }
     const restarted = ingressRecordForObservedPermission({
-      route, permission, observedAtIso: '2026-08-13T10:00:01.000Z',
+      route: restartedRoute, permission, observedAtIso: '2026-08-13T10:00:01.000Z',
       providerObservation: {
         ...providerObservation,
         capability: {
           ...providerObservation.capability,
-          runtimeInstanceId: `runtime_instance_${'d'.repeat(32)}`,
+          runtimeInstanceId: replacementRuntimeInstanceId,
         },
       },
     })
@@ -363,9 +380,39 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         },
       },
     })
-    expect(restarted.effectRef).not.toBe(first.effectRef)
-    expect(recreatedSession.effectRef).not.toBe(first.effectRef)
-    expect(reusedRequest.effectRef).not.toBe(first.effectRef)
+    for (const rebound of [restarted, recreatedSession, reusedRequest]) {
+      expect(rebound.effectRef).toBe(first.effectRef)
+      expect(rebound.deliveryRef).not.toBe(first.deliveryRef)
+      expect(rebound.outboxId).not.toBe(first.outboxId)
+    }
+  })
+
+  test('rejects a stale delivery binding and a retained digest before any provider POST', async () => {
+    let posts = 0
+    const rotated = {
+      ...providerObservation,
+      capability: { ...providerObservation.capability, configGeneration: `config_generation_${'f'.repeat(32)}` },
+    }
+    const adapter = makeAdapter(
+      { get: async () => record } as never,
+      {
+        observeHostedApprovalPermissions: async () => [rotated],
+        answerPermission: async () => { posts += 1 },
+      } as never,
+    )
+    expect(await adapter.deliver({
+      route, requestId: permission.requestId, expectedEffectRef, expectedDeliveryRef,
+      decision: 'allow', revalidate: async () => true,
+    })).toBe('not_started')
+    expect(posts).toBe(0)
+
+    const changedPermission = { ...permission, raw: { ...permission.raw, title: 'Changed' } }
+    expect(() => ingressRecordForObservedPermission({
+      route, permission: changedPermission,
+      providerObservation: { ...providerObservation, normalized: changedPermission,
+        permission: { ...providerObservation.permission, rawPermission: changedPermission.raw as never } },
+      observedAtIso: '2026-08-13T10:00:04.000Z',
+    })).toThrow('digest mismatch')
   })
 
   test('performs zero effects when the same run and session rotate live host or auth projection', async () => {
@@ -386,7 +433,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         { get: async () => ++reads === 1 ? record : rotate(record) } as never,
         { observeHostedApprovalPermissions: async () => [observed()], answerPermission: async () => { answers += 1 } } as never,
       )
-      expect(await adapter.deliver({ route, requestId: permission.requestId, expectedEffectRef, decision: 'allow', revalidate: async () => true })).toBe('unavailable')
+      expect(await adapter.deliver({ route, requestId: permission.requestId, expectedEffectRef, expectedDeliveryRef, decision: 'allow', revalidate: async () => true })).toBe('unavailable')
       expect(answers).toBe(0)
     }
   })
@@ -416,7 +463,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       } as never,
     )
     expect(await adapter.deliver({
-      route, requestId: permission.requestId, expectedEffectRef, decision: 'allow',
+      route, requestId: permission.requestId, expectedEffectRef, expectedDeliveryRef, decision: 'allow',
       revalidate: async () => true,
     })).toBe('delivered')
     expect(tokenRecord).toEqual(record)

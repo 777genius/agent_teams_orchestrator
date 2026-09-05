@@ -76,6 +76,12 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     expect(() => decodeOwnerState(acknowledgement)).toThrow('acknowledgement')
     const delivery = state(); delivery.deliveries = [{ providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`, deliveryRef: 'delivery_ref_wrong', payloadFingerprint: 'f'.repeat(64), outboxId: delivery.ingress[0]!.outboxId, effectRef: delivery.ingress[0]!.effectRef, phase: 'started', result: null }]
     expect(() => decodeOwnerState(delivery)).toThrow('delivery binding')
+
+    const halfLegacyBinding = state()
+    halfLegacyBinding.bindings[0] = {
+      ...halfLegacyBinding.bindings[0]!, effectRef: null, quarantined: true,
+    }
+    expect(() => decodeOwnerState(halfLegacyBinding)).toThrow('private binding')
   })
 
   test('rejects malformed UTF-8 and duplicate nested persisted keys', () => {
@@ -100,28 +106,59 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
       routes: Array<{ openCodeBinding: Record<string, unknown> }>
       ingress: typeof current.ingress
       deliveries: HostedApprovalOwnerState['deliveries']
+      bindings?: HostedApprovalOwnerState['bindings']
     }
     legacy.schemaVersion = 1
+    delete legacy.bindings
     delete legacy.routes[0].openCodeBinding.openCodeArtifactDigest
     legacy.ingress.push(unreferenced)
+    for (const record of legacy.ingress) {
+      ;(record as { outboxVersion: number }).outboxVersion = 1
+      record.outboxId = `runtime_permission:${record.effectRef}`
+    }
+    const legacyReferenced = legacy.ingress[0]!
     legacy.deliveries = [{
       providerDeliveryId: 'delivery_legacy',
       reconciliationRef: 'approval-reconciliation_legacy',
-      deliveryRef: referenced.deliveryRef,
+      deliveryRef: legacyReferenced.deliveryRef,
       payloadFingerprint: 'f'.repeat(64),
-      outboxId: referenced.outboxId,
-      effectRef: referenced.effectRef,
+      outboxId: legacyReferenced.outboxId,
+      effectRef: legacyReferenced.effectRef,
       phase: 'started',
       result: null,
     }]
     const migrated = decodeOwnerState(legacy)
     expect(migrated).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       routes: [],
       actorMembers: {},
       ingress: [],
-      retiredIngress: [{ outboxId: referenced.outboxId }],
+      retiredIngress: [{ outboxId: legacyReferenced.outboxId }],
       deliveries: [{ providerDeliveryId: 'delivery_legacy', phase: 'started' }],
+    })
+  })
+
+  test('migrates schema2 composite hashes without relabeling them as permission digests', () => {
+    const old = structuredClone(state()) as unknown as Record<string, unknown> & {
+      ingress: HostedApprovalOwnerState['ingress']; bindings?: HostedApprovalOwnerState['bindings']
+      deliveries: HostedApprovalOwnerState['deliveries']
+    }
+    old.schemaVersion = 2
+    delete old.bindings
+    const ingress = old.ingress[0]!
+    ;(ingress as { outboxVersion: number }).outboxVersion = 1
+    ingress.outboxId = `runtime_permission:${ingress.effectRef}`
+    old.deliveries = [{
+      providerDeliveryId: 'delivery_schema2', reconciliationRef: 'approval-reconciliation_schema2',
+      deliveryRef: ingress.deliveryRef, payloadFingerprint: 'f'.repeat(64), outboxId: ingress.outboxId,
+      effectRef: ingress.effectRef, phase: 'completed', result: 'delivered',
+    }]
+    const migrated = decodeOwnerState(old)
+    expect(migrated).toMatchObject({
+      schemaVersion: 3, routes: [], ingress: [],
+      retiredIngress: [{ outboxId: ingress.outboxId, effectRef: ingress.effectRef }],
+      bindings: [{ requestId: ingress.commandId, effectRef: null, bindingDigest: null, quarantined: true }],
+      deliveries: [{ phase: 'completed', result: 'delivered' }],
     })
   })
 })
@@ -238,23 +275,29 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     expect(removed).toBe(1)
   })
 
-  test('publishes a legacy v1 migration as v2 without restoring legacy routes', async () => {
+  test('publishes a legacy v1 migration as v3 without restoring legacy routes', async () => {
     const { path } = await walPath()
     const wal = new HostedApprovalOwnerWal(path)
     const published = await wal.locked(async current => wal.publish(current, withoutRevision(state())))
     const legacy = structuredClone(published) as unknown as {
       schemaVersion: number
       routes: Array<{ openCodeBinding: Record<string, unknown> }>
+      bindings?: HostedApprovalOwnerState['bindings']
     }
     legacy.schemaVersion = 1
+    delete legacy.bindings
     delete legacy.routes[0]!.openCodeBinding.openCodeArtifactDigest
+    for (const record of (legacy as unknown as { ingress: HostedApprovalOwnerState['ingress'] }).ingress) {
+      ;(record as { outboxVersion: number }).outboxVersion = 1
+      record.outboxId = `runtime_permission:${record.effectRef}`
+    }
     await writeFile(path, `${JSON.stringify(legacy)}\n`, { mode: 0o600 })
     const migrated = await wal.locked(async current => {
-      expect(current).toMatchObject({ schemaVersion: 2, routes: [], ingress: [] })
+      expect(current).toMatchObject({ schemaVersion: 3, routes: [], ingress: [] })
       return wal.publish(current, withoutRevision(current!))
     })
-    expect(migrated.schemaVersion).toBe(2)
-    expect(JSON.parse(await readFile(path, 'utf8')).schemaVersion).toBe(2)
+    expect(migrated.schemaVersion).toBe(3)
+    expect(JSON.parse(await readFile(path, 'utf8')).schemaVersion).toBe(3)
   })
 
   test('rejects a writer-fence symlink without mutating its target', async () => {
@@ -366,8 +409,8 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
   test('compacts terminal delivery history while retaining every active or ambiguous effect', async () => {
     const { path } = await walPath(); const wal = new HostedApprovalOwnerWal(path)
     const base = state(); const active = structuredClone(base.ingress[0]!)
-    active.effectRef = `effect:${'e'.repeat(64)}`; active.outboxId = `runtime_permission:${active.effectRef}`
-    active.deliveryRef = 'delivery_ref_active'
+    active.effectRef = `effect:${'e'.repeat(64)}`; active.outboxId = `runtime_permission:effect:${'e'.repeat(64)}`
+    active.deliveryRef = `delivery_ref_opencode-${'e'.repeat(64)}`
     active.payloadJson = JSON.stringify({
       schemaVersion: 1, deliveryRef: active.deliveryRef, category: 'command', summary: 'Run tests',
       expiresAtMs: null, preview: null,
@@ -375,8 +418,8 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const terminalIngress = Array.from({ length: 2_050 }, (_, index) => {
       const suffix = index.toString(36); const digest = index.toString(16).padStart(64, '0')
       const record = structuredClone(base.ingress[0]!)
-      record.effectRef = `effect:${digest}`; record.outboxId = `runtime_permission:${record.effectRef}`
-      record.deliveryRef = `delivery_ref_terminal_${suffix}`
+      record.effectRef = `effect:${digest}`; record.outboxId = `runtime_permission:effect:${digest}`
+      record.deliveryRef = `delivery_ref_opencode-${digest}`
       record.commandId = `permission_terminal_${suffix}`
       record.payloadJson = JSON.stringify({
         schemaVersion: 1, deliveryRef: record.deliveryRef, category: 'command', summary: 'Run tests',
@@ -403,6 +446,11 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     })
     const published = await wal.locked(current => wal.publish(current, {
       ...withoutRevision(base), ingress: [...terminalIngress, active], deliveries,
+      bindings: [...terminalIngress, active].map(record => ({
+        teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
+        effectRef: record.effectRef, bindingDigest: record.outboxId.slice('runtime_permission:effect:'.length),
+        quarantined: false,
+      })),
     }))
     expect(published.deliveries).toHaveLength(2_049)
     expect(published.deliveries[0]?.outboxId).toBe(terminalIngress[2]!.outboxId)
@@ -622,9 +670,10 @@ await wal.locked(async state => {
 
 function state(): HostedApprovalOwnerState {
   const effectRef = `effect:${'c'.repeat(64)}`
-  const deliveryRef = `delivery_ref_opencode-${'c'.repeat(64)}`
+  const bindingDigest = 'b'.repeat(64)
+  const deliveryRef = `delivery_ref_opencode-${bindingDigest}`
   const ingress = {
-    outboxVersion: 1 as const, outboxId: `runtime_permission:${effectRef}`,
+    outboxVersion: 2 as const, outboxId: `runtime_permission:effect:${bindingDigest}`,
     commandId: 'permission_1', effectRef, deliveryRef, authority: structuredClone(route.authority),
     payloadJson: JSON.stringify({
       schemaVersion: 1, deliveryRef, category: 'command', summary: 'Run tests',
@@ -634,11 +683,14 @@ function state(): HostedApprovalOwnerState {
     lease: null, acknowledgedAtIso: null,
   }
   return {
-    schemaVersion: 2 as const, revision: 1, admissionGeneration: 'approval-admission-generation_1',
+    schemaVersion: 3 as const, revision: 1, admissionGeneration: 'approval-admission-generation_1',
     admissionDigest: 'a'.repeat(64), routes: [structuredClone(route)],
     writerFence: { generation: `approval-writer-fence_${'a'.repeat(32)}`, dev: '1', ino: '1' },
     actorMembers: { actor_owner: route.authority.deliveryOwnerId, actor_operator: `member_${'8'.repeat(32)}` },
-    ingress: [ingress], retiredIngress: [], deliveries: [],
+    ingress: [ingress], retiredIngress: [], bindings: [{
+      teamId: route.authority.teamId, runId: route.authority.runId, requestId: ingress.commandId,
+      effectRef, bindingDigest, quarantined: false,
+    }], deliveries: [],
   }
 }
 

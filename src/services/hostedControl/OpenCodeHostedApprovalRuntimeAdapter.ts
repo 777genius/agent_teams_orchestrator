@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 
 import {
   OpenCodePermissionEffectUnavailableError,
@@ -9,6 +10,7 @@ import {
 } from '../opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore, type OpenCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { OpenCodeNormalizedPermission } from '../opencode/types.js'
+import { canonicalHostedApprovalDigest, canonicalHostedApprovalJson } from '../opencode/OpenCodeClientFactory.js'
 import type { OpenCodeHostedApprovalObservedPermission } from '../opencode/OpenCodeSessionBridge.js'
 import { prepareOpenCodeArtifactDigestToken } from '../opencode/OpenCodeArtifactDigest.js'
 import type { HostedApprovalIngressRecord } from './HostedApprovalWire.js'
@@ -52,18 +54,25 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
       throw new Error('Hosted approval OpenCode permission session mismatch')
     }
     const observedAtIso = new Date(this.now()).toISOString()
-    return permissions.map(providerObservation => ({
-      route,
-      permission: providerObservation.normalized,
-      providerObservation,
-      observedAtIso,
-    }))
+    return permissions.map(providerObservation => {
+      const observed = {
+        route,
+        permission: providerObservation.normalized,
+        providerObservation,
+        observedAtIso,
+      }
+      // Observation is not admitted as trusted merely because it came from the
+      // provider client. Recompute D and the complete private binding here.
+      ingressRecordForObservedPermission(observed)
+      return observed
+    })
   }
 
   async deliver(input: {
     route: HostedApprovalRuntimeRoute
     requestId: string
     expectedEffectRef: string
+    expectedDeliveryRef: string
     decision: 'allow' | 'deny' | 'timeout'
     /** Revalidates the immutable admission generation/digest at the effect edge. */
     revalidate: () => Promise<boolean>
@@ -72,8 +81,15 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
   }): Promise<'delivered' | 'not_started' | 'unavailable' | 'ambiguous'> {
     let before: readonly HostedApprovalObservedPermission[]
     try { before = await this.observe(input.route) } catch { return 'unavailable' }
-    const expected = before.find(item => item.permission.requestId === input.requestId &&
-      ingressRecordForObservedPermission(item).effectRef === input.expectedEffectRef)
+    let expected: HostedApprovalObservedPermission | undefined
+    try {
+      expected = before.find(item => {
+        if (item.permission.requestId !== input.requestId) return false
+        const regenerated = ingressRecordForObservedPermission(item)
+        return regenerated.effectRef === input.expectedEffectRef &&
+          regenerated.deliveryRef === input.expectedDeliveryRef
+      })
+    } catch { return 'not_started' }
     if (!expected?.providerObservation) return 'not_started'
     let record
     try {
@@ -174,20 +190,31 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
 export function ingressRecordForObservedPermission(input: HostedApprovalObservedPermission): HostedApprovalIngressRecord {
   const requestId = input.permission.requestId
   const provider = input.providerObservation
-  const effectDigest = createHash('sha256').update(canonicalJson({
-    schemaVersion: 1,
+  if (!provider || provider.permission.requestId !== requestId ||
+    provider.permission.sessionId !== input.permission.sessionId ||
+    provider.capability.runtimeInstanceId !== input.route.authority.runtimeInstanceId ||
+    !isDeepStrictEqual(provider.normalized, input.permission) ||
+    !isDeepStrictEqual(provider.permission.rawPermission, input.permission.raw)) {
+    throw new Error('Invalid hosted approval provider observation')
+  }
+  const permissionDigest = canonicalHostedApprovalDigest(input.permission.raw)
+  if (provider.permission.permissionDigest !== permissionDigest) {
+    throw new Error('Hosted approval provider permission digest mismatch')
+  }
+  const bindingDigest = createHash('sha256').update(canonicalHostedApprovalJson({
+    schemaVersion: 2,
     authority: input.route.authority,
     sessionRecordFingerprint: input.route.openCodeBinding.sessionRecordFingerprint,
     liveEffectFingerprint: input.route.openCodeBinding.liveEffectFingerprint,
     requestId,
-    runtimeInstanceId: provider?.capability.runtimeInstanceId ?? null,
-    configGeneration: provider?.capability.configGeneration ?? null,
-    sessionIncarnation: provider?.permission.sessionIncarnation ?? null,
-    requestIncarnation: provider?.permission.requestIncarnation ?? null,
-    permissionDigest: provider?.permission.permissionDigest ?? null,
+    runtimeInstanceId: provider.capability.runtimeInstanceId,
+    configGeneration: provider.capability.configGeneration,
+    sessionIncarnation: provider.permission.sessionIncarnation,
+    requestIncarnation: provider.permission.requestIncarnation,
+    providerPermissionDigest: permissionDigest,
     providerPermission: input.permission.raw,
-  })).digest('hex')
-  const deliveryRef = `delivery_ref_opencode-${effectDigest}`
+  }), 'utf8').digest('hex')
+  const deliveryRef = `delivery_ref_opencode-${bindingDigest}`
   const summary = safeSummary(input.permission.title ?? `${input.permission.tool ?? 'tool'} permission requested`)
   const payloadJson = JSON.stringify({
     schemaVersion: 1, deliveryRef, category: category(input.permission),
@@ -195,23 +222,12 @@ export function ingressRecordForObservedPermission(input: HostedApprovalObserved
     expiresAtMs: null, preview: null,
   })
   return {
-    outboxVersion: 1, outboxId: `runtime_permission:effect:${effectDigest}`,
-    commandId: requestId, effectRef: `effect:${effectDigest}`, deliveryRef,
+    outboxVersion: 2, outboxId: `runtime_permission:effect:${bindingDigest}`,
+    commandId: requestId, effectRef: `effect:${permissionDigest}`, deliveryRef,
     authority: { ...input.route.authority }, payloadJson,
     observedAtIso: input.observedAtIso, acceptedAtIso: input.observedAtIso,
     lease: null, acknowledgedAtIso: null,
   }
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    const encoded = JSON.stringify(value)
-    if (encoded === undefined) throw new Error('Unsupported hosted approval canonical value')
-    return encoded
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  const record = value as Record<string, unknown>
-  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`
 }
 
 export function fingerprintOpenCodeApprovalSessionRecord(record: {

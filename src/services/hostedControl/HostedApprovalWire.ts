@@ -64,7 +64,7 @@ export type HostedApprovalIngressLease = {
 }
 
 export type HostedApprovalIngressRecord = {
-  outboxVersion: 1
+  outboxVersion: 2
   outboxId: string
   commandId: string
   effectRef: string
@@ -454,10 +454,12 @@ export function decodeHostedApprovalIngressRecord(
     'authority', 'payloadJson', 'observedAtIso', 'acceptedAtIso', 'lease',
     'acknowledgedAtIso',
   ], 'approval ingress record')
-  if (input.outboxVersion !== 1) throw new Error('Invalid approval ingress record version')
+  if (input.outboxVersion !== 2) throw new Error('Invalid approval ingress record version')
   const outboxId = patterned(input.outboxId, /^runtime_permission:effect:[a-f0-9]{64}$/, 'approval outboxId')
   const effectRef = patterned(input.effectRef, /^effect:[a-f0-9]{64}$/, 'approval effectRef')
-  if (outboxId !== `runtime_permission:${effectRef}`) throw new Error('Invalid approval outbox binding')
+  const delivery = deliveryRef(input.deliveryRef)
+  const bindingDigest = outboxId.slice('runtime_permission:effect:'.length)
+  if (delivery !== `delivery_ref_opencode-${bindingDigest}`) throw new Error('Invalid approval private binding')
   const authority = decodeHostedApprovalIngressAuthority(input.authority)
   bindIngressAuthority(authority, outerAuthority)
   const payloadJson = boundedText(input.payloadJson, 'approval payloadJson', HOSTED_APPROVAL_MAX_PAYLOAD_JSON_BYTES, true)
@@ -473,11 +475,11 @@ export function decodeHostedApprovalIngressRecord(
     throw new Error('Invalid approval ingress timestamps')
   }
   return {
-    outboxVersion: 1,
+    outboxVersion: 2,
     outboxId,
     commandId: identifier(input.commandId, 'approval commandId'),
     effectRef,
-    deliveryRef: deliveryRef(input.deliveryRef),
+    deliveryRef: delivery,
     authority,
     payloadJson,
     observedAtIso,

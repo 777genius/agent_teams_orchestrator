@@ -14,6 +14,8 @@ import type {
   HostedApprovalObservedPermission,
   OpenCodeHostedApprovalRuntimeAdapter,
 } from './OpenCodeHostedApprovalRuntimeAdapter.js'
+import { canonicalHostedApprovalDigest } from '../opencode/OpenCodeClientFactory.js'
+import type { OpenCodeHostedApprovalObservedPermission } from '../opencode/OpenCodeSessionBridge.js'
 
 const teamId = `team_${'1'.repeat(32)}`
 const runId = `run_${'2'.repeat(32)}`
@@ -65,20 +67,33 @@ async function fixture(
     tool: 'bash',
     title: 'Run tests',
   }
-  const observed = (): HostedApprovalObservedPermission[] => [
-    {
+  let sessionIncarnation = `session_incarnation_${'d'.repeat(32)}`
+  const observed = (): HostedApprovalObservedPermission[] => {
+    const permission = {
+      requestId: 'permission_1', sessionId: route.authority.sessionId,
+      tool: 'bash', title: 'Run tests', kind: 'tool', raw: rawPermission,
+    } as const
+    const providerObservation: OpenCodeHostedApprovalObservedPermission = {
+      capability: {
+        schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
+        authentication: 'opencode-basic' as const, runtimeInstanceId: route.authority.runtimeInstanceId,
+        configGeneration: `config_generation_${'b'.repeat(32)}`,
+      },
+      permission: {
+        requestId: permission.requestId, sessionId: permission.sessionId,
+        sessionIncarnation,
+        requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
+        permissionDigest: canonicalHostedApprovalDigest(rawPermission), rawPermission: rawPermission as never,
+      },
+      normalized: permission,
+    }
+    return [{
       route,
       observedAtIso: '2026-08-13T10:00:00.000Z',
-      permission: {
-        requestId: 'permission_1',
-        sessionId: route.authority.sessionId,
-        tool: 'bash',
-        title: 'Run tests',
-        kind: 'tool',
-        raw: rawPermission,
-      },
-    },
-  ]
+      permission,
+      providerObservation,
+    }]
+  }
   const runtime = {
     observe: async () => overrides.observe?.() ?? observed(),
     deliver: async (input: Parameters<OpenCodeHostedApprovalRuntimeAdapter['deliver']>[0]) =>
@@ -108,6 +123,7 @@ async function fixture(
     replaceRawPermission: (raw: Record<string, unknown>) => {
       rawPermission = raw
     },
+    recreateSession: () => { sessionIncarnation = `session_incarnation_${'e'.repeat(32)}` },
   }
 }
 
@@ -135,6 +151,45 @@ describe('HostedApprovalOwnerService R2', () => {
       commandId: 'permission_1',
       authority: { runId, teamId },
     })
+  })
+
+  test('durably quarantines a recreated private binding before a second occurrence is exposed', async () => {
+    const fx = await fixture()
+    const request = { ownerId: 'owner_1', leaseToken: 'lease_1', leaseDurationMs: 30_000, limit: 10 }
+    const first = await fx.service.claimIngress({ request, maximumAggregateBytes: 1_000_000 })
+    fx.recreateSession()
+    const replay = await fx.service.claimIngress({ request, maximumAggregateBytes: 1_000_000 })
+    expect(replay.map(record => record.deliveryRef)).toEqual(first.map(record => record.deliveryRef))
+    const recovered = await fx.store.read()
+    expect(recovered?.ingress).toHaveLength(1)
+    expect(recovered?.bindings).toHaveLength(2)
+    expect(recovered?.bindings.filter(binding => binding.quarantined)).toHaveLength(1)
+    const restarted = await new HostedApprovalOwnerStore(
+      new HostedApprovalOwnerWal(fx.store.wal.path),
+    ).read()
+    expect(restarted?.bindings.filter(binding => binding.quarantined)).toHaveLength(1)
+  })
+
+  test('does not bind a changed semantic digest to an already retained private occurrence', async () => {
+    const fx = await fixture()
+    await fx.service.pollIngress()
+    const record = (await fx.store.read())!.ingress[0]!
+    await expect(fx.store.admitIngress(fx.admission, {
+      ...record, effectRef: `effect:${'9'.repeat(64)}`,
+    })).rejects.toThrow('ingress conflict')
+    expect((await fx.store.read())?.ingress).toHaveLength(1)
+  })
+
+  test('treats an exact exposed binding as replay after acknowledged ingress retention expires', async () => {
+    const fx = await fixture()
+    await fx.service.pollIngress()
+    const persisted = (await fx.store.read())!
+    const record = persisted.ingress[0]!
+    await fx.store.wal.locked(async current => fx.store.wal.publish(current, {
+      ...withoutRevision(current!), ingress: [],
+    }))
+    await expect(fx.store.admitIngress(fx.admission, record)).resolves.toBe('replay')
+    expect((await fx.store.read())?.ingress).toEqual([])
   })
 
   test('fails a permission-list outage closed instead of treating it as empty', async () => {
@@ -446,6 +501,72 @@ if (mode === 'replacement') {
     }
   })
 
+  test('recovers schema2 ingress and evidence without retrying or relabeling its composite hash', async () => {
+    for (const phase of ['unstarted', 'started', 'completed'] as const) {
+      let providerCalls = 0
+      const fx = await fixture({ deliver: () => { providerCalls += 1; return 'delivered' } })
+      await fx.service.pollIngress()
+      const current = (await fx.store.read())!
+      const ingress = structuredClone(current.ingress[0]!)
+      const compositeDigest = '7'.repeat(64)
+      ;(ingress as { outboxVersion: number }).outboxVersion = 1
+      ingress.effectRef = `effect:${compositeDigest}`
+      ingress.outboxId = `runtime_permission:${ingress.effectRef}`
+      ingress.deliveryRef = `delivery_ref_opencode-${compositeDigest}`
+      ingress.payloadJson = JSON.stringify({
+        ...JSON.parse(ingress.payloadJson), deliveryRef: ingress.deliveryRef,
+      })
+      const request = delivery(ingress)
+      const legacy = {
+        ...current,
+        schemaVersion: 2,
+        ingress: [ingress],
+        retiredIngress: [],
+        deliveries: phase === 'unstarted' ? [] : [{
+          providerDeliveryId: request.providerDeliveryId,
+          reconciliationRef: request.reconciliationRef,
+          deliveryRef: request.deliveryRef,
+          payloadFingerprint: fingerprintHostedApprovalDelivery(request),
+          outboxId: ingress.outboxId,
+          effectRef: ingress.effectRef,
+          phase,
+          result: phase === 'completed' ? 'delivered' : null,
+        }],
+      } as Record<string, unknown>
+      delete legacy.bindings
+      await writeFile(fx.store.wal.path, `${JSON.stringify(legacy)}\n`, { mode: 0o600 })
+
+      await fx.service.recoverStateOnly()
+      const expected = phase === 'unstarted'
+        ? { status: 'stale_generation' as const }
+        : phase === 'started'
+        ? { status: 'operator_required' as const, reconciliationRef: request.reconciliationRef }
+        : { status: 'idempotent_replay' as const }
+      await expect(fx.service.authorizeDecision({
+        request, payloadFingerprint: fingerprintHostedApprovalDelivery(request),
+      })).resolves.toEqual(expected)
+      const expectedReconciliation = phase === 'unstarted'
+        ? { status: 'unavailable' as const }
+        : phase === 'started'
+        ? { status: 'operator_required' as const }
+        : { status: 'delivered' as const }
+      await expect(fx.service.reconcileDecision({
+        reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId,
+        partition: request.partition,
+      })).resolves.toEqual(expectedReconciliation)
+      expect(providerCalls).toBe(0)
+      expect(await fx.service.pollIngress()).toBe(0)
+      const recovered = await fx.store.read()
+      expect(recovered?.ingress).toEqual([])
+      expect(recovered?.bindings).toContainEqual({
+        teamId, runId, requestId: ingress.commandId,
+        effectRef: null, bindingDigest: null, quarantined: true,
+      })
+      expect(recovered?.bindings.filter(binding => binding.effectRef !== null && binding.quarantined)).toHaveLength(1)
+    }
+  })
+
   test('reconciles durable evidence without repeating the provider effect', async () => {
     for (const [effect, expected] of [
       ['delivered', 'delivered'],
@@ -683,7 +804,7 @@ if (mode === 'replacement') {
     }
   })
 
-  test('does not answer a reused request ID after the provider permission incarnation changes', async () => {
+  test('binds a changed semantic permission only through its exact new delivery occurrence', async () => {
     let effects = 0
     const fx = await fixture({
       deliver: () => {
@@ -710,13 +831,14 @@ if (mode === 'replacement') {
     expect(await fx.service.pollIngress()).toBe(1)
     const state = await fx.store.read()
     const second = state!.ingress.find(record => record.outboxId !== first!.outboxId)!
-    const request = { ...delivery(second), providerDeliveryId: 'delivery_2' }
-    expect(
-      await fx.service.authorizeDecision({
-        request,
-        payloadFingerprint: fingerprintHostedApprovalDelivery(request),
-      }),
-    ).toEqual({ status: 'conflict' })
+    const request = {
+      ...delivery(second), providerDeliveryId: 'delivery_2',
+      reconciliationRef: `approval-reconciliation_${'5'.repeat(64)}`,
+    }
+    expect(await fx.service.authorizeDecision({
+      request,
+      payloadFingerprint: fingerprintHostedApprovalDelivery(request),
+    })).toMatchObject({ status: 'authorized' })
     expect(effects).toBe(1)
   })
 

@@ -9,6 +9,7 @@ import {
   type OpenCodePermissionEffectContext,
 } from '../opencode/OpenCodeSessionBridge.js'
 import type { OpenCodeNormalizedPermission, OpenCodeSessionRecord } from '../opencode/types.js'
+import { canonicalHostedApprovalDigest } from '../opencode/OpenCodeClientFactory.js'
 import type { HostedControlProcessIdentity } from './HostedControlProcessIdentity.js'
 import { HostedApprovalRuntimeBindingFence } from './HostedApprovalRuntimeBindingFence.js'
 import {
@@ -191,13 +192,15 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
           requestId: permission.requestId, sessionId: record.opencodeSessionId,
           sessionIncarnation: `session_incarnation_${'e'.repeat(32)}`,
           requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
-          permissionDigest: 'd'.repeat(64), rawPermission,
+          permissionDigest: canonicalHostedApprovalDigest(rawPermission), rawPermission,
         },
         normalized: permission,
       }
-      const expectedEffectRef = ingressRecordForObservedPermission({
+      const expectedRecord = ingressRecordForObservedPermission({
         route, permission, providerObservation, observedAtIso: '2026-08-15T00:00:00.000Z',
-      }).effectRef
+      })
+      const expectedEffectRef = expectedRecord.effectRef
+      const expectedDeliveryRef = expectedRecord.deliveryRef
       let posts = 0
       const bridge = {
         observeHostedApprovalPermissions: async () => [providerObservation],
@@ -228,7 +231,7 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
         { prepareEffectToken: () => ({ consume: () => true }) },
       )
       const result = await adapter.deliver({
-        route, requestId: permission.requestId, expectedEffectRef, decision: 'allow',
+        route, requestId: permission.requestId, expectedEffectRef, expectedDeliveryRef, decision: 'allow',
         revalidate: async () => true,
         prepareEffectToken: async () => substitution.ownerToken === false
           ? null : { consume: () => true },

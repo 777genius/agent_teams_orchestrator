@@ -155,6 +155,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         route: bound.route,
         requestId: bound.record.commandId,
         expectedEffectRef: bound.record.effectRef,
+        expectedDeliveryRef: bound.record.deliveryRef,
         decision: input.request.decision,
         // The adapter invokes this again at its final provider boundary. Bind
         // authority to the exact locked fence incarnation, not just admission.
@@ -266,12 +267,12 @@ function operatorRequired(reconciliationRef: string): HostedApprovalDeliveryPort
   return { status: 'operator_required', reconciliationRef }
 }
 function findDelivery(state: HostedApprovalOwnerState, request: HostedApprovalDeliveryRequest): HostedApprovalDeliveryState | undefined {
-  const permissionOutboxes = new Set([...state.ingress, ...state.retiredIngress]
-    .filter(record => record.commandId === request.requestId &&
-      record.authority.teamId === request.partition.teamId && record.authority.runId === request.partition.runId)
-    .map(record => record.outboxId))
+  const exactIngress = [...state.ingress, ...state.retiredIngress].find(record =>
+    record.deliveryRef === request.deliveryRef && record.commandId === request.requestId &&
+    record.authority.teamId === request.partition.teamId && record.authority.runId === request.partition.runId)
   return state.deliveries.find(item =>
-    item.providerDeliveryId === request.providerDeliveryId || item.deliveryRef === request.deliveryRef ||
-    permissionOutboxes.has(item.outboxId),
+    item.providerDeliveryId === request.providerDeliveryId ||
+    item.reconciliationRef === request.reconciliationRef || item.deliveryRef === request.deliveryRef ||
+    exactIngress?.outboxId === item.outboxId,
   )
 }
