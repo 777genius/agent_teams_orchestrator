@@ -47,6 +47,9 @@ type CodexAppServerModel = {
   supportsPersonality?: boolean
   isDefault?: boolean
   upgrade?: unknown
+  availabilityNux?: {
+    message?: unknown
+  } | null
 }
 
 type CodexAppServerListModelsResponse = {
@@ -296,6 +299,11 @@ function normalizeCodexAppServerModels(models: readonly CodexAppServerModel[] | 
     seenLaunchModels.add(launchModel)
 
     const supportedReasoningEfforts = normalizeEfforts(model)
+    const rawAvailabilityNuxMessage = model.availabilityNux?.message
+    const availabilityNuxMessage =
+      typeof rawAvailabilityNuxMessage === 'string'
+        ? rawAvailabilityNuxMessage.trim() || null
+        : null
     normalizedModels.push({
       id,
       launchModel,
@@ -313,7 +321,8 @@ function normalizeCodexAppServerModels(models: readonly CodexAppServerModel[] | 
       upgrade: Boolean(model.upgrade),
       source: 'app-server',
       badgeLabel: id.replace(/^gpt-/, ''),
-      statusMessage: null,
+      statusMessage: availabilityNuxMessage,
+      metadata: availabilityNuxMessage ? { recentlyReleased: true } : null,
     })
   }
 
