@@ -144,7 +144,10 @@ const outfile = compile
 const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
 const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
-const version = dev ? getDevVersion(pkg.version) : pkg.version
+// Compatibility workaround: Anthropic rejects Fable 5.1 when MACRO.VERSION is
+// our 0.0.x package version. Report 2.1.251 globally; this is not an upstream upgrade.
+// https://github.com/777genius/agent-teams-ai/issues/569
+const version = dev ? getDevVersion('2.1.251') : '2.1.251'
 
 const outfileDir = dirname(outfile)
 if (outfileDir !== '.') {
