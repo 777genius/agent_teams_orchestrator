@@ -262,6 +262,80 @@ describe('anthropic runtime catalog', () => {
     })
   })
 
+  test('propagates API release timestamps to resolved aliases and passthrough models', () => {
+    const releaseDate = '2026-09-01T12:34:56Z'
+    const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
+      {
+        id: 'claude-opus-4-8',
+        type: 'model',
+        display_name: 'Claude Opus 4.8',
+        created_at: releaseDate,
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: { supported: true },
+        },
+      },
+      {
+        id: 'claude-fable-5-1',
+        type: 'model',
+        display_name: 'Claude Fable 5.1',
+        created_at: releaseDate,
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+      },
+    ])
+
+    for (const launchModel of [
+      'opus',
+      'opus[1m]',
+      'claude-opus-4-8',
+      'claude-opus-4-8[1m]',
+      'claude-fable-5-1',
+    ]) {
+      expect(
+        catalog.models.find((model) => model.launchModel === launchModel)
+          ?.metadata?.releaseDate,
+      ).toBe(releaseDate)
+    }
+  })
+
+  test('does not manufacture release dates from missing, invalid, or epoch timestamps', () => {
+    const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
+      {
+        id: 'claude-fable-5-1',
+        type: 'model',
+        created_at: '2026-02-31T00:00:00Z',
+      },
+      {
+        id: 'claude-mythos-5-1',
+        type: 'model',
+        created_at: '1970-01-01T00:00:00Z',
+      },
+      {
+        id: 'claude-sonnet-5-1',
+        type: 'model',
+      },
+      {
+        id: 'claude-fable-5-2',
+        type: 'model',
+        created_at: 123 as unknown as string,
+      },
+    ])
+
+    for (const launchModel of [
+      'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-sonnet-5-1',
+      'claude-fable-5-2',
+    ]) {
+      expect(
+        catalog.models.find((model) => model.launchModel === launchModel)
+          ?.metadata?.releaseDate,
+      ).toBeNull()
+    }
+  })
+
   test('does not surface deprecated or Claude Code removed first-party Anthropic models', () => {
     const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
       {
@@ -347,6 +421,7 @@ describe('anthropic runtime catalog', () => {
         id: 'qwen3.6',
         object: 'model',
         display_name: 'Qwen 3.6',
+        created_at: '2026-09-02T08:00:00+00:00',
         max_input_tokens: 128_000,
       },
       {
@@ -377,8 +452,10 @@ describe('anthropic runtime catalog', () => {
       badgeLabel: 'From gateway',
       metadata: {
         context: 128_000,
+        releaseDate: '2026-09-02T08:00:00+00:00',
       },
     })
+    expect(catalog.models[1]?.metadata?.releaseDate).toBeNull()
   })
 
   test('returns a static compatibility fallback catalog when live Anthropic data is unavailable', () => {
