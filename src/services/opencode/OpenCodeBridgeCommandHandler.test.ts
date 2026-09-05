@@ -1014,9 +1014,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(probeCalled).toBe(true)
-    expect(probeOptions).toEqual({
+    expect(probeOptions).toEqual(expect.objectContaining({
       selectedModel: 'openrouter/minimax-m2.5-free', toolApprovalMode: 'manual',
-    })
+      phaseContext: expect.objectContaining({ phase: 'host_start' }),
+    }))
     expect(released).toBe(true)
     if (result.ok) {
       expect(result.runtime.capabilitySnapshotId).toMatch(/^opencode:/)

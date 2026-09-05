@@ -90,6 +90,18 @@ const PERSISTENT_HOST_STARTUP_LOCK_RETRIES = 120
 const PERSISTENT_HOST_STARTUP_LOCK_MIN_RETRY_MS = 100
 const PERSISTENT_HOST_STARTUP_LOCK_MAX_RETRY_MS = 500
 
+export function shouldRetryPersistentHostStartupLock(
+  error: unknown,
+  attempt: number,
+  hasAbortSignal: boolean,
+): boolean {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined
+  return code === 'ELOCKED'
+    && (hasAbortSignal || attempt < PERSISTENT_HOST_STARTUP_LOCK_RETRIES)
+}
+
 type ManagedHostEntry = {
   handle: OpenCodeHostHandle
   child: ChildProcess | null
@@ -931,10 +943,7 @@ export class OpenCodeHostManager {
       try {
         return await lockfile.lock(lockPath, PERSISTENT_HOST_STARTUP_LOCK_OPTIONS)
       } catch (error) {
-        const code = error && typeof error === 'object' && 'code' in error
-          ? (error as { code?: unknown }).code
-          : undefined
-        if (code !== 'ELOCKED' || attempt >= PERSISTENT_HOST_STARTUP_LOCK_RETRIES) {
+        if (!shouldRetryPersistentHostStartupLock(error, attempt, Boolean(abortSignal))) {
           throw error
         }
       }
