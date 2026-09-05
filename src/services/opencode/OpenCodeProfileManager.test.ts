@@ -581,6 +581,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const builtin = await resolve('opencode/big-pickle', 'execution_probe')
     const builtinSame = await resolve('opencode/big-pickle', 'execution_probe')
     const builtinLaunch = await resolve('opencode/big-pickle', 'launch_runtime')
+    const currentBuiltinLaunch = await resolve(
+      'opencode/nemotron-3.5-lightning-free',
+      'launch_runtime',
+    )
     await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
       .rejects.toThrow('requires explicit selected authentication')
     await expect(resolve('opencode/BIG-PICKLE', 'launch_runtime'))
@@ -604,6 +608,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
     expect(builtinSame).toEqual(builtin)
     expect(builtin.selectedAuthIdentity).toBe('absent')
+    expect(currentBuiltinLaunch.selectedAuthIdentity).toBe('absent')
     expect(ollama.selectedAuthIdentity).toBe('absent')
     expect(loopback.selectedAuthIdentity).toBe('absent')
     expect(ollamaOtherModel.configFingerprint).not.toBe(ollama.configFingerprint)

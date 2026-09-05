@@ -1692,6 +1692,12 @@ const OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS = new Set([
 
 const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
   'big-pickle',
+  'ling-3.0-flash-fin-free',
+  'mimo-v2.5-free',
+  'muse-spark-1.2-contributor-free',
+  'muse-spark-1.3-contributor-free',
+  'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning-free',
 ])
 
 function resolveOpenCodeAuthlessAuthorityMode(input: {
