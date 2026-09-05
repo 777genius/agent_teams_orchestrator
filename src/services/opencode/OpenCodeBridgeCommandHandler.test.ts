@@ -180,6 +180,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
     hostKey: 'host-key',
     resolvedBehaviorFingerprint: 'resolved-fingerprint',
     opencodeSessionId: 'session-1',
+    runId: 'run-1',
     lastCanonicalCursor: null,
     lastKnownRawStatus: null,
     lastKnownDurableState: 'idle',
@@ -485,7 +486,10 @@ const originalPromptAsyncUntilAccepted = openCodeSessionBridge.promptAsyncUntilA
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalObservePreview = openCodeSessionBridge.observePreview
 const originalAbort = openCodeSessionBridge.abort
+const originalObserveStopIdle = openCodeSessionBridge.observeStopIdle
+const originalGetRawStatus = openCodeSessionBridge.getRawStatus
 const originalReleaseSession = openCodeSessionBridge.releaseSession
+const originalRestoreSessionLease = openCodeSessionBridge.restoreSessionLease
 const originalAnswerPermission = openCodeSessionBridge.answerPermission
 const originalProjectLogMessages = openCodeSessionBridge.projectLogMessages
 const originalList = openCodeSessionStore.list
@@ -755,8 +759,22 @@ beforeEach(async () => {
   })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
   openCodeSessionBridge.refreshSessionEnvironment = (async record =>
     record) as typeof openCodeSessionBridge.refreshSessionEnvironment
+  openCodeSessionBridge.getRawStatus = (async () => 'idle') as typeof openCodeSessionBridge.getRawStatus
+  openCodeSessionBridge.restoreSessionLease = async () => {}
+  openCodeSessionBridge.observeStopIdle = (async () => ({
+    arm: () => {},
+    currentStatus: () => null,
+    waitForIdle: async () => false,
+    dispose: async () => {},
+  })) as typeof openCodeSessionBridge.observeStopIdle
   openCodeSessionStore.upsert = (async () => 'updated') as typeof openCodeSessionStore.upsert
   openCodeSessionStore.delete = (async () => true) as typeof openCodeSessionStore.delete
+  openCodeSessionStore.get = (async (teamId, laneId, memberName) =>
+    (await openCodeSessionStore.list()).find(record =>
+      record.teamId === teamId
+      && (record.laneId ?? 'primary') === laneId
+      && record.memberName === memberName) ?? null
+  ) as typeof openCodeSessionStore.get
 })
 
 afterEach(async () => {
@@ -822,7 +840,10 @@ afterEach(async () => {
   openCodeSessionBridge.reconcileSession = originalReconcileSession
   openCodeSessionBridge.observePreview = originalObservePreview
   openCodeSessionBridge.abort = originalAbort
+  openCodeSessionBridge.observeStopIdle = originalObserveStopIdle
+  openCodeSessionBridge.getRawStatus = originalGetRawStatus
   openCodeSessionBridge.releaseSession = originalReleaseSession
+  openCodeSessionBridge.restoreSessionLease = originalRestoreSessionLease
   openCodeSessionBridge.answerPermission = originalAnswerPermission
   openCodeSessionBridge.projectLogMessages = originalProjectLogMessages
   openCodeSessionStore.list = originalList
@@ -1065,7 +1086,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     let released = 0
     let effects = 0
     openCodeProvisioningProbe.probeRetainingHost = async (_path, options) => {
-      expect(options).toEqual({ selectedModel: record.selectedModel, toolApprovalMode: 'manual' })
+      expect(options).toEqual(expect.objectContaining({
+        selectedModel: record.selectedModel,
+        toolApprovalMode: 'manual',
+      }))
       return { snapshot: { ...snapshot, providers: null, configProviders: null, modelMetadata: [] },
         host: snapshot.host, release: async () => { released += 1 } }
     }
@@ -1247,6 +1271,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
         aborted.push(target.memberName)
         return target.memberName !== 'bob' || bobCanStop
       }
+      openCodeSessionBridge.getRawStatus = async target =>
+        target.memberName === 'bob' && !bobCanStop ? null : 'idle'
       openCodeSessionBridge.releaseSession = async target => { released.push(target.memberName) }
       const body = { projectPath, teamId: 'team-a', laneId: 'primary', runId: 'run-1' }
       const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
@@ -1266,7 +1292,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       const complete = await stop()
       if (!('data' in complete) || !('stopped' in complete.data)) throw new Error('missing stop result')
       expect(complete.data.stopped).toBe(true)
-      expect(aborted).toEqual(['alice', 'bob', 'bob'])
+      expect([...aborted].sort()).toEqual(['alice', 'bob', 'bob'])
       expect(released).toEqual(['alice', 'bob'])
       const terminal = await store.list()
       expect(probes).toBe(3)
@@ -1281,7 +1307,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(replay.runtime.capabilitySnapshotId).toBe(cap)
       }
       expect(await store.list()).toEqual(terminal)
-      expect(aborted).toEqual(['alice', 'bob', 'bob'])
+      expect([...aborted].sort()).toEqual(['alice', 'bob', 'bob'])
       expect(released).toEqual(['alice', 'bob'])
       for (const patch of [{ expectedCapabilitySnapshotId: 'wrong' }, { runId: 'wrong-run' },
         { projectPath: '/tmp/wrong-terminal-project' }, { preconditions: {
@@ -1324,6 +1350,639 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(record.stoppedAt).toBeUndefined()
     })
   }
+
+  describe('reliable OpenCode stop contract', () => {
+    beforeEach(() => {
+      openCodeProvisioningProbe.probe = async () => snapshot
+      openCodeSessionBridge.releaseSession = async () => {}
+    })
+
+    test('1. exact stale run never aborts a successor session', async () => {
+      let aborts = 0
+      openCodeSessionStore.list = async () => [buildRecord({
+        runId: 'run-successor',
+        opencodeSessionId: 'session-successor',
+      })]
+      openCodeSessionBridge.abort = async () => { aborts += 1; return true }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: 'team-a', laneId: 'primary', runId: 'run-stale',
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(false)
+      expect(result.data.members).toEqual({})
+      expect(result.data.diagnostics.map(item => item.code)).toContain('opencode_stop_identity_changed')
+      expect(aborts).toBe(0)
+    })
+
+    test('2. mixed lanes abort and release only the addressed lane', async () => {
+      const effects: string[] = []
+      openCodeSessionStore.list = async () => [
+        buildRecord({ laneId: 'lane-a', memberName: 'alice', opencodeSessionId: 'session-alice' }),
+        buildRecord({ laneId: 'lane-b', memberName: 'bob', opencodeSessionId: 'session-bob' }),
+      ]
+      openCodeSessionBridge.abort = async record => { effects.push(`abort:${record.memberName}`); return true }
+      openCodeSessionBridge.releaseSession = async record => { effects.push(`release:${record.memberName}`) }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: 'team-a', laneId: 'lane-a', runId: 'run-1',
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(Object.keys(result.data.members)).toEqual(['alice'])
+      expect(result.data.stopped).toBe(true)
+      expect(effects).toEqual(['abort:alice', 'release:alice'])
+    })
+
+    test('3. abort true with busy then idle releases the lease and applies CAS', async () => {
+      const record = buildRecord()
+      const statuses = ['busy', 'idle']
+      const events: string[] = []
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.observeStopIdle = async () => {
+        events.push('observer-connected')
+        return {
+          arm: () => { events.push('observer-armed') },
+          currentStatus: () => null,
+          waitForIdle: async () => false,
+          dispose: async () => {},
+        }
+      }
+      openCodeSessionBridge.abort = async () => { events.push('abort'); return true }
+      openCodeSessionBridge.getRawStatus = async () => statuses.shift() ?? 'idle'
+      openCodeSessionBridge.releaseSession = async (_record, options) => {
+        expect(options).toEqual({ strictLeaseRelease: true })
+        events.push('release')
+      }
+      openCodeSessionStore.markStoppedIfSession = async current => {
+        events.push('cas')
+        return { ...record, ...current, stoppedAt: '2026-09-05T00:00:00.000Z' }
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.members.alice?.stopped).toBe(true)
+      expect(events).toEqual(['observer-connected', 'observer-armed', 'abort', 'release', 'cas'])
+    })
+
+    test('4. a session that remains busy keeps its lease and terminal marker', async () => {
+      const record = buildRecord()
+      let statusReads = 0; let releases = 0; let marks = 0
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => true
+      openCodeSessionBridge.getRawStatus = async () => { statusReads += 1; return 'busy' }
+      openCodeSessionBridge.releaseSession = async () => { releases += 1 }
+      openCodeSessionStore.markStoppedIfSession = async () => { marks += 1; return null }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.members.alice).toEqual({
+        sessionId: record.opencodeSessionId, stopped: false, diagnostics: ['still busy'],
+      })
+      expect(statusReads).toBe(3)
+      expect({ releases, marks }).toEqual({ releases: 0, marks: 0 })
+    })
+
+    test('5. abort false with explicit idle succeeds as already idle', async () => {
+      const record = buildRecord()
+      let releases = 0; let marks = 0
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => false
+      openCodeSessionBridge.getRawStatus = async () => 'idle'
+      openCodeSessionBridge.releaseSession = async () => { releases += 1 }
+      openCodeSessionStore.markStoppedIfSession = async () => {
+        marks += 1
+        return { ...record, stoppedAt: '2026-09-05T00:00:00.000Z' }
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.members.alice).toEqual({
+        sessionId: record.opencodeSessionId, stopped: true, diagnostics: ['already idle'],
+      })
+      expect({ releases, marks }).toEqual({ releases: 1, marks: 1 })
+    })
+
+    test('6. abort false with missing or unknown status never releases or marks stopped', async () => {
+      for (const [rawStatus, reason] of [[null, 'status missing'], [{ type: 'mystery' }, 'status unrecognized']] as const) {
+        const record = buildRecord()
+        let releases = 0; let marks = 0
+        openCodeSessionStore.list = async () => [record]
+        openCodeSessionBridge.abort = async () => false
+        openCodeSessionBridge.getRawStatus = (async () => rawStatus) as typeof openCodeSessionBridge.getRawStatus
+        openCodeSessionBridge.releaseSession = async () => { releases += 1 }
+        openCodeSessionStore.markStoppedIfSession = async () => { marks += 1; return null }
+
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+          teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+        }))
+        expect(result.ok).toBe(true)
+        if (!result.ok) continue
+        expect(result.data.members.alice?.stopped).toBe(false)
+        expect(result.data.members.alice?.diagnostics).toEqual(['abort rejected', reason])
+        expect({ releases, marks }).toEqual({ releases: 0, marks: 0 })
+      }
+    })
+
+    test('7. identity is rechecked before abort', async () => {
+      const record = buildRecord()
+      let aborts = 0
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionStore.get = async () => ({
+        ...record, runId: 'run-successor', opencodeSessionId: 'session-successor',
+      })
+      openCodeSessionBridge.abort = async () => { aborts += 1; return true }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.members.alice?.diagnostics).toEqual(['identity changed before abort'])
+      expect(aborts).toBe(0)
+    })
+
+    test('8. identity changes after idle and CAS mismatch both preserve the successor', async () => {
+      const record = buildRecord()
+      for (const failure of ['host-key', 'cas'] as const) {
+        let reads = 0; let releases = 0; let marks = 0
+        openCodeSessionStore.list = async () => [record]
+        openCodeSessionStore.get = async () => {
+          reads += 1
+          if (failure === 'host-key' && reads === 3) return { ...record, hostKey: 'successor-host' }
+          return record
+        }
+        openCodeSessionBridge.abort = async () => true
+        openCodeSessionBridge.getRawStatus = async () => 'idle'
+        openCodeSessionBridge.releaseSession = async () => { releases += 1 }
+        openCodeSessionStore.markStoppedIfSession = async () => { marks += 1; return null }
+
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+          teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+        }))
+        expect(result.ok).toBe(true)
+        if (!result.ok) continue
+        expect(result.data.members.alice?.stopped).toBe(false)
+        expect(result.data.members.alice?.diagnostics).toEqual(['identity changed before confirmation'])
+        expect({ releases, marks }).toEqual(failure === 'host-key'
+          ? { releases: 0, marks: 0 }
+          : { releases: 1, marks: 1 })
+      }
+    })
+
+    test('9. slow and failing members do not block successful peers', async () => {
+      const records = ['alice', 'bob', 'carol'].map(name => buildRecord({
+        memberName: name, opencodeSessionId: `session-${name}`,
+      }))
+      openCodeSessionStore.list = async () => records
+      openCodeSessionBridge.abort = async record => {
+        if (record.memberName === 'bob') throw new Error('bob transport failed')
+        if (record.memberName === 'carol') await new Promise(resolve => setTimeout(resolve, 20))
+        return true
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: 'team-a', laneId: 'primary', runId: 'run-1',
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(false)
+      expect(result.data.members.alice?.stopped).toBe(true)
+      expect(result.data.members.bob?.diagnostics).toEqual(['bob transport failed'])
+      expect(result.data.members.carol?.stopped).toBe(true)
+    })
+
+    test('10. member stop concurrency never exceeds four', async () => {
+      const records = Array.from({ length: 9 }, (_, index) => buildRecord({
+        memberName: `member-${index}`, opencodeSessionId: `session-${index}`,
+      }))
+      const gate = createDeferred<void>()
+      let active = 0; let maximum = 0; let started = 0
+      const firstWave = createDeferred<void>()
+      openCodeSessionStore.list = async () => records
+      openCodeSessionBridge.abort = async () => {
+        active += 1; started += 1; maximum = Math.max(maximum, active)
+        if (started === 4) firstWave.resolve()
+        await gate.promise
+        active -= 1
+        return true
+      }
+
+      const stop = executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: 'team-a', laneId: 'primary', runId: 'run-1',
+      }))
+      await firstWave.promise
+      expect(started).toBe(4)
+      expect(maximum).toBe(4)
+      gate.resolve()
+      const result = await stop
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(true)
+      expect(started).toBe(9)
+      expect(maximum).toBe(4)
+    })
+
+    test('11. the shared deadline cancels in-flight aborts and starts no queued aborts', async () => {
+      const records = Array.from({ length: 8 }, (_, index) => buildRecord({
+        memberName: `member-${index}`, opencodeSessionId: `session-${index}`,
+      }))
+      let started = 0; let cancelled = 0
+      openCodeSessionStore.list = async () => records
+      openCodeSessionBridge.abort = async (_record, options) => {
+        started += 1
+        return new Promise<boolean>((_resolve, reject) => {
+          const cancel = () => { cancelled += 1; reject(options.signal?.reason) }
+          if (options.signal?.aborted) cancel()
+          else options.signal?.addEventListener('abort', cancel, { once: true })
+        })
+      }
+      const envelope = {
+        ...buildEnvelope('opencode.stopTeam', {
+          teamId: 'team-a', laneId: 'primary', runId: 'run-1',
+        }),
+        timeoutMs: 25,
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(started).toBe(4)
+      expect(cancelled).toBe(4)
+      expect(Object.values(result.data.members).every(member => !member.stopped)).toBe(true)
+      expect(result.data.diagnostics.some(item => item.code === 'opencode_stop_deadline')).toBe(true)
+    })
+
+    test('12. an exact already-terminal record is idempotent and never aborts again', async () => {
+      const record = buildRecord({ stoppedAt: '2026-09-05T00:00:00.000Z' })
+      let aborts = 0
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => { aborts += 1; return true }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(true)
+      expect(result.data.members.alice?.stopped).toBe(true)
+      expect(aborts).toBe(0)
+    })
+
+    test('13. shared-host cleanup is scoped and preserves another active lease', async () => {
+      const record = buildRecord()
+      let cleanupInput: unknown
+      openCodeSessionStore.list = async () => [record, buildRecord({
+        teamId: 'team-other', laneId: 'other', memberName: 'peer', opencodeSessionId: 'session-peer',
+      })]
+      openCodeSessionBridge.abort = async () => true
+      openCodeHostManager.reconcilePersistentHosts = async input => {
+        cleanupInput = input
+        return { cleaned: 0, remaining: 1, hosts: [], diagnostics: [] }
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(true)
+      expect(cleanupInput).toEqual({ mode: 'stale', reason: 'stopTeam', projectPath: '/tmp/project',
+        staleAgeMs: 0, leaseStaleAgeMs: null, preflightLeaseStaleAgeMs: null })
+      expect(result.data.diagnostics.some(item => item.code === 'opencode_host_cleanup')).toBe(false)
+    })
+
+    test('14. a host without leases is reported as cleaned', async () => {
+      const record = buildRecord()
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => true
+      openCodeHostManager.reconcilePersistentHosts = async () => ({
+        cleaned: 1, remaining: 0, hosts: [], diagnostics: [],
+      })
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.diagnostics).toContainEqual({
+        code: 'opencode_host_cleanup', severity: 'info',
+        message: 'Disposed 1 OpenCode host without active leases for /tmp/project',
+      })
+    })
+
+    test('15. cleanup failure is a warning and preserves confirmed member success', async () => {
+      const record = buildRecord()
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => true
+      openCodeHostManager.reconcilePersistentHosts = async () => { throw new Error('cleanup unavailable') }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(true)
+      expect(result.data.members.alice?.stopped).toBe(true)
+      expect(result.data.diagnostics).toContainEqual({
+        code: 'opencode_host_cleanup_failed', severity: 'warning', message: 'cleanup unavailable',
+      })
+    })
+
+    test('16. aggregate stopped is true only when every addressed member is confirmed', async () => {
+      const records = ['alice', 'bob'].map(name => buildRecord({
+        memberName: name, opencodeSessionId: `session-${name}`,
+      }))
+      openCodeSessionStore.list = async () => records
+      openCodeSessionBridge.abort = async () => true
+      openCodeSessionBridge.getRawStatus = async record => record.memberName === 'alice' ? 'idle' : null
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: 'team-a', laneId: 'primary', runId: 'run-1',
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.members.alice?.stopped).toBe(true)
+      expect(result.data.members.bob?.stopped).toBe(false)
+      expect(result.data.stopped).toBe(false)
+    })
+
+    test('17. retained stop ignores a terminal member from a prior run', async () => {
+      const profileScope = {
+        purpose: 'launch_runtime' as const,
+        providerId: 'openai',
+        scopeToken: 'lane-scope',
+        configFingerprint: 'config',
+        selectedAuthIdentity: 'absent' as const,
+      }
+      const current = buildRecord({
+        runId: 'run-current',
+        selectedModel: 'openai/gpt-5.6-sol',
+        toolApprovalMode: 'auto',
+        profileScope,
+      })
+      const terminalPriorRun = buildRecord({
+        runId: 'run-prior',
+        memberName: 'retired-member',
+        opencodeSessionId: 'session-prior',
+        selectedModel: current.selectedModel,
+        toolApprovalMode: current.toolApprovalMode,
+        profileScope,
+        stoppedAt: '2026-09-04T00:00:00.000Z',
+      })
+      const aborted: string[] = []
+      openCodeSessionStore.list = async () => [current, terminalPriorRun]
+      openCodeProvisioningProbe.probeRetainingHost = async () => ({
+        snapshot, host: snapshot.host, release: async () => {},
+      })
+      openCodeSessionBridge.abort = async record => { aborted.push(record.memberName); return true }
+      const body = {
+        teamId: current.teamId,
+        laneId: current.laneId,
+        runId: current.runId,
+      }
+      const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+        ...body,
+        requiredCommand: 'opencode.stopTeam',
+        expectedCapabilitySnapshotId: 'selected',
+      }))
+      expect(handshake.ok).toBe(true)
+      if (!handshake.ok) return
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        ...body,
+        expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(true)
+      expect(Object.keys(result.data.members)).toEqual(['alice'])
+      expect(aborted).toEqual(['alice'])
+    })
+
+    test('18. retained stop rejects an active foreign run before any abort', async () => {
+      const profileScope = {
+        purpose: 'launch_runtime' as const,
+        providerId: 'openai',
+        scopeToken: 'lane-scope',
+        configFingerprint: 'config',
+        selectedAuthIdentity: 'absent' as const,
+      }
+      const current = buildRecord({
+        runId: 'run-current',
+        selectedModel: 'openai/gpt-5.6-sol',
+        toolApprovalMode: 'auto',
+        profileScope,
+      })
+      let records = [current]
+      let aborts = 0
+      openCodeSessionStore.list = async () => records
+      openCodeProvisioningProbe.probeRetainingHost = async () => ({
+        snapshot, host: snapshot.host, release: async () => {},
+      })
+      openCodeSessionBridge.abort = async () => { aborts += 1; return true }
+      const body = {
+        teamId: current.teamId,
+        laneId: current.laneId,
+        runId: current.runId,
+      }
+      const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+        ...body,
+        requiredCommand: 'opencode.stopTeam',
+        expectedCapabilitySnapshotId: 'selected',
+      }))
+      expect(handshake.ok).toBe(true)
+      if (!handshake.ok) return
+      records = [current, buildRecord({
+        runId: 'run-foreign',
+        memberName: 'foreign-member',
+        opencodeSessionId: 'session-foreign',
+        selectedModel: current.selectedModel,
+        toolApprovalMode: current.toolApprovalMode,
+        profileScope,
+      })]
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        ...body,
+        expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
+      }))
+
+      expect(result.ok).toBe(false)
+      expect(aborts).toBe(0)
+      if (!result.ok) {
+        expect(result.error.message).toContain('another run is active')
+      }
+    })
+
+    test('19. terminal CAS exception restores the exact active session lease', async () => {
+      const record = buildRecord()
+      const events: string[] = []
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => true
+      openCodeSessionBridge.releaseSession = async () => { events.push('release') }
+      openCodeSessionStore.markStoppedIfSession = async () => {
+        events.push('cas')
+        throw new Error('terminal CAS failed')
+      }
+      openCodeSessionBridge.restoreSessionLease = async restored => {
+        expect(restored).toEqual(record)
+        events.push('restore')
+      }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(false)
+      expect(result.data.members.alice?.diagnostics).toEqual(['terminal CAS failed'])
+      expect(result.data.diagnostics).toContainEqual({
+        code: 'opencode_stop_lease_restored',
+        severity: 'warning',
+        message: 'alice: restored the exact session lease after terminal CAS failed',
+      })
+      expect(events).toEqual(['release', 'cas', 'restore'])
+    })
+
+    test('20. terminal CAS exception never restores a successor session lease', async () => {
+      const record = buildRecord()
+      let reads = 0; let restores = 0
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionStore.get = async () => {
+        reads += 1
+        return reads >= 4
+          ? { ...record, opencodeSessionId: 'session-successor', runId: 'run-successor' }
+          : record
+      }
+      openCodeSessionBridge.abort = async () => true
+      openCodeSessionStore.markStoppedIfSession = async () => { throw new Error('terminal CAS failed') }
+      openCodeSessionBridge.restoreSessionLease = async () => { restores += 1 }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(false)
+      expect(result.data.members.alice?.diagnostics).toEqual(['terminal CAS failed'])
+      expect(result.data.diagnostics.map(item => item.code)).not.toContain('opencode_stop_lease_restored')
+      expect(restores).toBe(0)
+    })
+
+    test('21. lease restoration failure surfaces the CAS and compensation errors', async () => {
+      const record = buildRecord()
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionBridge.abort = async () => true
+      openCodeSessionStore.markStoppedIfSession = async () => { throw new Error('terminal CAS failed') }
+      openCodeSessionBridge.restoreSessionLease = async () => { throw new Error('lease restore failed') }
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', {
+        teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      }))
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.stopped).toBe(false)
+      expect(result.data.members.alice?.diagnostics).toEqual([
+        'OpenCode terminal CAS failed: terminal CAS failed; lease restoration failed: lease restore failed',
+      ])
+      expect(result.data.diagnostics).toContainEqual({
+        code: 'opencode_stop_compensation_failed',
+        severity: 'error',
+        message: 'alice: terminal CAS failed (terminal CAS failed) and exact lease restoration failed (lease restore failed)',
+      })
+    })
+
+    test('22. terminal CAS completing after deadline reports failure but remains idempotently terminal', async () => {
+      const originalPerformanceNow = Object.getOwnPropertyDescriptor(performance, 'now')
+      let monotonicNow = 1_000
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => monotonicNow,
+      })
+      try {
+        const record = buildRecord()
+        let stored = record
+        let aborts = 0; let releases = 0; let marks = 0
+        openCodeSessionStore.list = async () => [stored]
+        openCodeSessionBridge.abort = async () => { aborts += 1; return true }
+        openCodeSessionBridge.releaseSession = async (_record, options) => {
+          expect(options).toEqual({ strictLeaseRelease: true })
+          releases += 1
+        }
+        openCodeSessionStore.markStoppedIfSession = async () => {
+          marks += 1
+          monotonicNow = 2_501
+          stored = { ...record, stoppedAt: '2026-09-05T00:00:00.000Z' }
+          return stored
+        }
+        const body = { teamId: record.teamId, laneId: record.laneId, runId: record.runId }
+        const firstEnvelope = {
+          ...buildEnvelope('opencode.stopTeam', body),
+          timeoutMs: 1_500,
+        }
+
+        const first = await executeOpenCodeBridgeCommandEnvelope(firstEnvelope)
+
+        expect(first.ok).toBe(true)
+        if (!first.ok) return
+        expect(first.data.stopped).toBe(false)
+        expect(first.data.members.alice).toEqual({
+          sessionId: record.opencodeSessionId,
+          stopped: false,
+          diagnostics: ['deadline expired'],
+        })
+        expect(first.data.diagnostics).toContainEqual({
+          code: 'opencode_stop_deadline',
+          severity: 'error',
+          message: 'alice: deadline expired while completing the atomic lease/CAS transition',
+        })
+        expect(stored.stoppedAt).toBeDefined()
+        expect({ aborts, releases, marks }).toEqual({ aborts: 1, releases: 1, marks: 1 })
+
+        const replay = await executeOpenCodeBridgeCommandEnvelope({
+          ...buildEnvelope('opencode.stopTeam', body),
+          timeoutMs: 1_500,
+        })
+
+        expect(replay.ok).toBe(true)
+        if (!replay.ok) return
+        expect(replay.data.stopped).toBe(true)
+        expect(replay.data.members.alice?.stopped).toBe(true)
+        expect({ aborts, releases, marks }).toEqual({ aborts: 1, releases: 1, marks: 1 })
+      } finally {
+        if (originalPerformanceNow) {
+          Object.defineProperty(performance, 'now', originalPerformanceNow)
+        }
+      }
+    })
+  })
 
   test('explicit empty-lane stop checks absence in handshake and command before host or abort effects', async () => {
     let records: OpenCodeSessionRecord[] = []

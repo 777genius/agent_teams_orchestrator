@@ -664,25 +664,29 @@ export class OpenCodeSessionStore {
   }
 
   async markStoppedIfSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
+    record: Pick<OpenCodeSessionRecord,
+      'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId' | 'hostKey'>,
     stopAuthority?: OpenCodeSessionStopAuthority,
+    signal?: AbortSignal,
   ): Promise<OpenCodeSessionRecord | null> {
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
       if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
-        || previous.runId !== record.runId) return null
+        || previous.runId !== record.runId || previous.hostKey !== record.hostKey) return null
       if (isOpenCodeSessionStopped(previous)) {
         if (stopAuthority && jsonStringify(previous.stopAuthority) !== jsonStringify(stopAuthority)) return null
         return previous
       }
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
       const stoppedAt = new Date().toISOString()
       const next = { ...previous, stoppedAt, ...(stopAuthority ? { stopAuthority } : {}), updatedAt: stoppedAt }
       store.records[key] = next
       await this.writeStore(store)
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
       return next
-    })
+    }, signal)
   }
 
   async markStaleIfSession(

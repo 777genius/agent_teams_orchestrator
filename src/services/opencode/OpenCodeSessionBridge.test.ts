@@ -1111,11 +1111,122 @@ describe('OpenCodeSessionBridge', () => {
       ensureHost: async () => { throw new Error('release must not start a host') },
       releaseHost: async () => { throw new Error('lease failure must precede host release') },
       releaseHostLease: async () => { attempts += 1; throw new Error('registry write failed') },
+      releaseHostLeaseStrict: async () => { attempts += 1; throw new Error('registry write failed') },
     } })
     await expect(bridge.releaseSession(buildRecord(), { strictLeaseRelease: true }))
       .rejects.toThrow('registry write failed')
     await bridge.releaseSession(buildRecord())
     expect(attempts).toBe(2)
+  })
+
+  test('strict release keeps a retained persistent host alive for lease-aware reconciliation', async () => {
+    const releaseOptions: Array<{ keepPersistentAlive?: boolean }> = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => { throw new Error('release must not start a host') },
+        releaseHost: async (_hostKey, options) => { releaseOptions.push(options) },
+        releaseHostLeaseStrict: async () => true,
+      },
+    })
+    const record = buildRecord({ runId: 'run-1' })
+    const retained = (bridge as unknown as {
+      retainedSessionHosts: Map<string, string>
+    }).retainedSessionHosts
+    retained.set('team-a::primary::alice', record.hostKey)
+
+    await bridge.releaseSession(record, { strictLeaseRelease: true })
+
+    expect(releaseOptions).toEqual([{ keepPersistentAlive: true }])
+  })
+
+  test('restores the exact persistent lease for stop CAS compensation', async () => {
+    const retained: Array<{ hostKey: string; lease: unknown }> = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => { throw new Error('compensation must not start a host') },
+        releaseHost: async () => {},
+        retainHostLease: async (hostKey, lease) => { retained.push({ hostKey, lease }) },
+      },
+    })
+    const record = buildRecord({ runId: 'run-1', opencodeSessionId: 'session-stop' })
+
+    await bridge.restoreSessionLease(record)
+
+    expect(retained).toEqual([{
+      hostKey: record.hostKey,
+      lease: {
+        teamId: record.teamId,
+        laneId: record.laneId,
+        memberName: record.memberName,
+        runId: 'run-1',
+        sessionId: 'session-stop',
+      },
+    }])
+  })
+
+  test('keeps the stop observer host retained until observer disposal', async () => {
+    const events: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        retainHostLease: async () => { events.push('lease retained') },
+        releaseHost: async (_hostKey, options) => {
+          events.push(`host released:${options.keepPersistentAlive === true}`)
+        },
+      },
+      stopObserverFactory: async () => ({
+        arm: () => {},
+        currentStatus: () => null,
+        waitForIdle: async () => false,
+        dispose: async () => { events.push('observer disposed') },
+      }),
+    })
+    const observer = await bridge.observeStopIdle(buildRecord({
+      profileScope: null,
+      managedConfigFingerprint: profile.managedConfigFingerprint,
+    }))
+
+    expect(events).toEqual(['lease retained'])
+    await observer.dispose()
+    expect(events).toEqual([
+      'lease retained',
+      'observer disposed',
+      'host released:true',
+    ])
+  })
+
+  test('threads stop cancellation and remaining budget through profile, host, and client', async () => {
+    const controller = new AbortController()
+    const remainingMs = () => 321
+    let profileSignal: AbortSignal | undefined
+    let hostSignal: AbortSignal | undefined
+    let clientContext: { signal?: AbortSignal; remainingMs?: () => number } | undefined
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        profileSignal = options?.abortSignal
+        return profile
+      },
+      hostManager: {
+        ensureHost: async input => {
+          hostSignal = input.abortSignal
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: (_baseUrl, context) => {
+          clientContext = context
+          return { abortSession: async () => true } as never
+        },
+      },
+    })
+
+    expect(await bridge.abort(buildRecord(), { signal: controller.signal, remainingMs })).toBe(true)
+    expect(profileSignal).toBe(controller.signal)
+    expect(hostSignal).toBe(controller.signal)
+    expect(clientContext?.signal).toBe(controller.signal)
+    expect(clientContext?.remainingMs?.()).toBe(321)
   })
 
   test('confirmed stop fails on a real registry lock filesystem error', async () => {
