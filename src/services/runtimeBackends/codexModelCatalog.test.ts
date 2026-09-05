@@ -41,6 +41,9 @@ function createFakeCodexAppServerSpawn(options: {
           additionalSpeedTiers: ['fast'],
           inputModalities: ['text', 'image'],
           isDefault: true,
+          availabilityNux: {
+            message: '  Newly available in Codex  ',
+          },
         },
       ],
       nextCursor: 'page-2',
@@ -54,6 +57,7 @@ function createFakeCodexAppServerSpawn(options: {
           supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
           defaultReasoningEffort: 'high',
           inputModalities: ['text', 'image'],
+          availabilityNux: { message: 42 },
         },
       ],
       nextCursor: null,
@@ -144,7 +148,15 @@ describe('Codex app-server model catalog loader', () => {
     expect(catalog.status).toBe('ready')
     expect(catalog.models.map(model => model.launchModel)).toEqual(['gpt-5.4', 'gpt-5.5'])
     expect(catalog.defaultLaunchModel).toBe('gpt-5.4')
-    expect(catalog.models.find(model => model.id === 'gpt-5.5')?.displayName).toBe('GPT-5.5')
+    expect(catalog.models.find(model => model.id === 'gpt-5.4')).toMatchObject({
+      statusMessage: 'Newly available in Codex',
+      metadata: { recentlyReleased: true },
+    })
+    expect(catalog.models.find(model => model.id === 'gpt-5.5')).toMatchObject({
+      displayName: 'GPT-5.5',
+      statusMessage: null,
+      metadata: null,
+    })
   })
 
   test('falls back to the static catalog when the binary is missing', async () => {

@@ -96,6 +96,7 @@ export type RuntimeProviderModelCatalogItem = {
     limits?: unknown | null
     free?: boolean
     releaseDate?: string | null
+    recentlyReleased?: boolean
     opencode?: OpenCodeModelRouteMetadata | null
   } | null
 }
