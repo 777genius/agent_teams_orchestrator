@@ -5675,10 +5675,17 @@ async function handleEnvelope(
         }
         // Read the same selected launch scope as readiness. A broad inventory
         // profile has a different config/provider identity and cannot attest it.
-        const retained = await openCodeProvisioningProbe.probeRetainingHost(envelope.cwd, {
+        const probeOptions = {
           selectedModel: selected.raw,
-          toolApprovalMode: mode === 'manual' ? 'manual' : 'auto',
-        })
+          toolApprovalMode: mode === 'manual' ? 'manual' as const : 'auto' as const,
+        }
+        const retained = runtimeDeadline
+          ? await runtimeDeadline.runPhase('host_start', phaseContext =>
+              openCodeProvisioningProbe.probeRetainingHost(envelope.cwd, {
+                ...probeOptions,
+                phaseContext,
+              }))
+          : await openCodeProvisioningProbe.probeRetainingHost(envelope.cwd, probeOptions)
         try {
           snapshot = retained.snapshot
           assertOpenCodeLaunchRuntimeAvailable(snapshot)
@@ -5812,6 +5819,9 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     envelope.command === 'opencode.readiness'
     || envelope.command === 'opencode.launchTeam'
     || envelope.command === 'opencode.stopTeam'
+    || (envelope.command === 'opencode.handshake'
+      && envelope.body.requiredCommand === 'opencode.launchTeam'
+      && !shouldUseLightweightLaunchHandshake(envelope.body))
   )
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined

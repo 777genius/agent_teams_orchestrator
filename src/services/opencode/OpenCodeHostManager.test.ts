@@ -13,6 +13,7 @@ import {
   buildOpenCodeHostProfileIdentity,
   buildOpenCodeHostSpawnOptions,
   resolveOpenCodeBinaryHostIdentity,
+  shouldRetryPersistentHostStartupLock,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
 import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
@@ -46,6 +47,13 @@ const baseProfile: OpenCodePreparedProfile = {
   authState: 'ok',
   env: {},
 }
+
+test('deadline-bound host startup waits past the fallback retry cap', () => {
+  const locked = Object.assign(new Error('contended'), { code: 'ELOCKED' })
+  expect(shouldRetryPersistentHostStartupLock(locked, 120, true)).toBe(true)
+  expect(shouldRetryPersistentHostStartupLock(locked, 120, false)).toBe(false)
+  expect(shouldRetryPersistentHostStartupLock(new Error('failed'), 0, true)).toBe(false)
+})
 
 function createMockChildProcess(pid = 4242): {
   child: ChildProcess
