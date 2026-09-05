@@ -9,10 +9,12 @@ import {
   createOpenCodeInventoryProbeProgressTracker,
   execOpenCodePortableCommand,
   filterOpenCodeConnectedProvidersForRuntime,
+  getOpenCodeInventoryCommandTimeoutMs,
   getOpenCodeRefreshModelsArgs,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
+  OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
   OPEN_CODE_PROBE_TIMEOUT_MS,
   isOpenCodeBuiltinFreeModelId,
   isOpenCodeInventoryTimeoutSnapshot,
@@ -133,6 +135,27 @@ describe('OpenCodeInventoryService parsers', () => {
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
     expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
     expect(getOpenCodeRefreshModelsArgs()).toEqual(['models', 'opencode', '--refresh'])
+  })
+
+  test('gives primary and fallback model-list commands the bounded model-list timeout', () => {
+    expect(getOpenCodeInventoryCommandTimeoutMs(getOpenCodeVerboseModelsArgs())).toBe(
+      OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['models'])).toBe(
+      OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
+    )
+  })
+
+  test('keeps non-model inventory commands on the standard probe timeout', () => {
+    expect(getOpenCodeInventoryCommandTimeoutMs(['--version'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['providers', 'list'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['agent', 'list'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
   })
 
   test('forces OpenCode to refresh models instead of reusing a prewarmed catalog result', async () => {
