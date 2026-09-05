@@ -136,6 +136,13 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
       retiredIngress: [{ outboxId: legacyReferenced.outboxId }],
       deliveries: [{ providerDeliveryId: 'delivery_legacy', phase: 'started' }],
     })
+    const priorSchema2Migration = structuredClone(migrated) as unknown as Record<string, unknown>
+    priorSchema2Migration.schemaVersion = 2
+    delete priorSchema2Migration.bindings
+    expect(decodeOwnerState(priorSchema2Migration)).toMatchObject({
+      schemaVersion: 3, retiredIngress: [{ outboxId: legacyReferenced.outboxId }],
+      deliveries: [{ providerDeliveryId: 'delivery_legacy', phase: 'started' }],
+    })
   })
 
   test('migrates schema2 composite hashes without relabeling them as permission digests', () => {
@@ -160,6 +167,88 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
       bindings: [{ requestId: ingress.commandId, effectRef: null, bindingDigest: null, quarantined: true }],
       deliveries: [{ phase: 'completed', result: 'delivered' }],
     })
+  })
+
+  test('recovers retired schema2 evidence by its old authority and accepts its own migration output', () => {
+    const old = structuredClone(state()) as unknown as Record<string, unknown> & {
+      routes: HostedApprovalRuntimeRoute[]; ingress: HostedApprovalOwnerState['ingress']
+      retiredIngress: HostedApprovalOwnerState['retiredIngress']; bindings?: HostedApprovalOwnerState['bindings']
+      deliveries: HostedApprovalOwnerState['deliveries']
+    }
+    old.schemaVersion = 2
+    delete old.bindings
+    const record = old.ingress.pop()!
+    ;(record as { outboxVersion: number }).outboxVersion = 1
+    record.outboxId = `runtime_permission:${record.effectRef}`
+    old.retiredIngress = [record]
+    old.deliveries = [{
+      providerDeliveryId: 'delivery_retired', reconciliationRef: 'approval-reconciliation_retired',
+      deliveryRef: record.deliveryRef, payloadFingerprint: 'f'.repeat(64), outboxId: record.outboxId,
+      effectRef: record.effectRef, phase: 'started', result: null,
+    }]
+    old.routes[0]!.authority.credentialGeneration += 1
+    old.routes[0]!.authority.credentialId = 'credential_rotated'
+    old.routes[0]!.openCodeBinding.credentialGeneration += 1
+    old.routes[0]!.openCodeBinding.credentialId = 'credential_rotated'
+
+    const migrated = decodeOwnerState(old)
+    expect(migrated).toMatchObject({
+      schemaVersion: 3, routes: [], ingress: [],
+      retiredIngress: [{ outboxId: record.outboxId, authority: record.authority }],
+      deliveries: [{ phase: 'started', result: null }],
+    })
+    expect(decodeOwnerState(structuredClone(migrated))).toEqual(migrated)
+  })
+
+  test('rejects schema2 duplicate routes and v2 ingress before migration', () => {
+    const duplicate = structuredClone(state()) as unknown as Record<string, unknown> & {
+      routes: HostedApprovalRuntimeRoute[]; ingress: HostedApprovalOwnerState['ingress']
+      bindings?: HostedApprovalOwnerState['bindings']
+    }
+    duplicate.schemaVersion = 2
+    delete duplicate.bindings
+    ;(duplicate.ingress[0] as { outboxVersion: number }).outboxVersion = 1
+    duplicate.ingress[0]!.outboxId = `runtime_permission:${duplicate.ingress[0]!.effectRef}`
+    duplicate.routes.push(structuredClone(duplicate.routes[0]!))
+    expect(() => decodeOwnerState(duplicate)).toThrow('schema2 route identity')
+    duplicate.routes[1]!.routeId = 'route_2'
+    expect(() => decodeOwnerState(duplicate)).toThrow('schema2 route identity')
+
+    const masquerading = structuredClone(state()) as unknown as Record<string, unknown> & {
+      bindings?: HostedApprovalOwnerState['bindings']
+    }
+    masquerading.schemaVersion = 2
+    delete masquerading.bindings
+    expect(() => decodeOwnerState(masquerading)).toThrow('legacy ingress')
+  })
+
+  test('enforces legacy tombstones, private-B ownership, and the complete v2 outbox prefix', () => {
+    const tombstone = state()
+    tombstone.bindings.push({
+      teamId: tombstone.bindings[0]!.teamId, runId: tombstone.bindings[0]!.runId,
+      requestId: tombstone.bindings[0]!.requestId,
+      effectRef: null, bindingDigest: null, quarantined: true,
+    })
+    expect(() => decodeOwnerState(tombstone)).toThrow('identity')
+
+    const reused = state()
+    reused.bindings.push({
+      teamId: reused.bindings[0]!.teamId, runId: `run_${'9'.repeat(32)}`, requestId: 'permission_other',
+      effectRef: `effect:${'d'.repeat(64)}`, bindingDigest: reused.bindings[0]!.bindingDigest,
+      quarantined: false,
+    })
+    expect(() => decodeOwnerState(reused)).toThrow('identity')
+
+    const distinct = state()
+    distinct.bindings.push({
+      teamId: distinct.bindings[0]!.teamId, runId: `run_${'9'.repeat(32)}`, requestId: 'permission_other',
+      effectRef: distinct.bindings[0]!.effectRef, bindingDigest: 'd'.repeat(64), quarantined: false,
+    })
+    expect(decodeOwnerState(distinct).bindings).toHaveLength(2)
+
+    const junkPrefix = state()
+    junkPrefix.ingress[0]!.outboxId = `${'x'.repeat('runtime_permission:effect:'.length)}${'b'.repeat(64)}`
+    expect(() => decodeOwnerState(junkPrefix)).toThrow('ingress binding')
   })
 })
 

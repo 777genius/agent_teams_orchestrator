@@ -720,7 +720,13 @@ export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
   const bindings = state.bindings.map(decodePrivateBinding)
   const deliveries = state.deliveries.map(value => decodeWalDelivery(value, allIngress))
   const exposed = bindings.filter(binding => !binding.quarantined)
+  const legacyTuples = new Set(bindings
+    .filter(binding => binding.effectRef === null && binding.bindingDigest === null)
+    .map(bindingTuple))
   const exposureKeys = exposed.map(binding => [binding.teamId, binding.runId, binding.requestId, binding.effectRef].join('\0'))
+  const privateDigests = bindings
+    .filter(binding => binding.bindingDigest !== null)
+    .map(binding => binding.bindingDigest)
   const bindingIdentities = bindings.map(binding =>
     [binding.teamId, binding.runId, binding.requestId, binding.effectRef, binding.bindingDigest].join('\0'))
   const everyIngressBound = ingress.every(record => exposed.some(binding =>
@@ -736,6 +742,7 @@ export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
       binding.effectRef === record.effectRef &&
       binding.bindingDigest === record.outboxId.slice('runtime_permission:effect:'.length)))
   if (new Set(routes.map(route => route.routeId)).size !== routes.length ||
+    new Set(routes.map(route => route.authority.sessionId)).size !== routes.length ||
     new Set(allIngress.map(record => record.outboxId)).size !== allIngress.length ||
     new Set(allIngress.map(record => record.deliveryRef)).size !== allIngress.length ||
     new Set(deliveries.map(record => record.providerDeliveryId)).size !== deliveries.length ||
@@ -743,7 +750,11 @@ export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
     new Set(deliveries.map(record => record.deliveryRef)).size !== deliveries.length ||
     new Set(deliveries.map(record => record.outboxId)).size !== deliveries.length ||
     new Set(exposureKeys).size !== exposureKeys.length ||
-    new Set(bindingIdentities).size !== bindingIdentities.length || !everyIngressBound || !everyRetiredBound) {
+    new Set(privateDigests).size !== privateDigests.length ||
+    new Set(bindingIdentities).size !== bindingIdentities.length ||
+    exposed.some(binding => legacyTuples.has(bindingTuple(binding))) ||
+    ingress.some(record => legacyTuples.has(ingressTuple(record))) ||
+    !everyIngressBound || !everyRetiredBound) {
     throw new Error('Invalid duplicate hosted approval WAL identity')
   }
   return {
@@ -816,31 +827,76 @@ function migrateLegacyOwnerState(state: Record<string, unknown>): HostedApproval
 
 /** Schema 2 used a composite effect hash and retained no raw permission, so D cannot be recovered. */
 function migrateSchema2OwnerState(state: Record<string, unknown>): HostedApprovalOwnerState {
-  if (!Array.isArray(state.routes) || !state.actorMembers || typeof state.actorMembers !== 'object' ||
-    Array.isArray(state.actorMembers)) throw new Error('Invalid hosted approval schema2 WAL')
-  const actors = state.actorMembers as Record<string, unknown>
+  exact(state, ['schemaVersion', 'revision', 'admissionGeneration', 'admissionDigest', 'routes', 'actorMembers', 'ingress', 'retiredIngress', 'deliveries', 'writerFence'], 'schema2 WAL')
+  if (!Number.isSafeInteger(state.revision) || (state.revision as number) < 1 ||
+    typeof state.admissionGeneration !== 'string' ||
+    !/^approval-admission-generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(state.admissionGeneration) ||
+    typeof state.admissionDigest !== 'string' || !/^[0-9a-f]{64}$/.test(state.admissionDigest) ||
+    !Array.isArray(state.routes) || !Array.isArray(state.ingress) ||
+    !Array.isArray(state.retiredIngress) || !Array.isArray(state.deliveries)) {
+    throw new Error('Invalid hosted approval schema2 WAL scalar')
+  }
+  const actors = object(state.actorMembers, 'schema2 actor members')
   for (const [actor, member] of Object.entries(actors)) {
     if (!/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/.test(actor) ||
       typeof member !== 'string' || !/^member_[0-9a-f]{32}$/.test(member)) {
       throw new Error('Invalid hosted approval schema2 actor mapping')
     }
   }
-  // Schema 2 routes did have the artifact binding. Validate that provenance
-  // before adapting only the already-validated shape to the legacy decoder.
-  state.routes.map(value => decodeWalRoute(value, actors))
-  const legacy = structuredClone(state)
-  legacy.schemaVersion = 1
-  if (Array.isArray(legacy.routes)) {
-    for (const route of legacy.routes) {
-      if (route && typeof route === 'object' && !Array.isArray(route)) {
-        const binding = (route as Record<string, unknown>).openCodeBinding
-        if (binding && typeof binding === 'object' && !Array.isArray(binding)) {
-          delete (binding as Record<string, unknown>).openCodeArtifactDigest
-        }
-      }
-    }
+  const writerFence = decodeWriterFence(state.writerFence)
+  const routes = state.routes.map(value => decodeWalRoute(value, actors))
+  const routeIds = routes.map(route => route.routeId)
+  const sessionIds = routes.map(route => route.authority.sessionId)
+  if (new Set(routeIds).size !== routes.length || new Set(sessionIds).size !== routes.length) {
+    throw new Error('Invalid duplicate hosted approval schema2 route identity')
   }
-  return migrateLegacyOwnerState(legacy)
+  const routeBySession = new Map(routes.map(route => [route.authority.sessionId, route]))
+  const ingress = state.ingress.map(value => decodeSchema2WalIngress(value, routeBySession))
+  const retiredIngress = state.retiredIngress.map(decodeSchema2RetiredIngress)
+  const allIngress = [...ingress, ...retiredIngress]
+  const deliveries = state.deliveries.map(value => decodeWalDelivery(value, allIngress))
+  if (new Set(allIngress.map(record => record.outboxId)).size !== allIngress.length ||
+    new Set(allIngress.map(record => record.deliveryRef)).size !== allIngress.length ||
+    new Set(deliveries.map(record => record.providerDeliveryId)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.reconciliationRef)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.deliveryRef)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.outboxId)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.effectRef)).size !== deliveries.length) {
+    throw new Error('Invalid duplicate hosted approval schema2 WAL identity')
+  }
+  const referenced = new Set(deliveries.map(delivery => delivery.outboxId))
+  const migrated: HostedApprovalOwnerState = {
+    schemaVersion: 3, revision: state.revision as number,
+    admissionGeneration: state.admissionGeneration, admissionDigest: state.admissionDigest,
+    routes: [], actorMembers: {}, ingress: [],
+    retiredIngress: allIngress.filter(record => referenced.has(record.outboxId)),
+    bindings: [...new Map(allIngress.map(record => {
+      const binding = legacyPrivateBinding(record)
+      return [bindingTuple(binding), binding] as const
+    })).values()],
+    deliveries, writerFence,
+  }
+  // A migration is accepted only if the exact image it returns is itself a
+  // valid schema-3 recovery state.
+  return decodeOwnerState(migrated)
+}
+
+function decodeSchema2WalIngress(
+  value: unknown, routes: ReadonlyMap<string, HostedApprovalRuntimeRoute>,
+): HostedApprovalHistoricalIngressRecord {
+  const record = object(value, 'schema2 WAL ingress')
+  const authority = decodeHostedApprovalIngressAuthority(record.authority)
+  const route = routes.get(authority.sessionId)
+  if (!route || !isDeepStrictEqual(route.authority, authority)) {
+    throw new Error('Invalid hosted approval schema2 ingress route')
+  }
+  return decodeLegacyIngress(record, authority)
+}
+
+function decodeSchema2RetiredIngress(value: unknown): HostedApprovalHistoricalIngressRecord {
+  const record = decodeRetiredWalIngress(value)
+  if (record.outboxVersion !== 1) throw new Error('Invalid hosted approval schema2 ingress version')
+  return record
 }
 
 function decodeWriterFence(value: unknown): HostedApprovalWriterFenceIdentity {
@@ -898,10 +954,13 @@ function decodeWalIngress(value: unknown, routes: ReadonlyMap<string, HostedAppr
   exact(record, ['outboxVersion', 'outboxId', 'commandId', 'effectRef', 'deliveryRef', 'authority', 'payloadJson', 'observedAtIso', 'acceptedAtIso', 'lease', 'acknowledgedAtIso'], 'WAL ingress')
   const authority = object(record.authority, 'WAL ingress authority')
   const route = typeof authority.sessionId === 'string' ? routes.get(authority.sessionId) : undefined
-  const bindingDigest = typeof record.outboxId === 'string' ? record.outboxId.slice('runtime_permission:effect:'.length) : ''
+  const validOutboxId = typeof record.outboxId === 'string' &&
+    /^runtime_permission:effect:[a-f0-9]{64}$/.test(record.outboxId)
+  const bindingDigest = validOutboxId
+    ? (record.outboxId as string).slice('runtime_permission:effect:'.length) : ''
   if (!route || !isDeepStrictEqual(route.authority, authority) || record.outboxVersion !== 2 ||
     typeof record.effectRef !== 'string' || !/^effect:[a-f0-9]{64}$/.test(record.effectRef) ||
-    !/^[a-f0-9]{64}$/.test(bindingDigest) || record.deliveryRef !== `delivery_ref_opencode-${bindingDigest}` ||
+    !validOutboxId || record.deliveryRef !== `delivery_ref_opencode-${bindingDigest}` ||
     !identifier(record.commandId) || typeof record.deliveryRef !== 'string' || !/^delivery_ref_[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/.test(record.deliveryRef) ||
     typeof record.payloadJson !== 'string' || Buffer.byteLength(record.payloadJson) > 136 * 1024 ||
     !iso(record.observedAtIso) || !iso(record.acceptedAtIso) || Date.parse(record.acceptedAtIso as string) < Date.parse(record.observedAtIso as string)) {
@@ -994,6 +1053,14 @@ function decodePrivateBinding(value: unknown): HostedApprovalPrivateBinding {
 function legacyPrivateBinding(record: HostedApprovalHistoricalIngressRecord): HostedApprovalPrivateBinding {
   return { teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
     effectRef: null, bindingDigest: null, quarantined: true }
+}
+
+function bindingTuple(binding: Pick<HostedApprovalPrivateBinding, 'teamId' | 'runId' | 'requestId'>): string {
+  return [binding.teamId, binding.runId, binding.requestId].join('\0')
+}
+
+function ingressTuple(record: HostedApprovalHistoricalIngressRecord): string {
+  return [record.authority.teamId, record.authority.runId, record.commandId].join('\0')
 }
 
 function isLegacyIngress(record: HostedApprovalHistoricalIngressRecord): boolean {

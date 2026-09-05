@@ -516,12 +516,16 @@ if (mode === 'replacement') {
       ingress.payloadJson = JSON.stringify({
         ...JSON.parse(ingress.payloadJson), deliveryRef: ingress.deliveryRef,
       })
+      if (phase !== 'unstarted') {
+        ingress.authority.credentialGeneration -= 1
+        ingress.authority.credentialId = 'credential_retired'
+      }
       const request = delivery(ingress)
       const legacy = {
         ...current,
         schemaVersion: 2,
-        ingress: [ingress],
-        retiredIngress: [],
+        ingress: phase === 'unstarted' ? [ingress] : [],
+        retiredIngress: phase === 'unstarted' ? [] : [ingress],
         deliveries: phase === 'unstarted' ? [] : [{
           providerDeliveryId: request.providerDeliveryId,
           reconciliationRef: request.reconciliationRef,
