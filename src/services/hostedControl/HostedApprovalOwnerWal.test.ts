@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { constants, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
+import { closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -11,6 +11,7 @@ import {
 } from './HostedApprovalOwnerWal.js'
 import {
   createOwnerWalPublicationProducerFromEnvironment,
+  createOwnerProvenanceNodeOperations,
   HOSTED_OWNER_PROVENANCE_CONTRACT,
   HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
@@ -274,7 +275,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
           activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
           descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
           emissionNonce: '6'.repeat(64), sequence: 1, lineSha256: '7'.repeat(64),
-        } }) },
+        } }) }
       },
       poison(reason): never { throw new Error(reason) }, close() {},
     }
@@ -340,6 +341,57 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     expect(captured.native.stateDelta.previousRevision).toBe(current.revision)
     expect(captured.native.stateDelta.changedFields).toContain('bindings')
     expect(Buffer.from(captured.next.bytes)).toEqual(await readFile(path))
+  })
+
+  // The concrete implementation reads Linux /proc descriptor flags. Other
+  // platforms must not stand in for that path with fabricated syscall results.
+  test.skipIf(process.platform !== 'linux')('admits only 00600 through real descriptor inspection and producer startup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'owner-native-descriptor-mode-'))
+    roots.push(root)
+    const operations = createOwnerProvenanceNodeOperations()
+    const modulePath = resolve(import.meta.dir, 'HostedApprovalOwnerProvenance.ts')
+    const identity = operations.identity(modulePath)
+    for (const mode of [0o0600, 0o4600, 0o2600, 0o1600, 0o6600, 0o7600, 0o0640, 0o0700]) {
+      const path = join(root, `capture-${mode.toString(8)}.ndjson`)
+      const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_APPEND | constants.O_WRONLY, 0o600)
+      let closed = false
+      try {
+        fchmodSync(fd, mode)
+        expect(Number(fstatSync(fd, { bigint: true }).mode & 0o7777n)).toBe(mode)
+        const descriptor = operations.descriptor(fd)
+        expect(descriptor.mode).toBe(mode)
+        const capsule = JSON.stringify({ activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+          contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+          expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: identity.exeSha256,
+            implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: identity.moduleSha256 },
+          producerRole: 'owner', streams: { ownerWalTimeline: { device: descriptor.device, fd: 9, inode: descriptor.inode } }, version: 2 })
+        const mappedFd = (requested: number) => { expect(requested).toBe(9); return fd }
+        const create = () => createOwnerWalPublicationProducerFromEnvironment({
+          environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: capsule }, modulePath,
+          imageCustodian: { prepare: () => { throw new Error('no WAL publication in descriptor admission test') } },
+          // Remap only the descriptor number; every observation/write/sync/close
+          // still uses the concrete operations on this test's owned file.
+          operations: { ...operations,
+            descriptor: requested => operations.descriptor(mappedFd(requested)),
+            write: (requested, bytes, offset) => operations.write(mappedFd(requested), bytes, offset),
+            sync: requested => operations.sync(mappedFd(requested)),
+            close: requested => { operations.close(mappedFd(requested)); closed = true },
+          },
+        })
+        if (mode === 0o600) {
+          const producer = create()
+          expect(producer).not.toBeNull()
+          producer!.close()
+          const lines = (await readFile(path, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
+          expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'producer-close'])
+          expect(lines[0].native.descriptor).toEqual({ device: descriptor.device, fd: 9, inode: descriptor.inode })
+        } else {
+          expect(create).toThrow('owner-provenance-descriptor-identity')
+          expect(await readFile(path, 'utf8')).toBe('')
+        }
+        expect(closed).toBe(true)
+      } finally { if (!closed) closeSync(fd) }
+    }
   })
 
   test('serializes one canonical native fact with controlled partial descriptor writes', () => {

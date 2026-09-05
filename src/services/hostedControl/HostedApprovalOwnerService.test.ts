@@ -36,6 +36,7 @@ async function fixture(
       | Promise<'delivered' | 'not_started' | 'unavailable' | 'ambiguous'>
     observe?: () => readonly HostedApprovalObservedPermission[]
     publicationProducer?: OwnerWalPublicationProducer
+    walHooks?: ConstructorParameters<typeof HostedApprovalOwnerWal>[1]
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'approval-owner-r2-'))
@@ -101,7 +102,7 @@ async function fixture(
     deliver: async (input: Parameters<OpenCodeHostedApprovalRuntimeAdapter['deliver']>[0]) =>
       (await overrides.deliver?.(input)) ?? 'delivered',
   } as unknown as OpenCodeHostedApprovalRuntimeAdapter
-  const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(join(root, 'owner.json'), undefined, overrides.publicationProducer), () =>
+  const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(join(root, 'owner.json'), overrides.walHooks, overrides.publicationProducer), () =>
     Date.parse('2026-08-13T10:00:01.000Z'),
   )
   const service = new HostedApprovalOwnerService({
@@ -379,6 +380,63 @@ describe('HostedApprovalOwnerService R2', () => {
     expect(effects).toBe(0)
     expect(poisoned).toBe(true)
     expect((await fx.store.read())?.deliveries).toMatchObject([{ phase: 'started', result: null }])
+  })
+
+  test('a settlement pre-replace failure preserves delivered uncertainty and prevents retry after recovery', async () => {
+    let effects = 0; let failSettlement = false; let failedWrites = 0
+    const fx = await fixture({
+      deliver: () => { effects += 1; failSettlement = true; return 'delivered' },
+      walHooks: { afterRetainedCreate: name => {
+        if (failSettlement && name.startsWith('owner.json.tmp.')) {
+          failedWrites += 1
+          throw new Error('settlement temp creation failure before replacement')
+        }
+      } },
+    })
+    const [record] = await fx.service.claimIngress({ request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 }, maximumAggregateBytes: 1_000_000 })
+    const request = delivery(record!)
+    const required = { status: 'operator_required', reconciliationRef: request.reconciliationRef }
+    expect(await runDelivery(fx.service, request, record!.authority)).toEqual(required)
+    expect(failedWrites).toBe(1)
+    expect(effects).toBe(1)
+    const durable = await readFile(fx.store.wal.path)
+    expect(JSON.parse(durable.toString()).deliveries).toMatchObject([{ phase: 'started', result: null }])
+    failSettlement = false
+    const recovered = new HostedApprovalOwnerService({
+      store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(fx.store.wal.path)),
+      admission: fx.admission,
+      runtime: { deliver: async () => { effects += 1; return 'delivered' } } as unknown as OpenCodeHostedApprovalRuntimeAdapter,
+      isCurrentOuterAuthority: async () => true,
+    })
+    await recovered.recoverStateOnly()
+    for (const service of [fx.service, recovered]) {
+      expect(await runDelivery(service, request, record!.authority)).toEqual(required)
+      expect(await service.reconcileDecision({ reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId, partition: request.partition })).toEqual({ status: 'operator_required' })
+    }
+    expect(effects).toBe(1)
+    expect(await readFile(fx.store.wal.path)).toEqual(durable)
+  })
+
+  test('a started pre-replace failure remains unavailable with no provider effect or durable start', async () => {
+    let failStart = false; let effects = 0; let failedWrites = 0
+    const fx = await fixture({
+      deliver: () => { effects += 1; return 'delivered' },
+      walHooks: { afterRetainedCreate: name => {
+        if (failStart && name.startsWith('owner.json.tmp.')) {
+          failedWrites += 1
+          throw new Error('started temp creation failure before replacement')
+        }
+      } },
+    })
+    const [record] = await fx.service.claimIngress({ request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 }, maximumAggregateBytes: 1_000_000 })
+    const durable = await readFile(fx.store.wal.path)
+    failStart = true
+    expect(await runDelivery(fx.service, delivery(record!), record!.authority)).toEqual({ status: 'unavailable' })
+    expect(failedWrites).toBe(1)
+    expect(effects).toBe(0)
+    expect((await fx.store.read())?.deliveries).toEqual([])
+    expect(await readFile(fx.store.wal.path)).toEqual(durable)
   })
 
   test('fence replacement after durable started fails closed at the final provider edge', async () => {

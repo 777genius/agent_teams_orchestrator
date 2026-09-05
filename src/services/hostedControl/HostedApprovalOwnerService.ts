@@ -151,9 +151,19 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       // Set before awaiting publication: a completed replacement whose capture
       // acknowledgement fails must never fall through as proven unavailable.
       reconciliationOnly = true
-      let startedState = (await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] }, {
-        operationNonce, mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
-      })).state
+      let startedState: HostedApprovalOwnerState
+      try {
+        startedState = (await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] }, {
+          operationNonce, mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
+        })).state
+      } catch (error) {
+        // Only this first write can prove that no started record was published.
+        // A later settlement failure cannot clear established uncertainty.
+        if (error instanceof HostedApprovalOwnerPublicationError && error.stage === 'definitely-not-replaced') {
+          reconciliationOnly = false
+        }
+        throw error
+      }
       if (!(await this.#routeCurrent(bound.route))) {
         return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce)
       }
@@ -185,7 +195,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       return this.#settle(startedState, started, 'completed', 'delivered', operationNonce)
     }) } catch (error) {
       if (error instanceof HostedApprovalOwnerPublicationError) {
-        return error.stage === 'definitely-not-replaced'
+        return !reconciliationOnly && error.stage === 'definitely-not-replaced'
           ? { status: 'unavailable' }
           : operatorRequired(input.request.reconciliationRef)
       }

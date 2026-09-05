@@ -132,7 +132,7 @@ export function createOwnerWalPublicationProducerFromEnvironment(options: Readon
   if (source === undefined) return null
   verifyContractMirror()
   const capsule = parseCapsule(source)
-  const operations = options.operations ?? nodeOperations()
+  const operations = options.operations ?? createOwnerProvenanceNodeOperations()
   try {
     const identity = operations.identity(options.modulePath)
     if (identity.pid !== process.pid || !Number.isSafeInteger(identity.pid) || identity.pid < 1 ||
@@ -363,7 +363,8 @@ function identifyFile(path: string): { dev: string; ino: string; sha256: string 
     return { dev: stat.dev.toString(), ino: stat.ino.toString(), sha256: digest.digest('hex') }
   } finally { closeSync(fd) }
 }
-function nodeOperations(): OwnerProvenanceOperations {
+/** Concrete Linux descriptor operations; callers may remap owned descriptors explicitly. */
+export function createOwnerProvenanceNodeOperations(): OwnerProvenanceOperations {
   return Object.freeze({
     identity(modulePath: string) {
       const stat = readFileSync('/proc/self/stat', 'utf8'); const end = stat.lastIndexOf(') '); const startTicks = stat.slice(end + 2).trim().split(/\s+/u)[19] ?? ''
@@ -374,7 +375,7 @@ function nodeOperations(): OwnerProvenanceOperations {
     descriptor(fd: number) {
       const identity = fstatSync(fd, { bigint: true }); const match = /^flags:\s+([0-7]+)$/mu.exec(readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8')); if (!match) throw new TypeError('owner-provenance-descriptor-flags')
       const flags = Number.parseInt(match[1]!, 8)
-      return Object.freeze({ device: identity.dev.toString(), inode: identity.ino.toString(), regular: identity.isFile(), append: (flags & constants.O_APPEND) !== 0, writeOnly: (flags & 3) === constants.O_WRONLY, mode: Number(identity.mode & 0o777n), nlink: identity.nlink.toString(), size: identity.size.toString() })
+      return Object.freeze({ device: identity.dev.toString(), inode: identity.ino.toString(), regular: identity.isFile(), append: (flags & constants.O_APPEND) !== 0, writeOnly: (flags & 3) === constants.O_WRONLY, mode: Number(identity.mode & 0o7777n), nlink: identity.nlink.toString(), size: identity.size.toString() })
     }, nonce: createOwnerOperationNonce, write: (fd, bytes, offset) => writeSync(fd, bytes, offset, bytes.byteLength - offset, null), sync: fdatasyncSync, close: closeSync,
   })
 }
