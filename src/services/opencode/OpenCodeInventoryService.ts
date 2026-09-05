@@ -82,7 +82,7 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
-const OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS = 30_000
+export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
@@ -277,6 +277,12 @@ export function getOpenCodeRefreshModelsArgs(): string[] {
   // provider filter. Filtering stdout keeps an explicit UI refresh fast and
   // bounded instead of serializing every model from every provider.
   return ['models', OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER, '--refresh']
+}
+
+export function getOpenCodeInventoryCommandTimeoutMs(args: readonly string[]): number {
+  return args[0] === 'models'
+    ? OPEN_CODE_MODEL_LIST_TIMEOUT_MS
+    : OPEN_CODE_PROBE_TIMEOUT_MS
 }
 
 function getOpenCodeCatalogRefreshProfile(
@@ -956,7 +962,7 @@ export class OpenCodeInventoryService {
         args,
         profile,
         abortSignal: options.abortSignal,
-        timeoutMs: options.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs ?? getOpenCodeInventoryCommandTimeoutMs(args),
       })
     } finally {
       leaveStep?.()
@@ -1075,7 +1081,7 @@ export class OpenCodeInventoryService {
               abortSignal: options.abortSignal,
               progress: options.progress,
               ...(options.refreshModels && args[0] === 'models'
-                ? { timeoutMs: OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS }
+                ? { timeoutMs: OPEN_CODE_MODEL_LIST_TIMEOUT_MS }
                 : {}),
             },
           ),

@@ -4337,6 +4337,7 @@ export class OpenCodeProviderManagementAdapter
       },
       {
         inventoryMode: 'profile',
+        hostLifetime: 'process',
         profileScope,
         prewarmManagedSubscriptionPlugins: false,
         abortSignal: abortController.signal,

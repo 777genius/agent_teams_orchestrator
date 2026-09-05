@@ -392,6 +392,47 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.deleteIfSession(record, token('old-attempt', 1, record.opencodeSessionId))).toBe(false)
   })
 
+  test('atomically replaces an ownerless stale legacy session when a strict run is introduced', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'stale-legacy-sessions.json'))
+    const legacy = { ...baseRecord, staleReason: 'managed_auth_changed' }
+    const identity = {
+      teamId: legacy.teamId,
+      laneId: legacy.laneId,
+      memberName: legacy.memberName,
+    }
+    await store.upsert(legacy)
+
+    const claim = await store.claimMaterialization(identity, 'strict-attempt', 'strict-run')
+    expect(claim).toEqual(expect.objectContaining({ kind: 'claimed' }))
+    if (claim.kind !== 'claimed') throw new Error('missing strict replacement claim')
+    expect(await store.get(legacy.teamId, legacy.laneId, legacy.memberName)).toEqual(legacy)
+
+    const successor = {
+      ...legacy,
+      runId: 'strict-run',
+      opencodeSessionId: 'strict-session',
+      staleReason: null,
+    }
+    expect(await store.commitMaterialization(successor, claim.ownerToken)).not.toBeNull()
+    expect(await store.get(legacy.teamId, legacy.laneId, legacy.memberName)).toEqual(successor)
+  })
+
+  test('keeps clean and unknown-outcome legacy sessions fenced from strict replacement', async () => {
+    for (const [name, staleReason] of [
+      ['clean', null],
+      ['unknown-outcome', 'launch_failed'],
+    ] as const) {
+      const store = new OpenCodeSessionStore(path.join(tempDir, `${name}-legacy-sessions.json`))
+      const legacy = { ...baseRecord, staleReason }
+      await store.upsert(legacy)
+      expect(await store.claimMaterialization(legacy, 'strict-attempt', 'strict-run')).toEqual({
+        kind: 'existing',
+        record: legacy,
+        ownerToken: null,
+      })
+    }
+  })
+
   test('cancelled different-run replacement preserves the stopped record and old owner until retry commit', async () => {
     const filePath = path.join(tempDir, 'sessions.json')
     const store = new OpenCodeSessionStore(filePath)

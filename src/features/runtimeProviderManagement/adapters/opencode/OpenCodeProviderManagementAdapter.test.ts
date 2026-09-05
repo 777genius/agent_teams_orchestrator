@@ -419,16 +419,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       {
         projectPath: '/tmp/project',
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         healthTimeoutMs: undefined,
         preparedProfile: true,
         includeAppMcp: undefined,
       },
     ])
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
-    expect(retainedHostLeases).toHaveLength(3)
+    expect(retainedHostLeases).toHaveLength(2)
     expect(releasedHostLeases).toEqual(retainedHostLeases)
-    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(3)
+    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(2)
     expect(
       retainedHostLeases.every(
         ({ hostKey, lease }) =>
@@ -437,7 +437,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(3)
+    expect(reconcileCalls).toHaveLength(2)
     expect(
       reconcileCalls.every(
         options =>

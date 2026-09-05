@@ -139,6 +139,21 @@ export function isOpenCodeSessionStopped(record: Pick<OpenCodeSessionRecord, 'st
     && new Date(value).toISOString() === value
 }
 
+function canReplaceOwnerlessStaleLegacySession(
+  record: OpenCodeSessionRecord,
+  requestedRunId: string | undefined,
+  materializationOwner: unknown,
+): boolean {
+  return !isOpenCodeSessionStopped(record)
+    && Boolean(requestedRunId?.trim())
+    && !record.runId?.trim()
+    && record.profileScope?.purpose !== 'launch_runtime'
+    && typeof record.staleReason === 'string'
+    && record.staleReason.length > 0
+    && record.staleReason !== 'launch_failed'
+    && materializationOwner === undefined
+}
+
 function isLockContention(error: unknown): boolean {
   return Boolean(
     error
@@ -455,9 +470,16 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(identity)
       const existing = store.records[key]
-      const replacingStopped = existing && isOpenCodeSessionStopped(existing)
-        && existing.runId && requestedRunId?.trim() && requestedRunId !== existing.runId
-      if (existing && !replacingStopped) {
+      const replacingExisting = existing && (
+        (isOpenCodeSessionStopped(existing)
+          && existing.runId && requestedRunId?.trim() && requestedRunId !== existing.runId)
+        || canReplaceOwnerlessStaleLegacySession(
+          existing,
+          requestedRunId,
+          store.materializationOwners?.[key],
+        )
+      )
+      if (existing && !replacingExisting) {
         return {
           kind: 'existing',
           record: existing,
@@ -509,9 +531,16 @@ export class OpenCodeSessionStore {
       const claimedRunId = store.materializationClaimRuns?.[key]
       if (claimedRunId && claimedRunId !== record.runId?.trim()) return null
       const previous = store.records[key]
-      const replacingStopped = Boolean(previous && isOpenCodeSessionStopped(previous)
-        && record.runId?.trim() && record.runId !== previous.runId && !record.stoppedAt)
-      if (previous && !replacingStopped) return null
+      const replacingExisting = Boolean(previous && !record.stoppedAt && (
+        (isOpenCodeSessionStopped(previous)
+          && record.runId?.trim() && record.runId !== previous.runId)
+        || canReplaceOwnerlessStaleLegacySession(
+          previous,
+          record.runId,
+          store.materializationOwners?.[key],
+        )
+      ))
+      if (previous && !replacingExisting) return null
       const committedOwner = { ...ownerToken, sessionId: record.opencodeSessionId }
       store.records[key] = record
       delete store.materializationClaims[key]
