@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { dlopen, FFIType } from 'bun:ffi'
 import { createHash } from 'node:crypto'
-import { closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
+import { closeSync, constants, existsSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  decodeOwnerState, HostedApprovalOwnerWal, parseOwnerStateSource, type HostedApprovalOwnerState,
+  decodeOwnerState, HostedApprovalOwnerPublicationError, HostedApprovalOwnerWal, parseOwnerStateSource, type HostedApprovalOwnerState,
 } from './HostedApprovalOwnerWal.js'
 import {
   createOwnerWalPublicationProducerFromEnvironment,
@@ -15,12 +16,14 @@ import {
   HOSTED_OWNER_PROVENANCE_CONTRACT,
   HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+  type BoundWalPublication,
   type OwnerWalNative,
   type OwnerWalPublicationProducer,
 } from './HostedApprovalOwnerProvenance.js'
 import {
   createRegularNodeAtDarwin, type DarwinSpawnNative,
 } from './HostedApprovalOwnerWalDarwin.internal.js'
+import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 
 const teamId = `team_${'1'.repeat(32)}`
@@ -264,30 +267,12 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
 
 describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
   test('binds exact absent P and durable N only after the real WAL replacement', async () => {
-    const { path } = await walPath(); let prepared: Parameters<OwnerWalPublicationProducer['prepare']>[0] | null = null
-    const producer: OwnerWalPublicationProducer = {
-      prepare(input) {
-        prepared = input
-        return { emit: () => ({ native: input.native, previous: input.previous, next: input.next, emission: {
-          stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
-            artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64),
-            pid: process.pid, startTicks: '1', exeDev: '1', exeIno: '1' },
-          activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
-          descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
-          emissionNonce: '6'.repeat(64), sequence: 1, lineSha256: '7'.repeat(64),
-        } }) }
-      },
-      poison(reason): never { throw new Error(reason) }, close() {},
-    }
-    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
-    const desired = withoutRevision(state())
-    const admission = {
-      digest: desired.admissionDigest, admissionGeneration: desired.admissionGeneration,
-      routes: desired.routes, actorMembers: desired.actorMembers, isCurrent: async () => true,
-    } as unknown as HostedApprovalRuntimeAdmission
-    const result = await wal.locked(current => wal.publishMutation(current, desired, {
-      operationNonce: '8'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
-    }))
+    const { path } = await walPath()
+    const capture = publicationCapture(path)
+    const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const admission = admissionFixture()
+    const result = await new HostedApprovalOwnerStore(wal).reconcileAdmission(admission)
+    const prepared = capture.prepared!
     const durable = await readFile(path)
     expect(prepared?.previous).toEqual({ kind: 'absent' })
     expect(Buffer.from(prepared!.next.bytes)).toEqual(durable)
@@ -296,20 +281,51 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       'retiredIngress', 'revision', 'routes', 'schemaVersion', 'writerFence',
     ])
     expect(prepared!.native.stateDelta.collectionSizes).toEqual({
-      actorMembers: { previous: 0, next: Object.keys(desired.actorMembers).length },
-      bindings: { previous: 0, next: desired.bindings.length },
-      deliveries: { previous: 0, next: desired.deliveries.length },
-      ingress: { previous: 0, next: desired.ingress.length },
-      retiredIngress: { previous: 0, next: desired.retiredIngress.length },
-      routes: { previous: 0, next: desired.routes.length },
+      actorMembers: { previous: 0, next: Object.keys(admission.actorMembers).length },
+      bindings: { previous: 0, next: 0 },
+      deliveries: { previous: 0, next: 0 },
+      ingress: { previous: 0, next: 0 },
+      retiredIngress: { previous: 0, next: 0 },
+      routes: { previous: 0, next: admission.routes.length },
     })
-    expect(result.capture).toBe('bound')
-    if (result.capture !== 'bound') throw new Error('missing bound publication')
-    expect(result.publication.next.sha256).toBe(prepared!.native.wal.sha256)
-    expect(result.publication.native.fence).toEqual(result.state.writerFence)
+    expect(result).toMatchObject({ revision: 1, admissionDigest: admission.digest,
+      admissionGeneration: admission.admissionGeneration, routes: admission.routes, actorMembers: admission.actorMembers,
+      ingress: [], retiredIngress: [], bindings: [], deliveries: [] })
+    expect(capture.bound!.next.sha256).toBe(prepared.native.wal.sha256)
+    expect(capture.bound!.native.fence).toEqual(result.writerFence)
+    capture.assertBound()
   })
 
-  test('retains old raw P separately from migrated M and compacted N', async () => {
+  test('rejects invented ingress and bindings in absent or migrated admission publications', async () => {
+    for (const predecessor of ['absent', 'legacy'] as const) {
+      const { path } = await walPath()
+      let oldBytes: Buffer | null = null
+      if (predecessor === 'legacy') {
+        const setup = new HostedApprovalOwnerWal(path)
+        const initial = await new HostedApprovalOwnerStore(setup).reconcileAdmission(admissionFixture())
+        const legacy = { ...initial, schemaVersion: 2, routes: [], actorMembers: {} } as Record<string, unknown>
+        delete legacy.bindings
+        oldBytes = Buffer.from(` ${JSON.stringify(legacy)}\n`)
+        await writeFile(path, oldBytes, { mode: 0o600 })
+      }
+      let prepares = 0
+      const producer: OwnerWalPublicationProducer = {
+        prepare() { prepares += 1; throw new Error('invalid witness reached capture') },
+        poison(reason): never { throw new Error(reason) }, close() {},
+      }
+      const wal = new HostedApprovalOwnerWal(path, undefined, producer)
+      await expect(wal.locked(current => wal.publishMutation(current, withoutRevision(state()), {
+        operationNonce: 'e'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
+        admission: admissionFixture(),
+      }))).rejects.toMatchObject({ stage: 'definitely-not-replaced',
+        message: 'Hosted approval admission publication witness mismatch' })
+      expect(prepares).toBe(0)
+      if (oldBytes) expect(await readFile(path)).toEqual(oldBytes)
+      else expect(existsSync(path)).toBe(false)
+    }
+  })
+
+  test('retains old raw P separately from migrated M and reconciled N', async () => {
     const { path } = await walPath()
     const setupWal = new HostedApprovalOwnerWal(path)
     const current = await setupWal.locked(value => setupWal.publish(value, withoutRevision(state())))
@@ -318,21 +334,16 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     delete legacy.bindings
     const oldBytes = Buffer.from(` ${JSON.stringify(legacy)}\n`)
     await writeFile(path, oldBytes, { mode: 0o600 })
-    let captured: Parameters<OwnerWalPublicationProducer['prepare']>[0] | null = null
-    const producer: OwnerWalPublicationProducer = {
-      prepare(input) { captured = input; return { emit: () => ({ native: input.native, previous: input.previous, next: input.next, emission: {} as never }) } },
-      poison(reason): never { throw new Error(reason) }, close() {},
-    }
-    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
-    const admission = { digest: current.admissionDigest, admissionGeneration: current.admissionGeneration,
-      routes: current.routes, actorMembers: current.actorMembers, isCurrent: async () => true } as unknown as HostedApprovalRuntimeAdmission
-    let migratedState: HostedApprovalOwnerState | null = null
-    await wal.locked(migrated => {
-      migratedState = migrated
-      return wal.publishMutation(migrated, withoutRevision(current), {
-        operationNonce: '9'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
-      })
-    })
+    const capture = publicationCapture(path)
+    const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const migratedState = await wal.read()
+    const result = await new HostedApprovalOwnerStore(wal).reconcileAdmission(admissionFixture())
+    const captured = capture.prepared!
+    expect(result).toMatchObject({ revision: current.revision + 1, routes: current.routes,
+      actorMembers: current.actorMembers, ingress: [], retiredIngress: [], bindings: [], deliveries: [] })
+    expect(migratedState).toMatchObject({ routes: [], actorMembers: {}, ingress: [] })
+    expect(Buffer.from(captured.next.bytes)).not.toEqual(oldBytes)
+    capture.assertBound()
     expect(migratedState).toMatchObject({ schemaVersion: 3, revision: current.revision, bindings: [] })
     expect(captured?.previous.kind).toBe('retained')
     if (captured?.previous.kind !== 'retained') throw new Error('missing retained predecessor')
@@ -341,6 +352,44 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     expect(captured.native.stateDelta.previousRevision).toBe(current.revision)
     expect(captured.native.stateDelta.changedFields).toContain('bindings')
     expect(Buffer.from(captured.next.bytes)).toEqual(await readFile(path))
+  })
+
+  test('retains exact P while Store reconciliation publishes actually compacted N', async () => {
+    const { path } = await walPath()
+    const setupWal = new HostedApprovalOwnerWal(path)
+    const initial = await new HostedApprovalOwnerStore(setupWal).reconcileAdmission(admissionFixture())
+    const base = state().ingress[0]!
+    const records = Array.from({ length: 2_050 }, (_, index) => {
+      const digest = index.toString(16).padStart(64, '0')
+      const deliveryRef = `delivery_ref_opencode-${digest}`
+      return { ...structuredClone(base), commandId: `permission_${index}`,
+        effectRef: `effect:${digest}`, outboxId: `runtime_permission:effect:${digest}`, deliveryRef,
+        payloadJson: JSON.stringify({ ...JSON.parse(base.payloadJson), deliveryRef }),
+        lease: { generation: 1, ownerId: 'owner_terminal', leaseToken: `lease_${index}`,
+          claimedAtIso: '2026-08-13T10:00:01.000Z', leaseExpiresAtIso: '2026-08-13T10:00:03.000Z' },
+        acknowledgedAtIso: '2026-08-13T10:00:02.000Z' }
+    })
+    const previous = { ...initial, ingress: records, bindings: records.map(record => ({
+      teamId, runId: route.authority.runId, requestId: record.commandId,
+      effectRef: record.effectRef, bindingDigest: record.outboxId.slice('runtime_permission:effect:'.length), quarantined: false,
+    })) }
+    // Retention runs on publication, not load: seed an exact valid older image.
+    expect(decodeOwnerState(previous).ingress).toHaveLength(2_050)
+    const oldBytes = Buffer.from(` ${JSON.stringify(previous)}\n`)
+    await writeFile(path, oldBytes, { mode: 0o600 })
+    const capture = publicationCapture(path)
+    const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const result = await new HostedApprovalOwnerStore(wal).reconcileAdmission({ ...admissionFixture(), digest: 'd'.repeat(64) })
+    expect(result.ingress).toEqual(records.slice(2))
+    expect(result.bindings).toEqual(previous.bindings)
+    expect(result.revision).toBe(initial.revision + 1)
+    expect(capture.prepared!.native.stateDelta.collectionSizes.ingress).toEqual({ previous: 2_050, next: 2_048 })
+    expect(capture.prepared!.native.stateDelta.previousStateSha256).toBe(createHash('sha256').update(oldBytes).digest('hex'))
+    const retained = capture.bound!.previous
+    expect(retained.kind).toBe('retained')
+    if (retained.kind !== 'retained') throw new Error('missing retained predecessor')
+    expect(Buffer.from(retained.image.bytes)).toEqual(oldBytes)
+    capture.assertBound()
   })
 
   // The concrete implementation reads Linux /proc descriptor flags. Other
@@ -356,7 +405,11 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_APPEND | constants.O_WRONLY, 0o600)
       let closed = false
       try {
-        fchmodSync(fd, mode)
+        // The pinned Bun gate did not retain special bits after fchmodSync.
+        // Use fixed-arity libc fchmod, then inspect the actual fd through both
+        // fstat and the production /proc descriptor projection.
+        const native = dlopen('libc.so.6', { fchmod: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 } })
+        try { expect(native.symbols.fchmod(fd, mode)).toBe(0) } finally { native.close() }
         expect(Number(fstatSync(fd, { bigint: true }).mode & 0o7777n)).toBe(mode)
         const descriptor = operations.descriptor(fd)
         expect(descriptor.mode).toBe(mode)
@@ -430,18 +483,16 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       prepare() { if (poisoned) throw new Error('poisoned'); prepares += 1; return { emit: () => { throw new Error('capture sync failed') } } },
       poison(reason): never { poisoned = true; throw new Error(reason) }, close() {},
     }
-    const desired = withoutRevision(state())
-    const admission = { digest: desired.admissionDigest, admissionGeneration: desired.admissionGeneration,
-      routes: desired.routes, actorMembers: desired.actorMembers, isCurrent: async () => true } as unknown as HostedApprovalRuntimeAdmission
+    const admission = admissionFixture()
     const wal = new HostedApprovalOwnerWal(path, undefined, producer)
-    await expect(wal.locked(current => wal.publishMutation(current, desired, {
-      operationNonce: 'b'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
-    }))).rejects.toMatchObject({ stage: 'published-capture-failed' })
-    expect((await readFile(path)).byteLength).toBeGreaterThan(2)
-    await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), admissionDigest: 'c'.repeat(64) }, {
-      operationNonce: 'c'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
-      admission: { ...admission, digest: 'c'.repeat(64) },
-    }))).rejects.toThrow('poisoned')
+    const store = new HostedApprovalOwnerStore(wal)
+    await expect(store.reconcileAdmission(admission)).rejects.toMatchObject({ stage: 'published-capture-failed' })
+    const durable = await readFile(path)
+    expect(JSON.parse(durable.toString())).toMatchObject({ revision: 1,
+      admissionDigest: admission.digest, routes: admission.routes, ingress: [], bindings: [], deliveries: [] })
+    expect(poisoned).toBe(true)
+    await expect(store.reconcileAdmission({ ...admission, digest: 'c'.repeat(64) })).rejects.toThrow('poisoned')
+    expect(await readFile(path)).toEqual(durable)
     expect(prepares).toBe(1)
   })
   test('keeps variadic creation out of Bun FFI on every supported platform', async () => {
@@ -934,19 +985,112 @@ await wal.locked(async state => {
     const { path } = await walPath(); const root = join(path, '..'); const moved = `${root}.effect-authority`
     roots.push(moved)
     const wal = new HostedApprovalOwnerWal(path)
-    await expect(wal.locked(async current => {
+    let effects = 0
+    let publishedBytes: Buffer | undefined
+    const operation = wal.locked(async current => {
       const published = await wal.publish(current, withoutRevision(state()))
+      publishedBytes = await readFile(path)
       const token = await wal.prepareEffectToken(published)
       expect(token).not.toBeNull()
       await rename(root, moved)
       await mkdir(root, { mode: 0o700 })
       await link(join(moved, 'owner.json'), path)
       await link(join(moved, 'owner.json.writer-fence.sqlite'), wal.fencePath)
-      expect(token!.consume()).toBe(false)
-    })).rejects.toThrow('writer fence changed before commit')
+      const consumed = token!.consume()
+      if (consumed) effects += 1
+      expect(consumed).toBe(false)
+    })
+    await expect(operation).rejects.toBeInstanceOf(HostedApprovalOwnerPublicationError)
+    await expect(operation).rejects.toMatchObject({ stage: 'replacement-uncertain' })
+    expect(effects).toBe(0)
+    expect(await readFile(path)).toEqual(publishedBytes)
+    expect(await readFile(join(moved, 'owner.json'))).toEqual(publishedBytes)
   })
 
 })
+
+function admissionFixture(): HostedApprovalRuntimeAdmission {
+  const fixture = state()
+  return {
+    schemaVersion: 1, admissionGeneration: fixture.admissionGeneration,
+    digest: fixture.admissionDigest, routes: fixture.routes, actorMembers: fixture.actorMembers,
+    outerAuthority: { deploymentId: route.authority.deploymentId, bootId: 'boot_test',
+      workspaceId: route.scope.workspaceId, teamId, restoreGeneration: 1,
+      mountBinding: { mountGeneration: 1, declaredRootHash: '0'.repeat(64) } },
+    isCurrent: async () => true, prepareEffectToken: async () => null,
+  }
+}
+
+// WAL/Store + production serializer + durable test custody coverage. Descriptor
+// and process identity are controlled here; the real syscall test above is a
+// separate boundary check, not proof of full hosted native integration.
+function publicationCapture(path: string) {
+  let prepared: Parameters<OwnerWalPublicationProducer['prepare']>[0] | undefined
+  let bound: BoundWalPublication | undefined
+  const chunks: Buffer[] = []
+  let nonce = 0
+  const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
+  const stage = (name: string, bytes: Uint8Array) => {
+    const stagedPath = `${path}.${name}`
+    const fd = openSync(stagedPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+    try { writeFileSync(fd, bytes); fsyncSync(fd) } finally { closeSync(fd) }
+    const parent = openSync(join(path, '..'), constants.O_RDONLY | constants.O_DIRECTORY)
+    try { fsyncSync(parent) } finally { closeSync(parent) }
+    return stagedPath
+  }
+  const native = createOwnerWalPublicationProducerFromEnvironment({
+    environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
+      activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+      contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+      expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
+        implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+      producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
+    }) }, modulePath: '/unused',
+    operations: {
+      identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11', exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+      descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+      nonce: () => (++nonce).toString(16).padStart(64, '0'),
+      write: (_fd, bytes, offset) => { chunks.push(Buffer.from(bytes.subarray(offset))); return bytes.byteLength - offset },
+      sync: () => {}, close: () => {},
+    },
+    imageCustodian: { prepare(previous, next) {
+      // Custody stages P/N before replacement and binds only after N is live.
+      if (previous.kind === 'absent') expect(existsSync(path)).toBe(false)
+      else expect(readFileSync(path)).toEqual(Buffer.from(previous.image.bytes))
+      const previousPath = previous.kind === 'retained' ? stage('P', previous.image.bytes) : null
+      const nextPath = stage('N', next.bytes)
+      expect(chunks).toHaveLength(1) // only producer-open before WAL replacement
+      return { bind(emission) {
+        expect(readFileSync(path)).toEqual(readFileSync(nextPath))
+        if (previous.kind === 'retained') expect(readFileSync(previousPath!)).toEqual(Buffer.from(previous.image.bytes))
+        expect(hash(chunks[1]!)).toBe(emission.lineSha256)
+        expect(emission.operationNonce).toBe(prepared!.intent.operationNonce)
+        return { previous, next }
+      } }
+    } },
+  })!
+  return {
+    get prepared() { return prepared }, get bound() { return bound },
+    producer: {
+      prepare(input) { prepared = input; const staged = native.prepare(input)
+        return { emit() { bound = staged.emit(); return bound } } },
+      poison(reason): never { return native.poison(reason) }, close() { native.close() },
+    } satisfies OwnerWalPublicationProducer,
+    assertBound() {
+      expect(bound).toBeDefined()
+      expect(chunks).toHaveLength(2)
+      const line = JSON.parse(chunks[1]!.toString())
+      expect(line.recordType).toBe('owner-wal-published')
+      expect(line.native).toEqual(prepared!.native)
+      expect(line.previousRecordSha256).toBe(hash(chunks[0]!))
+      expect(bound!.emission.lineSha256).toBe(hash(chunks[1]!))
+      expect(bound!.next.sha256).toBe(hash(readFileSync(path)))
+      expect(bound!.next.byteSize).toBe(readFileSync(path).byteLength)
+      expect(bound!.previous).toEqual(prepared!.previous)
+      native.close()
+    },
+  }
+}
 
 function state(): HostedApprovalOwnerState {
   const effectRef = `effect:${'c'.repeat(64)}`
