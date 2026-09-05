@@ -191,6 +191,7 @@ export type OpenCodeHostedApprovalCapability = {
 export type OpenCodeHostedApprovalPermission = {
   requestId: string
   sessionId: string
+  sessionIncarnation: string
   requestIncarnation: string
   permissionDigest: string
   rawPermission: OpenCodeHostedApprovalRawPermission

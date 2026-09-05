@@ -189,6 +189,7 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
         capability,
         permission: {
           requestId: permission.requestId, sessionId: record.opencodeSessionId,
+          sessionIncarnation: `session_incarnation_${'e'.repeat(32)}`,
           requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
           permissionDigest: 'd'.repeat(64), rawPermission,
         },

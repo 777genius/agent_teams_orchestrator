@@ -275,6 +275,7 @@ describe('OpenCodeSessionBridge', () => {
     const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
     const permission = {
       requestId: 'permission_1', sessionId: 'session-1',
+      sessionIncarnation: `session_incarnation_${'4'.repeat(32)}`,
       requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
       permissionDigest: '4'.repeat(64), rawPermission,
     }
@@ -301,6 +302,7 @@ describe('OpenCodeSessionBridge', () => {
           sessionId: 'session-1', permissions: [permission],
         }),
         answerPermission: async body => {
+          expect(body.condition?.sessionIncarnation).toBe(permission.sessionIncarnation)
           const finalizeConnected = await body.condition?.authorizeConnected?.({
             localAddress: '127.0.0.1', localPort: 50000,
             remoteAddress: '127.0.0.1', remotePort: host.port,
@@ -326,6 +328,55 @@ describe('OpenCodeSessionBridge', () => {
     expect({ endpointProofs, posts }).toEqual({ endpointProofs: 1, posts: 0 })
   })
 
+  test('performs zero POSTs when only the provider session incarnation is recreated', async () => {
+    let posts = 0
+    const capability = {
+      schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
+      authentication: 'opencode-basic' as const,
+      runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+      configGeneration: `config_generation_${'2'.repeat(32)}`,
+    }
+    const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
+    const retainedPermission = {
+      requestId: 'permission_1', sessionId: 'session-1',
+      sessionIncarnation: `session_incarnation_${'4'.repeat(32)}`,
+      requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+      permissionDigest: '4'.repeat(64), rawPermission,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getHostedApprovalCapability: async () => capability,
+        observeHostedApprovalPermissions: async () => ({
+          schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2',
+          runtimeInstanceId: capability.runtimeInstanceId,
+          configGeneration: capability.configGeneration,
+          sessionId: 'session-1', permissions: [{
+            ...retainedPermission,
+            sessionIncarnation: `session_incarnation_${'5'.repeat(32)}`,
+          }],
+        }),
+        answerPermission: async () => { posts += 1 },
+      } as never) },
+    })
+    await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: rawPermission,
+      requireAtomicConfigReply: true,
+      expectedHostedPermission: {
+        capability, permission: retainedPermission,
+        normalized: {
+          requestId: 'permission_1', sessionId: 'session-1', tool: 'bash',
+          title: null, kind: null, raw: rawPermission,
+        },
+      },
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(posts).toBe(0)
+  })
+
   test('consumes fences after exact peer proof and performs exactly one conditional POST', async () => {
     let posts = 0
     let peerProofs = 0
@@ -340,6 +391,7 @@ describe('OpenCodeSessionBridge', () => {
     const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
     const permission = {
       requestId: 'permission_1', sessionId: 'session-1',
+      sessionIncarnation: `session_incarnation_${'4'.repeat(32)}`,
       requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
       permissionDigest: '4'.repeat(64), rawPermission,
     }
@@ -377,6 +429,7 @@ describe('OpenCodeSessionBridge', () => {
           sessionId: 'session-1', permissions: [permission],
         }),
         answerPermission: async body => {
+          expect(body.condition?.sessionIncarnation).toBe(permission.sessionIncarnation)
           const finalizeConnected = await body.condition?.authorizeConnected?.({
             localAddress: '127.0.0.1', localPort: 50000,
             remoteAddress: '127.0.0.1', remotePort: host.port,
@@ -509,6 +562,7 @@ describe('OpenCodeSessionBridge', () => {
               sessionId: 'ses_1',
               permissions: [{
                 requestId: 'per_1', sessionId: 'ses_1',
+                sessionIncarnation: `session_incarnation_${'4'.repeat(32)}`,
                 requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
                 permissionDigest: createHash('sha256')
                   .update('{"always":[],"id":"per_1","metadata":{"cwd":"/tmp"},"patterns":["ls"],"permission":"bash","sessionID":"ses_1"}')
@@ -600,6 +654,7 @@ describe('OpenCodeSessionBridge', () => {
             permissions: [{
               requestId: rawPermission.id,
               sessionId: rawPermission.sessionID,
+              sessionIncarnation: `session_incarnation_${'4'.repeat(32)}`,
               requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
               permissionDigest: canonicalHostedApprovalDigest(rawPermission),
               rawPermission,

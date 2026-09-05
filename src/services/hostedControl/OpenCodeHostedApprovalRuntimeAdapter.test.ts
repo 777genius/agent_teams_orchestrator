@@ -95,6 +95,7 @@ const providerObservation = {
   permission: {
     requestId: permission.requestId,
     sessionId: permission.sessionId!,
+    sessionIncarnation: `session_incarnation_${'d'.repeat(32)}`,
     requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
     permissionDigest: canonicalHostedApprovalDigest(permission.raw),
     rawPermission: permission.raw,
@@ -328,7 +329,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     expect(replaced).not.toMatchObject({ outboxId: first.outboxId, effectRef: first.effectRef, deliveryRef: first.deliveryRef })
   })
 
-  test('binds runtime restart and request incarnation even when the raw digest is reused', () => {
+  test('binds runtime restart, session recreation, and request incarnation with a reused raw digest', () => {
     const first = ingressRecordForObservedPermission({
       route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z',
     })
@@ -352,7 +353,18 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         },
       },
     })
+    const recreatedSession = ingressRecordForObservedPermission({
+      route, permission, observedAtIso: '2026-08-13T10:00:03.000Z',
+      providerObservation: {
+        ...providerObservation,
+        permission: {
+          ...providerObservation.permission,
+          sessionIncarnation: `session_incarnation_${'f'.repeat(32)}`,
+        },
+      },
+    })
     expect(restarted.effectRef).not.toBe(first.effectRef)
+    expect(recreatedSession.effectRef).not.toBe(first.effectRef)
     expect(reusedRequest.effectRef).not.toBe(first.effectRef)
   })
 

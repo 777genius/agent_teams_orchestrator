@@ -182,6 +182,7 @@ export function ingressRecordForObservedPermission(input: HostedApprovalObserved
     requestId,
     runtimeInstanceId: provider?.capability.runtimeInstanceId ?? null,
     configGeneration: provider?.capability.configGeneration ?? null,
+    sessionIncarnation: provider?.permission.sessionIncarnation ?? null,
     requestIncarnation: provider?.permission.requestIncarnation ?? null,
     permissionDigest: provider?.permission.permissionDigest ?? null,
     providerPermission: input.permission.raw,

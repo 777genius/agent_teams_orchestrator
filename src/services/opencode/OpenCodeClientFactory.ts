@@ -75,6 +75,7 @@ export type OpenCodeClient = {
     condition?: {
       runtimeInstanceId: string
       configGeneration: string
+      sessionIncarnation: string
       requestIncarnation: string
       permissionDigest: string
       /**
@@ -160,6 +161,7 @@ const MAX_HOSTED_APPROVAL_RESPONSE_BYTES = 16 * 1024
 const MAX_HOSTED_APPROVAL_OBSERVATION_BYTES = 1024 * 1024
 const HOSTED_RUNTIME_INSTANCE = /^runtime_instance_[0-9a-f]{32}$/
 const HOSTED_CONFIG_GENERATION = /^config_generation_[0-9a-f]{32}$/
+const HOSTED_SESSION_INCARNATION = /^session_incarnation_[0-9a-f]{32}$/
 const HOSTED_REQUEST_INCARNATION = /^request_incarnation_[0-9a-f]{32}$/
 const HOSTED_DIGEST = /^[0-9a-f]{64}$/
 
@@ -189,6 +191,7 @@ function validateConditionalPermissionReply(
     configGeneration: string
     requestId: string
     sessionId: string
+    sessionIncarnation: string
     requestIncarnation: string
     permissionDigest: string
     decision: 'allow_once' | 'reject'
@@ -199,7 +202,7 @@ function validateConditionalPermissionReply(
   }
   const response = value as Record<string, unknown>
   if (Object.keys(response).sort().join(',') !==
-    'configGeneration,decision,permissionDigest,protocol,requestId,requestIncarnation,runtimeInstanceId,schemaVersion,sessionId,status' ||
+    'configGeneration,decision,permissionDigest,protocol,requestId,requestIncarnation,runtimeInstanceId,schemaVersion,sessionId,sessionIncarnation,status' ||
     response.schemaVersion !== 2 ||
     response.protocol !== HOSTED_APPROVAL_PROTOCOL ||
     response.status !== 'applied' ||
@@ -207,6 +210,7 @@ function validateConditionalPermissionReply(
     response.configGeneration !== expected.configGeneration ||
     response.requestId !== expected.requestId ||
     response.sessionId !== expected.sessionId ||
+    response.sessionIncarnation !== expected.sessionIncarnation ||
     response.requestIncarnation !== expected.requestIncarnation ||
     response.permissionDigest !== expected.permissionDigest ||
     response.decision !== expected.decision) {
@@ -263,10 +267,12 @@ function validateHostedApprovalPermission(
   }
   const record = value as Record<string, unknown>
   if (Object.keys(record).sort().join(',') !==
-      'permissionDigest,rawPermission,requestId,requestIncarnation,sessionId' ||
+      'permissionDigest,rawPermission,requestId,requestIncarnation,sessionId,sessionIncarnation' ||
     typeof record.requestId !== 'string' ||
     !record.requestId.startsWith('per') ||
     record.sessionId !== sessionId ||
+    typeof record.sessionIncarnation !== 'string' ||
+    !HOSTED_SESSION_INCARNATION.test(record.sessionIncarnation) ||
     typeof record.requestIncarnation !== 'string' ||
     !HOSTED_REQUEST_INCARNATION.test(record.requestIncarnation) ||
     typeof record.permissionDigest !== 'string' ||
@@ -882,12 +888,14 @@ export class OpenCodeClientFactory {
             expectedConfigGeneration: body.condition.configGeneration,
             requestId: body.requestId,
             sessionId: body.sessionId,
+            sessionIncarnation: body.condition.sessionIncarnation,
             requestIncarnation: body.condition.requestIncarnation,
             expectedPermissionDigest: body.condition.permissionDigest,
             decision,
           }
           if (!HOSTED_RUNTIME_INSTANCE.test(body.condition.runtimeInstanceId) ||
             !HOSTED_CONFIG_GENERATION.test(body.condition.configGeneration) ||
+            !HOSTED_SESSION_INCARNATION.test(body.condition.sessionIncarnation) ||
             !HOSTED_REQUEST_INCARNATION.test(body.condition.requestIncarnation) ||
             !HOSTED_DIGEST.test(body.condition.permissionDigest) ||
             Buffer.byteLength(JSON.stringify(conditionalPayload), 'utf8') >

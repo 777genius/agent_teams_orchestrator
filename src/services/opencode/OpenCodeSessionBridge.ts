@@ -1588,6 +1588,7 @@ export class OpenCodeSessionBridge {
       let hostConsumed = false
       let configGeneration: string | null = null
       let runtimeInstanceId: string | null = null
+      let sessionIncarnation: string | null = null
       let requestIncarnation: string | null = null
       let permissionDigest: string | null = null
       let preparedEndpointStartIdentity: string | null = null
@@ -1637,6 +1638,7 @@ export class OpenCodeSessionBridge {
         const permission = observation.permissions.find(candidate =>
           candidate.requestId === params.requestId &&
           candidate.sessionId === record.opencodeSessionId &&
+          candidate.sessionIncarnation === expected.permission.sessionIncarnation &&
           candidate.requestIncarnation === expected.permission.requestIncarnation &&
           candidate.permissionDigest === expected.permission.permissionDigest &&
           canonicalEffectValue(candidate.rawPermission) ===
@@ -1646,6 +1648,7 @@ export class OpenCodeSessionBridge {
           expected.capability.configGeneration !== capability.configGeneration) {
           throw new OpenCodePermissionEffectNotAuthorizedError()
         }
+        sessionIncarnation = permission.sessionIncarnation
         requestIncarnation = permission.requestIncarnation
         permissionDigest = permission.permissionDigest
       }
@@ -1721,7 +1724,8 @@ export class OpenCodeSessionBridge {
         if (failure !== null) throw failure
         return current
       }
-      const conditionalReply = configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
+      const conditionalReply = configGeneration && runtimeInstanceId && sessionIncarnation &&
+        requestIncarnation && permissionDigest
       if (!conditionalReply) {
         if (params.expectedPermissionRaw &&
           await proveEndpointOwner() !== preparedEndpointStartIdentity) {
@@ -1740,6 +1744,7 @@ export class OpenCodeSessionBridge {
                 condition: {
                   runtimeInstanceId,
                   configGeneration,
+                  sessionIncarnation,
                   requestIncarnation,
                   permissionDigest,
                   // The transport opens and pins its TCP socket first, awaits

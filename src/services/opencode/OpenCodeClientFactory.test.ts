@@ -3,11 +3,16 @@ import { once } from 'node:events'
 import { ClientRequest, createServer } from 'node:http'
 import { createServer as createTcpServer, type AddressInfo } from 'node:net'
 
-import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import {
+  canonicalHostedApprovalDigest,
+  OpenCodeClientFactory,
+  OpenCodePermissionConditionRejectedError,
+} from './OpenCodeClientFactory.js'
 
 const hostedAuth = { username: 'opencode', password: 'test-password', directory: '/tmp/project' }
 const runtimeInstanceId = `runtime_instance_${'1'.repeat(32)}`
 const configGeneration = `config_generation_${'2'.repeat(32)}`
+const sessionIncarnation = `session_incarnation_${'4'.repeat(32)}`
 const requestIncarnation = `request_incarnation_${'3'.repeat(32)}`
 const permissionDigest = 'a'.repeat(64)
 const rawPermission = () => ({
@@ -165,7 +170,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       return new Response(JSON.stringify(String(input).endsWith('/permissions') ? {
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
         configGeneration, sessionId: 'ses_123', permissions: [{
-          requestId: 'perm_123', sessionId: 'ses_123', requestIncarnation,
+          requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation, requestIncarnation,
           permissionDigest: canonicalHostedApprovalDigest(raw), rawPermission: raw,
         }],
       } : {
@@ -176,7 +181,7 @@ describe('OpenCodeClientFactory permissions API', () => {
     const client = hostedClient(factory)
     await expect(client.getHostedApprovalCapability()).resolves.toMatchObject({ runtimeInstanceId })
     await expect(client.observeHostedApprovalPermissions?.('ses_123')).resolves.toMatchObject({
-      permissions: [{ requestIncarnation }],
+      permissions: [{ sessionIncarnation, requestIncarnation }],
     })
     expect(requests.map(item => item.authorization)).toEqual([
       `Basic ${Buffer.from('opencode:test-password').toString('base64')}`,
@@ -274,23 +279,48 @@ describe('OpenCodeClientFactory permissions API', () => {
       requests.push({ url: String(input), body: JSON.parse(String(init?.body)), redirect: init?.redirect })
       return new Response(JSON.stringify({
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
-        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
         requestIncarnation, permissionDigest, decision: 'allow_once',
       }))
     } })
     await hostedClient(factory).answerPermission({
       requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
-      condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
+      condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
     })
     expect(requests).toEqual([{
       url: 'http://127.0.0.1:4096/experimental/agent-teams/hosted-approval/session/ses_123/permission/perm_123/reply',
       redirect: 'manual',
       body: {
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
-        expectedConfigGeneration: configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        expectedConfigGeneration: configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
         requestIncarnation, expectedPermissionDigest: permissionDigest, decision: 'allow_once',
       },
     }])
+  })
+
+  test('sends the exact session-bound reject POST and accepts only its full success tuple', async () => {
+    let request: { body: unknown; url: string } | null = null
+    const factory = new OpenCodeClientFactory({ fetchImpl: async (input, init) => {
+      request = { url: String(input), body: JSON.parse(String(init?.body)) }
+      return new Response(JSON.stringify({
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        sessionIncarnation, requestIncarnation, permissionDigest, decision: 'reject',
+      }))
+    } })
+    await hostedClient(factory).answerPermission({
+      requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
+      condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
+    })
+    expect(request).toEqual({
+      url: 'http://127.0.0.1:4096/experimental/agent-teams/hosted-approval/session/ses_123/permission/perm_123/reply',
+      body: {
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
+        expectedConfigGeneration: configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        sessionIncarnation, requestIncarnation, expectedPermissionDigest: permissionDigest,
+        decision: 'reject',
+      },
+    })
   })
 
   test('writes no conditional POST until the connected endpoint proof settles', async () => {
@@ -299,7 +329,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       posts += 1
       response.end(JSON.stringify({
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
-        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
         requestIncarnation, permissionDigest, decision: 'allow_once',
       }))
     })
@@ -317,7 +347,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       const reply = client.answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
-          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
           authorizeConnected: async () => { proofStarted(); return await proof },
         },
       })
@@ -331,7 +361,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       await expect(client.answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
-          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
           authorizeConnected: async () => () => false,
         },
       })).rejects.toThrow('rejected without effect')
@@ -361,7 +391,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       const reply = client.answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
-          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
           authorizeConnected: async connection => {
             expect(connection.remotePort).toBe(port)
             await didAccept
@@ -390,7 +420,7 @@ describe('OpenCodeClientFactory permissions API', () => {
     const server = createServer((_request, response) => {
       response.end(JSON.stringify({
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
-        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
         requestIncarnation, permissionDigest, decision: 'allow_once',
       }))
     })
@@ -409,7 +439,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       await client.answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
-          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
           authorizeConnected: async () => () => {
             queueMicrotask(() => { authority = 'changed' })
             return true
@@ -452,7 +482,7 @@ describe('OpenCodeClientFactory permissions API', () => {
         await expect(client.answerPermission({
           requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
           condition: {
-            runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+            runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
             authorizeConnected: async () => finalizer,
           },
         })).rejects.toThrow('rejected without effect')
@@ -471,7 +501,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response('', { status }) })
       await expect(hostedClient(factory).answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
-        condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
+        condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
       })).rejects.toBeInstanceOf(Error)
     }
     for (const response of [
@@ -483,9 +513,61 @@ describe('OpenCodeClientFactory permissions API', () => {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => { calls += 1; return response } })
       await expect(hostedClient(factory).answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
-        condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
+        condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
       })).rejects.toThrow()
       expect(calls).toBe(1)
+    }
+  })
+
+  test('treats substituted and obsolete success tuples as ambiguous after one dispatch', async () => {
+    const success = {
+      schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+      runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+      sessionIncarnation, requestIncarnation, permissionDigest, decision: 'allow_once',
+    }
+    for (const response of [
+      { ...success, sessionIncarnation: `session_incarnation_${'f'.repeat(32)}` },
+      (({ sessionIncarnation: _obsolete, ...rest }) => rest)(success),
+    ]) {
+      let calls = 0
+      const factory = new OpenCodeClientFactory({ fetchImpl: async () => {
+        calls += 1
+        return new Response(JSON.stringify(response))
+      } })
+      let failure: unknown = null
+      try {
+        await hostedClient(factory).answerPermission({
+          requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+          condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
+        })
+      } catch (error) {
+        failure = error
+      }
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
+      expect((failure as Error).message).toContain('reply was malformed')
+      expect(calls).toBe(1)
+    }
+  })
+
+  test('rejects missing, null, malformed, and obsolete session-incarnation observations', async () => {
+    const raw = rawPermission()
+    const validPermission = {
+      requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
+      requestIncarnation, permissionDigest: canonicalHostedApprovalDigest(raw), rawPermission: raw,
+    }
+    for (const permission of [
+      (({ sessionIncarnation: _omitted, ...rest }) => rest)(validPermission),
+      { ...validPermission, sessionIncarnation: null },
+      { ...validPermission, sessionIncarnation: 'session_incarnation_not-hex' },
+      { ...validPermission, sessionGeneration: sessionIncarnation },
+    ]) {
+      const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response(JSON.stringify({
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
+        configGeneration, sessionId: 'ses_123', permissions: [permission],
+      })) })
+      await expect(hostedClient(factory).observeHostedApprovalPermissions?.('ses_123'))
+        .rejects.toThrow('permission was malformed')
     }
   })
 
@@ -504,7 +586,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       ' '.repeat(1024 * 1024 + 1),
       JSON.stringify({ schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
         configGeneration, sessionId: 'ses_123', permissions: [{ requestId: 'perm_123', sessionId: 'ses_123',
-          requestIncarnation, permissionDigest, rawPermission: raw }] }),
+          sessionIncarnation, requestIncarnation, permissionDigest, rawPermission: raw }] }),
     ]) {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response(body) })
       await expect(hostedClient(factory).observeHostedApprovalPermissions?.('ses_123')).rejects.toThrow()
@@ -532,6 +614,7 @@ describe('OpenCodeClientFactory permissions API', () => {
         permissions: [{
           requestId: 'perm_123',
           sessionId: 'ses_123',
+          sessionIncarnation,
           requestIncarnation,
           permissionDigest: canonicalHostedApprovalDigest(raw),
           rawPermission: raw,
