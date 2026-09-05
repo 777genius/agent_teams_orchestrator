@@ -10,11 +10,13 @@ import type {
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerWal, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
+import { createOwnerOperationNonce, type OwnerLeaseClaim } from './HostedApprovalOwnerProvenance.js'
 
 export class HostedApprovalOwnerStore {
   constructor(readonly wal: HostedApprovalOwnerWal, private readonly now: () => number = Date.now) {}
 
   reconcileAdmission(admission: HostedApprovalRuntimeAdmission): Promise<HostedApprovalOwnerState> {
+    const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
       if (state?.admissionDigest === admission.digest &&
@@ -34,18 +36,22 @@ export class HostedApprovalOwnerStore {
       )
       const retiredIngress = [...retiredByOutbox.values()]
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
-      const published = await this.wal.publish(state, {
+      const published = await this.wal.publishMutation(state, {
         schemaVersion: 3, admissionGeneration: admission.admissionGeneration,
         admissionDigest: admission.digest, routes: [...admission.routes],
         actorMembers: { ...admission.actorMembers }, ingress, retiredIngress,
         bindings: state?.bindings ?? [], deliveries: state?.deliveries ?? [],
-      })
-      if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
-      return published
+      }, { operationNonce, mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission })
+      if (!(await admission.isCurrent())) {
+        try { this.wal.poisonPublicationCapture('owner-wal-admission-lost-after-publication') } catch { /* admission failure remains authoritative */ }
+        throw new Error('Hosted approval admission changed during recovery')
+      }
+      return published.state
     })
   }
 
   admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay' | 'quarantined'> {
+    const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state || state.admissionDigest !== admission.digest || !(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
       const route = admission.routes.find(route => isDeepStrictEqual(route.authority, record.authority))
@@ -70,27 +76,29 @@ export class HostedApprovalOwnerStore {
       if (sameSemantic.length > 0) {
         if (!sameSemantic.some(binding => binding.effectRef === record.effectRef && binding.bindingDigest === digest)) {
           if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
-          await this.wal.publish(state, { ...withoutRevision(state), bindings: [...state.bindings, {
+          await this.wal.publishMutation(state, { ...withoutRevision(state), bindings: [...state.bindings, {
             teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
             effectRef: record.effectRef, bindingDigest: digest, quarantined: true,
-          }] })
+          }] }, { operationNonce, mutation: { kind: 'binding-quarantined', outcome: 'quarantined' }, record })
         }
         return 'quarantined'
       }
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
-      await this.wal.publish(state, { ...withoutRevision(state), ingress: [...state.ingress, record], bindings: [...state.bindings, {
+      await this.wal.publishMutation(state, { ...withoutRevision(state), ingress: [...state.ingress, record], bindings: [...state.bindings, {
         teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
         effectRef: record.effectRef, bindingDigest: digest, quarantined: false,
-      }] })
+      }] }, { operationNonce, mutation: { kind: 'ingress-admitted', outcome: 'admitted' }, record })
       return 'admitted'
     })
   }
 
   claim(request: HostedApprovalClaimRequest, maximumAggregateBytes: number): Promise<readonly HostedApprovalIngressRecord[]> {
+    const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state) return []
       const now = this.now(); if (!Number.isSafeInteger(now) || now < 0) return []
-      const records: HostedApprovalIngressRecord[] = []; let bytes = 2; let stopped = false; let changed = false
+      const records: HostedApprovalIngressRecord[] = []; const changedRecords: HostedApprovalIngressRecord[] = []
+      let bytes = 2; let stopped = false
       const ingress = state.ingress.map(record => {
         if (stopped || records.length >= request.limit || record.acknowledgedAtIso !== null) return record
         const liveLease = record.lease && Date.parse(record.lease.leaseExpiresAtIso) > now
@@ -112,14 +120,20 @@ export class HostedApprovalOwnerStore {
         const claimed = { ...record, lease }
         const size = Buffer.byteLength(JSON.stringify(claimed)) + (records.length ? 1 : 0)
         if (bytes + size > maximumAggregateBytes) { stopped = true; return record }
-        bytes += size; records.push(claimed); changed = true; return claimed
+        bytes += size; records.push(claimed); changedRecords.push(claimed); return claimed
       })
-      if (changed) await this.wal.publish(state, { ...withoutRevision(state), ingress })
+      if (changedRecords.length > 0) {
+        const claims: OwnerLeaseClaim[] = changedRecords.map(record => ({ outboxId: record.outboxId, ...record.lease! }))
+        await this.wal.publishMutation(state, { ...withoutRevision(state), ingress }, {
+          operationNonce, mutation: { kind: 'ingress-lease-claimed', outcome: 'claimed', claims }, records: changedRecords,
+        })
+      }
       return records
     })
   }
 
   acknowledge(request: HostedApprovalAckRequest): Promise<HostedApprovalAckResult> {
+    const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state) return { status: 'unavailable' }
       const index = state.ingress.findIndex(record => record.outboxId === request.outboxId)
@@ -135,8 +149,11 @@ export class HostedApprovalOwnerStore {
       if (!lease || lease.generation !== request.generation || lease.ownerId !== request.ownerId ||
         lease.leaseToken !== request.leaseToken || Date.parse(lease.leaseExpiresAtIso) <= now) return { status: 'conflict' }
       const ingress = [...state.ingress]
-      ingress[index] = { ...record, acknowledgedAtIso: new Date(now).toISOString() }
-      await this.wal.publish(state, { ...withoutRevision(state), ingress })
+      const acknowledged = { ...record, acknowledgedAtIso: new Date(now).toISOString() }
+      ingress[index] = acknowledged
+      await this.wal.publishMutation(state, { ...withoutRevision(state), ingress }, {
+        operationNonce, mutation: { kind: 'ingress-acknowledged', outcome: 'acknowledged' }, request, record: acknowledged,
+      })
       return { status: 'acknowledged' }
     })
   }

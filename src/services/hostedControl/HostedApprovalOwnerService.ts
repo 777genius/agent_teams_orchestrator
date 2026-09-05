@@ -11,7 +11,8 @@ import type {
   HostedApprovalWirePort,
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
-import type { HostedApprovalDeliveryState, HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import { HostedApprovalOwnerPublicationError, type HostedApprovalDeliveryState, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import { createOwnerOperationNonce } from './HostedApprovalOwnerProvenance.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import { ingressRecordForObservedPermission, OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 
@@ -119,6 +120,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       return { status: 'unavailable' }
     }
     let reconciliationOnly = false
+    const operationNonce = createOwnerOperationNonce()
     try { return await this.options.store.wal.locked(async state => {
       if (!state || state.admissionGeneration !== this.options.admission.admissionGeneration ||
         state.admissionDigest !== this.options.admission.digest) return { status: 'stale_generation' }
@@ -128,16 +130,16 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       if (!bound || !isDeepStrictEqual(bound.route.authority, input.admittedAuthority)) return { status: 'stale_generation' }
       if (!(await this.#routeCurrent(bound.route))) return { status: 'stale_generation' }
       if (bound.route.authority.teamId !== input.request.partition.teamId || bound.route.authority.runId !== input.request.partition.runId) {
-        return this.#reject(state, bound.route, bound.record.outboxId, input, 'wrong_lane')
+        return this.#reject(state, bound.route, bound.record.outboxId, input, 'wrong_lane', operationNonce)
       }
       const payload = JSON.parse(bound.record.payloadJson) as { expiresAtMs: number | null }
       if (payload.expiresAtMs !== null && payload.expiresAtMs <= (this.options.now ?? Date.now)()) {
-        return this.#reject(state, bound.route, bound.record.outboxId, input, 'expired')
+        return this.#reject(state, bound.route, bound.record.outboxId, input, 'expired', operationNonce)
       }
       if (input.request.principal.kind === 'operator') {
         const memberId = state.actorMembers[input.request.principal.actorId]
-        if (!memberId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'unavailable')
-        if (memberId === bound.route.authority.deliveryOwnerId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'self_approval')
+        if (!memberId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'unavailable', operationNonce)
+        if (memberId === bound.route.authority.deliveryOwnerId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'self_approval', operationNonce)
       }
       const started: HostedApprovalDeliveryState = {
         providerDeliveryId: input.request.providerDeliveryId,
@@ -146,10 +148,14 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         payloadFingerprint: input.payloadFingerprint, outboxId: bound.record.outboxId,
         effectRef: bound.record.effectRef, phase: 'started', result: null,
       }
-      let startedState = await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] })
+      // Set before awaiting publication: a completed replacement whose capture
+      // acknowledgement fails must never fall through as proven unavailable.
       reconciliationOnly = true
+      let startedState = (await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] }, {
+        operationNonce, mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
+      })).state
       if (!(await this.#routeCurrent(bound.route))) {
-        return this.#settle(startedState, started, 'rejected', 'stale_generation')
+        return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce)
       }
       const result = await this.options.runtime.deliver({
         route: bound.route,
@@ -174,10 +180,15 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       }
       startedState = fresh
       if (result === 'ambiguous') return operatorRequired(input.request.reconciliationRef)
-      if (result === 'not_started') return this.#settle(startedState, started, 'rejected', 'stale_generation')
-      if (result === 'unavailable') return this.#settle(startedState, started, 'rejected', 'unavailable')
-      return this.#settle(startedState, started, 'completed', 'delivered')
-    }) } catch {
+      if (result === 'not_started') return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce)
+      if (result === 'unavailable') return this.#settle(startedState, started, 'rejected', 'unavailable', operationNonce)
+      return this.#settle(startedState, started, 'completed', 'delivered', operationNonce)
+    }) } catch (error) {
+      if (error instanceof HostedApprovalOwnerPublicationError) {
+        return error.stage === 'definitely-not-replaced'
+          ? { status: 'unavailable' }
+          : operatorRequired(input.request.reconciliationRef)
+      }
       return reconciliationOnly
         ? operatorRequired(input.request.reconciliationRef)
         : { status: 'unavailable' }
@@ -232,19 +243,28 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       },
     }
   }
-  async #reject(state: HostedApprovalOwnerState, route: HostedApprovalRuntimeRoute, outboxId: string, input: Parameters<HostedApprovalWirePort['deliverDecision']>[0], result: Exclude<HostedApprovalDeliveryState['result'], 'delivered' | null>) {
+  async #reject(state: HostedApprovalOwnerState, route: HostedApprovalRuntimeRoute, outboxId: string, input: Parameters<HostedApprovalWirePort['deliverDecision']>[0], result: Exclude<HostedApprovalDeliveryState['result'], 'delivered' | null>, operationNonce: string) {
     if (!(await this.#routeCurrent(route))) return { status: 'stale_generation' as const }
     const record = [...state.ingress, ...state.retiredIngress].find(item => item.outboxId === outboxId)
     if (!record) return { status: 'unavailable' as const }
     const delivery: HostedApprovalDeliveryState = { providerDeliveryId: input.request.providerDeliveryId, reconciliationRef: input.request.reconciliationRef, deliveryRef: input.request.deliveryRef, payloadFingerprint: input.payloadFingerprint, outboxId, effectRef: record.effectRef, phase: 'rejected', result }
-    await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, delivery] })
+    await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, delivery] }, {
+      operationNonce, mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: result }, delivery,
+    })
     return { status: result } as const
   }
-  async #settle(state: HostedApprovalOwnerState, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>) {
+  async #settle(state: HostedApprovalOwnerState, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>, operationNonce: string) {
     // A provider receipt or proven terminal pre-effect failure is stronger than
     // a later admission rotation. Persist that evidence under the WAL CAS; do
     // not turn a proved outcome back into ambiguity.
-    await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: state.deliveries.map(item => item.providerDeliveryId === delivery.providerDeliveryId ? { ...item, phase, result } : item) })
+    const settled = { ...delivery, phase, result } as HostedApprovalDeliveryState
+    await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: state.deliveries.map(item => item.providerDeliveryId === delivery.providerDeliveryId ? settled : item) }, {
+      operationNonce,
+      mutation: phase === 'completed'
+        ? { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }
+        : { kind: 'delivery-settled', phase: 'rejected', outcome: result as Exclude<typeof result, 'delivered'> },
+      delivery: settled,
+    })
     return { status: result === 'delivered' ? 'delivered' as const : result }
   }
 }

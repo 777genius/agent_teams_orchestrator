@@ -20,6 +20,7 @@ import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.j
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
+import type { OwnerWalPublicationProducer } from './HostedApprovalOwnerProvenance.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
 import {
@@ -44,6 +45,11 @@ export const OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED: boolean = false
  */
 export function createHostedControlProductionPortFactory(
   createOpenCodeLane: () => TeamLifecycleLaneEffectPort = createProductionOpenCodeTeamLifecycleLane,
+  /**
+   * Explicit W1/C seam for the single process-owned FD9 producer. The caller
+   * owns its lifecycle; no environment lookup or ambient writer occurs here.
+   */
+  ownerWalPublication?: OwnerWalPublicationProducer,
 ): HostedControlRuntimePortFactory {
   return async (context: HostedControlRuntimePortFactoryContext) => {
     const execution = new DurableTeamLifecycleExecution(
@@ -118,6 +124,8 @@ export function createHostedControlProductionPortFactory(
             const owner = new HostedApprovalOwnerService({
               store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
                 join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
+                undefined,
+                ownerWalPublication,
               )),
               admission: approvalAdmission,
               runtime: new OpenCodeHostedApprovalRuntimeAdapter(),

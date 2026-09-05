@@ -9,6 +9,7 @@ import { fingerprintHostedApprovalDelivery, type HostedApprovalDeliveryRequest }
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
+import { HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, type OwnerWalMutation, type OwnerWalPublicationProducer } from './HostedApprovalOwnerProvenance.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import type {
   HostedApprovalObservedPermission,
@@ -34,6 +35,7 @@ async function fixture(
       | 'ambiguous'
       | Promise<'delivered' | 'not_started' | 'unavailable' | 'ambiguous'>
     observe?: () => readonly HostedApprovalObservedPermission[]
+    publicationProducer?: OwnerWalPublicationProducer
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'approval-owner-r2-'))
@@ -99,7 +101,7 @@ async function fixture(
     deliver: async (input: Parameters<OpenCodeHostedApprovalRuntimeAdapter['deliver']>[0]) =>
       (await overrides.deliver?.(input)) ?? 'delivered',
   } as unknown as OpenCodeHostedApprovalRuntimeAdapter
-  const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(join(root, 'owner.json')), () =>
+  const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(join(root, 'owner.json'), undefined, overrides.publicationProducer), () =>
     Date.parse('2026-08-13T10:00:01.000Z'),
   )
   const service = new HostedApprovalOwnerService({
@@ -128,6 +130,62 @@ async function fixture(
 }
 
 describe('HostedApprovalOwnerService R2', () => {
+  test('emits each genuine Store publication once and emits nothing for exact replay', async () => {
+    const mutations: OwnerWalMutation[] = []
+    const publicationProducer: OwnerWalPublicationProducer = {
+      prepare(input) { return { emit: () => {
+        mutations.push(input.native.mutation)
+        return { native: input.native, previous: input.previous, next: input.next, emission: {
+          stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+            artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64), pid: process.pid,
+            startTicks: '1', exeDev: '1', exeIno: '1' }, activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
+          descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
+          emissionNonce: '6'.repeat(64), sequence: mutations.length, lineSha256: '7'.repeat(64),
+        } }
+      } } }, poison(reason): never { throw new Error(reason) }, close() {},
+    }
+    const fx = await fixture({ publicationProducer })
+    expect(mutations.map(mutation => mutation.kind)).toEqual(['admission-reconciled'])
+    await fx.service.pollIngress()
+    expect(mutations.map(mutation => mutation.kind)).toEqual(['admission-reconciled', 'ingress-admitted'])
+    await fx.service.pollIngress()
+    expect(mutations.map(mutation => mutation.kind)).toEqual(['admission-reconciled', 'ingress-admitted'])
+    const claimRequest = { ownerId: 'owner_1', leaseToken: 'lease_1', leaseDurationMs: 30_000, limit: 1 }
+    const [claimed] = await fx.store.claim(claimRequest, 1_000_000)
+    expect(mutations.map(mutation => mutation.kind)).toEqual([
+      'admission-reconciled', 'ingress-admitted', 'ingress-lease-claimed',
+    ])
+    await fx.store.claim(claimRequest, 1_000_000)
+    expect(mutations.map(mutation => mutation.kind)).toEqual([
+      'admission-reconciled', 'ingress-admitted', 'ingress-lease-claimed',
+    ])
+    const acknowledgement = { outboxId: claimed!.outboxId, generation: claimed!.lease!.generation,
+      ownerId: claimRequest.ownerId, leaseToken: claimRequest.leaseToken }
+    expect(await fx.store.acknowledge(acknowledgement)).toEqual({ status: 'acknowledged' })
+    expect(await fx.store.acknowledge(acknowledgement)).toEqual({ status: 'already_acknowledged' })
+    expect(mutations.map(mutation => mutation.kind)).toEqual([
+      'admission-reconciled', 'ingress-admitted', 'ingress-lease-claimed', 'ingress-acknowledged',
+    ])
+    const decisionRequest = delivery(claimed!)
+    expect(await runDelivery(fx.service, decisionRequest, claimed!.authority)).toEqual({ status: 'delivered' })
+    const afterDelivery = [
+      'admission-reconciled', 'ingress-admitted', 'ingress-lease-claimed', 'ingress-acknowledged',
+      'delivery-started', 'delivery-settled',
+    ]
+    expect(mutations.map(mutation => mutation.kind)).toEqual(afterDelivery)
+    expect(await runDelivery(fx.service, decisionRequest, claimed!.authority)).toEqual({ status: 'idempotent_replay' })
+    expect(mutations.map(mutation => mutation.kind)).toEqual(afterDelivery)
+    fx.recreateSession()
+    await fx.service.pollIngress()
+    expect(mutations.map(mutation => mutation.kind)).toEqual([
+      ...afterDelivery, 'binding-quarantined',
+    ])
+    await fx.service.pollIngress()
+    expect(mutations.map(mutation => mutation.kind)).toEqual([
+      ...afterDelivery, 'binding-quarantined',
+    ])
+  })
+
   test('exposes only the exact recovered and still-current admission', async () => {
     const fx = await fixture()
     await expect(fx.service.isAdmissionRecoveredCurrent()).resolves.toBe(true)
@@ -290,6 +348,37 @@ describe('HostedApprovalOwnerService R2', () => {
         }),
       ).toEqual({ status: 'unavailable' })
     expect(effects).toBe(0)
+  })
+
+  test('post-publication started capture failure enters reconciliation-only before provider invocation', async () => {
+    let poisoned = false; let effects = 0
+    const publicationProducer: OwnerWalPublicationProducer = {
+      prepare(input) {
+        if (poisoned) throw new Error('capture poisoned')
+        return { emit: () => {
+          if (input.intent.mutation.kind === 'delivery-started') throw new Error('capture sync failed')
+          return { native: input.native, previous: input.previous, next: input.next, emission: {
+            stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+              artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64), pid: process.pid,
+              startTicks: '1', exeDev: '1', exeIno: '1' }, activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
+            descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
+            emissionNonce: '6'.repeat(64), sequence: 1, lineSha256: '7'.repeat(64),
+          } }
+        } }
+      },
+      poison(reason): never { poisoned = true; throw new Error(reason) }, close() {},
+    }
+    const fx = await fixture({ publicationProducer, deliver: () => { effects += 1; return 'delivered' } })
+    const [record] = await fx.service.claimIngress({
+      request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 }, maximumAggregateBytes: 1_000_000,
+    })
+    const request = delivery(record!)
+    expect(await runDelivery(fx.service, request, record!.authority)).toEqual({
+      status: 'operator_required', reconciliationRef: request.reconciliationRef,
+    })
+    expect(effects).toBe(0)
+    expect(poisoned).toBe(true)
+    expect((await fx.store.read())?.deliveries).toMatchObject([{ phase: 'started', result: null }])
   })
 
   test('fence replacement after durable started fails closed at the final provider edge', async () => {

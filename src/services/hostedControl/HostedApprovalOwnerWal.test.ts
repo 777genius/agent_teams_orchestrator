@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -9,9 +10,17 @@ import {
   decodeOwnerState, HostedApprovalOwnerWal, parseOwnerStateSource, type HostedApprovalOwnerState,
 } from './HostedApprovalOwnerWal.js'
 import {
+  createOwnerWalPublicationProducerFromEnvironment,
+  HOSTED_OWNER_PROVENANCE_CONTRACT,
+  HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+  HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+  type OwnerWalNative,
+  type OwnerWalPublicationProducer,
+} from './HostedApprovalOwnerProvenance.js'
+import {
   createRegularNodeAtDarwin, type DarwinSpawnNative,
 } from './HostedApprovalOwnerWalDarwin.internal.js'
-import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
+import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 
 const teamId = `team_${'1'.repeat(32)}`
 const roots: string[] = []
@@ -253,6 +262,136 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
 })
 
 describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
+  test('binds exact absent P and durable N only after the real WAL replacement', async () => {
+    const { path } = await walPath(); let prepared: Parameters<OwnerWalPublicationProducer['prepare']>[0] | null = null
+    const producer: OwnerWalPublicationProducer = {
+      prepare(input) {
+        prepared = input
+        return { emit: () => ({ native: input.native, previous: input.previous, next: input.next, emission: {
+          stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+            artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64),
+            pid: process.pid, startTicks: '1', exeDev: '1', exeIno: '1' },
+          activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
+          descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
+          emissionNonce: '6'.repeat(64), sequence: 1, lineSha256: '7'.repeat(64),
+        } }) },
+      },
+      poison(reason): never { throw new Error(reason) }, close() {},
+    }
+    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
+    const desired = withoutRevision(state())
+    const admission = {
+      digest: desired.admissionDigest, admissionGeneration: desired.admissionGeneration,
+      routes: desired.routes, actorMembers: desired.actorMembers, isCurrent: async () => true,
+    } as unknown as HostedApprovalRuntimeAdmission
+    const result = await wal.locked(current => wal.publishMutation(current, desired, {
+      operationNonce: '8'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
+    }))
+    const durable = await readFile(path)
+    expect(prepared?.previous).toEqual({ kind: 'absent' })
+    expect(Buffer.from(prepared!.next.bytes)).toEqual(durable)
+    expect(prepared!.native.stateDelta.changedFields).toEqual([
+      'actorMembers', 'admissionDigest', 'admissionGeneration', 'bindings', 'deliveries', 'ingress',
+      'retiredIngress', 'revision', 'routes', 'schemaVersion', 'writerFence',
+    ])
+    expect(prepared!.native.stateDelta.collectionSizes).toEqual({
+      actorMembers: { previous: 0, next: Object.keys(desired.actorMembers).length },
+      bindings: { previous: 0, next: desired.bindings.length },
+      deliveries: { previous: 0, next: desired.deliveries.length },
+      ingress: { previous: 0, next: desired.ingress.length },
+      retiredIngress: { previous: 0, next: desired.retiredIngress.length },
+      routes: { previous: 0, next: desired.routes.length },
+    })
+    expect(result.capture).toBe('bound')
+    if (result.capture !== 'bound') throw new Error('missing bound publication')
+    expect(result.publication.next.sha256).toBe(prepared!.native.wal.sha256)
+    expect(result.publication.native.fence).toEqual(result.state.writerFence)
+  })
+
+  test('retains old raw P separately from migrated M and compacted N', async () => {
+    const { path } = await walPath()
+    const setupWal = new HostedApprovalOwnerWal(path)
+    const current = await setupWal.locked(value => setupWal.publish(value, withoutRevision(state())))
+    const legacy = structuredClone(current) as unknown as Record<string, unknown>
+    legacy.schemaVersion = 2; legacy.routes = []; legacy.actorMembers = {}; legacy.ingress = []
+    delete legacy.bindings
+    const oldBytes = Buffer.from(` ${JSON.stringify(legacy)}\n`)
+    await writeFile(path, oldBytes, { mode: 0o600 })
+    let captured: Parameters<OwnerWalPublicationProducer['prepare']>[0] | null = null
+    const producer: OwnerWalPublicationProducer = {
+      prepare(input) { captured = input; return { emit: () => ({ native: input.native, previous: input.previous, next: input.next, emission: {} as never }) } },
+      poison(reason): never { throw new Error(reason) }, close() {},
+    }
+    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
+    const admission = { digest: current.admissionDigest, admissionGeneration: current.admissionGeneration,
+      routes: current.routes, actorMembers: current.actorMembers, isCurrent: async () => true } as unknown as HostedApprovalRuntimeAdmission
+    let migratedState: HostedApprovalOwnerState | null = null
+    await wal.locked(migrated => {
+      migratedState = migrated
+      return wal.publishMutation(migrated, withoutRevision(current), {
+        operationNonce: '9'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
+      })
+    })
+    expect(migratedState).toMatchObject({ schemaVersion: 3, revision: current.revision, bindings: [] })
+    expect(captured?.previous.kind).toBe('retained')
+    if (captured?.previous.kind !== 'retained') throw new Error('missing retained predecessor')
+    expect(Buffer.from(captured.previous.image.bytes)).toEqual(oldBytes)
+    expect(captured.native.stateDelta.previousStateSha256).toBe(createHash('sha256').update(oldBytes).digest('hex'))
+    expect(captured.native.stateDelta.previousRevision).toBe(current.revision)
+    expect(captured.native.stateDelta.changedFields).toContain('bindings')
+    expect(Buffer.from(captured.next.bytes)).toEqual(await readFile(path))
+  })
+
+  test('serializes one canonical native fact with controlled partial descriptor writes', () => {
+    const chunks: Buffer[] = []; let nonce = 0
+    const capsule = JSON.stringify({ activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+      contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+      expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64), implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+      producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2 })
+    const producer = createOwnerWalPublicationProducerFromEnvironment({
+      environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: capsule }, modulePath: '/unused',
+      imageCustodian: { prepare: (previous, next) => ({ bind: () => ({ previous, next }) }) },
+      operations: {
+        identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11', exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+        descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+        nonce: () => (++nonce).toString(16).padStart(64, '0'),
+        write: (_fd, bytes, offset) => { const count = Math.min(17, bytes.byteLength - offset); chunks.push(Buffer.from(bytes.subarray(offset, offset + count))); return count },
+        sync: () => {}, close: () => {},
+      },
+    })!
+    const bytes = Buffer.from('{}\n'); const hash = createHash('sha256').update(bytes).digest('hex')
+    const native: OwnerWalNative = { fence: { generation: `approval-writer-fence_${'a'.repeat(32)}`, dev: '1', ino: '2' },
+      mutation: { kind: 'admission-reconciled', outcome: 'published' }, revision: 1,
+      stateDelta: { changedFields: ['actorMembers', 'admissionDigest', 'admissionGeneration', 'bindings', 'deliveries', 'ingress', 'retiredIngress', 'revision', 'routes', 'schemaVersion', 'writerFence'],
+        collectionSizes: Object.fromEntries(['actorMembers', 'bindings', 'deliveries', 'ingress', 'retiredIngress', 'routes'].map(key => [key, { previous: 0, next: 0 }])) as OwnerWalNative['stateDelta']['collectionSizes'],
+        nextRevision: 1, nextStateSha256: hash, previousRevision: null, previousStateSha256: null }, wal: { byteSize: bytes.length, sha256: hash } }
+    producer.prepare({ intent: { operationNonce: 'a'.repeat(64), mutation: native.mutation, admission: {} as HostedApprovalRuntimeAdmission }, native,
+      previous: { kind: 'absent' }, next: { byteSize: bytes.length, sha256: hash, bytes } }).emit()
+    const lines = Buffer.concat(chunks).toString('utf8').trimEnd().split('\n').map(line => JSON.parse(line))
+    expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published'])
+    expect(lines[1].previousRecordSha256).toBe(createHash('sha256').update(`${JSON.stringify(lines[0])}\n`).digest('hex'))
+  })
+
+  test('poisons capture after durable publication failure and cannot retry from old authority', async () => {
+    const { path } = await walPath(); let poisoned = false; let prepares = 0
+    const producer: OwnerWalPublicationProducer = {
+      prepare() { if (poisoned) throw new Error('poisoned'); prepares += 1; return { emit: () => { throw new Error('capture sync failed') } } },
+      poison(reason): never { poisoned = true; throw new Error(reason) }, close() {},
+    }
+    const desired = withoutRevision(state())
+    const admission = { digest: desired.admissionDigest, admissionGeneration: desired.admissionGeneration,
+      routes: desired.routes, actorMembers: desired.actorMembers, isCurrent: async () => true } as unknown as HostedApprovalRuntimeAdmission
+    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
+    await expect(wal.locked(current => wal.publishMutation(current, desired, {
+      operationNonce: 'b'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission,
+    }))).rejects.toMatchObject({ stage: 'published-capture-failed' })
+    expect((await readFile(path)).byteLength).toBeGreaterThan(2)
+    await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), admissionDigest: 'c'.repeat(64) }, {
+      operationNonce: 'c'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
+      admission: { ...admission, digest: 'c'.repeat(64) },
+    }))).rejects.toThrow('poisoned')
+    expect(prepares).toBe(1)
+  })
   test('keeps variadic creation out of Bun FFI on every supported platform', async () => {
     const source = await readFile(resolve(import.meta.dir, 'HostedApprovalOwnerWal.ts'), 'utf8')
     const openatDeclaration = source.split('\n').find(line => line.trimStart().startsWith('openat:'))
