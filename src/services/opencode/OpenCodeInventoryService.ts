@@ -80,7 +80,9 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
 }
 
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
-export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
+// Summary still prepares the profile and runs sequential version/auth probes.
+// Allow profile I/O plus both per-command budgets without starting a model host.
+export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
 export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
