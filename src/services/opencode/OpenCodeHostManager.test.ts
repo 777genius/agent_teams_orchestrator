@@ -156,8 +156,15 @@ describe('OpenCodeHostManager', () => {
     expect(buildOpenCodeHostProfileIdentity(scoped, 'binary-a')).toContain('auth:known:auth-a')
   })
 
-  test('starts a fresh persistent host when managed OpenCode auth changes', async () => {
-    let profile = baseProfile
+  test.each(['auth', 'mcp-endpoint', 'mcp-app-instance'] as const)(
+    'starts a fresh persistent host when %s changes', async change => {
+    const initialProfile = {
+      ...baseProfile,
+      managedConfig: { ...baseProfile.managedConfig, mcp: { 'agent-teams': {
+        type: 'remote', url: 'http://127.0.0.1:43110/mcp#agent-teams-app-instance=old',
+      } } },
+    }
+    let profile = initialProfile
     let port = 43150
     let spawnCount = 0
     const manager = new OpenCodeHostManager({
@@ -194,10 +201,15 @@ describe('OpenCodeHostManager', () => {
     })
 
     const beforeAuthRefresh = await manager.ensureHost({ hostLifetime: 'persistent' })
-    profile = {
-      ...baseProfile,
-      managedAuthFingerprint: 'managed-auth-refreshed',
-    }
+    expect((await manager.ensureHost({ hostLifetime: 'persistent' })).pid)
+      .toBe(beforeAuthRefresh.pid)
+    profile = change === 'auth'
+      ? { ...initialProfile, managedAuthFingerprint: 'managed-auth-refreshed' }
+      : { ...initialProfile, managedConfig: { ...initialProfile.managedConfig,
+          mcp: { 'agent-teams': { type: 'remote', url: change === 'mcp-endpoint'
+            ? 'http://127.0.0.1:43111/mcp#agent-teams-app-instance=old'
+            : 'http://127.0.0.1:43110/mcp#agent-teams-app-instance=new' } },
+        } }
     const afterAuthRefresh = await manager.ensureHost({ hostLifetime: 'persistent' })
 
     expect(afterAuthRefresh.hostKey).not.toBe(beforeAuthRefresh.hostKey)

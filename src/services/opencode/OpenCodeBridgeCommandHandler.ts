@@ -2477,6 +2477,35 @@ function preHostCursorFailureReadinessData(input: {
   }
 }
 
+function unsupportedExtensionBoundReadinessData(selectedModel: string, providerId: string) {
+  const reason =
+    `OpenCode model ${selectedModel} uses extension-bound provider ${providerId}, `
+    + 'which is not supported by the current Agent Teams launch runtime. Choose another OpenCode model.'
+  return {
+    state: 'model_unavailable',
+    launchAllowed: false,
+    modelId: selectedModel,
+    availableModels: [],
+    opencodeVersion: null,
+    installMethod: 'unknown',
+    binaryPath: 'opencode',
+    hostHealthy: false,
+    appMcpConnected: false,
+    requiredToolsPresent: false,
+    permissionBridgeReady: true,
+    runtimeStoresReady: true,
+    supportLevel: null,
+    missing: [reason],
+    diagnostics: [reason],
+    evidence: {
+      capabilitiesReady: true,
+      mcpToolProofRoute: null,
+      observedMcpTools: [],
+      runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
+    },
+  }
+}
+
 async function runReadiness(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
@@ -2495,9 +2524,13 @@ async function runReadiness(
   if (qualifiedSelectedModel
     && (qualifiedSelectedModel.providerId === 'kiro'
       || qualifiedSelectedModel.providerId === 'cursor-acp')) {
-    throw new Error(
-      `OpenCode execution_probe does not support extension-bound provider ${qualifiedSelectedModel.providerId}`,
-    )
+    return {
+      snapshot: null,
+      data: unsupportedExtensionBoundReadinessData(
+        qualifiedSelectedModel.raw,
+        qualifiedSelectedModel.providerId,
+      ),
+    }
   }
   const runProvisioningPhase = async (
     phase: 'host_start' | 'post_probe_refresh',
