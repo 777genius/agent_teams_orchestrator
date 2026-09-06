@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
-import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
-import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { OpenCodeClientFactory, isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
+import { OpenCodeHostManager, isOpenCodeHostManagerBoundToCustody } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge, prepareOpenCodePermissionProfileToken } from './OpenCodeSessionBridge.js'
 import { assertTrustedOpenCodeCustody, createOpenCodeSupervisedCustodyAcquirer,
   type TrustedOpenCodeCustody, type OpenCodeSupervisorAdmissionSource } from './OpenCodeSupervisedHostCustody.js'
@@ -26,6 +26,51 @@ describe('OpenCode supervised admission', () => {
       expect(fixture.requests).toHaveLength(0)
     } finally { await fixture.close() }
   })
+
+  test.skipIf(process.platform !== 'linux')('every constructor captures an accessor custody once, including nested factories', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      let forgedCalls = 0
+      const forged = { ...custody,
+        authorizeConnected: async () => { forgedCalls += 1; return { consume: () => true } },
+      } as TrustedOpenCodeCustody
+      const stable = { mode: 'supervisor-adopt-only' as const, custody }
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: stable })
+      const factory = new OpenCodeClientFactory({ acquisitionPolicy: stable })
+      const sessionStore = { get: async () => null, upsert: async () => 'created' as const, markStale: async () => null }
+      const constructors = [
+        (acquisitionPolicy: typeof stable) => new OpenCodeClientFactory({ acquisitionPolicy }),
+        (acquisitionPolicy: typeof stable) => new OpenCodeHostManager({ acquisitionPolicy }),
+        (acquisitionPolicy: typeof stable) => new OpenCodeSessionBridge({ acquisitionPolicy,
+          hostManager: manager, clientFactory: factory, sessionStore }),
+      ]
+      for (const construct of constructors) {
+        let reads = 0
+        const policy = { mode: 'supervisor-adopt-only' as const,
+          get custody() { return ++reads === 2 ? forged : custody } }
+        const consumer = construct(policy)
+        expect(reads).toBe(1)
+        expect(Reflect.get(consumer, 'custody')).toBe(custody)
+        expect(Reflect.set(consumer, 'custody', forged)).toBe(false)
+        Object.defineProperty(policy, 'custody', { value: forged })
+        if (consumer instanceof OpenCodeClientFactory) {
+          expect(isOpenCodeClientFactoryBoundToCustody(consumer, custody)).toBe(true)
+          await consumer.create(fixture.expected.endpoint.baseUrl).getHealth!()
+        } else if (consumer instanceof OpenCodeHostManager) {
+          expect(isOpenCodeHostManagerBoundToCustody(consumer, custody)).toBe(true)
+          const host = await consumer.ensureHost({ lease: supervisedLease })
+          expect(host.custody).toBe('supervisor')
+        }
+        reads = 0
+        expect(() => construct({ mode: 'supervisor-adopt-only',
+          get custody() { return ++reads === 1 ? forged : custody },
+        })).toThrow('custody unavailable')
+        expect(reads).toBe(1)
+      }
+      expect(forgedCalls).toBe(0)
+    } finally { await fixture.close() }
+  }, 120_000)
 
   test.skipIf(process.platform !== 'linux')('wrong namespace, executable, start, auth and profile cannot admit', async () => {
     for (const change of ['namespace', 'inode', 'digest', 'start', 'auth', 'profile']) {

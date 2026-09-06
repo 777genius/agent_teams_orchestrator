@@ -506,16 +506,18 @@ export class OpenCodeSessionBridge {
     const policy = deps.acquisitionPolicy
     if (policy && policy.mode !== 'desktop') {
       if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
-      assertTrustedOpenCodeCustody(policy.custody)
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
       if (new.target !== OpenCodeSessionBridge) throw new Error('OpenCode supervised bridge must use the admitted implementation')
-      if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, policy.custody) ||
-        !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, policy.custody) || !deps.sessionStore ||
+      if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
+        !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) || !deps.sessionStore ||
         deps.prepareProfile || deps.preparePermissionProfileToken || deps.captureProcessIdentity ||
         deps.captureEstablishedPeerIdentity || deps.captureLoopbackEndpointIdentity) {
         throw new Error('OpenCode supervised bridge requires the complete custody-bound dependencies')
       }
-      this.custody = policy.custody
+      this.custody = custody
       this.deps = Object.freeze({ ...deps,
+        acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }),
         sessionStore: Object.freeze({ get: deps.sessionStore.get.bind(deps.sessionStore),
           upsert: deps.sessionStore.upsert.bind(deps.sessionStore), markStale: deps.sessionStore.markStale.bind(deps.sessionStore) }),
         mcpManager: deps.mcpManager && Object.freeze({ ensureAppMcp: deps.mcpManager.ensureAppMcp.bind(deps.mcpManager) }),

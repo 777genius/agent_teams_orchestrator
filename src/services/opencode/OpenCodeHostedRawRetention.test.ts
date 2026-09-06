@@ -102,18 +102,19 @@ describe('OpenCode bounded raw retention', () => {
       method: 'GET', path: '/', bytes: Buffer.alloc(0),
     })
     const failure = pending.then(() => null, error => error)
-    await started
-    sink.write = async (_bytes, _offset, length) => length
-    sink.sync = async () => {}
-    sink.isCurrent = () => true
-    encoded.recordId = 'b'.repeat(64)
-    release()
-    const error = await failure
-    expect(error).toBeInstanceOf(Error)
-    expect(error.message).toContain('append failed')
-    expect(syncs).toBe(1)
-    expect(port.isCurrent()).toBe(false)
-    await port.close()
+    try {
+      await started
+      sink.write = async (_bytes, _offset, length) => length
+      sink.sync = async () => {}
+      sink.isCurrent = () => true
+      encoded.recordId = 'b'.repeat(64)
+      release()
+      const error = await failure
+      expect(error).toBeInstanceOf(Error)
+      expect(error.message).toContain('append failed')
+      expect(syncs).toBe(1)
+      expect(port.isCurrent()).toBe(false)
+    } finally { release(); await failure; await port.close() }
   })
 
   test('poisons on zero writes, sync failure, overflow and descriptor replacement', async () => {

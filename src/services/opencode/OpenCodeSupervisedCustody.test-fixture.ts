@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AddressInfo, Socket } from 'node:net'
+import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { canonicalHostedApprovalJson } from './OpenCodeClientFactory.js'
@@ -17,18 +17,39 @@ const hash = (text: string) => createHash('sha256').update(text).digest('hex')
 export const supervisedLease = { teamId: 'team_test', laneId: 'primary', memberName: 'worker',
   runId: 'run_test', sessionId: 'ses_test' }
 
+export async function supervisedTestWait<T>(pending: Promise<T>, label: string, ms = 10_000): Promise<T> {
+  let timer!: ReturnType<typeof setTimeout>
+  try {
+    return await Promise.race([pending, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), ms)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+/** A failed exchange must not leave a test waiting forever for an unreached stage. */
+export function supervisedTestStage(stage: Promise<void>, exchange: Promise<unknown>, label: string) {
+  return supervisedTestWait(Promise.race([stage, exchange.then(result => {
+    throw new Error(`Exchange settled before ${label}`, { cause: result })
+  })]), label, 30_000)
+}
+
+type ObservedRequest = { method: string; url: string; headers: IncomingMessage['headers']; body: Buffer }
+
 /** Local server fixture owns its actual listener/process expectation. This is
  * explicitly test infrastructure, not a production supervisor admission provider.
  */
 export async function supervisedFixture(options: {
   handle?: (request: IncomingMessage, response: ServerResponse) => void
+  // Use a genuine TCP listener for wire framing tests; an HTTP server's socket
+  // facade may interpret end() as response finalization instead of raw bytes.
+  rawResponse?: (request: ObservedRequest, socket: Socket) => void
   sync?: (observation: OpenCodeRawObservation | undefined) => Promise<void>
   write?: (bytes: Uint8Array, offset: number, length: number, observation: OpenCodeRawObservation | undefined) => Promise<number>
   mutateBundle?: (bundle: Awaited<ReturnType<OpenCodeSupervisorAdmissionSource['acquire']>>) => void
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'opencode-w1-a-'))
   const observations: OpenCodeRawObservation[] = []
-  const requests: Array<{ url: string; headers: IncomingMessage['headers']; body: Buffer }> = []
+  const requests: ObservedRequest[] = []
   // Count TCP bytes even when no complete HTTP request can be parsed.
   const connections: Array<{ socket: Socket; chunks: Buffer[]; closed: Promise<void> }> = []
   let live = true
@@ -42,11 +63,36 @@ export async function supervisedFixture(options: {
     authentication: 'opencode-basic' as const, runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
     configGeneration: `config_generation_${'2'.repeat(32)}` }
   const config = { config: {}, configProviders: {}, agents: [], mcp: [] }
-  const server = createServer((request, response) => {
+  const server = options.rawResponse ? createTcpServer(socket => {
+    let bytes = Buffer.alloc(0)
+    let delivered = false
+    socket.on('data', chunk => {
+      if (delivered) return
+      bytes = Buffer.concat([bytes, chunk])
+      const boundary = bytes.indexOf('\r\n\r\n')
+      if (boundary < 0) return
+      const [line, ...fields] = bytes.subarray(0, boundary).toString('ascii').split('\r\n')
+      const [method, url] = line!.split(' ')
+      const headers: IncomingMessage['headers'] = {}
+      for (const field of fields) {
+        const colon = field.indexOf(':')
+        headers[field.slice(0, colon).toLowerCase()] = field.slice(colon + 1).trim()
+      }
+      const length = Number(headers['content-length'] ?? 0)
+      if (!method || !url || !Number.isSafeInteger(length) || length < 0 || length > 16 * 1024) {
+        socket.destroy(); return
+      }
+      if (bytes.length < boundary + 4 + length) return
+      delivered = true
+      const request = { method, url, headers, body: Buffer.from(bytes.subarray(boundary + 4, boundary + 4 + length)) }
+      requests.push(request)
+      options.rawResponse!(request, socket)
+    })
+  }) : createServer((request, response) => {
     const chunks: Buffer[] = []
     request.on('data', chunk => chunks.push(Buffer.from(chunk)))
     request.on('end', () => {
-      requests.push({ url: request.url!, headers: request.headers, body: Buffer.concat(chunks) })
+      requests.push({ method: request.method!, url: request.url!, headers: request.headers, body: Buffer.concat(chunks) })
       if (options.handle) { options.handle(request, response); return }
       const data = request.url === '/global/health' ? { healthy: true } :
         request.url === '/agent' ? [] : request.url?.endsWith('hosted-approval-capability') ? hosted : {}
@@ -56,6 +102,7 @@ export async function supervisedFixture(options: {
   server.on('connection', socket => {
     const chunks: Buffer[] = []
     const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+    socket.on('error', () => {})
     socket.on('data', chunk => chunks.push(Buffer.from(chunk)))
     connections.push({ socket, chunks, closed })
   })
@@ -131,7 +178,7 @@ export async function supervisedFixture(options: {
     async close() {
       live = false; lose()
       await rawRetention.close()
-      server.closeAllConnections()
+      for (const connection of connections) connection.socket.destroy()
       await new Promise<void>(resolve => server.close(() => resolve()))
       await rm(directory, { recursive: true, force: true })
     },

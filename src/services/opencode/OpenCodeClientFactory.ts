@@ -514,10 +514,11 @@ type SupervisedNativeResponse = {
 
 function awaitRequestAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
-    const aborted = () => reject(signal.reason ?? new Error('OpenCode request aborted'))
+    const cleanup = () => signal.removeEventListener('abort', aborted)
+    const aborted = () => { cleanup(); reject(signal.reason ?? new Error('OpenCode request aborted')) }
     signal.addEventListener('abort', aborted, { once: true })
     if (signal.aborted) aborted()
-    void pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted))
+    void pending.then(value => { cleanup(); resolve(value) }, error => { cleanup(); reject(error) })
   })
 }
 
@@ -621,6 +622,15 @@ async function fetchHostedApprovalOverAuthorizedConnection(
         if (dispatch?.captured) custody?.rawRetention.poison('request_failed')
         reject(error)
       })
+      // Some transports close the socket without emitting a request error while
+      // headers are pending. Cancellation must settle this wait independently.
+      const abortRequest = () => {
+        request.destroy()
+        reject(signal.reason ?? new Error('OpenCode request aborted'))
+      }
+      signal.addEventListener('abort', abortRequest, { once: true })
+      request.once('close', () => signal.removeEventListener('abort', abortRequest))
+      if (signal.aborted) { abortRequest(); return }
       let finalized = false
       try {
         finalized = finalizeConnected()
@@ -770,12 +780,14 @@ export class OpenCodeClientFactory {
     const policy = deps.acquisitionPolicy
     if (policy && policy.mode !== 'desktop') {
       if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
-      assertTrustedOpenCodeCustody(policy.custody)
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
       if (new.target !== OpenCodeClientFactory) throw new Error('OpenCode supervised factory must use the admitted implementation')
       if (deps.fetchImpl) throw new Error('OpenCode supervised transport cannot use fetch override')
-      this.custody = policy.custody
+      this.deps = Object.freeze({ ...deps, acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }) })
+      this.custody = custody
       Object.defineProperty(this, 'create', { value: OpenCodeClientFactory.prototype.create.bind(this) })
-      custodyFactories.set(this, policy.custody)
+      custodyFactories.set(this, custody)
       Object.freeze(this)
     }
   }
@@ -818,7 +830,9 @@ export class OpenCodeClientFactory {
       let retained: RetainedRequest | null = null
       let operationToken: OneUseFence | null = null
       let custodyToken: OneUseFence | null = null
-      let tokensConsumed = false
+      let finished = false
+      const unconsumed = new Set<OneUseFence>()
+      const consume = (token: OneUseFence) => { unconsumed.delete(token); return token.consume() }
       const requestedTimeout = context.requestTimeoutMs
       const responseTimeout = requestedTimeout === undefined ? endpointTimeoutMs :
         Math.max(0, Math.min(endpointTimeoutMs, Number.isFinite(requestedTimeout) ? requestedTimeout : 0))
@@ -858,7 +872,13 @@ export class OpenCodeClientFactory {
       }
       armDeadline(custody ? remainingBudget(SUPERVISED_PREPARATION_TIMEOUT_MS) : timeoutMs)
       const captureToken = (pending: Promise<OneUseFence | null>) => awaitRequestAbort(pending.then(token => {
-        if (controller.signal.aborted) { token?.consume(); return null }
+        if (finished || !deadlineCurrent()) {
+          try { token?.consume() } catch {}
+          return null
+        }
+        // Register before resolving the abort race, including a token delivered
+        // in the same turn as cancellation but never assigned by its caller.
+        if (token) unconsumed.add(token)
         return token
       }), controller.signal)
 
@@ -890,27 +910,28 @@ export class OpenCodeClientFactory {
         const connectedAuthorization = custody ? async (connection: OpenCodeConnectedSocketIdentity) => {
           custodyToken = await captureToken(custody.authorizeConnected(connection))
           if (!custodyToken) return null
-          const final = authorizeConnected ? await authorizeConnected(connection) : () => true
+          const final = await captureToken(authorizeConnected
+            ? authorizeConnected(connection).then(finalize => finalize ? { consume: finalize } : null)
+            : Promise.resolve({ consume: () => true }))
           if (!final) return null
           let used = false
           return () => {
             if (used) return false
             used = true
-            tokensConsumed = true
             // Consume every acquired fence even on failure; none may leak pinned fds.
             let valid = custody.rawRetention.isCurrent() && deadlineCurrent()
-            try { if (operationToken) valid = operationToken.consume() && valid } catch { valid = false }
-            try { valid = final() && valid } catch { valid = false }
-            try { valid = custodyToken!.consume() && valid } catch { valid = false }
+            try { if (operationToken) valid = consume(operationToken) && valid } catch { valid = false }
+            try { valid = consume(final) && valid } catch { valid = false }
+            try { valid = consume(custodyToken!) && valid } catch { valid = false }
             valid = valid && custody.rawRetention.isCurrent() && deadlineCurrent()
             if (valid) armDeadline(remainingBudget(responseTimeout))
             return valid && deadlineCurrent()
           }
         } : authorizeConnected
         const transported = custody || (connectedAuthorization && !this.deps.fetchImpl)
-          ? await fetchHostedApprovalOverAuthorizedConnection(
+          ? await awaitRequestAbort(fetchHostedApprovalOverAuthorizedConnection(
               baseUrl + path, requestInit, controller.signal, connectedAuthorization!, dispatch, custody,
-            )
+            ), controller.signal)
           : await (async () => {
               if (authorizeConnected) {
                 throw new OpenCodePermissionConditionRejectedError(
@@ -929,8 +950,11 @@ export class OpenCodeClientFactory {
         }
         if (custody && !retained && response.headers.has('content-encoding') &&
           response.headers.get('content-encoding') !== 'identity') throw new Error('OpenCode supervised encoding rejected')
-        if (custody && !retained && (init?.method ?? 'GET') === 'GET' && response.status !== 200) {
-          throw new Error('OpenCode supervised read did not return a complete successful observation')
+        if (custody && !retained && (!response.ok || ((init?.method ?? 'GET') === 'GET' && response.status !== 200))) {
+          // Native framing and encoding have already been checked. Preserve the
+          // authenticated status without exposing a generic failure body. Reads
+          // used for admission still require exactly 200, including config.
+          throw new OpenCodeHttpResponseError(response.status, response.statusText, '')
         }
         return strictHostedApprovalResponse
           ? await parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes, !!custody, operation?.kind === 'reply')
@@ -951,10 +975,9 @@ export class OpenCodeClientFactory {
         }
         throw error
       } finally {
-        if (!tokensConsumed) {
-          try { custodyToken?.consume() } catch {}
-          try { operationToken?.consume() } catch {}
-        }
+        finished = true
+        for (const token of unconsumed) { try { token.consume() } catch {} }
+        unconsumed.clear()
         clearTimeout(timeout)
         context.signal?.removeEventListener('abort', abortFromContext)
       }
@@ -1066,7 +1089,7 @@ export class OpenCodeClientFactory {
             `/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageID)}`,
           )
         } catch (error) {
-          if (error instanceof Error && error.message.includes('(404 ')) {
+          if (error instanceof OpenCodeHttpResponseError && error.status === 404) {
             const messages = await request<OpenCodeMessage[]>(
               `/session/${encodeURIComponent(id)}/message`,
             ).catch(() => [])

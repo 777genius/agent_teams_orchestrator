@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { canonicalHostedApprovalDigest, canonicalHostedApprovalJson, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
@@ -25,6 +26,47 @@ function sessionRecord(fixture: Awaited<ReturnType<typeof supervisedFixture>>, h
 }
 
 describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridge', () => {
+  test('bootstrap injection proceeds after a complete authenticated missing-message 404', async () => {
+    const text = 'admitted bootstrap context'
+    const messageID = 'msg_bootstrap'
+    const message = { info: { id: messageID, role: 'user' }, parts: [{ type: 'text', text }] }
+    let injected = false
+    const fixture = await supervisedFixture({ handle(request, response) {
+      if (request.method === 'POST' && request.url === '/session/ses_test/message') {
+        injected = true; response.end(JSON.stringify(message)); return
+      }
+      if (request.url === `/session/ses_test/message/${messageID}`) {
+        if (!injected) { response.statusCode = 404; response.end(); return }
+        response.end(JSON.stringify(message)); return
+      }
+      const result = request.url?.startsWith('/session/ses_test/message') ? injected ? [message] : [] :
+        request.url === '/global/health' ? { healthy: true } : request.url === '/agent' ? [] :
+        request.url?.endsWith('hosted-approval-capability') ? fixture.expected.hosted : {}
+      response.end(canonicalHostedApprovalJson(result))
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const acquisitionPolicy = { mode: 'supervisor-adopt-only' as const, custody }
+      const store = new OpenCodeSessionStore(`${fixture.profile.profileRootPath}/sessions.json`)
+      const bridge = new OpenCodeSessionBridge({ acquisitionPolicy, sessionStore: store,
+        hostManager: new OpenCodeHostManager({ acquisitionPolicy }),
+        clientFactory: new OpenCodeClientFactory({ acquisitionPolicy }),
+        oauthRefreshCoordinator: { ensureFreshForPrompt: async () => ({ checked: false, refreshed: false }) },
+      })
+      const record = sessionRecord(fixture, custody.hostKey)
+      await store.upsert(record)
+      const contextHash = createHash('sha256').update(text).digest('hex')
+      expect(await bridge.injectAppManagedBootstrapContext(record, {
+        messageID, text, contextHash, briefingHash: 'fixture-briefing',
+      })).toMatchObject({ messageID, runtimeSessionId: 'ses_test', alreadyPresent: false, contextHash })
+      const posts = fixture.requests.filter(request => request.method === 'POST')
+      expect(posts).toHaveLength(1)
+      expect(JSON.parse(posts[0]!.body.toString())).toMatchObject({ messageID, noReply: true, parts: message.parts })
+      expect(fixture.requests.filter(request => request.url === `/session/ses_test/message/${messageID}`)).toHaveLength(2)
+      await bridge.releaseSession(record)
+    } finally { await fixture.close() }
+  }, 120_000)
+
   test('snapshots the session and bound dependencies while host acquisition awaits health', async () => {
     let healthStarted!: () => void
     let releaseHealth!: () => void

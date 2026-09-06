@@ -4,9 +4,9 @@ import type { Dirent } from 'node:fs'
 import net from 'node:net'
 import { mkdir, readlink, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { OpenCodeClientFactory, type OpenCodeClientRequestContext } from './OpenCodeClientFactory.js'
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
-  type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
+  type OneUseFence, type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -30,6 +30,8 @@ import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventorySe
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import {
+  OpenCodeRuntimeDeadline,
+  type OpenCodePhaseContext,
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
@@ -501,10 +503,14 @@ export class OpenCodeHostManager {
     const policy = deps.acquisitionPolicy
     if (policy && policy.mode !== 'desktop') {
       if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
-      assertTrustedOpenCodeCustody(policy.custody)
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
       if (new.target !== OpenCodeHostManager) throw new Error('OpenCode supervised manager must use the admitted implementation')
-      this.custody = policy.custody
-      this.supervisedClientFactory = new OpenCodeClientFactory({ acquisitionPolicy: policy })
+      this.deps = Object.freeze({ ...deps, acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }) })
+      this.custody = custody
+      this.supervisedClientFactory = new OpenCodeClientFactory({
+        acquisitionPolicy: { mode: 'supervisor-adopt-only', custody },
+      })
       // Supervised consumers retain these exact operations. Neither subclasses
       // nor later instance/prototype assignments can replace a validated fence.
       for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeHostManager.prototype))) {
@@ -514,7 +520,7 @@ export class OpenCodeHostManager {
           Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
         }
       }
-      custodyManagers.set(this, policy.custody)
+      custodyManagers.set(this, custody)
       Object.freeze(this)
     }
   }
@@ -540,10 +546,13 @@ export class OpenCodeHostManager {
     return prepareProfile(projectPath, options)
   }
 
-  private async fetchJson(url: string, init?: RequestInit, requestTimeoutMs?: number): Promise<FetchJsonResult> {
+  private async fetchJson(url: string, init?: RequestInit, requestTimeoutMs?: number,
+    context?: OpenCodeClientRequestContext): Promise<FetchJsonResult> {
     if (this.custody) {
       const base = this.custody.expected.endpoint.baseUrl
-      const client = this.supervisedClientFactory!.create(base, { signal: init?.signal ?? undefined, requestTimeoutMs })
+      const client = this.supervisedClientFactory!.create(base, {
+        ...context, signal: context?.signal ?? init?.signal ?? undefined, requestTimeoutMs,
+      })
       const reads: Record<string, () => Promise<unknown>> = {
         [`${base}/global/health`]: () => client.getHealth!(),
         [`${base}/config`]: () => client.getConfig(),
@@ -562,10 +571,11 @@ export class OpenCodeHostManager {
     url: string,
     timeoutMs: number,
     init?: RequestInit,
+    context?: OpenCodeClientRequestContext,
   ): Promise<FetchJsonResult> {
     // The supervised transport separately bounds proof preparation and response
     // time. An outer desktop timer would expire while synchronous hashing runs.
-    if (this.custody) return this.fetchJson(url, init, timeoutMs)
+    if (this.custody) return this.fetchJson(url, init, timeoutMs, context)
     const controller = new AbortController()
     const timeout = setTimeout(() => {
       controller.abort()
@@ -1228,11 +1238,12 @@ export class OpenCodeHostManager {
     })
   }
 
-  private async checkHealthyHostOnce(baseUrl: string): Promise<{ version: string | null } | null> {
+  private async checkHealthyHostOnce(baseUrl: string, context?: OpenCodeClientRequestContext): Promise<{ version: string | null } | null> {
     try {
       const result = await this.fetchJsonWithTimeout(
         `${baseUrl}/global/health`,
         OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+        undefined, context,
       )
       const data = result.data as { healthy?: boolean; version?: string }
       if (result.status === 200 && data?.healthy === true) {
@@ -1408,11 +1419,11 @@ export class OpenCodeHostManager {
     throw new Error(`OpenCode host did not become healthy within ${healthTimeoutMs}ms`)
   }
 
-  private async getResolvedConfigFingerprint(baseUrl: string): Promise<string | null> {
+  private async getResolvedConfigFingerprint(baseUrl: string, context?: OpenCodeClientRequestContext): Promise<string | null> {
     try {
       const paths = ['/config', '/config/providers', '/agent', '/mcp']
       const read = (pathname: string) => this.fetchJsonWithTimeout(
-        baseUrl + pathname, OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS)
+        baseUrl + pathname, OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS, undefined, context)
       const results: FetchJsonResult[] = []
       if (this.custody) {
         // Each proof hashes the actual executable at preparation and consumption.
@@ -1726,12 +1737,29 @@ export class OpenCodeHostManager {
   ): Promise<OpenCodeHostHandle> {
     // This branch precedes ALL desktop profile, binary, plugin, port and registry work.
     if (this.custody) {
+      if (params.abortSignal?.aborted) throwOpenCodeAbortReason(params.abortSignal)
       params = { ...params, lease: params.lease ? Object.freeze({ ...params.lease }) : undefined,
         profileOptions: params.profileOptions ? { ...params.profileOptions } : undefined,
         preparedProfile: params.preparedProfile ? structuredClone(params.preparedProfile) : undefined }
-      const pending = this.#supervisedTail.then(() => this.adoptSupervisedHost(params))
-      this.#supervisedTail = pending.catch(() => undefined)
-      return pending
+      const deadline = new OpenCodeRuntimeDeadline(normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs))
+      const abort = () => deadline.abort(params.abortSignal?.reason)
+      params.abortSignal?.addEventListener('abort', abort, { once: true })
+      if (params.abortSignal?.aborted) abort()
+      const release = this.custody.retainOwnerResource(() => deadline.abort(new Error('OpenCode supervised custody lost')))
+      const previous = this.#supervisedTail
+      const pending = deadline.runPhase('host_start', async context => {
+        await raceOpenCodeAbortSignal(previous, context.signal)
+        context.throwIfExpired()
+        return context
+      }).then(context => this.adoptSupervisedHost(params, context))
+      // Serialize live acquisitions, not an abandoned authority provider's
+      // unresolved promise. Queued callers have their own abort/deadline race.
+      this.#supervisedTail = previous.then(() => pending).catch(() => undefined)
+      try { return await pending } finally {
+        deadline.dispose()
+        params.abortSignal?.removeEventListener('abort', abort)
+        release()
+      }
     }
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
@@ -1862,65 +1890,99 @@ export class OpenCodeHostManager {
     projectPath?: string | null; hostKey?: string | null
     preparedProfile?: OpenCodePreparedProfile; profileOptions?: OpenCodePrepareProfileOptions
     abortSignal?: AbortSignal; lease?: OpenCodeHostLeaseInput
-  }): Promise<OpenCodeHostHandle> {
+  }, context: OpenCodePhaseContext): Promise<OpenCodeHostHandle> {
     const custody = this.custody!
     assertTrustedOpenCodeCustody(custody)
     const e = custody.expected
-    if (params.abortSignal?.aborted) throwOpenCodeAbortReason(params.abortSignal)
-    if ((params.projectPath != null && params.projectPath !== e.profile.projectPath) ||
-      (params.hostKey != null && params.hostKey !== custody.hostKey) || !params.lease ||
-      (params.profileOptions?.toolApprovalMode && params.profileOptions.toolApprovalMode !== 'manual') ||
-      Object.keys(params.profileOptions ?? {}).some(key => !['toolApprovalMode', 'abortSignal'].includes(key))) {
-      throw new Error('OpenCode supervised project, profile or lease mismatch')
+    context.throwIfExpired()
+    const unconsumed = new Set<OneUseFence>()
+    let finished = false
+    const wait = async <T>(operation: () => Promise<T>): Promise<T> => {
+      context.throwIfExpired()
+      const pending = operation()
+      // A provider can synchronously abort while returning its promise. The
+      // abort helper then exits before observing it; still handle late failure.
+      void pending.catch(() => undefined)
+      const result = await raceOpenCodeAbortSignal(pending, context.signal)
+      context.throwIfExpired()
+      return result
     }
-    const leaseKey = buildLeaseKey(params.lease)
-    const initialLease = await custody.prepareLeaseToken(params.lease)
-    if (!initialLease?.consume()) throw new Error('OpenCode supervised session admission unavailable')
-    const profile = await custody.readPreparedProfile()
-    if (params.preparedProfile && ['projectPath', 'profileRootKey', 'profileRootPath',
-      'projectBehaviorFingerprint', 'managedConfigFingerprint', 'managedAuthFingerprint',
-      'sourceAuthFingerprint', 'sourceAuthSources'].some(key =>
-        JSON.stringify(params.preparedProfile![key as keyof OpenCodePreparedProfile]) !==
-        JSON.stringify(profile[key as keyof OpenCodePreparedProfile]))) {
-      throw new Error('OpenCode supervised prepared profile substitution')
+    const prepare = (operation: () => Promise<OneUseFence | null>) => wait(() =>
+      operation().then(token => {
+        if (token) {
+          if (finished || context.signal.aborted || context.remainingMs() <= 0) {
+            try { token.consume() } catch {}
+            return null
+          }
+          unconsumed.add(token)
+        }
+        return token
+      }))
+    const consume = (token: OneUseFence | null) => {
+      if (!token) return false
+      unconsumed.delete(token)
+      return token.consume()
     }
-    if (!(await custody.assertCurrent())) throw new Error('OpenCode supervised custody lost')
-    const health = await this.checkHealthyHostOnce(e.endpoint.baseUrl)
-    const fingerprint = await this.getResolvedConfigFingerprint(e.endpoint.baseUrl)
-    if (!health || fingerprint !== e.profile.resolvedConfigFingerprint) {
-      throw new Error('OpenCode supervised health or resolved config mismatch')
+    try {
+      if ((params.projectPath != null && params.projectPath !== e.profile.projectPath) ||
+        (params.hostKey != null && params.hostKey !== custody.hostKey) || !params.lease ||
+        (params.profileOptions?.toolApprovalMode && params.profileOptions.toolApprovalMode !== 'manual') ||
+        Object.keys(params.profileOptions ?? {}).some(key => !['toolApprovalMode', 'abortSignal'].includes(key))) {
+        throw new Error('OpenCode supervised project, profile or lease mismatch')
+      }
+      const leaseKey = buildLeaseKey(params.lease)
+      const initialLease = await prepare(() => custody.prepareLeaseToken(params.lease!))
+      if (!consume(initialLease)) throw new Error('OpenCode supervised session admission unavailable')
+      const profile = await wait(() => custody.readPreparedProfile())
+      if (params.preparedProfile && ['projectPath', 'profileRootKey', 'profileRootPath',
+        'projectBehaviorFingerprint', 'managedConfigFingerprint', 'managedAuthFingerprint',
+        'sourceAuthFingerprint', 'sourceAuthSources'].some(key =>
+          JSON.stringify(params.preparedProfile![key as keyof OpenCodePreparedProfile]) !==
+          JSON.stringify(profile[key as keyof OpenCodePreparedProfile]))) {
+        throw new Error('OpenCode supervised prepared profile substitution')
+      }
+      if (!consume(await prepare(() => custody.prepareEffectToken()))) throw new Error('OpenCode supervised custody lost')
+      const health = await wait(() => this.checkHealthyHostOnce(e.endpoint.baseUrl, context))
+      const fingerprint = await wait(() => this.getResolvedConfigFingerprint(e.endpoint.baseUrl, context))
+      if (!health || fingerprint !== e.profile.resolvedConfigFingerprint) {
+        throw new Error('OpenCode supervised health or resolved config mismatch')
+      }
+      await wait(() => this.supervisedClientFactory!.create(e.endpoint.baseUrl, context).getHostedApprovalCapability!())
+      const lease = await prepare(() => custody.prepareLeaseToken(params.lease!))
+      const fence = await prepare(() => custody.prepareEffectToken())
+      let valid = true
+      try { valid = consume(lease) && valid } catch { valid = false }
+      try { valid = consume(fence) && valid } catch { valid = false }
+      context.throwIfExpired()
+      if (!valid) throw new Error('OpenCode supervised admission lost before publication')
+      // No await between exact first lease and handle publication; acquisitions are serialized.
+      const existing = this.#hosts.get(custody.hostKey)
+      if (existing) {
+        if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
+        existing.supervisor.leases.add(leaseKey)
+        existing.refCount += 1
+        return existing.handle
+      }
+      const handle: OpenCodeHostHandle = {
+        custody: 'supervisor', hostKey: custody.hostKey, profileRootKey: profile.profileRootKey,
+        projectPath: profile.projectPath, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+        openCodeArtifactDigest: `sha256:${e.executable.sha256}`, baseUrl: e.endpoint.baseUrl,
+        port: e.endpoint.port, pid: e.process.pid, processStartedAtMs: Number(e.process.startTicks),
+        version: health.version, state: 'healthy', profile, resolvedConfigFingerprint: fingerprint, diagnostics: [],
+      }
+      Object.freeze(handle.diagnostics)
+      for (const key of Object.keys(handle)) {
+        if (key !== 'state') Object.defineProperty(handle, key, { writable: false, configurable: false })
+      }
+      Object.seal(handle)
+      this.#hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
+        lifetime: 'process', supervisor: { custody, leases: new Set([leaseKey]) } })
+      return handle
+    } finally {
+      finished = true
+      for (const token of unconsumed) { try { token.consume() } catch {} }
+      unconsumed.clear()
     }
-    await this.supervisedClientFactory!.create(e.endpoint.baseUrl).getHostedApprovalCapability!()
-    const lease = await custody.prepareLeaseToken(params.lease)
-    let fence: Awaited<ReturnType<TrustedOpenCodeCustody['prepareEffectToken']>>
-    try { fence = await custody.prepareEffectToken() } catch (error) { lease?.consume(); throw error }
-    let valid = !params.abortSignal?.aborted
-    try { valid = (lease?.consume() ?? false) && valid } catch { valid = false }
-    try { valid = (fence?.consume() ?? false) && valid } catch { valid = false }
-    if (!valid) throw new Error('OpenCode supervised admission lost before publication')
-    // No await between exact first lease and handle publication; acquisitions are serialized.
-    const existing = this.#hosts.get(custody.hostKey)
-    if (existing) {
-      if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
-      existing.supervisor.leases.add(leaseKey)
-      existing.refCount += 1
-      return existing.handle
-    }
-    const handle: OpenCodeHostHandle = {
-      custody: 'supervisor', hostKey: custody.hostKey, profileRootKey: profile.profileRootKey,
-      projectPath: profile.projectPath, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
-      openCodeArtifactDigest: `sha256:${e.executable.sha256}`, baseUrl: e.endpoint.baseUrl,
-      port: e.endpoint.port, pid: e.process.pid, processStartedAtMs: Number(e.process.startTicks),
-      version: health.version, state: 'healthy', profile, resolvedConfigFingerprint: fingerprint, diagnostics: [],
-    }
-    Object.freeze(handle.diagnostics)
-    for (const key of Object.keys(handle)) {
-      if (key !== 'state') Object.defineProperty(handle, key, { writable: false, configurable: false })
-    }
-    Object.seal(handle)
-    this.#hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
-      lifetime: 'process', supervisor: { custody, leases: new Set([leaseKey]) } })
-    return handle
   }
 
   getHost(hostKey: string): OpenCodeHostHandle | null {
