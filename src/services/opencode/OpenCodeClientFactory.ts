@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { request as httpRequest } from 'node:http'
+import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { connect as connectTcp } from 'node:net'
 import { Readable } from 'node:stream'
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
@@ -129,6 +129,8 @@ export type OpenCodeClient = {
 export type OpenCodeClientRequestContext = {
   signal?: AbortSignal
   remainingMs?: () => number
+  /** Optional shorter response deadline; supervised identity preparation has its own bound. */
+  requestTimeoutMs?: number
 }
 
 type OpenCodeClientFactoryDeps = {
@@ -165,6 +167,9 @@ class OpenCodeHttpResponseError extends Error {
     )
   }
 }
+
+// Only the native conditional-reply contract's complete, empty 409/412 qualifies.
+class OpenCodeValidatedConditionRejection extends OpenCodeHttpResponseError {}
 
 const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v2' as const
 const MAX_HOSTED_APPROVAL_RESPONSE_BYTES = 16 * 1024
@@ -393,7 +398,9 @@ async function readBoundedUtf8Response(
     offset += chunk.byteLength
   }
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    // Preserve a BOM as data: three wire bytes must never validate as an empty
+    // native rejection, nor disappear from a canonical JSON comparison.
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
     throw new Error('OpenCode hosted approval response was not valid UTF-8')
   }
@@ -465,18 +472,26 @@ async function parseStrictHostedApprovalResponse<T>(
   response: Response,
   maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
   supervised = false,
+  conditionalReply = false,
 ): Promise<T> {
   let text = ''
   try {
     text = await readBoundedUtf8Response(response, maximumBytes)
   } catch (error) {
-    if (!response.ok && !supervised) {
+    if (!response.ok && !supervised && !conditionalReply) {
       throw new OpenCodeHttpResponseError(response.status, response.statusText, '')
     }
     throw error
   }
+  if (conditionalReply && (response.status === 409 || response.status === 412)) {
+    const encoding = response.headers.get('content-encoding')
+    if (text === '' && (encoding === null || encoding === 'identity')) {
+      throw new OpenCodeValidatedConditionRejection(response.status, response.statusText, '')
+    }
+    throw new Error('OpenCode conditional rejection did not match the native empty-body contract')
+  }
   if (supervised) {
-    // Status alone, especially an empty 409/412, is not validated failure evidence.
+    // Canonical JSON validates syntax, never absence of a permission effect.
     rejectDuplicateJsonKeys(text)
     const decoded = JSON.parse(text)
     if (!decoded || typeof decoded !== 'object' || canonicalHostedApprovalJson(decoded) !== text) {
@@ -493,6 +508,19 @@ async function parseStrictHostedApprovalResponse<T>(
   return JSON.parse(text) as T
 }
 
+type SupervisedNativeResponse = {
+  native: IncomingMessage; status: number; statusText: string; headers: Headers
+}
+
+function awaitRequestAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error('OpenCode request aborted'))
+    signal.addEventListener('abort', aborted, { once: true })
+    if (signal.aborted) aborted()
+    void pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted))
+  })
+}
+
 async function fetchHostedApprovalOverAuthorizedConnection(
   urlValue: string,
   init: RequestInit,
@@ -500,9 +528,9 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   authorizeConnected: (
     connection: OpenCodeConnectedSocketIdentity,
   ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>,
-  dispatch?: { endAttempted: boolean; body: Buffer },
+  dispatch?: { endAttempted: boolean; body: Buffer; captured: boolean },
   custody?: TrustedOpenCodeCustody,
-): Promise<Response> {
+): Promise<Response | SupervisedNativeResponse> {
   const url = new URL(urlValue)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
     throw new Error('OpenCode hosted approval endpoint was not private loopback HTTP')
@@ -513,7 +541,9 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   }
   const socket = connectTcp({ host: '127.0.0.1', port })
   // Keep an error listener while asynchronous peer/custody proof is pending.
-  socket.on('error', () => undefined)
+  socket.on('error', () => {
+    if (dispatch?.captured) custody?.rawRetention.poison('socket_failed')
+  })
   const releaseSocket = custody?.retainOwnerResource(() => { socket.destroy() })
   socket.once('close', () => releaseSocket?.())
   const abortSocket = () => socket.destroy(signal.reason instanceof Error
@@ -542,7 +572,7 @@ async function fetchHostedApprovalOverAuthorizedConnection(
       remoteAddress: socket.remoteAddress ?? '',
       remotePort: socket.remotePort ?? 0,
     }
-    const finalizeConnected = await authorizeConnected(connection)
+    const finalizeConnected = await awaitRequestAbort(authorizeConnected(connection), signal)
     if (!finalizeConnected) {
       throw new OpenCodePermissionConditionRejectedError(
         new Error('OpenCode hosted approval connected endpoint was not authorized'),
@@ -555,7 +585,7 @@ async function fetchHostedApprovalOverAuthorizedConnection(
     const headers = new Headers(init.headers)
     headers.set('connection', 'close')
     if (body !== undefined) headers.set('content-length', String(Buffer.byteLength(body, 'utf8')))
-    return await new Promise<Response>((resolve, reject) => {
+    return await new Promise<Response | SupervisedNativeResponse>((resolve, reject) => {
       const request = httpRequest({
         protocol: 'http:', hostname: '127.0.0.1', port,
         path: `${url.pathname}${url.search}`, method: init.method ?? 'GET',
@@ -569,13 +599,28 @@ async function fetchHostedApprovalOverAuthorizedConnection(
         }
         try {
           const status = response.statusCode ?? 500
+          if (custody) {
+            if (dispatch?.captured) {
+              const encoding = responseHeaders.get('content-encoding')
+              if (encoding !== null && encoding !== 'identity') custody.rawRetention.poison('unexpected_encoding')
+              response.once('aborted', () => custody.rawRetention.poison('incomplete_body'))
+              response.once('error', () => custody.rawRetention.poison('incomplete_body'))
+            }
+            // Response forbids a 205 body. Preserve the native stream and HTTP
+            // parser's completion evidence before applying that normalization.
+            resolve({ native: response, status, statusText: response.statusMessage ?? '', headers: responseHeaders })
+            return
+          }
           resolve(new Response([204, 205, 304].includes(status) ? null :
             Readable.toWeb(response) as ReadableStream, {
             status, statusText: response.statusMessage, headers: responseHeaders,
           }))
         } catch (error) { response.destroy(); reject(error) }
       })
-      request.once('error', reject)
+      request.once('error', error => {
+        if (dispatch?.captured) custody?.rawRetention.poison('request_failed')
+        reject(error)
+      })
       let finalized = false
       try {
         finalized = finalizeConnected()
@@ -609,13 +654,16 @@ async function fetchHostedApprovalOverAuthorizedConnection(
  * The node HTTP transport does no decompression. No header carrying secrets is retained.
  */
 async function retainSupervisedResponse(
-  response: Response, custody: TrustedOpenCodeCustody, retained: RetainedRequest,
+  response: SupervisedNativeResponse, custody: TrustedOpenCodeCustody, retained: RetainedRequest | null,
   maximumBytes: number,
 ): Promise<Response> {
   const chunks: Buffer[] = []
   let size = 0
   let complete = false
-  const reader = response.body?.getReader()
+  const encoding = response.headers.get('content-encoding')
+  const encoded = encoding !== null && encoding !== 'identity'
+  if (retained && encoded) custody.rawRetention.poison('unexpected_encoding')
+  const reader = (Readable.toWeb(response.native) as ReadableStream<Uint8Array>).getReader()
   try {
     if (reader) while (true) {
       const next = await reader.read()
@@ -624,25 +672,28 @@ async function retainSupervisedResponse(
       chunks.push(Buffer.from(next.value.subarray(0, remaining)))
       size += Math.min(remaining, next.value.length)
       if (next.value.length > remaining) {
+        if (retained) custody.rawRetention.poison('response_limit')
         await reader.cancel().catch(() => undefined)
         throw new Error('OpenCode raw response limit')
       }
     }
-    complete = true
+    complete = response.native.complete && response.native.readableEnded
   } catch {
-    // Retain the bounded prefix before recording and poisoning the exchange.
+    if (retained) custody.rawRetention.poison('incomplete_body')
   } finally { reader?.releaseLock() }
   const bytes = Buffer.concat(chunks, size)
-  const encoding = response.headers.get('content-encoding')
-  await custody.rawRetention.retainResponse(retained, {
+  if (!complete && retained) custody.rawRetention.poison('incomplete_body')
+  if (retained) await custody.rawRetention.retainResponse(retained, {
     status: response.status, contentEncoding: encoding,
     peerOperationNonce: null, bytes, complete,
   })
-  if (!complete || (encoding !== null && encoding !== 'identity')) {
-    await custody.rawRetention.recordFailure(retained, {
-      phase: 'response-incomplete', code: complete ? 'unexpected_encoding' : 'incomplete_body',
-    }).catch(() => undefined)
-    custody.rawRetention.poison('response_unusable')
+  if (!complete || encoded) {
+    if (retained) {
+      custody.rawRetention.poison('response_unusable')
+      void custody.rawRetention.recordFailure(retained, {
+        phase: 'response-incomplete', code: complete ? 'unexpected_encoding' : 'incomplete_body',
+      }).catch(() => undefined)
+    }
     throw new Error('OpenCode supervised response incomplete or encoded')
   }
   return new Response([204, 205, 304].includes(response.status) ? null : bytes, {
@@ -653,6 +704,9 @@ async function retainSupervisedResponse(
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
+// Real executable hashing and connected-peer proof precede the HTTP exchange.
+// Bound that work separately so it cannot consume an endpoint's response budget.
+const SUPERVISED_PREPARATION_TIMEOUT_MS = 5_000
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
 const PROVIDER_OAUTH_AUTHORIZE_TIMEOUT_MS = 30_000
 // GitHub device authorization codes can remain valid for up to 15 minutes.
@@ -702,15 +756,27 @@ function resolveAbortReason(signal: AbortSignal, fallback: Error): unknown {
   return signal.reason === undefined ? fallback : signal.reason
 }
 
+const custodyFactories = new WeakMap<object, TrustedOpenCodeCustody>()
+export function isOpenCodeClientFactoryBoundToCustody(value: object, custody: TrustedOpenCodeCustody): boolean {
+  return custodyFactories.get(value) === custody
+}
+
 export class OpenCodeClientFactory {
   private readonly custody?: TrustedOpenCodeCustody
-  constructor(private readonly deps: OpenCodeClientFactoryDeps = {}) {
+  private readonly deps: OpenCodeClientFactoryDeps
+  constructor(deps: OpenCodeClientFactoryDeps = {}) {
+    deps = { ...deps }
+    this.deps = Object.freeze({ ...deps })
     const policy = deps.acquisitionPolicy
     if (policy && policy.mode !== 'desktop') {
       if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
       assertTrustedOpenCodeCustody(policy.custody)
+      if (new.target !== OpenCodeClientFactory) throw new Error('OpenCode supervised factory must use the admitted implementation')
       if (deps.fetchImpl) throw new Error('OpenCode supervised transport cannot use fetch override')
       this.custody = policy.custody
+      Object.defineProperty(this, 'create', { value: OpenCodeClientFactory.prototype.create.bind(this) })
+      custodyFactories.set(this, policy.custody)
+      Object.freeze(this)
     }
   }
 
@@ -721,6 +787,7 @@ export class OpenCodeClientFactory {
     context: OpenCodeClientRequestContext = {},
     hostedApprovalAuth?: OpenCodeHostedApprovalAuth,
   ): OpenCodeClient {
+    context = { ...context, remainingMs: context.remainingMs?.bind(context) }
     const custody = this.custody
     if (custody && baseUrl !== custody.expected.endpoint.baseUrl) {
       throw new Error('OpenCode supervised origin mismatch')
@@ -747,12 +814,20 @@ export class OpenCodeClientFactory {
     ): Promise<T> => {
       // Freeze the wire body before retention or any other asynchronous boundary.
       const dispatch = custody ? { endAttempted: false,
-        body: Buffer.from(typeof init?.body === 'string' ? init.body : '') } : undefined
+        body: Buffer.from(typeof init?.body === 'string' ? init.body : ''), captured: !!operation } : undefined
       let retained: RetainedRequest | null = null
       let operationToken: OneUseFence | null = null
       let custodyToken: OneUseFence | null = null
       let tokensConsumed = false
-      const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
+      const requestedTimeout = context.requestTimeoutMs
+      const responseTimeout = requestedTimeout === undefined ? endpointTimeoutMs :
+        Math.max(0, Math.min(endpointTimeoutMs, Number.isFinite(requestedTimeout) ? requestedTimeout : 0))
+      const totalBudget = resolveRequestTimeoutMs(Number.POSITIVE_INFINITY, context)
+      const totalDeadline = performance.now() + totalBudget
+      // Never invoke caller callbacks after consuming the final fences. Carry
+      // the original total deadline through both supervised phases instead.
+      const remainingBudget = (limit: number) => Math.max(0, Math.min(limit, totalDeadline - performance.now()))
+      const timeoutMs = Math.floor(Math.min(responseTimeout, totalBudget))
       const timeoutError = new Error(
         `OpenCode request timed out after ${timeoutMs}ms for ${path}`,
       )
@@ -761,15 +836,31 @@ export class OpenCodeClientFactory {
       }
 
       const controller = new AbortController()
+      if (custody && operation) controller.signal.addEventListener('abort', () => {
+        custody.rawRetention.poison('exchange_aborted')
+      }, { once: true })
       const abortFromContext = () => {
         if (!controller.signal.aborted && context.signal) {
           controller.abort(resolveAbortReason(context.signal, timeoutError))
         }
       }
       context.signal?.addEventListener('abort', abortFromContext, { once: true })
-      const timeout = setTimeout(() => {
-        controller.abort(timeoutError)
-      }, timeoutMs)
+      let deadline = 0
+      let timeout: ReturnType<typeof setTimeout>
+      const armDeadline = (ms: number) => {
+        clearTimeout(timeout)
+        deadline = performance.now() + ms
+        timeout = setTimeout(() => controller.abort(timeoutError), ms)
+      }
+      const deadlineCurrent = () => {
+        if (performance.now() >= deadline) controller.abort(timeoutError)
+        return !controller.signal.aborted
+      }
+      armDeadline(custody ? remainingBudget(SUPERVISED_PREPARATION_TIMEOUT_MS) : timeoutMs)
+      const captureToken = (pending: Promise<OneUseFence | null>) => awaitRequestAbort(pending.then(token => {
+        if (controller.signal.aborted) { token?.consume(); return null }
+        return token
+      }), controller.signal)
 
       try {
         let requestInit: RequestInit = {
@@ -788,16 +879,16 @@ export class OpenCodeClientFactory {
             (url.searchParams.has('directory') && url.searchParams.get('directory') !== custody.expected.profile.projectPath) ||
             url.searchParams.has('workspace')) throw new Error('OpenCode supervised directory substitution')
           if (operation) {
-            operationToken = await custody.prepareOperationToken(operation)
+            operationToken = await captureToken(custody.prepareOperationToken(operation))
             if (!operationToken) throw new Error('OpenCode admitted HTTP operation unavailable')
-            retained = await custody.rawRetention.retainRequest(custody.rawRetention.bindOperation(operation), {
+            retained = await awaitRequestAbort(custody.rawRetention.retainRequest(custody.rawRetention.bindOperation(operation), {
               method: init?.method === 'POST' ? 'POST' : 'GET', path, bytes: dispatch!.body,
-            })
+            }), controller.signal)
           }
           requestInit = custody.authenticatedRequest(baseUrl + path, requestInit)
         }
         const connectedAuthorization = custody ? async (connection: OpenCodeConnectedSocketIdentity) => {
-          custodyToken = await custody.authorizeConnected(connection)
+          custodyToken = await captureToken(custody.authorizeConnected(connection))
           if (!custodyToken) return null
           const final = authorizeConnected ? await authorizeConnected(connection) : () => true
           if (!final) return null
@@ -807,16 +898,18 @@ export class OpenCodeClientFactory {
             used = true
             tokensConsumed = true
             // Consume every acquired fence even on failure; none may leak pinned fds.
-            let valid = custody.rawRetention.isCurrent() && !controller.signal.aborted
+            let valid = custody.rawRetention.isCurrent() && deadlineCurrent()
             try { if (operationToken) valid = operationToken.consume() && valid } catch { valid = false }
             try { valid = final() && valid } catch { valid = false }
             try { valid = custodyToken!.consume() && valid } catch { valid = false }
-            return valid && custody.rawRetention.isCurrent() && !controller.signal.aborted
+            valid = valid && custody.rawRetention.isCurrent() && deadlineCurrent()
+            if (valid) armDeadline(remainingBudget(responseTimeout))
+            return valid && deadlineCurrent()
           }
         } : authorizeConnected
-        let response = connectedAuthorization && !this.deps.fetchImpl
+        const transported = custody || (connectedAuthorization && !this.deps.fetchImpl)
           ? await fetchHostedApprovalOverAuthorizedConnection(
-              baseUrl + path, requestInit, controller.signal, connectedAuthorization, dispatch, custody,
+              baseUrl + path, requestInit, controller.signal, connectedAuthorization!, dispatch, custody,
             )
           : await (async () => {
               if (authorizeConnected) {
@@ -826,7 +919,11 @@ export class OpenCodeClientFactory {
               }
               return await fetchImpl(baseUrl + path, requestInit)
             })()
-        if (custody && retained) response = await retainSupervisedResponse(response, custody, retained, maximumResponseBytes)
+        const response = 'native' in transported
+          ? await awaitRequestAbort(retainSupervisedResponse(transported, custody!, retained,
+              retained ? maximumResponseBytes : MAX_HOSTED_APPROVAL_OBSERVATION_BYTES), controller.signal)
+          : transported
+        if (custody && !deadlineCurrent()) throw timeoutError
         if (custody && response.status >= 300 && response.status < 400) {
           throw new Error('OpenCode supervised redirect rejected')
         }
@@ -836,15 +933,14 @@ export class OpenCodeClientFactory {
           throw new Error('OpenCode supervised read did not return a complete successful observation')
         }
         return strictHostedApprovalResponse
-          ? await parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes, !!custody)
+          ? await parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes, !!custody, operation?.kind === 'reply')
           : await parseResponse<T>(response, !!custody)
       } catch (error) {
-        if (custody && operation && !(error instanceof OpenCodeHttpResponseError &&
-          (error.status === 409 || error.status === 412))) {
-          await custody.rawRetention.recordFailure(retained, {
+        if (custody && operation && !(error instanceof OpenCodeValidatedConditionRejection)) {
+          custody.rawRetention.poison('exchange_failed')
+          void custody.rawRetention.recordFailure(retained, {
             phase: dispatch?.endAttempted ? 'end-attempted' : 'before-end', code: 'exchange_failed',
           }).catch(() => undefined)
-          custody.rawRetention.poison('exchange_failed')
         }
         if (custody && !dispatch?.endAttempted) throw new OpenCodeRequestNotDispatchedError()
         if (context.signal?.aborted) {
@@ -1007,6 +1103,7 @@ export class OpenCodeClientFactory {
           }),
         ),
       answerPermission: async body => {
+        body = { ...body, condition: body.condition ? { ...body.condition } : undefined }
         if (custody && !body.condition) throw new Error('OpenCode supervised conditional reply required')
         const reply = body.decision === 'allow' ? 'once' : body.decision
         const payload = {
@@ -1050,7 +1147,7 @@ export class OpenCodeClientFactory {
         }
         try {
           if (!body.sessionId) throw new Error('OpenCode hosted approval session id missing')
-          if (!body.condition.authorizeConnected && !this.deps.fetchImpl) {
+          if (!body.condition.authorizeConnected && (custody || !this.deps.fetchImpl)) {
             throw new OpenCodePermissionConditionRejectedError(
               new Error('OpenCode hosted approval connected endpoint proof was unavailable'),
             )
@@ -1105,8 +1202,7 @@ export class OpenCodeClientFactory {
             decision,
           }))
         } catch (error) {
-          if (error instanceof OpenCodeHttpResponseError &&
-            (error.status === 409 || error.status === 412)) {
+          if (error instanceof OpenCodeValidatedConditionRejection) {
             throw new OpenCodePermissionConditionRejectedError(error)
           }
           throw error

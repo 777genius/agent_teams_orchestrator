@@ -478,8 +478,13 @@ function normalizePersistentHostLeases(value: unknown): Record<string, Persisten
   return leases
 }
 
+const custodyManagers = new WeakMap<object, TrustedOpenCodeCustody>()
+export function isOpenCodeHostManagerBoundToCustody(value: object, custody: TrustedOpenCodeCustody): boolean {
+  return custodyManagers.get(value) === custody
+}
+
 export class OpenCodeHostManager {
-  private readonly hosts = new Map<string, ManagedHostEntry>()
+  readonly #hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
@@ -487,15 +492,30 @@ export class OpenCodeHostManager {
 
   private readonly custody?: TrustedOpenCodeCustody
   private readonly supervisedClientFactory?: OpenCodeClientFactory
-  private supervisedTail: Promise<unknown> = Promise.resolve()
+  #supervisedTail: Promise<unknown> = Promise.resolve()
+  private readonly deps: OpenCodeHostManagerDeps
 
-  constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {
+  constructor(deps: OpenCodeHostManagerDeps = {}) {
+    deps = { ...deps }
+    this.deps = Object.freeze({ ...deps })
     const policy = deps.acquisitionPolicy
     if (policy && policy.mode !== 'desktop') {
       if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
       assertTrustedOpenCodeCustody(policy.custody)
+      if (new.target !== OpenCodeHostManager) throw new Error('OpenCode supervised manager must use the admitted implementation')
       this.custody = policy.custody
       this.supervisedClientFactory = new OpenCodeClientFactory({ acquisitionPolicy: policy })
+      // Supervised consumers retain these exact operations. Neither subclasses
+      // nor later instance/prototype assignments can replace a validated fence.
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeHostManager.prototype))) {
+        if (name !== 'constructor' && typeof descriptor.value === 'function') {
+          Object.defineProperty(this, name, { value: descriptor.value.bind(this) })
+        } else if (descriptor.get) {
+          Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
+        }
+      }
+      custodyManagers.set(this, policy.custody)
+      Object.freeze(this)
     }
   }
 
@@ -520,10 +540,10 @@ export class OpenCodeHostManager {
     return prepareProfile(projectPath, options)
   }
 
-  private async fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
+  private async fetchJson(url: string, init?: RequestInit, requestTimeoutMs?: number): Promise<FetchJsonResult> {
     if (this.custody) {
       const base = this.custody.expected.endpoint.baseUrl
-      const client = this.supervisedClientFactory!.create(base, { signal: init?.signal ?? undefined })
+      const client = this.supervisedClientFactory!.create(base, { signal: init?.signal ?? undefined, requestTimeoutMs })
       const reads: Record<string, () => Promise<unknown>> = {
         [`${base}/global/health`]: () => client.getHealth!(),
         [`${base}/config`]: () => client.getConfig(),
@@ -543,6 +563,9 @@ export class OpenCodeHostManager {
     timeoutMs: number,
     init?: RequestInit,
   ): Promise<FetchJsonResult> {
+    // The supervised transport separately bounds proof preparation and response
+    // time. An outer desktop timer would expire while synchronous hashing runs.
+    if (this.custody) return this.fetchJson(url, init, timeoutMs)
     const controller = new AbortController()
     const timeout = setTimeout(() => {
       controller.abort()
@@ -769,7 +792,7 @@ export class OpenCodeHostManager {
   }
 
   private hasTrackedAliveHostUsingTempPath(tempPath: string, ignoredPid?: number): boolean {
-    for (const entry of this.hosts.values()) {
+    for (const entry of this.#hosts.values()) {
       const pid = entry.handle.pid
       if (entry.handle.profile.tmpPath !== tempPath) {
         continue
@@ -1095,11 +1118,12 @@ export class OpenCodeHostManager {
   }
 
   async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    input = Object.freeze({ ...input })
     if (this.custody) {
-      const entry = this.hosts.get(hostKey)
+      const entry = this.#hosts.get(hostKey)
       const token = await this.custody.prepareLeaseToken(input)
       const valid = token?.consume() ?? false
-      if (!valid || !entry?.supervisor || this.hosts.get(hostKey) !== entry) {
+      if (!valid || !entry?.supervisor || this.#hosts.get(hostKey) !== entry) {
         throw new Error('OpenCode supervised lease unavailable')
       }
       entry.supervisor.leases.add(buildLeaseKey(input))
@@ -1109,14 +1133,14 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
-    if (this.hosts.get(hostKey)?.lifetime === 'process') return
+    if (this.#hosts.get(hostKey)?.lifetime === 'process') return
 
     await this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
       let record = registry.hosts[hostKey]
       if (!record) {
-        const entry = this.hosts.get(hostKey)
+        const entry = this.#hosts.get(hostKey)
         if (!entry) {
           throw new Error(`OpenCode host ${hostKey} is unavailable for lease publication`)
         }
@@ -1173,8 +1197,9 @@ export class OpenCodeHostManager {
   }
 
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    input = Object.freeze({ ...input })
     if (this.custody) {
-      this.hosts.get(hostKey)?.supervisor?.leases.delete(buildLeaseKey(input))
+      this.#hosts.get(hostKey)?.supervisor?.leases.delete(buildLeaseKey(input))
       return
     }
     const registryPath = this.persistentRegistryPath
@@ -1326,7 +1351,7 @@ export class OpenCodeHostManager {
         (await this.getResolvedConfigFingerprint(handle.baseUrl)) ??
         record.resolvedConfigFingerprint
     }
-    this.hosts.set(hostKey, {
+    this.#hosts.set(hostKey, {
       handle,
       child: null,
       refCount: this.pendingRefCounts.get(hostKey) ?? 1,
@@ -1339,7 +1364,7 @@ export class OpenCodeHostManager {
       }
       return handle
     } catch (error) {
-      this.hosts.delete(hostKey)
+      this.#hosts.delete(hostKey)
       if (leaseReserved && lease) {
         await this.releaseHostLease(hostKey, lease).catch(() => undefined)
       }
@@ -1385,24 +1410,17 @@ export class OpenCodeHostManager {
 
   private async getResolvedConfigFingerprint(baseUrl: string): Promise<string | null> {
     try {
-      const [config, configProviders, agents, mcp] = await Promise.all([
-        this.fetchJsonWithTimeout(
-          `${baseUrl}/config`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
-        ),
-        this.fetchJsonWithTimeout(
-          `${baseUrl}/config/providers`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
-        ),
-        this.fetchJsonWithTimeout(
-          `${baseUrl}/agent`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
-        ),
-        this.fetchJsonWithTimeout(
-          `${baseUrl}/mcp`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
-        ),
-      ])
+      const paths = ['/config', '/config/providers', '/agent', '/mcp']
+      const read = (pathname: string) => this.fetchJsonWithTimeout(
+        baseUrl + pathname, OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS)
+      const results: FetchJsonResult[] = []
+      if (this.custody) {
+        // Each proof hashes the actual executable at preparation and consumption.
+        // Serialize these four probes; do not share cached authority or start four
+        // response timers competing with the same synchronous proof work.
+        for (const pathname of paths) results.push(await read(pathname))
+      } else results.push(...await Promise.all(paths.map(read)))
+      const [config, configProviders, agents, mcp] = results as [FetchJsonResult, FetchJsonResult, FetchJsonResult, FetchJsonResult]
 
       if (this.custody && (
         !config.data || typeof config.data !== 'object' || Array.isArray(config.data) ||
@@ -1472,7 +1490,7 @@ export class OpenCodeHostManager {
     })
 
     entry.child.once('exit', (code, signal) => {
-      if (this.hosts.get(hostKey) !== entry) {
+      if (this.#hosts.get(hostKey) !== entry) {
         return
       }
 
@@ -1483,7 +1501,7 @@ export class OpenCodeHostManager {
         )
       }
 
-      this.hosts.delete(hostKey)
+      this.#hosts.delete(hostKey)
       this.pendingHosts.delete(hostKey)
       void this.removePersistentHost(hostKey).catch(() => undefined)
       void this.cleanupOpenTuiTempArtifactsIfUnused(
@@ -1588,7 +1606,7 @@ export class OpenCodeHostManager {
           ownedByProcess: true,
           lifetime,
         }
-        this.hosts.set(hostKey, recoveryEntry)
+        this.#hosts.set(hostKey, recoveryEntry)
         this.bindHostLifecycle(hostKey, recoveryEntry)
       }
       throw new Error(
@@ -1634,7 +1652,7 @@ export class OpenCodeHostManager {
       ownedByProcess: true,
       lifetime,
     }
-    this.hosts.set(hostKey, entry)
+    this.#hosts.set(hostKey, entry)
     this.bindHostLifecycle(hostKey, entry)
     if (shouldUnrefOpenCodeHostProcess(lifetime)) {
       unrefChildProcessHandle(child)
@@ -1677,7 +1695,7 @@ export class OpenCodeHostManager {
         (await this.captureProcessStartTimeMs(handle.pid).catch(() => null))
       const terminated = await this.forceKillSpawnedHostProcess(child, expectedStartedAtMs)
       if (terminated) {
-        this.hosts.delete(hostKey)
+        this.#hosts.delete(hostKey)
         await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
       } else {
         diagnostics.push(
@@ -1708,8 +1726,11 @@ export class OpenCodeHostManager {
   ): Promise<OpenCodeHostHandle> {
     // This branch precedes ALL desktop profile, binary, plugin, port and registry work.
     if (this.custody) {
-      const pending = this.supervisedTail.then(() => this.adoptSupervisedHost(params))
-      this.supervisedTail = pending.catch(() => undefined)
+      params = { ...params, lease: params.lease ? Object.freeze({ ...params.lease }) : undefined,
+        profileOptions: params.profileOptions ? { ...params.profileOptions } : undefined,
+        preparedProfile: params.preparedProfile ? structuredClone(params.preparedProfile) : undefined }
+      const pending = this.#supervisedTail.then(() => this.adoptSupervisedHost(params))
+      this.#supervisedTail = pending.catch(() => undefined)
       return pending
     }
     if (params.abortSignal?.aborted) {
@@ -1756,13 +1777,13 @@ export class OpenCodeHostManager {
     })()
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
-    const existing = this.hosts.get(hostKey)
+    const existing = this.#hosts.get(hostKey)
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
       if (params.lease) {
         try {
           await this.retainHostLease(hostKey, params.lease)
-          if (this.hosts.get(hostKey)?.handle !== existing.handle) {
+          if (this.#hosts.get(hostKey)?.handle !== existing.handle) {
             throw new Error(`OpenCode host ${hostKey} was disposed before its lease was published`)
           }
         } catch (error) {
@@ -1779,14 +1800,14 @@ export class OpenCodeHostManager {
         Math.max(this.pendingHostHealthTimeoutMs.get(hostKey) ?? 0, healthTimeoutMs),
       )
       const handle = await raceOpenCodeAbortSignal(pending, params.abortSignal)
-      const pendingEntry = this.hosts.get(hostKey)
+      const pendingEntry = this.#hosts.get(hostKey)
       if (pendingEntry) {
         pendingEntry.refCount += 1
       }
       if (params.lease) {
         try {
           await this.retainHostLease(hostKey, params.lease)
-          if (this.hosts.get(hostKey)?.handle !== handle) {
+          if (this.#hosts.get(hostKey)?.handle !== handle) {
             throw new Error(`OpenCode host ${hostKey} was disposed before its lease was published`)
           }
         } catch (error) {
@@ -1878,7 +1899,7 @@ export class OpenCodeHostManager {
     try { valid = (fence?.consume() ?? false) && valid } catch { valid = false }
     if (!valid) throw new Error('OpenCode supervised admission lost before publication')
     // No await between exact first lease and handle publication; acquisitions are serialized.
-    const existing = this.hosts.get(custody.hostKey)
+    const existing = this.#hosts.get(custody.hostKey)
     if (existing) {
       if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
       existing.supervisor.leases.add(leaseKey)
@@ -1892,17 +1913,22 @@ export class OpenCodeHostManager {
       port: e.endpoint.port, pid: e.process.pid, processStartedAtMs: Number(e.process.startTicks),
       version: health.version, state: 'healthy', profile, resolvedConfigFingerprint: fingerprint, diagnostics: [],
     }
-    this.hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
+    Object.freeze(handle.diagnostics)
+    for (const key of Object.keys(handle)) {
+      if (key !== 'state') Object.defineProperty(handle, key, { writable: false, configurable: false })
+    }
+    Object.seal(handle)
+    this.#hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
       lifetime: 'process', supervisor: { custody, leases: new Set([leaseKey]) } })
     return handle
   }
 
   getHost(hostKey: string): OpenCodeHostHandle | null {
-    return this.hosts.get(hostKey)?.handle ?? null
+    return this.#hosts.get(hostKey)?.handle ?? null
   }
 
   async refreshResolvedConfigFingerprint(hostKey: string): Promise<string | null> {
-    const entry = this.hosts.get(hostKey)
+    const entry = this.#hosts.get(hostKey)
     if (!entry) {
       return null
     }
@@ -1910,7 +1936,7 @@ export class OpenCodeHostManager {
     const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
     if (this.custody && (fingerprint !== this.custody.expected.profile.resolvedConfigFingerprint ||
       !(await this.custody.assertCurrent()))) throw new Error('OpenCode supervised resolved config changed')
-    if (fingerprint) {
+    if (fingerprint && !this.custody) {
       entry.handle.resolvedConfigFingerprint = fingerprint
     }
     return entry.handle.resolvedConfigFingerprint
@@ -1929,8 +1955,9 @@ export class OpenCodeHostManager {
     resolvedConfigFingerprint: string | null
     openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<boolean> {
+    input = Object.freeze({ ...input })
     if (this.custody && !(await this.custody.assertCurrent())) return false
-    const entry = this.hosts.get(input.hostKey)
+    const entry = this.#hosts.get(input.hostKey)
     if (this.custody && (entry?.supervisor?.custody !== this.custody ||
       input.pid !== this.custody.expected.process.pid ||
       input.processStartedAtMs !== Number(this.custody.expected.process.startTicks) ||
@@ -1962,7 +1989,8 @@ export class OpenCodeHostManager {
     resolvedConfigFingerprint: string | null
     openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<{ consume(): boolean } | null> {
-    const entry = this.hosts.get(input.hostKey)
+    input = Object.freeze({ ...input })
+    const entry = this.#hosts.get(input.hostKey)
     if (!entry || !input.openCodeArtifactDigest || !(await this.verifyEffectHost(input))) return null
     const executingToken = prepareExecutingOpenCodeArtifactDigestToken(
       input.pid,
@@ -1979,7 +2007,7 @@ export class OpenCodeHostManager {
       consume: () => {
         if (consumed) return false
         consumed = true
-        const live = this.hosts.get(input.hostKey)
+        const live = this.#hosts.get(input.hostKey)
         const retained = live === entry && live.handle === handle &&
           handle.pid === input.pid && handle.processStartedAtMs === input.processStartedAtMs &&
           handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
@@ -1999,7 +2027,7 @@ export class OpenCodeHostManager {
     options: { force: boolean },
   ): Promise<void> {
     if (this.custody) throw new Error('OpenCode supervisor retains process cleanup authority')
-    const entry = this.hosts.get(record.hostKey)
+    const entry = this.#hosts.get(record.hostKey)
     const pid = entry?.handle.pid ?? record.pid
     let terminated = false
 
@@ -2072,7 +2100,7 @@ export class OpenCodeHostManager {
       entry.child?.stdin?.destroy()
       entry.handle.state = 'disposed'
     }
-    this.hosts.delete(record.hostKey)
+    this.#hosts.delete(record.hostKey)
     this.pendingHosts.delete(record.hostKey)
     await this.cleanupOpenTuiTempArtifactsIfUnused(
       entry?.handle.profile.tmpPath ?? this.getPersistentProfileTmpPath(record.profileRootKey),
@@ -2082,18 +2110,18 @@ export class OpenCodeHostManager {
 
   async disposeHost(hostKey: string): Promise<boolean> {
     if (this.custody) {
-      const entry = this.hosts.get(hostKey)
+      const entry = this.#hosts.get(hostKey)
       if (!entry?.supervisor) {
         if (hostKey === this.custody.hostKey) await this.custody.closeOwnerResources()
         return false
       }
       entry.handle.state = 'disposed'
       entry.supervisor.leases.clear()
-      this.hosts.delete(hostKey)
+      this.#hosts.delete(hostKey)
       await this.custody.closeOwnerResources()
       return true
     }
-    const entry = this.hosts.get(hostKey)
+    const entry = this.#hosts.get(hostKey)
     if (!entry) {
       return false
     }
@@ -2143,8 +2171,8 @@ export class OpenCodeHostManager {
     diagnostics: string[]
   }> {
     if (this.custody) {
-      const disposed = this.hosts.size
-      for (const key of this.hosts.keys()) await this.disposeHost(key)
+      const disposed = this.#hosts.size
+      for (const key of this.#hosts.keys()) await this.disposeHost(key)
       await this.custody.closeOwnerResources()
       return { disposed, kept: 0, diagnostics: [] }
     }
@@ -2153,7 +2181,7 @@ export class OpenCodeHostManager {
     let kept = 0
     const diagnostics: string[] = []
 
-    for (const [hostKey, entry] of Array.from(this.hosts.entries())) {
+    for (const [hostKey, entry] of Array.from(this.#hosts.entries())) {
       if (!entry.ownedByProcess) {
         kept += 1
         continue
@@ -2181,7 +2209,7 @@ export class OpenCodeHostManager {
     if (this.custody) {
       const close = options.mode === 'force' || options.reason === 'shutdown'
       const result = close ? await this.disposeUnregisteredOwnedHosts() : null
-      return { cleaned: result?.disposed ?? 0, remaining: this.hosts.size, hosts: [], diagnostics: [] }
+      return { cleaned: result?.disposed ?? 0, remaining: this.#hosts.size, hosts: [], diagnostics: [] }
     }
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
@@ -2254,7 +2282,7 @@ export class OpenCodeHostManager {
           )
         }
         const leaseCount = Object.keys(leases).length
-        const entry = this.hosts.get(hostKey)
+        const entry = this.#hosts.get(hostKey)
         const normalizedRecordProjectPath = normalizedProjectPathFilter
           ? await normalizeProjectPathForComparison(record.projectPath)
           : null
@@ -2485,13 +2513,13 @@ export class OpenCodeHostManager {
     options: { keepPersistentAlive?: boolean } = {},
   ): Promise<void> {
     if (this.custody) {
-      const entry = this.hosts.get(hostKey)
+      const entry = this.#hosts.get(hostKey)
       if (!entry?.supervisor) return
       entry.refCount = Math.max(0, entry.refCount - 1)
-      if (entry.refCount === 0 && entry.supervisor.leases.size === 0) this.hosts.delete(hostKey)
+      if (entry.refCount === 0 && entry.supervisor.leases.size === 0) this.#hosts.delete(hostKey)
       return
     }
-    const entry = this.hosts.get(hostKey)
+    const entry = this.#hosts.get(hostKey)
     if (!entry) {
       return
     }
@@ -2510,7 +2538,7 @@ export class OpenCodeHostManager {
       if (entry.ownedByProcess) {
         await this.disposeHost(hostKey)
       } else {
-        this.hosts.delete(hostKey)
+        this.#hosts.delete(hostKey)
       }
     }
   }

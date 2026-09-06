@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { canonicalHostedApprovalJson } from './OpenCodeClientFactory.js'
@@ -22,12 +22,15 @@ export const supervisedLease = { teamId: 'team_test', laneId: 'primary', memberN
  */
 export async function supervisedFixture(options: {
   handle?: (request: IncomingMessage, response: ServerResponse) => void
-  sync?: () => Promise<void>
+  sync?: (observation: OpenCodeRawObservation | undefined) => Promise<void>
+  write?: (bytes: Uint8Array, offset: number, length: number, observation: OpenCodeRawObservation | undefined) => Promise<number>
   mutateBundle?: (bundle: Awaited<ReturnType<OpenCodeSupervisorAdmissionSource['acquire']>>) => void
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'opencode-w1-a-'))
   const observations: OpenCodeRawObservation[] = []
   const requests: Array<{ url: string; headers: IncomingMessage['headers']; body: Buffer }> = []
+  // Count TCP bytes even when no complete HTTP request can be parsed.
+  const connections: Array<{ socket: Socket; chunks: Buffer[]; closed: Promise<void> }> = []
   let live = true
   let lose!: () => void
   const lost = new Promise<void>(resolve => { lose = resolve })
@@ -49,6 +52,12 @@ export async function supervisedFixture(options: {
         request.url === '/agent' ? [] : request.url?.endsWith('hosted-approval-capability') ? hosted : {}
       response.end(canonicalHostedApprovalJson(data))
     })
+  })
+  server.on('connection', socket => {
+    const chunks: Buffer[] = []
+    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+    socket.on('data', chunk => chunks.push(Buffer.from(chunk)))
+    connections.push({ socket, chunks, closed })
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -91,8 +100,8 @@ export async function supervisedFixture(options: {
       return { bytes, recordId: hash(bytes.toString('utf8')) }
     },
     isCurrent: () => live,
-    write: async (_bytes, _offset, length) => length,
-    sync: options.sync ?? (async () => {}),
+    write: (bytes, offset, length) => options.write?.(bytes, offset, length, observations.at(-1)) ?? Promise.resolve(length),
+    sync: () => options.sync?.(observations.at(-1)) ?? Promise.resolve(),
     close: async () => {},
   }
   const rawRetention = createOpenCodeRawRetention(sink)
@@ -116,7 +125,7 @@ export async function supervisedFixture(options: {
       return bundle
     },
   }
-  return { expected, profile, source, rawRetention, requests, observations, server,
+  return { expected, profile, source, sink, rawRetention, requests, observations, server, connections,
     acquire: createOpenCodeSupervisedCustodyAcquirer(source),
     revoke() { live = false; lose() },
     async close() {

@@ -77,7 +77,14 @@ export function assertOpenCodeRawRetentionPort(port: OpenCodeRawRetentionPort): 
  * injected admitted sink's responsibility. Failure permanently revokes dispatch.
  */
 export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): OpenCodeRawRetentionPort {
+  // Retain the admitted operations, never methods subsequently installed on sink.
+  const encode = sink.encode.bind(sink)
+  const sinkCurrent = sink.isCurrent.bind(sink)
+  const write = sink.write.bind(sink)
+  const sync = sink.sync.bind(sink)
+  const closeSink = sink.close.bind(sink)
   let poisoned = false
+  let storageFailed = false
   let closed = false
   let total = 0
   let queued = 0
@@ -85,13 +92,15 @@ export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): Open
   let closing: Promise<void> | undefined
   const bindings = new WeakSet<object>()
   const requests = new WeakMap<object, boolean>()
-  const current = () => {
-    if (poisoned || closed) return false
+  const storageCurrent = () => {
+    if (storageFailed || closed) return false
     try {
-      if (!sink.isCurrent()) poisoned = true
-    } catch { poisoned = true }
-    return !poisoned
+      if (!sinkCurrent()) storageFailed = true
+    } catch { storageFailed = true }
+    if (storageFailed) poisoned = true
+    return !storageFailed
   }
+  const current = () => !poisoned && storageCurrent()
   const requireCurrent = () => {
     if (!current()) { poisoned = true; throw new Error('OpenCode raw retention unavailable') }
   }
@@ -101,33 +110,47 @@ export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): Open
       sha256: createHash('sha256').update(bytes).digest('hex'),
       bodyBase64: Buffer.from(bytes).toString('base64') })
   }
-  const append = (observation: OpenCodeRawObservation): Promise<string> => {
-    requireCurrent()
+  const append = (observation: OpenCodeRawObservation, terminal = false): Promise<string> => {
+    // Terminal evidence cannot grant dispatch authority. It may still be written
+    // after revocation, provided the original storage capability is current.
+    const revokedAppend = new Error('OpenCode raw dispatch revoked')
+    const requireStorage = () => {
+      if (!storageCurrent()) throw new Error('OpenCode raw retention unavailable')
+    }
+    const requireAppend = () => {
+      requireStorage()
+      if (!terminal && poisoned) throw revokedAppend
+    }
+    requireAppend()
     if (queued >= 16) { poisoned = true; throw new Error('OpenCode raw queue limit') }
     queued += 1
     const pending = tail.then(async () => {
-      requireCurrent()
-      const encoded = sink.encode(observation)
+      requireAppend()
+      const encoded = encode(observation)
       const bytes = Buffer.from(encoded.bytes)
-      if (!/^[0-9a-f]{64}$/.test(encoded.recordId) || bytes.length < 1 ||
+      const recordId = encoded.recordId
+      if (!/^[0-9a-f]{64}$/.test(recordId) || bytes.length < 1 ||
         bytes.length > MAX_RECORD || total + bytes.length > MAX_CAPTURE) {
         throw new Error('OpenCode raw record limit or identity')
       }
       total += bytes.length
       let offset = 0
       while (offset < bytes.length) {
-        requireCurrent()
-        const written = await sink.write(bytes, offset, bytes.length - offset)
+        // Finish an append already begun even if dispatch is revoked midway;
+        // cancellation must not tear a line and prevent later terminal evidence.
+        requireStorage()
+        const written = await write(bytes, offset, bytes.length - offset)
         if (!Number.isSafeInteger(written) || written <= 0 || written > bytes.length - offset) {
           throw new Error('OpenCode raw append made invalid progress')
         }
         offset += written
       }
-      await sink.sync()
-      requireCurrent()
-      return encoded.recordId
-    }).catch(() => {
+      await sync()
+      requireAppend()
+      return recordId
+    }).catch(error => {
       poisoned = true
+      if (error !== revokedAppend) storageFailed = true
       throw new Error('OpenCode raw append failed')
     }).finally(() => { queued -= 1 })
     tail = pending.catch(() => undefined)
@@ -162,26 +185,29 @@ export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): Open
       return result
     },
     async retainResponse(request, response) {
-      requireCurrent()
       if (requests.get(request) !== false) {
         poisoned = true
         throw new Error('OpenCode raw request substituted or completed')
       }
       requests.set(request, true)
+      if (!response.complete || (response.contentEncoding !== null && response.contentEncoding !== 'identity')) {
+        poisoned = true
+      }
       const retained = body(Buffer.from(response.bytes))
       await append({ phase: 'response', request, status: response.status,
         contentEncoding: response.contentEncoding, peerOperationNonce: null,
-        correlation: 'unavailable', body: retained, complete: response.complete })
+        correlation: 'unavailable', body: retained, complete: response.complete }, true)
       return retained
     },
     async recordFailure(request, failure) {
+      poisoned = true
       if (request && !requests.has(request)) throw new Error('OpenCode raw request substituted')
-      await append({ phase: 'failure', request, failure: { ...failure } })
+      await append({ phase: 'failure', request, failure: { ...failure } }, true)
     },
     poison() { poisoned = true },
     close() {
       closed = true
-      return closing ??= tail.then(() => sink.close())
+      return closing ??= tail.then(() => closeSink())
     },
   }
   ports.add(port)

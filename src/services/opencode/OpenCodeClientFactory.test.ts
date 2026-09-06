@@ -496,25 +496,32 @@ describe('OpenCodeClientFactory permissions API', () => {
     }
   })
 
-  test('treats numeric 409/412 as no-effect and redirect/server/malformed as ambiguous without retry', async () => {
+  test('accepts native empty 409/412 and keeps unsupported rejections ambiguous without retry', async () => {
     for (const status of [409, 412]) {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response('', { status }) })
       await expect(hostedClient(factory).answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
         condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
-      })).rejects.toBeInstanceOf(Error)
+      })).rejects.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
     }
     for (const response of [
       new Response('', { status: 307, headers: { location: 'http://127.0.0.1:9/reply' } }),
       new Response('mentions (409 conflict)', { status: 500 }),
+      new Response('{}', { status: 409 }),
+      new Response('[]', { status: 412 }),
+      new Response(new Uint8Array([0xff]), { status: 409 }),
+      new Response(new Uint8Array([0xef, 0xbb, 0xbf]), { status: 409 }),
+      new Response('', { status: 412, headers: { 'content-encoding': 'gzip' } }),
       new Response('{}'),
     ]) {
       let calls = 0
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => { calls += 1; return response } })
-      await expect(hostedClient(factory).answerPermission({
+      const error = await hostedClient(factory).answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
         condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest },
-      })).rejects.toThrow()
+      }).catch(error => error)
+      expect(error).toBeInstanceOf(Error)
+      expect(error).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
       expect(calls).toBe(1)
     }
   })

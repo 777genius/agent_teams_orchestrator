@@ -153,9 +153,18 @@ function processCurrent(e: ExpectedSupervisedOpenCode): boolean {
  */
 export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervisorAdmissionSource) {
   const expected = immutable(structuredClone(source.expected))
+  const acquire = source.acquire.bind(source)
   validateExpected(expected)
   return async (): Promise<TrustedOpenCodeCustody> => {
-    const bundle = await source.acquire()
+    const bundle = await acquire()
+    const rawRetention = bundle.rawRetention
+    const readPreparedProfile = bundle.readPreparedProfile.bind(bundle)
+    const prepareAuthority = bundle.prepareEffectToken.bind(bundle)
+    const prepareLease = bundle.prepareLeaseToken.bind(bundle)
+    const prepareOperation = bundle.prepareOperationToken.bind(bundle)
+    const closeBundle = bundle.closeOwnerResources.bind(bundle)
+    const bundleLost = bundle.lost
+    let admittedProfileIdentity: string | undefined
     let revoked = false
     let closing: Promise<void> | undefined
     let lose!: () => void
@@ -171,12 +180,12 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
     const close = () => {
       revoke()
       return closing ??= Promise.allSettled([
-        Promise.resolve().then(() => bundle.rawRetention?.close()),
-        Promise.resolve().then(() => bundle.closeOwnerResources()),
+        Promise.resolve().then(() => rawRetention?.close()),
+        Promise.resolve().then(closeBundle),
       ]).then(() => undefined)
     }
     try {
-      assertOpenCodeRawRetentionPort(bundle.rawRetention)
+      assertOpenCodeRawRetentionPort(rawRetention)
       if (canonical(bundle.expected) !== canonical(expected) ||
         bundle.serverAuth.id !== expected.serverAuthId || !bundle.serverAuth.password ||
         !bundle.serverAuth.username || /[:\r\n\0]/.test(bundle.serverAuth.username)) {
@@ -184,35 +193,48 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
       }
       // Secret stays in this closure; never in profile env, handles or raw records.
       const authorization = `Basic ${Buffer.from(`${bundle.serverAuth.username}:${bundle.serverAuth.password}`).toString('base64')}`
-      void bundle.lost.then(revoke, revoke)
+      void bundleLost.then(revoke, revoke)
       const current = () => {
-        if (!revoked && (!bundle.rawRetention.isCurrent() || !processCurrent(expected))) revoke()
+        if (!revoked && (!rawRetention.isCurrent() || !processCurrent(expected))) revoke()
         return !revoked
+      }
+      const captureFence = (token: OneUseFence | null): OneUseFence | null => {
+        if (!token) return null
+        const consume = token.consume.bind(token)
+        let used = false
+        return Object.freeze({ consume() {
+          if (used) return false
+          used = true
+          let valid = current()
+          try { valid = consume() && valid } catch { valid = false }
+          return valid && current()
+        } })
       }
       const prepareEffectToken = async (): Promise<OneUseFence | null> => {
         if (!current()) return null
-        const authority = await bundle.prepareEffectToken()
+        const authority = captureFence(await prepareAuthority())
         if (!authority) return null
         const artifact = prepareExecutingOpenCodeArtifactDigestToken(expected.process.pid,
           `sha256:${expected.executable.sha256}`)
         if (!artifact) { authority.consume(); return null }
         let used = false
-        return { consume() {
+        return Object.freeze({ consume() {
           if (used) return false
           used = true
           let valid = current()
           try { valid = authority.consume() && valid } catch { valid = false }
           try { valid = artifact.consume() && valid } catch { valid = false }
+          valid = current() && valid
           if (!valid) revoke()
           return valid
-        } }
+        } })
       }
       const custody = {
         expected, hostKey: `supervised::${createHash('sha256').update(canonical(expected)).digest('hex')}`,
-        rawRetention: bundle.rawRetention, lost,
+        rawRetention, lost,
         async readPreparedProfile() {
           if (!current()) throw new Error('OpenCode supervisor custody lost')
-          const profile = structuredClone(await bundle.readPreparedProfile())
+          const profile = structuredClone(await readPreparedProfile())
           for (const key of ['projectPath', 'profileRootKey', 'profileRootPath',
             'projectBehaviorFingerprint', 'managedConfigFingerprint', 'sourceAuthFingerprint',
             'managedAuthFingerprint', 'sourceAuthSources'] as const) {
@@ -224,15 +246,28 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
           // A supervised profile never lends server credentials to ordinary consumers.
           delete profile.env.OPENCODE_SERVER_PASSWORD
           delete profile.env.OPENCODE_SERVER_USERNAME
-          return immutable({ ...profile, custody: 'supervisor' as const })
+          const verified = immutable({ ...profile, custody: 'supervisor' as const })
+          // Fingerprints alone do not bind the files checked by the final fence.
+          // Pin the complete admitted profile, including paths and absent sources.
+          // Optional undefined profile properties have the same meaning as
+          // absent ones. Required expectation fields were checked above.
+          const identity = canonical(JSON.parse(JSON.stringify(verified)))
+          if (admittedProfileIdentity && identity !== admittedProfileIdentity) {
+            revoke()
+            throw new Error('OpenCode supervised profile identity changed')
+          }
+          admittedProfileIdentity ??= identity
+          return verified
         },
         async assertCurrent() {
           const token = await prepareEffectToken()
           return token?.consume() ?? false
         },
         prepareEffectToken,
-        prepareLeaseToken: (lease: OpenCodeHostLeaseInput) => bundle.prepareLeaseToken({ ...lease }),
-        prepareOperationToken: (operation: HostedHttpOperation) => bundle.prepareOperationToken({ ...operation }),
+        prepareLeaseToken: async (lease: OpenCodeHostLeaseInput) =>
+          captureFence(await prepareLease(Object.freeze({ ...lease }))),
+        prepareOperationToken: async (operation: HostedHttpOperation) =>
+          captureFence(await prepareOperation(Object.freeze({ ...operation }))),
         async authorizeConnected(connection: OpenCodeConnectedSocketIdentity) {
           if (!current() || connection.remotePort !== expected.endpoint.port) return null
           const peer = await captureOpenCodeEstablishedPeerIdentity(expected.process.pid,

@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { writeFile } from 'node:fs/promises'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
-import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeSessionBridge, prepareOpenCodePermissionProfileToken } from './OpenCodeSessionBridge.js'
 import { assertTrustedOpenCodeCustody, createOpenCodeSupervisedCustodyAcquirer,
-  type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
+  type TrustedOpenCodeCustody, type OpenCodeSupervisorAdmissionSource } from './OpenCodeSupervisedHostCustody.js'
 import { supervisedFixture, supervisedLease } from './OpenCodeSupervisedCustody.test-fixture.js'
 
 describe('OpenCode supervised admission', () => {
@@ -84,6 +86,9 @@ describe('OpenCode supervised admission', () => {
         expect(request.headers['accept-encoding']).toBe('identity')
         expect(request.headers['x-opencode-directory']).toBe(fixture.expected.profile.projectPath)
       }
+      const probes = ['/global/health', '/config', '/config/providers', '/agent', '/mcp',
+        '/experimental/agent-teams/hosted-approval-capability']
+      expect(fixture.requests.map(request => request.url)).toEqual([...probes, ...probes])
     } finally { await fixture.close() }
   }, 120_000)
 
@@ -110,6 +115,13 @@ describe('OpenCode supervised admission', () => {
       const acquisitionPolicy = { mode: 'supervisor-adopt-only' as const, custody }
       expect(() => new OpenCodeSessionBridge({ acquisitionPolicy,
         hostManager: new OpenCodeHostManager(), clientFactory: new OpenCodeClientFactory() })).toThrow()
+      class ForgedManager extends OpenCodeHostManager { isBoundToCustody() { return true } }
+      class ForgedFactory extends OpenCodeClientFactory { isBoundToCustody() { return true } }
+      const sessionStore = { get: async () => null, upsert: async () => 'created' as const, markStale: async () => null }
+      expect(() => new OpenCodeSessionBridge({ acquisitionPolicy, sessionStore,
+        hostManager: new ForgedManager(), clientFactory: new ForgedFactory() })).toThrow()
+      expect(() => new ForgedManager({ acquisitionPolicy })).toThrow()
+      expect(() => new ForgedFactory({ acquisitionPolicy })).toThrow()
       expect(() => new OpenCodeClientFactory({ acquisitionPolicy, fetchImpl: fetch })).toThrow()
       const factory = new OpenCodeClientFactory({ acquisitionPolicy })
       expect(() => factory.create('http://127.0.0.1:1')).toThrow('origin mismatch')
@@ -119,4 +131,81 @@ describe('OpenCode supervised admission', () => {
       expect(await custody.assertCurrent()).toBe(false)
     } finally { await fixture.close() }
   })
+
+  test.skipIf(process.platform !== 'linux')('lease publication uses the authorized snapshot across an await', async () => {
+    let pause = false
+    let entered!: () => void
+    let release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const fixture = await supervisedFixture({ mutateBundle(bundle) {
+      const prepare = bundle.prepareLeaseToken
+      bundle.prepareLeaseToken = async lease => {
+        const token = await prepare(lease)
+        if (pause) { entered(); await gate }
+        return token
+      }
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const params = { lease: { ...supervisedLease } }
+      const acquisition = manager.ensureHost(params)
+      params.lease.sessionId = 'ses_unauthorized'
+      const host = await acquisition
+      pause = true
+      const input = { ...supervisedLease }
+      const pending = manager.retainHostLease(host.hostKey, input)
+      await started
+      input.sessionId = 'ses_unauthorized'
+      release()
+      await pending
+      await manager.releaseHostLease(host.hostKey, supervisedLease)
+      await manager.releaseHost(host.hostKey)
+      expect(manager.getHost(host.hostKey)).toBeNull()
+    } finally { release?.(); await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('admitted profile paths and handle identity cannot move the auth fence', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const fingerprint = createHash('sha256').update('admitted-auth').digest('hex')
+      fixture.profile.managedAuthFingerprint = fingerprint
+      fixture.expected.profile.managedAuthFingerprint = fingerprint
+      await writeFile(fixture.profile.managedAuthPath, 'admitted-auth')
+      const alternate = `${fixture.profile.profileRootPath}/substitute-auth.json`
+      await writeFile(alternate, 'admitted-auth')
+      const custody = await createOpenCodeSupervisedCustodyAcquirer(fixture.source)()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const handle = await manager.ensureHost({ lease: supervisedLease })
+      expect(Reflect.set(handle, 'profile', { ...handle.profile, managedAuthPath: alternate })).toBe(false)
+      expect(Reflect.set(handle.profile, 'managedAuthPath', alternate)).toBe(false)
+      for (const field of ['pid', 'baseUrl', 'hostKey', 'resolvedConfigFingerprint', 'openCodeArtifactDigest']) {
+        expect(Reflect.set(handle, field, 'substituted')).toBe(false)
+      }
+      const fence = await prepareOpenCodePermissionProfileToken(await custody.readPreparedProfile())
+      expect(fence).not.toBeNull()
+      await writeFile(fixture.profile.managedAuthPath, 'rotated-auth')
+      expect(fence!.consume()).toBe(false)
+      fixture.profile.managedAuthPath = alternate
+      await expect(custody.readPreparedProfile()).rejects.toThrow('profile identity changed')
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('admission source and bundle operations remain captured', async () => {
+    let bundle!: Awaited<ReturnType<OpenCodeSupervisorAdmissionSource['acquire']>>
+    const fixture = await supervisedFixture({ mutateBundle(value) { bundle = value } })
+    try {
+      fixture.source.acquire = async () => { throw new Error('substituted acquisition') }
+      const custody = await fixture.acquire()
+      bundle.readPreparedProfile = async () => { throw new Error('substituted profile reader') }
+      bundle.prepareEffectToken = async () => null
+      bundle.prepareLeaseToken = async () => null
+      bundle.prepareOperationToken = async () => null
+      expect(await custody.assertCurrent()).toBe(true)
+      expect((await custody.prepareLeaseToken(supervisedLease))?.consume()).toBe(true)
+      expect((await custody.prepareOperationToken({ kind: 'capability' }))?.consume()).toBe(true)
+      expect((await custody.readPreparedProfile()).managedAuthPath).toBe(fixture.profile.managedAuthPath)
+    } finally { await fixture.close() }
+  }, 120_000)
 })

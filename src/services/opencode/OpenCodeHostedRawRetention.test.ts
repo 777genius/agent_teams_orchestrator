@@ -35,8 +35,8 @@ describe('OpenCode bounded raw retention', () => {
     await port.close()
   })
 
-  test('retains empty, Unicode, invalid UTF-8 and 1 MiB response bodies unchanged', async () => {
-    for (const bytes of [Buffer.alloc(0), Buffer.from('漢字'), Buffer.from([0xc0, 0xaf]), Buffer.alloc(1024 * 1024, 255)]) {
+  test('retains empty, Unicode and invalid UTF-8 response bodies unchanged', async () => {
+    for (const bytes of [Buffer.alloc(0), Buffer.from('漢字'), Buffer.from([0xc0, 0xaf])]) {
       const { port, records } = recorder()
       const request = await port.retainRequest(port.bindOperation({ kind: 'observe', sessionId: 'ses_1' }), {
         method: 'GET', path: '/permissions', bytes: Buffer.alloc(0),
@@ -48,6 +48,70 @@ describe('OpenCode bounded raw retention', () => {
       expect(records[1]).toMatchObject({ complete: false, correlation: 'unavailable', peerOperationNonce: null })
       await port.close()
     }
+  })
+
+  test('retains a 1 MiB body through actual nested base64 serialization and partial appends', async () => {
+    const appended: Buffer[] = []
+    const lines: Buffer[] = []
+    const { port } = recorder({
+      encode(observation) {
+        // Exercise the structural/payload/raw-line expansion without defining a
+        // production RawRecord adapter (that remains a W1-B/P1 prerequisite).
+        const structure = Buffer.from(JSON.stringify(observation))
+        const payload = Buffer.from(JSON.stringify({ structureBase64: structure.toString('base64') }))
+        const line = Buffer.from(JSON.stringify({ payloadBase64: payload.toString('base64') }) + '\n')
+        expect(structure.length).toBeLessThanOrEqual(2 * 1024 * 1024)
+        expect(payload.length).toBeLessThanOrEqual(2 * 1024 * 1024)
+        lines.push(line)
+        return { bytes: line, recordId: 'a'.repeat(64) }
+      },
+      async write(bytes, offset, length) {
+        const written = Math.min(length, 65536)
+        appended.push(Buffer.from(bytes.subarray(offset, offset + written)))
+        return written
+      },
+    })
+    const request = await port.retainRequest(port.bindOperation({ kind: 'observe', sessionId: 'ses_1' }), {
+      method: 'GET', path: '/permissions', bytes: Buffer.alloc(0),
+    })
+    const bytes = Buffer.alloc(1024 * 1024, 255)
+    await port.retainResponse(request, { status: 200, contentEncoding: null, peerOperationNonce: null, bytes, complete: true })
+    expect(lines[1]!.length).toBeGreaterThan(2 * 1024 * 1024)
+    expect(lines[1]!.length).toBeLessThanOrEqual(4 * 1024 * 1024)
+    expect(Buffer.concat(appended)).toEqual(Buffer.concat(lines))
+    const payload = JSON.parse(Buffer.from(JSON.parse(lines[1]!.toString()).payloadBase64, 'base64').toString())
+    const observation = JSON.parse(Buffer.from(payload.structureBase64, 'base64').toString())
+    expect(Buffer.from(observation.body.bodyBase64, 'base64')).toEqual(bytes)
+    await port.close()
+  })
+
+  test('captures sink operations and record identity before asynchronous writes', async () => {
+    let release!: () => void
+    let writing!: () => void
+    const started = new Promise<void>(resolve => { writing = resolve })
+    const pendingWrite = new Promise<void>(resolve => { release = resolve })
+    let syncs = 0
+    const encoded = { bytes: Buffer.from('record'), recordId: 'a'.repeat(64) }
+    const sink: OpenCodeRawRetentionSink = {
+      encode: () => encoded, isCurrent: () => true,
+      async write(_bytes, _offset, length) { writing(); await pendingWrite; return length },
+      async sync() { syncs += 1; throw new Error('actual sync failure') }, close: async () => {},
+    }
+    const port = createOpenCodeRawRetention(sink)
+    const pending = port.retainRequest(port.bindOperation({ kind: 'capability' }), {
+      method: 'GET', path: '/', bytes: Buffer.alloc(0),
+    })
+    const failure = expect(pending).rejects.toThrow('append failed')
+    await started
+    sink.write = async (_bytes, _offset, length) => length
+    sink.sync = async () => {}
+    sink.isCurrent = () => true
+    encoded.recordId = 'b'.repeat(64)
+    release()
+    await failure
+    expect(syncs).toBe(1)
+    expect(port.isCurrent()).toBe(false)
+    await port.close()
   })
 
   test('poisons on zero writes, sync failure, overflow and descriptor replacement', async () => {
