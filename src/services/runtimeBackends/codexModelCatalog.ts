@@ -504,6 +504,13 @@ function classifyCatalogFailure(error: unknown): {
   const lower = message.toLowerCase()
   const code = error instanceof JsonRpcRequestError && error.code !== null ? String(error.code) : null
   if (
+    !(error instanceof JsonRpcRequestError) &&
+    (message.startsWith('JSON-RPC request timed out:') ||
+      message.startsWith('codex app-server model/list timed out after'))
+  ) {
+    return { appServerState: 'degraded', message, code: 'timeout' }
+  }
+  if (
     code === '-32601' ||
     lower.includes('method not found') ||
     lower.includes('unknown method') ||

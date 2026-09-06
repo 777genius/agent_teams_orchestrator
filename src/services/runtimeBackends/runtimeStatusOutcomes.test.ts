@@ -81,9 +81,29 @@ describe('runtime status outcome completeness', () => {
       })
     }
     expect(degraded.providers.codex).toMatchObject({
-      statusCheckOutcome: 'pending',
-      statusCheckErrorCode: 'partial_response',
+      statusCheckOutcome: 'transient_error',
+      statusCheckErrorCode: 'unavailable',
     })
+  })
+
+  test('Codex settled catalog timeouts do not remain pending or change auth', async () => {
+    process.env.CODEX_API_KEY = 'test-key'
+    Bun.which = ((name: string) => name === 'codex' ? '/test/codex' : null) as typeof Bun.which
+
+    for (const status of ['degraded', 'stale', 'unavailable'] as const) {
+      const failed = catalog(status, 'codex')
+      failed.diagnostics.code = 'timeout'
+      failed.diagnostics.message = 'JSON-RPC request timed out: initialize'
+      const payload = await getUnifiedRuntimeStatusPayload('codex', {
+        getCodexModelCatalog: async () => failed,
+      })
+      expect(payload.providers.codex).toMatchObject({
+        authenticated: true,
+        verificationState: 'verified',
+        statusCheckOutcome: 'transient_error',
+        statusCheckErrorCode: 'timeout',
+      })
+    }
   })
 
   test('Codex configured CLI nonzero status fails closed in summary and full', async () => {

@@ -1158,20 +1158,19 @@ export async function getUnifiedRuntimeStatusPayload(
       const modelCatalogDynamic =
         modelCatalog.source === 'app-server' &&
         (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
-      const catalogStatusCheck = modelCatalog.status === 'unavailable'
+      // The catalog read has settled. A failed/stale result is recoverable,
+      // not an in-flight check that the desktop should keep waiting for.
+      const catalogStatusCheck = modelCatalog.status !== 'ready'
         ? {
             statusCheckOutcome: 'transient_error' as const,
-            statusCheckErrorCode: 'unavailable' as const,
+            statusCheckErrorCode: modelCatalog.diagnostics.code === 'timeout'
+              ? 'timeout' as const
+              : 'unavailable' as const,
           }
-        : modelCatalog.status === 'stale' || modelCatalog.status === 'degraded'
-          ? {
-              statusCheckOutcome: 'pending' as const,
-              statusCheckErrorCode: 'partial_response' as const,
-            }
-          : {
-              statusCheckOutcome: 'authoritative' as const,
-              statusCheckErrorCode: null,
-            }
+        : {
+            statusCheckOutcome: 'authoritative' as const,
+            statusCheckErrorCode: null,
+          }
       providers.codex = {
         providerId: 'codex',
         displayName: 'Codex',
