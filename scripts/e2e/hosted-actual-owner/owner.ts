@@ -8,7 +8,6 @@ import { HostedApprovalOwnerService } from '../../../src/services/hostedControl/
 import { HostedApprovalOwnerStore } from '../../../src/services/hostedControl/HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerWal } from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
 import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRuntimeAdmission } from '../../../src/services/hostedControl/HostedApprovalRuntimeAdmission.js'
-import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { hostedControlAuthorityFromConfig } from '../../../src/services/hostedControl/HostedControlRuntimeConfig.js'
@@ -38,52 +37,17 @@ import {
   openTrustedDirectory, type SecureFileIdentity,
 } from './secure-files.js'
 
+import { parseAcceptanceInvocation, isDirectAcceptanceEntry as matchesDirectEntry } from './invocation.js'
+export { parseAcceptanceInvocation } from './invocation.js'
+export function isDirectAcceptanceEntry(argv: readonly string[], entryUrl = import.meta.url): boolean {
+  return matchesDirectEntry(argv, entryUrl)
+}
+import type { ActualOwnerV2Composition } from './entry-v2.js'
+
 const MAX_CONTROL_BYTES = 16 * 1024
 type ProviderIdentity = ActualOwnerAcceptanceEvidence['providers'][number]
-function approvalIdForRecord(record: { authority: { teamId: string; runId: string }; commandId: string }): string {
-  return `approval_${createHash('sha256').update(JSON.stringify({
-    schemaVersion: 1, teamId: record.authority.teamId,
-    runId: record.authority.runId, requestId: record.commandId,
-  })).digest('hex').slice(0, 32)}`
-}
 export { processStartIdentity, proveExecutingProviderIdentity } from './provider-identity.js'
-class EvidenceApprovalPort implements HostedApprovalWirePort {
-  constructor(
-    readonly service: HostedApprovalOwnerService,
-    private readonly changed: (
-      event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
-      requestId: string | null, effectId: string | null,
-      reconciliation?: { reconciliationRef: string; providerDeliveryId: string; runId: string },
-    ) => Promise<void>,
-  ) {}
-  async claimIngress(input: Parameters<HostedApprovalWirePort['claimIngress']>[0]) {
-    const result = await this.service.claimIngress(input)
-    for (const record of result) {
-      await this.changed('ingress_durable', approvalIdForRecord(record), record.commandId, record.effectRef)
-    }
-    return result
-  }
-  acknowledgeIngress(request: Parameters<HostedApprovalWirePort['acknowledgeIngress']>[0]) { return this.service.acknowledgeIngress(request) }
-  getAdmittedIngressAuthority(authority: Parameters<HostedApprovalWirePort['getAdmittedIngressAuthority']>[0]) { return this.service.getAdmittedIngressAuthority(authority) }
-  resolveIngressAuthority(authority: Parameters<HostedApprovalWirePort['resolveIngressAuthority']>[0]) { return this.service.resolveIngressAuthority(authority) }
-  authorizeDecision(input: Parameters<HostedApprovalWirePort['authorizeDecision']>[0]) { return this.service.authorizeDecision(input) }
-  async deliverDecision(input: Parameters<HostedApprovalWirePort['deliverDecision']>[0]) {
-    const result = await this.service.deliverDecision(input)
-    const event = result.status === 'delivered' || result.status === 'idempotent_replay'
-      ? input.request.decision === 'allow' ? 'completed' : 'rejected'
-      : 'decision_committed'
-    await this.changed(event, input.request.approvalId, input.request.requestId, null)
-    return result
-  }
-  async reconcileDecision(request: Parameters<HostedApprovalWirePort['reconcileDecision']>[0]) {
-    const result = await this.service.reconcileDecision(request)
-    await this.changed(`reconcile_${result.status}`, null, null, null, {
-      reconciliationRef: request.reconciliationRef, providerDeliveryId: request.providerDeliveryId,
-      runId: request.partition.runId,
-    })
-    return result
-  }
-}
+import { approvalIdForRecord, EvidenceApprovalPort } from './approval-evidence-port.js'
 export class AcceptanceRuntime {
   private runtime: HostedControlRuntime | null = null
   private readinessLease: Socket | null = null
@@ -774,9 +738,13 @@ export class AcceptanceRuntime {
   }
 }
 
-export async function runActualOwnerAcceptance(args: readonly string[]): Promise<void> {
+export async function runActualOwnerAcceptance(args: readonly string[], v2?: ActualOwnerV2Composition): Promise<void> {
   if (args[0] === HOSTED_CONTROL_SOCKET_BROKER_FLAG) {
     await runHostedControlSocketBroker([...args.slice(1)])
+  }
+  if (args[0]?.startsWith('--hosted-actual-owner-sealed-protocol=')) {
+    const { runActualOwnerV2 } = await import('./entry-v2.js')
+    return runActualOwnerV2(args, v2)
   }
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   const invocation = parseAcceptanceInvocation(args)
@@ -797,29 +765,6 @@ export async function runActualOwnerAcceptance(args: readonly string[]): Promise
     throw error
   }
   await new Promise<void>(() => undefined)
-}
-
-export function parseAcceptanceInvocation(args: readonly string[]): {
-  configArgs: readonly string[]
-  bootstrapFds: { launcherLeaseFd: number; livenessFd: number; bootstrapFd: number }
-} {
-  const expected = ['--runtime-manifest', '--actual-owner-contract', '--actual-owner-contract-sha256',
-    '--actual-owner-contract-byte-count', '--launcher-lease-fd', '--liveness-fd', '--bootstrap-fd']
-  if (args.length !== 14 || expected.some((flag, index) => args[index * 2] !== flag)) {
-    throw new Error('hosted_actual_owner_invocation_invalid')
-  }
-  const values = [args[9], args[11], args[13]].map(value => Number(value))
-  if (values.some((value, index) => value !== index + 6) || new Set(values).size !== 3) {
-    throw new Error('hosted_actual_owner_bootstrap_fd_map_invalid')
-  }
-  return {
-    configArgs: args.slice(0, 8),
-    bootstrapFds: { launcherLeaseFd: values[0]!, livenessFd: values[1]!, bootstrapFd: values[2]! },
-  }
-}
-
-export function isDirectAcceptanceEntry(argv: readonly string[], entryUrl = import.meta.url): boolean {
-  return resolve(argv[1] ?? '') === fileURLToPath(entryUrl)
 }
 
 if (isDirectAcceptanceEntry(process.argv)) {

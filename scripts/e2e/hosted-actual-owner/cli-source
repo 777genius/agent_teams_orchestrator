@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+# The admitted supervisor owns FD11. Never reopen it or pass v2 through the
+# legacy launcher checks (which allocate helpers and overwrite native FD9).
+if [[ "${1-}" == --hosted-actual-owner-sealed-protocol=* ]]; then
+  if [[ "${1-}" != "--hosted-actual-owner-sealed-protocol=v2" || "$#" -ne 3 || "${2-}" != "--runtime-manifest" || "${3-}" != "/sandbox/runtime-manifest.json" ]]; then
+    exit 64
+  fi
+  exec /proc/self/fd/11 run ./scripts/e2e/hosted-actual-owner-owner.ts "$@"
+fi
+
 REPOSITORY_ROOT="$(pwd -P)"
 SCRIPT_DIR="$REPOSITORY_ROOT/scripts/e2e/hosted-actual-owner"
 STABLE_LAUNCHER="$SCRIPT_DIR/cli-source"

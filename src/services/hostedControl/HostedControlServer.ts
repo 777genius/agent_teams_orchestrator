@@ -1,20 +1,26 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { lstatSync, type Stats } from 'node:fs'
-import { constants, chmod, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
-import { connect, createServer, type Server, type Socket } from 'node:net'
-import { basename, dirname, join } from 'node:path'
+import { type ChildProcess } from 'node:child_process'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { link, lstat } from 'node:fs/promises'
+import { createServer, type Server, type Socket } from 'node:net'
+import { dirname } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import {
   createHostedControlProof,
   createHostedDomainProof,
   createHostedRawDomainProof,
-  parseStrictHostedProofLastJsonFrame,
   verifyHostedControlProof,
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
-import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
+import type { HostedControlInheritedActivationV2 } from './HostedControlInheritedActivationV2.js'
+import { decodeHostedReadinessRequest, HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_READINESS_MAX_LINE_BYTES,
+  type HostedReadinessAdmission } from './HostedControlReadiness.js'
+export { decodeHostedReadinessRequest, admitHostedReadiness, HOSTED_READINESS_MAX_LINE_BYTES,
+  HOSTED_LIFECYCLE_PROOF_DOMAIN, type HostedReadinessAdmission } from './HostedControlReadiness.js'
+import { isSocketIdentityCurrentSync, socketPublicationPath, listenLoopback, startSocketBroker,
+  killSocketBroker, closeServer, proveSocketPathIsServerOwned, consumePublicationProbe, sameSocketIdentity,
+  prepareSocketPath, removeOwnedSocketPathIfCurrent, removeSocketIfIdentityMatches,
+  type PublicationProbe } from './HostedControlServerPublication.js'
 import {
   HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
   HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES,
@@ -38,9 +44,7 @@ export const HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES = 64 * 1024
 export const HOSTED_CONTROL_MAX_LINE_BYTES = 8 * 1024 * 1024
 export const HOSTED_CONTROL_READ_DEADLINE_MS = 5_000
 export const HOSTED_CONTROL_ACTIVATION_RECOVERY_DEADLINE_MS = 30_000
-export const HOSTED_LIFECYCLE_PROOF_DOMAIN = 'agent-teams.hosted-lifecycle.owner-proof/v1'
 export const HOSTED_TEAM_MESSAGE_PROOF_DOMAIN = 'agent-teams.hosted-team-message.owner-proof/v1'
-export const HOSTED_READINESS_MAX_LINE_BYTES = 4 * 1024
 
 export type HostedTaskMutationPort = {
   mutate(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult>
@@ -71,6 +75,8 @@ export type HostedControlServerOptions = {
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
   /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
   activationSessionFactory?: HostedApprovalActivationSessionFactory
+  /** Reserve activation for FD5 even during asynchronous socket publication. */
+  activationTransport?: 'inherited-v2'
 }
 
 type ActivationPhase =
@@ -96,10 +102,6 @@ type ActivationCandidate = {
   recoveryDeadline: ReturnType<typeof setTimeout> | null
 }
 
-export type HostedReadinessAdmission =
-  | { protocol: 'legacy'; challenge: string }
-  | { protocol: 'canonical'; challenge: string; bootstrapDigest: string }
-
 export class HostedControlServer {
   readonly #options: HostedControlServerOptions
   #server: Server | null = null
@@ -115,6 +117,8 @@ export class HostedControlServer {
   #activationConsumed = false
   #activationGeneration = 0
   #activation: ActivationCandidate | null = null
+  #inheritedActivation: HostedControlInheritedActivationV2 | null = null
+  #inheritedSocket: Socket | null = null
   readonly #mutationLease = new AsyncLocalStorage<Socket>()
   readonly #handlers = new Set<Promise<void>>()
   #stopping = false
@@ -130,6 +134,23 @@ export class HostedControlServer {
   async hasActiveLease(): Promise<boolean> {
     const expectedLease = this.#mutationLease.getStore() ?? this.#leaseSocket
     return !!expectedLease && this.#leaseSocket === expectedLease && !expectedLease.destroyed && await this.#hasCurrentSocketIdentity()
+  }
+
+  /** Transfers the exact admitted FD5; publication remains the actual socket
+   * identity used by the existing activation verifier. No broker or reconnect. */
+  attachInheritedActivationV2(resource: HostedControlInheritedActivationV2): void {
+    if (!this.#server || !this.#ownerBinding || !this.#options.activationSessionFactory ||
+      this.#options.activationTransport !== 'inherited-v2' || this.#inheritedActivation ||
+      this.#stopping || !this.#isCurrentSocketIdentitySync()) {
+      resource.close(); throw new Error('Hosted control inherited activation unavailable')
+    }
+    const socket = resource.take()
+    this.#inheritedActivation = resource
+    this.#inheritedSocket = socket
+    this.#sockets.add(socket)
+    socket.once('close', () => this.#sockets.delete(socket))
+    this.#handleConnection(socket)
+    socket.resume()
   }
 
   async start(): Promise<void> {
@@ -222,6 +243,7 @@ export class HostedControlServer {
 
   async #stop(): Promise<void> {
     this.#stopping = true
+    this.#inheritedActivation?.close()
     // The approval delegate is synchronously fenced before any listener,
     // handler, lifecycle port, root lease, or descriptor cleanup can begin.
     const activationRevocation = this.#activation
@@ -314,7 +336,8 @@ export class HostedControlServer {
         return
       }
       bytes += chunk.byteLength
-      if (bytes > HOSTED_CONTROL_MAX_LINE_BYTES) {
+      if (bytes > (this.#inheritedSocket === socket
+        ? HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES : HOSTED_CONTROL_MAX_LINE_BYTES)) {
         failClosed()
         return
       }
@@ -337,6 +360,7 @@ export class HostedControlServer {
         void handler.finally(() => this.#handlers.delete(handler))
         return
       }
+      if (this.#inheritedSocket === socket) { failClosed(); return }
       const handler = this.#processLine(socket, line)
         .catch(failClosed)
       this.#handlers.add(handler)
@@ -346,7 +370,8 @@ export class HostedControlServer {
   }
 
   async #beginActivation(socket: Socket, prepareFrame: string): Promise<void> {
-    if (this.#activationConsumed || this.#activation || this.#stopping ||
+    if ((this.#options.activationTransport === 'inherited-v2' && socket !== this.#inheritedSocket) ||
+      this.#activationConsumed || this.#activation || this.#stopping ||
       Buffer.byteLength(prepareFrame, 'utf8') > HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES) {
       socket.destroy()
       return
@@ -494,6 +519,7 @@ export class HostedControlServer {
         const current = !!ownerBinding && !!parentIdentity &&
           this.#activation === candidate && this.#activationGeneration === generation &&
           candidate.socket === socket && !socket.destroyed &&
+          (this.#inheritedSocket !== socket || this.#inheritedActivation!.isCurrent()) &&
           isSocketIdentityCurrentSync(
             this.#options.socketPath, ownerBinding, parentIdentity,
           )
@@ -508,6 +534,7 @@ export class HostedControlServer {
   #isActivationCurrent(candidate: ActivationCandidate): boolean {
     return this.#activation === candidate && this.#activationGeneration === candidate.generation &&
       candidate.phase !== 'revoked' && !this.#stopping && !candidate.socket.destroyed &&
+      (this.#inheritedSocket !== candidate.socket || this.#inheritedActivation!.isCurrent()) &&
       this.#isCurrentSocketIdentitySync()
   }
 
@@ -694,28 +721,6 @@ function isActivationPrepare(line: string): boolean {
   }
 }
 
-function isSocketIdentityCurrentSync(
-  socketPath: string,
-  ownerBinding: HostedControlOwnerBinding,
-  parentIdentity: { device: number; inode: number },
-): boolean {
-  try {
-    const socketStat = lstatSync(socketPath)
-    const parentStat = lstatSync(dirname(socketPath))
-    return socketStat.isSocket() && (socketStat.mode & 0o077) === 0 &&
-      (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) &&
-      parentStat.isDirectory() && !parentStat.isSymbolicLink() &&
-      String(socketStat.dev) === ownerBinding.socketIdentity.device &&
-      String(socketStat.ino) === ownerBinding.socketIdentity.inode &&
-      socketStat.uid === ownerBinding.socketIdentity.uid &&
-      socketStat.gid === ownerBinding.socketIdentity.gid &&
-      (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode &&
-      parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
-  } catch {
-    return false
-  }
-}
-
 function writeRetainedFrame(socket: Socket, frame: string): Promise<void> {
   if (!frame.endsWith('\n') || frame.slice(0, -1).includes('\n')) {
     return Promise.reject(new Error('Hosted approval activation response is not one frame'))
@@ -737,123 +742,6 @@ function isApprovalOperation(value: unknown): boolean {
 
 function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
-}
-
-export function decodeHostedReadinessRequest(input: {
-  secret: Uint8Array
-  authority: HostedControlStableAuthority
-  ownerBinding: HostedControlOwnerBinding
-  bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
-  line: string
-  message: Record<string, unknown>
-}): HostedReadinessAdmission {
-  if (Buffer.byteLength(input.line) > HOSTED_READINESS_MAX_LINE_BYTES) {
-    throw new TypeError('Invalid hosted readiness frame size')
-  }
-  if (isLegacyReadiness(input.message)) {
-    if (input.bootstrapBinding || !isDeepStrictEqual(input.message.socketIdentity, input.ownerBinding.socketIdentity) ||
-      !verifyLegacyReadiness(input.secret, input.line, input.message)) {
-      throw new TypeError('Invalid legacy hosted readiness proof')
-    }
-    return { protocol: 'legacy', challenge: String(input.message.challenge) }
-  }
-  const signed = parseStrictHostedProofLastJsonFrame(input.line, 'controllerProof')
-  if (!isDeepStrictEqual(signed.value, input.message)) throw new TypeError('Invalid hosted readiness raw frame')
-  const expectedKeys = ['schemaVersion', 'operation', 'capability', 'socketIdentity', 'challenge', 'bootstrapBinding', 'expectedOwnerBinding', 'controllerProof'].sort()
-  const keys = Object.keys(input.message).sort()
-  const identity = input.message.socketIdentity
-  const bootstrap = input.message.bootstrapBinding
-  const expectedOwner = input.message.expectedOwnerBinding
-  const proofKeyId = createHash('sha256').update(input.secret).digest('hex')
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index]) ||
-    input.message.schemaVersion !== 2 || input.message.operation !== 'readiness' ||
-    input.message.capability !== 'hosted-lifecycle-command' || typeof input.message.challenge !== 'string' ||
-    !/^[0-9a-f]{64}$/.test(input.message.challenge) || !identity || typeof identity !== 'object' ||
-    Array.isArray(identity) || Object.keys(identity).sort().join(',') !== 'device,gid,inode,mode,uid' ||
-    !isDeepStrictEqual(identity, input.ownerBinding.socketIdentity) || !expectedOwner ||
-    !isDeepStrictEqual(expectedOwner, input.ownerBinding) || !bootstrap || typeof bootstrap !== 'object' ||
-    Array.isArray(bootstrap) || !input.bootstrapBinding ||
-    !isDeepStrictEqual(bootstrap, input.bootstrapBinding) ||
-    !validBootstrapBinding(bootstrap as Record<string, unknown>, input.authority, proofKeyId) ||
-    !verifyRawReadiness(input.secret, signed.serializedUnsignedEnvelope, signed.proof)) {
-    throw new TypeError('Invalid canonical hosted readiness proof')
-  }
-  return {
-    protocol: 'canonical',
-    challenge: input.message.challenge,
-    bootstrapDigest: (bootstrap as Record<string, unknown>).bootstrapDigest as string,
-  }
-}
-
-export function admitHostedReadiness(input: {
-  secret: Uint8Array
-  ownerBinding: HostedControlOwnerBinding
-  bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
-  line: string
-  message: Record<string, unknown>
-}): boolean {
-  const binding = input.bootstrapBinding
-  const authority: HostedControlStableAuthority = {
-    deploymentId: binding?.deploymentId ?? '',
-    bootId: binding?.bootId ?? '',
-    restoreGeneration: 0,
-    workspaceId: binding?.workspaceId ?? '',
-    teamId: `team_${'0'.repeat(32)}`,
-    mountBinding: {
-      mountGeneration: binding?.mountGeneration ?? 1,
-      declaredRootHash: '0'.repeat(64),
-    },
-  }
-  try {
-    decodeHostedReadinessRequest({ ...input, authority })
-    return true
-  } catch {
-    return false
-  }
-}
-
-function isLegacyReadiness(message: Record<string, unknown>): boolean {
-  return Object.keys(message).sort().join(',') ===
-    'capability,challenge,operation,ownerProof,schemaVersion,socketIdentity' &&
-    message.schemaVersion === 2 && message.operation === 'readiness' &&
-    message.capability === 'hosted-lifecycle-command' &&
-    typeof message.challenge === 'string' && /^[0-9a-f]{64}$/.test(message.challenge)
-}
-
-function verifyLegacyReadiness(
-  secret: Uint8Array,
-  line: string,
-  message: Record<string, unknown>,
-): boolean {
-  const proof = message.ownerProof
-  if (typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof)) return false
-  const suffix = `,"ownerProof":${JSON.stringify(proof)}}`
-  if (!line.endsWith(suffix)) return false
-  const serialized = `${line.slice(0, -suffix.length)}}`
-  let unsigned: unknown
-  try { unsigned = JSON.parse(serialized) } catch { return false }
-  if (!unsigned || typeof unsigned !== 'object' || Array.isArray(unsigned) || JSON.stringify(unsigned) !== serialized) return false
-  const expected = createHostedDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', unsigned)
-  return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))
-}
-
-function verifyRawReadiness(secret: Uint8Array, serialized: string, proof: string): boolean {
-  const expected = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
-  return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))
-}
-
-function validBootstrapBinding(
-  value: Record<string, unknown>,
-  authority: HostedControlStableAuthority,
-  proofKeyId: string,
-): boolean {
-  const keys = Object.keys(value).sort().join(',')
-  return keys === 'bootId,bootstrapDigest,deploymentId,mountGeneration,ownerArtifactDigest,proofKeyId,workspaceId' &&
-    value.deploymentId === authority.deploymentId && value.bootId === authority.bootId &&
-    value.workspaceId === authority.workspaceId && value.mountGeneration === authority.mountBinding.mountGeneration &&
-    typeof value.bootstrapDigest === 'string' && /^[0-9a-f]{64}$/.test(value.bootstrapDigest) &&
-    typeof value.ownerArtifactDigest === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.ownerArtifactDigest) &&
-    value.proofKeyId === proofKeyId
 }
 
 function taskResultMatchesRequest(
@@ -887,253 +775,4 @@ function sameStableAuthority(
   const { actorId: _, ...stable } = actual
   const { actorId: _ignored, ...stableExpected } = expected as HostedControlAuthority
   return isDeepStrictEqual(stable, stableExpected)
-}
-
-type PublicationProbe = {
-  nonce: Buffer
-  resolve(): void
-  reject(error: unknown): void
-}
-
-function socketPublicationPath(socketPath: string): string {
-  const parent = dirname(socketPath)
-  const publishedName = basename(socketPath)
-  const nameBytes = Buffer.byteLength(publishedName)
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidateName = randomBytes(Math.max(1, Math.ceil(nameBytes * 3 / 4)))
-      .toString('base64url').slice(0, nameBytes)
-    if (candidateName !== publishedName) return join(parent, candidateName)
-  }
-  throw new Error('Hosted control publication socket name could not be allocated')
-}
-
-async function listenLoopback(server: Server): Promise<void> {
-  server.listen({ host: '127.0.0.1', port: 0, exclusive: true })
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => { server.off('listening', onListening); reject(error) }
-    const onListening = () => { server.off('error', onError); resolve() }
-    server.once('error', onError)
-    server.once('listening', onListening)
-  })
-}
-
-async function startSocketBroker(
-  listenPath: string,
-  targetPort: number,
-  token: Buffer,
-): Promise<ChildProcess> {
-  const brokerArgs = [HOSTED_CONTROL_SOCKET_BROKER_FLAG, listenPath, String(targetPort)]
-  const isCompiledBinary = Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length > 0
-  if (!isCompiledBinary) {
-    const entrypoint = process.argv[1]
-    if (!entrypoint) throw new Error('Hosted control socket broker entrypoint is unavailable')
-    if (entrypoint.endsWith('.test.ts')) {
-      brokerArgs.splice(0, 1,
-        new URL('./fixtures/hostedControlSocketBrokerChild.ts', import.meta.url).pathname)
-    } else {
-      brokerArgs.unshift(entrypoint)
-    }
-  }
-  const broker = spawn(process.execPath, brokerArgs, {
-    stdio: ['pipe', 'pipe', 'inherit', 'pipe'],
-  })
-  const tokenPipe = broker.stdio[3]
-  if (!broker.stdin || !broker.stdout || !tokenPipe || !('write' in tokenPipe)) {
-    broker.kill('SIGKILL')
-    throw new Error('Hosted control socket broker pipes are unavailable')
-  }
-  await new Promise<void>((resolve, reject) => {
-    let bytes = Buffer.alloc(0)
-    const timeout = setTimeout(() => finish(new Error('Hosted control socket broker startup timed out')),
-      HOSTED_CONTROL_READ_DEADLINE_MS)
-    const finish = (error?: Error) => {
-      clearTimeout(timeout)
-      broker.stdout?.off('data', onData)
-      tokenPipe.off('error', onTokenError)
-      broker.off('error', onError)
-      broker.off('exit', onExit)
-      if (error) reject(error); else resolve()
-    }
-    const onData = (chunk: Buffer) => {
-      bytes = Buffer.concat([bytes, chunk])
-      if (bytes.byteLength > 256) { finish(new Error('Hosted control socket broker response was oversized')); return }
-      const newline = bytes.indexOf(0x0a)
-      if (newline < 0) return
-      if (newline !== bytes.byteLength - 1 || bytes.toString('utf8', 0, newline) !==
-        '{"schemaVersion":1,"kind":"ready"}') {
-        finish(new Error('Hosted control socket broker response was invalid'))
-        return
-      }
-      finish()
-    }
-    const onError = () => finish(new Error('Hosted control socket broker failed to start'))
-    const onTokenError = () => finish(new Error('Hosted control socket broker credential write failed'))
-    const onExit = () => finish(new Error('Hosted control socket broker exited before readiness'))
-    broker.stdout.on('data', onData)
-    tokenPipe.once('error', onTokenError)
-    broker.once('error', onError)
-    broker.once('exit', onExit)
-    tokenPipe.end(token)
-  }).catch(async error => {
-    await killSocketBroker(broker)
-    throw error
-  })
-  return broker
-}
-
-async function killSocketBroker(broker: ChildProcess): Promise<void> {
-  if (broker.exitCode !== null || broker.signalCode !== null) return
-  const exited = new Promise<void>(resolve => broker.once('exit', () => resolve()))
-  broker.kill('SIGKILL')
-  await exited
-}
-
-async function closeServer(server: Server): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    server.close(error => error ? reject(error) : resolve())
-  })
-}
-
-async function proveSocketPathIsServerOwned(
-  socketPath: string,
-  arm: (probe: PublicationProbe) => void,
-): Promise<void> {
-  const nonce = randomBytes(32)
-  let resolve!: () => void
-  let reject!: (error: unknown) => void
-  const accepted = new Promise<void>((accept, decline) => { resolve = accept; reject = decline })
-  arm({ nonce, resolve, reject })
-  const client = connect(socketPath)
-  const timeout = setTimeout(() => reject(
-    new Error('Hosted control publication ownership proof timed out'),
-  ), HOSTED_CONTROL_READ_DEADLINE_MS)
-  client.once('error', reject)
-  client.end(nonce)
-  await accepted.finally(() => {
-    clearTimeout(timeout)
-    client.destroy()
-  })
-}
-
-function consumePublicationProbe(socket: Socket, probe: PublicationProbe, initialData = Buffer.alloc(0)): void {
-  let bytes = Buffer.from(initialData)
-  socket.setTimeout(HOSTED_CONTROL_READ_DEADLINE_MS, () => {
-    socket.destroy()
-    probe.reject(new Error('Hosted control publication ownership proof timed out'))
-  })
-  socket.on('data', chunk => {
-    bytes = Buffer.concat([bytes, chunk])
-    if (bytes.byteLength > probe.nonce.byteLength) {
-      socket.destroy()
-      probe.reject(new Error('Hosted control publication ownership proof was invalid'))
-    }
-  })
-  socket.once('end', () => {
-    socket.destroy()
-    if (bytes.byteLength === probe.nonce.byteLength && timingSafeEqual(bytes, probe.nonce)) probe.resolve()
-    else probe.reject(new Error('Hosted control publication ownership proof was invalid'))
-  })
-  socket.once('error', probe.reject)
-}
-
-function sameSocketIdentity(
-  stat: Stats,
-  expected: { device: number; inode: number },
-): boolean {
-  return stat.isSocket() && stat.dev === expected.device && stat.ino === expected.inode
-}
-
-async function prepareSocketPath(socketPath: string): Promise<{ device: number; inode: number }> {
-  const parent = dirname(socketPath)
-  await mkdir(parent, { recursive: true, mode: 0o700 })
-  await chmod(parent, 0o700)
-  const handle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0)); const stat = await handle.stat(); await handle.close()
-  const parentIdentity = { device: stat.dev, inode: stat.ino }
-  let existing
-  try { existing = await lstat(socketPath) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return parentIdentity
-    throw error
-  }
-  if (!existing.isSocket() || (existing.mode & 0o077) !== 0 ||
-    (process.getuid?.() !== undefined && existing.uid !== process.getuid?.())) {
-    throw new Error('Refusing to replace an unsafe hosted control socket path')
-  }
-  if (await socketAcceptsConnections(socketPath)) {
-    throw new Error('Refusing to replace an active hosted control socket')
-  }
-  await removeSocketIfIdentityMatches(socketPath, {
-    device: existing.dev, inode: existing.ino,
-  }, parentIdentity)
-  return parentIdentity
-}
-
-async function socketAcceptsConnections(socketPath: string): Promise<boolean> {
-  return new Promise(resolve => {
-    const socket = connect(socketPath)
-    let settled = false
-    const finish = (active: boolean) => {
-      if (settled) return
-      settled = true
-      socket.destroy()
-      resolve(active)
-    }
-    socket.setTimeout(250, () => finish(true))
-    socket.once('connect', () => finish(true))
-    socket.once('error', error => {
-      const code = (error as NodeJS.ErrnoException).code
-      finish(code !== 'ECONNREFUSED' && code !== 'ENOENT')
-    })
-  })
-}
-
-async function removeOwnedSocketPathIfCurrent(
-  socketPath: string,
-  expected: { device: number; inode: number },
-  parentExpected: { device: number; inode: number },
-): Promise<void> {
-  const [socketStat, parentStat] = await Promise.all([
-    lstat(socketPath).catch(() => null),
-    lstat(dirname(socketPath)).catch(() => null),
-  ])
-  if (!socketStat || !parentStat?.isDirectory() || parentStat.isSymbolicLink() ||
-    parentStat.dev !== parentExpected.device || parentStat.ino !== parentExpected.inode ||
-    !sameSocketIdentity(socketStat, expected)) return
-  await removeSocketIfIdentityMatches(socketPath, expected, parentExpected)
-}
-
-/** Atomically quarantines the path, then deletes only the admitted inode. */
-async function removeSocketIfIdentityMatches(
-  socketPath: string,
-  expected: { device: number; inode: number },
-  parentExpected: { device: number; inode: number },
-): Promise<void> {
-  const parent = dirname(socketPath)
-  const quarantine = join(parent, `.${basename(socketPath)}.reclaim-${process.pid}-${randomBytes(16).toString('hex')}`)
-  const parentBefore = await lstat(parent)
-  if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
-    parentBefore.dev !== parentExpected.device || parentBefore.ino !== parentExpected.inode) {
-    throw new Error('Hosted control socket parent was substituted')
-  }
-  try { await rename(socketPath, quarantine) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-    throw error
-  }
-  const moved = await lstat(quarantine).catch(() => null)
-  const parentAfter = await lstat(parent).catch(() => null)
-  const movedMatches = !!moved?.isSocket() && moved.dev === expected.device && moved.ino === expected.inode
-  const parentMatches = !!parentAfter?.isDirectory() && !parentAfter.isSymbolicLink() &&
-    parentAfter.dev === parentExpected.device && parentAfter.ino === parentExpected.inode
-  if (!movedMatches || !parentMatches) {
-    // Never let restoration overwrite a replacement that appeared after the
-    // quarantine rename. A hard link is an atomic no-replace restoration of
-    // the exact inode; if the original name is occupied, preserve both names.
-    if (parentMatches) {
-      await link(quarantine, socketPath).then(
-        () => unlink(quarantine),
-        () => undefined,
-      ).catch(() => undefined)
-    }
-    throw new Error('Hosted control socket changed during inode-safe removal')
-  }
-  await unlink(quarantine)
 }
