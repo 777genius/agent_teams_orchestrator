@@ -101,14 +101,16 @@ describe('OpenCode bounded raw retention', () => {
     const pending = port.retainRequest(port.bindOperation({ kind: 'capability' }), {
       method: 'GET', path: '/', bytes: Buffer.alloc(0),
     })
-    const failure = expect(pending).rejects.toThrow('append failed')
+    const failure = pending.then(() => null, error => error)
     await started
     sink.write = async (_bytes, _offset, length) => length
     sink.sync = async () => {}
     sink.isCurrent = () => true
     encoded.recordId = 'b'.repeat(64)
     release()
-    await failure
+    const error = await failure
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toContain('append failed')
     expect(syncs).toBe(1)
     expect(port.isCurrent()).toBe(false)
     await port.close()
