@@ -1577,6 +1577,38 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(paged.ok && paged.value.totalCount).toBe(result.value.totalCount)
   })
 
+  test('allows slow summary profile preparation without starting a host or losing connections', async () => {
+    let hostStarts = 0
+    const projectPath = '/tmp/summary-slow-profile-sandbox'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          expect(options?.mode).toBe('summary')
+          // A real cold profile exceeded the former eight-second total budget.
+          await new Promise(resolve => setTimeout(resolve, 8_100))
+          return inventory({
+            projectPath,
+            connectedProviders: [{
+              id: 'openrouter', source: 'credentials', authHint: 'api', credentialScopes: ['local'],
+            }],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => { hostStarts += 1; throw new Error('Summary must not start a host') },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => { throw new Error('Summary must not read a live catalog') },
+      },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, summary: true })
+    expect(hostStarts).toBe(0)
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.value.entries.find(entry => entry.providerId === 'openrouter')?.state)
+      .toBe('connected')
+  }, 15_000)
+
   test('does not infer companion connectivity from summary config alone', async () => {
     let ensureHostCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({

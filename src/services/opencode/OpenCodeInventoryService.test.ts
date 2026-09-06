@@ -124,6 +124,9 @@ describe('OpenCodeInventoryService parsers', () => {
   })
 
   test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
+    expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      OPEN_CODE_PROBE_TIMEOUT_MS * 3,
+    )
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
       OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
     )
