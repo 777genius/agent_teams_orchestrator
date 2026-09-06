@@ -78,10 +78,12 @@ export class HostedApprovalOwnerPublicationError extends Error {
   ) { super(message, options); this.name = 'HostedApprovalOwnerPublicationError' }
 }
 
+type WalFileIdentity = { dev: number | bigint; ino: number | bigint }
 type LockedWalSnapshot = {
   state: HostedApprovalOwnerState | null
   raw: Buffer | null
   stored: Record<string, unknown> | null
+  identity: WalFileIdentity | null
 }
 
 const MAX_BYTES = 32 * 1024 * 1024
@@ -257,12 +259,14 @@ export class HostedApprovalOwnerWal {
   #activeParentHandle: FileHandle | null = null
   #activeSnapshot: LockedWalSnapshot | null = null
   #activePublished = false
+  #publicationCaptureFailed = false
   readonly #writerContext = new AsyncLocalStorage<symbol>()
   readonly fencePath: string
   readonly lockPath: string
   constructor(readonly path: string, private readonly testHooks?: {
     afterFenceOpen?: () => Promise<void>
     afterWalRename?: () => Promise<void>
+    closeWalTemp?: (fd: number) => void
     afterFenceTempFsync?: () => Promise<void>
     afterFenceLink?: () => Promise<void>
     beforeRetainedCreate?: () => void
@@ -304,7 +308,7 @@ export class HostedApprovalOwnerWal {
       const result = await this.#writerContext.run(writer, async () => {
         const value = await operation(state)
         if (!(await this.ownsCurrentFence())) {
-          try { this.publicationProducer?.poison('owner-wal-final-fence-lost') } catch { /* fence error remains authoritative */ }
+          this.#invalidatePublicationCapture('owner-wal-final-fence-lost')
           if (this.#activePublished) throw new HostedApprovalOwnerPublicationError(
             'replacement-uncertain', 'Hosted approval writer fence changed after publication',
           )
@@ -359,7 +363,7 @@ export class HostedApprovalOwnerWal {
   }
 
   #readPinnedSnapshot(parent: FileHandle): LockedWalSnapshot {
-    if (!existsAt(parent.fd, basename(this.path))) return { state: null, raw: null, stored: null }
+    if (!existsAt(parent.fd, basename(this.path))) return { state: null, raw: null, stored: null, identity: null }
     const fd = openAt(parent.fd, basename(this.path), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
     try {
       const stat = fstatSync(fd)
@@ -370,7 +374,7 @@ export class HostedApprovalOwnerWal {
       // Custody P before any parser or migration can transform its meaning.
       const retainedRaw = Buffer.from(raw)
       const state = parseOwnerStateSource(retainedRaw)
-      return { state, raw: retainedRaw, stored: parseStoredOwnerState(retainedRaw) }
+      return { state, raw: retainedRaw, stored: parseStoredOwnerState(retainedRaw), identity: { dev: stat.dev, ino: stat.ino } }
     } finally { closeSync(fd) }
   }
 
@@ -389,8 +393,16 @@ export class HostedApprovalOwnerWal {
 
   /** Invalidates an active capture when authority fails after a real publication. */
   poisonPublicationCapture(reason: string): void {
-    if (!this.#activePublished || !this.publicationProducer) return
-    this.publicationProducer.poison(reason)
+    if (this.#activePublished) this.#invalidatePublicationCapture(reason)
+  }
+
+  /** Capture failure revokes local effect authority for this WAL's lifetime, not reconciliation reads. */
+  isPublicationCaptureCurrent(): boolean { return !this.#publicationCaptureFailed }
+
+  #invalidatePublicationCapture(reason: string): void {
+    if (!this.publicationProducer) return
+    this.#publicationCaptureFailed = true
+    try { this.publicationProducer.poison(reason) } catch { /* local revocation survives producer/caller error handling */ }
   }
 
   async #publish(
@@ -398,6 +410,9 @@ export class HostedApprovalOwnerWal {
     next: Omit<HostedApprovalOwnerState, 'revision' | 'writerFence'> & Partial<Pick<HostedApprovalOwnerState, 'writerFence'>>,
     intent: OwnerWalMutationIntent | null,
   ): Promise<HostedApprovalOwnerWalPublishResult> {
+    if (!this.isPublicationCaptureCurrent()) {
+      throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL capture poisoned')
+    }
     if (!this.#activeWriter || !this.#activeFenceIdentity || this.#writerContext.getStore() !== this.#activeWriter) {
       throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL publish requires writer fence')
     }
@@ -405,7 +420,8 @@ export class HostedApprovalOwnerWal {
     const activeSnapshot = this.#activeSnapshot
     if (!activeSnapshot) throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL retained predecessor unavailable')
     const current = this.#readPinnedSnapshot(this.#activeParentHandle!)
-    if (!isDeepStrictEqual(current.state, previous) || !sameOptionalBytes(current.raw, activeSnapshot.raw)) {
+    if (!isDeepStrictEqual(current.state, previous) || !sameOptionalBytes(current.raw, activeSnapshot.raw) ||
+      !isDeepStrictEqual(current.identity, activeSnapshot.identity)) {
       throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL compare-and-swap conflict')
     }
     let state: HostedApprovalOwnerState
@@ -430,16 +446,20 @@ export class HostedApprovalOwnerWal {
           : { kind: 'absent' }
         validateMutationWitness(intent, previous, next)
         native = ownerWalNative(activeSnapshot, state, bytes, intent)
-        prepared = this.publicationProducer.prepare({ intent, native, previous: previousImage, next: nextImage })
+        try { prepared = this.publicationProducer.prepare({ intent, native, previous: previousImage, next: nextImage }) } catch (error) {
+          this.#invalidatePublicationCapture('owner-wal-capture-prepare-failed')
+          throw error
+        }
       }
     } catch (error) {
       throw new HostedApprovalOwnerPublicationError('definitely-not-replaced',
         error instanceof Error ? error.message : 'Hosted approval WAL publication preparation failed', { cause: error })
     }
-    try { await this.#publishExact(bytes) } catch (error) {
+    let identity: WalFileIdentity
+    try { identity = await this.#publishExact(bytes) } catch (error) {
       if (error instanceof HostedApprovalOwnerPublicationError) {
         if (error.stage === 'replacement-uncertain') {
-          try { this.publicationProducer?.poison('owner-wal-replacement-uncertain') } catch { /* retain typed stage */ }
+          this.#invalidatePublicationCapture('owner-wal-replacement-uncertain')
         }
         throw error
       }
@@ -447,14 +467,14 @@ export class HostedApprovalOwnerWal {
     }
     this.#activePublished = true
     if (!(await this.ownsCurrentFence())) {
-      try { this.publicationProducer?.poison('owner-wal-final-fence-lost') } catch { /* retain typed stage */ }
+      this.#invalidatePublicationCapture('owner-wal-final-fence-lost')
       throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval writer fence changed after publication')
     }
-    this.#activeSnapshot = { state, raw: Buffer.from(bytes), stored: JSON.parse(bytes.toString('utf8')) as Record<string, unknown> }
+    this.#activeSnapshot = { state, raw: Buffer.from(bytes), stored: JSON.parse(bytes.toString('utf8')) as Record<string, unknown>, identity }
     let publication: BoundWalPublication | null = null
     if (prepared) {
       try { publication = prepared.emit() } catch (error) {
-        try { this.publicationProducer!.poison('owner-wal-published-capture-failed') } catch { /* preserve typed stage */ }
+        this.#invalidatePublicationCapture('owner-wal-published-capture-failed')
         throw new HostedApprovalOwnerPublicationError('published-capture-failed', 'Hosted approval WAL published but native capture failed', { cause: error })
       }
     }
@@ -466,8 +486,9 @@ export class HostedApprovalOwnerWal {
    * parent directory, and SQLite writer-fence incarnation owned by this writer.
    */
   async prepareEffectToken(expected: HostedApprovalOwnerState): Promise<{ consume(): boolean } | null> {
-    if (!this.#activeWriter || !this.#activeFenceIdentity ||
-      this.#writerContext.getStore() !== this.#activeWriter || !(await this.ownsCurrentFence())) return null
+    if (!this.isPublicationCaptureCurrent() || !this.#activeWriter || !this.#activeFenceIdentity ||
+      this.#writerContext.getStore() !== this.#activeWriter || !(await this.ownsCurrentFence()) ||
+      !this.isPublicationCaptureCurrent()) return null
     const expectedBytes = Buffer.from(`${JSON.stringify(expected)}\n`)
     const activeParent = this.#activeParentHandle
     let parentFd = -1; let walFd = -1
@@ -497,6 +518,7 @@ export class HostedApprovalOwnerWal {
           if (consumed) return false
           consumed = true
           try {
+            if (!this.isPublicationCaptureCurrent()) return false
             const currentParent = fstatSync(ownedParentFd)
             const currentLinkedParent = lstatSync(dirname(this.path))
             const currentWal = fstatSync(ownedWalFd)
@@ -538,7 +560,7 @@ export class HostedApprovalOwnerWal {
     }
   }
 
-  async #publishExact(bytes: Uint8Array): Promise<void> {
+  async #publishExact(bytes: Uint8Array): Promise<WalFileIdentity> {
     const directory = dirname(this.path)
     const parent = this.#activeParentHandle
     if (!parent) throw new Error('Hosted approval WAL parent authority unavailable')
@@ -547,51 +569,57 @@ export class HostedApprovalOwnerWal {
     let tempFd = -1
     let renamed = false
     try {
-      const parentIdentity = await parent.stat(); const linkedParent = await lstat(directory)
-      if (!safeDirectoryIdentity(parentIdentity, linkedParent)) throw new Error('Unsafe hosted approval WAL directory')
-      tempFd = createPathInPinnedParent(
-        parent.fd, directory, tempName, this.testHooks?.beforeRetainedCreate, this.testHooks?.afterRetainedCreate,
-      )
-      const encoded = Buffer.from(bytes)
-      if (writeSync(tempFd, encoded, 0, encoded.length, 0) !== encoded.length) throw new Error('Hosted approval WAL short write')
-      const written = fstatSync(tempFd)
-      if (!written.isFile() || (written.mode & 0o077) !== 0 || written.size !== encoded.length) {
-        throw new Error('Unsafe hosted approval WAL temporary image')
-      }
-      fsyncSync(tempFd)
-      renameAt(parent.fd, tempName, walName); renamed = true
-      try { await this.testHooks?.afterWalRename?.() } catch (error) {
-        throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL replacement uncertain', { cause: error })
-      }
-      const currentWritten = fstatSync(tempFd)
-      const publishedFd = openAt(parent.fd, walName, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-      const linkedWal = fstatSync(publishedFd)
-      closeSync(publishedFd)
-      if (currentWritten.dev !== linkedWal.dev || currentWritten.ino !== linkedWal.ino) {
-        throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL publication substituted')
-      }
-      const exact = readExactFd(tempFd, encoded.length)
-      if (!exact?.equals(encoded)) {
-        throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL publication bytes changed')
-      }
-      await parent.sync()
-      const finalWritten = fstatSync(tempFd)
-      const finalFd = openAt(parent.fd, walName, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-      const finalWal = fstatSync(finalFd)
-      closeSync(finalFd)
-      if (finalWritten.dev !== finalWal.dev || finalWritten.ino !== finalWal.ino) {
-        throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL durability edge substituted')
+      try {
+        const parentIdentity = await parent.stat(); const linkedParent = await lstat(directory)
+        if (!safeDirectoryIdentity(parentIdentity, linkedParent)) throw new Error('Unsafe hosted approval WAL directory')
+        tempFd = createPathInPinnedParent(
+          parent.fd, directory, tempName, this.testHooks?.beforeRetainedCreate, this.testHooks?.afterRetainedCreate,
+        )
+        const encoded = Buffer.from(bytes)
+        if (writeSync(tempFd, encoded, 0, encoded.length, 0) !== encoded.length) throw new Error('Hosted approval WAL short write')
+        const written = fstatSync(tempFd)
+        if (!written.isFile() || (written.mode & 0o077) !== 0 || written.size !== encoded.length) {
+          throw new Error('Unsafe hosted approval WAL temporary image')
+        }
+        fsyncSync(tempFd)
+        renameAt(parent.fd, tempName, walName); renamed = true
+        try { await this.testHooks?.afterWalRename?.() } catch (error) {
+          throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL replacement uncertain', { cause: error })
+        }
+        const currentWritten = fstatSync(tempFd)
+        const publishedFd = openAt(parent.fd, walName, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        const linkedWal = fstatSync(publishedFd)
+        closeSync(publishedFd)
+        if (currentWritten.dev !== linkedWal.dev || currentWritten.ino !== linkedWal.ino) {
+          throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL publication substituted')
+        }
+        const exact = readExactFd(tempFd, encoded.length)
+        if (!exact?.equals(encoded)) {
+          throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL publication bytes changed')
+        }
+        await parent.sync()
+        const finalWritten = fstatSync(tempFd)
+        const finalFd = openAt(parent.fd, walName, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        const finalWal = fstatSync(finalFd)
+        closeSync(finalFd)
+        if (finalWritten.dev !== finalWal.dev || finalWritten.ino !== finalWal.ino) {
+          throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL durability edge substituted')
+        }
+        return { dev: finalWritten.dev, ino: finalWritten.ino }
+      } finally {
+        // Cleanup participates in the same replacement-stage boundary as I/O.
+        // A close failure after rename cannot prove that N was never installed.
+        try { if (tempFd >= 0) (this.testHooks?.closeWalTemp ?? closeSync)(tempFd) } finally {
+          if (!renamed && existsAt(parent.fd, tempName)) {
+            try { unlinkAt(parent.fd, tempName) } catch { /* best-effort cleanup in the owned namespace */ }
+          }
+        }
       }
     } catch (error) {
       if (renamed && !(error instanceof HostedApprovalOwnerPublicationError)) {
         throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL replacement uncertain', { cause: error })
       }
       throw error
-    } finally {
-      if (tempFd >= 0) closeSync(tempFd)
-      if (!renamed && existsAt(parent.fd, tempName)) {
-        try { unlinkAt(parent.fd, tempName) } catch { /* best-effort cleanup in the owned namespace */ }
-      }
     }
   }
 
@@ -900,20 +928,32 @@ function validateMutationWitness(
     case 'ingress-lease-claimed':
       if (!('records' in intent) || !previous || !sameProposedExcept(previous, proposed, ['ingress']) ||
         intent.records.length === 0 || intent.records.length !== intent.mutation.claims.length ||
+        new Set(intent.records.map(record => record.outboxId)).size !== intent.records.length ||
+        !isDeepStrictEqual(intent.records.map(record => record.outboxId), previous.ingress
+          .filter(record => intent.records.some(changed => changed.outboxId === record.outboxId)).map(record => record.outboxId)) ||
         !isDeepStrictEqual(proposed.ingress, previous.ingress.map(record =>
           intent.records.find(changed => changed.outboxId === record.outboxId) ?? record)) || intent.records.some((record, index) =>
-          !proposed.ingress.some(nextRecord => isDeepStrictEqual(nextRecord, record)) || !record.lease ||
+          !validLeaseClaim(previous.ingress.find(old => old.outboxId === record.outboxId), record) || !record.lease ||
           !isDeepStrictEqual(intent.mutation.claims[index], { outboxId: record.outboxId, ...record.lease }))) {
         throw new Error('Hosted approval claim publication witness mismatch')
       }
       return
-    case 'ingress-acknowledged':
-      if (!('request' in intent) || !previous || !sameProposedExcept(previous, proposed, ['ingress']) ||
-        intent.record.acknowledgedAtIso === null || intent.record.outboxId !== intent.request.outboxId ||
-        proposed.ingress.length !== previous.ingress.length || proposed.ingress.filter((record, index) =>
-          !isDeepStrictEqual(record, previous.ingress[index])).length !== 1 ||
-        !proposed.ingress.some(record => isDeepStrictEqual(record, intent.record))) throw new Error('Hosted approval acknowledgement publication witness mismatch')
+    case 'ingress-acknowledged': {
+      if (!('request' in intent)) throw new Error('Hosted approval acknowledgement publication witness mismatch')
+      const old = previous?.ingress.find(record => record.outboxId === intent.request.outboxId)
+      const lease = old?.lease
+      const acknowledgedAt = Date.parse(intent.record.acknowledgedAtIso ?? '')
+      if (!previous || !old || !lease || !sameProposedExcept(previous, proposed, ['ingress']) ||
+        old.acknowledgedAtIso !== null || !Number.isFinite(acknowledgedAt) ||
+        lease.generation !== intent.request.generation || lease.ownerId !== intent.request.ownerId ||
+        lease.leaseToken !== intent.request.leaseToken || acknowledgedAt < Date.parse(lease.claimedAtIso) ||
+        acknowledgedAt >= Date.parse(lease.leaseExpiresAtIso) ||
+        !isDeepStrictEqual(intent.record, { ...old, acknowledgedAtIso: intent.record.acknowledgedAtIso }) ||
+        !isDeepStrictEqual(proposed.ingress, previous.ingress.map(record => record === old ? intent.record : record))) {
+        throw new Error('Hosted approval acknowledgement publication witness mismatch')
+      }
       return
+    }
     case 'delivery-started':
       if (!('delivery' in intent) || !previous || !sameProposedExcept(previous, proposed, ['deliveries']) ||
         intent.delivery.phase !== 'started' || intent.delivery.result !== null ||
@@ -936,11 +976,20 @@ function validSettlementTransition(
   proposed: readonly HostedApprovalDeliveryState[],
   delivery: HostedApprovalDeliveryState,
 ): boolean {
-  if (proposed.length === previous.length + 1) return isDeepStrictEqual(proposed, [...previous, delivery])
+  if (proposed.length === previous.length + 1) return delivery.phase === 'rejected' &&
+    isDeepStrictEqual(proposed, [...previous, delivery])
   if (proposed.length !== previous.length) return false
   const index = previous.findIndex(item => item.providerDeliveryId === delivery.providerDeliveryId)
   if (index < 0 || previous[index]!.phase !== 'started') return false
+  if (!isDeepStrictEqual(delivery, { ...previous[index]!, phase: delivery.phase, result: delivery.result })) return false
   return isDeepStrictEqual(proposed, previous.map((item, itemIndex) => itemIndex === index ? delivery : item))
+}
+
+function validLeaseClaim(previous: HostedApprovalIngressRecord | undefined, next: HostedApprovalIngressRecord): boolean {
+  return !!previous && previous.acknowledgedAtIso === null && !!next.lease &&
+    next.lease.generation === (previous.lease?.generation ?? 0) + 1 &&
+    (!previous.lease || Date.parse(previous.lease.leaseExpiresAtIso) <= Date.parse(next.lease.claimedAtIso)) &&
+    isDeepStrictEqual(next, { ...previous, lease: next.lease })
 }
 
 function sameProposedExcept(

@@ -118,7 +118,14 @@ export function createOwnerOperationNonce(): string { return randomBytes(32).toS
 export function retainedWalImage(bytes: Uint8Array): RetainedWalImage {
   const owned = Uint8Array.from(bytes)
   if (owned.byteLength < 2 || owned.byteLength > 32 * 1024 * 1024) throw new RangeError('Hosted approval retained WAL image out of bounds')
-  return Object.freeze({ byteSize: owned.byteLength, sha256: sha256(owned), bytes: owned })
+  // Typed-array elements remain writable under a frozen wrapper. Never expose
+  // the private preimage; every reader owns its returned byte copy.
+  return Object.freeze({ byteSize: owned.byteLength, sha256: sha256(owned), get bytes() { return Uint8Array.from(owned) } })
+}
+
+function copyPreviousImage(previous: PreviousWalImage): PreviousWalImage {
+  return previous.kind === 'absent' ? Object.freeze({ kind: 'absent' }) :
+    Object.freeze({ kind: 'retained', image: retainedWalImage(previous.image.bytes) })
 }
 
 export function createOwnerWalPublicationProducerFromEnvironment(options: Readonly<{
@@ -187,7 +194,10 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
     const emissionNonce = this.#nextEmissionNonce()
     const line = this.#line('owner-wal-published', input.intent.operationNonce, input.native, sequence, emissionNonce)
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new RangeError('owner-provenance-line-bounded')
-    const custody = this.imageCustodian.prepare(input.previous, input.next)
+    // Keep receipt ownership separate from both caller and custody ownership.
+    const previous = copyPreviousImage(input.previous)
+    const next = retainedWalImage(input.next.bytes)
+    const custody = this.imageCustodian.prepare(copyPreviousImage(previous), retainedWalImage(next.bytes))
     let used = false
     return Object.freeze({ emit: () => {
       if (used || sequence !== this.#sequence) return this.poison('owner-provenance-prepared-publication-stale')
@@ -196,12 +206,12 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
       const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce: input.intent.operationNonce, emissionNonce, sequence, lineSha256 })
       let bound: Readonly<{ previous: PreviousWalImage; next: RetainedWalImage }>
       try { bound = custody.bind(emission) } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-image-bind') }
-      if (!sameRetainedImage(bound.next, input.next) ||
-        bound.previous.kind !== input.previous.kind || bound.previous.kind === 'retained' && input.previous.kind === 'retained' &&
-          !sameRetainedImage(bound.previous.image, input.previous.image)) {
+      if (!sameRetainedImage(bound.next, next) ||
+        bound.previous.kind !== previous.kind || bound.previous.kind === 'retained' && previous.kind === 'retained' &&
+          !sameRetainedImage(bound.previous.image, previous.image)) {
         return this.poison('owner-provenance-image-custody-mismatch')
       }
-      return Object.freeze({ native: input.native, previous: bound.previous, next: bound.next, emission })
+      return Object.freeze({ native: input.native, previous, next, emission })
     } })
   }
   poison(reason: string): never {
@@ -350,8 +360,9 @@ function canonicalJson(value: unknown): string {
 }
 function sha256(bytes: string | Uint8Array): string { return createHash('sha256').update(bytes).digest('hex') }
 function sameRetainedImage(left: RetainedWalImage, right: RetainedWalImage): boolean {
-  return left.byteSize === left.bytes.byteLength && left.sha256 === sha256(left.bytes) &&
-    left.byteSize === right.byteSize && left.sha256 === right.sha256 && Buffer.from(left.bytes).equals(Buffer.from(right.bytes))
+  const leftBytes = left.bytes; const rightBytes = right.bytes
+  return left.byteSize === leftBytes.byteLength && left.sha256 === sha256(leftBytes) &&
+    left.byteSize === right.byteSize && left.sha256 === right.sha256 && Buffer.from(leftBytes).equals(Buffer.from(rightBytes))
 }
 function identifyFile(path: string): { dev: string; ino: string; sha256: string } {
   const fd = openSync(path, constants.O_RDONLY)

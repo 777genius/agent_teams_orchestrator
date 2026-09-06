@@ -42,9 +42,11 @@ export class HostedApprovalOwnerStore {
         actorMembers: { ...admission.actorMembers }, ingress, retiredIngress,
         bindings: state?.bindings ?? [], deliveries: state?.deliveries ?? [],
       }, { operationNonce, mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission })
-      if (!(await admission.isCurrent())) {
+      try {
+        if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
+      } catch (error) {
         try { this.wal.poisonPublicationCapture('owner-wal-admission-lost-after-publication') } catch { /* admission failure remains authoritative */ }
-        throw new Error('Hosted approval admission changed during recovery')
+        throw error
       }
       return published.state
     })

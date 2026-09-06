@@ -37,7 +37,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     try {
       if (!(await this.#authorityCurrent())) return false
       const state = await this.options.store.read()
-      return !!state &&
+      return this.options.store.wal.isPublicationCaptureCurrent() && !!state &&
         state.admissionGeneration === this.options.admission.admissionGeneration &&
         state.admissionDigest === this.options.admission.digest &&
         isDeepStrictEqual(state.routes, this.options.admission.routes) &&
@@ -209,7 +209,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     request: Parameters<HostedApprovalWirePort['reconcileDecision']>[0],
   ): Promise<HostedApprovalReconciliationResult> {
     if (request.partition.teamId !== this.options.admission.outerAuthority.teamId ||
-      !(await this.#authorityCurrent())) return { status: 'unavailable' }
+      !(await this.#admissionAuthorityCurrent())) return { status: 'unavailable' }
     try {
       return await this.options.store.reconcileDecision(request, this.options.admission)
     } catch {
@@ -218,6 +218,10 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
   }
 
   async #authorityCurrent(): Promise<boolean> {
+    return this.options.store.wal.isPublicationCaptureCurrent() &&
+      await this.#admissionAuthorityCurrent() && this.options.store.wal.isPublicationCaptureCurrent()
+  }
+  async #admissionAuthorityCurrent(): Promise<boolean> {
     try {
       return await this.options.isCurrentOuterAuthority() && await this.options.admission.isCurrent()
     } catch { return false }

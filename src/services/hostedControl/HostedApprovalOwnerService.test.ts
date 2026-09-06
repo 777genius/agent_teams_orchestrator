@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { closeSync } from 'node:fs'
 import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -9,7 +10,7 @@ import { fingerprintHostedApprovalDelivery, type HostedApprovalDeliveryRequest }
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
-import { HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, type OwnerWalMutation, type OwnerWalPublicationProducer } from './HostedApprovalOwnerProvenance.js'
+import { createOwnerWalPublicationProducerFromEnvironment, HOSTED_OWNER_PROVENANCE_CONTRACT, HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256, HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, type OwnerWalMutation, type OwnerWalPublicationProducer } from './HostedApprovalOwnerProvenance.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import type {
   HostedApprovalObservedPermission,
@@ -351,35 +352,57 @@ describe('HostedApprovalOwnerService R2', () => {
     expect(effects).toBe(0)
   })
 
-  test('post-publication started capture failure enters reconciliation-only before provider invocation', async () => {
+  test.each(['capture-sync', 'cleanup-close'] as const)('started %s failure revokes readiness and effect authority but preserves reconciliation', async failure => {
     let poisoned = false; let effects = 0
-    const publicationProducer: OwnerWalPublicationProducer = {
-      prepare(input) {
-        if (poisoned) throw new Error('capture poisoned')
-        return { emit: () => {
-          if (input.intent.mutation.kind === 'delivery-started') throw new Error('capture sync failed')
-          return { native: input.native, previous: input.previous, next: input.next, emission: {
-            stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
-              artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64), pid: process.pid,
-              startTicks: '1', exeDev: '1', exeIno: '1' }, activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
-            descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
-            emissionNonce: '6'.repeat(64), sequence: 1, lineSha256: '7'.repeat(64),
-          } }
-        } }
+    let armed = false; let nonce = 0; const chunks: Buffer[] = []
+    const publicationProducer = createOwnerWalPublicationProducerFromEnvironment({
+      environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
+        activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+        contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+        expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
+          implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+        producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
+      }) }, modulePath: '/unused',
+      imageCustodian: { prepare: (previous, next) => ({ bind: () => ({ previous, next }) }) },
+      operations: {
+        identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11', exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+        descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+        nonce: () => (++nonce).toString(16).padStart(64, '0'),
+        write: (_fd, bytes, offset) => { chunks.push(Buffer.from(bytes.subarray(offset))); return bytes.byteLength - offset },
+        sync: () => { if (armed && failure === 'capture-sync') throw new Error('capture sync failed') }, close: () => {},
       },
-      poison(reason): never { poisoned = true; throw new Error(reason) }, close() {},
-    }
-    const fx = await fixture({ publicationProducer, deliver: () => { effects += 1; return 'delivered' } })
+      onPoison: () => { poisoned = true },
+    })!
+    const fx = await fixture({ publicationProducer, deliver: () => { effects += 1; return 'delivered' },
+      walHooks: { closeWalTemp(fd) { closeSync(fd); if (armed && failure === 'cleanup-close') throw new Error('close failed') } },
+    })
     const [record] = await fx.service.claimIngress({
       request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 }, maximumAggregateBytes: 1_000_000,
     })
     const request = delivery(record!)
+    expect(await fx.service.isAdmissionRecoveredCurrent()).toBe(true)
+    armed = true
     expect(await runDelivery(fx.service, request, record!.authority)).toEqual({
       status: 'operator_required', reconciliationRef: request.reconciliationRef,
     })
     expect(effects).toBe(0)
     expect(poisoned).toBe(true)
     expect((await fx.store.read())?.deliveries).toMatchObject([{ phase: 'started', result: null }])
+    expect(await fx.service.isAdmissionRecoveredCurrent()).toBe(false)
+    await fx.store.wal.locked(async current => {
+      expect(await fx.store.wal.ownsCurrentFence()).toBe(true)
+      expect(await fx.store.wal.prepareEffectToken(current!)).toBeNull()
+    })
+    const durable = await readFile(fx.store.wal.path); const appended = chunks.length
+    await fx.service.recoverStateOnly() // unchanged admission is a nonpublishing read
+    expect(await fx.service.isAdmissionRecoveredCurrent()).toBe(false)
+    expect(await fx.service.authorizeDecision({ request, payloadFingerprint: fingerprintHostedApprovalDelivery(request) }))
+      .toEqual({ status: 'unavailable' })
+    expect(await fx.service.reconcileDecision({ reconciliationRef: request.reconciliationRef,
+      providerDeliveryId: request.providerDeliveryId, partition: request.partition })).toEqual({ status: 'operator_required' })
+    expect(effects).toBe(0)
+    expect(chunks).toHaveLength(appended)
+    expect(await readFile(fx.store.wal.path)).toEqual(durable)
   })
 
   test('a settlement pre-replace failure preserves delivered uncertainty and prevents retry after recovery', async () => {

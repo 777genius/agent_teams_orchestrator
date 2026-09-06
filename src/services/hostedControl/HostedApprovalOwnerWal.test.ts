@@ -18,6 +18,8 @@ import {
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
   type BoundWalPublication,
   type OwnerWalNative,
+  type PreviousWalImage,
+  type RetainedWalImage,
   type OwnerWalPublicationProducer,
 } from './HostedApprovalOwnerProvenance.js'
 import {
@@ -477,23 +479,270 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     expect(lines[1].previousRecordSha256).toBe(createHash('sha256').update(`${JSON.stringify(lines[0])}\n`).digest('hex'))
   })
 
-  test('poisons capture after durable publication failure and cannot retry from old authority', async () => {
-    const { path } = await walPath(); let poisoned = false; let prepares = 0
-    const producer: OwnerWalPublicationProducer = {
-      prepare() { if (poisoned) throw new Error('poisoned'); prepares += 1; return { emit: () => { throw new Error('capture sync failed') } } },
-      poison(reason): never { poisoned = true; throw new Error(reason) }, close() {},
-    }
+  test('cleanup close failure after directory sync preserves replacement uncertainty and poisons capture', async () => {
+    const { path } = await walPath(); const capture = publicationCapture(path)
+    let closed = false
+    const wal = new HostedApprovalOwnerWal(path, { closeWalTemp(fd) {
+      closeSync(fd); closed = true; throw new Error('temporary descriptor close failed')
+    } }, capture.producer)
+    const store = new HostedApprovalOwnerStore(wal)
+    await expect(store.reconcileAdmission(admissionFixture())).rejects.toMatchObject({ stage: 'replacement-uncertain' })
+    expect(closed).toBe(true)
+    const durable = await readFile(path)
+    expect(JSON.parse(durable.toString()).revision).toBe(1)
+    expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open'])
+    expect(wal.isPublicationCaptureCurrent()).toBe(false)
+    await wal.locked(async current => { expect(await wal.prepareEffectToken(current!)).toBeNull() })
+    expect(await readFile(path)).toEqual(durable)
+  })
+
+  test('byte-identical predecessor inode substitution fails CAS without emitting or replacing it', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const bytes = await readFile(path); const initialInode = (await lstat(path)).ino
+    let replacementInode = 0
+    await expect(wal.locked(async current => {
+      await writeFile(`${path}.replacement`, bytes, { mode: 0o600 })
+      await rename(`${path}.replacement`, path)
+      replacementInode = (await lstat(path)).ino
+      return wal.publishMutation(current, { ...withoutRevision(current!), admissionDigest: 'd'.repeat(64) }, {
+        operationNonce: 'e'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
+        admission: { ...admissionFixture(), digest: 'd'.repeat(64) },
+      })
+    })).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval WAL compare-and-swap conflict' })
+    expect(replacementInode).not.toBe(initialInode)
+    expect((await lstat(path)).ino).toBe(replacementInode)
+    expect(await readFile(path)).toEqual(bytes)
+    expect(capture.prepared).toBeUndefined()
+    expect(capture.lines).toHaveLength(1)
+    capture.producer.close()
+  })
+
+  test('advances predecessor inode and raw P for two native publications within one lock', async () => {
+    const { path } = await walPath(); const capture = publicationCapture(path)
+    const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
     const admission = admissionFixture()
-    const wal = new HostedApprovalOwnerWal(path, undefined, producer)
+    await wal.locked(async current => {
+      const first = await wal.publishMutation(current, {
+        ...withoutRevision(state()), ingress: [], bindings: [],
+      }, { operationNonce: 'a'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission })
+      const firstBytes = await readFile(path); const firstInode = (await lstat(path)).ino
+      const second = await wal.publishMutation(first.state, { ...withoutRevision(first.state), admissionDigest: 'd'.repeat(64) }, {
+        operationNonce: 'b'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
+        admission: { ...admission, digest: 'd'.repeat(64) },
+      })
+      expect(second.state.revision).toBe(2)
+      expect((await lstat(path)).ino).not.toBe(firstInode)
+      expect(capture.bound!.previous.kind).toBe('retained')
+      if (capture.bound!.previous.kind === 'retained') expect(Buffer.from(capture.bound!.previous.image.bytes)).toEqual(firstBytes)
+    })
+    expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published', 'owner-wal-published'])
+    expect(capture.lines[2].previousRecordSha256).toBe(createHash('sha256').update(`${JSON.stringify(capture.lines[1])}\n`).digest('hex'))
+    capture.producer.close()
+  })
+
+  test('custody and caller byte aliases cannot alter either bound retained preimage', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const previousBytes = await readFile(path)
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    await new HostedApprovalOwnerStore(wal).reconcileAdmission({ ...admissionFixture(), digest: 'd'.repeat(64) })
+    const bound = capture.bound!; const custody = capture.custody!
+    const nextBytes = await readFile(path)
+    expect(bound.next).not.toBe(custody.next)
+    expect(bound.next).not.toBe(custody.returned.next)
+    for (const image of [custody.next, custody.returned.next, bound.next]) image.bytes.fill(0)
+    for (const previous of [custody.previous, custody.returned.previous, bound.previous]) {
+      if (previous.kind !== 'retained') throw new Error('missing P')
+      previous.image.bytes.fill(0)
+    }
+    expect(Buffer.from(bound.next.bytes)).toEqual(nextBytes)
+    if (bound.previous.kind !== 'retained') throw new Error('missing bound P')
+    expect(Buffer.from(bound.previous.image.bytes)).toEqual(previousBytes)
+    expect(bound.next.sha256).toBe(createHash('sha256').update(bound.next.bytes).digest('hex'))
+    expect(bound.previous.image.sha256).toBe(createHash('sha256').update(bound.previous.image.bytes).digest('hex'))
+    expect(bound.emission.lineSha256).toBe(createHash('sha256').update(`${JSON.stringify(capture.lines[1])}\n`).digest('hex'))
+    capture.producer.close()
+  })
+
+  test('postpublication admission false and rejection both revoke capture and outstanding effect tokens', async () => {
+    for (const failure of ['false', 'throw'] as const) {
+      const { path } = await walPath(); const capture = publicationCapture(path)
+      const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      let probes = 0; let token: { consume(): boolean } | null = null
+      const admission: HostedApprovalRuntimeAdmission = { ...admissionFixture(), isCurrent: async () => {
+        if (++probes !== 3) return true
+        token = await wal.prepareEffectToken((await wal.read())!)
+        if (failure === 'throw') throw new Error('admission probe rejected')
+        return false
+      } }
+      await expect(new HostedApprovalOwnerStore(wal).reconcileAdmission(admission)).rejects.toThrow(
+        failure === 'throw' ? 'admission probe rejected' : 'admission changed during recovery',
+      )
+      expect(probes).toBe(3)
+      expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published'])
+      expect(capture.bound!.next.bytes).toEqual(new Uint8Array(await readFile(path)))
+      expect(wal.isPublicationCaptureCurrent()).toBe(false)
+      expect(token).not.toBeNull()
+      expect((token as { consume(): boolean } | null)?.consume()).toBe(false)
+      await wal.locked(async current => { expect(current?.revision).toBe(1); expect(await wal.prepareEffectToken(current!)).toBeNull() })
+    }
+  })
+
+  test('capture poison revokes a token within its live locked context and persists across locks', async () => {
+    const { path } = await walPath(); const capture = publicationCapture(path)
+    const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    await wal.locked(async current => {
+      const result = await wal.publishMutation(current, { ...withoutRevision(state()), ingress: [], bindings: [] }, {
+        operationNonce: 'a'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission: admissionFixture(),
+      })
+      const token = await wal.prepareEffectToken(result.state)
+      expect(token).not.toBeNull()
+      wal.poisonPublicationCapture('test authority revoked')
+      expect(await wal.ownsCurrentFence()).toBe(true)
+      expect(token!.consume()).toBe(false)
+      expect(await wal.prepareEffectToken(result.state)).toBeNull()
+    })
+    await wal.locked(async current => { expect(current?.revision).toBe(1); expect(await wal.prepareEffectToken(current!)).toBeNull() })
+  })
+
+  test('typed lease witnesses reject no-op, live, reordered, duplicate and identity-changing claims', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    const fixture = state(); const secondRecord = structuredClone(fixture.ingress[0]!)
+    secondRecord.commandId = 'permission_2'; secondRecord.outboxId = `runtime_permission:effect:${'e'.repeat(64)}`
+    secondRecord.deliveryRef = `delivery_ref_opencode-${'e'.repeat(64)}`
+    secondRecord.payloadJson = JSON.stringify({ ...JSON.parse(secondRecord.payloadJson), deliveryRef: secondRecord.deliveryRef })
+    fixture.ingress.push(secondRecord)
+    fixture.bindings.push({ ...fixture.bindings[0]!, requestId: secondRecord.commandId, bindingDigest: 'e'.repeat(64) })
+    await setup.locked(current => setup.publish(current, withoutRevision(fixture)))
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    let now = Date.parse('2026-08-13T10:00:01.000Z')
+    const store = new HostedApprovalOwnerStore(wal, () => now)
+    const request = { ownerId: 'owner_1', leaseToken: 'lease_1', leaseDurationMs: 30_000, limit: 2 }
+    const [claimed, second] = await store.claim(request, 1_000_000)
+    expect(claimed!.lease!.generation).toBe(1)
+    const bytes = await readFile(path)
+    const rejectClaim = async (records: NonNullable<typeof claimed>[]) => {
+      await expect(wal.locked(current => wal.publishMutation(current, {
+        ...withoutRevision(current!), ingress: current!.ingress.map(record => records.find(item => item.outboxId === record.outboxId) ?? record),
+      }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'ingress-lease-claimed', outcome: 'claimed',
+        claims: records.map(record => ({ outboxId: record.outboxId, ...record.lease! })) }, records })))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval claim publication witness mismatch' })
+    }
+    await rejectClaim([claimed!])
+    await rejectClaim([{ ...claimed!, lease: { ...claimed!.lease!, generation: 2 } }])
+    const renewed = { ...claimed!, lease: { ...claimed!.lease!, generation: 2,
+      claimedAtIso: '2026-08-13T10:00:31.000Z', leaseExpiresAtIso: '2026-08-13T10:01:01.000Z' } }
+    await rejectClaim([renewed, renewed])
+    await rejectClaim([{ ...second!, lease: renewed.lease }, renewed])
+    await rejectClaim([{ ...renewed, acceptedAtIso: '2026-08-13T10:00:00.001Z' }])
+    expect(await readFile(path)).toEqual(bytes)
+    expect(capture.lines).toHaveLength(2)
+    expect(await store.claim(request, 1_000_000)).toEqual([claimed!, second!])
+    expect(capture.lines).toHaveLength(2)
+    now += 30_000
+    expect((await store.claim(request, 1_000_000))[0]!.lease!.generation).toBe(2)
+    expect(capture.lines).toHaveLength(3)
+    capture.producer.close()
+  })
+
+  test('ack witnesses enforce exact live lease and change only the first acknowledgement', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const store = new HostedApprovalOwnerStore(wal, () => Date.parse('2026-08-13T10:00:01.000Z'))
+    const [claimed] = await store.claim({ ownerId: 'owner_1', leaseToken: 'lease_1', leaseDurationMs: 30_000, limit: 1 }, 1_000_000)
+    const request = { outboxId: claimed!.outboxId, generation: 1, ownerId: 'owner_1', leaseToken: 'lease_1' }
+    const acknowledged = { ...claimed!, acknowledgedAtIso: '2026-08-13T10:00:02.000Z' }
+    const bytes = await readFile(path)
+    for (const input of [
+      { request: { ...request, generation: 2 }, record: acknowledged },
+      { request: { ...request, ownerId: 'owner_wrong' }, record: acknowledged },
+      { request: { ...request, leaseToken: 'lease_wrong' }, record: acknowledged },
+      { request, record: { ...acknowledged, acceptedAtIso: '2026-08-13T10:00:00.001Z' } },
+      { request, record: { ...acknowledged, acknowledgedAtIso: '2026-08-13T10:00:31.000Z' } },
+    ]) {
+      await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), ingress: [input.record] }, {
+        operationNonce: 'e'.repeat(64), mutation: { kind: 'ingress-acknowledged', outcome: 'acknowledged' }, ...input,
+      }))).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval acknowledgement publication witness mismatch' })
+    }
+    expect(await readFile(path)).toEqual(bytes)
+    expect(capture.lines).toHaveLength(2)
+    expect(await store.acknowledge(request)).toEqual({ status: 'acknowledged' })
+    expect(await store.acknowledge(request)).toEqual({ status: 'already_acknowledged' })
+    await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), ingress: [acknowledged] }, {
+      operationNonce: 'f'.repeat(64), mutation: { kind: 'ingress-acknowledged', outcome: 'acknowledged' }, request, record: acknowledged,
+    }))).rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+    expect(capture.lines).toHaveLength(3)
+    capture.producer.close()
+  })
+
+  test('settlements require a start for completion and preserve every delivery identity field', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    const initial = await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const record = initial.ingress[0]!
+    const started: HostedApprovalOwnerState['deliveries'][number] = {
+      providerDeliveryId: 'delivery_1', reconciliationRef: 'approval-reconciliation_1', deliveryRef: record.deliveryRef,
+      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: 'f'.repeat(64), phase: 'started', result: null,
+    }
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    const settle = (delivery: typeof started) => wal.locked(current => wal.publishMutation(current, {
+      ...withoutRevision(current!), deliveries: [delivery],
+    }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }, delivery }))
+    const completed = { ...started, phase: 'completed' as const, result: 'delivered' as const }
+    await expect(settle(completed)).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
+    expect(capture.lines).toHaveLength(1)
+    await wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), deliveries: [started] }, {
+      operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
+    }))
+    const bytes = await readFile(path)
+    for (const changed of [{ providerDeliveryId: 'delivery_other' }, { reconciliationRef: 'approval-reconciliation_other' }, { payloadFingerprint: 'd'.repeat(64) }]) {
+      await expect(settle({ ...completed, ...changed })).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
+    }
+    expect(await readFile(path)).toEqual(bytes)
+    expect(capture.lines).toHaveLength(2)
+    await settle(completed)
+    expect((await wal.read())!.deliveries).toEqual([completed])
+    expect(capture.lines).toHaveLength(3)
+    capture.producer.close()
+  })
+
+  test('poisons capture after durable publication failure and cannot retry from old authority', async () => {
+    const { path } = await walPath(); let failSync = false
+    const capture = publicationCapture(path, { failSync: () => failSync })
+    const admission = admissionFixture()
+    const wal = new HostedApprovalOwnerWal(path, { afterWalRename: async () => { failSync = true } }, capture.producer)
     const store = new HostedApprovalOwnerStore(wal)
     await expect(store.reconcileAdmission(admission)).rejects.toMatchObject({ stage: 'published-capture-failed' })
     const durable = await readFile(path)
     expect(JSON.parse(durable.toString())).toMatchObject({ revision: 1,
       admissionDigest: admission.digest, routes: admission.routes, ingress: [], bindings: [], deliveries: [] })
-    expect(poisoned).toBe(true)
+    expect(wal.isPublicationCaptureCurrent()).toBe(false)
+    expect(capture.bound).toBeUndefined()
+    // Bytes appended before a failing sync are not a bound publication receipt.
+    expect(capture.lines).toHaveLength(2)
     await expect(store.reconcileAdmission({ ...admission, digest: 'c'.repeat(64) })).rejects.toThrow('poisoned')
     expect(await readFile(path)).toEqual(durable)
-    expect(prepares).toBe(1)
+    expect(capture.lines).toHaveLength(2)
+  })
+
+  test('a direct rejected delivery remains a valid native settlement without a started publication', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    const initial = await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const record = initial.ingress[0]!
+    const rejected: HostedApprovalOwnerState['deliveries'][number] = {
+      providerDeliveryId: 'delivery_1', reconciliationRef: 'approval-reconciliation_1', deliveryRef: record.deliveryRef,
+      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: 'f'.repeat(64), phase: 'rejected', result: 'expired',
+    }
+    const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+    await wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), deliveries: [rejected] }, {
+      operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' }, delivery: rejected,
+    }))
+    expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published'])
+    expect(capture.bound!.native.mutation).toEqual({ kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' })
+    expect((await wal.read())!.deliveries).toEqual([rejected])
+    capture.assertBound()
   })
   test('keeps variadic creation out of Bun FFI on every supported platform', async () => {
     const source = await readFile(resolve(import.meta.dir, 'HostedApprovalOwnerWal.ts'), 'utf8')
@@ -1024,9 +1273,10 @@ function admissionFixture(): HostedApprovalRuntimeAdmission {
 // WAL/Store + production serializer + durable test custody coverage. Descriptor
 // and process identity are controlled here; the real syscall test above is a
 // separate boundary check, not proof of full hosted native integration.
-function publicationCapture(path: string) {
+function publicationCapture(path: string, options: { failSync?: () => boolean } = {}) {
   let prepared: Parameters<OwnerWalPublicationProducer['prepare']>[0] | undefined
   let bound: BoundWalPublication | undefined
+  let custody: { previous: PreviousWalImage; next: RetainedWalImage; returned: { previous: PreviousWalImage; next: RetainedWalImage } } | undefined
   const chunks: Buffer[] = []
   let nonce = 0
   const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
@@ -1051,26 +1301,31 @@ function publicationCapture(path: string) {
       descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
       nonce: () => (++nonce).toString(16).padStart(64, '0'),
       write: (_fd, bytes, offset) => { chunks.push(Buffer.from(bytes.subarray(offset))); return bytes.byteLength - offset },
-      sync: () => {}, close: () => {},
+      sync: () => { if (options.failSync?.()) throw new Error('capture sync failed') }, close: () => {},
     },
     imageCustodian: { prepare(previous, next) {
       // Custody stages P/N before replacement and binds only after N is live.
       if (previous.kind === 'absent') expect(existsSync(path)).toBe(false)
       else expect(readFileSync(path)).toEqual(Buffer.from(previous.image.bytes))
-      const previousPath = previous.kind === 'retained' ? stage('P', previous.image.bytes) : null
-      const nextPath = stage('N', next.bytes)
-      expect(chunks).toHaveLength(1) // only producer-open before WAL replacement
+      const sequence = chunks.length
+      const previousPath = previous.kind === 'retained' ? stage(`P.${sequence}`, previous.image.bytes) : null
+      const nextPath = stage(`N.${sequence}`, next.bytes)
+      const returned = { previous: previous.kind === 'absent' ? previous :
+        { kind: 'retained' as const, image: { ...previous.image, bytes: previous.image.bytes } },
+        next: { ...next, bytes: next.bytes } }
+      custody = { previous, next, returned }
       return { bind(emission) {
         expect(readFileSync(path)).toEqual(readFileSync(nextPath))
         if (previous.kind === 'retained') expect(readFileSync(previousPath!)).toEqual(Buffer.from(previous.image.bytes))
-        expect(hash(chunks[1]!)).toBe(emission.lineSha256)
+        expect(hash(chunks[sequence]!)).toBe(emission.lineSha256)
         expect(emission.operationNonce).toBe(prepared!.intent.operationNonce)
-        return { previous, next }
+        return returned
       } }
     } },
   })!
   return {
-    get prepared() { return prepared }, get bound() { return bound },
+    get prepared() { return prepared }, get bound() { return bound }, get custody() { return custody },
+    get lines() { return chunks.map(chunk => JSON.parse(chunk.toString())) },
     producer: {
       prepare(input) { prepared = input; const staged = native.prepare(input)
         return { emit() { bound = staged.emit(); return bound } } },
