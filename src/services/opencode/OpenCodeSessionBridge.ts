@@ -16,11 +16,15 @@ import {
 } from '../hostedControl/HostedControlProcessIdentity.js'
 import {
   canonicalHostedApprovalDigest,
+  isOpenCodeClientFactoryBoundToCustody,
+  OpenCodeRequestNotDispatchedError,
   OpenCodePermissionConditionRejectedError,
   openCodeClientFactory,
 } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { isOpenCodeHostManagerBoundToCustody, openCodeHostManager } from './OpenCodeHostManager.js'
+import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
+  type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
 import {
   captureOpenCodeEstablishedPeerIdentity,
@@ -59,6 +63,7 @@ import type {
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 
 type OpenCodeSessionBridgeDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
@@ -139,6 +144,7 @@ export type OpenCodePermissionEffectContext = {
   record: OpenCodeSessionRecord
   profile: OpenCodePreparedProfile
   host: {
+    custody?: 'desktop' | 'supervisor'
     hostKey: string
     profileRootKey: string
     projectPath: string
@@ -490,9 +496,63 @@ function isTransientOpenCodeCreateSessionError(error: unknown): boolean {
 }
 
 export class OpenCodeSessionBridge {
-  private readonly retainedSessionHosts = new Map<string, string>()
+  readonly #retainedSessionHosts = new Map<string, string>()
 
-  constructor(private readonly deps: OpenCodeSessionBridgeDeps = {}) {}
+  private readonly custody?: TrustedOpenCodeCustody
+  private readonly deps: OpenCodeSessionBridgeDeps
+  constructor(deps: OpenCodeSessionBridgeDeps = {}) {
+    deps = { ...deps }
+    this.deps = deps
+    const policy = deps.acquisitionPolicy
+    if (policy && policy.mode !== 'desktop') {
+      if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
+      if (new.target !== OpenCodeSessionBridge) throw new Error('OpenCode supervised bridge must use the admitted implementation')
+      if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
+        !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) || !deps.sessionStore ||
+        deps.prepareProfile || deps.preparePermissionProfileToken || deps.captureProcessIdentity ||
+        deps.captureEstablishedPeerIdentity || deps.captureLoopbackEndpointIdentity) {
+        throw new Error('OpenCode supervised bridge requires the complete custody-bound dependencies')
+      }
+      this.custody = custody
+      this.deps = Object.freeze({ ...deps,
+        acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }),
+        sessionStore: Object.freeze({ get: deps.sessionStore.get.bind(deps.sessionStore),
+          upsert: deps.sessionStore.upsert.bind(deps.sessionStore), markStale: deps.sessionStore.markStale.bind(deps.sessionStore) }),
+        mcpManager: deps.mcpManager && Object.freeze({ ensureAppMcp: deps.mcpManager.ensureAppMcp.bind(deps.mcpManager) }),
+        eventTranslator: deps.eventTranslator && Object.freeze({ reconcileSessionMessages: deps.eventTranslator.reconcileSessionMessages.bind(deps.eventTranslator) }),
+        logProjector: deps.logProjector && Object.freeze({ projectSummary: deps.logProjector.projectSummary.bind(deps.logProjector) }),
+        offlineReader: deps.offlineReader && Object.freeze({ readSession: deps.offlineReader.readSession.bind(deps.offlineReader) }),
+        previewObserver: deps.previewObserver && Object.freeze({ observeSession: deps.previewObserver.observeSession.bind(deps.previewObserver) }),
+        turnSettledObserver: deps.turnSettledObserver && Object.freeze({ observe: deps.turnSettledObserver.observe.bind(deps.turnSettledObserver) }),
+        oauthRefreshCoordinator: deps.oauthRefreshCoordinator && Object.freeze({ ensureFreshForPrompt: deps.oauthRefreshCoordinator.ensureFreshForPrompt.bind(deps.oauthRefreshCoordinator) }),
+      })
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeSessionBridge.prototype))) {
+        if (name === 'constructor') continue
+        if (typeof descriptor.value === 'function') {
+          Object.defineProperty(this, name, { value: descriptor.value.bind(this) })
+        } else if (descriptor.get) {
+          Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
+        }
+      }
+      Object.freeze(this)
+    }
+  }
+
+  private snapshotSession(record: OpenCodeSessionRecord): OpenCodeSessionRecord {
+    return this.custody ? Object.freeze(structuredClone(record)) : record
+  }
+
+  private requireSupervisedDependency(key: keyof OpenCodeSessionBridgeDeps): void {
+    if (this.custody && !this.deps[key]) {
+      throw new Error(`OpenCode supervised ${key} composition unavailable`)
+    }
+  }
+
+  private hostedApprovalAuth(profile: OpenCodePreparedProfile) {
+    return this.custody ? undefined : hostedApprovalAuth(profile)
+  }
 
   private get hostManager() {
     return this.deps.hostManager ?? openCodeHostManager
@@ -507,30 +567,37 @@ export class OpenCodeSessionBridge {
   }
 
   private get mcpManager() {
+    this.requireSupervisedDependency('mcpManager')
     return this.deps.mcpManager ?? openCodeMcpManager
   }
 
   private get eventTranslator() {
+    this.requireSupervisedDependency('eventTranslator')
     return this.deps.eventTranslator ?? openCodeEventTranslator
   }
 
   private get previewObserver() {
+    this.requireSupervisedDependency('previewObserver')
     return this.deps.previewObserver ?? openCodePreviewObserver
   }
 
   private get turnSettledObserver() {
+    this.requireSupervisedDependency('turnSettledObserver')
     return this.deps.turnSettledObserver ?? openCodeTurnSettledObserver
   }
 
   private get logProjector() {
+    this.requireSupervisedDependency('logProjector')
     return this.deps.logProjector ?? openCodeLogProjector
   }
 
   private get offlineReader() {
+    this.requireSupervisedDependency('offlineReader')
     return this.deps.offlineReader ?? openCodeOfflineSessionReader
   }
 
   private get oauthRefreshCoordinator() {
+    this.requireSupervisedDependency('oauthRefreshCoordinator')
     return this.deps.oauthRefreshCoordinator ?? openCodeOAuthRefreshCoordinator
   }
 
@@ -538,6 +605,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     profile: OpenCodePreparedProfile,
   ): Promise<void> {
+    if (this.custody) throw new Error('OpenCode supervised auth remediation unavailable')
     if (parseProviderScopedModel(record.selectedModel).providerID !== 'xai') {
       return
     }
@@ -556,6 +624,14 @@ export class OpenCodeSessionBridge {
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
   ) {
+    if (this.custody) {
+      if ((projectPath != null && projectPath !== this.custody.expected.profile.projectPath) ||
+        (options?.toolApprovalMode && options.toolApprovalMode !== 'manual') ||
+        Object.keys(options ?? {}).some(key => !['toolApprovalMode', 'abortSignal'].includes(key))) {
+        throw new Error('OpenCode supervised profile preparation unavailable')
+      }
+      return this.custody.readPreparedProfile()
+    }
     const prepareProfile =
       this.deps.prepareProfile
       ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
@@ -574,6 +650,16 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     projectPath: string | null | undefined = record.projectPath,
   ): Promise<PreparedSessionProfile> {
+    record = this.snapshotSession(record)
+    if (this.custody) {
+      if (record.toolApprovalMode !== 'manual' || record.hostKey !== this.custody.hostKey ||
+        record.projectPath !== this.custody.expected.profile.projectPath) {
+        throw new Error('OpenCode supervised session binding mismatch')
+      }
+      const profile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual' })
+      if (this.buildSessionProfileStaleReason(record, profile)) throw new Error('OpenCode supervised session profile stale')
+      return { profile, toolApprovalMode: 'manual' }
+    }
     if (record.toolApprovalMode) {
       return {
         profile: await this.prepareProfile(projectPath, { toolApprovalMode: record.toolApprovalMode }),
@@ -648,6 +734,7 @@ export class OpenCodeSessionBridge {
     runId?: string | null
     toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
+    if (this.custody) params = { ...params, identity: { ...params.identity } }
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
@@ -675,7 +762,7 @@ export class OpenCodeSessionBridge {
         } catch (error) {
           lastCreateError = error
           if (
-            attemptIndex >= OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS.length ||
+            this.custody || attemptIndex >= OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS.length ||
             !isTransientOpenCodeCreateSessionError(error)
           ) {
             throw error
@@ -768,8 +855,9 @@ export class OpenCodeSessionBridge {
     runId?: string | null,
     profile?: OpenCodePreparedProfile,
   ) {
+    record = this.snapshotSession(record)
     const sessionKey = this.buildSessionKey(record)
-    if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
+    if (this.#retainedSessionHosts.get(sessionKey) === record.hostKey) {
       await this.hostManager.retainHostLease?.(record.hostKey, {
         teamId: record.teamId,
         laneId: record.laneId,
@@ -798,13 +886,14 @@ export class OpenCodeSessionBridge {
         sessionId: record.opencodeSessionId,
       },
     })
-    this.retainedSessionHosts.set(sessionKey, record.hostKey)
+    this.#retainedSessionHosts.set(sessionKey, record.hostKey)
     return host
   }
 
   async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
+    record = { ...record }
     const sessionKey = this.buildSessionKey(record)
-    const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
+    const retainedHostKey = this.#retainedSessionHosts.get(sessionKey)
     await this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
@@ -815,7 +904,7 @@ export class OpenCodeSessionBridge {
       return
     }
 
-    this.retainedSessionHosts.delete(sessionKey)
+    this.#retainedSessionHosts.delete(sessionKey)
     await this.hostManager.releaseHost(retainedHostKey)
   }
 
@@ -823,6 +912,8 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     options: { attachIfMissing?: boolean } = {},
   ): Promise<OpenCodeSessionAppMcpReadyResult> {
+    record = this.snapshotSession(record)
+    options = { ...options }
     return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
       let result: Awaited<ReturnType<typeof openCodeMcpManager.ensureAppMcp>>
       try {
@@ -864,6 +955,7 @@ export class OpenCodeSessionBridge {
     }) => Promise<T>,
     profile?: OpenCodePreparedProfile,
   ): Promise<T> {
+    record = this.snapshotSession(record)
     const sessionProfile = profile
       ? {
         profile,
@@ -883,23 +975,20 @@ export class OpenCodeSessionBridge {
     })
 
     try {
+      const effectProfile = this.custody ? await this.custody.readPreparedProfile() : sessionProfile.profile
+      const effectHost: OpenCodePermissionEffectContext['host'] = {
+        custody: host.custody, hostKey: host.hostKey, profileRootKey: host.profileRootKey,
+        projectPath: host.projectPath, projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+        openCodeArtifactDigest: host.openCodeArtifactDigest ?? null, baseUrl: host.baseUrl,
+        port: host.port, pid: host.pid, processStartedAtMs: host.processStartedAtMs ?? null,
+        resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+      }
       return await callback({
         baseUrl: host.baseUrl,
-        profile: sessionProfile.profile,
+        profile: effectProfile,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
-        host: {
-          hostKey: host.hostKey,
-          profileRootKey: host.profileRootKey,
-          projectPath: host.projectPath,
-          projectBehaviorFingerprint: host.projectBehaviorFingerprint,
-          openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
-          baseUrl: host.baseUrl,
-          port: host.port,
-          pid: host.pid,
-          processStartedAtMs: host.processStartedAtMs ?? null,
-          resolvedConfigFingerprint: host.resolvedConfigFingerprint,
-        },
+        host: this.custody ? Object.freeze(effectHost) : effectHost,
       })
     } finally {
       await this.hostManager.releaseHost(host.hostKey)
@@ -915,6 +1004,7 @@ export class OpenCodeSessionBridge {
       runtimePid: number | null
     }) => Promise<T>,
   ): Promise<T> {
+    record = this.snapshotSession(record)
     let sessionProfile = await this.prepareProfileForSessionRecord(record)
     const refreshResult = await this.oauthRefreshCoordinator.ensureFreshForPrompt({
       selectedModel: record.selectedModel,
@@ -1062,9 +1152,12 @@ export class OpenCodeSessionBridge {
     fresh?: boolean
     toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<OpenCodeSessionRecord> {
+    if (this.custody) params = { ...params,
+      preparedProfile: params.preparedProfile ? structuredClone(params.preparedProfile) : params.preparedProfile }
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
-    const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const stored = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const existing = stored ? this.snapshotSession(stored) : stored
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
         profile: params.preparedProfile,
@@ -1150,7 +1243,7 @@ export class OpenCodeSessionBridge {
     })
     try {
       await this.sessionStore.upsert(created.record)
-      this.retainedSessionHosts.set(
+      this.#retainedSessionHosts.set(
         this.buildSessionKey(created.record),
         created.retainedHostKey,
       )
@@ -1169,6 +1262,7 @@ export class OpenCodeSessionBridge {
   }
 
   async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
+    record = this.snapshotSession(record)
     const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
       this.prepareProfileForSessionRecord(record),
       this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null),
@@ -1204,6 +1298,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     limit?: number,
   ): Promise<OpenCodeMessage[]> {
+    record = this.snapshotSession(record)
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       return client.getSessionMessages(record.opencodeSessionId, limit)
@@ -1279,6 +1374,8 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<OpenCodeMessage> {
+    record = this.snapshotSession(record)
+    if (this.custody) params = structuredClone(params)
     return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
@@ -1316,6 +1413,8 @@ export class OpenCodeSessionBridge {
     injectionVerifiedAt: string
     alreadyPresent: boolean
   }> {
+    record = this.snapshotSession(record)
+    params = { ...params }
     return this.withSessionPromptHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
@@ -1419,6 +1518,8 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<void> {
+    record = this.snapshotSession(record)
+    if (this.custody) params = structuredClone(params)
     await this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
@@ -1455,6 +1556,8 @@ export class OpenCodeSessionBridge {
     turnSettled: OpenCodeTurnSettledSummary
     hookDiagnostics: string[]
   }> {
+    record = this.snapshotSession(record)
+    if (this.custody) params = { ...params, parts: params.parts?.map(part => ({ ...part })) }
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
@@ -1532,6 +1635,7 @@ export class OpenCodeSessionBridge {
   }
 
   async abort(record: OpenCodeSessionRecord): Promise<boolean> {
+    record = this.snapshotSession(record)
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       return client.abortSession(record.opencodeSessionId)
@@ -1563,11 +1667,19 @@ export class OpenCodeSessionBridge {
       ) => Promise<boolean | OpenCodePermissionEffectToken>
     },
   ): Promise<unknown> {
+    record = this.snapshotSession(record)
+    if (this.custody) params = { ...params,
+      expectedPermissionRaw: params.expectedPermissionRaw && structuredClone(params.expectedPermissionRaw),
+      expectedHostedPermission: params.expectedHostedPermission && structuredClone(params.expectedHostedPermission) }
     const invocation: {
       phase: 'not_started' | 'invoked' | 'completed'
       completedResult?: unknown
     } = { phase: 'not_started' }
     try {
+      if (this.custody && (!params.requireAtomicConfigReply || !params.expectedPermissionRaw ||
+        !params.expectedHostedPermission || !params.validatePreparedEffect || !params.authorizeEffect)) {
+        throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
       return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
       if (params.authorizeObservation &&
         !(await params.authorizeObservation({ record, profile, host }))) {
@@ -1576,7 +1688,7 @@ export class OpenCodeSessionBridge {
       const client = this.clientFactory.create(
         baseUrl,
         {},
-        params.requireAtomicConfigReply ? hostedApprovalAuth(profile) : undefined,
+        params.requireAtomicConfigReply ? this.hostedApprovalAuth(profile) : undefined,
       )
       let preparedToken: OpenCodePermissionEffectToken | null = null
       let authorityToken: OpenCodePermissionEffectToken | null = null
@@ -1667,12 +1779,14 @@ export class OpenCodeSessionBridge {
         if (params.validatePreparedEffect) {
           const prepared = await params.validatePreparedEffect({ record, profile, host })
           if (!prepared) throw new OpenCodePermissionEffectNotAuthorizedError()
+          if (this.custody && typeof prepared === 'boolean') throw new OpenCodePermissionEffectNotAuthorizedError()
           preparedToken = typeof prepared === 'boolean' ? null : prepared
         }
       }
       if (params.authorizeEffect) {
         const authorized = await params.authorizeEffect({ record, profile, host })
         if (!authorized) throw new OpenCodePermissionEffectNotAuthorizedError()
+        if (this.custody && typeof authorized === 'boolean') throw new OpenCodePermissionEffectNotAuthorizedError()
         authorityToken = typeof authorized === 'boolean' ? null : authorized
       }
       if (params.expectedPermissionRaw) {
@@ -1781,6 +1895,10 @@ export class OpenCodeSessionBridge {
         invocation.phase = 'completed'
         return invocation.completedResult
       } catch (error) {
+        if (error instanceof OpenCodeRequestNotDispatchedError) {
+          invocation.phase = 'not_started'
+          throw new OpenCodePermissionEffectUnavailableError(error)
+        }
         if (error instanceof OpenCodePermissionConditionRejectedError) {
           invocation.phase = 'not_started'
           throw new OpenCodePermissionEffectNotAuthorizedError()
@@ -1809,9 +1927,10 @@ export class OpenCodeSessionBridge {
 
   /** Returns the upstream config generation only for the exact atomic contract. */
   async probeHostedApprovalCapability(record: OpenCodeSessionRecord): Promise<string | null> {
+    record = this.snapshotSession(record)
     try {
       return await this.withSessionHost(record, async ({ baseUrl, profile }) => {
-        const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+        const client = this.clientFactory.create(baseUrl, {}, this.hostedApprovalAuth(profile))
         if (!client.getHostedApprovalCapability) return null
         const capability = decodeHostedApprovalCapability(
           await client.getHostedApprovalCapability(),
@@ -1831,6 +1950,7 @@ export class OpenCodeSessionBridge {
   async captureHostedApprovalBinding(
     record: OpenCodeSessionRecord,
   ): Promise<OpenCodeHostedApprovalBindingCapture> {
+    record = this.snapshotSession(record)
     return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
       if (record.providerId !== 'opencode' || record.toolApprovalMode !== 'manual' ||
         record.staleReason !== null || host.pid <= 0 ||
@@ -1848,7 +1968,7 @@ export class OpenCodeSessionBridge {
       if (!endpointBefore || endpointBefore.startIdentity !== before.startIdentity) {
         throw new Error('OpenCode hosted approval endpoint ownership is unavailable')
       }
-      const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+      const client = this.clientFactory.create(baseUrl, {}, this.hostedApprovalAuth(profile))
       if (!client.getHostedApprovalCapability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')
       }
@@ -1896,11 +2016,12 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     authorizeObservation?: (context: OpenCodePermissionEffectContext) => Promise<boolean>,
   ): Promise<OpenCodeHostedApprovalObservedPermission[]> {
+    record = this.snapshotSession(record)
     return this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
       if (authorizeObservation && !(await authorizeObservation({ record, profile, host }))) {
         throw new OpenCodePermissionEffectNotAuthorizedError()
       }
-      const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+      const client = this.clientFactory.create(baseUrl, {}, this.hostedApprovalAuth(profile))
       if (!client.getHostedApprovalCapability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')
       }
@@ -1939,6 +2060,7 @@ export class OpenCodeSessionBridge {
   }
 
   async getSession(record: OpenCodeSessionRecord): Promise<OpenCodeSessionSummary> {
+    record = this.snapshotSession(record)
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       return client.getSession(record.opencodeSessionId)
@@ -1946,6 +2068,7 @@ export class OpenCodeSessionBridge {
   }
 
   async getRawStatus(record: OpenCodeSessionRecord): Promise<OpenCodeSessionStatusInput | null> {
+    record = this.snapshotSession(record)
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       const statusMap = await client.getSessionStatus()
@@ -1966,6 +2089,8 @@ export class OpenCodeSessionBridge {
     runtimePromptMessageId: string
     hookDiagnostics: string[]
   }> {
+    record = this.snapshotSession(record)
+    if (this.custody) params = { ...params, parts: params.parts?.map(part => ({ ...part })) }
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
@@ -2022,6 +2147,11 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
+    record = this.snapshotSession(record)
+    options = { ...options }
+    if (this.custody && options.sessionId != null && options.sessionId.trim() !== record.opencodeSessionId) {
+      throw new Error('OpenCode supervised reconciliation target is not the admitted session')
+    }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
     const profile = sessionProfile.profile
     const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
@@ -2147,6 +2277,8 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionPreviewSummary
   }> {
+    record = this.snapshotSession(record)
+    options = { ...options }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
     const profile = sessionProfile.profile
     const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
@@ -2209,6 +2341,8 @@ export class OpenCodeSessionBridge {
     summary: OpenCodeSessionReconcileSummary
     logProjection: OpenCodeLogProjection
   }> {
+    record = this.snapshotSession(record)
+    options = { ...options }
     let reconciled = await this.reconcileSession(record, options)
     if (reconciled.summary.reconcileOutcome === 'stale') {
       try {

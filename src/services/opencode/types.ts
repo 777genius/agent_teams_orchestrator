@@ -23,6 +23,7 @@ export type OpenCodePrepareProfileOptions = {
 }
 
 export type OpenCodePreparedProfile = {
+  custody?: 'desktop' | 'supervisor'
   projectPath: string
   profileRootKey: string
   profileRootPath: string
@@ -52,6 +53,7 @@ export type OpenCodePreparedProfile = {
 }
 
 export type OpenCodeHostHandle = {
+  custody?: 'desktop' | 'supervisor'
   hostKey: string
   profileRootKey: string
   projectPath: string
