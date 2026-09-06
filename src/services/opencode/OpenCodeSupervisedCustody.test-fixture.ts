@@ -1,11 +1,13 @@
+import { expect, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { canonicalHostedApprovalJson } from './OpenCodeClientFactory.js'
+import * as endpointIdentity from './OpenCodeLoopbackEndpointIdentity.js'
+import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
 import { resolveExecutingOpenCodeArtifactDigest } from './OpenCodeArtifactDigest.js'
 import { createOpenCodeRawRetention, type OpenCodeRawObservation,
   type OpenCodeRawRetentionSink } from './OpenCodeHostedRawRetention.js'
@@ -33,15 +35,54 @@ export function supervisedTestStage(stage: Promise<void>, exchange: Promise<unkn
   })]), label, 30_000)
 }
 
-type ObservedRequest = { method: string; url: string; headers: IncomingMessage['headers']; body: Buffer }
+type ObservedConnection = {
+  socket: Socket; chunks: Buffer[]; closed: Promise<void>
+  // Snapshot before close clears the runtime Socket's address properties.
+  identity: OpenCodeConnectedSocketIdentity
+}
+type ObservedRequest = {
+  method: string; url: string; headers: Record<string, string>; body: Buffer; connection: ObservedConnection
+}
+
+/** Small response writer for this fixture. Every path uses the genuine TCP
+ * socket; no Bun HTTP-server connection events or HTTP socket facades. */
+class FixtureResponse {
+  statusCode = 200
+  private headers = new Map<string, string>()
+  private sent = false
+  private chunked = false
+  constructor(private socket: Socket) {}
+  setHeader(name: string, value: string) { this.headers.set(name.toLowerCase(), value) }
+  private head(length?: number): Buffer {
+    this.sent = true
+    this.headers.set('connection', 'close')
+    if (!this.headers.has('content-length')) {
+      if (length !== undefined) this.headers.set('content-length', String(length))
+      else { this.headers.set('transfer-encoding', 'chunked'); this.chunked = true }
+    }
+    return Buffer.from(`HTTP/1.1 ${this.statusCode} Fixture\r\n` +
+      [...this.headers].map(([name, value]) => `${name}: ${value}\r\n`).join('') + '\r\n', 'latin1')
+  }
+  write(value: string | Uint8Array) {
+    const bytes = typeof value === 'string' ? Buffer.from(value) : Buffer.from(value)
+    if (!this.sent) this.socket.write(this.head())
+    if (bytes.length) this.socket.write(this.chunked
+      ? Buffer.concat([Buffer.from(`${bytes.length.toString(16)}\r\n`), bytes, Buffer.from('\r\n')]) : bytes)
+  }
+  end(value: string | Uint8Array = '') {
+    const bytes = typeof value === 'string' ? Buffer.from(value) : Buffer.from(value)
+    if (!this.sent) { this.socket.end(Buffer.concat([this.head(bytes.length), bytes])); return }
+    this.write(bytes)
+    this.socket.end(this.chunked ? '0\r\n\r\n' : undefined)
+  }
+  destroy() { this.socket.destroy() }
+}
 
 /** Local server fixture owns its actual listener/process expectation. This is
  * explicitly test infrastructure, not a production supervisor admission provider.
  */
 export async function supervisedFixture(options: {
-  handle?: (request: IncomingMessage, response: ServerResponse) => void
-  // Use a genuine TCP listener for wire framing tests; an HTTP server's socket
-  // facade may interpret end() as response finalization instead of raw bytes.
+  handle?: (request: ObservedRequest, response: FixtureResponse) => void
   rawResponse?: (request: ObservedRequest, socket: Socket) => void
   sync?: (observation: OpenCodeRawObservation | undefined) => Promise<void>
   write?: (bytes: Uint8Array, offset: number, length: number, observation: OpenCodeRawObservation | undefined) => Promise<number>
@@ -51,7 +92,9 @@ export async function supervisedFixture(options: {
   const observations: OpenCodeRawObservation[] = []
   const requests: ObservedRequest[] = []
   // Count TCP bytes even when no complete HTTP request can be parsed.
-  const connections: Array<{ socket: Socket; chunks: Buffer[]; closed: Promise<void> }> = []
+  const connections: ObservedConnection[] = []
+  const acceptedWaiters = new Set<() => void>()
+  const proofs: Array<{ connection: ObservedConnection; identity: OpenCodeConnectedSocketIdentity }> = []
   let live = true
   let lose!: () => void
   const lost = new Promise<void>(resolve => { lose = resolve })
@@ -63,48 +106,50 @@ export async function supervisedFixture(options: {
     authentication: 'opencode-basic' as const, runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
     configGeneration: `config_generation_${'2'.repeat(32)}` }
   const config = { config: {}, configProviders: {}, agents: [], mcp: [] }
-  const server = options.rawResponse ? createTcpServer(socket => {
+  const server = createTcpServer(socket => {
+    const chunks: Buffer[] = []
+    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+    const connection = { socket, chunks, closed, identity: {
+      localAddress: socket.remoteAddress!, localPort: socket.remotePort!,
+      remoteAddress: socket.localAddress!, remotePort: socket.localPort!,
+    } }
+    connections.push(connection)
+    socket.on('error', () => {})
+    for (const accepted of acceptedWaiters) accepted()
     let bytes = Buffer.alloc(0)
     let delivered = false
     socket.on('data', chunk => {
+      chunks.push(Buffer.from(chunk))
       if (delivered) return
       bytes = Buffer.concat([bytes, chunk])
+      if (bytes.length > 2 * 1024 * 1024) { socket.destroy(); return }
       const boundary = bytes.indexOf('\r\n\r\n')
       if (boundary < 0) return
       const [line, ...fields] = bytes.subarray(0, boundary).toString('ascii').split('\r\n')
       const [method, url] = line!.split(' ')
-      const headers: IncomingMessage['headers'] = {}
+      const headers: Record<string, string> = {}
       for (const field of fields) {
         const colon = field.indexOf(':')
-        headers[field.slice(0, colon).toLowerCase()] = field.slice(colon + 1).trim()
+        const name = field.slice(0, colon).toLowerCase()
+        if (colon <= 0 || headers[name] !== undefined) { socket.destroy(); return }
+        headers[name] = field.slice(colon + 1).trim()
       }
       const length = Number(headers['content-length'] ?? 0)
-      if (!method || !url || !Number.isSafeInteger(length) || length < 0 || length > 16 * 1024) {
+      if (!method || !url || !Number.isSafeInteger(length) || length < 0 || length > 1024 * 1024) {
         socket.destroy(); return
       }
       if (bytes.length < boundary + 4 + length) return
       delivered = true
-      const request = { method, url, headers, body: Buffer.from(bytes.subarray(boundary + 4, boundary + 4 + length)) }
+      const request = { method, url, headers, connection,
+        body: Buffer.from(bytes.subarray(boundary + 4, boundary + 4 + length)) }
       requests.push(request)
-      options.rawResponse!(request, socket)
-    })
-  }) : createServer((request, response) => {
-    const chunks: Buffer[] = []
-    request.on('data', chunk => chunks.push(Buffer.from(chunk)))
-    request.on('end', () => {
-      requests.push({ method: request.method!, url: request.url!, headers: request.headers, body: Buffer.concat(chunks) })
+      if (options.rawResponse) { options.rawResponse(request, socket); return }
+      const response = new FixtureResponse(socket)
       if (options.handle) { options.handle(request, response); return }
       const data = request.url === '/global/health' ? { healthy: true } :
-        request.url === '/agent' ? [] : request.url?.endsWith('hosted-approval-capability') ? hosted : {}
+        request.url === '/agent' ? [] : request.url.endsWith('hosted-approval-capability') ? hosted : {}
       response.end(canonicalHostedApprovalJson(data))
     })
-  })
-  server.on('connection', socket => {
-    const chunks: Buffer[] = []
-    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
-    socket.on('error', () => {})
-    socket.on('data', chunk => chunks.push(Buffer.from(chunk)))
-    connections.push({ socket, chunks, closed })
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -172,15 +217,72 @@ export async function supervisedFixture(options: {
       return bundle
     },
   }
+  const waitForConnection = async (identity: OpenCodeConnectedSocketIdentity) => {
+    const matches = () => connections.filter(value =>
+      Object.entries(identity).every(([key, part]) => value.identity[key as keyof typeof identity] === part))
+    let accepted!: () => void
+    const ready = new Promise<void>(resolve => { accepted = () => { if (matches().length) resolve() } })
+    acceptedWaiters.add(accepted)
+    try {
+      accepted()
+      await supervisedTestWait(ready, `TCP accept for authorized local port ${identity.localPort}`)
+      expect(matches()).toHaveLength(1)
+      return matches()[0]!
+    } finally { acceptedWaiters.delete(accepted) }
+  }
+  // Observe the actual verifier's input/result and always run its original OS
+  // proof. This is not a substitute proof or a custody/factory override. The
+  // rendezvous makes the accepted descriptor authoritative on pinned Bun too.
+  const prove = endpointIdentity.captureOpenCodeEstablishedPeerIdentity
+  const proofSpy = spyOn(endpointIdentity, 'captureOpenCodeEstablishedPeerIdentity')
+    .mockImplementation(async (...args: Parameters<typeof prove>) => {
+      const identity = { ...args[2] }
+      if (identity.remotePort !== port || !server.listening) return prove(...args)
+      const connection = await waitForConnection(identity)
+      expect(connection.chunks).toHaveLength(0)
+      const peer = await prove(...args)
+      if (peer) {
+        expect(peer.pid).toBe(expected.process.pid)
+        expect(peer.startIdentity).toBe(expected.process.startIdentity)
+        expect(peer.port).toBe(port)
+        expect(connection.chunks).toHaveLength(0)
+        proofs.push({ connection, identity })
+      }
+      return peer
+    })
+  const assertSocketCustody = () => {
+    for (const request of requests) {
+      const authorized = proofs.filter(proof => proof.connection === request.connection)
+      expect(authorized.length).toBeGreaterThan(0)
+      for (const proof of authorized) expect(request.connection.identity).toEqual(proof.identity)
+      expect(request.connection.identity.localPort).toBeGreaterThan(0)
+      expect(request.connection.identity.remotePort).toBe(port)
+      expect(requests.filter(other => other.connection === request.connection)).toHaveLength(1)
+      const wire = Buffer.concat(request.connection.chunks)
+      const boundary = wire.indexOf('\r\n\r\n')
+      expect(boundary).toBeGreaterThan(0)
+      expect(wire.subarray(boundary + 4)).toEqual(request.body)
+      expect(request.headers.connection).toBe('close')
+    }
+    // No unparsed partial HTTP bytes may escape on an unproved connection.
+    for (const connection of connections.filter(value => value.chunks.length)) {
+      expect(proofs.some(proof => proof.connection === connection)).toBe(true)
+      expect(requests.filter(request => request.connection === connection)).toHaveLength(1)
+    }
+  }
   return { expected, profile, source, sink, rawRetention, requests, observations, server, connections,
+    waitForConnection, assertSocketCustody,
     acquire: createOpenCodeSupervisedCustodyAcquirer(source),
     revoke() { live = false; lose() },
     async close() {
-      live = false; lose()
-      await rawRetention.close()
-      for (const connection of connections) connection.socket.destroy()
-      await new Promise<void>(resolve => server.close(() => resolve()))
-      await rm(directory, { recursive: true, force: true })
+      try { assertSocketCustody() } finally {
+        proofSpy.mockRestore()
+        live = false; lose()
+        for (const connection of connections) connection.socket.destroy()
+        await rawRetention.close()
+        await new Promise<void>(resolve => server.close(() => resolve()))
+        await rm(directory, { recursive: true, force: true })
+      }
     },
   }
 }

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { connect as connectTcp } from 'node:net'
-import { Readable } from 'node:stream'
+import { encodeOpenCodeSocketHttpRequest, readOpenCodeSocketHttpResponse,
+  MAX_OPENCODE_SOCKET_HTTP_BODY_BYTES, type OpenCodeSocketHttpResponse } from './OpenCodeAuthorizedSocketHttp.js'
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
   type TrustedOpenCodeCustody, type OneUseFence } from './OpenCodeSupervisedHostCustody.js'
 import type { HostedHttpOperation, RetainedRequest } from './OpenCodeHostedRawRetention.js'
@@ -508,10 +508,6 @@ async function parseStrictHostedApprovalResponse<T>(
   return JSON.parse(text) as T
 }
 
-type SupervisedNativeResponse = {
-  native: IncomingMessage; status: number; statusText: string; headers: Headers
-}
-
 function awaitRequestAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const cleanup = () => signal.removeEventListener('abort', aborted)
@@ -531,7 +527,8 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>,
   dispatch?: { endAttempted: boolean; body: Buffer; captured: boolean },
   custody?: TrustedOpenCodeCustody,
-): Promise<Response | SupervisedNativeResponse> {
+  maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+): Promise<OpenCodeSocketHttpResponse> {
   const url = new URL(urlValue)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
     throw new Error('OpenCode hosted approval endpoint was not private loopback HTTP')
@@ -540,6 +537,9 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
     throw new Error('OpenCode hosted approval endpoint port was invalid')
   }
+  const body = dispatch?.body ?? Buffer.from(typeof init.body === 'string' ? init.body : '')
+  const wire = encodeOpenCodeSocketHttpRequest(url, init, body)
+  if (signal.aborted) throw signal.reason ?? new Error('OpenCode request aborted')
   const socket = connectTcp({ host: '127.0.0.1', port })
   // Keep an error listener while asynchronous peer/custody proof is pending.
   socket.on('error', () => {
@@ -547,32 +547,33 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   })
   const releaseSocket = custody?.retainOwnerResource(() => { socket.destroy() })
   socket.once('close', () => releaseSocket?.())
-  const abortSocket = () => socket.destroy(signal.reason instanceof Error
-    ? signal.reason
-    : new Error('OpenCode hosted approval connection aborted'))
+  const abortSocket = () => { socket.destroy() }
   const cleanupAbort = () => signal.removeEventListener('abort', abortSocket)
   signal.addEventListener('abort', abortSocket, { once: true })
   socket.once('close', cleanupAbort)
-  let requestDispatched = false
+  let reader: ReturnType<typeof readOpenCodeSocketHttpResponse> | undefined
   try {
     await new Promise<void>((resolve, reject) => {
       const connected = () => { cleanup(); resolve() }
       const failed = (error: Error) => { cleanup(); reject(error) }
+      const closed = () => failed(new Error('OpenCode supervised connection unavailable'))
       const cleanup = () => {
         socket.off('connect', connected)
         socket.off('error', failed)
+        socket.off('close', closed)
       }
       socket.once('connect', connected)
       socket.once('error', failed)
+      socket.once('close', closed)
       if (socket.destroyed) failed(new Error('OpenCode supervised connection unavailable'))
       if (signal.aborted) abortSocket()
     })
-    const connection = {
+    const connection = Object.freeze({
       localAddress: socket.localAddress ?? '',
       localPort: socket.localPort ?? 0,
       remoteAddress: socket.remoteAddress ?? '',
       remotePort: socket.remotePort ?? 0,
-    }
+    })
     const finalizeConnected = await awaitRequestAbort(authorizeConnected(connection), signal)
     if (!finalizeConnected) {
       throw new OpenCodePermissionConditionRejectedError(
@@ -582,116 +583,43 @@ async function fetchHostedApprovalOverAuthorizedConnection(
     if (signal.aborted) abortSocket()
     if (socket.destroyed) throw new Error('OpenCode authorized connection closed before dispatch')
 
-    const body = dispatch?.body ?? (typeof init.body === 'string' ? init.body : undefined)
-    const headers = new Headers(init.headers)
-    headers.set('connection', 'close')
-    if (body !== undefined) headers.set('content-length', String(Buffer.byteLength(body, 'utf8')))
-    return await new Promise<Response | SupervisedNativeResponse>((resolve, reject) => {
-      const request = httpRequest({
-        protocol: 'http:', hostname: '127.0.0.1', port,
-        path: `${url.pathname}${url.search}`, method: init.method ?? 'GET',
-        headers: Object.fromEntries(headers.entries()), agent: false,
-        createConnection: () => socket,
-      }, response => {
-        const responseHeaders = new Headers()
-        for (const [name, value] of Object.entries(response.headers)) {
-          if (Array.isArray(value)) value.forEach(member => responseHeaders.append(name, member))
-          else if (value !== undefined) responseHeaders.set(name, String(value))
-        }
-        try {
-          const status = response.statusCode ?? 500
-          if (custody) {
-            if (dispatch?.captured) {
-              const encoding = responseHeaders.get('content-encoding')
-              if (encoding !== null && encoding !== 'identity') custody.rawRetention.poison('unexpected_encoding')
-              response.once('aborted', () => custody.rawRetention.poison('incomplete_body'))
-              response.once('error', () => custody.rawRetention.poison('incomplete_body'))
-            }
-            // Response forbids a 205 body. Preserve the native stream and HTTP
-            // parser's completion evidence before applying that normalization.
-            resolve({ native: response, status, statusText: response.statusMessage ?? '', headers: responseHeaders })
-            return
-          }
-          resolve(new Response([204, 205, 304].includes(status) ? null :
-            Readable.toWeb(response) as ReadableStream, {
-            status, statusText: response.statusMessage, headers: responseHeaders,
-          }))
-        } catch (error) { response.destroy(); reject(error) }
-      })
-      request.once('error', error => {
-        if (dispatch?.captured) custody?.rawRetention.poison('request_failed')
-        reject(error)
-      })
-      // Some transports close the socket without emitting a request error while
-      // headers are pending. Cancellation must settle this wait independently.
-      const abortRequest = () => {
-        request.destroy()
-        reject(signal.reason ?? new Error('OpenCode request aborted'))
-      }
-      signal.addEventListener('abort', abortRequest, { once: true })
-      request.once('close', () => signal.removeEventListener('abort', abortRequest))
-      if (signal.aborted) { abortRequest(); return }
-      let finalized = false
-      try {
-        finalized = finalizeConnected()
-      } catch (error) {
-        request.destroy()
-        reject(new OpenCodePermissionConditionRejectedError(error))
-        return
-      }
-      if (!finalized) {
-        request.destroy()
-        reject(new OpenCodePermissionConditionRejectedError(
-          new Error('OpenCode hosted approval connected endpoint finalizer rejected dispatch'),
-        ))
-        return
-      }
-      // This call intentionally shares the finalizer's synchronous stack: no
-      // promise, await, or microtask may interpose after fence consumption.
-      requestDispatched = true
-      if (dispatch) dispatch.endAttempted = true
-      try { request.end(body) } catch (error) { request.destroy(); reject(error) }
+    reader = readOpenCodeSocketHttpResponse(socket, signal, maximumBytes, code => {
+      if (dispatch?.captured) custody?.rawRetention.poison(code)
     })
-  } finally {
-    if (!requestDispatched) {
-      cleanupAbort()
-      socket.destroy()
+    let finalized = false
+    try { finalized = finalizeConnected() } catch (error) {
+      throw new OpenCodePermissionConditionRejectedError(error)
     }
+    if (!finalized) throw new OpenCodePermissionConditionRejectedError(
+      new Error('OpenCode hosted approval connected endpoint finalizer rejected dispatch'),
+    )
+    // A final fence can synchronously revoke/destroy this very socket.
+    if (signal.aborted || socket.destroyed) throw new Error('OpenCode authorized connection closed before dispatch')
+    // No HTTP API may receive authority to open a replacement connection. Bun
+    // 1.3.11 ignores http.request/Agent createConnection overrides. The first
+    // HTTP byte is written to the proved socket in this finalizer's sync stack.
+    // Keep the existing marker: even a synchronous write throw is uncertain.
+    if (dispatch) dispatch.endAttempted = true
+    socket.write(wire)
+    return await reader.response
+  } finally {
+    reader?.cancel()
+    cleanupAbort()
+    socket.destroy()
+    releaseSocket?.()
   }
 }
 
 /** Retain even empty or undecodable bodies, and actual prefixes on truncation.
- * The node HTTP transport does no decompression. No header carrying secrets is retained.
+ * The socket reader does no decompression. No header carrying secrets is retained.
  */
 async function retainSupervisedResponse(
-  response: SupervisedNativeResponse, custody: TrustedOpenCodeCustody, retained: RetainedRequest | null,
-  maximumBytes: number,
+  response: OpenCodeSocketHttpResponse, custody: TrustedOpenCodeCustody, retained: RetainedRequest | null,
 ): Promise<Response> {
-  const chunks: Buffer[] = []
-  let size = 0
-  let complete = false
-  const encoding = response.headers.get('content-encoding')
+  const { bytes, complete } = response
+  const encoding = response.contentEncoding
   const encoded = encoding !== null && encoding !== 'identity'
   if (retained && encoded) custody.rawRetention.poison('unexpected_encoding')
-  const reader = (Readable.toWeb(response.native) as ReadableStream<Uint8Array>).getReader()
-  try {
-    if (reader) while (true) {
-      const next = await reader.read()
-      if (next.done) break
-      const remaining = maximumBytes - size
-      chunks.push(Buffer.from(next.value.subarray(0, remaining)))
-      size += Math.min(remaining, next.value.length)
-      if (next.value.length > remaining) {
-        if (retained) custody.rawRetention.poison('response_limit')
-        await reader.cancel().catch(() => undefined)
-        throw new Error('OpenCode raw response limit')
-      }
-    }
-    complete = response.native.complete && response.native.readableEnded
-  } catch {
-    if (retained) custody.rawRetention.poison('incomplete_body')
-  } finally { reader?.releaseLock() }
-  const bytes = Buffer.concat(chunks, size)
   if (!complete && retained) custody.rawRetention.poison('incomplete_body')
   if (retained) await custody.rawRetention.retainResponse(retained, {
     status: response.status, contentEncoding: encoding,
@@ -706,7 +634,16 @@ async function retainSupervisedResponse(
     }
     throw new Error('OpenCode supervised response incomplete or encoded')
   }
-  return new Response([204, 205, 304].includes(response.status) ? null : bytes, {
+  return socketHttpResponseToWeb(response)
+}
+
+function socketHttpResponseToWeb(response: OpenCodeSocketHttpResponse): Response {
+  if (!response.complete || (response.contentEncoding !== null && response.contentEncoding !== 'identity')) {
+    throw new Error('OpenCode HTTP response incomplete or encoded')
+  }
+  const bodyForbidden = [204, 205, 304].includes(response.status)
+  if (bodyForbidden && response.bytes.length) throw new Error('OpenCode HTTP status forbids response body')
+  return new Response(bodyForbidden ? null : response.bytes, {
     status: response.status, statusText: response.statusText, headers: response.headers,
   })
 }
@@ -825,8 +762,14 @@ export class OpenCodeClientFactory {
       operation?: HostedHttpOperation,
     ): Promise<T> => {
       // Freeze the wire body before retention or any other asynchronous boundary.
+      // Bound the UTF-8 allocation itself; a short Unicode string can exceed
+      // the transport byte limit even when its character count is smaller.
+      const bodyText = typeof init?.body === 'string' ? init.body : ''
+      if (custody && Buffer.byteLength(bodyText, 'utf8') > MAX_OPENCODE_SOCKET_HTTP_BODY_BYTES) {
+        throw new OpenCodeRequestNotDispatchedError()
+      }
       const dispatch = custody ? { endAttempted: false,
-        body: Buffer.from(typeof init?.body === 'string' ? init.body : ''), captured: !!operation } : undefined
+        body: Buffer.from(bodyText), captured: !!operation } : undefined
       let retained: RetainedRequest | null = null
       let operationToken: OneUseFence | null = null
       let custodyToken: OneUseFence | null = null
@@ -928,10 +871,13 @@ export class OpenCodeClientFactory {
             return valid && deadlineCurrent()
           }
         } : authorizeConnected
+        // The socket reader settles on abort with any received status/entity
+        // prefix. An outer abort race here could skip that terminal retention.
         const transported = custody || (connectedAuthorization && !this.deps.fetchImpl)
-          ? await awaitRequestAbort(fetchHostedApprovalOverAuthorizedConnection(
+          ? await fetchHostedApprovalOverAuthorizedConnection(
               baseUrl + path, requestInit, controller.signal, connectedAuthorization!, dispatch, custody,
-            ), controller.signal)
+              custody && !retained ? MAX_HOSTED_APPROVAL_OBSERVATION_BYTES : maximumResponseBytes,
+            )
           : await (async () => {
               if (authorizeConnected) {
                 throw new OpenCodePermissionConditionRejectedError(
@@ -940,9 +886,10 @@ export class OpenCodeClientFactory {
               }
               return await fetchImpl(baseUrl + path, requestInit)
             })()
-        const response = 'native' in transported
-          ? await awaitRequestAbort(retainSupervisedResponse(transported, custody!, retained,
-              retained ? maximumResponseBytes : MAX_HOSTED_APPROVAL_OBSERVATION_BYTES), controller.signal)
+        const response = 'complete' in transported
+          ? custody
+            ? await awaitRequestAbort(retainSupervisedResponse(transported, custody, retained), controller.signal)
+            : socketHttpResponseToWeb(transported)
           : transported
         if (custody && !deadlineCurrent()) throw timeoutError
         if (custody && response.status >= 300 && response.status < 400) {

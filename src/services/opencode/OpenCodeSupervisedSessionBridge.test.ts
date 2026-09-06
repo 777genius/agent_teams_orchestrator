@@ -6,7 +6,8 @@ import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge, OpenCodePermissionEffectNotAuthorizedError,
   OpenCodePermissionEffectUnavailableError } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
-import { supervisedFixture, supervisedLease } from './OpenCodeSupervisedCustody.test-fixture.js'
+import { supervisedFixture, supervisedLease, supervisedTestStage,
+  supervisedTestWait } from './OpenCodeSupervisedCustody.test-fixture.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
 function sessionRecord(fixture: Awaited<ReturnType<typeof supervisedFixture>>, hostKey: string): OpenCodeSessionRecord {
@@ -90,7 +91,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
       const bridge = new OpenCodeSessionBridge(deps)
       const record = sessionRecord(fixture, custody.hostKey)
       const pending = bridge.abort(record)
-      await started
+      await supervisedTestStage(started, pending, 'bridge acquisition health')
       record.opencodeSessionId = 'ses_substituted'
       record.memberName = 'substituted'
       deps.hostManager = new OpenCodeHostManager()
@@ -156,13 +157,13 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
           },
         }
         const pending = bridge.answerPermission(record, params).then(value => ({ value }), error => ({ error }))
-        await ready
+        await supervisedTestStage(ready, pending, `${mode} bridge effect authority`)
         if (mode === 'profile-rotation') await writeFile(fixture.profile.managedAuthPath, 'rotated')
         if (mode === 'session-rotation') await store.upsert({ ...record, opencodeSessionId: 'ses_recreated' })
         record.opencodeSessionId = 'ses_caller_substitution'
         params.requestId = 'per_caller_substitution'
         release()
-        const result = await pending
+        const result = await supervisedTestWait(pending, `${mode} bridge result`, 60_000)
         const posts = fixture.requests.filter(request => request.url.endsWith('/reply'))
         if (mode === 'success') {
           expect('value' in result && result.value).toMatchObject({ status: 'applied', sessionId: 'ses_test', requestId: 'per_test' })
@@ -172,13 +173,15 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
           expect('error' in result && result.error).toBeInstanceOf(mode === 'profile-rotation'
             ? OpenCodePermissionEffectNotAuthorizedError : OpenCodePermissionEffectUnavailableError)
           expect(posts).toHaveLength(0)
-          await Promise.all(fixture.connections.map(connection => connection.closed))
+          await supervisedTestWait(Promise.all(fixture.connections.map(connection => connection.closed)),
+            `${mode} actual TCP socket closure`)
           const wire = Buffer.concat(fixture.connections.flatMap(connection => connection.chunks)).toString()
           expect(wire).not.toContain('POST ')
         }
         for (const request of fixture.requests) {
           expect(request.headers.authorization).toBe(`Basic ${Buffer.from('opencode:fixture-secret').toString('base64')}`)
         }
+        fixture.assertSocketCustody()
         expect(fixture.observations.filter(observation => observation.phase === 'response')
           .every(observation => observation.peerOperationNonce === null && observation.correlation === 'unavailable')).toBe(true)
         await bridge.releaseSession(sessionRecord(fixture, custody.hostKey))

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { once } from 'node:events'
-import { ClientRequest, createServer } from 'node:http'
-import { createServer as createTcpServer, type AddressInfo } from 'node:net'
+import { createServer as createTcpServer, Socket, type AddressInfo } from 'node:net'
+import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
 
 import {
   canonicalHostedApprovalDigest,
@@ -25,6 +25,50 @@ const rawPermission = () => ({
 })
 const hostedClient = (factory: OpenCodeClientFactory) =>
   factory.create('http://127.0.0.1:4096', {}, hostedAuth)
+
+async function receiptSocketServer() {
+  const sockets: Array<{ socket: Socket; identity: OpenCodeConnectedSocketIdentity; bytes: Buffer; closed: Promise<void> }> = []
+  const requests: typeof sockets = []
+  const receipt = Buffer.from(JSON.stringify({
+    schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+    runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
+    requestIncarnation, permissionDigest, decision: 'allow_once',
+  }))
+  const server = createTcpServer(socket => {
+    const seen = { socket, bytes: Buffer.alloc(0),
+      identity: { localAddress: socket.remoteAddress!, localPort: socket.remotePort!,
+        remoteAddress: socket.localAddress!, remotePort: socket.localPort! },
+      closed: new Promise<void>(resolve => socket.once('close', () => resolve())) }
+    sockets.push(seen)
+    socket.on('error', () => {})
+    socket.on('data', chunk => {
+      seen.bytes = Buffer.concat([seen.bytes, chunk])
+      const boundary = seen.bytes.indexOf('\r\n\r\n')
+      if (boundary < 0 || requests.includes(seen)) return
+      const length = Number(/\r\ncontent-length: ([0-9]+)\r\n/i.exec(seen.bytes.toString())?.[1] ?? 0)
+      if (seen.bytes.length < boundary + 4 + length) return
+      requests.push(seen)
+      socket.end(Buffer.concat([Buffer.from(`HTTP/1.1 200 OK\r\nContent-Length: ${receipt.length}\r\nConnection: close\r\n\r\n`), receipt]))
+    })
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const port = (server.address() as AddressInfo).port
+  return { server, port, sockets, requests,
+    async accepted(identity: OpenCodeConnectedSocketIdentity) {
+      const match = () => sockets.find(seen => seen.identity.localPort === identity.localPort)
+      if (!match()) await once(server, 'connection')
+      expect(match()).toBeDefined()
+      expect(match()!.identity).toEqual(identity)
+      expect(match()!.bytes.length).toBe(0)
+      return match()!
+    },
+    async close() {
+      for (const seen of sockets) seen.socket.destroy()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
+}
 
 describe('OpenCodeClientFactory permissions API', () => {
   test('delegates generic provider OAuth authorization and callback to OpenCode', async () => {
@@ -324,18 +368,8 @@ describe('OpenCodeClientFactory permissions API', () => {
   })
 
   test('writes no conditional POST until the connected endpoint proof settles', async () => {
-    let posts = 0
-    const server = createServer((_request, response) => {
-      posts += 1
-      response.end(JSON.stringify({
-        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
-        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
-        requestIncarnation, permissionDigest, decision: 'allow_once',
-      }))
-    })
-    server.listen(0, '127.0.0.1')
-    await once(server, 'listening')
-    const port = (server.address() as AddressInfo).port
+    const fixture = await receiptSocketServer()
+    const { port } = fixture
     try {
       let settleProof!: (finalizer: (() => boolean) | null) => void
       let proofStarted!: () => void
@@ -348,28 +382,36 @@ describe('OpenCodeClientFactory permissions API', () => {
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
           runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
-          authorizeConnected: async () => { proofStarted(); return await proof },
+          authorizeConnected: async connection => {
+            await fixture.accepted(connection); proofStarted(); return await proof
+          },
         },
       })
       await started
       await Bun.sleep(10)
-      expect(posts).toBe(0)
+      expect(fixture.requests).toHaveLength(0)
+      expect(fixture.sockets).toHaveLength(1)
+      expect(fixture.sockets[0]!.bytes.length).toBe(0)
       settleProof(() => true)
       await expect(reply).resolves.toBeTruthy()
-      expect(posts).toBe(1)
+      expect(fixture.requests).toHaveLength(1)
+      expect(fixture.sockets).toHaveLength(1)
+      expect(fixture.requests[0]).toBe(fixture.sockets[0])
 
       await expect(client.answerPermission({
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
           runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
-          authorizeConnected: async () => () => false,
+          authorizeConnected: async connection => {
+            await fixture.accepted(connection); return () => false
+          },
         },
       })).rejects.toThrow('rejected without effect')
-      expect(posts).toBe(1)
-    } finally {
-      server.close()
-      await once(server, 'close')
-    }
+      expect(fixture.requests).toHaveLength(1)
+      expect(fixture.sockets).toHaveLength(2)
+      await fixture.sockets[1]!.closed
+      expect(fixture.sockets[1]!.bytes.length).toBe(0)
+    } finally { await fixture.close() }
   })
 
   test('writes zero POST or credential bytes after an accepted-connection listener swap', async () => {
@@ -416,22 +458,19 @@ describe('OpenCodeClientFactory permissions API', () => {
 
   test('dispatches synchronously before a final-consumption authority mutation', async () => {
     let authority = 'current'
-    let authorityAtEnd: string | null = null
-    const server = createServer((_request, response) => {
-      response.end(JSON.stringify({
-        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
-        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
-        requestIncarnation, permissionDigest, decision: 'allow_once',
-      }))
-    })
-    server.listen(0, '127.0.0.1')
-    await once(server, 'listening')
-    const port = (server.address() as AddressInfo).port
-    const originalEnd = ClientRequest.prototype.end
-    ClientRequest.prototype.end = function (...args: unknown[]) {
-      authorityAtEnd = authority
-      return originalEnd.apply(this, args as never)
-    } as typeof ClientRequest.prototype.end
+    let authorityAtWrite: string | null = null
+    const fixture = await receiptSocketServer()
+    const { port } = fixture
+    let authorizedPort = 0
+    let writes = 0
+    const originalWrite = Socket.prototype.write
+    Socket.prototype.write = function (this: Socket, ...args: unknown[]) {
+      if (this.remotePort === port) {
+        expect(this.localPort).toBe(authorizedPort)
+        writes += 1; authorityAtWrite = authority
+      }
+      return originalWrite.apply(this, args as never)
+    } as typeof Socket.prototype.write
     try {
       const client = new OpenCodeClientFactory().create(
         `http://127.0.0.1:${port}`, {}, hostedAuth,
@@ -440,18 +479,25 @@ describe('OpenCodeClientFactory permissions API', () => {
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
           runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
-          authorizeConnected: async () => () => {
-            queueMicrotask(() => { authority = 'changed' })
-            return true
+          authorizeConnected: async connection => {
+            await fixture.accepted(connection)
+            authorizedPort = connection.localPort
+            return () => {
+              queueMicrotask(() => { authority = 'changed' })
+              return true
+            }
           },
         },
       })
-      expect(authorityAtEnd).toBe('current')
+      expect(authorityAtWrite).toBe('current')
       expect(authority).toBe('changed')
+      expect(writes).toBe(1)
+      expect(fixture.sockets).toHaveLength(1)
+      expect(fixture.requests).toHaveLength(1)
+      expect(fixture.requests[0]).toBe(fixture.sockets[0])
     } finally {
-      ClientRequest.prototype.end = originalEnd
-      server.close()
-      await once(server, 'close')
+      Socket.prototype.write = originalWrite
+      await fixture.close()
     }
   })
 
@@ -468,13 +514,8 @@ describe('OpenCodeClientFactory permissions API', () => {
       () => { throw new Error('finalizer drift') },
       oneUseFinalizer,
     ]) {
-      let received = Buffer.alloc(0)
-      const server = createTcpServer(socket => {
-        socket.on('data', chunk => { received = Buffer.concat([received, chunk]) })
-      })
-      server.listen(0, '127.0.0.1')
-      await once(server, 'listening')
-      const port = (server.address() as AddressInfo).port
+      const fixture = await receiptSocketServer()
+      const { port } = fixture
       try {
         const client = new OpenCodeClientFactory().create(
           `http://127.0.0.1:${port}`, {}, hostedAuth,
@@ -483,16 +524,15 @@ describe('OpenCodeClientFactory permissions API', () => {
           requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
           condition: {
             runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
-            authorizeConnected: async () => finalizer,
+            authorizeConnected: async connection => { await fixture.accepted(connection); return finalizer },
           },
         })).rejects.toThrow('rejected without effect')
-        await Bun.sleep(10)
-        expect(received.byteLength).toBe(0)
-        expect(received.includes(Buffer.from('Authorization: Basic', 'utf8'))).toBe(false)
-      } finally {
-        server.close()
-        await once(server, 'close')
-      }
+        expect(fixture.sockets).toHaveLength(1)
+        await fixture.sockets[0]!.closed
+        expect(fixture.sockets[0]!.bytes.byteLength).toBe(0)
+        expect(fixture.sockets[0]!.bytes.includes(Buffer.from('Authorization: Basic', 'utf8'))).toBe(false)
+        expect(fixture.requests).toHaveLength(0)
+      } finally { await fixture.close() }
     }
   })
 

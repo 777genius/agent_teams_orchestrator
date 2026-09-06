@@ -205,11 +205,14 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised acquisition b
         const pending = manager.ensureHost({ lease: supervisedLease, abortSignal: abort.signal }).catch(error => error)
         await supervisedTestStage(entered.promise, pending, path)
         expect(fixture.requests.at(-1)!.url).toBe(path)
+        const accepted = fixture.requests.at(-1)!.connection
+        expect(fixture.connections).toHaveLength(fixture.requests.length)
+        fixture.assertSocketCustody()
         const count = fixture.requests.length
         const reason = new Error(`cancel ${path}`)
         abort.abort(reason)
         expect(await supervisedTestWait(pending, `${path} cancellation`, 1000)).toBe(reason)
-        await supervisedTestWait(fixture.connections.at(-1)!.closed, `${path} socket close`, 1000)
+        await supervisedTestWait(accepted.closed, `${path} exact authorized socket close`, 1000)
         expect(fixture.requests).toHaveLength(count)
         expect(manager.getHost(custody.hostKey)).toBeNull()
       } finally { abort.abort(); await fixture.close() }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { ClientRequest } from 'node:http'
+import { Socket } from 'node:net'
 import { createInterface } from 'node:readline'
 import { canonicalHostedApprovalDigest, canonicalHostedApprovalJson, OpenCodeClientFactory,
   OpenCodePermissionConditionRejectedError, OpenCodeRequestNotDispatchedError } from './OpenCodeClientFactory.js'
@@ -26,7 +26,22 @@ function replyCase(requestId = 'per_test') {
 const { condition, receipt, reply, payload } = replyCase()
 
 describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', () => {
-  test('durable request precedes finalizer/end; raw response precedes validation; frames stay 10/11', async () => {
+  test('oversized UTF-8 request is rejected before retaining or connecting', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl)
+      await expect(client.sendSessionMessage('ses_test', { parts: [{ type: 'text', text: '雪'.repeat(400_000) }] }))
+        .rejects.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+      expect(fixture.connections).toHaveLength(0)
+      expect(fixture.requests).toHaveLength(0)
+      expect(fixture.observations).toHaveLength(0)
+      expect(custody.rawRetention.isCurrent()).toBe(true)
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test('durable request precedes finalizer/first socket write; raw response precedes validation; frames stay 10/11', async () => {
     let release!: () => void
     let syncing!: () => void
     const started = new Promise<void>(resolve => { syncing = resolve })
@@ -38,34 +53,47 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     })
     let finalized = false
     let changed = false
-    let atEnd = true
-    const originalEnd = ClientRequest.prototype.end
-    ClientRequest.prototype.end = function (...args: unknown[]) {
-      atEnd = changed
-      return originalEnd.apply(this, args as never)
-    } as typeof ClientRequest.prototype.end
+    let atWrite: boolean | undefined
+    let authorizedPort = 0
+    let writes = 0
+    const originalWrite = Socket.prototype.write
+    Socket.prototype.write = function (this: Socket, ...args: unknown[]) {
+      if (this.remotePort === fixture.expected.endpoint.port) {
+        writes += 1; atWrite = changed
+        expect(this.localPort).toBe(authorizedPort)
+      }
+      return originalWrite.apply(this, args as never)
+    } as typeof Socket.prototype.write
     try {
       const custody = await fixture.acquire()
       const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
         .create(fixture.expected.endpoint.baseUrl, {}, { password: 'override', directory: '/wrong' })
       const pending = client.answerPermission({ ...reply, condition: { ...condition,
-        authorizeConnected: async () => () => {
-          finalized = true; queueMicrotask(() => { changed = true }); return true
+        authorizeConnected: async connection => {
+          await fixture.waitForConnection(connection)
+          authorizedPort = connection.localPort
+          return () => {
+            finalized = true; queueMicrotask(() => { changed = true }); return true
+          }
         } } })
-      await started
+      await supervisedTestStage(started, pending, 'request retention')
       expect(finalized).toBe(false)
       expect(fixture.requests).toHaveLength(0)
       expect(fixture.connections.flatMap(connection => connection.chunks)).toHaveLength(0)
       release()
       await expect(pending).resolves.toEqual(receipt)
       expect(finalized).toBe(true)
-      expect(atEnd).toBe(false)
+      expect(atWrite).toBe(false)
+      expect(writes).toBe(1)
+      expect(fixture.connections).toHaveLength(1)
+      expect(fixture.connections[0]!.identity.localPort).toBe(authorizedPort)
+      fixture.assertSocketCustody()
       expect(Object.keys(JSON.parse(fixture.requests[0]!.body.toString()))).toHaveLength(10)
       expect(Object.keys(receipt)).toHaveLength(11)
       expect(fixture.requests[0]!.headers.authorization).not.toContain('override')
       expect(fixture.observations.map(record => record.phase)).toEqual(['request', 'response'])
       expect(fixture.observations[1]).toMatchObject({ correlation: 'unavailable', peerOperationNonce: null })
-    } finally { ClientRequest.prototype.end = originalEnd; release?.(); await fixture.close() }
+    } finally { Socket.prototype.write = originalWrite; release?.(); await fixture.close() }
   })
 
   test('only accepted empty 409/412 are no-effect; all other retained failures remain uncertain', async () => {
@@ -107,6 +135,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         .create(fixture.expected.endpoint.baseUrl)
       const failure = await client.answerPermission({ ...reply, condition: { ...condition,
         authorizeConnected: async connection => {
+          await fixture.waitForConnection(connection)
           connected = connection.remotePort === fixture.expected.endpoint.port && connection.localPort > 0
           return () => {
             finalizerCalls += 1
@@ -130,6 +159,40 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       expect(retained.phase === 'request' && JSON.parse(Buffer.from(retained.body.bodyBase64, 'base64').toString())).toEqual(payload)
     } finally { await fixture.close() }
   }, 120_000)
+
+  for (const mode of ['false', 'throw', 'reuse'] as const) {
+    test(`finalizer ${mode} closes the exact authorized socket with zero bytes`, async () => {
+      const fixture = await supervisedFixture()
+      let calls = 0
+      let used = false
+      const finalizer = () => {
+        calls += 1
+        if (mode === 'throw') throw new Error('finalizer drift')
+        if (mode === 'false' || used) return false
+        used = true; return true
+      }
+      if (mode === 'reuse') expect(finalizer()).toBe(true)
+      try {
+        const custody = await fixture.acquire()
+        const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+          .create(fixture.expected.endpoint.baseUrl)
+        const failure = await client.answerPermission({ ...reply, condition: { ...condition,
+          authorizeConnected: async connection => {
+            const accepted = await fixture.waitForConnection(connection)
+            expect(accepted.identity).toEqual(connection)
+            expect(custody.rawRetention.isCurrent()).toBe(true)
+            return finalizer
+          },
+        } }).catch(error => error)
+        expect(failure).toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+        expect(calls).toBe(mode === 'reuse' ? 2 : 1)
+        expect(fixture.connections).toHaveLength(1)
+        await supervisedTestWait(fixture.connections[0]!.closed, `${mode} finalizer socket close`)
+        expect(fixture.connections[0]!.chunks).toHaveLength(0)
+        expect(fixture.requests).toHaveLength(0)
+      } finally { await fixture.close() }
+    }, 120_000)
+  }
 
   test('retains encoded or truncated bytes before poisoning', async () => {
     for (const incomplete of [false, true]) {
@@ -157,8 +220,8 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     }
   }, 120_000)
 
-  test('end throw and response-sync failure remain uncertain, while retained valid 409 is no-effect', async () => {
-    for (const mode of ['end-throw', 'response-sync-failure', 'valid-409']) {
+  test('socket write throw and response-sync failure remain uncertain, while retained valid 409 is no-effect', async () => {
+    for (const mode of ['write-throw', 'response-sync-failure', 'valid-409']) {
       let syncs = 0
       const fixture = await supervisedFixture({
         async sync() { if (++syncs === 2 && mode === 'response-sync-failure') throw new Error('sync failed') },
@@ -167,12 +230,13 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
           response.end(mode === 'valid-409' ? '' : canonicalHostedApprovalJson(receipt))
         },
       })
-      const originalEnd = ClientRequest.prototype.end
+      const originalWrite = Socket.prototype.write
       try {
         const custody = await fixture.acquire()
-        if (mode === 'end-throw') ClientRequest.prototype.end = function () {
-          throw new Error('end failed')
-        } as typeof ClientRequest.prototype.end
+        if (mode === 'write-throw') Socket.prototype.write = function (this: Socket, ...args: unknown[]) {
+          if (this.remotePort === fixture.expected.endpoint.port) throw new Error('write failed')
+          return originalWrite.apply(this, args as never)
+        } as typeof Socket.prototype.write
         const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
           .create(fixture.expected.endpoint.baseUrl)
         let error: unknown
@@ -186,7 +250,12 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
           expect(error).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
           expect(custody.rawRetention.isCurrent()).toBe(false)
         }
-      } finally { ClientRequest.prototype.end = originalEnd; await fixture.close() }
+        expect(fixture.connections).toHaveLength(1)
+        if (mode === 'write-throw') {
+          await supervisedTestWait(fixture.connections[0]!.closed, 'throwing write socket close')
+          expect(fixture.connections[0]!.chunks).toHaveLength(0)
+        }
+      } finally { Socket.prototype.write = originalWrite; await fixture.close() }
     }
   }, 120_000)
 
@@ -205,7 +274,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       const factory = new OpenCodeClientFactory(deps)
       const body = { ...reply, condition: { ...reply.condition } }
       const pending = factory.create(fixture.expected.endpoint.baseUrl).answerPermission(body)
-      await started
+      await supervisedTestStage(started, pending, 'retention before dependency substitution')
       let stolen = 0
       deps.fetchImpl = async () => { stolen += 1; throw new Error('substituted transport') }
       body.sessionId = 'ses_substitute'
@@ -250,10 +319,12 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     }
   }, 120_000)
 
-  test('205 retains native bytes and truncation before status normalization', async () => {
-    for (const complete of [true, false]) {
+  for (const status of [204, 205]) for (const complete of [true, false]) {
+    test(`${status} retains exact prefix before normalization on immediate EOF, complete=${complete}`, async () => {
+      const wire = `HTTP/1.1 ${status} No Content\r\nContent-Length: ${complete ? 6 : 100}\r\nConnection: close\r\n\r\nprefix`
+      let emitted: string | undefined
       const fixture = await supervisedFixture({ rawResponse(_request, socket) {
-        socket.end(`HTTP/1.1 205 Reset Content\r\nContent-Length: ${complete ? 6 : 100}\r\nConnection: close\r\n\r\nprefix`)
+        emitted = wire; socket.end(wire)
       } })
       try {
         const custody = await fixture.acquire()
@@ -264,15 +335,17 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         expect(failure).not.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
         expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
         const retained = fixture.observations.find(record => record.phase === 'response')!
-        expect(retained).toMatchObject({ status: 205, complete })
+        expect(emitted).toBe(wire)
+        expect(retained).toMatchObject({ status, complete })
         expect(retained.phase === 'response' && Buffer.from(retained.body.bodyBase64, 'base64').toString()).toBe('prefix')
         expect(custody.rawRetention.isCurrent()).toBe(false)
         expect(fixture.requests).toHaveLength(1)
+        expect(fixture.connections).toHaveLength(1)
         expect(fixture.requests[0]!.method).toBe('POST')
         expect(JSON.parse(fixture.requests[0]!.body.toString())).toEqual(payload)
       } finally { await fixture.close() }
-    }
-  }, 120_000)
+    }, 120_000)
+  }
 
   test('failure revokes a concurrent retained request while terminal append or sync is stalled', async () => {
     for (const mode of ['malformed', 'encoded', 'incomplete'] as const) {
@@ -319,7 +392,8 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         const failedCase = replyCase('per_failed')
         let waitingFinalized = false
         const waiting = client.answerPermission({ ...waitingCase.reply, condition: { ...waitingCase.condition,
-          authorizeConnected: async () => {
+          authorizeConnected: async connection => {
+            await fixture.waitForConnection(connection)
             peerReady(); await peerGate; return () => { waitingFinalized = true; return true }
           },
         } }).catch(error => error)
@@ -339,6 +413,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         expect(waitingFinalized).toBe(true)
         await supervisedTestWait(fixture.connections[0]!.closed, 'revoked waiting socket close')
         expect(fixture.connections[0]!.chunks).toHaveLength(0)
+        expect(fixture.connections).toHaveLength(2)
         expect(fixture.requests).toHaveLength(1)
         expect(fixture.observations.filter(record => record.phase === 'request')).toHaveLength(2)
         expect(fixture.requests[0]!.url).toContain('/permission/per_failed/reply')
@@ -400,8 +475,30 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     } finally { proofFinished?.(); await fixture.close() }
   }, 120_000)
 
-  test('empty numeric rejection with encoding or incomplete framing remains uncertain', async () => {
-    for (const encoded of [true, false]) {
+  test('response timeout retains the received prefix and closes only the authorized socket', async () => {
+    const fixture = await supervisedFixture({ rawResponse(_request, socket) {
+      socket.write('HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nprefix')
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl, { requestTimeoutMs: 100 })
+      const failure = await supervisedTestWait(client.answerPermission(reply).catch(error => error), 'partial response timeout')
+      expect(failure.message).toContain('timed out')
+      expect(failure).not.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+      expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
+      expect(fixture.connections).toHaveLength(1)
+      expect(fixture.requests).toHaveLength(1)
+      await supervisedTestWait(fixture.requests[0]!.connection.closed, 'partial response exact socket close')
+      const retained = fixture.observations.find(record => record.phase === 'response')!
+      expect(retained).toMatchObject({ status: 200, complete: false })
+      expect(retained.phase === 'response' && Buffer.from(retained.body.bodyBase64, 'base64')).toEqual(Buffer.from('prefix'))
+      expect(custody.rawRetention.isCurrent()).toBe(false)
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  for (const encoded of [true, false]) {
+    test(`empty 409 on immediate EOF stays uncertain: ${encoded ? 'gzip' : 'incomplete length'}`, async () => {
       const fixture = await supervisedFixture({ rawResponse(_request, socket) {
         socket.end('HTTP/1.1 409 Conflict\r\nConnection: close\r\n' +
           (encoded ? 'Content-Length: 0\r\nContent-Encoding: gzip' : 'Content-Length: 1') + '\r\n\r\n')
@@ -418,9 +515,61 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
           .toMatchObject({ status: 409, complete: encoded, body: { byteLength: 0 } })
         expect(custody.rawRetention.isCurrent()).toBe(false)
         expect(fixture.requests).toHaveLength(1)
+        expect(fixture.connections).toHaveLength(1)
         expect(JSON.parse(fixture.requests[0]!.body.toString())).toEqual(payload)
       } finally { await fixture.close() }
-    }
+    }, 120_000)
+  }
+
+  for (const mode of ['duplicate-encoding', 'conflicting-encoding', 'duplicate-length'] as const) {
+    test(`empty 409 retains metadata and stays uncertain for ${mode}`, async () => {
+      const encoding = mode === 'duplicate-encoding' ? 'identity, identity' : mode === 'conflicting-encoding' ? 'identity, gzip' : null
+      const fixture = await supervisedFixture({ rawResponse(_request, socket) {
+        socket.end('HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n' +
+          (mode === 'duplicate-length' ? 'Content-Length: 0\r\n' :
+            `Content-Encoding: identity\r\ncOnTeNt-EnCoDiNg: ${mode === 'duplicate-encoding' ? 'identity' : 'gzip'}\r\n`) + '\r\n')
+      } })
+      try {
+        const custody = await fixture.acquire()
+        const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+          .create(fixture.expected.endpoint.baseUrl)
+        const failure = await client.answerPermission(reply).catch(error => error)
+        expect(failure).toBeInstanceOf(Error)
+        expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
+        expect(failure).not.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+        expect(fixture.observations.find(record => record.phase === 'response')).toMatchObject({
+          status: 409, contentEncoding: encoding, complete: mode !== 'duplicate-length', body: { byteLength: 0 },
+        })
+        expect(fixture.connections).toHaveLength(1)
+        expect(fixture.requests).toHaveLength(1)
+        expect(custody.rawRetention.isCurrent()).toBe(false)
+      } finally { await fixture.close() }
+    }, 120_000)
+  }
+
+  test('valid chunked reply retains only exact entity bytes and keeps unadmitted nonce metadata unavailable', async () => {
+    const bytes = Buffer.from(canonicalHostedApprovalJson(receipt))
+    const fixture = await supervisedFixture({ rawResponse(_request, socket) {
+      socket.end(Buffer.concat([
+        Buffer.from('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: identity\r\n' +
+          `x-agent-teams-hosted-operation-nonce: ${'a'.repeat(64)}\r\n\r\n7;fixture=yes\r\n`),
+        bytes.subarray(0, 7), Buffer.from(`\r\n${(bytes.length - 7).toString(16)}\r\n`), bytes.subarray(7),
+        Buffer.from('\r\n0\r\nX-Fixture: bounded\r\n\r\n'),
+      ]))
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl)
+      expect(await client.answerPermission(reply)).toEqual(receipt)
+      expect(fixture.connections).toHaveLength(1)
+      expect(fixture.requests).toHaveLength(1)
+      const retained = fixture.observations.find(record => record.phase === 'response')!
+      expect(retained).toMatchObject({ status: 200, complete: true, contentEncoding: 'identity',
+        peerOperationNonce: null, correlation: 'unavailable' })
+      expect(retained.phase === 'response' && Buffer.from(retained.body.bodyBase64, 'base64')).toEqual(bytes)
+      expect(custody.rawRetention.isCurrent()).toBe(true)
+    } finally { await fixture.close() }
   }, 120_000)
 
   test('an exhausted total budget cannot gain a new response deadline after proof', async () => {
@@ -434,7 +583,8 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
         .create(fixture.expected.endpoint.baseUrl, { remainingMs: () => expires - performance.now() })
       const failure = await client.answerPermission({ ...reply, condition: { ...condition,
-        authorizeConnected: async () => {
+        authorizeConnected: async connection => {
+          await fixture.waitForConnection(connection)
           connected = true
           await new Promise(resolve => setTimeout(resolve, Math.max(0, expires - performance.now()) + 50))
           return () => { cleaned(); return true }
