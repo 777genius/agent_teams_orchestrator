@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
 import type {
@@ -11,7 +11,7 @@ import type {
   HostedApprovalWirePort,
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
-import { HostedApprovalOwnerPublicationError, type HostedApprovalDeliveryState, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import { bindOwnerDeliveryRequest, HostedApprovalOwnerPublicationError, type HostedApprovalDeliveryState, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
 import { createOwnerOperationNonce } from './HostedApprovalOwnerProvenance.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import { ingressRecordForObservedPermission, OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
@@ -101,19 +101,21 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
   }
 
   async authorizeDecision(input: { request: HostedApprovalDeliveryRequest; payloadFingerprint: string }): Promise<HostedApprovalDeliveryAuthorizationResult> {
+    input = structuredClone(input)
     if (!(await this.#authorityCurrent())) return { status: 'unavailable' }
     let state: HostedApprovalOwnerState | null
     try { state = await this.options.store.read() } catch { return { status: 'unavailable' } }
     if (!state) return { status: 'unavailable' }
     const prior = findDelivery(state, input.request)
     if (prior) return replay(prior, input.request, input.payloadFingerprint)
-    const bound = bindRequest(state, input.request); if (!bound) return { status: 'stale_generation' }
+    const bound = bindOwnerDeliveryRequest(state, input.request); if (!bound) return { status: 'stale_generation' }
     const token = `approval-authorization_${(this.options.createToken ?? (() => randomUUID().replaceAll('-', '')))()}`
     this.#tokens.set(token, { request: input.request, fingerprint: input.payloadFingerprint })
     return { status: 'authorized', authorization: { token, persistedAuthority: bound.route.authority } }
   }
 
   async deliverDecision(input: Parameters<HostedApprovalWirePort['deliverDecision']>[0]): Promise<HostedApprovalDeliveryPortResult> {
+    input = structuredClone(input)
     const token = this.#tokens.get(input.authorization.token); this.#tokens.delete(input.authorization.token)
     if (!token || token.fingerprint !== input.payloadFingerprint || !isDeepStrictEqual(token.request, input.request) ||
       !isDeepStrictEqual(input.authorization.persistedAuthority, input.admittedAuthority) || !(await this.#authorityCurrent())) {
@@ -126,7 +128,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         state.admissionDigest !== this.options.admission.digest) return { status: 'stale_generation' }
       const prior = findDelivery(state, input.request)
       if (prior) return replay(prior, input.request, input.payloadFingerprint)
-      const bound = bindRequest(state, input.request)
+      const bound = bindOwnerDeliveryRequest(state, input.request)
       if (!bound || !isDeepStrictEqual(bound.route.authority, input.admittedAuthority)) return { status: 'stale_generation' }
       if (!(await this.#routeCurrent(bound.route))) return { status: 'stale_generation' }
       if (bound.route.authority.teamId !== input.request.partition.teamId || bound.route.authority.runId !== input.request.partition.runId) {
@@ -155,6 +157,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       try {
         startedState = (await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] }, {
           operationNonce, mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
+          initial: { request: input.request, payloadFingerprint: input.payloadFingerprint },
         })).state
       } catch (error) {
         // Only this first write can prove that no started record was published.
@@ -264,6 +267,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     const delivery: HostedApprovalDeliveryState = { providerDeliveryId: input.request.providerDeliveryId, reconciliationRef: input.request.reconciliationRef, deliveryRef: input.request.deliveryRef, payloadFingerprint: input.payloadFingerprint, outboxId, effectRef: record.effectRef, phase: 'rejected', result }
     await this.options.store.wal.publishMutation(state, { ...withoutRevision(state), deliveries: [...state.deliveries, delivery] }, {
       operationNonce, mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: result }, delivery,
+      initial: { request: input.request, payloadFingerprint: input.payloadFingerprint },
     })
     return { status: result } as const
   }
@@ -278,18 +282,12 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         ? { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }
         : { kind: 'delivery-settled', phase: 'rejected', outcome: result as Exclude<typeof result, 'delivered'> },
       delivery: settled,
+      initial: null,
     })
     return { status: result === 'delivered' ? 'delivered' as const : result }
   }
 }
 
-function bindRequest(state: HostedApprovalOwnerState, request: HostedApprovalDeliveryRequest) {
-  const record = state.ingress.find(item => item.deliveryRef === request.deliveryRef && item.commandId === request.requestId && item.authority.teamId === request.partition.teamId && item.authority.runId === request.partition.runId)
-  if (!record || request.approvalGeneration !== `generation_runtime-permission-${record.effectRef.slice(7)}`) return null
-  const approvalId = `approval_${createHash('sha256').update(JSON.stringify({ schemaVersion: 1, teamId: request.partition.teamId, runId: request.partition.runId, requestId: request.requestId })).digest('hex').slice(0, 32)}`
-  if (request.approvalId !== approvalId) return null
-  const route = state.routes.find(item => isDeepStrictEqual(item.authority, record.authority)); return route ? { record, route } : null
-}
 function replay(prior: HostedApprovalDeliveryState, request: HostedApprovalDeliveryRequest, fingerprint: string): HostedApprovalDeliveryPortResult {
   if (prior.providerDeliveryId !== request.providerDeliveryId || prior.deliveryRef !== request.deliveryRef ||
     prior.reconciliationRef !== request.reconciliationRef || prior.payloadFingerprint !== fingerprint) return { status: 'conflict' }

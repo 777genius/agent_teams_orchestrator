@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, constants, fdatasyncSync, fstatSync, openSync, readFileSync, readSync, writeSync } from 'node:fs'
 
-import type { HostedApprovalIngressRecord, HostedApprovalAckRequest } from './HostedApprovalWire.js'
+import type { HostedApprovalIngressRecord, HostedApprovalAckRequest, HostedApprovalDeliveryRequest } from './HostedApprovalWire.js'
 import type { HostedApprovalDeliveryState, HostedApprovalOwnerState, HostedApprovalWriterFenceIdentity } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
 import HOSTED_OWNER_PROVENANCE_CONTRACT_ARTIFACT from './contracts/hosted-producer-provenance-v2.schema.json' with { type: 'text' }
@@ -38,6 +38,7 @@ export type OwnerLeaseClaim = Readonly<{
   ownerId: string
 }>
 
+export type OwnerWalInitialDeliveryWitness = Readonly<{ request: HostedApprovalDeliveryRequest; payloadFingerprint: string }>
 /** A discriminated witness created at the real mutation site, never inferred by WAL. */
 export type OwnerWalMutationIntent =
   | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'admission-reconciled' }>; admission: HostedApprovalRuntimeAdmission }>
@@ -45,8 +46,8 @@ export type OwnerWalMutationIntent =
   | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'binding-quarantined' }>; record: HostedApprovalIngressRecord }>
   | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'ingress-lease-claimed' }>; records: readonly HostedApprovalIngressRecord[] }>
   | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'ingress-acknowledged' }>; request: HostedApprovalAckRequest; record: HostedApprovalIngressRecord }>
-  | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'delivery-started' }>; delivery: HostedApprovalDeliveryState }>
-  | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'delivery-settled' }>; delivery: HostedApprovalDeliveryState }>
+  | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'delivery-started' }>; delivery: HostedApprovalDeliveryState; initial: OwnerWalInitialDeliveryWitness }>
+  | Readonly<{ operationNonce: string; mutation: Extract<OwnerWalMutation, { kind: 'delivery-settled' }>; delivery: HostedApprovalDeliveryState; initial: OwnerWalInitialDeliveryWitness | null }>
 
 export type OwnerStateField = keyof HostedApprovalOwnerState
 export type OwnerWalNative = Readonly<{
@@ -94,6 +95,8 @@ export interface OwnerWalImageCustodian {
   }>
 }
 export interface OwnerWalPublicationProducer {
+  /** Process-owned, irreversible health: every WAL sharing this producer must consult it. */
+  isHealthy(): boolean
   prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication
   poison(reason: string): never
   close(): void
@@ -165,8 +168,10 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
   #previous: string | null = null
   #fatal: Error | null = null
   #closed = false
+  #closing = false
   readonly #emissionNonces = new Set<string>()
   readonly #producer: VerifiedOwnerProducerIdentity
+  isHealthy(): boolean { return this.#fatal === null && !this.#closed && !this.#closing }
   constructor(private readonly capsule: Capsule, identity: ReturnType<OwnerProvenanceOperations['identity']>, private readonly operations: OwnerProvenanceOperations, private readonly imageCustodian: OwnerWalImageCustodian, private readonly onPoison?: (error: Error) => void) {
     this.#producer = Object.freeze({ role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, artifactManifestSha256: capsule.expectedProducer.artifactManifestSha256, moduleSha256: identity.moduleSha256, exeSha256: identity.exeSha256, pid: identity.pid, startTicks: identity.startTicks, exeDev: identity.exeDev, exeIno: identity.exeIno })
     this.#append('producer-open', null, { descriptor: capsule.streams.ownerWalTimeline })
@@ -178,32 +183,39 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
   }
   #prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication {
     if (this.#fatal) throw this.#fatal
-    if (this.#closed) return this.poison('owner-provenance-writer-closed')
-    validateIntent(input.intent)
+    if (this.#closed || this.#closing) return this.poison('owner-provenance-writer-closed')
+    // Own all receipt metadata before nonce/custody/I/O callbacks can mutate
+    // the inputs. The serialized line and acknowledgement use these same values.
+    const operationNonce = input.intent.operationNonce
+    const mutation = structuredClone(input.intent.mutation)
     validateNative(input.native)
-    if (!sameRetainedImage(input.next, input.next) || input.next.sha256 !== input.native.wal.sha256 ||
-      input.next.byteSize !== input.native.wal.byteSize || input.previous.kind === 'absent' && input.native.stateDelta.previousStateSha256 !== null ||
+    const native = freezeNativeMetadata(JSON.parse(canonicalJson(input.native)) as OwnerWalNative)
+    validateIntent({ operationNonce, mutation })
+    validateNative(native)
+    if (!sameRetainedImage(input.next, input.next) || input.next.sha256 !== native.wal.sha256 ||
+      input.next.byteSize !== native.wal.byteSize || input.previous.kind === 'absent' && native.stateDelta.previousStateSha256 !== null ||
       input.previous.kind === 'retained' && (!sameRetainedImage(input.previous.image, input.previous.image) ||
-        input.previous.image.sha256 !== input.native.stateDelta.previousStateSha256)) {
+        input.previous.image.sha256 !== native.stateDelta.previousStateSha256)) {
       throw new TypeError('owner-provenance-image-native-mismatch')
     }
-    if (input.intent.mutation !== input.native.mutation && canonicalJson(input.intent.mutation) !== canonicalJson(input.native.mutation)) {
+    if (canonicalJson(mutation) !== canonicalJson(native.mutation)) {
       throw new TypeError('owner-provenance-mutation-mismatch')
     }
-    const sequence = this.#sequence
-    const emissionNonce = this.#nextEmissionNonce()
-    const line = this.#line('owner-wal-published', input.intent.operationNonce, input.native, sequence, emissionNonce)
-    if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new RangeError('owner-provenance-line-bounded')
     // Keep receipt ownership separate from both caller and custody ownership.
     const previous = copyPreviousImage(input.previous)
     const next = retainedWalImage(input.next.bytes)
+    const sequence = this.#sequence
+    const emissionNonce = this.#nextEmissionNonce()
+    const line = this.#line('owner-wal-published', operationNonce, native, sequence, emissionNonce)
+    if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new RangeError('owner-provenance-line-bounded')
     const custody = this.imageCustodian.prepare(copyPreviousImage(previous), retainedWalImage(next.bytes))
     let used = false
     return Object.freeze({ emit: () => {
+      if (!this.isHealthy()) return this.poison('owner-provenance-writer-unavailable')
       if (used || sequence !== this.#sequence) return this.poison('owner-provenance-prepared-publication-stale')
       used = true
       const lineSha256 = this.#writePrepared(line, sequence)
-      const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce: input.intent.operationNonce, emissionNonce, sequence, lineSha256 })
+      const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce, emissionNonce, sequence, lineSha256 })
       let bound: Readonly<{ previous: PreviousWalImage; next: RetainedWalImage }>
       try { bound = custody.bind(emission) } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-image-bind') }
       if (!sameRetainedImage(bound.next, next) ||
@@ -211,7 +223,8 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
           !sameRetainedImage(bound.previous.image, previous.image)) {
         return this.poison('owner-provenance-image-custody-mismatch')
       }
-      return Object.freeze({ native: input.native, previous, next, emission })
+      if (!this.isHealthy()) return this.poison('owner-provenance-health-lost-during-emission')
+      return Object.freeze({ native, previous, next, emission })
     } })
   }
   poison(reason: string): never {
@@ -220,7 +233,8 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
     throw error
   }
   close(): void {
-    if (this.#closed) return
+    if (this.#closed || this.#closing) return
+    this.#closing = true
     let closeError: Error | null = null
     try { if (!this.#fatal) this.#append('producer-close', null, {}) } finally {
       try { this.operations.sync(HOSTED_OWNER_PROVENANCE_FD) } catch (error) { closeError ??= error as Error }
@@ -245,6 +259,7 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
   }
   #writePrepared(line: string, sequence: number): string {
     if (this.#fatal) throw this.#fatal
+    if (this.#closed) return this.poison('owner-provenance-writer-closed')
     if (sequence !== this.#sequence) return this.poison('owner-provenance-sequence-conflict')
     const bytes = Buffer.from(line)
     if (bytes.byteLength > MAX_LINE_BYTES) return this.poison('owner-provenance-line-bounded')
@@ -283,7 +298,15 @@ function verifyContractMirror(): void {
   if (bytes.byteLength !== 56_415 || sha256(bytes) !== HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256) throw new Error('owner-provenance-schema-digest-mismatch')
 }
 
-function validateIntent(intent: OwnerWalMutationIntent): void {
+function freezeNativeMetadata<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const child of Object.values(value)) freezeNativeMetadata(child)
+    Object.freeze(value)
+  }
+  return value
+}
+
+function validateIntent(intent: Pick<OwnerWalMutationIntent, 'operationNonce' | 'mutation'>): void {
   if (!HEX_64.test(intent.operationNonce)) throw new TypeError('owner-provenance-operation-nonce')
   if (intent.mutation.kind === 'ingress-lease-claimed' && intent.mutation.claims.length === 0) throw new TypeError('owner-provenance-empty-claims')
 }

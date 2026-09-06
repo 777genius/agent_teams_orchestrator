@@ -133,19 +133,7 @@ async function fixture(
 
 describe('HostedApprovalOwnerService R2', () => {
   test('emits each genuine Store publication once and emits nothing for exact replay', async () => {
-    const mutations: OwnerWalMutation[] = []
-    const publicationProducer: OwnerWalPublicationProducer = {
-      prepare(input) { return { emit: () => {
-        mutations.push(input.native.mutation)
-        return { native: input.native, previous: input.previous, next: input.next, emission: {
-          stream: 'ownerWalTimeline', producer: { role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
-            artifactManifestSha256: '1'.repeat(64), moduleSha256: '2'.repeat(64), exeSha256: '3'.repeat(64), pid: process.pid,
-            startTicks: '1', exeDev: '1', exeIno: '1' }, activation: { controllerNonce: '4'.repeat(64), runId: 'run_test', stackManifestSha256: '5'.repeat(64) },
-          descriptor: { fd: 9, device: '1', inode: '1' }, operationNonce: input.intent.operationNonce,
-          emissionNonce: '6'.repeat(64), sequence: mutations.length, lineSha256: '7'.repeat(64),
-        } }
-      } } }, poison(reason): never { throw new Error(reason) }, close() {},
-    }
+    const { producer: publicationProducer, mutations } = nativeServiceCapture()
     const fx = await fixture({ publicationProducer })
     expect(mutations.map(mutation => mutation.kind)).toEqual(['admission-reconciled'])
     await fx.service.pollIngress()
@@ -354,25 +342,10 @@ describe('HostedApprovalOwnerService R2', () => {
 
   test.each(['capture-sync', 'cleanup-close'] as const)('started %s failure revokes readiness and effect authority but preserves reconciliation', async failure => {
     let poisoned = false; let effects = 0
-    let armed = false; let nonce = 0; const chunks: Buffer[] = []
-    const publicationProducer = createOwnerWalPublicationProducerFromEnvironment({
-      environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
-        activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
-        contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
-        expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
-          implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
-        producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
-      }) }, modulePath: '/unused',
-      imageCustodian: { prepare: (previous, next) => ({ bind: () => ({ previous, next }) }) },
-      operations: {
-        identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11', exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
-        descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
-        nonce: () => (++nonce).toString(16).padStart(64, '0'),
-        write: (_fd, bytes, offset) => { chunks.push(Buffer.from(bytes.subarray(offset))); return bytes.byteLength - offset },
-        sync: () => { if (armed && failure === 'capture-sync') throw new Error('capture sync failed') }, close: () => {},
-      },
-      onPoison: () => { poisoned = true },
-    })!
+    let armed = false
+    const { producer: publicationProducer, chunks } = nativeServiceCapture({
+      failSync: () => armed && failure === 'capture-sync', onPoison: () => { poisoned = true },
+    })
     const fx = await fixture({ publicationProducer, deliver: () => { effects += 1; return 'delivered' },
       walHooks: { closeWalTemp(fd) { closeSync(fd); if (armed && failure === 'cleanup-close') throw new Error('close failed') } },
     })
@@ -403,6 +376,68 @@ describe('HostedApprovalOwnerService R2', () => {
     expect(effects).toBe(0)
     expect(chunks).toHaveLength(appended)
     expect(await readFile(fx.store.wal.path)).toEqual(durable)
+    // A new WAL must inherit the process producer's poison even when recovery
+    // takes Store's unchanged-admission shortcut and performs no native write.
+    const reconstructedWal = new HostedApprovalOwnerWal(fx.store.wal.path, undefined, publicationProducer)
+    const reconstructed = new HostedApprovalOwnerService({ store: new HostedApprovalOwnerStore(reconstructedWal),
+      admission: fx.admission, runtime: fx.runtime, isCurrentOuterAuthority: async () => true })
+    await reconstructed.recoverStateOnly()
+    expect(await reconstructed.isAdmissionRecoveredCurrent()).toBe(false)
+    expect(await reconstructed.authorizeDecision({ request, payloadFingerprint: fingerprintHostedApprovalDelivery(request) }))
+      .toEqual({ status: 'unavailable' })
+    await reconstructedWal.locked(async current => {
+      expect(await reconstructedWal.prepareEffectToken(current!)).toBeNull()
+      await expect(reconstructedWal.publishMutation(current, { ...withoutRevision(current!), admissionDigest: 'e'.repeat(64) }, {
+        operationNonce: 'e'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' },
+        admission: { ...fx.admission, digest: 'e'.repeat(64) },
+      })).rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+    })
+    expect(await reconstructed.reconcileDecision({ reconciliationRef: request.reconciliationRef,
+      providerDeliveryId: request.providerDeliveryId, partition: request.partition })).toEqual({ status: 'operator_required' })
+    expect(chunks).toHaveLength(appended)
+    expect(await readFile(fx.store.wal.path)).toEqual(durable)
+    expect(effects).toBe(0)
+  })
+
+  test('fallible outer releases preserve direct-rejection, started and completed reconciliation without retry', async () => {
+    for (const outcome of ['direct-rejection', 'started', 'completed'] as const) for (const failures of [['parent'], ['fence', 'unlock', 'lock', 'parent']]) {
+      const capture = nativeServiceCapture(); let effects = 0; let armed = false
+      const releases: string[] = []
+      const fx = await fixture({ publicationProducer: capture.producer,
+        deliver: () => { effects += 1; return outcome === 'started' ? 'ambiguous' : 'delivered' },
+        walHooks: { releaseWriterResource: async (resource, release) => {
+          await release()
+          if (armed) { releases.push(resource); if (failures.includes(resource)) throw new Error(`release ${resource} failed`) }
+        } },
+      })
+      const [record] = await fx.service.claimIngress({
+        request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 }, maximumAggregateBytes: 1_000_000,
+      })
+      const request = delivery(record!)
+      if (outcome === 'direct-rejection') request.principal = { kind: 'operator', actorId: 'actor_self' }
+      const before = capture.mutations.length
+      armed = true
+      expect(await runDelivery(fx.service, request, record!.authority)).toEqual({ status: 'operator_required', reconciliationRef: request.reconciliationRef })
+      armed = false
+      expect(releases).toEqual(['fence', 'unlock', 'lock', 'parent'])
+      expect(capture.producer.isHealthy()).toBe(false)
+      expect(await fx.service.isAdmissionRecoveredCurrent()).toBe(false)
+      const durable = await readFile(fx.store.wal.path)
+      const phase = outcome === 'direct-rejection' ? 'rejected' : outcome
+      expect((await fx.store.read())!.deliveries[0]!.phase).toBe(phase)
+      expect(capture.mutations.slice(before).map(mutation => mutation.kind)).toEqual(outcome === 'direct-rejection'
+        ? ['delivery-settled'] : outcome === 'started' ? ['delivery-started'] : ['delivery-started', 'delivery-settled'])
+      const appended = capture.chunks.length
+      await fx.service.recoverStateOnly()
+      expect(await fx.service.reconcileDecision({ reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId, partition: request.partition })).toEqual({
+        status: outcome === 'direct-rejection' ? 'not_delivered' : outcome === 'started' ? 'operator_required' : 'delivered',
+      })
+      expect(await runDelivery(fx.service, request, record!.authority)).toEqual({ status: 'unavailable' })
+      expect(effects).toBe(outcome === 'direct-rejection' ? 0 : 1)
+      expect(capture.chunks).toHaveLength(appended)
+      expect(await readFile(fx.store.wal.path)).toEqual(durable)
+    }
   })
 
   test('a settlement pre-replace failure preserves delivered uncertainty and prevents retry after recovery', async () => {
@@ -1192,4 +1227,34 @@ function makeRoute(): HostedApprovalRuntimeRoute {
       liveEffectFingerprint: 'b'.repeat(64),
     },
   }
+}
+
+// Real Owner serializer with controlled descriptor I/O, shared by mutation and failure tests.
+function nativeServiceCapture(options: { failSync?: () => boolean; onPoison?: () => void } = {}) {
+  let nonce = 0
+  const chunks: Buffer[] = []
+  const mutations: OwnerWalMutation[] = []
+  const producer = createOwnerWalPublicationProducerFromEnvironment({
+    environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
+      activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+      contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+      expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
+        implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+      producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
+    }) }, modulePath: '/unused',
+    imageCustodian: { prepare: (previous, next) => ({ bind: () => ({ previous, next }) }) },
+    operations: {
+      identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11', exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+      descriptor: () => ({ device: '7', inode: '8', regular: true, append: true, writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+      nonce: () => (++nonce).toString(16).padStart(64, '0'),
+      write: (_fd, bytes, offset) => {
+        const chunk = Buffer.from(bytes.subarray(offset)); chunks.push(chunk)
+        const line = JSON.parse(chunk.toString())
+        if (line.recordType === 'owner-wal-published') mutations.push(line.native.mutation)
+        return chunk.byteLength
+      },
+      sync: () => { if (options.failSync?.()) throw new Error('capture sync failed') }, close: () => {},
+    }, onPoison: options.onPoison,
+  })!
+  return { producer, chunks, mutations }
 }

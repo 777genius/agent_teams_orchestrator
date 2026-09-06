@@ -21,7 +21,9 @@ import {
   type PreviousWalImage,
   type RetainedWalImage,
   type OwnerWalPublicationProducer,
+  type OwnerWalInitialDeliveryWitness,
 } from './HostedApprovalOwnerProvenance.js'
+import { fingerprintHostedApprovalDelivery, type HostedApprovalIngressRecord } from './HostedApprovalWire.js'
 import {
   createRegularNodeAtDarwin, type DarwinSpawnNative,
 } from './HostedApprovalOwnerWalDarwin.internal.js'
@@ -312,6 +314,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       }
       let prepares = 0
       const producer: OwnerWalPublicationProducer = {
+        isHealthy: () => true,
         prepare() { prepares += 1; throw new Error('invalid witness reached capture') },
         poison(reason): never { throw new Error(reason) }, close() {},
       }
@@ -593,7 +596,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
   test('capture poison revokes a token within its live locked context and persists across locks', async () => {
     const { path } = await walPath(); const capture = publicationCapture(path)
     const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
-    await wal.locked(async current => {
+    await expect(wal.locked(async current => {
       const result = await wal.publishMutation(current, { ...withoutRevision(state()), ingress: [], bindings: [] }, {
         operationNonce: 'a'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission: admissionFixture(),
       })
@@ -603,7 +606,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       expect(await wal.ownsCurrentFence()).toBe(true)
       expect(token!.consume()).toBe(false)
       expect(await wal.prepareEffectToken(result.state)).toBeNull()
-    })
+    })).rejects.toMatchObject({ stage: 'published-capture-failed' })
     await wal.locked(async current => { expect(current?.revision).toBe(1); expect(await wal.prepareEffectToken(current!)).toBeNull() })
   })
 
@@ -682,19 +685,21 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
     const initial = await setup.locked(current => setup.publish(current, withoutRevision(state())))
     const record = initial.ingress[0]!
+    const witness = initialDeliveryWitness(record)
     const started: HostedApprovalOwnerState['deliveries'][number] = {
-      providerDeliveryId: 'delivery_1', reconciliationRef: 'approval-reconciliation_1', deliveryRef: record.deliveryRef,
-      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: 'f'.repeat(64), phase: 'started', result: null,
+      providerDeliveryId: witness.request.providerDeliveryId, reconciliationRef: witness.request.reconciliationRef, deliveryRef: record.deliveryRef,
+      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: witness.payloadFingerprint, phase: 'started', result: null,
     }
     const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
     const settle = (delivery: typeof started) => wal.locked(current => wal.publishMutation(current, {
       ...withoutRevision(current!), deliveries: [delivery],
-    }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }, delivery }))
+    }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }, delivery, initial: null }))
     const completed = { ...started, phase: 'completed' as const, result: 'delivered' as const }
     await expect(settle(completed)).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
     expect(capture.lines).toHaveLength(1)
     await wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), deliveries: [started] }, {
       operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: started,
+      initial: witness,
     }))
     const bytes = await readFile(path)
     for (const changed of [{ providerDeliveryId: 'delivery_other' }, { reconciliationRef: 'approval-reconciliation_other' }, { payloadFingerprint: 'd'.repeat(64) }]) {
@@ -731,13 +736,15 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
     const initial = await setup.locked(current => setup.publish(current, withoutRevision(state())))
     const record = initial.ingress[0]!
+    const witness = initialDeliveryWitness(record)
     const rejected: HostedApprovalOwnerState['deliveries'][number] = {
-      providerDeliveryId: 'delivery_1', reconciliationRef: 'approval-reconciliation_1', deliveryRef: record.deliveryRef,
-      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: 'f'.repeat(64), phase: 'rejected', result: 'expired',
+      providerDeliveryId: witness.request.providerDeliveryId, reconciliationRef: witness.request.reconciliationRef, deliveryRef: record.deliveryRef,
+      outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: witness.payloadFingerprint, phase: 'rejected', result: 'expired',
     }
     const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
     await wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), deliveries: [rejected] }, {
       operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' }, delivery: rejected,
+      initial: witness,
     }))
     expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published'])
     expect(capture.bound!.native.mutation).toEqual({ kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' })
@@ -1273,7 +1280,7 @@ function admissionFixture(): HostedApprovalRuntimeAdmission {
 // WAL/Store + production serializer + durable test custody coverage. Descriptor
 // and process identity are controlled here; the real syscall test above is a
 // separate boundary check, not proof of full hosted native integration.
-function publicationCapture(path: string, options: { failSync?: () => boolean } = {}) {
+function publicationCapture(path: string, options: { failSync?: () => boolean; duringCustodyPrepare?: () => void } = {}) {
   let prepared: Parameters<OwnerWalPublicationProducer['prepare']>[0] | undefined
   let bound: BoundWalPublication | undefined
   let custody: { previous: PreviousWalImage; next: RetainedWalImage; returned: { previous: PreviousWalImage; next: RetainedWalImage } } | undefined
@@ -1308,17 +1315,19 @@ function publicationCapture(path: string, options: { failSync?: () => boolean } 
       if (previous.kind === 'absent') expect(existsSync(path)).toBe(false)
       else expect(readFileSync(path)).toEqual(Buffer.from(previous.image.bytes))
       const sequence = chunks.length
+      const operationNonce = prepared!.intent.operationNonce
       const previousPath = previous.kind === 'retained' ? stage(`P.${sequence}`, previous.image.bytes) : null
       const nextPath = stage(`N.${sequence}`, next.bytes)
       const returned = { previous: previous.kind === 'absent' ? previous :
         { kind: 'retained' as const, image: { ...previous.image, bytes: previous.image.bytes } },
         next: { ...next, bytes: next.bytes } }
       custody = { previous, next, returned }
+      options.duringCustodyPrepare?.()
       return { bind(emission) {
         expect(readFileSync(path)).toEqual(readFileSync(nextPath))
         if (previous.kind === 'retained') expect(readFileSync(previousPath!)).toEqual(Buffer.from(previous.image.bytes))
         expect(hash(chunks[sequence]!)).toBe(emission.lineSha256)
-        expect(emission.operationNonce).toBe(prepared!.intent.operationNonce)
+        expect(emission.operationNonce).toBe(operationNonce)
         return returned
       } }
     } },
@@ -1327,6 +1336,7 @@ function publicationCapture(path: string, options: { failSync?: () => boolean } 
     get prepared() { return prepared }, get bound() { return bound }, get custody() { return custody },
     get lines() { return chunks.map(chunk => JSON.parse(chunk.toString())) },
     producer: {
+      isHealthy: () => native.isHealthy(),
       prepare(input) { prepared = input; const staged = native.prepare(input)
         return { emit() { bound = staged.emit(); return bound } } },
       poison(reason): never { return native.poison(reason) }, close() { native.close() },
@@ -1345,6 +1355,313 @@ function publicationCapture(path: string, options: { failSync?: () => boolean } 
       native.close()
     },
   }
+}
+
+describe('Owner W2 r809 boundary regressions', () => {
+  test.skipIf(process.platform !== 'linux')('outer cleanup closes every unconsumed effect token descriptor', async () => {
+    const { path } = await walPath(); const wal = new HostedApprovalOwnerWal(path)
+    await new HostedApprovalOwnerStore(wal).reconcileAdmission(admissionFixture())
+    const identity = lstatSync(path)
+    const openWalDescriptors = () => readdirSync('/proc/self/fd').filter(name => {
+      try { const stat = fstatSync(Number(name)); return stat.dev === identity.dev && stat.ino === identity.ino }
+      catch { return false }
+    }).length
+    const tokens: Array<{ consume(): boolean }> = []
+    await wal.locked(async current => {
+      tokens.push((await wal.prepareEffectToken(current!))!, (await wal.prepareEffectToken(current!))!)
+      expect(tokens.every(Boolean)).toBe(true)
+      expect(openWalDescriptors()).toBe(2)
+    })
+    expect(openWalDescriptors()).toBe(0)
+    for (const token of tokens) expect(token.consume()).toBe(false)
+  })
+
+  test('producer poison and close revoke already prepared tokens and every sharing WAL', async () => {
+    for (const failure of ['poison', 'close'] as const) {
+      let duringClose: (() => void) | undefined
+      const { path } = await walPath(); const capture = publicationCapture(path, { failSync: () => { duringClose?.(); return false } })
+      const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      await new HostedApprovalOwnerStore(wal).reconcileAdmission(admissionFixture())
+      const peer = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      await wal.locked(async current => {
+        const token = await wal.prepareEffectToken(current!)
+        expect(token).not.toBeNull()
+        if (failure === 'poison') expect(() => capture.producer.poison('shared producer failed')).toThrow('shared producer failed')
+        else {
+          let observedClosing = false
+          duringClose = () => {
+            observedClosing = true
+            expect(capture.producer.isHealthy()).toBe(false)
+            expect(token!.consume()).toBe(false)
+          }
+          capture.producer.close()
+          expect(observedClosing).toBe(true)
+        }
+        expect(capture.producer.isHealthy()).toBe(false)
+        expect(peer.isPublicationCaptureCurrent()).toBe(false)
+        expect(wal.isPublicationCaptureCurrent()).toBe(false)
+        expect(token!.consume()).toBe(false)
+        expect(await wal.prepareEffectToken(current!)).toBeNull()
+      })
+      const reconstructed = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      await new HostedApprovalOwnerStore(reconstructed).reconcileAdmission(admissionFixture())
+      expect(reconstructed.isPublicationCaptureCurrent()).toBe(false)
+      await reconstructed.locked(async current => {
+        expect(current?.revision).toBe(1)
+        expect(await reconstructed.prepareEffectToken(current!)).toBeNull()
+      })
+    }
+  })
+
+  test('final synchronous CAS rejects P replacement from custody and after awaited temporary staging', async () => {
+    for (const boundary of ['custody', 'staging'] as const) for (const substitution of ['inode', 'bytes', 'absent'] as const) {
+      const { path } = await walPath()
+      if (substitution !== 'absent') {
+        const setup = new HostedApprovalOwnerWal(path)
+        await new HostedApprovalOwnerStore(setup).reconcileAdmission(admissionFixture())
+      }
+      const oldBytes = existsSync(path) ? readFileSync(path) : null
+      const oldInode = existsSync(path) ? lstatSync(path).ino : null
+      let replacement!: Buffer; let replacementInode = 0; let renamed = false
+      let capture!: ReturnType<typeof publicationCapture>
+      const substitute = () => {
+        replacement = oldBytes ? Buffer.from(oldBytes) : Buffer.from(capture.prepared!.next.bytes)
+        if (substitution === 'bytes') {
+          replacement = Buffer.from(`${JSON.stringify({ ...JSON.parse(replacement.toString()), admissionDigest: 'f'.repeat(64) })}\n`)
+          writeFileSync(path, replacement)
+        } else {
+          writeFileSync(`${path}.substitution`, replacement, { mode: 0o600 })
+          renameSync(`${path}.substitution`, path)
+        }
+        replacementInode = lstatSync(path).ino
+      }
+      capture = publicationCapture(path, { duringCustodyPrepare: boundary === 'custody' ? substitute : undefined })
+      const wal = new HostedApprovalOwnerWal(path, {
+        afterWalTempFsync: boundary === 'staging' ? async () => { await Promise.resolve(); substitute() } : undefined,
+        afterWalRename: async () => { renamed = true },
+      }, capture.producer)
+      await expect(new HostedApprovalOwnerStore(wal).reconcileAdmission({ ...admissionFixture(), digest: 'd'.repeat(64) }))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      expect(renamed).toBe(false)
+      expect(readFileSync(path)).toEqual(replacement)
+      expect(lstatSync(path).ino).toBe(replacementInode)
+      if (substitution === 'inode') expect(replacementInode).not.toBe(oldInode)
+      if (substitution === 'bytes') expect(replacementInode).toBe(oldInode)
+      expect(capture.prepared).toBeDefined()
+      expect(capture.bound).toBeUndefined()
+      expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open'])
+      expect(readdirSync(join(path, '..')).filter(name => name.startsWith('owner.json.tmp.'))).toEqual([])
+      capture.producer.close()
+    }
+  })
+
+  test('quarantine requires an exact predecessor tuple/semantic witness and a canonical observation', async () => {
+    const observed = state().ingress[0]!
+    for (const mismatch of ['first', 'team', 'run', 'request', 'semantic'] as const) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      const fixture = state(); fixture.ingress = []
+      if (mismatch === 'first') fixture.bindings = []
+      else {
+        const binding = fixture.bindings[0]!; binding.bindingDigest = 'e'.repeat(64)
+        if (mismatch === 'team') binding.teamId = `team_${'9'.repeat(32)}`
+        if (mismatch === 'run') binding.runId = `run_${'9'.repeat(32)}`
+        if (mismatch === 'request') binding.requestId = 'permission_other'
+        if (mismatch === 'semantic') binding.effectRef = `effect:${'9'.repeat(64)}`
+      }
+      await setup.locked(current => setup.publish(current, withoutRevision(fixture)))
+      const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      const bytes = readFileSync(path)
+      await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), bindings: [...current!.bindings, {
+        ...state().bindings[0]!, quarantined: true,
+      }] }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'binding-quarantined', outcome: 'quarantined' }, record: observed })))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval quarantine publication witness mismatch' })
+      expect(readFileSync(path)).toEqual(bytes)
+      expect(capture.prepared).toBeUndefined()
+      expect(await new HostedApprovalOwnerStore(wal).admitIngress(admissionFixture(), observed)).toBe('admitted')
+      expect(capture.bound!.native.mutation.kind).toBe('ingress-admitted')
+      capture.producer.close()
+    }
+    for (const predecessor of ['exposed', 'quarantined', 'tombstone'] as const) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      const fixture = state(); fixture.ingress = []
+      fixture.bindings[0] = { ...fixture.bindings[0]!, bindingDigest: predecessor === 'tombstone' ? null : 'e'.repeat(64),
+        effectRef: predecessor === 'tombstone' ? null : observed.effectRef, quarantined: predecessor !== 'exposed' }
+      await setup.locked(current => setup.publish(current, withoutRevision(fixture)))
+      const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      const store = new HostedApprovalOwnerStore(wal)
+      for (const bad of [{ ...observed, deliveryRef: 'delivery_ref_wrong' }, { ...observed, payloadJson: '{}' },
+        { ...observed, authority: { ...observed.authority, runtimeInstanceId: 'runtime_wrong' } }]) {
+        await expect(wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), bindings: [
+          ...current!.bindings, { ...state().bindings[0]!, quarantined: true },
+        ] }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'binding-quarantined', outcome: 'quarantined' }, record: bad })))
+          .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      }
+      expect(capture.lines).toHaveLength(1)
+      expect(await store.admitIngress(admissionFixture(), observed)).toBe('quarantined')
+      expect(capture.bound!.native.mutation.kind).toBe('binding-quarantined')
+      expect((await wal.read())!.ingress).toEqual([])
+      expect(await store.admitIngress(admissionFixture(), observed)).toBe('quarantined')
+      expect(capture.lines).toHaveLength(2)
+      capture.producer.close()
+    }
+  })
+
+  test('initial starts and direct rejections bind the entire original request and fingerprint', async () => {
+    for (const phase of ['started', 'rejected'] as const) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      const fixture = state(); const first = fixture.ingress[0]!
+      const second = { ...structuredClone(first), commandId: 'permission_2', outboxId: `runtime_permission:effect:${'e'.repeat(64)}`,
+        deliveryRef: `delivery_ref_opencode-${'e'.repeat(64)}`, effectRef: `effect:${'d'.repeat(64)}` }
+      second.payloadJson = JSON.stringify({ ...JSON.parse(second.payloadJson), deliveryRef: second.deliveryRef })
+      fixture.ingress.push(second)
+      fixture.bindings.push({ ...fixture.bindings[0]!, requestId: second.commandId, bindingDigest: 'e'.repeat(64), effectRef: second.effectRef })
+      await setup.locked(current => setup.publish(current, withoutRevision(fixture)))
+      const initial = initialDeliveryWitness(first)
+      const delivery: HostedApprovalOwnerState['deliveries'][number] = { providerDeliveryId: initial.request.providerDeliveryId,
+        reconciliationRef: initial.request.reconciliationRef, payloadFingerprint: initial.payloadFingerprint,
+        outboxId: first.outboxId, deliveryRef: first.deliveryRef, effectRef: first.effectRef, phase, result: phase === 'started' ? null : 'expired' }
+      const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      const publish = (candidate: typeof delivery, witness: OwnerWalInitialDeliveryWitness) => wal.locked(current => wal.publishMutation(current, {
+        ...withoutRevision(current!), deliveries: [candidate],
+      }, phase === 'started'
+        ? { operationNonce: 'a'.repeat(64), mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: candidate, initial: witness }
+        : { operationNonce: 'a'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' }, delivery: candidate, initial: witness }))
+      const before = readFileSync(path)
+      // A's provider ID/reconciliation/fingerprint crossed with B's internally
+      // coherent outbox/delivery/effect tuple used to pass every decoder.
+      await expect(publish({ ...delivery, outboxId: second.outboxId, deliveryRef: second.deliveryRef, effectRef: second.effectRef }, initial))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      for (const patch of [{ approvalId: `approval_${'f'.repeat(32)}` }, { approvalGeneration: `generation_runtime-permission-${'f'.repeat(64)}` },
+        { requestId: second.commandId }, { partition: { ...initial.request.partition, runId: `run_${'9'.repeat(32)}` } }]) {
+        const request = { ...initial.request, ...patch }; const payloadFingerprint = fingerprintHostedApprovalDelivery(request)
+        await expect(publish({ ...delivery, payloadFingerprint }, { request, payloadFingerprint })).rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      }
+      await expect(publish({ ...delivery, payloadFingerprint: 'f'.repeat(64) }, { ...initial, payloadFingerprint: 'f'.repeat(64) }))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      expect(readFileSync(path)).toEqual(before)
+      expect(capture.lines).toHaveLength(1)
+      await publish(delivery, initial)
+      expect(capture.bound!.native.mutation.kind).toBe(phase === 'started' ? 'delivery-started' : 'delivery-settled')
+      expect((await wal.read())!.deliveries).toEqual([delivery])
+      capture.producer.close()
+    }
+  })
+
+  test('native receipt owns nonce, mutation claims and every nested count across preparation and emission', async () => {
+    const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+    await setup.locked(current => setup.publish(current, withoutRevision(state())))
+    const capture = publicationCapture(path)
+    let expected!: OwnerWalNative; let operationNonce = ''
+    const wal = new HostedApprovalOwnerWal(path, { afterWalRename: async () => {
+      const input = capture.prepared!
+      expected = structuredClone(input.native); operationNonce = input.intent.operationNonce
+      Reflect.set(input.intent, 'operationNonce', 'f'.repeat(64))
+      if (input.native.mutation.kind !== 'ingress-lease-claimed') throw new Error('expected native lease claim')
+      Reflect.set(input.native.mutation.claims[0]!, 'leaseToken', 'lease_substituted')
+      for (const pair of Object.values(input.native.stateDelta.collectionSizes)) Reflect.set(pair, 'next', 99)
+      await Promise.resolve()
+    } }, capture.producer)
+    await new HostedApprovalOwnerStore(wal, () => Date.parse('2026-08-13T10:00:01.000Z')).claim(
+      { ownerId: 'owner_1', leaseToken: 'lease_1', leaseDurationMs: 30_000, limit: 1 }, 1_000_000)
+    const bound = capture.bound!; const line = capture.lines[1]!
+    expect(line.native).toEqual(expected)
+    expect(line.operationNonce).toBe(operationNonce)
+    expect(bound.native).toEqual(line.native)
+    expect(bound.emission.operationNonce).toBe(operationNonce)
+    expect(bound.emission.lineSha256).toBe(createHash('sha256').update(`${JSON.stringify(line)}\n`).digest('hex'))
+    const assertFrozen = (value: unknown) => {
+      if (value && typeof value === 'object') {
+        expect(Object.isFrozen(value)).toBe(true)
+        for (const child of Object.values(value)) assertFrozen(child)
+      }
+    }
+    assertFrozen(bound.native); assertFrozen(bound.emission)
+    expect(Reflect.set(bound.native.stateDelta.collectionSizes.ingress, 'next', 99)).toBe(false)
+    if (bound.native.mutation.kind !== 'ingress-lease-claimed') throw new Error('expected bound lease claim')
+    expect(Reflect.set(bound.native.mutation.claims[0]!, 'leaseToken', 'lease_mutated')).toBe(false)
+    expect((await wal.read())!.ingress[0]!.lease!.leaseToken).toBe('lease_1')
+    expect(bound.native).toEqual(line.native)
+    capture.producer.close()
+  })
+
+  test('outer cleanup attempts all releases and retains typed stage after direct rejection or start', async () => {
+    for (const phase of ['started', 'rejected'] as const) for (const failures of [['parent'], ['fence', 'unlock', 'lock', 'parent']]) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      await setup.locked(current => setup.publish(current, withoutRevision(state())))
+      const initial = initialDeliveryWitness(state().ingress[0]!)
+      const record = state().ingress[0]!
+      const delivery: HostedApprovalOwnerState['deliveries'][number] = { providerDeliveryId: initial.request.providerDeliveryId,
+        reconciliationRef: initial.request.reconciliationRef, deliveryRef: record.deliveryRef, outboxId: record.outboxId,
+        effectRef: record.effectRef, payloadFingerprint: initial.payloadFingerprint, phase, result: phase === 'started' ? null : 'expired' }
+      const capture = publicationCapture(path); let armed = true; const releases: string[] = []
+      const wal = new HostedApprovalOwnerWal(path, { releaseWriterResource: async (resource, release) => {
+        if (armed && releases.some(released => failures.includes(released))) expect(capture.producer.isHealthy()).toBe(false)
+        await release()
+        if (armed) { releases.push(resource); if (failures.includes(resource)) throw new Error(`release ${resource} failed`) }
+      } }, capture.producer)
+      let error: unknown
+      try {
+        await wal.locked(current => wal.publishMutation(current, { ...withoutRevision(current!), deliveries: [delivery] }, phase === 'started'
+          ? { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-started', outcome: 'started' }, delivery, initial }
+          : { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' }, delivery, initial }))
+      } catch (failure) { error = failure }
+      expect(error).toBeInstanceOf(HostedApprovalOwnerPublicationError)
+      expect(error).toMatchObject({ stage: 'published-capture-failed' })
+      expect(((error as Error).cause as AggregateError).errors.map(failure => failure.message))
+        .toEqual(failures.map(resource => `release ${resource} failed`))
+      expect(releases).toEqual(['fence', 'unlock', 'lock', 'parent'])
+      expect(capture.bound!.native.mutation.kind).toBe(phase === 'started' ? 'delivery-started' : 'delivery-settled')
+      expect(capture.producer.isHealthy()).toBe(false)
+      expect((await wal.read())!.deliveries).toEqual([delivery])
+      armed = false
+      await wal.locked(async current => { expect(await wal.prepareEffectToken(current!)).toBeNull() })
+      expect(capture.lines).toHaveLength(2)
+    }
+  })
+
+  test('cleanup aggregates preserve the original failure before and after the replacement boundary', async () => {
+    for (const boundary of ['acquisition', 'replacement'] as const) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      await new HostedApprovalOwnerStore(setup).reconcileAdmission(admissionFixture())
+      const capture = publicationCapture(path); let armed = true; const releases: string[] = []
+      const fail = async () => { if (armed) throw new Error(`${boundary} failed`) }
+      const wal = new HostedApprovalOwnerWal(path, {
+        afterFenceOpen: boundary === 'acquisition' ? fail : undefined,
+        afterWalRename: boundary === 'replacement' ? fail : undefined,
+        releaseWriterResource: async (resource, release) => {
+          await release()
+          if (armed) { releases.push(resource); throw new Error(`release ${resource} failed`) }
+        },
+      }, capture.producer)
+      let error: unknown
+      try { await new HostedApprovalOwnerStore(wal).reconcileAdmission({ ...admissionFixture(), digest: 'd'.repeat(64) }) }
+      catch (failure) { error = failure }
+      expect(releases).toEqual(['fence', 'unlock', 'lock', 'parent'])
+      if (boundary === 'replacement') expect(error).toMatchObject({ stage: 'replacement-uncertain' })
+      const aggregate = boundary === 'replacement' ? (error as Error).cause : error
+      expect(aggregate).toBeInstanceOf(AggregateError)
+      expect((aggregate as AggregateError).errors).toHaveLength(5)
+      expect((aggregate as AggregateError).errors[0]).toBeInstanceOf(Error)
+      expect(capture.lines).toHaveLength(1)
+      expect(capture.producer.isHealthy()).toBe(boundary === 'acquisition')
+      armed = false
+      await wal.locked(async current => { expect(current?.revision).toBe(boundary === 'acquisition' ? 1 : 2) })
+      if (boundary === 'acquisition') capture.producer.close()
+    }
+  })
+})
+
+function initialDeliveryWitness(record: HostedApprovalIngressRecord): OwnerWalInitialDeliveryWitness {
+  const { teamId, runId } = record.authority
+  const request = {
+    providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`,
+    principal: { kind: 'operator' as const, actorId: 'actor_operator' }, deliveryRef: record.deliveryRef,
+    approvalId: `approval_${createHash('sha256').update(JSON.stringify({ schemaVersion: 1,
+      teamId, runId, requestId: record.commandId })).digest('hex').slice(0, 32)}`,
+    approvalGeneration: `generation_runtime-permission-${record.effectRef.slice(7)}`,
+    decision: 'allow' as const, partition: { teamId, runId }, requestId: record.commandId,
+  }
+  return { request, payloadFingerprint: fingerprintHostedApprovalDelivery(request) }
 }
 
 function state(): HostedApprovalOwnerState {

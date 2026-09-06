@@ -8,7 +8,7 @@ import type {
   HostedApprovalReconciliationRequest,
   HostedApprovalReconciliationResult,
 } from './HostedApprovalWire.js'
-import { HostedApprovalOwnerWal, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import { classifyOwnerIngressObservation, HostedApprovalOwnerWal, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
 import { createOwnerOperationNonce, type OwnerLeaseClaim } from './HostedApprovalOwnerProvenance.js'
 
@@ -53,6 +53,7 @@ export class HostedApprovalOwnerStore {
   }
 
   admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay' | 'quarantined'> {
+    record = structuredClone(record)
     const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state || state.admissionDigest !== admission.digest || !(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
@@ -60,29 +61,15 @@ export class HostedApprovalOwnerStore {
       if (!route || !state.routes.some(current => isDeepStrictEqual(current, route))) {
         throw new Error('Hosted approval ingress route unavailable')
       }
-      const prior = [...state.ingress, ...state.retiredIngress]
-        .find(item => item.outboxId === record.outboxId || item.deliveryRef === record.deliveryRef)
-      if (prior) {
-        if (!isDeepStrictEqual(intent(prior), intent(record))) throw new Error('Hosted approval ingress conflict')
-        return 'replay'
-      }
+      const observation = classifyOwnerIngressObservation(state, record)
+      if (observation === 'replay' || observation === 'quarantined') return observation
       const digest = record.outboxId.slice('runtime_permission:effect:'.length)
-      const sameTuple = state.bindings.filter(binding => binding.teamId === record.authority.teamId &&
-        binding.runId === record.authority.runId && binding.requestId === record.commandId)
-      const sameSemantic = sameTuple.filter(binding => binding.effectRef === null || binding.effectRef === record.effectRef)
-      const exactBinding = sameSemantic.find(binding => binding.effectRef === record.effectRef &&
-        binding.bindingDigest === digest && !binding.quarantined)
-      // The full acknowledged ingress may have aged out, but the permanent
-      // exposure ledger still makes the exact private intent an idempotent replay.
-      if (exactBinding) return 'replay'
-      if (sameSemantic.length > 0) {
-        if (!sameSemantic.some(binding => binding.effectRef === record.effectRef && binding.bindingDigest === digest)) {
-          if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
-          await this.wal.publishMutation(state, { ...withoutRevision(state), bindings: [...state.bindings, {
-            teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
-            effectRef: record.effectRef, bindingDigest: digest, quarantined: true,
-          }] }, { operationNonce, mutation: { kind: 'binding-quarantined', outcome: 'quarantined' }, record })
-        }
+      if (observation === 'quarantine') {
+        if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
+        await this.wal.publishMutation(state, { ...withoutRevision(state), bindings: [...state.bindings, {
+          teamId: record.authority.teamId, runId: record.authority.runId, requestId: record.commandId,
+          effectRef: record.effectRef, bindingDigest: digest, quarantined: true,
+        }] }, { operationNonce, mutation: { kind: 'binding-quarantined', outcome: 'quarantined' }, record })
         return 'quarantined'
       }
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
@@ -95,6 +82,7 @@ export class HostedApprovalOwnerStore {
   }
 
   claim(request: HostedApprovalClaimRequest, maximumAggregateBytes: number): Promise<readonly HostedApprovalIngressRecord[]> {
+    request = { ...request }
     const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state) return []
@@ -135,6 +123,7 @@ export class HostedApprovalOwnerStore {
   }
 
   acknowledge(request: HostedApprovalAckRequest): Promise<HostedApprovalAckResult> {
+    request = { ...request }
     const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!state) return { status: 'unavailable' }
@@ -204,8 +193,4 @@ export class HostedApprovalOwnerStore {
 
 export function withoutRevision(state: HostedApprovalOwnerState): Omit<HostedApprovalOwnerState, 'revision' | 'writerFence'> {
   const { revision: _revision, writerFence: _writerFence, ...rest } = state; return rest
-}
-function intent(record: HostedApprovalIngressRecord | HostedApprovalOwnerState['retiredIngress'][number]): unknown {
-  const { lease: _lease, acknowledgedAtIso: _ack, observedAtIso: _observed, acceptedAtIso: _accepted, ...rest } = record
-  return rest
 }
