@@ -547,6 +547,46 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     }, 120_000)
   }
 
+  for (const mode of ['http10-transfer-encoding', 'missing-status-separator'] as const) {
+    for (const status of [409, 412, 200]) {
+      test(`${mode} cannot establish ${status === 200 ? 'applied' : `empty ${status} no-effect`} after POST`, async () => {
+        const bytes = status === 200 ? Buffer.from(canonicalHostedApprovalJson(receipt)) : Buffer.alloc(0)
+        const tail = mode === 'http10-transfer-encoding'
+          ? Buffer.concat([...(bytes.length ? [Buffer.from(`${bytes.length.toString(16)}\r\n`), bytes, Buffer.from('\r\n')] : []),
+              Buffer.from('0\r\n\r\n')])
+          : bytes
+        const head = mode === 'http10-transfer-encoding'
+          ? `HTTP/1.0 ${status} ${status === 200 ? 'OK' : status === 409 ? 'Conflict' : 'Precondition Failed'}\r\nTransfer-Encoding: chunked`
+          : `HTTP/1.1 ${status}\r\nContent-Length: ${bytes.length}`
+        const wire = Buffer.concat([Buffer.from(`${head}\r\n\r\n`), tail])
+        let emitted: Buffer | undefined
+        const fixture = await supervisedFixture({ rawResponse(_request, socket) {
+          emitted = wire; socket.end(wire)
+        } })
+        try {
+          const custody = await fixture.acquire()
+          const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+            .create(fixture.expected.endpoint.baseUrl)
+          const failure = await client.answerPermission(reply).catch(error => error)
+          expect(failure).toBeInstanceOf(Error)
+          expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
+          expect(failure).not.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+          expect(emitted).toEqual(wire)
+          const retained = fixture.observations.find(record => record.phase === 'response')!
+          expect(retained).toMatchObject({ status, complete: false, body: { byteLength: tail.length } })
+          expect(retained.phase === 'response' && Buffer.from(retained.body.bodyBase64, 'base64')).toEqual(tail)
+          expect(custody.rawRetention.isCurrent()).toBe(false)
+          expect(fixture.connections).toHaveLength(1)
+          expect(fixture.requests).toHaveLength(1)
+          expect(fixture.requests[0]!.method).toBe('POST')
+          expect(JSON.parse(fixture.requests[0]!.body.toString())).toEqual(payload)
+          fixture.assertSocketCustody()
+          await supervisedTestWait(fixture.connections[0]!.closed, `${mode} authorized socket EOF/close`)
+        } finally { await fixture.close() }
+      }, 120_000)
+    }
+  }
+
   test('valid chunked reply retains only exact entity bytes and keeps unadmitted nonce metadata unavailable', async () => {
     const bytes = Buffer.from(canonicalHostedApprovalJson(receipt))
     const fixture = await supervisedFixture({ rawResponse(_request, socket) {

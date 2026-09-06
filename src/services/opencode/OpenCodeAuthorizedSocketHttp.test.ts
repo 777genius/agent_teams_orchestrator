@@ -105,6 +105,41 @@ describe('OpenCode authorized socket HTTP framing', () => {
     expect(result.unsafe).toContain('unexpected_encoding')
   })
 
+  for (const version of ['1.0', '1.1']) {
+    test(`HTTP/${version} permits an empty reason phrase only after its separator`, async () => {
+      const valid = await exchange([`HTTP/${version} 409 \r\nContent-Length: 0\r\n\r\n`])
+      expect(valid.response).toMatchObject({ status: 409, statusText: '', complete: true, bytes: Buffer.alloc(0) })
+      expect(valid.unsafe).toEqual([])
+      const invalid = await exchange([`HTTP/${version} 409\r\nContent-Length: 0\r\n\r\n`])
+      expect(invalid.response).toMatchObject({ status: 409, complete: false, bytes: Buffer.alloc(0) })
+      expect(invalid.unsafe).toContain('invalid_status')
+    })
+  }
+
+  for (const tail of ['0\r\n\r\n', '6\r\nprefix\r\n0\r\n\r\n']) {
+    test(`HTTP/1.0 transfer coding keeps ${tail.length} raw tail bytes as incomplete evidence`, async () => {
+      const result = await exchange(['HTTP/1.0 409 Conflict\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\n', tail])
+      expect(result.response).toMatchObject({ status: 409, complete: false, bytes: Buffer.from(tail) })
+      expect(result.unsafe).toContain('invalid_framing')
+    })
+  }
+
+  test('the final response version determines whether transfer coding is allowed', async () => {
+    const result = await exchange(['HTTP/1.1 103 Early Hints\r\n\r\n',
+      'HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n'])
+    expect(result.response).toMatchObject({ status: 200, complete: false, bytes: Buffer.from('0\r\n\r\n') })
+    expect(result.unsafe).toContain('invalid_framing')
+  })
+
+  test('malformed status or version/framing retains only the bounded raw tail', async () => {
+    const tail = Buffer.from('10\r\n0123456789abcdef\r\n0\r\n\r\n')
+    for (const head of ['HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked', 'HTTP/1.1 200\r\nContent-Length: 16']) {
+      const result = await exchange([`${head}\r\n\r\n`, tail], 8)
+      expect(result.response).toMatchObject({ status: 200, complete: false, bytes: tail.subarray(0, 8) })
+      expect(result.unsafe).toContain('response_limit')
+    }
+  })
+
   const badFrames = [
     { name: 'duplicate identical length', header: 'Content-Length: 0\r\nContent-Length: 0', tail: '', prefix: '' },
     { name: 'conflicting length', header: 'Content-Length: 0\r\nContent-Length: 1', tail: '', prefix: '' },
@@ -141,6 +176,15 @@ describe('OpenCode authorized socket HTTP framing', () => {
     expect(result.response).toMatchObject({ complete: true, bytes: Buffer.from('prefix') })
     const cancelled = await exchange(['HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nprefix'], 16 * 1024, true)
     expect(cancelled.response).toMatchObject({ complete: false, bytes: Buffer.from('prefix') })
+  })
+
+  test('complete length or chunk framing without EOF remains incomplete', async () => {
+    for (const wire of ['HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n',
+      'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n']) {
+      const cancelled = await exchange([wire], 16 * 1024, true)
+      expect(cancelled.response.complete).toBe(false)
+      expect(cancelled.unsafe).toContain('incomplete_body')
+    }
   })
 
   test('header, field, chunk metadata and body allocation limits fail closed', async () => {

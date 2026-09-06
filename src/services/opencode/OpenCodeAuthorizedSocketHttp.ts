@@ -52,7 +52,7 @@ export function encodeOpenCodeSocketHttpRequest(url: URL, init: RequestInit, bod
 }
 
 /** Observe data directly, before an EOF/reset can discard a stream's queued
- * prefix. Transfer framing is removed; content encoding is never decoded.
+ * prefix. Valid transfer framing is removed; content encoding is never decoded.
  * Completion requires the requested connection-close EOF, so surplus bytes in
  * later packets cannot be silently accepted after a Content-Length/chunk end. */
 export function readOpenCodeSocketHttpResponse(
@@ -71,6 +71,7 @@ export function readOpenCodeSocketHttpResponse(
   void response.catch(() => undefined)
   let settled = false
   let valid = true
+  let version = ''
   let status = 0
   let statusText = ''
   let headers = new Headers()
@@ -112,10 +113,13 @@ export function readOpenCodeSocketHttpResponse(
     return true
   }
   const readStatus = (line: string): boolean => {
-    const match = /^HTTP\/1\.[01] ([1-5][0-9]{2})(?: ([\t\x20-\x7e\x80-\xff]*))?$/.exec(line)
-    if (!match) return false
-    status = Number(match[1]); statusText = match[2] ?? ''
-    return true
+    const match = /^HTTP\/(1\.[01]) ([1-5][0-9]{2}) ([\t\x20-\x7e\x80-\xff]*)$/.exec(line)
+    // A bare status code is recognizable evidence, but the separator before
+    // even an empty reason phrase is mandatory for a valid status line.
+    const observed = match ?? /^HTTP\/(1\.[01]) ([1-5][0-9]{2})$/.exec(line)
+    if (!observed) return false
+    version = observed[1]!; status = Number(observed[2]); statusText = match?.[3] ?? ''
+    return match !== null
   }
   const field = (line: string): [string, string] | null => {
     const colon = line.indexOf(':')
@@ -126,7 +130,10 @@ export function readOpenCodeSocketHttpResponse(
   }
   const readHeaders = (block: Buffer): boolean => {
     const [line, ...fields] = block.toString('latin1').split('\r\n')
-    if (!readStatus(line!)) { fail('invalid_status'); return false }
+    if (!readStatus(line!)) {
+      if (!status) { fail('invalid_status'); return false }
+      markUnsafe('invalid_status'); state = 'close'; return true
+    }
     headers = new Headers()
     const values = new Map<string, string[]>()
     for (const line of fields) {
@@ -152,7 +159,9 @@ export function readOpenCodeSocketHttpResponse(
     }
     // Ambiguous framing can never validate a receipt or an empty 409/412.
     // Keep its bounded received tail as incomplete evidence until EOF.
+    // HTTP/1.0 does not support Transfer-Encoding, even a lone chunked field.
     if (lengths.length > 1 || (lengths.length && transfers.length) ||
+      (version === '1.0' && transfers.length) ||
       (transfers.length && (transfers.length !== 1 || transfers[0]!.toLowerCase() !== 'chunked')) ||
       (lengths.length && (!/^[0-9]+$/.test(lengths[0]!) || !Number.isSafeInteger(Number(lengths[0]))))) {
       markUnsafe('invalid_framing'); state = 'close'; return true

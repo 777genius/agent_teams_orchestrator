@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { once } from 'node:events'
 import { createServer as createTcpServer, Socket, type AddressInfo } from 'node:net'
-import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
+import { captureOpenCodeEstablishedPeerIdentity, type OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
+import { captureHostedControlProcessIdentity } from '../hostedControl/HostedControlProcessIdentity.js'
+import { openCodeHttpServerFixture } from './OpenCodeHttpServer.test-fixture.js'
+import { supervisedTestWait } from './OpenCodeSupervisedCustody.test-fixture.js'
 
 import {
   canonicalHostedApprovalDigest,
@@ -366,6 +369,90 @@ describe('OpenCodeClientFactory permissions API', () => {
       },
     })
   })
+
+  for (const status of [200, 409, 412]) {
+    test.skipIf(process.platform !== 'linux' || !process.env.CLAUDE_TEAM_OPENCODE_HTTP_SERVER_SOURCE_ROOT)(`actual OpenCode HTTP adapter on Bun 1.3.11 closes the authorized ${status} socket before deadline`, async () => {
+      const receipt = {
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123', sessionIncarnation,
+        requestIncarnation, permissionDigest, decision: 'allow_once',
+      }
+      const fixture = await openCodeHttpServerFixture(status, receipt)
+      const originalWrite = Socket.prototype.write
+      const writtenSockets: Socket[] = []
+      const wire: Buffer[] = []
+      let authorized: OpenCodeConnectedSocketIdentity | undefined
+      let proofCount = 0
+      let finalizerCalls = 0
+      let wroteAt = 0
+      let eofAt = 0
+      let socketClosed: Promise<void> | undefined
+      const responseDeadlineMs = 2000
+      Socket.prototype.write = function (this: Socket, ...args: unknown[]) {
+        if (this.remotePort === fixture.port) {
+          expect({ localAddress: this.localAddress, localPort: this.localPort,
+            remoteAddress: this.remoteAddress, remotePort: this.remotePort }).toEqual(authorized)
+          expect(finalizerCalls).toBe(1)
+          expect(this.bytesWritten).toBe(0)
+          writtenSockets.push(this)
+          wroteAt = performance.now()
+          this.on('data', bytes => wire.push(Buffer.from(bytes)))
+          this.prependOnceListener('end', () => { eofAt = performance.now() })
+          socketClosed = new Promise<void>(resolve => this.once('close', () => resolve()))
+        }
+        return originalWrite.apply(this, args as never)
+      } as typeof Socket.prototype.write
+      try {
+        const owner = await captureHostedControlProcessIdentity(process.pid)
+        const client = new OpenCodeClientFactory().create(`http://127.0.0.1:${fixture.port}`,
+          { requestTimeoutMs: responseDeadlineMs }, hostedAuth)
+        const startedAt = performance.now()
+        const result = await client.answerPermission({
+          requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+          condition: { runtimeInstanceId, configGeneration, sessionIncarnation, requestIncarnation, permissionDigest,
+            authorizeConnected: async connection => {
+              // Real kernel proof of the accepted server descriptor. Bun's HTTP
+              // connection event/socket facade is not a pre-write TCP witness.
+              const peer = await captureOpenCodeEstablishedPeerIdentity(owner.pid, owner.startIdentity, connection)
+              expect(peer).toEqual({ address: '127.0.0.1', port: fixture.port, ...owner })
+              expect(fixture.requests).toHaveLength(0)
+              expect(writtenSockets).toHaveLength(0)
+              proofCount += 1
+              authorized = { ...connection }
+              return () => { finalizerCalls += 1; return true }
+            },
+          },
+        }).catch(error => error)
+        if (status === 200) expect(result).toEqual(receipt)
+        else expect(result).toBeInstanceOf(OpenCodePermissionConditionRejectedError)
+        expect(proofCount).toBe(1)
+        expect(finalizerCalls).toBe(1)
+        expect(writtenSockets).toHaveLength(1)
+        // A frame-complete early return, timeout/reset or forced teardown cannot
+        // satisfy the observed end event on the very socket used for first write.
+        expect(wroteAt).toBeGreaterThan(0)
+        expect(eofAt).toBeGreaterThanOrEqual(wroteAt)
+        expect(eofAt - startedAt).toBeLessThan(responseDeadlineMs)
+        expect(fixture.server.listening).toBe(true)
+        expect(fixture.failures).toEqual([])
+        expect(fixture.requests).toHaveLength(1)
+        const request = fixture.requests[0]!
+        expect(request).toMatchObject({ method: 'POST',
+          url: '/experimental/agent-teams/hosted-approval/session/ses_123/permission/perm_123/reply',
+          peerAddress: authorized!.localAddress, peerPort: authorized!.localPort })
+        expect(request.headers.connection).toBe('close')
+        expect(JSON.parse(request.body.toString())).toMatchObject({ requestId: 'perm_123',
+          sessionId: 'ses_123', expectedPermissionDigest: permissionDigest, decision: 'allow_once' })
+        expect(Buffer.concat(wire).toString('latin1')).toContain(`HTTP/1.1 ${status} `)
+        expect(socketClosed).toBeDefined()
+        await supervisedTestWait(socketClosed!, 'OpenCode HTTP adapter authorized socket close', responseDeadlineMs)
+      } finally {
+        Socket.prototype.write = originalWrite
+        for (const socket of writtenSockets) socket.destroy()
+        await fixture.close()
+      }
+    }, 30_000)
+  }
 
   test('writes no conditional POST until the connected endpoint proof settles', async () => {
     const fixture = await receiptSocketServer()
