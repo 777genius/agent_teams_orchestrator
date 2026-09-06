@@ -2287,7 +2287,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(effects).toBe(0)
   })
 
-  test('execution readiness rejects Kiro and Cursor before provider, host, MCP, or member effects', async () => {
+  test('execution readiness reports Kiro and Cursor as model-unavailable before side effects', async () => {
     let effects = 0
     openCodeProvisioningProbe.probeRetainingHost = (async () => {
       effects += 1
@@ -2308,10 +2308,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
         projectPath: '/tmp/project', selectedModel: `${providerId}/near-marker-model`,
         requireExecutionProbe: true,
       }))
-      expect(result.ok).toBe(false)
-      if (!result.ok) expect(result.error.message).toContain(
-        `execution_probe does not support extension-bound provider ${providerId}`,
-      )
+      expect(result.ok).toBe(true)
+      if (result.ok) {
+        expect(result.data.state).toBe('model_unavailable')
+        expect(result.data.launchAllowed).toBe(false)
+        expect(result.data.missing).toEqual([
+          expect.stringContaining(`extension-bound provider ${providerId}`),
+        ])
+      }
     }
     expect(effects).toBe(0)
   })

@@ -445,7 +445,15 @@ export function buildOpenCodeHostProfileIdentity(
   const authIdentity = profile.profileScope?.selectedAuthIdentity
     ?? profile.managedAuthFingerprint
     ?? 'absent'
-  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+  // Capability fingerprints intentionally omit MCP URLs/environment. Host reuse
+  // must still bind to the current transport, including the app-instance marker.
+  const mcp = profile.managedConfig.mcp as Record<string, unknown> | undefined
+  const transportJson = JSON.stringify(mcp?.['agent-teams'] ?? null, (_key, value) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
+      : value)
+  const transportIdentity = hashText(transportJson)
+  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}::mcp:${transportIdentity}`
 }
 
 function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
