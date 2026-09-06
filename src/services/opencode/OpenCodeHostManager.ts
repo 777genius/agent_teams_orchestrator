@@ -4,6 +4,9 @@ import type { Dirent } from 'node:fs'
 import net from 'node:net'
 import { mkdir, readlink, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
+  type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -95,6 +98,7 @@ const PERSISTENT_HOST_STARTUP_LOCK_MIN_RETRY_MS = 100
 const PERSISTENT_HOST_STARTUP_LOCK_MAX_RETRY_MS = 500
 
 type ManagedHostEntry = {
+  supervisor?: { custody: TrustedOpenCodeCustody; leases: Set<string> }
   handle: OpenCodeHostHandle
   child: ChildProcess | null
   refCount: number
@@ -108,6 +112,7 @@ type FetchJsonResult = {
 }
 
 type OpenCodeHostManagerDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   prepareProfile?: (
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
@@ -480,7 +485,21 @@ export class OpenCodeHostManager {
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
   private installedArtifact: { binaryPath: string; digest: OpenCodeArtifactDigest | null } | null = null
 
-  constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
+  private readonly custody?: TrustedOpenCodeCustody
+  private readonly supervisedClientFactory?: OpenCodeClientFactory
+  private supervisedTail: Promise<unknown> = Promise.resolve()
+
+  constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy && policy.mode !== 'desktop') {
+      if (policy.mode !== 'supervisor-adopt-only') throw new Error('OpenCode acquisition policy invalid')
+      assertTrustedOpenCodeCustody(policy.custody)
+      this.custody = policy.custody
+      this.supervisedClientFactory = new OpenCodeClientFactory({ acquisitionPolicy: policy })
+    }
+  }
+
+  isBoundToCustody(custody: TrustedOpenCodeCustody): boolean { return this.custody === custody }
 
   private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
     if (!binaryPath || this.deps.spawnHostProcess || process.platform !== 'linux') return null
@@ -502,6 +521,20 @@ export class OpenCodeHostManager {
   }
 
   private async fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
+    if (this.custody) {
+      const base = this.custody.expected.endpoint.baseUrl
+      const client = this.supervisedClientFactory!.create(base, { signal: init?.signal ?? undefined })
+      const reads: Record<string, () => Promise<unknown>> = {
+        [`${base}/global/health`]: () => client.getHealth!(),
+        [`${base}/config`]: () => client.getConfig(),
+        [`${base}/config/providers`]: () => client.getConfigProviders(),
+        [`${base}/agent`]: () => client.listAgents(),
+        [`${base}/mcp`]: () => client.getMcp(),
+      }
+      const read = reads[url]
+      if (!read) throw new Error('OpenCode supervised host observation unavailable')
+      return { status: 200, data: await read() }
+    }
     return (this.deps.fetchJson ?? fetchJson)(url, init)
   }
 
@@ -1062,6 +1095,16 @@ export class OpenCodeHostManager {
   }
 
   async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    if (this.custody) {
+      const entry = this.hosts.get(hostKey)
+      const token = await this.custody.prepareLeaseToken(input)
+      const valid = token?.consume() ?? false
+      if (!valid || !entry?.supervisor || this.hosts.get(hostKey) !== entry) {
+        throw new Error('OpenCode supervised lease unavailable')
+      }
+      entry.supervisor.leases.add(buildLeaseKey(input))
+      return
+    }
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return
@@ -1130,6 +1173,10 @@ export class OpenCodeHostManager {
   }
 
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    if (this.custody) {
+      this.hosts.get(hostKey)?.supervisor?.leases.delete(buildLeaseKey(input))
+      return
+    }
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return
@@ -1357,6 +1404,12 @@ export class OpenCodeHostManager {
         ),
       ])
 
+      if (this.custody && (
+        !config.data || typeof config.data !== 'object' || Array.isArray(config.data) ||
+        !configProviders.data || typeof configProviders.data !== 'object' || Array.isArray(configProviders.data) ||
+        !Array.isArray(agents.data) || !mcp.data || typeof mcp.data !== 'object' || Array.isArray(mcp.data)
+      )) return null
+
       const fingerprintSource = {
         config:
           config.status === 200 ? normalizeResolvedFingerprintValue(config.data, 'config') : null,
@@ -1367,6 +1420,10 @@ export class OpenCodeHostManager {
         agents:
           agents.status === 200 ? normalizeResolvedFingerprintValue(agents.data, 'agents') : null,
         mcp: mcp.status === 200 ? normalizeResolvedFingerprintValue(mcp.data, 'mcp') : null,
+      }
+
+      if (this.custody && Object.values(fingerprintSource).some(value => value === null || value === undefined)) {
+        return null
       }
 
       if (
@@ -1649,6 +1706,12 @@ export class OpenCodeHostManager {
       lease?: OpenCodeHostLeaseInput
     } = {},
   ): Promise<OpenCodeHostHandle> {
+    // This branch precedes ALL desktop profile, binary, plugin, port and registry work.
+    if (this.custody) {
+      const pending = this.supervisedTail.then(() => this.adoptSupervisedHost(params))
+      this.supervisedTail = pending.catch(() => undefined)
+      return pending
+    }
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
@@ -1774,6 +1837,66 @@ export class OpenCodeHostManager {
     return createPromise
   }
 
+  private async adoptSupervisedHost(params: {
+    projectPath?: string | null; hostKey?: string | null
+    preparedProfile?: OpenCodePreparedProfile; profileOptions?: OpenCodePrepareProfileOptions
+    abortSignal?: AbortSignal; lease?: OpenCodeHostLeaseInput
+  }): Promise<OpenCodeHostHandle> {
+    const custody = this.custody!
+    assertTrustedOpenCodeCustody(custody)
+    const e = custody.expected
+    if (params.abortSignal?.aborted) throwOpenCodeAbortReason(params.abortSignal)
+    if ((params.projectPath != null && params.projectPath !== e.profile.projectPath) ||
+      (params.hostKey != null && params.hostKey !== custody.hostKey) || !params.lease ||
+      (params.profileOptions?.toolApprovalMode && params.profileOptions.toolApprovalMode !== 'manual') ||
+      Object.keys(params.profileOptions ?? {}).some(key => !['toolApprovalMode', 'abortSignal'].includes(key))) {
+      throw new Error('OpenCode supervised project, profile or lease mismatch')
+    }
+    const leaseKey = buildLeaseKey(params.lease)
+    const initialLease = await custody.prepareLeaseToken(params.lease)
+    if (!initialLease?.consume()) throw new Error('OpenCode supervised session admission unavailable')
+    const profile = await custody.readPreparedProfile()
+    if (params.preparedProfile && ['projectPath', 'profileRootKey', 'profileRootPath',
+      'projectBehaviorFingerprint', 'managedConfigFingerprint', 'managedAuthFingerprint',
+      'sourceAuthFingerprint', 'sourceAuthSources'].some(key =>
+        JSON.stringify(params.preparedProfile![key as keyof OpenCodePreparedProfile]) !==
+        JSON.stringify(profile[key as keyof OpenCodePreparedProfile]))) {
+      throw new Error('OpenCode supervised prepared profile substitution')
+    }
+    if (!(await custody.assertCurrent())) throw new Error('OpenCode supervised custody lost')
+    const health = await this.checkHealthyHostOnce(e.endpoint.baseUrl)
+    const fingerprint = await this.getResolvedConfigFingerprint(e.endpoint.baseUrl)
+    if (!health || fingerprint !== e.profile.resolvedConfigFingerprint) {
+      throw new Error('OpenCode supervised health or resolved config mismatch')
+    }
+    await this.supervisedClientFactory!.create(e.endpoint.baseUrl).getHostedApprovalCapability!()
+    const lease = await custody.prepareLeaseToken(params.lease)
+    let fence: Awaited<ReturnType<TrustedOpenCodeCustody['prepareEffectToken']>>
+    try { fence = await custody.prepareEffectToken() } catch (error) { lease?.consume(); throw error }
+    let valid = !params.abortSignal?.aborted
+    try { valid = (lease?.consume() ?? false) && valid } catch { valid = false }
+    try { valid = (fence?.consume() ?? false) && valid } catch { valid = false }
+    if (!valid) throw new Error('OpenCode supervised admission lost before publication')
+    // No await between exact first lease and handle publication; acquisitions are serialized.
+    const existing = this.hosts.get(custody.hostKey)
+    if (existing) {
+      if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
+      existing.supervisor.leases.add(leaseKey)
+      existing.refCount += 1
+      return existing.handle
+    }
+    const handle: OpenCodeHostHandle = {
+      custody: 'supervisor', hostKey: custody.hostKey, profileRootKey: profile.profileRootKey,
+      projectPath: profile.projectPath, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      openCodeArtifactDigest: `sha256:${e.executable.sha256}`, baseUrl: e.endpoint.baseUrl,
+      port: e.endpoint.port, pid: e.process.pid, processStartedAtMs: Number(e.process.startTicks),
+      version: health.version, state: 'healthy', profile, resolvedConfigFingerprint: fingerprint, diagnostics: [],
+    }
+    this.hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
+      lifetime: 'process', supervisor: { custody, leases: new Set([leaseKey]) } })
+    return handle
+  }
+
   getHost(hostKey: string): OpenCodeHostHandle | null {
     return this.hosts.get(hostKey)?.handle ?? null
   }
@@ -1785,6 +1908,8 @@ export class OpenCodeHostManager {
     }
 
     const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
+    if (this.custody && (fingerprint !== this.custody.expected.profile.resolvedConfigFingerprint ||
+      !(await this.custody.assertCurrent()))) throw new Error('OpenCode supervised resolved config changed')
     if (fingerprint) {
       entry.handle.resolvedConfigFingerprint = fingerprint
     }
@@ -1804,7 +1929,13 @@ export class OpenCodeHostManager {
     resolvedConfigFingerprint: string | null
     openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<boolean> {
+    if (this.custody && !(await this.custody.assertCurrent())) return false
     const entry = this.hosts.get(input.hostKey)
+    if (this.custody && (entry?.supervisor?.custody !== this.custody ||
+      input.pid !== this.custody.expected.process.pid ||
+      input.processStartedAtMs !== Number(this.custody.expected.process.startTicks) ||
+      input.resolvedConfigFingerprint !== this.custody.expected.profile.resolvedConfigFingerprint ||
+      entry.handle.baseUrl !== this.custody.expected.endpoint.baseUrl)) return false
     if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
       input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
     if (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
@@ -1838,6 +1969,10 @@ export class OpenCodeHostManager {
       input.openCodeArtifactDigest,
     )
     if (!executingToken) return null
+    let custodyToken: Awaited<ReturnType<TrustedOpenCodeCustody['prepareEffectToken']>> = null
+    try { custodyToken = this.custody ? await this.custody.prepareEffectToken() : null }
+    catch (error) { executingToken.consume(); throw error }
+    if (this.custody && !custodyToken) { executingToken.consume(); return null }
     const handle = entry.handle
     let consumed = false
     return {
@@ -1850,8 +1985,11 @@ export class OpenCodeHostManager {
           handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
           handle.openCodeArtifactDigest === input.openCodeArtifactDigest &&
           this.isProcessAlive(input.pid)
-        const executingCurrent = executingToken.consume()
-        return retained && executingCurrent
+        let executingCurrent = false
+        let custodyCurrent = !this.custody
+        try { executingCurrent = executingToken.consume() } catch {}
+        try { if (custodyToken) custodyCurrent = custodyToken.consume() } catch {}
+        return retained && executingCurrent && custodyCurrent
       },
     }
   }
@@ -1860,6 +1998,7 @@ export class OpenCodeHostManager {
     record: PersistentHostRegistryRecord,
     options: { force: boolean },
   ): Promise<void> {
+    if (this.custody) throw new Error('OpenCode supervisor retains process cleanup authority')
     const entry = this.hosts.get(record.hostKey)
     const pid = entry?.handle.pid ?? record.pid
     let terminated = false
@@ -1942,6 +2081,18 @@ export class OpenCodeHostManager {
   }
 
   async disposeHost(hostKey: string): Promise<boolean> {
+    if (this.custody) {
+      const entry = this.hosts.get(hostKey)
+      if (!entry?.supervisor) {
+        if (hostKey === this.custody.hostKey) await this.custody.closeOwnerResources()
+        return false
+      }
+      entry.handle.state = 'disposed'
+      entry.supervisor.leases.clear()
+      this.hosts.delete(hostKey)
+      await this.custody.closeOwnerResources()
+      return true
+    }
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return false
@@ -1991,6 +2142,12 @@ export class OpenCodeHostManager {
     kept: number
     diagnostics: string[]
   }> {
+    if (this.custody) {
+      const disposed = this.hosts.size
+      for (const key of this.hosts.keys()) await this.disposeHost(key)
+      await this.custody.closeOwnerResources()
+      return { disposed, kept: 0, diagnostics: [] }
+    }
     const registry = await this.readPersistentRegistry()
     let disposed = 0
     let kept = 0
@@ -2021,6 +2178,11 @@ export class OpenCodeHostManager {
   async reconcilePersistentHosts(
     options: OpenCodePersistentHostReconcileOptions = {},
   ): Promise<OpenCodePersistentHostReconcileResult> {
+    if (this.custody) {
+      const close = options.mode === 'force' || options.reason === 'shutdown'
+      const result = close ? await this.disposeUnregisteredOwnedHosts() : null
+      return { cleaned: result?.disposed ?? 0, remaining: this.hosts.size, hosts: [], diagnostics: [] }
+    }
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return {
@@ -2322,6 +2484,13 @@ export class OpenCodeHostManager {
     hostKey: string,
     options: { keepPersistentAlive?: boolean } = {},
   ): Promise<void> {
+    if (this.custody) {
+      const entry = this.hosts.get(hostKey)
+      if (!entry?.supervisor) return
+      entry.refCount = Math.max(0, entry.refCount - 1)
+      if (entry.refCount === 0 && entry.supervisor.leases.size === 0) this.hosts.delete(hostKey)
+      return
+    }
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return
