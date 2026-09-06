@@ -1099,7 +1099,8 @@ export function bindOwnerDeliveryRequest(state: HostedApprovalOwnerState, reques
     exact(object(request.partition, 'delivery partition'), ['teamId', 'runId'], 'delivery partition')
     const principal = object(request.principal, 'delivery principal')
     exact(principal, principal.kind === 'operator' ? ['kind', 'actorId'] : ['kind'], 'delivery principal')
-    if (!identifier(request.providerDeliveryId) || !/^approval-reconciliation_[0-9a-f]{64}$/u.test(request.reconciliationRef) ||
+    if (!identifier(request.providerDeliveryId) || typeof request.reconciliationRef !== 'string' ||
+      !/^approval-reconciliation_[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/.test(request.reconciliationRef) ||
       !(request.decision === 'timeout' && principal.kind === 'system_timeout' ||
         (request.decision === 'allow' || request.decision === 'deny') && principal.kind === 'operator' &&
         typeof principal.actorId === 'string' && /^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/u.test(principal.actorId))) return null

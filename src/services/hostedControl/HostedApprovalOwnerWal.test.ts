@@ -1547,6 +1547,47 @@ describe('Owner W2 r809 boundary regressions', () => {
     }
   })
 
+  test('initial started and direct rejected publications preserve the accepted reconciliation reference domain', async () => {
+    for (const phase of ['started', 'rejected'] as const) for (const suffix of ['1', 'Z.Mixed_case-9', 'A'.repeat(192)]) {
+      const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
+      const fixture = state(); const record = fixture.ingress[0]!
+      await setup.locked(current => setup.publish(current, withoutRevision(fixture)))
+      const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
+      const request = { ...initialDeliveryWitness(record).request, reconciliationRef: `approval-reconciliation_${suffix}` }
+      const initial = { request, payloadFingerprint: fingerprintHostedApprovalDelivery(request) }
+      const delivery: HostedApprovalOwnerState['deliveries'][number] = { providerDeliveryId: request.providerDeliveryId,
+        reconciliationRef: request.reconciliationRef, payloadFingerprint: initial.payloadFingerprint,
+        deliveryRef: record.deliveryRef, outboxId: record.outboxId, effectRef: record.effectRef,
+        phase, result: phase === 'started' ? null : 'expired' }
+      const publish = (candidate: typeof delivery, witness: OwnerWalInitialDeliveryWitness) => wal.locked(current => wal.publishMutation(current, {
+        ...withoutRevision(current!), deliveries: [candidate],
+      }, phase === 'started'
+        ? { operationNonce: 'a'.repeat(64), mutation: { kind: 'delivery-started', outcome: 'started' }, delivery: candidate, initial: witness }
+        : { operationNonce: 'a'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'rejected', outcome: 'expired' }, delivery: candidate, initial: witness }))
+      const before = readFileSync(path)
+      for (const reconciliationRef of ['approval-reconciliation_', 'approval-reconciliation_.x', 'approval-reconciliation_-x',
+        'approval-reconciliation_x:y', 'approval-reconciliation_x/y', 'approval-reconciliation_é',
+        'approval-reconciliation_x y', 'other_1', `approval-reconciliation_${'A'.repeat(193)}`]) {
+        const invalidRequest = { ...request, reconciliationRef }
+        const payloadFingerprint = fingerprintHostedApprovalDelivery(invalidRequest)
+        await expect(publish({ ...delivery, reconciliationRef, payloadFingerprint }, { request: invalidRequest, payloadFingerprint }))
+          .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      }
+      // Valid references still require the exact original request and fingerprint.
+      const changedRequest = { ...request, reconciliationRef: 'approval-reconciliation_other' }
+      await expect(publish(delivery, { request: changedRequest, payloadFingerprint: fingerprintHostedApprovalDelivery(changedRequest) }))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      await expect(publish({ ...delivery, payloadFingerprint: 'f'.repeat(64) }, { ...initial, payloadFingerprint: 'f'.repeat(64) }))
+        .rejects.toMatchObject({ stage: 'definitely-not-replaced' })
+      expect(readFileSync(path)).toEqual(before)
+      expect(capture.lines).toHaveLength(1)
+      await publish(delivery, initial)
+      expect((await wal.read())!.deliveries).toEqual([delivery])
+      expect(capture.bound!.native.mutation.kind).toBe(phase === 'started' ? 'delivery-started' : 'delivery-settled')
+      capture.producer.close()
+    }
+  })
+
   test('native receipt owns nonce, mutation claims and every nested count across preparation and emission', async () => {
     const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
     await setup.locked(current => setup.publish(current, withoutRevision(state())))

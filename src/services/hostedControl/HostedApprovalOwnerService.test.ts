@@ -176,6 +176,48 @@ describe('HostedApprovalOwnerService R2', () => {
     ])
   })
 
+  test('authorizes and starts accepted non-hex reconciliation references with capture on or off', async () => {
+    for (const captureEnabled of [false, true]) for (const suffix of ['1', 'Z.Mixed_case-9', 'A'.repeat(192)]) {
+      const capture = captureEnabled ? nativeServiceCapture() : undefined
+      let effects = 0
+      const fx = await fixture({ publicationProducer: capture?.producer, deliver: () => { effects += 1; return 'ambiguous' } })
+      await fx.service.pollIngress()
+      const record = (await fx.store.read())!.ingress[0]!
+      const request = { ...delivery(record), reconciliationRef: `approval-reconciliation_${suffix}` }
+      const payloadFingerprint = fingerprintHostedApprovalDelivery(request)
+      const auth = await fx.service.authorizeDecision({ request, payloadFingerprint })
+      expect(auth.status).toBe('authorized')
+      if (auth.status !== 'authorized') throw new Error('Expected authorization')
+      expect(await fx.service.deliverDecision({ request, payloadFingerprint, authorization: auth.authorization,
+        admittedAuthority: record.authority })).toEqual({ status: 'operator_required', reconciliationRef: request.reconciliationRef })
+      expect((await fx.store.read())!.deliveries).toMatchObject([{ reconciliationRef: request.reconciliationRef,
+        payloadFingerprint, phase: 'started', result: null }])
+      expect(effects).toBe(1)
+      if (capture) expect(capture.mutations.at(-1)?.kind).toBe('delivery-started')
+      capture?.producer.close()
+    }
+  })
+
+  test('authorization rejects references outside the accepted domain without publication', async () => {
+    for (const captureEnabled of [false, true]) {
+      const capture = captureEnabled ? nativeServiceCapture() : undefined
+      const fx = await fixture({ publicationProducer: capture?.producer })
+      await fx.service.pollIngress()
+      const before = await fx.store.read()
+      const mutations = capture?.mutations.length
+      for (const reconciliationRef of ['', 'approval-reconciliation_', 'approval-reconciliation_.x',
+        'approval-reconciliation_-x', 'approval-reconciliation_x:y', 'approval-reconciliation_x/y',
+        'approval-reconciliation_é', 'approval-reconciliation_x y', 'other_1', `approval-reconciliation_${'A'.repeat(193)}`]) {
+        const request = { ...delivery(before!.ingress[0]!), reconciliationRef }
+        expect(await fx.service.authorizeDecision({ request, payloadFingerprint: fingerprintHostedApprovalDelivery(request) }))
+          .toEqual({ status: 'stale_generation' })
+      }
+      expect(await fx.store.read()).toEqual(before)
+      expect(capture?.mutations.length).toBe(mutations)
+      capture?.producer.close()
+    }
+  })
+
   test('exposes only the exact recovered and still-current admission', async () => {
     const fx = await fixture()
     await expect(fx.service.isAdmissionRecoveredCurrent()).resolves.toBe(true)
