@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { OpenCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
+import type { OpenCodeMessage } from './types.js'
 
 function buildSseResponse(chunks: string[], status = 200, contentType = 'text/event-stream'): Response {
   const encoder = new TextEncoder()
@@ -57,6 +58,125 @@ async function waitForTick(): Promise<void> {
 }
 
 describe('OpenCodeTurnSettledObserver', () => {
+  test('does not settle during silence between completed tool steps and the final assistant response', async () => {
+    const stream = buildControlledSseResponse()
+    let transcriptReads = 0
+    let finalResponse = false
+    const observer = new OpenCodeTurnSettledObserver({
+      fetchImpl: async input => {
+        if (String(input).endsWith('/event')) return stream.response
+        transcriptReads += 1
+        return Response.json([
+          { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+          {
+            info: { id: 'msg-tool', role: 'assistant', parentID: 'msg-prompt', finish: 'tool-calls', time: { completed: 100 } },
+            parts: [
+              { type: 'text', text: 'Checking the task and writing the result.' },
+              { type: 'tool', tool: 'agent-teams_task_get', state: { status: 'completed', input: {}, output: 'ok' } },
+              { type: 'step-finish', reason: 'tool-calls' },
+            ],
+          },
+          ...(finalResponse ? [{
+            info: { id: 'msg-final', role: 'assistant', parentID: 'msg-prompt', finish: 'stop', time: { completed: 200 } },
+            parts: [{ type: 'text', text: 'Task completed.' }],
+          }] : []),
+        ])
+      },
+    })
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096', sessionId: 'session-1', runtimePromptMessageId: 'msg-prompt',
+      timeoutMs: 1_000, idleTimeoutMs: 10,
+    })
+    let settled = false
+    const waitPromise = observation.waitForSettled().then(summary => { settled = true; return summary })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"tool","sessionID":"session-1","messageID":"msg-tool"}}}\n\n')
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(settled).toBe(false)
+    expect(transcriptReads).toBe(1)
+
+    finalResponse = true
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-final"}}}\n\n')
+    const summary = await waitPromise
+    expect(summary.outcome).toBe('success')
+    expect(summary.latestAssistantMessageId).toBe('msg-final')
+    expect(summary.diagnostics.join('\n')).toContain('terminal assistant response')
+  })
+
+  test.each([
+    ['unfinished', { info: { id: 'msg-latest', role: 'assistant' }, parts: [{ type: 'step-start' }] }, 'timeout'],
+    ['unknown', { info: { id: 'msg-latest', role: 'assistant', finish: 'unknown', time: { completed: 200 } }, parts: [] }, 'timeout'],
+    ['error', { info: { id: 'msg-latest', role: 'assistant', error: { name: 'APIError', message: 'Provider failed' } }, parts: [] }, 'error'],
+  ] as const)('uses the latest %s response during silence instead of an earlier completed answer', async (_, latest, outcome) => {
+    const stream = buildControlledSseResponse()
+    const transcript: OpenCodeMessage[] = [
+      { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+      {
+        info: { id: 'msg-earlier', role: 'assistant', finish: 'stop', time: { completed: 100 } },
+        parts: [{ type: 'text', text: 'Earlier answer' }],
+      },
+      { info: { ...latest.info }, parts: [...latest.parts] },
+    ]
+    const observer = new OpenCodeTurnSettledObserver({
+      fetchImpl: async input => String(input).endsWith('/event') ? stream.response : Response.json(transcript),
+    })
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096', sessionId: 'session-1', runtimePromptMessageId: 'msg-prompt',
+      timeoutMs: 60, idleTimeoutMs: 10,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-latest"}}}\n\n')
+    const summary = await observation.waitForSettled()
+    expect(summary.outcome).toBe(outcome)
+    expect(summary.latestAssistantMessageId).toBe('msg-latest')
+  })
+
+  test('rearms silence reconciliation when new activity outlasts an in-flight transcript read', async () => {
+    const stream = buildControlledSseResponse()
+    let transcriptReads = 0
+    let resolveFirstRead!: (response: Response) => void
+    let notifyFirstRead!: () => void
+    const firstReadStarted = new Promise<void>(resolve => { notifyFirstRead = resolve })
+    const finalTranscript = (messageId: string) => Response.json([
+      { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+      {
+        info: { id: messageId, role: 'assistant', parentID: 'msg-prompt', finish: 'stop', time: { completed: 100 } },
+        parts: [{ type: 'text', text: 'Done.' }],
+      },
+    ])
+    const observer = new OpenCodeTurnSettledObserver({
+      fetchImpl: async input => {
+        if (String(input).endsWith('/event')) return stream.response
+        transcriptReads += 1
+        if (transcriptReads === 1) {
+          const pending = new Promise<Response>(resolve => { resolveFirstRead = resolve })
+          notifyFirstRead()
+          return pending
+        }
+        return finalTranscript('msg-final')
+      },
+    })
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096', sessionId: 'session-1', runtimePromptMessageId: 'msg-prompt',
+      timeoutMs: 1_000, idleTimeoutMs: 10,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-earlier"}}}\n\n')
+    await firstReadStarted
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-final"}}}\n\n')
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(transcriptReads).toBe(1)
+    resolveFirstRead(finalTranscript('msg-earlier'))
+
+    const summary = await observation.waitForSettled()
+    expect(summary.outcome).toBe('success')
+    expect(summary.latestAssistantMessageId).toBe('msg-final')
+    expect(transcriptReads).toBe(2)
+  })
+
   test('settles successfully when prompt persists, assistant activity occurs, and session becomes idle', async () => {
     const observer = new OpenCodeTurnSettledObserver({
       promptMessageIdFactory: () => 'msg_prompt_1',
