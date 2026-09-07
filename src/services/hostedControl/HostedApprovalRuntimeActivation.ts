@@ -131,6 +131,13 @@ export type VerifiedHostedApprovalActivation = {
   }
 }
 
+const productionActivations = new WeakMap<object, string>()
+export function assertHostedApprovalProductionActivation(value: VerifiedHostedApprovalActivation): void {
+  if (productionActivations.get(value) !== JSON.stringify(value)) {
+    throw new Error('Hosted approval production activation unavailable')
+  }
+}
+
 /**
  * Pure, fail-closed activation-v2 verifier. It accepts only the product's
  * canonical publication wrapper; authorship is never accepted out of band.
@@ -141,13 +148,15 @@ export function unwrapHostedApprovalActivation(
   expected: HostedApprovalActivationExpectation,
   pins?: HostedApprovalActivationV2ProductionPinSource,
 ): VerifiedHostedApprovalActivation {
-  return unwrapWithPins(
+  const activation = unwrapWithPins(
     source,
     proofKey,
     pins === undefined ? getHostedApprovalActivationV2ProductionPins() :
       requireHostedApprovalActivationV2ProductionPins(pins),
     expected,
   )
+  productionActivations.set(activation, JSON.stringify(activation))
+  return activation
 }
 
 /** Test-only vector seam; never supplies production authority. */

@@ -209,13 +209,17 @@ export class OpenCodeProvisioningProbe {
     const mcpManager = this.deps.mcpManager ?? openCodeMcpManager
 
     let host: OpenCodeHostHandle | undefined
-    const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
+    const custody = this.deps.acquisitionPolicy?.mode === 'supervisor-adopt-only'
+      ? this.deps.acquisitionPolicy.custody : undefined
+    const preflightLease = custody?.createPreflightLease('readiness') ?? createOpenCodePreflightHostLeaseInput('readiness')
     let released = false
     const release = async () => {
-      if (released || !host) {
+      if (released) {
         return
       }
       released = true
+      custody?.releasePreflightLease(preflightLease)
+      if (!host) return
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (options.disposeHostOnRelease !== false) {
         await hostManager.releaseHost(host.hostKey)
@@ -241,6 +245,7 @@ export class OpenCodeProvisioningProbe {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
     } catch (error) {
+      custody?.releasePreflightLease(preflightLease)
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }

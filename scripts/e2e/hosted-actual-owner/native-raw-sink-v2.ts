@@ -1,3 +1,4 @@
+import { PRIVATE_HTTP_KIND, PRIVATE_HTTP_PURPOSE, privateHttpObservation, privateHttpOperation } from './native-private-http.js'
 import type { HostedControlBootstrapAdmissionV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2.js'
 import type { OpenCodeRawObservation, OpenCodeRawRetentionSink } from '../../../src/services/opencode/OpenCodeHostedRawRetention.js'
 import { canonicalJson, sha256, type MatrixRow } from './native-http-contract.js'
@@ -30,20 +31,20 @@ export function nativeHttpContextV2(bootstrap: HostedControlBootstrapAdmissionV2
  * Requests are indexed before completion so terminal records cannot substitute
  * another exchange or acquire a new context after authority loss. */
 export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
-  prefix: Buffer, binding: { initialByteLength: number; initialSha256: string; nextSequence: number }) {
+  prefix: Buffer, binding: { initialByteLength: number; initialSha256: string; nextSequence: number }, privateKey?: Buffer) {
   const context = snapshotHttpContext(contextValue)
   const state = inspectNativeRawPrefix(prefix, binding, context.activation.controllerNonce)
   let sequence = state.nextSequence, previous = state.lastMonotonicNs
-  const requests = new Map<string, { nonce: string; responded: boolean; privateConfiguration: boolean }>()
+  const requests = new Map<string, { nonce: string; responded: boolean; privateOperation: string | null }>()
   const nonces = new Set<string>()
   let failed = false
-  return (input: OpenCodeRawObservation): { bytes: Uint8Array; recordId: string } => {
+  const encode = (input: OpenCodeRawObservation): { bytes: Uint8Array; recordId: string; privateByteLength?: number } => {
     httpCheck(!failed, 'encoder_failed')
     try {
       let observation: Record<string, unknown>
+      let privateOperation: string | null = null
       if (input.phase === 'request') {
-        // No admitted nonsecret body contract exists for configuration writes.
-        httpCheck(!(input.method === 'POST' && input.path === '/mcp'), 'private_configuration_body')
+        privateOperation = privateHttpOperation(input)
         httpCheck(!nonces.has(input.binding.ownerExchangeNonce), 'encoder_nonce_reuse')
         observation = { phase: 'request-retained', ownerExchangeNonce: input.binding.ownerExchangeNonce,
           operation: input.binding.operation, method: input.method, path: input.path, body: input.body }
@@ -51,11 +52,9 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
         const request = input.request
         const retained = request && requests.get(request.recordId)
         httpCheck(!request || retained?.nonce === request.ownerExchangeNonce, 'encoder_request_binding')
+        privateOperation = retained?.privateOperation ?? null
         if (input.phase === 'response') {
           httpCheck(retained && !retained.responded && input.connectedPeer, 'encoder_response_binding')
-          // Base64 and normalized fingerprints cannot establish nonsecret bytes.
-          // Refuse publication before building any record/body hash envelope.
-          httpCheck(!retained.privateConfiguration, 'private_configuration_body')
           observation = { phase: 'response-retained', ownerExchangeNonce: request!.ownerExchangeNonce,
             requestRecordId: request!.recordId, status: input.status, responseHeaders: input.responseHeaders,
             peerOperationNonce: input.peerOperationNonce, nonceStatus: input.nonceStatus,
@@ -63,11 +62,16 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
         } else observation = { phase: 'exchange-failed', ownerExchangeNonce: request?.ownerExchangeNonce ?? null,
           requestRecordId: request?.recordId ?? null, failure: input.failure }
       }
-      const record = Buffer.from(canonicalJson({ schemaVersion: 2, purpose: OWNER_HTTP_OBSERVATION_PURPOSE,
+      if (privateOperation) {
+        httpCheck(!!privateKey, 'private_configuration_body')
+        observation = privateHttpObservation(context, privateKey!, privateOperation, input)
+      }
+      const record = Buffer.from(canonicalJson({ schemaVersion: privateOperation ? 1 : 2,
+        purpose: privateOperation ? PRIVATE_HTTP_PURPOSE : OWNER_HTTP_OBSERVATION_PURPOSE,
         context, observation }))
       httpCheck(record.length <= HTTP_LIMITS.record, 'encoder_record_limit')
-      const payload = { kind: OWNER_HTTP_OBSERVATION_KIND, recordBase64: record.toString('base64'), recordSha256: sha256(record) }
-      decodeOwnerHttpRecordV2(payload)
+      const payload = { kind: privateOperation ? PRIVATE_HTTP_KIND : OWNER_HTTP_OBSERVATION_KIND, recordBase64: record.toString('base64'), recordSha256: sha256(record) }
+      if (!privateOperation) decodeOwnerHttpRecordV2(payload)
       // Never increment or synthesize the observed clock to clear prefix checks.
       const clock = process.hrtime.bigint()
       httpCheck(clock > previous, 'encoder_clock')
@@ -79,12 +83,13 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
       if (input.phase === 'request') {
         httpCheck(requests.size < 65536, 'encoder_request_limit')
         nonces.add(input.binding.ownerExchangeNonce)
-        requests.set(encoded.recordId, { nonce: input.binding.ownerExchangeNonce, responded: false, privateConfiguration: input.path === '/config' || input.path === '/config/providers' })
+        requests.set(encoded.recordId, { nonce: input.binding.ownerExchangeNonce, responded: false, privateOperation })
       } else if (input.phase === 'response') requests.get(input.request.recordId)!.responded = true
       sequence += 1; previous = clock
-      return encoded
+      return { ...encoded, privateByteLength: privateOperation && input.phase !== 'failure' ? input.body.byteLength : 0 }
     } catch (error) { failed = true; throw error }
   }
+  return Object.assign(encode, { initialPrivateByteLength: state.privateByteLength })
 }
 
 /** Takes the actual FD8 only; no path writer or injectable encoding callback. */
@@ -93,8 +98,8 @@ export async function createNativeRawSinkV2(bootstrap: HostedControlBootstrapAdm
   const context = nativeHttpContextV2(bootstrap, location)
   const storage = retainNativeRawDescriptorV2(bootstrap.rawRetention, deadline, context.activation.controllerNonce)
   try {
-    const encode = createNativeHttpEncoderV2(context, storage.readPrefix(), storage.binding)
-    return Object.freeze({ initialByteLength: storage.initialByteLength, encode,
+    const encode = createNativeHttpEncoderV2(context, storage.readPrefix(), storage.binding, bootstrap.secret)
+    return Object.freeze({ initialByteLength: storage.initialByteLength, initialPrivateByteLength: encode.initialPrivateByteLength, encode,
       isCurrent: storage.isCurrent, write: storage.write, sync: storage.sync, close: storage.close })
   } catch (error) { await storage.close(); throw error }
 }

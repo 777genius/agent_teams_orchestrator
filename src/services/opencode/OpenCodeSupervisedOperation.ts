@@ -44,3 +44,10 @@ export function classifySupervisedProviderOperation(method: string, path: string
   if (!name) throw new Error('OpenCode supervised operation unsupported')
   return Object.freeze({ kind: 'provider', name, method, path })
 }
+
+export const PRIVATE_SUPERVISED_PROVIDER_OPERATIONS = Object.freeze([
+  'config', 'config-providers', 'providers', 'provider-auth-methods', 'agents', 'mcp-read', 'mcp-add', 'mcp-connect',
+] as const)
+export function isPrivateSupervisedProviderOperation(operation: HostedHttpOperation): boolean {
+  return operation.kind === 'provider' && (PRIVATE_SUPERVISED_PROVIDER_OPERATIONS as readonly string[]).includes(operation.name)
+}

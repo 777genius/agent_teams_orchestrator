@@ -1,3 +1,5 @@
+import { privateMcpConfigurationMatches } from './OpenCodePrivateMcpConfig.js'
+import { createOpenCodePreflightHostLeaseInput } from './OpenCodePreflightLease.js'
 import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
@@ -46,7 +48,10 @@ export interface OpenCodeSupervisorAdmissionSource {
     readPreparedProfile(): Promise<OpenCodePreparedProfile>
     // These retain supervisor admission, executed module/manifest and activation
     // authority, not a caller's assertion about the process being alive.
+    assertCurrentSync?(): boolean
     prepareEffectToken(): Promise<OneUseFence | null>
+    registerPreflightLease?(lease: OpenCodeHostLeaseInput): void
+    releasePreflightLease?(lease: OpenCodeHostLeaseInput): void
     prepareLeaseToken(lease: OpenCodeHostLeaseInput): Promise<OneUseFence | null>
     prepareOperationToken(operation: HostedHttpOperation): Promise<OneUseFence | null>
     readonly lost: Promise<void>
@@ -62,8 +67,11 @@ export interface TrustedOpenCodeCustody {
   readonly rawRetention: OpenCodeRawRetentionPort
   readonly lost: Promise<void>
   readPreparedProfile(): Promise<OpenCodePreparedProfile>
+  assertPrivateMcpConfiguration(config: unknown): void
   assertCurrent(): Promise<boolean>
   prepareEffectToken(): Promise<OneUseFence | null>
+  createPreflightLease(scope: 'readiness' | 'execution'): OpenCodeHostLeaseInput
+  releasePreflightLease(lease: OpenCodeHostLeaseInput): void
   prepareLeaseToken(lease: OpenCodeHostLeaseInput): Promise<OneUseFence | null>
   prepareOperationToken(operation: HostedHttpOperation): Promise<OneUseFence | null>
   authorizeConnected(connection: OpenCodeConnectedSocketIdentity): Promise<OneUseFence | null>
@@ -161,10 +169,16 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
     const rawRetention = bundle.rawRetention
     const readPreparedProfile = bundle.readPreparedProfile.bind(bundle)
     const prepareAuthority = bundle.prepareEffectToken.bind(bundle)
+    const sourceCurrent = bundle.assertCurrentSync?.bind(bundle)
     const prepareLease = bundle.prepareLeaseToken.bind(bundle)
+    const registerPreflight = bundle.registerPreflightLease?.bind(bundle)
+    const releasePreflight = bundle.releasePreflightLease?.bind(bundle)
+    const preflights = new Set<OpenCodeHostLeaseInput>()
     const prepareOperation = bundle.prepareOperationToken.bind(bundle)
     const closeBundle = bundle.closeOwnerResources.bind(bundle)
     const bundleLost = bundle.lost
+    let authorization: string | undefined
+    let admittedManagedConfig: unknown
     let admittedProfileIdentity: string | undefined
     let revoked = false
     let closing: Promise<void> | undefined
@@ -174,12 +188,14 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
     const exchanges = new Map<Promise<void>, () => void>()
     const revoke = () => {
       if (revoked) return
-      revoked = true; lose()
+      revoked = true; admittedManagedConfig = undefined; authorization = undefined; admittedProfileIdentity = undefined; lose()
       for (const cancel of exchanges.values()) { try { cancel() } catch {} }
       for (const closeResource of resources) {
         try { closeResource() } catch {}
       }
       resources.clear()
+      for (const lease of preflights) { try { releasePreflight?.(lease) } catch {} }
+      preflights.clear()
     }
     const close = () => {
       revoke()
@@ -196,10 +212,14 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
         throw new Error('OpenCode supervisor admission mismatch')
       }
       // Secret stays in this closure; never in profile env, handles or raw records.
-      const authorization = `Basic ${Buffer.from(`${bundle.serverAuth.username}:${bundle.serverAuth.password}`).toString('base64')}`
+      authorization = `Basic ${Buffer.from(`${bundle.serverAuth.username}:${bundle.serverAuth.password}`).toString('base64')}`
       void bundleLost.then(revoke, revoke)
       const current = () => {
-        if (!revoked && (!rawRetention.isCurrent() || !processCurrent(expected))) revoke()
+        if (!revoked) {
+          try {
+            if (!rawRetention.isCurrent() || !processCurrent(expected) || (sourceCurrent && !sourceCurrent())) revoke()
+          } catch { revoke() }
+        }
         return !revoked
       }
       const captureFence = (token: OneUseFence | null): OneUseFence | null => {
@@ -262,13 +282,33 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
             throw new Error('OpenCode supervised profile identity changed')
           }
           admittedProfileIdentity ??= identity
+          admittedManagedConfig = verified.managedConfig
           return verified
+        },
+        assertPrivateMcpConfiguration(config: unknown) {
+          if (!current() || !privateMcpConfigurationMatches(admittedManagedConfig, config)) {
+            revoke()
+            throw new Error('OpenCode supervised MCP configuration mismatch')
+          }
         },
         async assertCurrent() {
           const token = await prepareEffectToken()
           return token?.consume() ?? false
         },
         prepareEffectToken,
+        createPreflightLease(scope: 'readiness' | 'execution') {
+          if (!current() || !registerPreflight || !releasePreflight ||
+            (scope !== 'readiness' && scope !== 'execution') || preflights.size >= 16) {
+            throw new Error('OpenCode supervised preflight unavailable')
+          }
+          const lease = Object.freeze(createOpenCodePreflightHostLeaseInput(scope))
+          registerPreflight(lease)
+          preflights.add(lease)
+          return lease
+        },
+        releasePreflightLease(lease: OpenCodeHostLeaseInput) {
+          if (preflights.delete(lease)) releasePreflight?.(lease)
+        },
         async prepareLeaseToken(lease: OpenCodeHostLeaseInput) {
           if (!current()) return null
           const token = captureFence(await prepareLease(Object.freeze({ ...lease })))
@@ -276,6 +316,14 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
           return token
         },
         async prepareOperationToken(operation: HostedHttpOperation) {
+          // The selected host already launched with its admitted MCP config.
+          // Reconfiguration needs a new admission, never a desktop-style repair.
+          // Revoke before the first await so outstanding effect/connection tokens
+          // and exchanges cannot race a same-process configuration mutation.
+          if (operation.kind === 'provider' && operation.name === 'mcp-add') {
+            revoke()
+            return null
+          }
           if (!current()) return null
           const token = captureFence(await prepareOperation(Object.freeze({ ...operation })))
           if (!current()) { token?.consume(); return null }
@@ -290,7 +338,7 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
         },
         authenticatedRequest(urlValue: string, init: RequestInit) {
           const url = new URL(urlValue)
-          if (!current() || url.origin !== expected.endpoint.baseUrl || url.username || url.password ||
+          if (!current() || !authorization || url.origin !== expected.endpoint.baseUrl || url.username || url.password ||
             url.hash || urlValue !== `${expected.endpoint.baseUrl}${url.pathname}${url.search}`) {
             throw new Error('OpenCode supervised request authority mismatch')
           }

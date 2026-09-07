@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { Socket } from 'node:net'
+import { Socket, createServer, type AddressInfo } from 'node:net'
 import { createInterface } from 'node:readline'
 import { canonicalHostedApprovalDigest, canonicalHostedApprovalJson, OpenCodeClientFactory,
   OpenCodePermissionConditionRejectedError, OpenCodeRequestNotDispatchedError } from './OpenCodeClientFactory.js'
@@ -468,17 +468,13 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
 
   test('supervised preparation and response have separate real bounded deadlines', async () => {
     let slowProof = false
-    let hangingProof = false
-    let proofFinished!: () => void
-    const proofGate = new Promise<void>(resolve => { proofFinished = resolve })
     let receivedAt = 0
     let hangResponse = false
     const fixture = await supervisedFixture({
       mutateBundle(bundle) {
         const prepare = bundle.prepareEffectToken
         bundle.prepareEffectToken = async () => {
-          if (hangingProof) await proofGate
-          else if (slowProof) await new Promise<void>(resolve => setTimeout(resolve, 250))
+          if (slowProof) await new Promise<void>(resolve => setTimeout(resolve, 250))
           return prepare()
         }
       },
@@ -499,16 +495,56 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       const elapsedResponse = performance.now() - receivedAt
       expect(elapsedResponse).toBeGreaterThanOrEqual(80)
       expect(elapsedResponse).toBeLessThan(1000)
-      hangingProof = true
-      const started = performance.now()
       const before = fixture.requests.length
-      const preparationFailure = await supervisedTestWait(client.getHealth!().catch(error => error), 'preparation deadline')
-      expect(preparationFailure).toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+      const poisonedAt = performance.now()
+      await expect(client.getHealth!()).rejects.toThrow()
+      expect(performance.now() - poisonedAt).toBeLessThan(1000)
+      expect(fixture.requests).toHaveLength(before)
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test('preparation deadline settles before late proof while custody drain retains and invalidates it', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let hang = false, entered = false, consumed = 0
+    const fixture = await supervisedFixture({ mutateBundle(bundle) {
+      const prepare = bundle.prepareEffectToken
+      bundle.prepareEffectToken = async () => {
+        if (!hang) return prepare()
+        entered = true
+        await gate
+        const token = await prepare()
+        return token && { consume() { consumed++; return token.consume() } }
+      }
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl)
+      hang = true
+      const started = performance.now()
+      const failure = await supervisedTestWait(client.getHealth!().catch(error => error), 'preparation deadline')
+      expect(entered).toBe(true)
+      expect(failure).toBeInstanceOf(OpenCodeRequestNotDispatchedError)
       expect(performance.now() - started).toBeGreaterThanOrEqual(4900)
       expect(performance.now() - started).toBeLessThan(6500)
-      expect(fixture.requests).toHaveLength(before)
-      proofFinished()
-    } finally { proofFinished?.(); await fixture.close() }
+      expect(fixture.requests).toHaveLength(0)
+      expect(fixture.connections).toHaveLength(1)
+      await supervisedTestWait(fixture.connections[0]!.closed, 'preparation exact socket close')
+      expect(fixture.connections.flatMap(connection => connection.chunks)).toHaveLength(0)
+      expect(custody.rawRetention.isCurrent()).toBe(false)
+      let drained = false
+      const drain = custody.closeOwnerResources().then(() => { drained = true })
+      await Promise.resolve()
+      expect(drained).toBe(false)
+      expect(consumed).toBe(0)
+      release()
+      await supervisedTestWait(drain, 'late proof custody drain')
+      expect(consumed).toBe(1)
+      expect(fixture.connections.flatMap(connection => connection.chunks)).toHaveLength(0)
+      await expect(client.getHealth!()).rejects.toThrow()
+      expect(fixture.requests).toHaveLength(0)
+    } finally { release(); await fixture.close() }
   }, 120_000)
 
   test('response timeout retains the received prefix and closes only the authorized socket', async () => {
@@ -679,9 +715,18 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
   }, 120_000)
 
   test('generic consumers inherit auth and redirects never select a different credential origin', async () => {
+    let redirectedConnections = 0, redirectedBytes = 0
+    const redirectTarget = createServer(socket => {
+      redirectedConnections++
+      socket.on('data', bytes => { redirectedBytes += bytes.length })
+      socket.end()
+    })
+    redirectTarget.listen(0, '127.0.0.1')
+    await once(redirectTarget, 'listening')
+    const redirectUrl = `http://127.0.0.1:${(redirectTarget.address() as AddressInfo).port}/stolen`
     const fixture = await supervisedFixture({ handle(request, response) {
       if (request.url === '/session/redirect') {
-        response.statusCode = 302; response.setHeader('location', 'http://127.0.0.1:1/stolen')
+        response.statusCode = 302; response.setHeader('location', redirectUrl)
       }
       response.end('{}')
     } })
@@ -696,8 +741,33 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       expect(fixture.requests).toHaveLength(4)
       for (const request of fixture.requests) expect(request.headers.authorization)
         .toBe(`Basic ${Buffer.from('opencode:fixture-secret').toString('base64')}`)
-      expect(fixture.observations).toHaveLength(0)
-    } finally { await fixture.close() }
+      expect(redirectedConnections).toBe(0)
+      expect(redirectedBytes).toBe(0)
+      expect(fixture.connections).toHaveLength(4)
+      expect(fixture.observations).toHaveLength(9)
+      const paths = ['/provider', '/session/ses_test', '/mcp', '/session/redirect']
+      const names = ['providers', 'session-read', 'mcp-read', 'session-read']
+      for (let i = 0; i < paths.length; i++) {
+        const request = fixture.observations[i * 2]!
+        const response = fixture.observations[i * 2 + 1]!
+        expect(request).toMatchObject({ phase: 'request', method: 'GET', path: paths[i],
+          binding: { operation: { kind: 'provider', name: names[i] } } })
+        expect(response).toMatchObject({ phase: 'response', status: i === 3 ? 302 : 200, complete: true })
+        if (request.phase !== 'request' || response.phase !== 'response') throw new Error('missing pair')
+        expect(response.request.ownerExchangeNonce).toBe(request.binding.ownerExchangeNonce)
+        expect(Buffer.from(request.body.bodyBase64, 'base64').length).toBe(0)
+        expect(Buffer.from(response.body.bodyBase64, 'base64').toString()).toBe('{}')
+      }
+      const terminal = fixture.observations[8]!
+      const redirected = fixture.observations[7]!
+      expect(terminal).toMatchObject({ phase: 'failure', failure: { phase: 'end-attempted', code: 'exchange_failed' } })
+      if (terminal.phase !== 'failure' || redirected.phase !== 'response') throw new Error('missing redirect evidence')
+      expect(terminal.request).toBe(redirected.request)
+      expect(custody.rawRetention.isCurrent()).toBe(false)
+    } finally {
+      await fixture.close()
+      await new Promise<void>(resolve => redirectTarget.close(() => resolve()))
+    }
   }, 120_000)
 
   test('complete authenticated generic 404 keeps typed status and missing-message fallback', async () => {
@@ -721,9 +791,47 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         '/session/ses_test/message/msg_missing', '/session/ses_test/message',
         '/session/ses_test/message/msg_existing', '/session/ses_test/message', '/session/ses_missing',
       ])
-      expect(fixture.observations).toHaveLength(0)
+      expect(fixture.observations).toHaveLength(10)
+      for (let i = 0; i < 5; i++) {
+        const request = fixture.observations[i * 2]!
+        const response = fixture.observations[i * 2 + 1]!
+        expect(request).toMatchObject({ phase: 'request', method: 'GET', path: fixture.requests[i]!.url })
+        expect(response).toMatchObject({ phase: 'response', status: i === 1 || i === 3 ? 200 : 404, complete: true })
+        if (request.phase !== 'request' || response.phase !== 'response') throw new Error('missing pair')
+        expect(response.request.ownerExchangeNonce).toBe(request.binding.ownerExchangeNonce)
+        expect(Buffer.from(response.body.bodyBase64, 'base64').toString()).toBe(
+          i === 1 || i === 3 ? JSON.stringify([existing]) : 'private diagnostic body')
+      }
       expect(custody.rawRetention.isCurrent()).toBe(true)
     } finally { await fixture.close() }
+  }, 120_000)
+
+  test('recoverable missing reads do not exempt private config, arbitrary statuses, parsing or retention failures', async () => {
+    for (const scenario of ['config404', 'health404', 'session500', 'malformed200', 'unsynced404'] as const) {
+      const fixture = await supervisedFixture({
+        handle(_request, response) {
+          response.statusCode = scenario === 'session500' ? 500 : scenario === 'malformed200' ? 200 : 404
+          response.end('private diagnostic')
+        },
+        async sync(observation) {
+          if (scenario === 'unsynced404' && observation?.phase === 'response') throw new Error('sync rejected')
+        },
+      })
+      try {
+        const custody = await fixture.acquire()
+        const token = await custody.prepareOperationToken({kind:'provider',name:'session-read',method:'GET',path:'/session/next'})
+        const client = new OpenCodeClientFactory({acquisitionPolicy:{mode:'supervisor-adopt-only',custody}})
+          .create(fixture.expected.endpoint.baseUrl)
+        const pending = scenario === 'config404' ? client.getConfig() : scenario === 'health404'
+          ? client.getHealth!() : client.getSession('missing')
+        expect(await pending.catch(error => error)).toBeInstanceOf(Error)
+        expect(custody.rawRetention.isCurrent()).toBe(false)
+        expect(token!.consume()).toBe(false)
+        expect(fixture.requests).toHaveLength(1)
+        await expect(client.getSession('next')).rejects.toThrow()
+        expect(fixture.requests).toHaveLength(1)
+      } finally { await fixture.close() }
+    }
   }, 120_000)
 
   test('incomplete or encoded generic 404 cannot establish a missing message', async () => {

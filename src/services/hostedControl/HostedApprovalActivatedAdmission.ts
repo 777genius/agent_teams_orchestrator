@@ -21,6 +21,17 @@ import type {
   HostedApprovalRuntimeRoute,
 } from './HostedApprovalRuntimeAdmission.js'
 
+const retainedActivations = new WeakMap<object, { activation: VerifiedHostedApprovalActivation; isCurrent(): boolean }>()
+export function assertHostedApprovalActivatedAdmission(admission: HostedApprovalRuntimeAdmission,
+  activation: VerifiedHostedApprovalActivation): void {
+  if (retainedActivations.get(admission)?.activation !== activation) throw new Error('Hosted approval activated admission unavailable')
+}
+
+/** Synchronous view of the same retained raw-file/socket/epoch fence. */
+export function isHostedApprovalActivatedAdmissionCurrent(admission: HostedApprovalRuntimeAdmission): boolean {
+  try { return retainedActivations.get(admission)?.isCurrent() ?? false } catch { return false }
+}
+
 const MAX_RAW_ADMISSION_BYTES = 256 * 1024
 const SHA256 = /^sha256:([0-9a-f]{64})$/
 
@@ -98,7 +109,7 @@ export function loadHostedApprovalActivatedAdmission(
     } catch { return false }
   }
 
-  return Object.freeze({
+  const admission = Object.freeze({
     schemaVersion: 1 as const,
     admissionGeneration: activation.requestedTeam.admissionGeneration,
     outerAuthority: Object.freeze({
@@ -121,6 +132,8 @@ export function loadHostedApprovalActivatedAdmission(
       rawArtifactCurrent,
     )),
   })
+  retainedActivations.set(admission, { activation, isCurrent: synchronouslyCurrent })
+  return admission
 }
 
 function canonicalAdmissionBytes(activation: VerifiedHostedApprovalActivation): Buffer {

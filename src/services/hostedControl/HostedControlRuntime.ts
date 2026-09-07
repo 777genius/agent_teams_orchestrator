@@ -35,6 +35,13 @@ import {
   type HostedControlRuntimeConfig,
 } from './HostedControlRuntimeConfig.js'
 
+const nativeFactoryContexts = new WeakMap<object, HostedControlBootstrapAdmissionV2>()
+/** Only an actual runtime instance can issue its frozen provider context. */
+export function assertHostedControlNativeRuntimeContext(context: HostedControlRuntimePortFactoryContext,
+  bootstrap: HostedControlBootstrapAdmissionV2): void {
+  if (nativeFactoryContexts.get(context) !== bootstrap) throw new Error('Hosted control native runtime context unavailable')
+}
+
 export type HostedControlRuntimePorts = {
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
@@ -207,7 +214,7 @@ export class HostedControlRuntime {
         throw new Error('Hosted control owner changed before port composition')
       }
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
-      ports = await this.createPorts(Object.freeze({
+      const factoryContext: HostedControlRuntimePortFactoryContext = Object.freeze({
         authority,
         legacyKey: config.legacyKey,
         teamRoot: ownerScope.canonicalTeamRoot,
@@ -241,20 +248,24 @@ export class HostedControlRuntime {
                 claudeRoot: config.claudeRoot, legacyKey: config.legacyKey,
                 expectedRootIdentity: ownerScope.rootIdentity,
               })
-              if (!this.#acceptingEffects || !(nativeProvidersReady || adoptingNativeProviders) || !rootCurrent()) return null
+              if (!this.#acceptingEffects || !(nativeProvidersReady || adoptingNativeProviders) || !rootCurrent() ||
+                !nativeAdmission.guard.assertCurrentSync()) return null
               const retainedServer = server
               const token = retainedServer?.prepareRetainedProviderToken()
               if (!token) return null
               return Object.freeze({ consume: () => {
                 const current = token.consume()
-                return current && rootCurrent() && this.#acceptingEffects && server === retainedServer &&
+                return current && rootCurrent() && nativeAdmission.guard.assertCurrentSync() &&
+                  this.#acceptingEffects && server === retainedServer &&
                   (nativeProvidersReady || adoptingNativeProviders)
               } })
             },
           }),
         } : {}),
         isCurrentAuthority,
-      }))
+      })
+      if (nativeAdmission) nativeFactoryContexts.set(factoryContext, nativeAdmission)
+      ports = await this.createPorts(factoryContext)
       // Local state recovery is complete. Native provider adoption is deferred
       // until the retained activation write and separate lifecycle lease; legacy
       // composition retains its existing pre-publication recovery ordering.

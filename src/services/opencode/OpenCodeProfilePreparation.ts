@@ -1,3 +1,4 @@
+import { retainOpenCodeBehaviorInventory } from './OpenCodeBehaviorInventory.js'
 import { resolveOpenCodeAuthCoordinationPath } from './OpenCodeAuthCoordinationLock.js'
 import { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
 export { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
@@ -10,6 +11,7 @@ import {
   lstat,
   mkdir,
   readlink,
+  realpath,
   readdir,
   readFile,
   rm,
@@ -456,101 +458,15 @@ async function runAfterSettled(previous: Promise<void> | undefined): Promise<voi
   }
 }
 
-const PROJECT_BEHAVIOR_FILES = [
-  'opencode.json',
-  'opencode.jsonc',
-  'AGENTS.md',
-  'CLAUDE.md',
-  '.opencode/package.json',
-  '.opencode/package-lock.json',
-  '.opencode/pnpm-lock.yaml',
-  '.opencode/yarn.lock',
-  '.opencode/npm-shrinkwrap.json',
-  '.opencode/bun.lock',
-  '.opencode/bun.lockb',
-] as const
-
-const PROJECT_BEHAVIOR_DIRS = [
-  '.opencode/plugins',
-  '.opencode/tools',
-  '.opencode/agents',
-  '.opencode/commands',
-  '.opencode/modes',
-  '.opencode/skills',
-  '.agents/skills',
-] as const
-
-async function collectBehaviorDirectoryEntries(
-  rootPath: string,
-  relativeDir: string,
-): Promise<string[]> {
-  const absoluteDir = path.join(rootPath, relativeDir)
-  if (!(await fileExists(absoluteDir))) {
-    return []
-  }
-
-  const entries: string[] = []
-  const walk = async (currentDir: string): Promise<void> => {
-    const dirents = await readdir(currentDir, { withFileTypes: true })
-    dirents.sort((left, right) => left.name.localeCompare(right.name))
-
-    for (const dirent of dirents) {
-      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') {
-        continue
-      }
-
-      const nextPath = path.join(currentDir, dirent.name)
-      if (dirent.isDirectory()) {
-        await walk(nextPath)
-        continue
-      }
-      if (!dirent.isFile()) {
-        continue
-      }
-
-      const relativePath = path.relative(rootPath, nextPath)
-      const content = await readFile(nextPath)
-      entries.push(`${relativePath}:${hashBuffer(content)}`)
-    }
-  }
-
-  await walk(absoluteDir)
-  return entries
-}
-
 export async function collectProjectBehaviorMetadata(projectPath: string): Promise<{
   projectBehaviorFingerprint: string
   behaviorSources: string[]
 }> {
-  const entries: string[] = []
-  const behaviorSources = new Set<string>()
-
-  for (const relativePath of PROJECT_BEHAVIOR_FILES) {
-    const absolutePath = path.join(projectPath, relativePath)
-    if (!(await fileExists(absolutePath))) {
-      continue
-    }
-
-    const content = await readFile(absolutePath)
-    entries.push(`${relativePath}:${hashBuffer(content)}`)
-    behaviorSources.add(relativePath)
-  }
-
-  for (const relativeDir of PROJECT_BEHAVIOR_DIRS) {
-    const dirEntries = await collectBehaviorDirectoryEntries(projectPath, relativeDir)
-    for (const entry of dirEntries) {
-      const separatorIndex = entry.indexOf(':')
-      behaviorSources.add(separatorIndex >= 0 ? entry.slice(0, separatorIndex) : entry)
-      entries.push(entry)
-    }
-  }
-
-  entries.sort()
-
-  return {
-    projectBehaviorFingerprint: hashString(entries.join('\n')),
-    behaviorSources: Array.from(behaviorSources).sort(),
-  }
+  // Resolve platform aliases only at the caller root, before retaining selected
+  // components. Enumeration and byte reads have no asynchronous pathname gap.
+  const inventory = retainOpenCodeBehaviorInventory(await realpath(projectPath))
+  try { inventory.assertCurrent(); return inventory.metadata }
+  finally { inventory.close() }
 }
 
 export function buildManagedConfig(

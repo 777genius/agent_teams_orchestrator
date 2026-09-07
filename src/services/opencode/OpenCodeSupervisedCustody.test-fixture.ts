@@ -6,6 +6,7 @@ import { createServer as createTcpServer, type AddressInfo, type Socket } from '
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { canonicalHostedApprovalJson } from './OpenCodeClientFactory.js'
+import { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
 import * as endpointIdentity from './OpenCodeLoopbackEndpointIdentity.js'
 import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
 import { resolveExecutingOpenCodeArtifactDigest } from './OpenCodeArtifactDigest.js'
@@ -82,6 +83,8 @@ class FixtureResponse {
  * explicitly test infrastructure, not a production supervisor admission provider.
  */
 export async function supervisedFixture(options: {
+  initialManagedConfig?: OpenCodePreparedProfile['managedConfig']
+  encode?: (observation: OpenCodeRawObservation, expected: ExpectedSupervisedOpenCode) => ReturnType<OpenCodeRawRetentionSink['encode']>
   handle?: (request: ObservedRequest, response: FixtureResponse) => void
   rawResponse?: (request: ObservedRequest, socket: Socket) => void
   sync?: (observation: OpenCodeRawObservation | undefined) => Promise<void>
@@ -159,10 +162,11 @@ export async function supervisedFixture(options: {
   const startTicks = processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]!
   const exe = await stat(`${proc}/exe`, { bigint: true })
   const executableDigest = resolveExecutingOpenCodeArtifactDigest(process.pid)!
+  const managedConfig = structuredClone(options.initialManagedConfig ?? {})
   const profile: OpenCodePreparedProfile = {
     projectPath: directory, profileRootKey: 'fixture', profileRootPath: directory,
-    projectBehaviorFingerprint: hash(''), managedConfigFingerprint: hash('{}'), behaviorSources: [],
-    managedConfig: {}, homePath: directory, tmpPath: directory, xdgConfigHome: directory,
+    projectBehaviorFingerprint: hash(''), managedConfigFingerprint: buildManagedConfigFingerprint(managedConfig), behaviorSources: [],
+    managedConfig, homePath: directory, tmpPath: directory, xdgConfigHome: directory,
     xdgDataHome: directory, xdgCacheHome: directory, managedAuthPath: join(directory, 'absent-auth.json'),
     sourceAuthPath: null, sourceAuthSources: [], sourceAuthFingerprint: null, managedAuthFingerprint: null,
     authState: 'missing', env: {},
@@ -188,6 +192,7 @@ export async function supervisedFixture(options: {
   const sink: OpenCodeRawRetentionSink = {
     encode(observation) {
       observations.push(observation)
+      if (options.encode) return options.encode(observation, expected)
       const bytes = Buffer.from(JSON.stringify(observation))
       return { bytes, recordId: hash(bytes.toString('utf8')) }
     },

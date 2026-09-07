@@ -1,3 +1,4 @@
+import { isPrivateSupervisedProviderOperation } from './OpenCodeSupervisedOperation.js'
 import { createHash } from 'node:crypto'
 import { connect as connectTcp } from 'node:net'
 import { encodeOpenCodeSocketHttpRequest, readOpenCodeSocketHttpResponse,
@@ -787,6 +788,7 @@ export class OpenCodeClientFactory {
       let operationToken: OneUseFence | null = null
       let custodyToken: OneUseFence | null = null
       let finished = false
+      let recoverableMissing: OpenCodeHttpResponseError | undefined
       const unconsumed = new Set<OneUseFence>()
       const preparations: Promise<unknown>[] = []
       const consume = (token: OneUseFence) => { unconsumed.delete(token); return token.consume() }
@@ -922,19 +924,34 @@ export class OpenCodeClientFactory {
           // Native framing and encoding have already been checked. Preserve the
           // authenticated status without exposing a generic failure body. Reads
           // used for admission still require exactly 200, including config.
-          throw new OpenCodeHttpResponseError(response.status, response.statusText, '')
+          const failure = new OpenCodeHttpResponseError(response.status, response.statusText, '')
+          // Only this locally created error follows validated framing, authenticated
+          // transport and durable response retention. It is an ordinary missing read,
+          // not a capture failure; recordFailure deliberately remains poisonous.
+          if (response.status === 404 && operation.method === 'GET' &&
+            (operation.name === 'message-read' || operation.name === 'session-read') &&
+            retained && custody.rawRetention.isCurrent()) recoverableMissing = failure
+          throw failure
         }
-        return strictHostedApprovalResponse
+        const parsed = strictHostedApprovalResponse
           ? await parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes, !!custody, operation?.kind === 'reply')
           : await parseResponse<T>(response, !!custody)
+        if (custody && operation?.kind === 'provider' && operation.name === 'config') {
+          custody.assertPrivateMcpConfiguration(parsed)
+        }
+        return parsed
       } catch (error) {
-        if (custody && operation && !(error instanceof OpenCodeValidatedConditionRejection)) {
+        if (custody && operation && (!recoverableMissing || error !== recoverableMissing) && !(error instanceof OpenCodeValidatedConditionRejection)) {
           custody.rawRetention.poison('exchange_failed')
           await custody.rawRetention.recordFailure(retained, {
             phase: dispatch?.endAttempted ? 'end-attempted' : 'before-end', code: 'exchange_failed',
           }).catch(() => undefined)
         }
         if (custody && !dispatch?.endAttempted) throw new OpenCodeRequestNotDispatchedError()
+        if (custody && operation && isPrivateSupervisedProviderOperation(operation)) {
+          if (error instanceof OpenCodeHttpResponseError) throw new OpenCodeHttpResponseError(error.status, '', '')
+          throw new Error('OpenCode private HTTP exchange failed')
+        }
         if (context.signal?.aborted) {
           throw resolveAbortReason(context.signal, timeoutError)
         }
@@ -950,8 +967,7 @@ export class OpenCodeClientFactory {
         context.signal?.removeEventListener('abort', abortFromContext)
         // Abort races revoke writes promptly, but cannot release bundle
         // resources while a preparation still owns a late one-use token.
-        await Promise.allSettled(preparations)
-        completeExchange()
+        void Promise.allSettled(preparations).then(completeExchange)
       }
     }
 

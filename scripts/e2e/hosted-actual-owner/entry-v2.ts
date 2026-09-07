@@ -1,3 +1,7 @@
+import type { NativeOwnerComposition } from './native-composition.js'
+import { acquireNativeProviderCustody, retainNativeActivatedScenario, type NativeAdmittedScenario } from './native-provider-admission.js'
+import type { NativeAdmittedLaunch } from './native-launch-admission.js'
+import { PRIVATE_PROFILE_AUTH } from '../../../src/services/opencode/OpenCodePreparedProfileContract.js'
 import { join } from 'node:path'
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { createHostedControlProductionPortFactory } from '../../../src/services/hostedControl/HostedControlProductionComposition.js'
@@ -6,8 +10,7 @@ import { createOwnedOpenCodeLifecycleCommandExecutor } from '../../../src/servic
 import { createOpenCodeSupervisedProviderBundle } from '../../../src/services/opencode/OpenCodeSupervisedProviderBundle.js'
 import type { TrustedOpenCodeCustody } from '../../../src/services/opencode/OpenCodeSupervisedHostCustody.js'
 import { requireHostedApprovalActivationV2ProductionPins, type HostedApprovalActivationV2ProductionPinSource } from '../../../src/services/hostedControl/HostedApprovalActivationV2Pins.js'
-import { readHostedControlBootstrapV2,
-  type OwnerV2LaunchSelection } from '../../../src/services/hostedControl/HostedControlBootstrapV2.js'
+import { readHostedControlBootstrapV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2.js'
 import { HostedApprovalActivatablePort } from '../../../src/services/hostedControl/HostedApprovalActivatablePort.js'
 import { HostedApprovalDeferredManifestV2 } from '../../../src/services/hostedControl/HostedApprovalDeferredManifestV2.js'
 import { HostedApprovalOwnerWal } from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
@@ -18,36 +21,27 @@ import type { OwnerWalPublicationProducer } from '../../../src/services/hostedCo
 import { parseOwnerV2Invocation, readOwnerRuntimeManifestV2 } from './runtime-manifest-v2.js'
 import { createNativePublicationV2 } from './native-publication-v2.js'
 import { createNativeWalImagesV2 } from './native-wal-images-v2.js'
-import { SELECTED_LAUNCH_PHASE, type SelectedLaunchPhase } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
+import { SELECTED_LAUNCH_PHASE } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
 
-/** Required source/built-entry composition inputs, retained by the selected
- * supervisor launch. Entry constructs W2 image custody; W1 admission retains FD8;
- * this bootstrap slice must not replace those with ambient desktop services. */
-export type ActualOwnerV2Composition = Readonly<{
-  /** Independently admitted Product activation identity, not the lifecycle launcher signer. */
-  activationPins: HostedApprovalActivationV2ProductionPinSource
-  /** Verify existing signed artifacts against payload-provisioned public roots.
-   * The untrusted phase must never choose those roots. Return its admitted pins. */
-  admitLaunch(phase: SelectedLaunchPhase): OwnerV2LaunchSelection | Promise<OwnerV2LaunchSelection>
-  /** Branded admission only; entry constructs every provider consumer itself. */
-  acquireProviderCustody(): Promise<TrustedOpenCodeCustody>
-}>
+export type ActualOwnerV2Composition = NativeOwnerComposition
 
 export async function runActualOwnerV2(args: readonly string[], composition?: ActualOwnerV2Composition): Promise<void> {
   // Even an uncomposed invocation must run the bounded inherited admission and
   // close its one-use descriptors. There is no legacy argv or FD fallback.
   let activationPins: HostedApprovalActivationV2ProductionPinSource | undefined
+  let admittedLaunch: NativeAdmittedLaunch | undefined
   const modulePath = process.argv[1]
-  const bootstrap = await readHostedControlBootstrapV2({ modulePath, selectionPhase: SELECTED_LAUNCH_PHASE,
+  const bootstrap = await readHostedControlBootstrapV2({ modulePath, privateAuthFormat: PRIVATE_PROFILE_AUTH, selectionPhase: SELECTED_LAUNCH_PHASE,
     async selectLaunch(phase) {
       const path = parseOwnerV2Invocation(args)
       if (!composition || !phase) throw new Error('hosted_owner_v2_selected_launch_composition_missing')
-      activationPins = requireHostedApprovalActivationV2ProductionPins(composition.activationPins)
-      const launch = await composition.admitLaunch(phase)
+      admittedLaunch = composition.admitLaunch(phase)
+      activationPins = requireHostedApprovalActivationV2ProductionPins(admittedLaunch.activationPins)
+      const launch = admittedLaunch.launch
       readOwnerRuntimeManifestV2(path, launch)
       return launch
     },
-  })
+  }).catch(error => { composition?.close(); throw error })
   let native: OwnerWalPublicationProducer | undefined
   let walImages: Awaited<ReturnType<typeof createNativeWalImagesV2>> | undefined
   const runtime = new HostedControlRuntime(bootstrap, async context => {
@@ -55,6 +49,7 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
     // FD9 and image custody exist before any approval recovery can publish WAL.
     walImages = await createNativeWalImagesV2(bootstrap, context.teamRoot)
     native = createNativePublicationV2(bootstrap, modulePath, walImages)
+    let admittedScenario: NativeAdmittedScenario | undefined
     let provider: Promise<ReturnType<typeof createOpenCodeSupervisedProviderBundle>> | undefined
     let execute: ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor> | undefined
     let providerRevoked = false
@@ -66,10 +61,11 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
       // synchronous stack, then returns their evidence-drain completion.
       if (activeCustody) providerDrain ??= activeCustody.closeOwnerResources()
     }
-    const acquireCustody = composition.acquireProviderCustody.bind(composition)
     const getProvider = () => {
       if (providerRevoked) return Promise.reject(new Error('hosted_owner_v2_provider_revoked'))
-      return provider ??= acquireCustody().then(async custody => {
+      if (!admittedLaunch || !admittedScenario) return Promise.reject(new Error('hosted_owner_v2_scenario_unavailable'))
+      return provider ??= acquireNativeProviderCustody({ bootstrap, runtimeContext: context,
+        admittedLaunch, admittedScenario }).then(async custody => {
       activeCustody = custody
       if (providerRevoked) {
         revokeProvider()
@@ -117,10 +113,11 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
           assertBootstrapCurrent: activation.assertBootstrapCurrent,
           assertRootCurrent: activation.assertRootCurrent,
         },
-        recover: async admission => {
+        recover: async (admission, verifiedActivation) => {
           if (!await activation.assertBootstrapCurrent() || !await activation.assertRootCurrent()) {
             throw new Error('hosted_owner_v2_guard_lost')
           }
+          admittedScenario = retainNativeActivatedScenario(admittedLaunch!, admission, verifiedActivation)
           const owner = new HostedApprovalOwnerService({ store, admission, runtime: approvalRuntime,
             isCurrentOuterAuthority: () => context.isCurrentAuthority({
               actorId: 'hosted-approval-owner', ...context.authority,
@@ -163,7 +160,7 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
     process.off('SIGINT', signal); process.off('SIGTERM', signal)
     try { await runtime.stop() } finally {
       try { native?.close() } finally {
-        try { walImages?.close() } finally { await bootstrap.close() }
+        try { walImages?.close() } finally { try { await bootstrap.close() } finally { composition?.close() } }
       }
     }
   }

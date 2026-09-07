@@ -1,3 +1,4 @@
+import { PRIVATE_HTTP_KIND, decodePrivateHttpRecord, assertPrivateHttpOuterBinding } from './native-private-http.js'
 import { canonicalJson, exactRecord, MATRIX_ROWS, RAW_RECORD_PURPOSE, sha256, type RawRecord } from './native-http-contract.js'
 import { HTTP_LIMITS, HTTP_OBSERVATION_KIND } from './native-raw-http-types.js'
 import { assertHttpOuterBinding, decodeHttpBase64, decodeHttpRecord, decodeOwnerHttpRecordV2,
@@ -30,6 +31,7 @@ export function parseNativeRawEnvelope(bytes: Buffer, sequence: number, controll
   httpCheck(data !== null && typeof data === 'object' && !Array.isArray(data), 'outer_payload')
   if (data.kind === HTTP_OBSERVATION_KIND) assertHttpOuterBinding(outer, decodeHttpRecord(data))
   if (data.kind === OWNER_HTTP_OBSERVATION_KIND) assertHttpOuterBinding(outer, decodeOwnerHttpRecordV2(data))
+  if (data.kind === PRIVATE_HTTP_KIND) assertPrivateHttpOuterBinding(outer, decodePrivateHttpRecord(data))
   return outer
 }
 
@@ -52,20 +54,26 @@ export function encodeNativeRawEnvelope(input: Omit<RawRecord,
  * records. Does not turn those records into Owner HTTP observations. */
 export function inspectNativeRawPrefix(bytes: Buffer, binding: {
   initialByteLength: number; initialSha256: string; nextSequence: number
-}, controllerNonce: string): Readonly<{ nextSequence: number; lastMonotonicNs: bigint }> {
+}, controllerNonce: string): Readonly<{ nextSequence: number; lastMonotonicNs: bigint; privateByteLength: number }> {
   httpCheck(bytes.length <= HTTP_LIMITS.ledger && bytes.length === binding.initialByteLength &&
     sha256(bytes) === binding.initialSha256 && Number.isSafeInteger(binding.nextSequence), 'prefix_binding')
   httpCheck(bytes.length === 0 || bytes.at(-1) === 10, 'prefix_framing')
-  let offset = 0, sequence = 1, previous = -1n
+  let offset = 0, sequence = 1, previous = -1n, privateByteLength = 0
   const ids = new Set<string>()
   while (offset < bytes.length) {
     const end = bytes.indexOf(10, offset)
     httpCheck(end > offset, 'prefix_line')
     const record = parseNativeRawEnvelope(bytes.subarray(offset, end), sequence, controllerNonce)
+    const payload = parseHttpCanonical(decodeHttpBase64(record.payloadBase64, HTTP_LIMITS.payload, 'prefix_payload'), 'prefix_payload') as Record<string, unknown>
+    if (payload.kind === PRIVATE_HTTP_KIND) {
+      const body = decodePrivateHttpRecord(payload).observation.privateBody as { byteLength: number } | null
+      privateByteLength += body?.byteLength ?? 0
+      httpCheck(bytes.length + privateByteLength <= HTTP_LIMITS.ledger, 'prefix_private_budget')
+    }
     const clock = BigInt(record.monotonicNs)
     httpCheck(clock > previous && !ids.has(record.recordId), 'prefix_order')
     ids.add(record.recordId); previous = clock; sequence += 1; offset = end + 1
   }
   httpCheck(sequence === binding.nextSequence, 'prefix_sequence')
-  return Object.freeze({ nextSequence: sequence, lastMonotonicNs: previous })
+  return Object.freeze({ nextSequence: sequence, lastMonotonicNs: previous, privateByteLength })
 }

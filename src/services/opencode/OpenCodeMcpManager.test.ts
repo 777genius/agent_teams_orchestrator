@@ -18,9 +18,11 @@ function normalizePath(value: string): string {
 
 describe('OpenCodeMcpManager', () => {
   test('treats an existing app MCP server as present without reattaching', async () => {
+    let resolverCalls = 0
     let addCalls = 0
 
     const manager = new OpenCodeMcpManager({
+      env: {},
       clientFactory: {
         create: () => ({
           getMcp: async () => ({
@@ -35,6 +37,7 @@ describe('OpenCodeMcpManager', () => {
         }),
       },
       resolveLaunchConfig: async () => {
+        resolverCalls++
         throw new Error('not used')
       },
     })
@@ -48,6 +51,7 @@ describe('OpenCodeMcpManager', () => {
     expect(result.summary.matchedServerName).toBe('agent-teams')
     expect(result.summary.connected).toBe(true)
     expect(addCalls).toBe(0)
+    expect(resolverCalls).toBe(0)
   })
 
   test('ignores a blank remote URL env value when an app MCP server is already present', async () => {
@@ -841,20 +845,24 @@ describe('OpenCodeMcpManager', () => {
   })
 
   test('rejects non-string MCP env JSON values for local MCP launch config', async () => {
-    await expect(
-      resolveOpenCodeAppMcpLaunchConfig({
+    for (const value of [true, { secret: 'PRIVATE_SENTINEL_VALUE' }]) {
+      const failure = await resolveOpenCodeAppMcpLaunchConfig({
         env: {
-          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/Agent Teams AI/agent-teams-ai',
-          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp/index.js',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/fixture',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/fixture.js',
           CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({
-            ELECTRON_RUN_AS_NODE: true,
+            PRIVATE_SENTINEL_KEY: value,
+            ELECTRON_RUN_AS_NODE: value,
           }),
         },
         pathExists: async () => false,
-      }),
-    ).rejects.toThrow(
-      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON value for ELECTRON_RUN_AS_NODE must be a string',
-    )
+      }).catch(error => error)
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure.message).toBe('CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON values must be strings')
+      expect(String(failure)).not.toContain('PRIVATE_SENTINEL_KEY')
+      expect(String(failure)).not.toContain('PRIVATE_SENTINEL_VALUE')
+      expect(String(failure)).not.toContain('ELECTRON_RUN_AS_NODE')
+    }
   })
 
   test('resolves workspace source MCP launch through node and the tsx CLI entrypoint', async () => {

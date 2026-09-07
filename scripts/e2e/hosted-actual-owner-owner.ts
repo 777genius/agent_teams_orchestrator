@@ -8,7 +8,8 @@ if (args[0] === '--hosted-control-socket-broker') {
   await runHostedControlSocketBroker(args.slice(1))
 } else if (args[0]?.startsWith('--hosted-actual-owner-sealed-protocol=')) {
   const { runActualOwnerV2 } = await import('./hosted-actual-owner/entry-v2.js')
-  await runActualOwnerV2(args)
+  const { createNativeOwnerComposition } = await import('./hosted-actual-owner/native-composition.js')
+  await runActualOwnerV2(args, createNativeOwnerComposition())
 } else if (typeof HOSTED_ACTUAL_OWNER_NATIVE_BUILD === 'undefined' || !HOSTED_ACTUAL_OWNER_NATIVE_BUILD) {
   const { runActualOwnerAcceptance } = await import('./hosted-actual-owner/owner.js')
   await runActualOwnerAcceptance(args)

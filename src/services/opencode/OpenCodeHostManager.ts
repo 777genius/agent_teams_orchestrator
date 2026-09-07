@@ -1,3 +1,6 @@
+import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodePreflightLease.js'
+export { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID, createOpenCodePreflightHostLeaseInput } from './OpenCodePreflightLease.js'
+import { buildResolvedConfigFingerprint } from './OpenCodeResolvedConfigFingerprint.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import type { Dirent } from 'node:fs'
@@ -56,8 +59,6 @@ const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS = 5
 const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS = 50
 const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
-export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
-const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 // Bun/OpenTUI temp dylib prefixes vary between builds (.bbb, .bbc, .b9dd, ...).
 // Keep the match constrained to hidden hexadecimal dylibs inside the app-owned
 // profile tmp directory so unrelated user files are never removed.
@@ -210,12 +211,6 @@ export type OpenCodePersistentHostReconcileResult = {
   diagnostics: string[]
 }
 
-function hashJson(value: unknown): string {
-  return createHash('sha256')
-    .update(JSON.stringify(value) ?? '')
-    .digest('hex')
-}
-
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
@@ -225,45 +220,6 @@ async function normalizeProjectPathForComparison(projectPath: string): Promise<s
   const canonical = await realpath(resolved).catch(() => resolved)
   const normalized = path.normalize(canonical)
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
-}
-
-function normalizeResolvedFingerprintValue(
-  value: unknown,
-  scope: 'config' | 'configProviders' | 'agents' | 'mcp',
-): unknown {
-  if (scope === 'mcp') {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      return value
-    }
-    return Object.keys(value as Record<string, unknown>).sort()
-  }
-
-  if (Array.isArray(value)) {
-    const normalized = value.map(item => normalizeResolvedFingerprintValue(item, scope))
-    if (scope === 'configProviders' || scope === 'agents') {
-      return normalized.sort((left, right) =>
-        JSON.stringify(left).localeCompare(JSON.stringify(right)),
-      )
-    }
-    return normalized
-  }
-
-  if (!value || typeof value !== 'object') {
-    return value
-  }
-
-  const record = value as Record<string, unknown>
-  return Object.keys(record)
-    .sort()
-    .reduce<Record<string, unknown>>((acc, key) => {
-      // Host transport details like loopback port and inherited environment
-      // are expected to drift across host restarts and must not stale sessions.
-      if (key === 'environment' || key === 'server') {
-        return acc
-      }
-      acc[key] = normalizeResolvedFingerprintValue(record[key], scope)
-      return acc
-    }, {})
 }
 
 async function allocateLoopbackPort(): Promise<number> {
@@ -386,22 +342,6 @@ function isExpectedPersistentOpenCodeHostCommand(
   const hasLoopbackHostname =
     /(?:^|\s)--hostname(?:=|\s+)(?:127\.0\.0\.1|localhost|::1)(?=\s|$)/i.test(normalized)
   return hasExpectedPort && hasLoopbackHostname
-}
-
-export function createOpenCodePreflightHostLeaseInput(scope: string): OpenCodeHostLeaseInput {
-  const normalizedScope =
-    scope
-      .trim()
-      .replace(/[^a-zA-Z0-9_.-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 96) || 'probe'
-  return {
-    teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
-    laneId: OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID,
-    memberName: `${normalizedScope}-${process.pid}-${randomUUID()}`,
-    runId: `preflight_${process.pid}_${randomUUID()}`,
-    sessionId: null,
-  }
 }
 
 function isOpenCodePreflightHostLease(lease: PersistentHostLeaseRecord): boolean {
@@ -1433,37 +1373,7 @@ export class OpenCodeHostManager {
       } else results.push(...await Promise.all(paths.map(read)))
       const [config, configProviders, agents, mcp] = results as [FetchJsonResult, FetchJsonResult, FetchJsonResult, FetchJsonResult]
 
-      if (this.custody && (
-        !config.data || typeof config.data !== 'object' || Array.isArray(config.data) ||
-        !configProviders.data || typeof configProviders.data !== 'object' || Array.isArray(configProviders.data) ||
-        !Array.isArray(agents.data) || !mcp.data || typeof mcp.data !== 'object' || Array.isArray(mcp.data)
-      )) return null
-
-      const fingerprintSource = {
-        config:
-          config.status === 200 ? normalizeResolvedFingerprintValue(config.data, 'config') : null,
-        configProviders:
-          configProviders.status === 200
-            ? normalizeResolvedFingerprintValue(configProviders.data, 'configProviders')
-            : null,
-        agents:
-          agents.status === 200 ? normalizeResolvedFingerprintValue(agents.data, 'agents') : null,
-        mcp: mcp.status === 200 ? normalizeResolvedFingerprintValue(mcp.data, 'mcp') : null,
-      }
-
-      if (this.custody && Object.values(fingerprintSource).some(value => value === null || value === undefined)) {
-        return null
-      }
-
-      if (
-        fingerprintSource.config === null &&
-        fingerprintSource.configProviders === null &&
-        fingerprintSource.agents === null &&
-        fingerprintSource.mcp === null
-      ) {
-        return null
-      }
-      return hashJson(fingerprintSource)
+      return buildResolvedConfigFingerprint({ config, configProviders, agents, mcp }, !!this.custody)
     } catch {
       return null
     }

@@ -1128,7 +1128,7 @@ export class OpenCodeExecutionProbe {
     const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
       promise: null,
     }
-    const preflightLease = createOpenCodePreflightHostLeaseInput(
+    const preflightLease = this.custody?.createPreflightLease('execution') ?? createOpenCodePreflightHostLeaseInput(
       `model-probe-${params.selectedModel}`,
     )
     let host: OpenCodeHostHandle
@@ -1137,7 +1137,7 @@ export class OpenCodeExecutionProbe {
         hostStartupState.promise = (async () => {
           const ensuredHost = await this.hostManager.ensureHost({
             projectPath: params.projectPath,
-            profileOptions: {
+            profileOptions: this.custody ? { toolApprovalMode: 'manual' } : {
               includeAppMcp: false,
               modelOutputLimitOverrides: [
                 {
@@ -1163,6 +1163,7 @@ export class OpenCodeExecutionProbe {
         return hostStartupState.promise
       })
     } catch (error) {
+      this.custody?.releasePreflightLease(preflightLease)
       const hostStartup = hostStartupState.promise
       if (isOpenCodeRuntimeDeadlineError(error) && hostStartup) {
         const startupCleanup = hostStartup.then(
@@ -1289,6 +1290,7 @@ export class OpenCodeExecutionProbe {
         cacheFilePath: null,
       })
     } finally {
+      this.custody?.releasePreflightLease(preflightLease)
       await this.hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (params.disposeHostOnRelease !== false) {
         await this.hostManager.releaseHost(host.hostKey)

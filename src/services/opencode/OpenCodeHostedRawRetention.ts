@@ -77,7 +77,9 @@ export type OpenCodeRawObservation =
 export interface OpenCodeRawRetentionSink {
   /** Verified inherited bytes already occupying this capture, before appends. */
   readonly initialByteLength?: number
-  encode(observation: OpenCodeRawObservation): { bytes: Uint8Array; recordId: string }
+  /** Privately committed body bytes already charged by the inherited prefix. */
+  readonly initialPrivateByteLength?: number
+  encode(observation: OpenCodeRawObservation): { bytes: Uint8Array; recordId: string; privateByteLength?: number }
   isCurrent(): boolean
   write(bytes: Uint8Array, offset: number, length: number): Promise<number>
   sync(): Promise<void>
@@ -105,7 +107,9 @@ export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): Open
   let storageFailed = false
   let sealed = false
   let closed = false
-  let total = sink.initialByteLength ?? 0
+  const initialPrivateBytes = sink.initialPrivateByteLength ?? 0
+  if (!Number.isSafeInteger(initialPrivateBytes) || initialPrivateBytes < 0) throw new Error('OpenCode private prefix byte length invalid')
+  let total = (sink.initialByteLength ?? 0) + initialPrivateBytes
   if (!Number.isSafeInteger(total) || total < 0 || total > MAX_CAPTURE) {
     throw new Error('OpenCode raw prefix byte length invalid')
   }
@@ -152,11 +156,13 @@ export function createOpenCodeRawRetention(sink: OpenCodeRawRetentionSink): Open
       const encoded = encode(observation)
       const bytes = Buffer.from(encoded.bytes)
       const recordId = encoded.recordId
-      if (!/^[0-9a-f]{64}$/.test(recordId) || bytes.length < 1 ||
-        bytes.length > MAX_RECORD || total + bytes.length > MAX_CAPTURE) {
+      const privateBytes = encoded.privateByteLength ?? 0
+      if (!Number.isSafeInteger(privateBytes) || privateBytes < 0 || privateBytes > MAX_BODY ||
+        !/^[0-9a-f]{64}$/.test(recordId) || bytes.length < 1 ||
+        bytes.length > MAX_RECORD || total + bytes.length + privateBytes > MAX_CAPTURE) {
         throw new Error('OpenCode raw record limit or identity')
       }
-      total += bytes.length
+      total += bytes.length + privateBytes
       let offset = 0
       while (offset < bytes.length) {
         // Finish an append already begun even if dispatch is revoked midway;

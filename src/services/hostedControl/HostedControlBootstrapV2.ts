@@ -11,6 +11,11 @@ import { freezeSelectionV2, observeExecutingOwnerV2, processV2, verifySelectedLa
 import { AUTH_V2, canonicalV2, decodeFramesV2, immutableV2, OWNER_V2_ROLES, requireV2, verifyLeaseV2,
   type BootstrapHeaderV2, type Immutable, type OwnerV2Role, type ServerCredentialsV2 } from './HostedControlBootstrapV2Wire.js'
 
+const admittedBootstraps = new WeakSet<object>()
+export function assertHostedControlBootstrapAdmissionV2(value: HostedControlBootstrapAdmissionV2): void {
+  requireV2(admittedBootstraps.has(value) && value.guard.assertCurrentSync(), 'bootstrap_authority')
+}
+
 export type HostedControlBootstrapAdmissionV2 = Readonly<{
   protocol: 'v2'
   config: Omit<HostedControlRuntimeConfig, 'secretFile'>
@@ -25,7 +30,7 @@ export type HostedControlBootstrapAdmissionV2 = Readonly<{
   ownerNative: Readonly<{ fd: 9; resource: OwnedDescriptorV2; descriptor: DescriptorSnapshotV2; producerCapsule: string }>
   executedOwner: ExecutingOwnerV2
   secret: Buffer
-  guard: HostedControlDescriptorGuard
+  guard: HostedControlDescriptorGuard & { assertCurrentSync(): boolean }
   activation: HostedControlInheritedActivationV2
   close(): Promise<void>
 }>
@@ -44,7 +49,7 @@ export async function readHostedControlBootstrapV2(options: {
     .map(([role, fd]) => [role, new OwnedDescriptorV2(fd)]))
   const owner = (role: OwnerV2Role) => owners.get(role)!
   let secret: Buffer | undefined
-  let guard: HostedControlDescriptorGuard | undefined
+  let guard: (HostedControlDescriptorGuard & { assertCurrentSync(): boolean }) | undefined
   let activation: HostedControlInheritedActivationV2 | undefined
   let preparedProfile: PreparedProfileProjection | undefined
   let credentials: ServerCredentialsV2 | undefined
@@ -117,11 +122,12 @@ export async function readHostedControlBootstrapV2(options: {
       executedOwner: executed, secret, guard, activation,
       async close() {
         if (closed) return
-        closed = true; credentials = undefined; preparedProfile = undefined; secret!.fill(0)
+        closed = true; admittedBootstraps.delete(result); credentials = undefined; preparedProfile = undefined; secret!.fill(0)
         try { try { activation!.close() } finally { await guard!.close() } }
         finally { for (const resource of owners.values()) resource.close() }
       },
     })
+    admittedBootstraps.add(result)
     success = true
     return result
   } catch (error) {
@@ -146,7 +152,7 @@ async function withinDeadline<T>(pending: T | Promise<T>, deadline: number): Pro
   })]) } finally { clearTimeout(timer) }
 }
 function retainGuard(lease: OwnedDescriptorV2, live: OwnedDescriptorV2, leaseSnapshot: DescriptorSnapshotV2,
-  liveSnapshot: DescriptorSnapshotV2, header: BootstrapHeaderV2): HostedControlDescriptorGuard {
+  liveSnapshot: DescriptorSnapshotV2, header: BootstrapHeaderV2): HostedControlDescriptorGuard & { assertCurrentSync(): boolean } {
   let current = true, closed = false
   let lose!: () => void; const lost = new Promise<void>(resolve => { lose = resolve })
   const markLost = () => { if (current) { current = false; lose() } }
@@ -166,6 +172,7 @@ function retainGuard(lease: OwnedDescriptorV2, live: OwnedDescriptorV2, leaseSna
   }
   const timer = setInterval(check, 10); timer.unref?.()
   return Object.freeze({ lost,
+    assertCurrentSync: check,
     async assertCurrent() { return check() },
     async close() { if (closed) return; closed = true; markLost(); clearInterval(timer); live.close(); lease.close() },
   })

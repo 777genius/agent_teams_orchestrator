@@ -938,6 +938,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         providerId: 'xai',
         credential: stale,
       })
+      await mkdir(path.join(tempDir, 'active-project'), { recursive: true })
       const activeProfile = await manager.prepareProfile(path.join(tempDir, 'active-project'), {
         includeAppMcp: false,
         includeManagedSubscriptionPlugins: false,
@@ -948,6 +949,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         credential: rotated,
       })
 
+      await mkdir(path.join(tempDir, 'restarted-project'), { recursive: true })
       const restartedProfile = await manager.prepareProfile(path.join(tempDir, 'restarted-project'), {
         includeAppMcp: false,
         includeManagedSubscriptionPlugins: false,
@@ -1006,6 +1008,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         }),
       ])
 
+      await mkdir(path.join(tempDir, 'llmgateway-project'), { recursive: true })
       const profile = await manager.prepareProfile(path.join(tempDir, 'llmgateway-project'), {
         includeAppMcp: false,
         includeManagedSubscriptionPlugins: false,
@@ -1097,6 +1100,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
     try {
       const manager = new OpenCodeProfileManager()
+      await mkdir(path.join(tempDir, 'project-config-import'), { recursive: true })
       const profile = await manager.prepareProfile(path.join(tempDir, 'project-config-import'))
       const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
       const providers = managedConfig.provider as Record<string, unknown>
@@ -1203,6 +1207,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
 
     try {
+      await mkdir(path.join(tempDir, 'project-ollama-cloud-import'), { recursive: true })
       const profile = await new OpenCodeProfileManager().prepareProfile(
         path.join(tempDir, 'project-ollama-cloud-import'),
       )
@@ -1299,6 +1304,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
     try {
       const manager = new OpenCodeProfileManager()
+      await mkdir(path.join(tempDir, 'project'), { recursive: true })
       const profile = await manager.prepareProfile(path.join(tempDir, 'project'))
       const profileNodeModulesPath = path.join(profile.xdgConfigHome, 'opencode', 'node_modules')
       const sharedNodeModulesPath = path.join(profile.xdgCacheHome, 'config-node_modules')
@@ -1377,6 +1383,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'http://127.0.0.1:41004/mcp'
     try {
       const manager = new OpenCodeProfileManager()
+      await mkdir(path.join(tempDir, 'project-remote-mcp'), { recursive: true })
       const profile = await manager.prepareProfile(path.join(tempDir, 'project-remote-mcp'))
       const appMcpConfig = (
         profile.managedConfig.mcp as Record<string, { environment?: Record<string, string> }>

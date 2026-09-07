@@ -9,6 +9,7 @@ export const SELECTED_LAUNCH_MAGIC = 0x48534c31 // HSL1; distinct from activatio
 export const SELECTED_LAUNCH_MAXIMUM = 256 * 1024
 export type SelectedLaunchPhase = Readonly<{
   contract: typeof SELECTED_LAUNCH_PHASE
+  nativeAdmission?: unknown
   launch: OwnerV2LaunchSelection
   sealed: Readonly<{
     observedMonotonicNs: string
@@ -29,7 +30,9 @@ export function decodeSelectedLaunchPhase(bytes: Buffer): SelectedLaunchPhase {
   requireV2(length > 0 && length <= SELECTED_LAUNCH_MAXIMUM && bytes.length === length + 8, 'selection_phase_length')
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(8))
-    const value = recordV2(JSON.parse(text), 'contract,launch,sealed')
+    const parsed = JSON.parse(text)
+    const value = recordV2(parsed, 'contract,launch,sealed' +
+      (parsed && Object.hasOwn(parsed, 'nativeAdmission') ? ',nativeAdmission' : ''))
     requireV2(value.contract === SELECTED_LAUNCH_PHASE && canonicalV2(value) === text, 'selection_phase_contract')
     const evidenceKeys = ['selectedSupervisor', 'selectedControl', 'selectedRecipe'] as const
     const launch = value.launch as Record<string, unknown>
