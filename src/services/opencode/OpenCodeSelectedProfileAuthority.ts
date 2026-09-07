@@ -43,6 +43,27 @@ function normalizeSelectedAgentDefaults(agents: unknown): unknown {
   }))
 }
 
+// OpenCode's config schema silently drops model fields it does not know when it
+// serves GET /config (verified on 1.18.4 and 1.18.29), so managed catalog
+// metadata carrying them can never match the live config. Strip the same fields
+// from both sides; every field OpenCode actually keeps still fails closed.
+const CONFIG_DROPPED_MODEL_FIELDS = ['structured_output'] as const
+
+function normalizeSelectedProviderModels(provider: unknown): unknown {
+  if (!provider || typeof provider !== 'object' || Array.isArray(provider)) return provider
+  const models = (provider as Record<string, unknown>).models
+  if (!models || typeof models !== 'object' || Array.isArray(models)) return provider
+  return {
+    ...(provider as Record<string, unknown>),
+    models: Object.fromEntries(Object.entries(models).map(([modelId, model]) => {
+      if (!model || typeof model !== 'object' || Array.isArray(model)) return [modelId, model]
+      const normalized = { ...(model as Record<string, unknown>) }
+      for (const field of CONFIG_DROPPED_MODEL_FIELDS) delete normalized[field]
+      return [modelId, normalized]
+    })),
+  }
+}
+
 export async function refreshSelectedProfileAuthority(input: {
     host: OpenCodeHostHandle
     selectedModel: string
@@ -71,7 +92,8 @@ export async function refreshSelectedProfileAuthority(input: {
       const provider = config.provider as Record<string, unknown> | undefined
       const mcp = config.mcp as Record<string, unknown> | undefined
       return {
-        provider: { [selected.providerId]: provider?.[selected.providerId] ?? null },
+        provider: { [selected.providerId]:
+          normalizeSelectedProviderModels(provider?.[selected.providerId] ?? null) },
         model: config.model ?? null,
         small_model: config.small_model ?? null,
         plugin: config.plugin ?? null,
