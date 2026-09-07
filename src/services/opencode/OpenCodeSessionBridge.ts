@@ -528,6 +528,10 @@ export class OpenCodeSessionBridge {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
+      // Selected launches seal the managed-config domain used by strict host reuse.
+      ...(params.profile.profileScope?.purpose === 'launch_runtime'
+        ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false }
+        : {}),
     })
 
     try {
