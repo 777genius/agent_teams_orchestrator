@@ -3042,6 +3042,21 @@ async function assertOpenCodeLaunchMcpReady(
   }
 }
 
+/**
+ * Stands down a session whose launch bootstrap failed, WITHOUT erasing the fact
+ * that it existed.
+ *
+ * The record used to be deleted here. That made the failure permanent: the
+ * session store is the only thing `sendMessage` consults, and its recovery path
+ * is keyed on finding a record that is stale - it recreates the session before
+ * delivery precisely then. With no record at all there is nothing to recognise,
+ * so every later message to that member is refused with "No stored OpenCode
+ * session record", forever, and the app has no way back short of relaunching
+ * the whole team.
+ *
+ * Keeping the record stale costs one row and restores the recovery that already
+ * exists. The host-side session is still released, so nothing is left running.
+ */
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
   ownerToken?: MaterializationOwnerToken,
@@ -3069,15 +3084,8 @@ async function cleanupFailedLaunchSession(
     ))
   }
 
-  try {
-    await openCodeSessionStore.deleteIfSession(record, ownerToken)
-  } catch (error) {
-    diagnostics.push(teamDiagnostic(
-      'opencode_launch_failed_session_delete_failed',
-      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
-      'warning',
-    ))
-  }
+  // Deliberately no delete: the stale record above is what lets the next
+  // delivery recreate the session instead of refusing forever.
   return diagnostics
 }
 

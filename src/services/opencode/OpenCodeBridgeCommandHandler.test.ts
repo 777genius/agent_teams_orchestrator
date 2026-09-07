@@ -3960,9 +3960,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
       expect(result.ok).toBe(false)
       if (!result.ok) expect(result.error.message).toContain('changed before bootstrap')
+      // No cleanup-delete: the record is left stale on purpose so the next
+      // delivery can recreate the session instead of refusing forever.
       expect(events).toEqual([
         'materialize:alice', 'mcp:alice', 'cleanup-stale:alice',
-        'cleanup-release:alice', 'cleanup-delete:alice',
+        'cleanup-release:alice',
       ])
     } finally {
       openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
@@ -4056,7 +4058,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(Object.keys(result.data.members)).toEqual(['alice'])
       expect(events).toEqual([
         'bootstrap:alice', 'publish:alice', 'bootstrap:bob',
-        'cleanup-stale:bob', 'cleanup-release:bob', 'cleanup-delete:bob',
+        'cleanup-stale:bob', 'cleanup-release:bob',
       ])
     } finally {
       openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
