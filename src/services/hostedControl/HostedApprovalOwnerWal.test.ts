@@ -315,6 +315,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       let prepares = 0
       const producer: OwnerWalPublicationProducer = {
         isHealthy: () => true,
+        withPublication: operation => operation(),
         prepare() { prepares += 1; throw new Error('invalid witness reached capture') },
         poison(reason): never { throw new Error(reason) }, close() {},
       }
@@ -399,60 +400,61 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
 
   // The concrete implementation reads Linux /proc descriptor flags. Other
   // platforms must not stand in for that path with fabricated syscall results.
-  test.skipIf(process.platform !== 'linux')('admits only 00600 through real descriptor inspection and producer startup', async () => {
+  test.skipIf(process.platform !== 'linux').each(
+    [0o0600, 0o4600, 0o2600, 0o1600, 0o6600, 0o7600, 0o0640, 0o0700]
+      .map(mode => [mode.toString(8).padStart(5, '0'), mode] as const),
+  )('admits only 00600 through real descriptor inspection and producer startup (mode %s)', async (_modeName, mode) => {
     const root = await mkdtemp(join(tmpdir(), 'owner-native-descriptor-mode-'))
     roots.push(root)
     const operations = createOwnerProvenanceNodeOperations()
     const modulePath = resolve(import.meta.dir, 'HostedApprovalOwnerProvenance.ts')
     const identity = operations.identity(modulePath)
-    for (const mode of [0o0600, 0o4600, 0o2600, 0o1600, 0o6600, 0o7600, 0o0640, 0o0700]) {
-      const path = join(root, `capture-${mode.toString(8)}.ndjson`)
-      const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_APPEND | constants.O_WRONLY, 0o600)
-      let closed = false
-      try {
-        // The pinned Bun gate did not retain special bits after fchmodSync.
-        // Use fixed-arity libc fchmod, then inspect the actual fd through both
-        // fstat and the production /proc descriptor projection.
-        const native = dlopen('libc.so.6', { fchmod: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 } })
-        try { expect(native.symbols.fchmod(fd, mode)).toBe(0) } finally { native.close() }
-        expect(Number(fstatSync(fd, { bigint: true }).mode & 0o7777n)).toBe(mode)
-        const descriptor = operations.descriptor(fd)
-        expect(descriptor.mode).toBe(mode)
-        const capsule = JSON.stringify({ activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
-          contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
-          expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: identity.exeSha256,
-            implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: identity.moduleSha256 },
-          producerRole: 'owner', streams: { ownerWalTimeline: { device: descriptor.device, fd: 9, inode: descriptor.inode } }, version: 2 })
-        const mappedFd = (requested: number) => { expect(requested).toBe(9); return fd }
-        const create = () => createOwnerWalPublicationProducerFromEnvironment({
-          environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: capsule }, modulePath,
-          imageCustodian: { prepare: () => { throw new Error('no WAL publication in descriptor admission test') } },
-          // Remap only the descriptor number; every observation/write/sync/close
-          // still uses the concrete operations on this test's owned file.
-          operations: { ...operations,
-            descriptor: requested => operations.descriptor(mappedFd(requested)),
-            write: (requested, bytes, offset) => operations.write(mappedFd(requested), bytes, offset),
-            sync: requested => operations.sync(mappedFd(requested)),
-            close: requested => { operations.close(mappedFd(requested)); closed = true },
-          },
-        })
-        if (mode === 0o600) {
-          const producer = create()
-          expect(producer).not.toBeNull()
-          producer!.close()
-          const lines = (await readFile(path, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
-          expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'producer-close'])
-          expect(lines[0].native.descriptor).toEqual({ device: descriptor.device, fd: 9, inode: descriptor.inode })
-        } else {
-          expect(create).toThrow('owner-provenance-descriptor-identity')
-          expect(await readFile(path, 'utf8')).toBe('')
-        }
-        expect(closed).toBe(true)
-      } finally { if (!closed) closeSync(fd) }
-    }
+    const path = join(root, `capture-${mode.toString(8)}.ndjson`)
+    const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_APPEND | constants.O_WRONLY, 0o600)
+    let closed = false
+    try {
+      // The pinned Bun gate did not retain special bits after fchmodSync.
+      // Use fixed-arity libc fchmod, then inspect the actual fd through both
+      // fstat and the production /proc descriptor projection.
+      const native = dlopen('libc.so.6', { fchmod: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 } })
+      try { expect(native.symbols.fchmod(fd, mode)).toBe(0) } finally { native.close() }
+      expect(Number(fstatSync(fd, { bigint: true }).mode & 0o7777n)).toBe(mode)
+      const descriptor = operations.descriptor(fd)
+      expect(descriptor.mode).toBe(mode)
+      const capsule = JSON.stringify({ activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+        contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+        expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: identity.exeSha256,
+          implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: identity.moduleSha256 },
+        producerRole: 'owner', streams: { ownerWalTimeline: { device: descriptor.device, fd: 9, inode: descriptor.inode } }, version: 2 })
+      const mappedFd = (requested: number) => { expect(requested).toBe(9); return fd }
+      const create = () => createOwnerWalPublicationProducerFromEnvironment({
+        environment: { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: capsule }, modulePath,
+        imageCustodian: { prepare: () => { throw new Error('no WAL publication in descriptor admission test') } },
+        // Remap only the descriptor number; every observation/write/sync/close
+        // still uses the concrete operations on this test's owned file.
+        operations: { ...operations,
+          descriptor: requested => operations.descriptor(mappedFd(requested)),
+          write: (requested, bytes, offset) => operations.write(mappedFd(requested), bytes, offset),
+          sync: requested => operations.sync(mappedFd(requested)),
+          close: requested => { operations.close(mappedFd(requested)); closed = true },
+        },
+      })
+      if (mode === 0o600) {
+        const producer = create()
+        expect(producer).not.toBeNull()
+        producer!.close()
+        const lines = (await readFile(path, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
+        expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'producer-close'])
+        expect(lines[0].native.descriptor).toEqual({ device: descriptor.device, fd: 9, inode: descriptor.inode })
+      } else {
+        expect(create).toThrow('owner-provenance-descriptor-identity')
+        expect(await readFile(path, 'utf8')).toBe('')
+      }
+      expect(closed).toBe(true)
+    } finally { if (!closed) closeSync(fd) }
   })
 
-  test('serializes one canonical native fact with controlled partial descriptor writes', () => {
+  test('serializes one canonical native fact with controlled partial descriptor writes', async () => {
     const chunks: Buffer[] = []; let nonce = 0
     const capsule = JSON.stringify({ activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
       contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
@@ -475,8 +477,8 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       stateDelta: { changedFields: ['actorMembers', 'admissionDigest', 'admissionGeneration', 'bindings', 'deliveries', 'ingress', 'retiredIngress', 'revision', 'routes', 'schemaVersion', 'writerFence'],
         collectionSizes: Object.fromEntries(['actorMembers', 'bindings', 'deliveries', 'ingress', 'retiredIngress', 'routes'].map(key => [key, { previous: 0, next: 0 }])) as OwnerWalNative['stateDelta']['collectionSizes'],
         nextRevision: 1, nextStateSha256: hash, previousRevision: null, previousStateSha256: null }, wal: { byteSize: bytes.length, sha256: hash } }
-    producer.prepare({ intent: { operationNonce: 'a'.repeat(64), mutation: native.mutation, admission: {} as HostedApprovalRuntimeAdmission }, native,
-      previous: { kind: 'absent' }, next: { byteSize: bytes.length, sha256: hash, bytes } }).emit()
+    await producer.withPublication(async () => producer.prepare({ intent: { operationNonce: 'a'.repeat(64), mutation: native.mutation, admission: {} as HostedApprovalRuntimeAdmission }, native,
+      previous: { kind: 'absent' }, next: { byteSize: bytes.length, sha256: hash, bytes } }).emit())
     const lines = Buffer.concat(chunks).toString('utf8').trimEnd().split('\n').map(line => JSON.parse(line))
     expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published'])
     expect(lines[1].previousRecordSha256).toBe(createHash('sha256').update(`${JSON.stringify(lines[0])}\n`).digest('hex'))
@@ -1343,8 +1345,9 @@ function publicationCapture(path: string, options: { failSync?: () => boolean; d
     get lines() { return chunks.map(chunk => JSON.parse(chunk.toString())) },
     producer: {
       isHealthy: () => native.isHealthy(),
+      withPublication: operation => native.withPublication(operation),
       prepare(input) { prepared = input; const staged = native.prepare(input)
-        return { emit() { bound = staged.emit(); return bound } } },
+        return { ...staged, emit() { bound = staged.emit(); return bound } } },
       poison(reason): never { return native.poison(reason) }, close() { native.close() },
     } satisfies OwnerWalPublicationProducer,
     assertBound() {

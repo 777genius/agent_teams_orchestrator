@@ -13,6 +13,8 @@ import { createRegularNodeAtDarwin } from './HostedApprovalOwnerWalDarwin.intern
 import { assertNoDuplicateJsonObjectKeys } from './ownerProof.js'
 import { containsHostPath } from './hostPathSafety.js'
 import {
+  abandonOwnerWalPublication,
+  replaceOwnerWalPublication,
   retainedWalImage,
   type BoundWalPublication,
   type OwnerWalMutationIntent,
@@ -81,6 +83,7 @@ export class HostedApprovalOwnerPublicationError extends Error {
 }
 
 type WalFileIdentity = { dev: number | bigint; ino: number | bigint }
+type WalPublicationProgress = { stage: 'replacement-uncertain' | 'published-capture-failed' | null }
 type LockedWalSnapshot = {
   state: HostedApprovalOwnerState | null
   raw: Buffer | null
@@ -481,12 +484,51 @@ export class HostedApprovalOwnerWal {
       next = structuredClone(next)
       if (intent) intent = 'admission' in intent
         ? { ...intent, mutation: { ...intent.mutation }, admission: { ...intent.admission,
-          routes: structuredClone(intent.admission.routes), actorMembers: { ...intent.admission.actorMembers } } }
+          routes: structuredClone(intent.admission.routes), actorMembers: { ...intent.admission.actorMembers },
+          outerAuthority: structuredClone(intent.admission.outerAuthority) } }
         : structuredClone(intent)
     } catch (error) {
       throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval publication input snapshot failed', { cause: error })
     }
+    const writer = this.#activeWriter
+    // A locked callback may publish more than once. Admission errors must use
+    // this operation's replacement evidence, even if its callback is still live.
+    const progress: WalPublicationProgress = { stage: null }
+    const publish = async () => {
+      try { return await this.#publishSnapshot(previous, next, intent, writer, progress) } catch (error) {
+        // Revoke inside shared admission, before the next WAL can stage/replace.
+        if (this.#activePublicationStage || error instanceof PosixNamespaceLookupError) {
+          this.#invalidatePublicationCapture('owner-wal-publication-failed')
+        }
+        throw error
+      }
+    }
+    if (!this.publicationProducer) return publish()
+    try { return await this.publicationProducer.withPublication(publish) } catch (error) {
+      if (error instanceof HostedApprovalOwnerPublicationError &&
+        (!progress.stage || error.stage !== 'definitely-not-replaced')) throw error
+      throw new HostedApprovalOwnerPublicationError(progress.stage ?? 'definitely-not-replaced',
+        'Hosted approval WAL publication admission failed', { cause: error })
+    }
+  }
+
+  async #publishSnapshot(
+    previous: HostedApprovalOwnerState | null,
+    next: Omit<HostedApprovalOwnerState, 'revision' | 'writerFence'> & Partial<Pick<HostedApprovalOwnerState, 'writerFence'>>,
+    intent: OwnerWalMutationIntent | null,
+    writer: symbol,
+    progress: WalPublicationProgress,
+  ): Promise<HostedApprovalOwnerWalPublishResult> {
+    if (!this.isPublicationCaptureCurrent()) {
+      throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL capture poisoned')
+    }
+    if (this.#activeWriter !== writer || this.#writerContext.getStore() !== writer || !this.#activeFenceIdentity) {
+      throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL publish requires writer fence')
+    }
     if (!(await this.ownsCurrentFence())) throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval writer fence changed')
+    if (!this.isPublicationCaptureCurrent()) {
+      throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL capture poisoned')
+    }
     const activeSnapshot = this.#activeSnapshot
     if (!activeSnapshot) throw new HostedApprovalOwnerPublicationError('definitely-not-replaced', 'Hosted approval WAL retained predecessor unavailable')
     const current = this.#readPinnedSnapshot(this.#activeParentHandle!)
@@ -526,7 +568,7 @@ export class HostedApprovalOwnerWal {
         error instanceof Error ? error.message : 'Hosted approval WAL publication preparation failed', { cause: error })
     }
     let identity: WalFileIdentity
-    try { identity = await this.#publishExact(bytes, activeSnapshot) } catch (error) {
+    try { identity = await this.#publishExact(bytes, activeSnapshot, prepared, progress) } catch (error) {
       if (error instanceof HostedApprovalOwnerPublicationError) {
         if (error.stage === 'replacement-uncertain') {
           this.#invalidatePublicationCapture('owner-wal-replacement-uncertain')
@@ -540,6 +582,7 @@ export class HostedApprovalOwnerWal {
       throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval writer fence changed after publication')
     }
     this.#activePublicationStage = 'published-capture-failed'
+    progress.stage = 'published-capture-failed'
     this.#activeSnapshot = { state, raw: Buffer.from(bytes), stored: JSON.parse(bytes.toString('utf8')) as Record<string, unknown>, identity }
     let publication: BoundWalPublication | null = null
     if (prepared) {
@@ -651,7 +694,13 @@ export class HostedApprovalOwnerWal {
     }
   }
 
-  async #publishExact(bytes: Uint8Array, predecessor: LockedWalSnapshot): Promise<WalFileIdentity> {
+  async #publishExact(bytes: Uint8Array, predecessor: LockedWalSnapshot,
+    prepared: ReturnType<OwnerWalPublicationProducer['prepare']> | null,
+    progress: WalPublicationProgress,
+  ): Promise<WalFileIdentity> {
+    // Retain the opaque key before staging. A facade getter must never execute
+    // between the final predecessor/fence checks and the actual rename.
+    const publicationLifetime = prepared?.lifetime
     const directory = dirname(this.path)
     const parent = this.#activeParentHandle
     if (!parent) throw new Error('Hosted approval WAL parent authority unavailable')
@@ -674,16 +723,20 @@ export class HostedApprovalOwnerWal {
         }
         fsyncSync(tempFd)
         await this.testHooks?.afterWalTempFsync?.()
-        // Last synchronous pre-rename CAS. No callback or await may intervene
+        // Last synchronous pre-rename CAS. No caller hook or await may intervene
         // between this retained P/namespace check and atomic replacement.
         if (!this.isPublicationCaptureCurrent()) throw new Error('Hosted approval WAL capture poisoned')
+        if (prepared && !this.#ownsCurrentFenceSync()) throw new Error('Hosted approval writer fence changed')
         if (!safeDirectoryIdentity(fstatSync(parent.fd), lstatSync(directory))) throw new Error('Unsafe hosted approval WAL directory')
         const current = this.#readPinnedSnapshot(parent)
         if (!sameOptionalBytes(current.raw, predecessor.raw) || !isDeepStrictEqual(current.identity, predecessor.identity)) {
           throw new Error('Hosted approval WAL compare-and-swap conflict')
         }
-        renameAt(parent.fd, tempName, walName); renamed = true
+        if (prepared) replaceOwnerWalPublication(publicationLifetime!, () => { renameAt(parent.fd, tempName, walName) })
+        else renameAt(parent.fd, tempName, walName)
+        renamed = true
         this.#activePublicationStage = 'replacement-uncertain'
+        progress.stage = 'replacement-uncertain'
         try { await this.testHooks?.afterWalRename?.() } catch (error) {
           throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL replacement uncertain', { cause: error })
         }
@@ -717,6 +770,13 @@ export class HostedApprovalOwnerWal {
         }
       }
     } catch (error) {
+      if (!renamed && prepared) {
+        // This local effect flag, after all staging/cleanup has settled, is the
+        // proof of abandonment. Never trust a callback's asserted error stage.
+        try { abandonOwnerWalPublication(publicationLifetime!) } catch {
+          this.#invalidatePublicationCapture('owner-wal-publication-abandon-failed')
+        }
+      }
       if (renamed && !(error instanceof HostedApprovalOwnerPublicationError)) {
         throw new HostedApprovalOwnerPublicationError('replacement-uncertain', 'Hosted approval WAL replacement uncertain', { cause: error })
       }
@@ -735,6 +795,33 @@ export class HostedApprovalOwnerWal {
     if (!writer || !identity || handle === null || lockHandle === null || !lockIdentity || !parent || this.#writerContext.getStore() !== writer) return false
     try {
       const [openedParent, linkedParent] = await Promise.all([parent.stat(), lstat(dirname(this.path))])
+      const opened = fstatSync(handle)
+      const linkedFd = openAt(parent.fd, basename(this.fencePath), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      const linked = fstatSync(linkedFd); closeSync(linkedFd)
+      const openedLock = fstatSync(lockHandle)
+      const linkedLock = lstatSync(this.lockPath)
+      if (!safeDirectoryIdentity(openedParent, linkedParent) || !opened.isFile() || !linked.isFile() ||
+        String(opened.dev) !== identity.dev || String(opened.ino) !== identity.ino ||
+        opened.dev !== linked.dev || opened.ino !== linked.ino || (opened.mode & 0o077) !== 0 ||
+        (process.getuid?.() !== undefined && opened.uid !== process.getuid()) ||
+        !openedLock.isFile() || linkedLock.isSymbolicLink() || !linkedLock.isFile() ||
+        openedLock.dev !== lockIdentity.dev || openedLock.ino !== lockIdentity.ino ||
+        linkedLock.dev !== lockIdentity.dev || linkedLock.ino !== lockIdentity.ino ||
+        (openedLock.mode & 0o077) !== 0) return false
+      return isDeepStrictEqual(readFenceIdentity(handle), identity)
+    } catch { return false }
+  }
+
+  #ownsCurrentFenceSync(): boolean {
+    const writer = this.#activeWriter
+    const identity = this.#activeFenceIdentity
+    const handle = this.#activeFenceHandle
+    const lockHandle = this.#activeLockHandle
+    const lockIdentity = this.#activeLockIdentity
+    const parent = this.#activeParentHandle
+    if (!writer || !identity || handle === null || lockHandle === null || !lockIdentity || !parent || this.#writerContext.getStore() !== writer) return false
+    try {
+      const openedParent = fstatSync(parent.fd); const linkedParent = lstatSync(dirname(this.path))
       const opened = fstatSync(handle)
       const linkedFd = openAt(parent.fd, basename(this.fencePath), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
       const linked = fstatSync(linkedFd); closeSync(linkedFd)

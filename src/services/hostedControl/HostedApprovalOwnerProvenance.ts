@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { closeSync, constants, fdatasyncSync, fstatSync, openSync, readFileSync, readSync, writeSync } from 'node:fs'
 
 import type { HostedApprovalIngressRecord, HostedApprovalAckRequest, HostedApprovalDeliveryRequest } from './HostedApprovalWire.js'
@@ -90,7 +91,26 @@ export type BoundWalPublication = Readonly<{
   next: RetainedWalImage
 }>
 
-export interface OwnerWalPreparedPublication { emit(): BoundWalPublication }
+export interface OwnerWalPreparedPublication {
+  /** Opaque native lifetime; facades must retain this exact capability. */
+  readonly lifetime: object
+  emit(): BoundWalPublication
+}
+type PreparedPublicationState = { phase: 'preparing' | 'prepared' | 'replacing' | 'replaced' | 'emitting' | 'complete' | 'abandoned' }
+// A facade-provided assertion cannot authorize replacement. Only the native
+// producer registers these controls, which retain its admission and lifecycle.
+const publicationLifetimes = new WeakMap<object, { replace(operation: () => void): void; abandon(): void }>()
+export function replaceOwnerWalPublication(lifetime: object, operation: () => void): void {
+  const controls = publicationLifetimes.get(lifetime)
+  if (!controls) throw new Error('owner-provenance-publication-lifetime-required')
+  controls.replace(operation)
+}
+/** Called by WAL only after its replacement routine has proven no rename occurred. */
+export function abandonOwnerWalPublication(lifetime: object): void {
+  const controls = publicationLifetimes.get(lifetime)
+  if (!controls) throw new Error('owner-provenance-publication-lifetime-required')
+  controls.abandon()
+}
 export interface OwnerWalImageCustodian {
   /** Durably stages immutable P/N before WAL replacement; unbound stages are never publication facts. */
   prepare(previous: PreviousWalImage, next: RetainedWalImage): Readonly<{
@@ -100,6 +120,12 @@ export interface OwnerWalImageCustodian {
 export interface OwnerWalPublicationProducer {
   /** Process-owned, irreversible health: every WAL sharing this producer must consult it. */
   isHealthy(): boolean
+  /**
+   * Process-owned sequencing through durable replacement, final fencing and bind.
+   * Borrowed facades MUST delegate to this same producer, never allocate a gate.
+   * Snapshot caller inputs before calling; revalidate authority inside admission.
+   */
+  withPublication<T>(operation: () => Promise<T>): Promise<T>
   prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication
   poison(reason: string): never
   close(): void
@@ -172,12 +198,50 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
   #fatal: Error | null = null
   #closed = false
   #closing = false
+  readonly #publicationContext = new AsyncLocalStorage<symbol>()
+  #activePublication: symbol | null = null
+  #preparation: PreparedPublicationState | null = null
+  readonly #publicationWaiters: Array<{ token: symbol; resolve(): void; reject(error: Error): void }> = []
   readonly #emissionNonces = new Set<string>()
   readonly #producer: VerifiedOwnerProducerIdentity
   isHealthy(): boolean { return this.#fatal === null && !this.#closed && !this.#closing }
   constructor(private readonly capsule: Capsule, identity: ReturnType<OwnerProvenanceOperations['identity']>, private readonly operations: OwnerProvenanceOperations, private readonly imageCustodian: OwnerWalImageCustodian, private readonly onPoison?: (error: Error) => void) {
     this.#producer = Object.freeze({ role: 'owner', implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, artifactManifestSha256: capsule.expectedProducer.artifactManifestSha256, moduleSha256: identity.moduleSha256, exeSha256: identity.exeSha256, pid: identity.pid, startTicks: identity.startTicks, exeDev: identity.exeDev, exeIno: identity.exeIno })
     this.#append('producer-open', null, { descriptor: capsule.streams.ownerWalTimeline })
+  }
+  async withPublication<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.isHealthy()) throw this.#fatal ?? new Error('owner-provenance-writer-unavailable')
+    // Reject nested or escaped callback contexts instead of waiting on ourselves.
+    if (this.#publicationContext.getStore()) return this.poison('owner-provenance-publication-reentrant')
+    const token = Symbol('owner-publication')
+    await new Promise<void>((resolve, reject) => {
+      if (this.#activePublication) {
+        // Bounded process-local backpressure, with no timers or background work.
+        if (this.#publicationWaiters.length >= 64) {
+          reject(new Error('owner-provenance-publication-queue-full'))
+        } else this.#publicationWaiters.push({ token, resolve, reject })
+      } else { this.#activePublication = token; resolve() }
+    })
+    try {
+      if (!this.isHealthy()) throw this.#fatal ?? new Error('owner-provenance-writer-unavailable')
+      const result = await this.#publicationContext.run(token, operation)
+      this.#settlePreparation()
+      if (!this.isHealthy()) throw this.#fatal ?? new Error('owner-provenance-writer-unavailable')
+      return result
+    } finally {
+      // A facade may settle while its WAL callback is still awaiting I/O.
+      // Revoke unresolved preparation BEFORE admission or queued work is freed.
+      this.#settlePreparation()
+      this.#preparation = null
+      this.#activePublication = null
+      const next = this.#publicationWaiters.shift()
+      if (next) { this.#activePublication = next.token; next.resolve() }
+    }
+  }
+  #settlePreparation(): void {
+    if (this.#preparation && this.#preparation.phase !== 'complete' && this.#preparation.phase !== 'abandoned') {
+      this.#revoke('owner-provenance-publication-unresolved')
+    }
   }
   prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication {
     try { return this.#prepare(input) } catch (error) {
@@ -187,6 +251,12 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
   #prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication {
     if (this.#fatal) throw this.#fatal
     if (this.#closed || this.#closing) return this.poison('owner-provenance-writer-closed')
+    const publicationToken = this.#activePublication
+    if (!publicationToken || this.#publicationContext.getStore() !== publicationToken || this.#preparation) {
+      return this.poison('owner-provenance-publication-admission-required')
+    }
+    const preparation: PreparedPublicationState = { phase: 'preparing' }
+    this.#preparation = preparation
     // Own all receipt metadata before nonce/custody/I/O callbacks can mutate
     // the inputs. The serialized line and acknowledgement use these same values.
     const operationNonce = input.intent.operationNonce
@@ -212,34 +282,75 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
     const line = this.#line('owner-wal-published', operationNonce, native, sequence, emissionNonce)
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new RangeError('owner-provenance-line-bounded')
     const custody = this.imageCustodian.prepare(copyPreviousImage(previous), retainedWalImage(next.bytes))
-    let used = false
-    return Object.freeze({ emit: () => {
+    preparation.phase = 'prepared'
+    const assertOwned = () => {
+      if (this.#activePublication !== publicationToken || this.#publicationContext.getStore() !== publicationToken ||
+        this.#preparation !== preparation) return this.poison('owner-provenance-publication-admission-expired')
       if (!this.isHealthy()) return this.poison('owner-provenance-writer-unavailable')
-      if (used || sequence !== this.#sequence) return this.poison('owner-provenance-prepared-publication-stale')
-      used = true
-      const lineSha256 = this.#writePrepared(line, sequence)
-      const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce, emissionNonce, sequence, lineSha256 })
-      let bound: ReturnType<ReturnType<OwnerWalImageCustodian['prepare']>['bind']>
-      try { bound = custody.bind(emission) } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-image-bind') }
-      if (!sameRetainedImage(bound.next, next) ||
-        bound.previous.kind !== previous.kind || bound.previous.kind === 'retained' && previous.kind === 'retained' &&
-          !sameRetainedImage(bound.previous.image, previous.image)) {
-        return this.poison('owner-provenance-image-custody-mismatch')
-      }
-      if (!this.isHealthy()) return this.poison('owner-provenance-health-lost-during-emission')
-      return Object.freeze({ native, previous, next, emission,
-        ...(bound.receipt === undefined ? {} : { receipt: freezeNativeMetadata(structuredClone(bound.receipt)) }),
-      })
+    }
+    const lifetime = Object.freeze({})
+    publicationLifetimes.set(lifetime, {
+      replace: operation => {
+        assertOwned()
+        if (preparation.phase !== 'prepared') return this.poison('owner-provenance-prepared-publication-stale')
+        preparation.phase = 'replacing'
+        // WAL supplies only its synchronous atomic rename, with no await or
+        // post-rename callback. A thrown rename proves no replacement occurred.
+        try { operation() } catch (error) { preparation.phase = 'prepared'; throw error }
+        preparation.phase = 'replaced'
+      },
+      abandon: () => {
+        assertOwned()
+        if (preparation.phase !== 'prepared') return this.poison('owner-provenance-publication-abandon-after-replacement')
+        preparation.phase = 'abandoned'
+      },
+    })
+    let used = false
+    return Object.freeze({ lifetime, emit: () => {
+      try {
+        if (!this.isHealthy()) return this.poison('owner-provenance-writer-unavailable')
+        if (this.#activePublication !== publicationToken || this.#publicationContext.getStore() !== publicationToken) {
+          return this.poison('owner-provenance-publication-admission-expired')
+        }
+        if (used || sequence !== this.#sequence || preparation.phase !== 'prepared' && preparation.phase !== 'replaced') {
+          return this.poison('owner-provenance-prepared-publication-stale')
+        }
+        used = true
+        preparation.phase = 'emitting'
+        const lineSha256 = this.#writePrepared(line, sequence)
+        const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce, emissionNonce, sequence, lineSha256 })
+        let bound: ReturnType<ReturnType<OwnerWalImageCustodian['prepare']>['bind']>
+        try { bound = custody.bind(emission) } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-image-bind') }
+        if (!sameRetainedImage(bound.next, next) ||
+          bound.previous.kind !== previous.kind || bound.previous.kind === 'retained' && previous.kind === 'retained' &&
+            !sameRetainedImage(bound.previous.image, previous.image)) {
+          return this.poison('owner-provenance-image-custody-mismatch')
+        }
+        if (!this.isHealthy()) return this.poison('owner-provenance-health-lost-during-emission')
+        const publication = Object.freeze({ native, previous, next, emission,
+          ...(bound.receipt === undefined ? {} : { receipt: freezeNativeMetadata(structuredClone(bound.receipt)) }),
+        })
+        preparation.phase = 'complete'
+        return publication
+      } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-emission-failed') }
     } })
   }
-  poison(reason: string): never {
+  #revoke(reason: string): Error {
     const error = this.#fatal ?? new Error(reason)
-    if (!this.#fatal) { this.#fatal = error; try { this.onPoison?.(error) } catch { /* authoritative error retained */ } }
-    throw error
+    if (!this.#fatal) {
+      this.#fatal = error
+      for (const waiter of this.#publicationWaiters.splice(0)) waiter.reject(error)
+      try { this.onPoison?.(error) } catch { /* authoritative error retained */ }
+    }
+    return error
   }
+  poison(reason: string): never { throw this.#revoke(reason) }
   close(): void {
     if (this.#closed || this.#closing) return
     this.#closing = true
+    // close is synchronous: an in-flight mutation cannot be drained here. Revoke
+    // it and queued callers, and never attest producer-close ahead of its result.
+    if (this.#activePublication) this.#revoke('owner-provenance-close-during-publication')
     let closeError: Error | null = null
     try { if (!this.#fatal) this.#append('producer-close', null, {}) } finally {
       try { this.operations.sync(HOSTED_OWNER_PROVENANCE_FD) } catch (error) { closeError ??= error as Error }
