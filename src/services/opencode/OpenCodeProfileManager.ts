@@ -97,27 +97,27 @@ const OPEN_CODE_PROFILE_RUNTIME_OVERRIDE_KEYS = [
 ] as const
 
 // Copilot Free and Student can expose only GitHub's Auto picker, which OpenCode
-// cannot currently execute through an explicit model id. Seed one conservative
+// cannot currently execute through an explicit model id. Seed a current lightweight
 // explicit model so provider discovery and verification can return an actionable
-// limitation instead of hiding the authenticated provider. Paid accounts still
-// receive their account-specific models from OpenCode live discovery.
+// limitation instead of hiding the authenticated provider. The seed does not grant
+// model access; availability still depends on the account and live discovery.
 const GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG = {
   name: 'GitHub Copilot',
   npm: '@ai-sdk/github-copilot',
   api: 'https://api.githubcopilot.com',
   models: {
-    'gpt-5-mini': {
-      name: 'GPT-5 Mini',
-      family: 'gpt-mini',
+    'gpt-5.6-luna': {
+      name: 'GPT-5.6 Luna',
+      family: 'gpt-5.6-luna',
       attachment: true,
       reasoning: true,
       tool_call: true,
       structured_output: true,
       temperature: false,
       limit: {
-        context: 264_000,
-        input: 128_000,
-        output: 64_000,
+        context: 1_050_000,
+        input: 922_000,
+        output: 128_000,
       },
       modalities: {
         input: ['text', 'image'],

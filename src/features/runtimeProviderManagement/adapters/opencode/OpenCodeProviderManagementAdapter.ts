@@ -355,11 +355,11 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/zai-org/glm-5.1',
   ],
   'github-copilot': [
+    'github-copilot/gpt-5.6-luna',
     'github-copilot/gpt-5-mini',
     'github-copilot/gpt-5.5',
     'github-copilot/claude-haiku-4.5',
     'github-copilot/claude-sonnet-4.6',
-    'github-copilot/gpt-5.6-luna',
   ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
