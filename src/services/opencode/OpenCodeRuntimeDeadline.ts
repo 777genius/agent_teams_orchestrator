@@ -131,7 +131,9 @@ export class OpenCodeRuntimeDeadline {
       () => this.abortForDeadline(),
       commandBudgetMs,
     ) as ReturnType<typeof setTimeout>
-    this.timer.unref?.()
+    // Pending commands must time out even without active I/O. In particular,
+    // Bun's Windows idle loop may never fire an unreferenced timer.
+    // Every owning command releases this referenced timer through dispose().
   }
 
   get signal(): AbortSignal {
