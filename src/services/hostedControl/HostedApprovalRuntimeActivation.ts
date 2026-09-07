@@ -17,6 +17,8 @@ import type {
 } from './protocol.js'
 import {
   getHostedApprovalActivationV2ProductionPins,
+  requireHostedApprovalActivationV2ProductionPins,
+  type HostedApprovalActivationV2ProductionPinSource,
   type HostedApprovalActivationV2PinSource,
 } from './HostedApprovalActivationV2Pins.js'
 
@@ -137,16 +139,18 @@ export function unwrapHostedApprovalActivation(
   source: string,
   proofKey: Uint8Array | string,
   expected: HostedApprovalActivationExpectation,
+  pins?: HostedApprovalActivationV2ProductionPinSource,
 ): VerifiedHostedApprovalActivation {
   return unwrapWithPins(
     source,
     proofKey,
-    getHostedApprovalActivationV2ProductionPins(),
+    pins === undefined ? getHostedApprovalActivationV2ProductionPins() :
+      requireHostedApprovalActivationV2ProductionPins(pins),
     expected,
   )
 }
 
-/** Test-only vector seam; production callers cannot select authorship pins. */
+/** Test-only vector seam; never supplies production authority. */
 export function unwrapHostedApprovalActivationForTest(
   source: string,
   proofKey: Uint8Array | string,

@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { requireHostedApprovalActivationV2ProductionPins, type HostedApprovalActivationV2ProductionPinSource } from '../../../src/services/hostedControl/HostedApprovalActivationV2Pins.js'
 import { readHostedControlBootstrapV2, type HostedControlBootstrapAdmissionV2,
   type OwnerV2LaunchSelection } from '../../../src/services/hostedControl/HostedControlBootstrapV2.js'
 import { HostedControlServer } from '../../../src/services/hostedControl/HostedControlServer.js'
@@ -17,6 +18,8 @@ import { createNativePublicationV2 } from './native-publication-v2.js'
  * supervisor launch. Recovery owns W1 custody + FD8 sink + W2 image custodian;
  * this bootstrap slice must not replace those with ambient desktop services. */
 export type ActualOwnerV2Composition = Readonly<{
+  /** Independently admitted Product activation identity, not the lifecycle launcher signer. */
+  activationPins: HostedApprovalActivationV2ProductionPinSource
   launch: OwnerV2LaunchSelection
   walImages: OwnerWalImageCustodian
   recover(bootstrap: HostedControlBootstrapAdmissionV2, native: OwnerWalPublicationProducer,
@@ -26,11 +29,13 @@ export type ActualOwnerV2Composition = Readonly<{
 export async function runActualOwnerV2(args: readonly string[], composition?: ActualOwnerV2Composition): Promise<void> {
   // Even an uncomposed invocation must run the bounded inherited admission and
   // close its one-use descriptors. There is no legacy argv or FD fallback.
+  let activationPins: HostedApprovalActivationV2ProductionPinSource | undefined
   const modulePath = process.argv[1]
   const bootstrap = await readHostedControlBootstrapV2({ modulePath,
     selectLaunch() {
       const path = parseOwnerV2Invocation(args)
       if (!composition) throw new Error('hosted_owner_v2_selected_launch_composition_missing')
+      activationPins = requireHostedApprovalActivationV2ProductionPins(composition.activationPins)
       readOwnerRuntimeManifestV2(path, composition.launch)
       return composition.launch
     },
@@ -90,7 +95,7 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
           native = createNativePublicationV2(bootstrap, modulePath, composition!.walImages)
           return composition!.recover(bootstrap, native, admission, activation)
         },
-      }),
+      }, requireHostedApprovalActivationV2ProductionPins(activationPins!)),
     })
     await server.start()
     if (!await bootstrap.guard.assertCurrent() || stopped) throw new Error('hosted_owner_v2_guard_lost')

@@ -1,7 +1,7 @@
 import { HostedApprovalActivationSession, HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
   type HostedApprovalActivationSessionOptions, type HostedApprovalActivationTransportSession } from './HostedApprovalActivationSession.js'
 import type { HostedApprovalActivationExpectation } from './HostedApprovalRuntimeActivation.js'
-import type { HostedApprovalActivationV2PinSource } from './HostedApprovalActivationV2Pins.js'
+import { requireHostedApprovalActivationV2ProductionPins, type HostedApprovalActivationV2ProductionPinSource, type HostedApprovalActivationV2PinSource } from './HostedApprovalActivationV2Pins.js'
 import { immutableV2, requireV2, SHA_V2, type BootstrapHeaderV2 } from './HostedControlBootstrapV2Wire.js'
 
 export type DeferredManifestExpectationV2 = Omit<HostedApprovalActivationExpectation, 'signedManifest'> & {
@@ -23,8 +23,9 @@ export class HostedApprovalDeferredManifestV2 implements HostedApprovalActivatio
   #session: HostedApprovalActivationTransportSession | null = null
   private constructor(private readonly options: DeferredManifestSessionOptionsV2,
     private readonly create: (o: HostedApprovalActivationSessionOptions) => HostedApprovalActivationTransportSession) {}
-  static production(options: DeferredManifestSessionOptionsV2): HostedApprovalDeferredManifestV2 {
-    return new HostedApprovalDeferredManifestV2(options, o => HostedApprovalActivationSession.production(o))
+  static production(options: DeferredManifestSessionOptionsV2, pins?: HostedApprovalActivationV2ProductionPinSource): HostedApprovalDeferredManifestV2 {
+    const retained = pins === undefined ? undefined : requireHostedApprovalActivationV2ProductionPins(pins)
+    return new HostedApprovalDeferredManifestV2(options, o => HostedApprovalActivationSession.production(o, retained))
   }
   /** Same existing test-vector pins seam; never selectable by the real entry. */
   static forTest(options: DeferredManifestSessionOptionsV2, pins: HostedApprovalActivationV2PinSource): HostedApprovalDeferredManifestV2 {
