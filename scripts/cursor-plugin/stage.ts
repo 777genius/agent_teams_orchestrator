@@ -1,5 +1,4 @@
 import path from 'node:path'
-import { buildCursorNativeAssets } from './build-native.js'
 import { buildCursorPluginArtifact } from './build.js'
 
 /**
@@ -9,7 +8,6 @@ import { buildCursorPluginArtifact } from './build.js'
 export async function stageCursorManagedAssets(destination: string): Promise<string> {
   const root = path.resolve(destination)
   await buildCursorPluginArtifact(path.join(root, 'plugin'))
-  await buildCursorNativeAssets(path.join(root, 'native'))
   return root
 }
 

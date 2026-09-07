@@ -14,7 +14,7 @@ export type CursorNativeAuthority = {
 
 export type CursorNativeAuthorityOutcome = {
   authority: CursorNativeAuthority | null
-  state: 'reused' | 'refreshed' | 'account-changed' | 'executable-changed' | 'signed-out'
+  state: 'refreshed' | 'account-changed' | 'executable-changed' | 'signed-out'
 }
 
 export type CursorAccountProbe = (
@@ -23,7 +23,6 @@ export type CursorAccountProbe = (
   abortSignal?: AbortSignal,
 ) => Promise<string | null>
 
-export const CURSOR_NATIVE_AUTHORITY_TTL_MS = 30 * 60 * 1000
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 
 /**
@@ -79,31 +78,43 @@ export async function isCursorNativeAccountAuthorized(input: {
  * A changed account or executable invalidates readiness immediately, because the
  * agent would otherwise keep running under an identity the app no longer believes.
  */
+/**
+ * Deduplicates bursts inside one launch sequence only. A trust window longer
+ * than this would hide exactly what this check exists to catch: a sign-out or an
+ * account switch that happens between two launches.
+ */
+export const CURSOR_NATIVE_AUTHORITY_DEDUPE_MS = 5_000
+let recentProbe: { at: number; key: string; accountHash: string | null } | null = null
+
 export async function reconcileCursorNativeAuthority(input: {
   statePath: string
   /** The real native binary. Never a generated wrapper: those are rewritten on
-   * every preparation, which would churn identity and defeat the probe window. */
+   * every preparation, which would churn identity on every launch. */
   executablePath: string
   /** Wrapper to probe through, so the native CLI sees its own home. */
   probeExecutablePath?: string
   platform?: NodeJS.Platform
-  ttlMs?: number
+  dedupeMs?: number
   now?: () => number
   probe?: CursorAccountProbe
   abortSignal?: AbortSignal
 }): Promise<CursorNativeAuthorityOutcome> {
   const now = (input.now ?? Date.now)()
-  const ttlMs = input.ttlMs ?? CURSOR_NATIVE_AUTHORITY_TTL_MS
   const executableHash = await resolveCursorExecutableIdentity(input.executablePath)
   const retained = await readAuthority(input.statePath)
   const executableChanged = Boolean(retained && retained.executableHash !== executableHash)
-  if (retained && !executableChanged && retained.probedAt + ttlMs > now) {
-    return { authority: retained, state: 'reused' }
-  }
-  const accountHash = await (input.probe ?? probeCursorAccountIdentity)(
-    input.probeExecutablePath ?? input.executablePath,
-    input.platform ?? process.platform, input.abortSignal,
-  ).catch(() => null)
+  // The account is always probed. The retained record only says what it was, so
+  // a change can be reported; it never stands in for a fresh answer.
+  const probeKey = `${input.probeExecutablePath ?? input.executablePath}|${executableHash}`
+  const dedupeMs = input.dedupeMs ?? CURSOR_NATIVE_AUTHORITY_DEDUPE_MS
+  const accountHash = recentProbe && recentProbe.key === probeKey
+    && now - recentProbe.at < dedupeMs
+    ? recentProbe.accountHash
+    : await (input.probe ?? probeCursorAccountIdentity)(
+      input.probeExecutablePath ?? input.executablePath,
+      input.platform ?? process.platform, input.abortSignal,
+    ).catch(() => null)
+  recentProbe = { at: now, key: probeKey, accountHash }
   if (!accountHash) return { authority: null, state: 'signed-out' }
   const authority: CursorNativeAuthority = { version: 1, accountHash, executableHash, probedAt: now }
   await writeAuthority(input.statePath, authority)

@@ -20,7 +20,6 @@ export async function buildCursorPluginArtifact(outputDirectory: string): Promis
   const staging = await mkdtemp(path.join(os.tmpdir(), 'agent-teams-cursor-build-'))
   try {
     await cp(path.join(packageRoot, 'src'), path.join(staging, 'src'), { recursive: true })
-    await cp(path.join(root, 'managed-control.ts'), path.join(staging, 'src/agent-teams-cursor-control.ts'))
     await symlink(path.join(root, 'node_modules'), path.join(staging, 'node_modules'), 'junction')
     const patch = path.join(root, 'cancellation.patch')
     for (const check of [true, false]) {
@@ -67,7 +66,6 @@ export async function buildCursorPluginArtifact(outputDirectory: string): Promis
       schema: 1, upstreamPackage: metadata.name, upstreamVersion: CURSOR_PLUGIN_VERSION,
       sourceSha256: CURSOR_PLUGIN_SOURCE_SHA256,
       patchSha256: sha256(await readFile(patch)),
-      controlSourceSha256: sha256(await readFile(path.join(root, 'managed-control.ts'))),
       lockSha256: sha256(await readFile(path.join(root, 'bun.lock'))),
       artifactSha256: sha256(artifact), bunVersion: Bun.version,
       entrypoint: 'dist/plugin-entry.js', backend: 'cursor-agent',

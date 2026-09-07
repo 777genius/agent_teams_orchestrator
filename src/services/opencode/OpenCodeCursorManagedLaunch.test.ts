@@ -41,7 +41,7 @@ test('managed staging replaces the upstream Cursor plugin, and its absence does 
     .toEqual(['opencode-kiro@0.4.0'])
 })
 
-test.skipIf(process.platform !== 'darwin')('the bridge supervises managed requests only, and never probes', async () => {
+test.skipIf(process.platform !== 'darwin')('the bridge gives the agent the MCP CLI and this profile\'s config', async () => {
   // A space in the path proves the generated bridge quotes every staged location.
   const root = await mkdtemp(path.join(os.tmpdir(), 'cursor managed launch-'))
   try {
@@ -56,58 +56,38 @@ test.skipIf(process.platform !== 'darwin')('the bridge supervises managed reques
     const hostBin = path.join(root, 'host bin')
     await mkdir(hostBin, { recursive: true })
     const fakeCursorAgent = path.join(hostBin, 'cursor-agent')
-    await writeFile(fakeCursorAgent, [
-      '#!/bin/sh',
-      'echo "argv:$*"',
-      'echo "supervised:${CURSOR_OWNER_SCOPE:+yes}"',
-      'echo "report:${CURSOR_SUPERVISOR_REPORT:-none}"',
-    ].join('\n') + '\n', 'utf8')
+    await writeFile(fakeCursorAgent, '#!/bin/sh\necho "argv:$*"\n', 'utf8')
     await chmod(fakeCursorAgent, 0o700)
 
     const hostEnv = { HOME: root, PATH: hostBin, CURSOR_AGENT_EXECUTABLE: fakeCursorAgent }
+    const configPath = path.join(root, 'profile config', 'opencode.json')
     const bridge = await ensureOpenCodeNativeCliCredentialBridge(
-      path.join(root, 'profile'), hostEnv, 'darwin', resolved.assets,
+      path.join(root, 'profile'), hostEnv, 'darwin', resolved.assets, configPath,
     )
     const source = await readFile(bridge.cursorAgentExecutablePath, 'utf8')
-    expect(source).toContain(resolved.assets.supervisorPath)
-    expect(source).toContain('CURSOR_SUPERVISOR_REPORT')
+    // mcptool must be reachable, and it must resolve this profile's servers.
+    expect(source).toContain(bridge.binPath)
+    expect(source).toContain(`export OPENCODE_CONFIG='${configPath}'`)
+    // The profile bins go last: this directory also holds a cursor-agent wrapper,
+    // and putting it first makes the wrapper exec itself forever.
+    expect(source.indexOf(hostBin)).toBeLessThan(source.indexOf(bridge.binPath))
+    expect(await readFile(path.join(bridge.binPath, 'mcptool'), 'utf8'))
+      .toContain(resolved.assets.mcpToolPath)
 
-    const run = async (env: Record<string, string>) => {
-      const result = Bun.spawnSync([bridge.cursorAgentExecutablePath, '--print', 'a b'], {
-        env: { PATH: hostBin, HOME: root, ...env }, stdout: 'pipe', stderr: 'pipe',
-      })
-      return {
-        code: result.exitCode,
-        out: new TextDecoder().decode(result.stdout),
-        err: new TextDecoder().decode(result.stderr),
-      }
-    }
+    // The wrapper still reaches the real CLI rather than itself.
+    const run = Bun.spawnSync([bridge.cursorAgentExecutablePath, '--print', 'a b'], {
+      env: { PATH: hostBin, HOME: root }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(run.exitCode, new TextDecoder().decode(run.stderr)).toBe(0)
+    expect(new TextDecoder().decode(run.stdout)).toContain('argv:--print a b')
 
-    const probe = await run({})
-    expect(probe.code).toBe(0)
-    expect(probe.out).toContain('argv:--print a b')
-    expect(probe.out).toContain('supervised:\n')
-    expect(probe.out).toContain('report:none')
-
-    const reportPath = path.join(root, 'report.json')
-    const managed = await run({ CURSOR_SUPERVISOR_REPORT: reportPath, CURSOR_OWNER_REQUEST_ID: 'request-1' })
-    expect(managed.code, managed.err).toBe(0)
-    expect(managed.out).toContain('argv:--print a b')
-    expect(managed.out).toContain('supervised:yes')
-    // The supervisor owns the acknowledgement destination; the agent must not see it.
-    expect(managed.out).toContain('report:none')
-    const report = JSON.parse(await readFile(reportPath, 'utf8'))
-    expect(report.version).toBe(1)
-    expect(report.requestId).toBe('request-1')
-    expect(report.cleanupCompleted).toBe(true)
-    expect(report.containment).toBe('owned-groups-and-scope-marked-descendants')
-    expect(report.scopeSweep.remaining).toEqual([])
-
+    // Without managed assets nothing is added to the bridge at all.
     const unmanaged = await ensureOpenCodeNativeCliCredentialBridge(
-      path.join(root, 'unmanaged'), hostEnv, 'darwin', null,
+      path.join(root, 'unmanaged'), hostEnv, 'darwin', null, null,
     )
-    expect(await readFile(unmanaged.cursorAgentExecutablePath, 'utf8'))
-      .not.toContain('CURSOR_SUPERVISOR_REPORT')
+    const unmanagedSource = await readFile(unmanaged.cursorAgentExecutablePath, 'utf8')
+    expect(unmanagedSource).not.toContain('OPENCODE_CONFIG=')
+    expect(unmanagedSource).not.toContain(unmanaged.binPath + "'")
   } finally {
     await rm(root, { recursive: true, force: true })
   }

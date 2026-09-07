@@ -5,19 +5,15 @@ import path from 'node:path'
 
 export const CURSOR_MANAGED_ASSET_ROOT_ENV = 'AGENT_TEAMS_CURSOR_MANAGED_ASSETS'
 
-const NATIVE_SCRIPT_NAMES = ['supervisor.mjs', 'preload.cjs', 'group-cleanup.mjs', 'scope-sweep.mjs'] as const
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['darwin'])
 const SUPPORTED_ARCHITECTURES = new Set(['arm64', 'x64'])
 
 export type OpenCodeCursorManagedAssets = {
   /** Absolute path to the reviewed plugin entrypoint OpenCode must load. */
   pluginEntryPath: string
-  /** Directory holding the supervisor, preload, sweep and compiled gate. */
-  nativeAssetsPath: string
-  supervisorPath: string
   /** The plugin's MCP CLI, which the agent shell needs to reach MCP servers. */
   mcpToolPath: string
-  /** Absolute interpreter the bridge uses to run the supervisor. */
+  /** Absolute interpreter the profile shim uses to run the MCP CLI. */
   interpreterPath: string
   /** Identity of exactly what was staged, for readiness binding and drift checks. */
   fingerprint: string
@@ -28,7 +24,6 @@ export type OpenCodeCursorManagedAssetsUnavailable = {
     | 'unsupported_platform'
     | 'not_staged'
     | 'plugin_artifact_mismatch'
-    | 'native_asset_mismatch'
     | 'no_interpreter'
 }
 
@@ -39,7 +34,7 @@ export type OpenCodeCursorManagedAssetsResult =
 const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
 
 /**
- * The supervisor is an ES module using node: builtins, so the bridge needs a real
+ * The MCP CLI is a standalone bundle, so the profile shim needs a real
  * interpreter. The single-file runtime executable cannot run it.
  */
 export async function resolveCursorManagedInterpreter(
@@ -103,25 +98,6 @@ async function verifyStagedPlugin(root: string): Promise<string> {
   return digest(manifestBytes)
 }
 
-async function verifyStagedNative(root: string, platform: NodeJS.Platform, arch: string): Promise<string> {
-  const manifestBytes = await readPrivateFile(path.join(root, 'manifest.json'), 64 * 1024)
-  const manifest = JSON.parse(Buffer.from(manifestBytes).toString('utf8')) as Record<string, unknown>
-  const files = manifest.files as Record<string, string> | undefined
-  if (manifest.schema !== 1 || manifest.platform !== platform || manifest.arch !== arch || !files) {
-    throw new Error('Cursor native assets were staged for another platform')
-  }
-  const expected = ['gate', ...NATIVE_SCRIPT_NAMES].sort()
-  if (Object.keys(files).sort().join(',') !== expected.join(',')) {
-    throw new Error('Cursor native assets are incomplete')
-  }
-  for (const [name, hash] of Object.entries(files)) {
-    const bytes = await readPrivateFile(path.join(root, name), 8 * 1024 * 1024)
-    if (digest(bytes) !== hash) throw new Error(`Cursor native asset ${name} does not match its manifest`)
-  }
-  await access(path.join(root, 'gate'), constants.X_OK)
-  return digest(manifestBytes)
-}
-
 /**
  * Fails closed. An unavailable result must keep the managed Cursor Stop path off
  * rather than degrade to a transport-only abort that cannot prove cleanup.
@@ -141,18 +117,11 @@ export async function resolveOpenCodeCursorManagedAssets(input: {
   const root = configured || input.defaultRoot
   if (!root) return { available: false, reason: 'not_staged' }
   const pluginRoot = path.join(root, 'plugin')
-  const nativeRoot = path.join(root, 'native')
   let pluginFingerprint: string
   try {
     pluginFingerprint = await verifyStagedPlugin(pluginRoot)
   } catch (error) {
     return { available: false, reason: isMissing(error) ? 'not_staged' : 'plugin_artifact_mismatch' }
-  }
-  let nativeFingerprint: string
-  try {
-    nativeFingerprint = await verifyStagedNative(nativeRoot, platform, arch)
-  } catch (error) {
-    return { available: false, reason: isMissing(error) ? 'not_staged' : 'native_asset_mismatch' }
   }
   const interpreterPath = await resolveCursorManagedInterpreter(input.env ?? process.env)
   if (!interpreterPath) return { available: false, reason: 'no_interpreter' }
@@ -164,10 +133,8 @@ export async function resolveOpenCodeCursorManagedAssets(input: {
     assets: {
       pluginEntryPath: path.join(pluginRoot, manifest.entrypoint),
       mcpToolPath: path.join(pluginRoot, manifest.mcpToolEntrypoint),
-      nativeAssetsPath: nativeRoot,
-      supervisorPath: path.join(nativeRoot, 'supervisor.mjs'),
       interpreterPath,
-      fingerprint: digest(Buffer.from(`${pluginFingerprint}:${nativeFingerprint}:${platform}:${arch}`)),
+      fingerprint: digest(Buffer.from(`${pluginFingerprint}:${platform}:${arch}`)),
     },
   }
 }

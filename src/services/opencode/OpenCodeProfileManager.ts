@@ -1399,16 +1399,6 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
             'fi',
           ]
         : []),
-      ...(command === 'cursor-agent' && cursorManagedAssets && platform === 'darwin'
-        ? [
-          // Only managed requests carry a report path; probes keep the direct exec.
-          'if [ -n "${CURSOR_SUPERVISOR_REPORT:-}" ]; then',
-          `  exec ${quotePosixShellValue(cursorManagedAssets.interpreterPath)}`
-            + ` ${quotePosixShellValue(cursorManagedAssets.supervisorPath)}`
-            + ` ${quotePosixShellValue(hostCommand)} "$@"`,
-          'fi',
-        ]
-        : []),
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
@@ -2668,11 +2658,11 @@ export class OpenCodeProfileManager {
     }
     // Retained per profile so the managed config fingerprint stays stable across
     // preparations and an existing host keeps serving the same endpoint.
-    const cursorManagedControlDirectory = cursorManagedAssets
-      ? path.join(profileRootPath, 'cursor-control')
+    const cursorManagedStatePath = cursorManagedAssets
+      ? path.join(profileRootPath, 'cursor-managed')
       : null
-    const cursorManagedProxyPort = cursorManagedControlDirectory
-      ? await reserveCursorManagedProxyPort(path.join(cursorManagedControlDirectory, 'proxy-port.json'))
+    const cursorManagedProxyPort = cursorManagedStatePath
+      ? await reserveCursorManagedProxyPort(path.join(cursorManagedStatePath, 'proxy-port.json'))
       : null
     if (cursorManagedProxyPort) {
       applyCursorManagedProxyEndpoint(managedConfig, cursorManagedProxyPort)
@@ -2792,11 +2782,11 @@ export class OpenCodeProfileManager {
     // A stale readiness answer must not survive a Cursor account switch or a
     // replaced binary, which the auth marker's TTL alone cannot notice.
     let cursorReadinessFingerprint: string | null = null
-    if (nativeCliCredentialBridge && cursorManagedControlDirectory && cursorManagedProxyPort) {
+    if (nativeCliCredentialBridge && cursorManagedStatePath && cursorManagedProxyPort) {
       enterStep('bind native Cursor authority')
       const hostCommand = nativeCliCredentialBridge.cursorAgentHostCommand
       const authority = await reconcileCursorNativeAuthority({
-        statePath: path.join(cursorManagedControlDirectory, 'native-authority.json'),
+        statePath: path.join(cursorManagedStatePath, 'native-authority.json'),
         executablePath: path.isAbsolute(hostCommand)
           ? hostCommand
           : Bun.which(hostCommand) ?? hostCommand,
@@ -2909,9 +2899,7 @@ export class OpenCodeProfileManager {
       env.CURSOR_AGENT_EXECUTABLE =
         nativeCliCredentialBridge.cursorAgentExecutablePath
     }
-    if (cursorManagedControlDirectory && cursorManagedProxyPort) {
-      env.AGENT_TEAMS_CURSOR_CONTROL_DIR = cursorManagedControlDirectory
-      env.AGENT_TEAMS_CURSOR_PROFILE_SCOPE = policy?.scope.scopeToken ?? profileRootKey
+    if (cursorManagedProxyPort) {
       env[CURSOR_MANAGED_PROXY_PORT_ENV] = String(cursorManagedProxyPort)
       if (cursorReadinessFingerprint) {
         env.AGENT_TEAMS_CURSOR_READINESS = cursorReadinessFingerprint

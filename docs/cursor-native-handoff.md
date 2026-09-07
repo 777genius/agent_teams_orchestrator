@@ -1,5 +1,13 @@
 # Cursor recovery handoff to local Claude Code
 
+> **Historical.** The native ownership barrier this document treats as the
+> critical blocker was removed: it addressed a problem this configuration does
+> not have, its central claim was false under SIP, and the ordinary transport
+> abort already ends the agent. Read
+> `cursor-handoff-evidence/managed-cursor-integration.md` for what the
+> integration actually is now.
+
+
 ## User instruction and current state
 
 Continue the minimal Cursor/OpenCode integration end-to-end, autonomously within the accepted scope. The user wants a working integration and a quick release, not a generic process-control framework. This is an unfinished checkpoint, NOT a release-ready fix. The previous agent stopped at the user's request. Do not assume that passing component tests proves product E2E.

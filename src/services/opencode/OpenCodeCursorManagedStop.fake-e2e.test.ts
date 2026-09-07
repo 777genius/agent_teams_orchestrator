@@ -9,7 +9,6 @@ import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.j
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OpenCodeClientFactory, type OpenCodeClient } from './OpenCodeClientFactory.js'
 import { CURSOR_MANAGED_ASSET_ROOT_ENV } from './OpenCodeCursorManagedAssets.js'
-import { stopCursorSessionWithNativeCleanup } from './OpenCodeCursorStopControl.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import {
@@ -31,15 +30,16 @@ const MODEL = { providerID: 'cursor-acp', modelID: 'auto' } as const
 const ENVIRONMENT_KEYS = [
   CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV, CURSOR_MANAGED_ASSET_ROOT_ENV,
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'CURSOR_AGENT_EXECUTABLE',
+  'FAKE_CURSOR_PID_FILE',
 ]
 
-function supervisedPids(): number[] {
-  const snapshot = execFileSync('/bin/ps', ['-Eww', '-ax', '-o', 'pid=,command='],
-    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 4000, env: { PATH: '/bin:/usr/bin' } })
-  return [...new Set(snapshot.split('\n')
-    .filter(line => line.includes('CURSOR_OWNER_SCOPE='))
-    .map(line => Number.parseInt(line, 10))
-    .filter(pid => Number.isSafeInteger(pid) && pid > 1))]
+/** The fake records its own pid, so Stop has something observable to end. */
+function agentPid(pidFile: string): number {
+  try {
+    return Number.parseInt(execFileSync('/bin/cat', [pidFile], { encoding: 'utf8' }).trim(), 10) || 0
+  } catch {
+    return 0
+  }
 }
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
@@ -75,6 +75,7 @@ function fakeCursorAgentSource(): string {
     "const path = require('node:path')",
     "if (process.argv.includes('status')) { console.log('Logged in as fake@example.com'); process.exit(0) }",
     "if (process.argv.includes('--version')) { console.log('fake-cursor-agent 0.0.0'); process.exit(0) }",
+    `require('node:fs').writeFileSync(process.env.FAKE_CURSOR_PID_FILE, String(process.pid))`,
     "let prompt = ''",
     "try { prompt = readFileSync(0, 'utf8') } catch { prompt = '' }",
     "// A follow-up carries the whole conversation, so only the newest turn counts.",
@@ -145,6 +146,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
     async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-managed-fake-e2e-'))
       const projectPath = path.join(root, 'project')
+      const pidFile = path.join(root, 'agent.pid')
       const original = Object.fromEntries(ENVIRONMENT_KEYS.map(key => [key, process.env[key]]))
       let hostManager: OpenCodeHostManager | null = null
       let hostKey: string | null = null
@@ -164,6 +166,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         process.env.XDG_DATA_HOME = path.join(root, 'source-data')
         process.env.XDG_CACHE_HOME = path.join(root, 'source-cache')
         process.env.CURSOR_AGENT_EXECUTABLE = fakeAgent
+        process.env.FAKE_CURSOR_PID_FILE = pidFile
 
         const profileManager = new OpenCodeProfileManager()
         const profile = await profileManager.prepareProfile(projectPath, {
@@ -175,9 +178,9 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         expect(Number(assignedPort)).toBeGreaterThan(1024)
         expect(assignedPort).not.toBe('32124')
         expect(profile.env.AGENT_TEAMS_CURSOR_READINESS).toMatch(/^[a-f0-9]{64}$/)
-        // The generated bridge must supervise managed requests and nothing else.
+        // The agent must be able to reach this profile's MCP servers.
         expect(await readFile(path.join(profile.profileRootPath,
-          'native-subscription-cli-bin/cursor-agent'), 'utf8')).toContain('CURSOR_SUPERVISOR_REPORT')
+          'native-subscription-cli-bin/cursor-agent'), 'utf8')).toContain('OPENCODE_CONFIG=')
 
         const binaryPath = resolveOpenCodeBinaryPath()
         if (!binaryPath) throw new Error('OpenCode binary is unavailable for the managed Cursor fake E2E')
@@ -265,33 +268,29 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         await until('follow-up turn', () => replied(stopped.id, followUpToken), 180_000)
 
         await prompt(stopped.id, `SLOW TOKEN:slow-${randomUUID().slice(0, 8)}`)
-        let owned: number[] = []
-        await until('supervised processes', () => {
-          owned = supervisedPids()
-          return owned.length > 0
+        let running = 0
+        await until('a live agent process', () => {
+          running = agentPid(pidFile)
+          return running > 0 && alive(running)
         }, 120_000)
 
-        expect(await stopCursorSessionWithNativeCleanup({
-          profile, runtimePid: host.pid, sessionId: stopped.id,
-          abortTransport: () => client.abortSession(stopped.id),
-        })).toBe(true)
+        // Stop is the transport abort. The plugin cancels the request on that
+        // signal and ends the agent child with it; nothing else is required.
+        expect(await client.abortSession(stopped.id)).toBe(true)
         await sleep(2500)
-        expect(owned.filter(alive)).toEqual([])
+        expect(alive(running)).toBe(false)
         const textAfterStop = (await summarize(client, stopped.id)).latestAssistantText ?? ''
         await sleep(2000)
         expect((await summarize(client, stopped.id)).latestAssistantText ?? '').toBe(textAfterStop)
 
-        // A sealed session answers repeated Stops without reopening.
-        expect(await stopCursorSessionWithNativeCleanup({
-          profile, runtimePid: host.pid, sessionId: stopped.id,
-          abortTransport: () => client.abortSession(stopped.id),
-        })).toBe(true)
+        // A repeated Stop on an already stopped session stays harmless.
+        expect(await client.abortSession(stopped.id)).toBe(true)
 
         const siblingToken = `sibling-${randomUUID().slice(0, 8)}`
         await prompt(sibling.id, `TOKEN:${siblingToken}`)
         await until('sibling turn after Stop', () => replied(sibling.id, siblingToken), 180_000)
         expect(JSON.stringify((await summarize(client, sibling.id)).messages)).not.toContain(warmToken)
-        expect(supervisedPids().filter(pid => owned.includes(pid))).toEqual([])
+        expect(alive(running)).toBe(false)
       } finally {
         if (hostManager && hostKey) {
           await hostManager.releaseHost(hostKey).catch(() => undefined)

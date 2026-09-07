@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.js'
@@ -32,7 +32,7 @@ test('reports missing staging instead of degrading to an unmanaged Cursor launch
   }
 })
 
-test.skipIf(process.platform !== 'darwin')('accepts only staging that still matches its manifests', async () => {
+test.skipIf(process.platform !== 'darwin')('accepts only staging that still matches its manifest', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-assets-'))
   try {
     await stageCursorManagedAssets(root)
@@ -40,9 +40,10 @@ test.skipIf(process.platform !== 'darwin')('accepts only staging that still matc
     expect(first.available).toBe(true)
     if (!first.available) return
     expect(first.assets.pluginEntryPath).toBe(path.join(root, 'plugin/dist/plugin-entry.js'))
-    expect(first.assets.supervisorPath).toBe(path.join(root, 'native/supervisor.mjs'))
+    expect(first.assets.mcpToolPath).toBe(path.join(root, 'plugin/dist/cli/mcptool.js'))
     expect(path.isAbsolute(first.assets.interpreterPath)).toBe(true)
     expect(first.assets.fingerprint).toMatch(/^[a-f0-9]{64}$/)
+
     // Identical staging of the same sources must produce the same readiness identity.
     const again = await mkdtemp(path.join(os.tmpdir(), 'cursor-assets-again-'))
     try {
@@ -52,25 +53,18 @@ test.skipIf(process.platform !== 'darwin')('accepts only staging that still matc
     } finally {
       await rm(again, { recursive: true, force: true })
     }
-    expect(await resolve(root, { arch: 'x64' })).toEqual({ available: false, reason: 'native_asset_mismatch' })
 
-    const supervisorPath = path.join(root, 'native/supervisor.mjs')
-    const supervisor = await readFile(supervisorPath)
-    await writeFile(supervisorPath, Buffer.concat([supervisor, Buffer.from('\n// tampered\n')]))
-    expect(await resolve(root)).toEqual({ available: false, reason: 'native_asset_mismatch' })
-    await writeFile(supervisorPath, supervisor)
+    // A tampered artifact, and a tampered CLI, must both fail closed.
+    for (const relative of ['plugin/dist/plugin-entry.js', 'plugin/dist/cli/mcptool.js']) {
+      const target = path.join(root, relative)
+      const original = await readFile(target)
+      await writeFile(target, Buffer.concat([original, Buffer.from('\n// tampered\n')]))
+      expect(await resolve(root)).toEqual({ available: false, reason: 'plugin_artifact_mismatch' })
+      await writeFile(target, original)
+    }
     expect((await resolve(root)).available).toBe(true)
 
-    const entrypoint = path.join(root, 'plugin/dist/plugin-entry.js')
-    const artifact = await readFile(entrypoint)
-    await writeFile(entrypoint, Buffer.concat([artifact, Buffer.from('\n// tampered\n')]))
-    expect(await resolve(root)).toEqual({ available: false, reason: 'plugin_artifact_mismatch' })
-    await writeFile(entrypoint, artifact)
-
-    await chmod(path.join(root, 'native/gate'), 0o600)
-    expect(await resolve(root)).toEqual({ available: false, reason: 'native_asset_mismatch' })
-    await chmod(path.join(root, 'native/gate'), 0o700)
-    // Without a real interpreter the bridge cannot run the supervisor at all.
+    // Without an interpreter the profile shim cannot run the CLI at all.
     expect(await resolveOpenCodeCursorManagedAssets({
       env: { [CURSOR_MANAGED_ASSET_ROOT_ENV]: root, PATH: '' },
     })).toEqual({ available: false, reason: 'no_interpreter' })

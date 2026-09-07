@@ -18,61 +18,73 @@ async function sandbox(): Promise<{ root: string; executable: string; statePath:
   return { root, executable, statePath: path.join(root, 'control/native-authority.json') }
 }
 
-test('reuses a probe within its window and never stores the account in the clear', async () => {
+test('probes the account every time, so a sign-out inside the old window is caught', async () => {
   const { root, executable, statePath } = await sandbox()
   try {
+    let account: string | null = 'a'.repeat(64)
     let probes = 0
-    const probe = async () => { probes += 1; return 'a'.repeat(64) }
-    const first = await reconcileCursorNativeAuthority({
-      statePath, executablePath: executable, probe, now: () => 1_000,
+    const probe = async () => { probes += 1; return account }
+    const reconcile = (now: number) => reconcileCursorNativeAuthority({
+      statePath, executablePath: executable, probe, now: () => now, dedupeMs: 0,
     })
-    expect(first.state).toBe('refreshed')
-    expect(first.authority?.accountHash).toBe('a'.repeat(64))
+
+    expect((await reconcile(1_000)).state).toBe('refreshed')
     expect(probes).toBe(1)
 
-    const reused = await reconcileCursorNativeAuthority({
-      statePath, executablePath: executable, probe, now: () => 1_000 + 60_000,
-    })
-    expect(reused.state).toBe('reused')
-    expect(probes).toBe(1)
+    // The defect this pins: with a trust window, a logout one second later stayed
+    // invisible for half an hour. Nothing but a fresh probe can see it.
+    account = null
+    expect(await reconcile(2_000)).toEqual({ authority: null, state: 'signed-out' })
+    expect(probes).toBe(2)
+
+    // And a switch to another account is reported the moment it happens.
+    account = 'b'.repeat(64)
+    const switched = await reconcile(3_000)
+    expect(switched.state).toBe('account-changed')
+    expect(switched.authority?.accountHash).toBe('b'.repeat(64))
 
     const persisted = await readFile(statePath, 'utf8')
     expect(persisted).not.toContain('@')
     expect(JSON.parse(persisted).accountHash).toMatch(/^[a-f0-9]{64}$/)
-    expect((await readFile(statePath, 'utf8')).length).toBeLessThan(400)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test('a different account or a replaced binary invalidates readiness at once', async () => {
+test('deduplicates repeated probes inside a single launch burst', async () => {
   const { root, executable, statePath } = await sandbox()
   try {
-    await reconcileCursorNativeAuthority({
-      statePath, executablePath: executable, probe: async () => 'a'.repeat(64), now: () => 1_000,
-    })
-    // Same window, but the user signed into another account.
-    const switched = await reconcileCursorNativeAuthority({
-      statePath, executablePath: executable, probe: async () => 'b'.repeat(64),
-      now: () => 1_000 + CURSOR_TTL + 1,
-    })
-    expect(switched.state).toBe('account-changed')
-    expect(switched.authority?.accountHash).toBe('b'.repeat(64))
-
-    // A replaced binary re-probes inside the window instead of trusting the record.
-    await writeFile(executable, '#!/bin/sh\nexit 1\n', 'utf8')
     let probes = 0
-    const replaced = await reconcileCursorNativeAuthority({
-      statePath, executablePath: executable, now: () => 1_000 + CURSOR_TTL + 2,
-      probe: async () => { probes += 1; return 'b'.repeat(64) },
+    const probe = async () => { probes += 1; return 'a'.repeat(64) }
+    const reconcile = (now: number) => reconcileCursorNativeAuthority({
+      statePath, executablePath: executable, probe, now: () => now, dedupeMs: 5_000,
     })
+    await reconcile(10_000)
+    await reconcile(11_000)
     expect(probes).toBe(1)
-    expect(replaced.state).toBe('executable-changed')
+    // Past the dedupe window the account is asked again, not assumed.
+    await reconcile(20_000)
+    expect(probes).toBe(2)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
-const CURSOR_TTL = 30 * 60 * 1000
+
+test('a replaced binary is reported even when the account is unchanged', async () => {
+  const { root, executable, statePath } = await sandbox()
+  try {
+    const probe = async () => 'a'.repeat(64)
+    await reconcileCursorNativeAuthority({
+      statePath, executablePath: executable, probe, now: () => 1_000, dedupeMs: 0,
+    })
+    await writeFile(executable, '#!/bin/sh\nexit 1\n', 'utf8')
+    expect((await reconcileCursorNativeAuthority({
+      statePath, executablePath: executable, probe, now: () => 2_000, dedupeMs: 0,
+    })).state).toBe('executable-changed')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('a signed-out probe never yields an authority, and a corrupt record is not trusted', async () => {
   const { root, executable, statePath } = await sandbox()
@@ -90,7 +102,7 @@ test('a signed-out probe never yields an authority, and a corrupt record is not 
       let probes = 0
       const result = await reconcileCursorNativeAuthority({
         statePath, executablePath: executable,
-        probe: async () => { probes += 1; return 'c'.repeat(64) },
+        probe: async () => { probes += 1; return 'c'.repeat(64) }, dedupeMs: 0,
       })
       expect(probes).toBe(1)
       expect(result.state).toBe('refreshed')

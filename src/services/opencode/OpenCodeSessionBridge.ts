@@ -3,10 +3,6 @@ import { createHash } from 'node:crypto'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
-import {
-  shouldUseManagedCursorStop,
-  stopCursorSessionWithNativeCleanup,
-} from './OpenCodeCursorStopControl.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
@@ -1762,17 +1758,8 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     options: OpenCodeStopRequestOptions = {},
   ): Promise<boolean> {
-    return this.withSessionHost(record, async ({ baseUrl, profile, runtimePid }) => {
+    return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl, options)
-      if (shouldUseManagedCursorStop({
-        providerId: parseProviderScopedModel(record.selectedModel).providerID,
-        profile,
-      })) {
-        return stopCursorSessionWithNativeCleanup({
-          profile, runtimePid, sessionId: record.opencodeSessionId, options,
-          abortTransport: () => client.abortSession(record.opencodeSessionId),
-        })
-      }
       return client.abortSession(record.opencodeSessionId)
     }, undefined, options, 'stop')
   }
