@@ -103,6 +103,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
+      - name: Install conformance test dependencies
+        run: bun install --frozen-lockfile
       - name: Download and verify pinned OpenCode archive
         shell: pwsh
         env:
@@ -148,8 +150,6 @@ jobs:
         env:
           PINNED_VERSION: ${{ matrix.version }}
         run: |
-          bun install --frozen-lockfile
-          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed' }
           bun build scripts/opencode-selected-authority-conformance.ts --target=bun --packages=bundle --define 'process.env.USER_TYPE="external"' --outfile=selected-authority-harness.js
           if ($LASTEXITCODE -ne 0) { throw 'Selected authority harness build failed' }
           docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,size=512m --memory 1g --cpus 1 -v "${env:GITHUB_WORKSPACE}/selected-authority-harness.js:/harness.js:ro" -v "${env:AUTHORITY_BINARY}:/opencode:ro" oven/bun@sha256:0733e50325078969732ebe3b15ce4c4be5082f18c4ac1a0f0ca4839c2e4e42a7 bun /harness.js /opencode $env:PINNED_VERSION $env:AUTHORITY_BINARY_SHA256 > conformance-selected-authority.json
