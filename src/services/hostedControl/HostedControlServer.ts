@@ -522,7 +522,8 @@ export class HostedControlServer {
         const current = !!ownerBinding && !!parentIdentity &&
           this.#activation === candidate && this.#activationGeneration === generation &&
           candidate.socket === socket && !socket.destroyed &&
-          (this.#inheritedSocket !== socket || this.#inheritedActivation!.isCurrent()) &&
+          (this.#inheritedSocket !== socket ||
+            this.#inheritedActivation!.isEffectCurrent(candidate.phase === 'leased')) &&
           isSocketIdentityCurrentSync(
             this.#options.socketPath, ownerBinding, parentIdentity,
           )

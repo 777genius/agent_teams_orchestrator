@@ -1,5 +1,5 @@
 import type { HostedControlConnection } from './HostedControlConnection.js'
-import { HostedControlInheritedConnectionV2 } from './HostedControlInheritedConnectionV2.js'
+import { HostedControlInheritedConnectionV2, socketCookieV2 } from './HostedControlInheritedConnectionV2.js'
 import { OwnedDescriptorV2, sameDescriptorV2, snapshotV2, type DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
 import { requireV2 } from './HostedControlBootstrapV2Wire.js'
 
@@ -10,7 +10,9 @@ export class HostedControlInheritedActivationV2 {
   #descriptor: OwnedDescriptorV2 | null
   #socket: HostedControlInheritedConnectionV2 | null = null
   #closed = false
+  readonly #cookie: bigint
   private constructor(descriptor: OwnedDescriptorV2, private readonly snapshot: DescriptorSnapshotV2) {
+    this.#cookie = socketCookieV2(descriptor.fd)
     this.#descriptor = descriptor; admitted.add(this)
   }
   static retain(descriptor: OwnedDescriptorV2, snapshot: DescriptorSnapshotV2): HostedControlInheritedActivationV2 {
@@ -28,7 +30,7 @@ export class HostedControlInheritedActivationV2 {
       socket.pause()
       return socket
     } catch (error) {
-      if (this.#matchesDescriptor()) owner.close(); else owner.take()
+      if (this.#ownsSocket(owner.fd)) owner.close(); else owner.take()
       this.#closed = true; throw error
     }
   }
@@ -38,13 +40,19 @@ export class HostedControlInheritedActivationV2 {
     if (this.#matchesDescriptor()) return true
     this.close(); return false
   }
+  isEffectCurrent(rejectPending: boolean): boolean {
+    return !this.#closed && !!this.#socket && this.#socket.isEffectCurrent(rejectPending)
+  }
+  #ownsSocket(fd: number): boolean {
+    try { return socketCookieV2(fd) === this.#cookie } catch { return false }
+  }
   #matchesDescriptor(): boolean {
-    try { return sameDescriptorV2(this.snapshot, snapshotV2('activation-v2')) } catch { return false }
+    try { return this.#ownsSocket(5) && sameDescriptorV2(this.snapshot, snapshotV2('activation-v2')) } catch { return false }
   }
   close(): void {
     this.#closed = true
     if (this.#descriptor) {
-      if (this.#matchesDescriptor()) this.#descriptor.close(); else this.#descriptor.take()
+      if (this.#ownsSocket(this.#descriptor.fd)) this.#descriptor.close(); else this.#descriptor.take()
       this.#descriptor = null
     }
     this.#socket?.destroy()

@@ -8,6 +8,8 @@ import { createHostedApprovalActivationV2PinsForTest } from '../../../../src/ser
 import { hostedControlAuthorityFromConfig, hostedControlOwnerIdentityFromConfig } from '../../../../src/services/hostedControl/HostedControlRuntimeConfig.js'
 import { HOSTED_CONTROL_SOCKET_BROKER_FLAG, runHostedControlSocketBroker } from '../../../../src/services/hostedControl/HostedControlSocketBroker.js'
 import { activationGolden } from '../../../../src/services/hostedControl/fixtures/bootstrapV2Producer.js'
+import { checkPretransfer, checkEffect } from './bootstrap-v2-regressions.js'
+import type { HostedApprovalActivationConnection } from '../../../../src/services/hostedControl/HostedApprovalActivationSession.js'
 import type { HostedApprovalWirePort } from '../../../../src/services/hostedControl/HostedApprovalWire.js'
 
 if (process.argv[2] === HOSTED_CONTROL_SOCKET_BROKER_FLAG) await runHostedControlSocketBroker(process.argv.slice(3))
@@ -19,30 +21,53 @@ try {
   bootstrap = await readHostedControlBootstrapV2({ modulePath: process.argv[1],
     selectLaunch: () => JSON.parse(readFileSync(selectionPath, 'utf8')) })
   const oneUseClosed = [4, 7, 11].map(closed)
-  if (scenario !== 'activation') {
+  if (scenario.startsWith('pretransfer-')) {
+    const checks = await checkPretransfer(bootstrap, scenario)
+    writeFileSync(resultPath, JSON.stringify({ ok: true, ...checks }))
+  } else if (!scenario.startsWith('activation')) {
     writeFileSync(resultPath, JSON.stringify({ ok: true, oneUseClosed, roles: bootstrap.header.descriptorMap.descriptors.map(d => [d.role, d.childFd]) }))
   } else {
     const admitted = bootstrap, port = new HostedApprovalActivatablePort()
+    let retained!: HostedApprovalActivationConnection
     const authority = hostedControlAuthorityFromConfig(admitted.config)
     server = new HostedControlServer({ socketPath: admitted.config.socketPath, secret: admitted.secret, authority,
       ownerIdentity: hostedControlOwnerIdentityFromConfig(admitted.config),
       activationTransport: 'inherited-v2',
       service: { async mutate() { throw new Error('unit fixture has no effects') } },
-      activationSessionFactory: connection => HostedApprovalDeferredManifestV2.forTest({
-        proofKey: admitted.secret, connection, port, expectedHost: admitted.expectedHost,
-        rawAdmissionPath: join(dirname(resultPath), 'admission.json'),
-        authority: { snapshot: () => ({ authority, ownerBinding: connection.ownerBinding,
-          socketPath: admitted.config.socketPath, ...admitted.approvalActivationV2 }),
-          assertBootstrapCurrent: () => admitted.guard.assertCurrent(), assertRootCurrent: () => true },
-        recover: async () => {
-          appendFileSync(resultPath + '.adopted', 'verified-before-adoption')
-          return { claimIngress: async () => [], acknowledgeIngress: async () => false,
-            getAdmittedIngressAuthority: async () => null, resolveIngressAuthority: async () => null,
-            authorizeDecision: async () => false, deliverDecision: async () => { throw new Error('no unit effect') },
-            reconcileDecision: async () => { throw new Error('no unit effect') } } as HostedApprovalWirePort
-        },
-      }, createHostedApprovalActivationV2PinsForTest({ publicKeySpkiDer: Buffer.from(activationGolden.signing.publicKeySpkiDerBase64url, 'base64url'),
-        publicKeyDigest: activationGolden.signing.publicKeyDigest, contractDigest: activationGolden.signing.contractDigest })),
+      beforeActivationFrameWriteForTest: (phase, socket) => {
+        if (phase === 'ready' && scenario.startsWith('activation-effect')) {
+          socket.pause() // Hold bytes in the kernel until the synchronous effect fence.
+          void checkEffect(() => retained, admitted.activation, resultPath).catch(error => {
+            writeFileSync(resultPath + '.effect', JSON.stringify({ error: String(error) }))
+          })
+        }
+      },
+      activationSessionFactory: connection => {
+        retained = connection
+        const session = HostedApprovalDeferredManifestV2.forTest({
+          proofKey: admitted.secret, connection, port, expectedHost: admitted.expectedHost,
+          rawAdmissionPath: join(dirname(resultPath), 'admission.json'),
+          authority: { snapshot: () => ({ authority, ownerBinding: connection.ownerBinding,
+            socketPath: admitted.config.socketPath, ...admitted.approvalActivationV2 }),
+            assertBootstrapCurrent: () => admitted.guard.assertCurrent(), assertRootCurrent: () => true },
+          recover: async () => {
+            appendFileSync(resultPath + '.adopted', 'verified-before-adoption')
+            return { claimIngress: async () => [], acknowledgeIngress: async () => false,
+              getAdmittedIngressAuthority: async () => null, resolveIngressAuthority: async () => null,
+              authorizeDecision: async () => false, deliverDecision: async () => { throw new Error('no unit effect') },
+              reconcileDecision: async () => { throw new Error('no unit effect') } } as HostedApprovalWirePort
+          },
+        }, createHostedApprovalActivationV2PinsForTest({ publicKeySpkiDer: Buffer.from(activationGolden.signing.publicKeySpkiDerBase64url, 'base64url'),
+          publicKeyDigest: activationGolden.signing.publicKeyDigest, contractDigest: activationGolden.signing.contractDigest }))
+        return {
+          activate: async frame => {
+            try { return await session.activate(frame) } catch (error) {
+              writeFileSync(resultPath + '.rejection', String(error)); throw error
+            }
+          },
+          revoke: () => session.revoke(),
+        }
+      },
     })
     await server.start()
     server.attachInheritedActivationV2(admitted.activation)

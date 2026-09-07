@@ -8,6 +8,7 @@ import type { HostedControlConnection, HostedControlConnectionEvents } from './H
 // Operate on the admitted open descriptor, without changing flags or making a
 // duplicate. MSG_DONTWAIT bounds every syscall; MSG_NOSIGNAL suppresses SIGPIPE.
 const native = process.platform === 'linux' ? dlopen('libc.so.6', {
+  poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
   recv: { args: [FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i64 },
   send: { args: [FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i64 },
   shutdown: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
@@ -18,7 +19,7 @@ const DONTWAIT = 0x40, NOSIGNAL = 0x4000, PEEK = 2
 const CHUNK = 16 * 1024, HIGH_WATER = 64 * 1024, MAX_QUEUED = 2 * HIGH_WATER
 const MAX_WRITES = 4, WRITE_DEADLINE_MS = 5000, POLL_MS = 2
 type Write = { bytes: Buffer; offset: number; deadline: number; done?: (error?: Error | null) => void }
-function cookie(fd: number): bigint {
+export function socketCookieV2(fd: number): bigint {
   const bytes = Buffer.alloc(8), size = new Uint32Array([8])
   if (native!.symbols.getsockopt(fd, 1, 57, ptr(bytes), ptr(size)) !== 0 || size[0] !== 8) {
     throw new Error('hosted_owner_v2_activation_socket_cookie')
@@ -52,19 +53,19 @@ export class HostedControlInheritedConnectionV2 extends EventEmitter<HostedContr
   constructor(owner: OwnedDescriptorV2, private readonly matchesIdentity: (fd: number) => boolean) {
     super()
     if (!native || !matchesIdentity(owner.fd)) throw new Error('hosted_owner_v2_activation_descriptor')
-    this.#cookie = cookie(owner.fd)
+    this.#cookie = socketCookieV2(owner.fd)
     this.#fd = owner.take()
     // Closing an unobserved resource must still be safe before server attachment.
     this.on('error', () => undefined)
   }
   get destroyed(): boolean { return this.#fd === null }
-  #sameSocket(fd: number): boolean { try { return cookie(fd) === this.#cookie } catch { return false } }
+  #sameSocket(fd: number): boolean { try { return socketCookieV2(fd) === this.#cookie } catch { return false } }
   #currentFd(): number {
     const fd = this.#fd
     if (fd === null || !this.matchesIdentity(fd) || !this.#sameSocket(fd)) throw new Error('hosted_owner_v2_activation_descriptor_changed')
     return fd
   }
-  /** Also observes peer EOF synchronously at the server's effect fence. */
+  /** Generic currency permits pending prepare/publication bytes. */
   isCurrent(): boolean {
     if (this.destroyed) return false
     try {
@@ -73,6 +74,27 @@ export class HostedControlInheritedConnectionV2 extends EventEmitter<HostedContr
       this.#eof()
     } catch (error) { this.destroy(error as Error) }
     return false
+  }
+  /** Synchronous effect-only observation. poll sees SHUT_WR behind queued
+   * bytes; peek neither consumes protocol input nor changes descriptor flags.
+   * Only the leased phase forbids pending input. Fail closed on EINTR/errors. */
+  isEffectCurrent(rejectPending: boolean): boolean {
+    if (this.destroyed) return false
+    try {
+      const fd = this.#currentFd(), pollfd = Buffer.alloc(8)
+      pollfd.writeInt32LE(fd, 0)
+      pollfd.writeInt16LE(0x2001, 4) // POLLIN | POLLRDHUP (Linux)
+      const n = native!.symbols.poll(ptr(pollfd), 1, 0)
+      if (n < 0 || (pollfd.readUInt16LE(6) & 0x2038)) {
+        throw new Error('hosted_owner_v2_activation_peer_closed') // RDHUP/HUP/ERR/NVAL
+      }
+      const pending = Number(native!.symbols.recv(fd, ptr(this.#scratch), 1, DONTWAIT | PEEK))
+      if (pending < 0) {
+        const errno = read.i32(native!.symbols.__errno_location()!)
+        if (errno === 11) return true // EAGAIN only; uncertainty rejects effects.
+      } else if (pending > 0 && !rejectPending) return true
+      throw new Error('hosted_owner_v2_activation_effect_input')
+    } catch (error) { this.destroy(error as Error); return false }
   }
   pause(): this { this.#paused = true; return this }
   resume(): this { this.#paused = false; this.#schedule(); return this }

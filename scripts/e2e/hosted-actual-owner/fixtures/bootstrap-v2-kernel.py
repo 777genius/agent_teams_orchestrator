@@ -159,6 +159,7 @@ try:
     # Actual FD5 peer used by the retained server tests; relay bytes unchanged.
     activation.setblocking(False)
     outgoing = bytearray()
+    inject = None
     while True:
         bounded()
         readable, writable, _ = select.select([0, activation, pidfd], [activation] if outgoing else [], [], .01)
@@ -168,12 +169,16 @@ try:
             if c is not None:
                 if c.get('close'): break
                 outgoing.extend(base64.b64decode(c['activation']))
+                if c.get('inject'): inject = c['inject']
                 if len(outgoing) > 1024 * 1024: raise ValueError('fixture activation queue overflow')
         if activation in writable:
             try: n = activation.send(outgoing[:37]); del outgoing[:n]
             except BlockingIOError: pass
             except (BrokenPipeError, ConnectionResetError):
                 emit({'type': 'activation_closed'}); break
+        if inject and not outgoing:
+            if inject == 'half-close': activation.shutdown(socket.SHUT_WR)
+            emit({'type': 'injected'}); inject = None
         if activation in readable:
             try: data = activation.recv(65536)
             except BlockingIOError: continue

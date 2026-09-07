@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { processV2, type OwnerV2LaunchSelection } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
 import { canonicalV2, hashV2, OWNER_V2_ROLES } from '../../../src/services/hostedControl/HostedControlBootstrapV2Wire.js'
-import { createHostedApprovalActivationV2Proof } from '../../../src/services/hostedControl/HostedApprovalRuntimeActivation.js'
+import { HOSTED_APPROVAL_ACTIVATION_CAPABILITY, createHostedApprovalActivationV2Proof } from '../../../src/services/hostedControl/HostedApprovalRuntimeActivation.js'
 import { HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256 } from '../../../src/services/hostedControl/HostedApprovalOwnerProvenance.js'
 import { activationGolden, assembleFixtureV2, fixtureHeaderV2 } from '../../../src/services/hostedControl/fixtures/bootstrapV2Producer.js'
 import { OwnedKernelChild, KernelChannel as Channel } from './kernel-fixture-ownership.js'
@@ -151,7 +151,7 @@ function activationFrames(f: Awaited<ReturnType<typeof fixture>>, change?: (bind
   // The publication candidate is available only after the actual socket exists.
   b.signedManifest.manifestDigest = `sha256:${hashV2(JSON.stringify({ format: b.signedManifest.format, ownerBinding: b.ownerBinding }))}`
   change?.(b)
-  const prepare = proof({ schemaVersion: 2, operation: 'approval_activation_prepare', capability: 'agent-teams-hosted-approval-activation-v2', challenge: '3'.repeat(64), binding: b }, 'owner-ready-request')
+  const prepare = proof({ schemaVersion: 2, operation: 'approval_activation_prepare', capability: HOSTED_APPROVAL_ACTIVATION_CAPABILITY, challenge: '3'.repeat(64), binding: b }, 'owner-ready-request')
   const envelope = proof({ schemaVersion: 2, purpose: 'agent-teams.hosted-approval-activation/v2', binding: b, admission: f.globalAdmission }, 'admission')
   const { publicKeyDigest, contractDigest, testOnlyPrivateKeyPkcs8Pem } = activationGolden.signing
   const statement = { schemaVersion: 2, algorithm: 'Ed25519', publicKeyDigest, contractDigest, envelope }
@@ -170,7 +170,58 @@ async function activationLine(channel: Channel): Promise<any> {
     if (bytes.endsWith('\n')) return JSON.parse(bytes)
   }
 }
+function expectResponse(frame: any, kind: 'owner_ready' | 'ready', prepare: string) {
+  const { controllerProof, ...unsigned } = frame
+  expect(frame.schemaVersion).toBe(2)
+  expect(frame.kind).toBe(kind)
+  expect(frame.capability).toBe(HOSTED_APPROVAL_ACTIVATION_CAPABILITY)
+  expect(frame.challenge).toBe(JSON.parse(prepare).challenge)
+  expect(frame.binding).toEqual(JSON.parse(prepare).binding)
+  if (kind === 'ready') expect(frame.activationDigest).toMatch(/^[a-f0-9]{64}$/)
+  expect(controllerProof).toBe(createHostedApprovalActivationV2Proof(
+    Buffer.alloc(32, 42), kind === 'owner_ready' ? 'owner-ready' : 'ready', JSON.stringify(unsigned)))
+}
+async function waitForFile(path: string) {
+  const deadline = performance.now() + 8000
+  while (!existsSync(path)) {
+    if (performance.now() >= deadline) throw new Error('fixture file deadline: ' + path)
+    await new Promise(resolve => setTimeout(resolve, 2))
+  }
+}
 describe('actual inherited Linux bootstrap-v2 descriptors', () => {
+  for (const scenario of ['pretransfer-drift-take', 'pretransfer-drift-close', 'pretransfer-replacement']) {
+    linuxTest(scenario + ' distinguishes ownership from admission and preserves exact FD5 reuse', async () => {
+      const f = await fixture(scenario)
+      try {
+        expect(f.report).toEqual({ ok: true, originalClosed: scenario !== 'pretransfer-replacement',
+          replacementPreserved: true, exactFd: 5 })
+      } finally { await f.close() }
+    })
+  }
+  for (const inject of ['pending', 'half-close']) {
+    linuxTest('leased effect token rejects buffered byte with ' + inject + ' synchronously', async () => {
+      const f = await fixture('activation-effect-' + inject)
+      try {
+        expect(f.report.ok).toBe(true)
+        const frames = activationFrames(f)
+        f.channel.send({ activation: Buffer.from(frames.prepare).toString('base64') })
+        expectResponse(await activationLine(f.channel), 'owner_ready', frames.prepare)
+        f.channel.send({ activation: Buffer.from(frames.publication).toString('base64') })
+        expectResponse(await activationLine(f.channel), 'ready', frames.prepare)
+        writeFileSync(f.result + '.arm', 'arm')
+        await waitForFile(f.result + '.armed')
+        f.channel.send({ activation: Buffer.from('x').toString('base64'), inject })
+        expect((await f.channel.next()).type).toBe('injected')
+        writeFileSync(f.result + '.consume', 'consume')
+        await waitForFile(f.result + '.effect')
+        expect(JSON.parse(readFileSync(f.result + '.effect', 'utf8'))).toEqual({
+          currentBefore: true, consumed: false, repeated: false, resourceCurrent: false,
+        })
+        await f.waitForActivationClose()
+      } finally { await f.close() }
+    })
+  }
+
   linuxTest('early setup failure reaps the immediately registered held child and helper', async () => {
     let childPid = 0
     const before = new Set(owned)
@@ -223,10 +274,10 @@ describe('actual inherited Linux bootstrap-v2 descriptors', () => {
       expect(f.report.repeatedAttachmentRejected).toBe(true)
       const frames = activationFrames(f)
       f.channel.send({ activation: Buffer.from(frames.prepare).toString('base64') })
-      expect((await activationLine(f.channel)).kind).toBe('owner_ready')
+      expectResponse(await activationLine(f.channel), 'owner_ready', frames.prepare)
       expect(existsSync(f.result + '.adopted')).toBe(false)
       f.channel.send({ activation: Buffer.from(frames.publication).toString('base64') })
-      expect((await activationLine(f.channel)).kind).toBe('ready')
+      expectResponse(await activationLine(f.channel), 'ready', frames.prepare)
       expect(readFileSync(f.result + '.adopted', 'utf8')).toBe('verified-before-adoption')
       f.channel.send({ activation: Buffer.from(frames.prepare).toString('base64') })
       await f.waitForActivationClose()
@@ -243,12 +294,15 @@ describe('actual inherited Linux bootstrap-v2 descriptors', () => {
       })
       f.channel.send({ activation: Buffer.from(frames.prepare).toString('base64') })
       if (failure === 'signature') {
-        expect((await activationLine(f.channel)).kind).toBe('owner_ready')
+        expectResponse(await activationLine(f.channel), 'owner_ready', frames.prepare)
         const pub = JSON.parse(frames.publication); pub.authorship.signature = 'A'.repeat(86)
         f.channel.send({ activation: Buffer.from(JSON.stringify(pub) + '\n').toString('base64') })
       }
-      // Wait for the handler to reject; do not make the test pass by closing first.
+      // Exact rejection proves the intended binding/signature boundary was reached.
       await f.waitForActivationClose()
+      expect(readFileSync(f.result + '.rejection', 'utf8')).toContain(failure === 'signature'
+        ? 'hosted_approval_activation_authorship_invalid'
+        : 'hosted_approval_activation_session_binding_mismatch')
     } finally { await f.close() }
     expect(existsSync(f.result + '.adopted')).toBe(false)
   }, 20000)

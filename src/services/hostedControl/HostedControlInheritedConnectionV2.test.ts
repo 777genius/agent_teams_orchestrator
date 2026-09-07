@@ -137,7 +137,7 @@ linuxTest('queue count and frame size reject overflow asynchronously', async () 
   }
 })
 linuxTest('FD substitution cancels pending I/O without reading, writing or closing the replacement', async () => {
-  for (const edge of ['fence', 'read', 'write', 'destroy']) {
+  for (const edge of ['fence', 'effect', 'read', 'write', 'destroy']) {
     const original = pair(), replacement = pair(); let calls = 0, data = 0
     original.connection.on('data', () => data++)
     original.connection.write('old bytes', error => { expect(error).toBeInstanceOf(Error); calls++ })
@@ -148,6 +148,7 @@ linuxTest('FD substitution cancels pending I/O without reading, writing or closi
     expect(io('send', replacement.peer.fd, Buffer.from('new bytes'))).toBe(9)
     if (edge === 'read') original.connection.resume()
     if (edge === 'fence') expect(original.connection.isCurrent()).toBe(false)
+    if (edge === 'effect') expect(original.connection.isEffectCurrent(true)).toBe(false)
     if (edge === 'destroy') original.connection.destroy()
     await until(() => calls === 1)
     original.connection.destroy()
@@ -169,4 +170,32 @@ linuxTest('end flushes accepted bytes before half-close and still observes peer 
   expect(bytes).toBe('final'); expect(connection.destroyed).toBe(false)
   peer.close(); connection.resume()
   await until(() => connection.destroyed)
+})
+
+linuxTest('effect observation sees buffered SHUT_WR and full close without consuming bytes first', () => {
+  for (const halfClose of [true, false]) {
+    const { connection, peer } = pair()
+    expect(io('send', peer.fd, Buffer.from('x'))).toBe(1)
+    if (halfClose) expect(native!.symbols.shutdown(peer.fd, 1)).toBe(0)
+    else peer.close()
+    // Even non-leased effects must observe shutdown behind buffered input.
+    expect(connection.isEffectCurrent(false)).toBe(false)
+    expect(connection.destroyed).toBe(true)
+  }
+})
+linuxTest('only the leased effect fence rejects pending input; framed exchange stays readable', async () => {
+  const { connection, peer } = pair(), frames: Buffer[] = []
+  const frame = Buffer.from('{"prepare":1}\n')
+  expect(io('send', peer.fd, frame)).toBe(frame.length)
+  expect(connection.isCurrent()).toBe(true)
+  expect(connection.isEffectCurrent(false)).toBe(true)
+  connection.on('data', bytes => frames.push(bytes)); connection.resume()
+  await until(() => Buffer.concat(frames).length === frame.length)
+  expect(Buffer.concat(frames)).toEqual(frame)
+  connection.pause()
+  expect(connection.isEffectCurrent(true)).toBe(true)
+  expect(io('send', peer.fd, Buffer.from('x'))).toBe(1)
+  expect(connection.isCurrent()).toBe(true)
+  expect(connection.isEffectCurrent(true)).toBe(false)
+  expect(connection.destroyed).toBe(true)
 })
