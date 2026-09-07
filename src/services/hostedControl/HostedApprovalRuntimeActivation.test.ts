@@ -657,7 +657,7 @@ test('production unwrap verifies a fresh Ed25519 signer with explicit pins and p
     expect(() => verifyProduction(createHostedApprovalActivationV2PinsForTest(pins) as typeof pins)).toThrow(/pins_unavailable/)
     const tampered = JSON.parse(source)
     tampered.authorship.signature = Buffer.alloc(64).toString('base64url')
-    expect(() => unwrapHostedApprovalActivation(JSON.stringify(tampered), fixture.proofKeyHex, expectation(fixture.binding), pins)).toThrow(/authorship_invalid/)
+    expect(() => unwrapHostedApprovalActivation(JSON.stringify(tampered) + '\n', fixture.proofKeyHex, expectation(fixture.binding), pins)).toThrow(/authorship_invalid/)
     expect(() => unwrapHostedApprovalActivation(source, fixture.proofKeyHex, expectation(fixture.binding))).toThrow(/pins_unavailable/)
     process.env[names[0]!] = fixture.publicKeySpkiDer
     process.env[names[1]!] = fixture.contractDigest

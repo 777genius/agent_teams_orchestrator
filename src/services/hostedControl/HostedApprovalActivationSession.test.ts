@@ -600,7 +600,7 @@ test('production factories retain explicit validated pins before prepare and acr
         if (mismatch !== 'none') {
           await expect(session.activate(harness.golden.prepare.transportBytes)).rejects.toThrow(/pin/)
           expect(recovered).toBe(0)
-          expect(harness.port.lifecycle.status).toBe('inactive')
+          expect(harness.port.lifecycle.status).toBe(deferred ? 'revoked' : 'inactive')
         } else {
           expect(await session.activate(harness.golden.prepare.transportBytes)).toBe(harness.golden.ready.transportBytes)
           expect(recovered).toBe(1)
