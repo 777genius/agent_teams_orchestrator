@@ -53,3 +53,111 @@ jobs:
 
       - name: Build dev runtime
         run: bun run build:dev
+
+  opencode-authority:
+    name: OpenCode selected authority (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test selected authority and sandbox lifecycle
+        run: bun run test:opencode-authority
+
+  opencode-conformance:
+    name: OpenCode ${{ matrix.version }} conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            version: '1.18.4'
+            asset: opencode-linux-x64.tar.gz
+            archiveSha256: bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174
+          - os: ubuntu-latest
+            version: '1.18.29'
+            asset: opencode-linux-x64.tar.gz
+            archiveSha256: ea800b7ff56226b70952126c9fc1e2517ca4c4b5682fd9d3f9e87449697a1194
+          - os: windows-latest
+            version: '1.18.29'
+            asset: opencode-windows-x64.zip
+            archiveSha256: b32618aa3d1415f6e4f473aec248edef25759203fb707d7d968359d86d4a35ee
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Download and verify pinned OpenCode archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED_VERSION: ${{ matrix.version }}
+          PINNED_ASSET: ${{ matrix.asset }}
+          PINNED_SHA256: ${{ matrix.archiveSha256 }}
+        run: |
+          $binaryRoot = Join-Path $env:RUNNER_TEMP 'opencode-authority-binary-TEST'
+          New-Item -ItemType Directory -Path $binaryRoot | Out-Null
+          gh release download "v$env:PINNED_VERSION" --repo anomalyco/opencode --pattern $env:PINNED_ASSET --dir $binaryRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned download failed' }
+          $archive = Join-Path $binaryRoot $env:PINNED_ASSET
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:PINNED_SHA256) { throw 'Pinned archive digest mismatch' }
+          if ($IsWindows) {
+            Expand-Archive -Path $archive -DestinationPath $binaryRoot
+            $binary = Join-Path $binaryRoot 'opencode.exe'
+          } else {
+            tar -xzf $archive -C $binaryRoot
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned extraction failed' }
+            $binary = Join-Path $binaryRoot 'opencode'
+          }
+          "AUTHORITY_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "AUTHORITY_BINARY_SHA256=$((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Test harness and real OpenCode without inference
+        shell: pwsh
+        env:
+          PINNED_VERSION: ${{ matrix.version }}
+        run: |
+          bun test scripts/opencode-authority-conformance.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Conformance harness tests failed' }
+          foreach ($permissionMode in @('auto', 'manual')) {
+            bun scripts/opencode-authority-conformance.ts $env:AUTHORITY_BINARY $env:PINNED_VERSION $env:AUTHORITY_BINARY_SHA256 $permissionMode > "conformance-$permissionMode.json"
+            if ($LASTEXITCODE -ne 0) { throw "Real OpenCode $permissionMode conformance failed" }
+          }
+          if (-not $IsWindows) {
+            bun scripts/opencode-permission-conformance.ts $env:AUTHORITY_BINARY $env:PINNED_VERSION $env:AUTHORITY_BINARY_SHA256 > conformance-permission.json
+            if ($LASTEXITCODE -ne 0) { throw 'Real permission engine conformance failed' }
+          }
+      - name: Full selected authority with connected MCP in isolated container
+        if: runner.os == 'Linux'
+        shell: pwsh
+        env:
+          PINNED_VERSION: ${{ matrix.version }}
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed' }
+          bun build scripts/opencode-selected-authority-conformance.ts --target=bun --packages=bundle --define 'process.env.USER_TYPE="external"' --outfile=selected-authority-harness.js
+          if ($LASTEXITCODE -ne 0) { throw 'Selected authority harness build failed' }
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,size=512m --memory 1g --cpus 1 -v "${env:GITHUB_WORKSPACE}/selected-authority-harness.js:/harness.js:ro" -v "${env:AUTHORITY_BINARY}:/opencode:ro" oven/bun@sha256:0733e50325078969732ebe3b15ce4c4be5082f18c4ac1a0f0ca4839c2e4e42a7 bun /harness.js /opencode $env:PINNED_VERSION $env:AUTHORITY_BINARY_SHA256 > conformance-selected-authority.json
+          if ($LASTEXITCODE -ne 0) { throw 'Full selected authority conformance failed' }
+      - name: Upload conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-conformance-${{ matrix.os }}-${{ matrix.version }}
+          path: conformance-*.json
+          if-no-files-found: ignore

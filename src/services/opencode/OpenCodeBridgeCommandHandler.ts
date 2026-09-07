@@ -2653,13 +2653,14 @@ async function runReadiness(
             ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
             : ` (${diagnostic.check})`
       }
-      const refreshedBefore = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+      const refreshedBefore = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
-      })
+        phaseContext,
+      }))
       if (!refreshedBefore) {
         throw new Error(`OpenCode selected readiness host/config/auth/project/MCP authority is unavailable${authorityDiagnostic}`)
       }
@@ -2669,13 +2670,14 @@ async function runReadiness(
         runtimeDeadline,
         cleanupSuccessfulSession: true,
       })
-      const refreshedAfter = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
+      const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
-      })
+        phaseContext,
+      }))
       if (!refreshedAfter) {
         throw new Error(`OpenCode selected readiness authority changed during execution proof${authorityDiagnostic}`)
       }

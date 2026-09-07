@@ -77,9 +77,8 @@ import type {
   OpenCodeToolApprovalMode,
 } from './types.js'
 
-export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
-export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
-export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
+import { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME, OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeAgentNames.js'
+export { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME, OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeAgentNames.js'
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
 const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
@@ -1934,6 +1933,8 @@ export async function resolveOpenCodeProfileScope(input: {
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
+  // Authority refresh reads scope without publishing a preparation snapshot.
+  cacheSnapshot?: boolean
 }): Promise<OpenCodeProfileScope> {
   const inputEnv = input.env ?? process.env
   const retainedScopeEnvironment = asRecord(safeParseJSONC(
@@ -2077,7 +2078,7 @@ export async function resolveOpenCodeProfileScope(input: {
     selectedAuthIdentity: selectedAuth.identity,
     scopeToken,
   }
-  if (!openCodeEffectiveConfigSnapshots.has(scopeToken)) {
+  if (input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
     openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
       projectPath,
       importedRuntimeConfig,

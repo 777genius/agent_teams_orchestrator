@@ -1,3 +1,4 @@
+import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { expect, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -51,6 +52,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
     let saved: OpenCodeSessionRecord | null = null
     let writes = 0
     let broadReads = 0
+    let agentReads = 0
     let reads = 0
     let released = 0
     let prompts = 0
@@ -83,6 +85,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
       },
       clientFactory: { create: () => ({
         getConfig: async () => { reads += 1; return liveConfig },
+        listAgents: async () => { agentReads += 1; return effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME) },
         createSession: async () => { sessionsCreated += 1; return { id: 'selected-session' } },
         getSessionMessages: async () => { messageReads += 1; return [] },
         getSessionStatus: async () => ({}), getPermissions: async () => [],
@@ -122,6 +125,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
       expect(writes).toBe(beforeRefreshWrites)
     }
     expect(reads).toBe(21)
+    expect(agentReads).toBe(reads)
     expect(prompts).toBe(5)
     expect(previews).toBe(5)
     expect(broadReads).toBe(0)
