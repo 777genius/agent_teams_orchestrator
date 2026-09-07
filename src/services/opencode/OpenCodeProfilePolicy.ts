@@ -13,7 +13,17 @@ export type OpenCodeProfilePolicyPlan = {
 const KIRO_PLUGIN = 'opencode-kiro@0.4.0'
 const CURSOR_PLUGIN = '@rama_nigg/open-cursor@2.5.2'
 
-export function planOpenCodeProfilePolicy(input: OpenCodeProfileScope): OpenCodeProfilePolicyPlan {
+/**
+ * `cursorManagedPlugin` replaces the upstream package with an app-built artifact
+ * that carries the managed Stop control. It is only supplied once the staged
+ * assets verify, so an unavailable artifact keeps today's upstream behaviour.
+ */
+export type OpenCodeProfilePolicyOverrides = { cursorManagedPlugin?: string | null }
+
+export function planOpenCodeProfilePolicy(
+  input: OpenCodeProfileScope,
+  overrides: OpenCodeProfilePolicyOverrides = {},
+): OpenCodeProfilePolicyPlan {
   const providerId = canonicalizeOpenCodeProviderId(input.providerId)
   const configFingerprint = input.configFingerprint.trim()
   const selectedAuthIdentity = input.selectedAuthIdentity?.trim()
@@ -44,7 +54,7 @@ export function planOpenCodeProfilePolicy(input: OpenCodeProfileScope): OpenCode
       providerId === 'kiro'
         ? [KIRO_PLUGIN]
         : providerId === 'cursor-acp'
-          ? [CURSOR_PLUGIN]
+          ? [overrides.cursorManagedPlugin?.trim() || CURSOR_PLUGIN]
           : [],
     reconcileAuth: input.purpose !== 'catalog',
   }

@@ -59,6 +59,20 @@ import {
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  CURSOR_MANAGED_ASSET_ROOT_ENV,
+  type OpenCodeCursorManagedAssets,
+  resolveOpenCodeCursorManagedAssets,
+} from './OpenCodeCursorManagedAssets.js'
+import {
+  applyCursorManagedProxyEndpoint,
+  CURSOR_MANAGED_PROXY_PORT_ENV,
+  reserveCursorManagedProxyPort,
+} from './OpenCodeCursorManagedPort.js'
+import {
+  buildCursorReadinessFingerprint,
+  reconcileCursorNativeAuthority,
+} from './OpenCodeCursorNativeAuthority.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
@@ -878,6 +892,8 @@ export async function areOpenCodeManagedPluginCachesReady(
 interface OpenCodeNativeCliCredentialBridge {
   binPath: string
   cursorAgentExecutablePath: string
+  /** The unwrapped native command, stable across profile preparations. */
+  cursorAgentHostCommand: string
   kiroCliExecutablePath: string
   hostHomePath: string
 }
@@ -900,6 +916,7 @@ type CursorAgentAuthProbe = (
   abortSignal?: AbortSignal,
 ) => Promise<boolean>
 
+const CURSOR_SIGNED_OUT_PATTERN = /\bnot logged in\b|"authenticated"\s*:\s*false/i
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
 const CURSOR_AGENT_AUTH_MARKER_TTL_MS = 30 * 60 * 1000
 const CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS = 60 * 1000
@@ -974,7 +991,9 @@ const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platfo
         shell: platform === 'win32',
       },
       (error, stdout, stderr) => {
-        resolve(!error && /\blogged in\b/i.test(`${stdout}\n${stderr}`))
+        // "Not logged in" also contains "logged in": a signed-out CLI must not pass.
+        const output = `${stdout}\n${stderr}`
+        resolve(!error && /\blogged in\b/i.test(output) && !CURSOR_SIGNED_OUT_PATTERN.test(output))
       },
     )
   })
@@ -1250,10 +1269,49 @@ function escapeWindowsBatchValue(value: string): string {
   return value.replaceAll('%', '%%')
 }
 
+/** Keeps the unscoped plugin list in step with the scoped policy override. */
+function substituteCursorManagedPlugin(
+  plugins: readonly string[],
+  assets: OpenCodeCursorManagedAssets | null,
+): string[] {
+  if (!assets) return [...plugins]
+  return plugins.map(plugin =>
+    plugin.startsWith('@rama_nigg/open-cursor') ? assets.pluginEntryPath : plugin)
+}
+
+const CURSOR_MANAGED_ASSET_CACHE_TTL_MS = 30_000
+let cursorManagedAssetCache:
+  | { at: number; key: string; assets: OpenCodeCursorManagedAssets | null }
+  | null = null
+
+/**
+ * Verification hashes the staged artifact, so repeated profile preparations reuse
+ * a short-lived result instead of re-reading it on every launch.
+ */
+async function resolveManagedCursorAssets(
+  runtimeEnv: NodeJS.ProcessEnv,
+): Promise<OpenCodeCursorManagedAssets | null> {
+  // Keyed by the staging root: a cache that ignored it would answer for another
+  // profile's assets, or keep denying after staging became available.
+  const key = `${runtimeEnv[CURSOR_MANAGED_ASSET_ROOT_ENV] ?? ''}|${process.platform}|${process.arch}`
+  if (cursorManagedAssetCache && cursorManagedAssetCache.key === key
+    && Date.now() - cursorManagedAssetCache.at < CURSOR_MANAGED_ASSET_CACHE_TTL_MS) {
+    return cursorManagedAssetCache.assets
+  }
+  // Explicit staging only. A conventional in-repo default would make managed
+  // Cursor depend on whether a developer happened to stage assets locally.
+  const result = await resolveOpenCodeCursorManagedAssets({ env: runtimeEnv })
+    .catch(() => ({ available: false as const, reason: 'not_staged' as const }))
+  const assets = result.available ? result.assets : null
+  cursorManagedAssetCache = { at: Date.now(), key, assets }
+  return assets
+}
+
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  cursorManagedAssets: OpenCodeCursorManagedAssets | null = null,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
   const hostHomePath = (
     platform === 'win32'
@@ -1315,6 +1373,16 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
             'fi',
           ]
         : []),
+      ...(command === 'cursor-agent' && cursorManagedAssets && platform === 'darwin'
+        ? [
+          // Only managed requests carry a report path; probes keep the direct exec.
+          'if [ -n "${CURSOR_SUPERVISOR_REPORT:-}" ]; then',
+          `  exec ${quotePosixShellValue(cursorManagedAssets.interpreterPath)}`
+            + ` ${quotePosixShellValue(cursorManagedAssets.supervisorPath)}`
+            + ` ${quotePosixShellValue(hostCommand)} "$@"`,
+          'fi',
+        ]
+        : []),
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
@@ -1327,7 +1395,10 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     writeBridge('cursor-agent'),
     writeBridge('kiro-cli'),
   ])
-  return { binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath }
+  return {
+    binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath,
+    cursorAgentHostCommand: cursorAgentCommand,
+  }
 }
 
 function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> {
@@ -2445,8 +2516,18 @@ export class OpenCodeProfileManager {
     const managedPaths = configSnapshot?.managedPaths ?? this.paths
     const runtimeEnv = configSnapshot?.runtimeEnv ?? process.env
     const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
+    // Verified staging is the only switch that turns on the managed Cursor path.
+    // Anything unavailable keeps the upstream plugin and today's launch behaviour.
+    const wantsCursorManagedAssets = options.profileScope
+      ? canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp'
+      : options.includeManagedSubscriptionPlugins !== false
+    const cursorManagedAssets = wantsCursorManagedAssets
+      ? await resolveManagedCursorAssets(runtimeEnv)
+      : null
     const policy = options.profileScope
-      ? planOpenCodeProfilePolicy(options.profileScope)
+      ? planOpenCodeProfilePolicy(options.profileScope, {
+          cursorManagedPlugin: cursorManagedAssets?.pluginEntryPath ?? null,
+        })
       : null
     const profileRootKey = policy
       ? hashString(JSON.stringify({
@@ -2530,7 +2611,10 @@ export class OpenCodeProfileManager {
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
       ?? (options.includeManagedSubscriptionPlugins === false
         ? []
-        : getOpenCodeManagedSubscriptionPluginPackages())
+        : substituteCursorManagedPlugin(
+          getOpenCodeManagedSubscriptionPluginPackages(),
+          cursorManagedAssets,
+        ))
     if (policy || managedSubscriptionPlugins.length > 0) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
@@ -2540,6 +2624,17 @@ export class OpenCodeProfileManager {
         policy.scope.providerId,
         managedSubscriptionPlugins,
       )
+    }
+    // Retained per profile so the managed config fingerprint stays stable across
+    // preparations and an existing host keeps serving the same endpoint.
+    const cursorManagedControlDirectory = cursorManagedAssets
+      ? path.join(profileRootPath, 'cursor-control')
+      : null
+    const cursorManagedProxyPort = cursorManagedControlDirectory
+      ? await reserveCursorManagedProxyPort(path.join(cursorManagedControlDirectory, 'proxy-port.json'))
+      : null
+    if (cursorManagedProxyPort) {
+      applyCursorManagedProxyEndpoint(managedConfig, cursorManagedProxyPort)
     }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: managedPaths.data,
@@ -2593,6 +2688,8 @@ export class OpenCodeProfileManager {
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
         profileRootPath,
         runtimeEnv,
+        process.platform,
+        cursorManagedAssets,
       )
     }
     enterStep('coordinate shared node_modules')
@@ -2635,6 +2732,36 @@ export class OpenCodeProfileManager {
         peerManagedAuthPaths: await this.listManagedAuthPaths(managedPaths.data),
         abortSignal: options.abortSignal,
       })
+    }
+    // A stale readiness answer must not survive a Cursor account switch or a
+    // replaced binary, which the auth marker's TTL alone cannot notice.
+    let cursorReadinessFingerprint: string | null = null
+    if (nativeCliCredentialBridge && cursorManagedControlDirectory && cursorManagedProxyPort) {
+      enterStep('bind native Cursor authority')
+      const hostCommand = nativeCliCredentialBridge.cursorAgentHostCommand
+      const authority = await reconcileCursorNativeAuthority({
+        statePath: path.join(cursorManagedControlDirectory, 'native-authority.json'),
+        executablePath: path.isAbsolute(hostCommand)
+          ? hostCommand
+          : Bun.which(hostCommand) ?? hostCommand,
+        probeExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
+        abortSignal: options.abortSignal,
+      }).catch(() => ({ authority: null, state: 'signed-out' as const }))
+      if (authority.state === 'account-changed' || authority.state === 'executable-changed') {
+        await Promise.all([globalAuthPath, managedAuthPath].map(authPath =>
+          removeOpenCodeAuthCredential({
+            authPath, abortSignal: options.abortSignal, providerId: 'cursor-acp',
+          }).catch(() => undefined)))
+      }
+      if (authority.authority && cursorManagedAssets) {
+        cursorReadinessFingerprint = buildCursorReadinessFingerprint({
+          authority: authority.authority,
+          assetsFingerprint: cursorManagedAssets.fingerprint,
+          profileScopeToken: policy?.scope.scopeToken ?? profileRootKey,
+          managedConfigFingerprint,
+          proxyPort: cursorManagedProxyPort,
+        })
+      }
     }
     if (nativeCliCredentialBridge) {
       enterStep('probe native provider credentials')
@@ -2725,6 +2852,14 @@ export class OpenCodeProfileManager {
         runtimeEnv.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
         nativeCliCredentialBridge.cursorAgentExecutablePath
+    }
+    if (cursorManagedControlDirectory && cursorManagedProxyPort) {
+      env.AGENT_TEAMS_CURSOR_CONTROL_DIR = cursorManagedControlDirectory
+      env.AGENT_TEAMS_CURSOR_PROFILE_SCOPE = policy?.scope.scopeToken ?? profileRootKey
+      env[CURSOR_MANAGED_PROXY_PORT_ENV] = String(cursorManagedProxyPort)
+      if (cursorReadinessFingerprint) {
+        env.AGENT_TEAMS_CURSOR_READINESS = cursorReadinessFingerprint
+      }
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
