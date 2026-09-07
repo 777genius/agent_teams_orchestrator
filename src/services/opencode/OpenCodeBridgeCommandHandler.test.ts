@@ -23,6 +23,7 @@ import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -158,7 +159,7 @@ function expectedFingerprintForModel(
   const fullModelId = model.includes('/') ? model : `openrouter/${model}`
   const providerId = fullModelId.slice(0, fullModelId.indexOf('/')).toLowerCase()
   return computeOpenCodeExpectedBehaviorFingerprint({
-    canonicalProjectPathFingerprint: hash('/tmp/project'),
+    canonicalProjectPathFingerprint: hash(normalizeOpenCodeProjectIdentity('/tmp/project')),
     modelProviderId: providerId,
     fullModelId: `${providerId}${fullModelId.slice(fullModelId.indexOf('/'))}`,
     projectBehaviorFingerprint: 'b'.repeat(64),
@@ -909,6 +910,21 @@ function createDeferred<T>() {
     reject = nextReject
   })
   return { promise, resolve, reject }
+}
+
+async function waitForCommandStage(
+  stage: Promise<void>,
+  command: ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>,
+  stageName: string,
+): Promise<void> {
+  await Promise.race([
+    stage,
+    command.then(result => {
+      throw new Error(`Command settled before ${stageName}: ${
+        'error' in result ? result.error.message : 'completed successfully'
+      }`)
+    }),
+  ])
 }
 
 type ManualTimer = { callback: () => void; timeoutMs: number; cancelled: boolean }
@@ -3866,6 +3882,26 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
+  test('reports rejected preflight instead of waiting for an unreached launch stage', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot, host: snapshot.host, release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    await withManualTimers(async () => {
+      const envelope = buildEnvelope('opencode.launchTeam', {
+        runId: 'run-rejected-preflight', laneId: 'primary', teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free', members: [{ name: 'alice' }],
+      })
+      ;(envelope.body.preconditions as Record<string, unknown>).expectedBehaviorFingerprint =
+        '0'.repeat(64)
+      const command = executeOpenCodeBridgeCommandEnvelope(envelope)
+      await expect(waitForCommandStage(
+        createDeferred<void>().promise, command, 'bootstrap injection',
+      )).rejects.toThrow(
+        'Command settled before bootstrap injection: OpenCode strict launch behavior precondition mismatch',
+      )
+    })
+  })
+
   test('waits for tracked cancellation cleanup before bounded owner release', async () => {
     const realNow = Date.now
     const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
@@ -3935,7 +3971,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         })
         envelope.timeoutMs = 1_000
         const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-        await injectionStarted.promise
+        await waitForCommandStage(injectionStarted.promise, resultPromise, 'bootstrap injection')
         const workTimer = timers.find(timer => !timer.cancelled && timer.timeoutMs === 750)
         expect(workTimer).toBeDefined()
         now = 1_750
@@ -4534,7 +4570,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       })
       envelope.timeoutMs = 1_000
       const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-      await refreshStarted.promise
+      await waitForCommandStage(refreshStarted.promise, resultPromise, 'authority refresh')
       expect(refreshSignal).not.toBeNull()
       const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
       expect(workTimer).toBeDefined()

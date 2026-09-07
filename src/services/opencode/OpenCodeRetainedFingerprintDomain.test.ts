@@ -10,6 +10,30 @@ import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
+async function stopFixtureChild(child: ChildProcess): Promise<void> {
+  // Failed spawns have no PID and emit close, but never exit.
+  if (child.pid == null || child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve, reject) => {
+    const onExit = () => {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit)
+      reject(new Error(`Fixture child ${child.pid} did not exit within 2000 ms after SIGKILL`))
+    }, 2000)
+    child.once('exit', onExit)
+    try {
+      child.kill('SIGKILL')
+    } catch (error) {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      reject(error)
+    }
+  })
+}
+
 // A fake HTTP binary tests our real registry/reader/bridge, not upstream conformance.
 test('fresh selected sessions retain the managed fingerprint domain', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-fingerprint-domain-TEST-'))
@@ -103,9 +127,7 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     expect(children).toHaveLength(1)
     // The same stale record with an actually dead, fixture-owned PID must be replaced.
     const oldChild = children[0]
-    const exited = new Promise<void>(resolve => oldChild.once('exit', () => resolve()))
-    oldChild.kill('SIGKILL')
-    await exited
+    await stopFixtureChild(oldChild)
     const fresh = await probeFor(managers()).probeRetainingHost(project, { selectedModel })
     expect(fresh.snapshot.hostHealthy).toBe(true)
     expect(fresh.host?.pid).not.toBe(record.runtimePid!)
@@ -113,16 +135,15 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     expect(children).toHaveLength(2)
     await fresh.release(true)
   } finally {
-    await Promise.all(children.map(async child => {
-      if (child.exitCode !== null || child.signalCode !== null) return
-      const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
-      child.kill('SIGKILL')
-      await exited
-    }))
-    for (const key of keys) {
-      if (original[key] === undefined) delete process.env[key]
-      else process.env[key] = original[key]
+    try {
+      await Promise.all(children.map(stopFixtureChild))
+    } finally {
+      for (const key of keys) {
+        if (original[key] === undefined) delete process.env[key]
+        else process.env[key] = original[key]
+      }
     }
+    // Preserve the sandbox for diagnosis if a fixture child failed to exit.
     await rm(root, { recursive: true, force: true })
   }
 }, 20_000)

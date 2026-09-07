@@ -18,6 +18,30 @@ function fixtureProviders(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
+async function stopFixtureChild(child: ChildProcess): Promise<void> {
+  // Failed spawns have no PID and emit close, but never exit.
+  if (child.pid == null || child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve, reject) => {
+    const onExit = () => {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit)
+      reject(new Error(`Fixture child ${child.pid} did not exit within 2000 ms after SIGKILL`))
+    }, 2000)
+    child.once('exit', onExit)
+    try {
+      child.kill('SIGKILL')
+    } catch (error) {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      reject(error)
+    }
+  })
+}
+
 // A fake HTTP binary tests our real registry/reader/bridge, not upstream conformance.
 test('selected persistent host adopts through real HTTP authority and remains stoppable after drift', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-selected-adoption-TEST-'))
@@ -224,16 +248,15 @@ test('selected persistent host adopts through real HTTP authority and remains st
     const registry = JSON.parse(await readFile(registryPath, 'utf8'))
     expect(registry.hosts[first.hostKey].resolvedConfigFingerprint).toBe(profile.managedConfigFingerprint)
   } finally {
-    await Promise.all(children.map(async child => {
-      if (child.exitCode !== null || child.signalCode !== null) return
-      const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
-      child.kill('SIGKILL')
-      await exited
-    }))
-    for (const key of keys) {
-      if (original[key] === undefined) delete process.env[key]
-      else process.env[key] = original[key]
+    try {
+      await Promise.all(children.map(stopFixtureChild))
+    } finally {
+      for (const key of keys) {
+        if (original[key] === undefined) delete process.env[key]
+        else process.env[key] = original[key]
+      }
     }
+    // Preserve the sandbox for diagnosis if a fixture child failed to exit.
     await rm(root, { recursive: true, force: true })
   }
 }, 20_000)
