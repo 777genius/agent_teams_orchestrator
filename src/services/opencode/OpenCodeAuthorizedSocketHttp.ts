@@ -15,6 +15,8 @@ export type OpenCodeSocketHttpResponse = {
   statusText: string
   headers: Headers
   contentEncoding: string | null
+  responseHeaders?: readonly (readonly [string, string])[]
+  connectedPeer?: { localAddress: string; localPort: number; remoteAddress: string; remotePort: number }
   bytes: Buffer
   complete: boolean
 }
@@ -60,6 +62,7 @@ export function readOpenCodeSocketHttpResponse(
   signal: AbortSignal,
   maximumBytes: number,
   unsafe: (code: string) => void,
+  stream?: { headers(status: number, headers: Headers): void; data(bytes: Uint8Array): void },
 ): { response: Promise<OpenCodeSocketHttpResponse>; cancel(): void } {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > MAX_OPENCODE_SOCKET_HTTP_BODY_BYTES) {
     throw new Error('OpenCode HTTP response bound invalid')
@@ -74,6 +77,7 @@ export function readOpenCodeSocketHttpResponse(
   let version = ''
   let status = 0
   let statusText = ''
+  let responseHeaders: Array<readonly [string, string]> = []
   let headers = new Headers()
   let contentEncoding: string | null = null
   let pending: Buffer = Buffer.alloc(0)
@@ -99,7 +103,7 @@ export function readOpenCodeSocketHttpResponse(
     // runtime must not become unhandled after the response has been retained.
     signal.removeEventListener('abort', aborted)
     socket.destroy()
-    if (status) resolve({ status, statusText, headers, contentEncoding,
+    if (status) resolve({ status, statusText, headers, contentEncoding, responseHeaders: Object.freeze([...responseHeaders]),
       bytes: Buffer.from(body.subarray(0, size)), complete })
     else reject(new Error('OpenCode HTTP response headers incomplete or invalid'))
   }
@@ -108,6 +112,7 @@ export function readOpenCodeSocketHttpResponse(
     const count = Math.min(bytes.length, maximumBytes - size)
     bytes.copy(body, size, 0, count)
     size += count
+    if (count) stream?.data(Buffer.from(bytes.subarray(0, count)))
     if (size && [204, 205, 304].includes(status)) unsafe('unexpected_status_body')
     if (count !== bytes.length) { fail('response_limit'); return false }
     return true
@@ -135,11 +140,15 @@ export function readOpenCodeSocketHttpResponse(
       markUnsafe('invalid_status'); state = 'close'; return true
     }
     headers = new Headers()
+    responseHeaders = []
     const values = new Map<string, string[]>()
     for (const line of fields) {
       const parsed = field(line)
       if (!parsed || ++headerFields > MAX_HEADER_FIELDS) { fail('invalid_headers'); return false }
       const [name, value] = parsed
+      if (name === 'content-encoding' || name === 'x-agent-teams-hosted-operation-nonce') {
+        responseHeaders.push(Object.freeze([name, value] as const))
+      }
       const list = values.get(name) ?? []
       list.push(value); values.set(name, list)
       if (name === 'content-encoding') contentEncoding = list.join(', ')
@@ -170,6 +179,7 @@ export function readOpenCodeSocketHttpResponse(
     else if (lengths.length) {
       remaining = Number(lengths[0]); state = remaining === 0 ? 'done' : 'length'
     } else state = 'close'
+    stream?.headers(status, new Headers(headers))
     return true
   }
   const data = (chunk: Buffer) => {

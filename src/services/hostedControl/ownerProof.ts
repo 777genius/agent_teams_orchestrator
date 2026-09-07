@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import { closeSync, fstatSync, lstatSync, openSync, realpathSync } from 'node:fs'
 import { constants, type FileHandle, lstat, open, realpath } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import {
@@ -73,6 +74,47 @@ export async function validateHostedControlOwnerBinding(input: {
     return !input.expectedRootIdentity || JSON.stringify(current.rootIdentity) === JSON.stringify(input.expectedRootIdentity)
   } catch {
     return false
+  }
+}
+
+/** Final native provider fence: compare the already admitted root identities in
+ * the same synchronous stack as token consumption. No async result is reused as
+ * proof that a pathname still names its admitted directory. */
+export function validateHostedControlOwnerBindingSync(input: {
+  claudeRoot: string
+  legacyKey: string
+  expectedRootIdentity: { claudeRoot: [number, number]; teamRoot: [number, number] }
+}): boolean {
+  const descriptors: number[] = []
+  try {
+    if (!/^[a-zA-Z0-9_-]+$/.test(input.legacyKey)) return false
+    const root = realpathSync(input.claudeRoot)
+    if (root !== input.claudeRoot) return false
+    const paths = [root, join(root, 'teams'), join(root, 'teams', input.legacyKey)]
+    const uid = process.getuid?.()
+    const identities = paths.map((path, index) => {
+      const linked = lstatSync(path)
+      if (!linked.isDirectory() || linked.isSymbolicLink()) throw new Error('owner_root_changed')
+      // Every descendant opens relative to its actual retained parent descriptor.
+      const anchored = index === 0 ? path : `/proc/self/fd/${descriptors[index - 1]}/${index === 1 ? 'teams' : input.legacyKey}`
+      const fd = openSync(anchored, constants.O_RDONLY | constants.O_DIRECTORY | O_NOFOLLOW)
+      descriptors.push(fd)
+      const stat = fstatSync(fd)
+      if (!stat.isDirectory() || linked.dev !== stat.dev || linked.ino !== stat.ino ||
+        (uid !== undefined && stat.uid !== uid)) throw new Error('owner_root_changed')
+      return [stat.dev, stat.ino] as [number, number]
+    })
+    for (let index = 0; index < paths.length; index++) {
+      const linked = lstatSync(paths[index]!)
+      if (!linked.isDirectory() || linked.isSymbolicLink() ||
+        linked.dev !== identities[index]![0] || linked.ino !== identities[index]![1]) return false
+    }
+    return identities[0]![0] === input.expectedRootIdentity.claudeRoot[0] &&
+      identities[0]![1] === input.expectedRootIdentity.claudeRoot[1] &&
+      identities[2]![0] === input.expectedRootIdentity.teamRoot[0] &&
+      identities[2]![1] === input.expectedRootIdentity.teamRoot[1]
+  } catch { return false } finally {
+    for (const fd of descriptors.reverse()) closeSync(fd)
   }
 }
 

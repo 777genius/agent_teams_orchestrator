@@ -1,3 +1,8 @@
+import { isOpenCodeMcpManagerBoundToCustody } from './OpenCodeMcpManager.js'
+import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy } from './OpenCodeSupervisedHostCustody.js'
+import { createOpenCodeSupervisedInventory } from './OpenCodeSupervisedInventory.js'
+import { OpenCodeClientFactory, isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
+import { isOpenCodeHostManagerBoundToCustody } from './OpenCodeHostManager.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   createOpenCodePreflightHostLeaseInput,
@@ -19,6 +24,7 @@ import type {
 } from './types.js'
 
 type OpenCodeProvisioningProbeDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   inventoryService?: Pick<typeof openCodeInventoryService, 'probe'>
   hostManager?: Pick<
     typeof openCodeHostManager,
@@ -74,7 +80,39 @@ function hasPrimaryTeammateAgent(
 export class OpenCodeProvisioningProbe {
   private readonly cache = new Map<string, CacheEntry>()
 
-  constructor(private readonly deps: OpenCodeProvisioningProbeDeps = {}) {}
+  private readonly deps: OpenCodeProvisioningProbeDeps
+  constructor(deps: OpenCodeProvisioningProbeDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy?.mode === 'supervisor-adopt-only') {
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
+      if (new.target !== OpenCodeProvisioningProbe) throw new Error('OpenCode supervised probe implementation substituted')
+      if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
+        !(deps.clientFactory instanceof OpenCodeClientFactory) ||
+        !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) || !deps.mcpManager ||
+        !isOpenCodeMcpManagerBoundToCustody(deps.mcpManager, custody) || deps.inventoryService) {
+        throw new Error('OpenCode supervised provisioning requires custody-bound consumers')
+      }
+      const hosts = deps.hostManager, mcp = deps.mcpManager
+      this.deps = Object.freeze({ acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }),
+        inventoryService: createOpenCodeSupervisedInventory(custody, deps.clientFactory),
+        clientFactory: Object.freeze({ create: deps.clientFactory.create.bind(deps.clientFactory) }),
+        hostManager: Object.freeze({ ensureHost: hosts.ensureHost.bind(hosts), releaseHost: hosts.releaseHost.bind(hosts),
+          releaseHostLease: hosts.releaseHostLease.bind(hosts),
+          refreshResolvedConfigFingerprint: hosts.refreshResolvedConfigFingerprint.bind(hosts) }),
+        mcpManager: Object.freeze({ ensureAppMcp: mcp.ensureAppMcp.bind(mcp) }),
+      })
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeProvisioningProbe.prototype))) {
+        if (name === 'constructor') continue
+        if (typeof descriptor.value === 'function') {
+          Object.defineProperty(this, name, { value: descriptor.value.bind(this) })
+        } else if (descriptor.get) {
+          Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
+        }
+      }
+      Object.freeze(this)
+    } else this.deps = deps
+  }
 
   async probe(
     projectPath?: string | null,
@@ -266,9 +304,10 @@ export class OpenCodeProvisioningProbe {
         appMcp?.summary.status === 'attached'
         || appMcp?.summary.status === 'present'
       ) {
-        host.resolvedConfigFingerprint =
-          (await hostManager.refreshResolvedConfigFingerprint?.(host.hostKey))
-          ?? host.resolvedConfigFingerprint
+        const refreshed = await hostManager.refreshResolvedConfigFingerprint?.(host.hostKey)
+        if (this.deps.acquisitionPolicy?.mode !== 'supervisor-adopt-only') {
+          host.resolvedConfigFingerprint = refreshed ?? host.resolvedConfigFingerprint
+        }
       }
 
       const diagnostics = [...inventory.diagnostics]

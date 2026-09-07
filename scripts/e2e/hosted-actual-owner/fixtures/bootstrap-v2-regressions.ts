@@ -4,6 +4,7 @@ import { dlopen, FFIType, ptr } from 'bun:ffi'
 import type { readHostedControlBootstrapV2 } from '../../../../src/services/hostedControl/HostedControlBootstrapV2.js'
 import type { HostedControlInheritedActivationV2 } from '../../../../src/services/hostedControl/HostedControlInheritedActivationV2.js'
 import type { HostedApprovalActivationConnection } from '../../../../src/services/hostedControl/HostedApprovalActivationSession.js'
+import { retainNativeRawDescriptorV2 } from '../native-raw-descriptor-v2.js'
 
 // Adversarial test actions only. Production never duplicates or changes flags.
 const native = dlopen('libc.so.6', {
@@ -11,6 +12,64 @@ const native = dlopen('libc.so.6', {
   socketpair: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
   dup2: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 })
+export async function checkRawDescriptor(
+  bootstrap: Awaited<ReturnType<typeof readHostedControlBootstrapV2>>, scenario: string,
+) {
+  if (scenario === 'raw-codec-invalid') {
+    assert.throws(() => retainNativeRawDescriptorV2(bootstrap.rawRetention, performance.now() + 5000,
+      bootstrap.expectedHost.activation.controllerNonce))
+    // Even a hash-authenticated prefix must decode before native writer transfer.
+    assert.equal(bootstrap.rawRetention.resource.fd, 8)
+    assert.equal(fstatSync(8).isFile(), true)
+    return
+  }
+  if (scenario === 'raw-prefix-mismatch') {
+    assert.throws(() => retainNativeRawDescriptorV2(bootstrap.rawRetention, performance.now() + 5000), /raw_prefix_changed/)
+    // Rejected prefix never transfers the writer from bootstrap.
+    assert.equal(bootstrap.rawRetention.resource.fd, 8)
+    return
+  }
+  const writer = retainNativeRawDescriptorV2(bootstrap.rawRetention, performance.now() + 5000)
+  assert.throws(() => bootstrap.rawRetention.resource.fd, /descriptor_consumed/)
+  assert.equal(writer.readPrefix().toString(), 'actual inherited prefix\n')
+  writer.readPrefix().fill(0)
+  assert.equal(writer.readPrefix().toString(), 'actual inherited prefix\n')
+  assert.equal(writer.isCurrent(), true)
+  try {
+    if (scenario === 'raw-prefix') {
+      const bytes = Buffer.from('actual append\n')
+      assert.equal(await writer.write(bytes, 0, bytes.length), bytes.length)
+      await writer.sync()
+      assert.equal(writer.isCurrent(), true)
+    } else if (scenario === 'raw-flags') {
+      const flags = native.symbols.fcntl(8, 3, 0)
+      assert.equal(native.symbols.fcntl(8, 4, flags & ~0o2000), 0)
+      assert.equal(writer.isCurrent(), false)
+      assert.equal(native.symbols.fcntl(8, 4, flags), 0)
+      assert.equal(writer.isCurrent(), false)
+      await assert.rejects(writer.write(Buffer.from('x'), 0, 1), /raw_writer_unavailable/)
+    } else if (scenario === 'raw-replacement') {
+      const slots = new Int32Array(2)
+      assert.equal(native.symbols.socketpair(1, 1 | 0x80000, 0, ptr(slots)), 0)
+      try {
+        const replacement = fstatSync(slots[0], { bigint: true })
+        assert.equal(native.symbols.dup2(slots[0], 8), 8)
+        assert.equal(writer.isCurrent(), false)
+        await assert.rejects(writer.close(), /raw_close_changed/)
+        await bootstrap.close()
+        const after = fstatSync(8, { bigint: true })
+        assert.equal(after.dev, replacement.dev); assert.equal(after.ino, replacement.ino)
+      } finally { closeSync(8); closeSync(slots[0]); closeSync(slots[1]) }
+    } else throw new Error('unknown raw descriptor scenario')
+  } finally {
+    if (scenario === 'raw-replacement') await assert.rejects(writer.close(), /raw_close_changed/)
+    else await writer.close()
+  }
+  assert.equal(writer.isCurrent(), false)
+  assert.equal(writer.close(), writer.close())
+  if (scenario === 'raw-replacement') await assert.rejects(writer.close(), /raw_close_changed/)
+  else await writer.close()
+}
 export async function checkPretransfer(
   bootstrap: Awaited<ReturnType<typeof readHostedControlBootstrapV2>>, scenario: string,
 ) {

@@ -1,3 +1,6 @@
+import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy, type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
+import { isOpenCodeHostManagerBoundToCustody } from './OpenCodeHostManager.js'
+import { isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
@@ -68,6 +71,7 @@ const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
 const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   hostManager?: Pick<
     typeof openCodeHostManager,
     'ensureHost' | 'releaseHost' | 'releaseHostLease'
@@ -680,12 +684,56 @@ export class OpenCodeExecutionProbe {
     { expiresAtMs: number, result: OpenCodeExecutionProbeResult }
   >()
 
-  constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
+  private readonly deps: OpenCodeExecutionProbeDeps
+  private readonly custody?: TrustedOpenCodeCustody
+  constructor(deps: OpenCodeExecutionProbeDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy?.mode === 'supervisor-adopt-only') {
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
+      if (new.target !== OpenCodeExecutionProbe) throw new Error('OpenCode supervised probe implementation substituted')
+      if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
+        !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) ||
+        deps.prepareProfile || deps.fanOutOAuthCredential || deps.withOAuthRefreshLock ||
+        deps.cursorNativeFailureProbe || deps.persistentCache || deps.persistentCacheRoot) {
+        throw new Error('OpenCode supervised execution requires custody-bound consumers')
+      }
+      this.custody = custody
+      const hosts = deps.hostManager, clients = deps.clientFactory
+      const translator = deps.eventTranslator ?? openCodeEventTranslator
+      this.deps = Object.freeze({ ...deps,
+        acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }),
+        hostManager: Object.freeze({ ensureHost: hosts.ensureHost.bind(hosts),
+          releaseHost: hosts.releaseHost.bind(hosts), releaseHostLease: hosts.releaseHostLease.bind(hosts) }),
+        clientFactory: Object.freeze({ create: clients.create.bind(clients) }),
+        eventTranslator: Object.freeze({ reconcileSessionMessages: translator.reconcileSessionMessages.bind(translator) }),
+        persistentCache: false,
+      })
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeExecutionProbe.prototype))) {
+        if (name === 'constructor') continue
+        if (typeof descriptor.value === 'function') {
+          Object.defineProperty(this, name, { value: descriptor.value.bind(this) })
+        } else if (descriptor.get) {
+          Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
+        }
+      }
+      Object.freeze(this)
+    } else this.deps = deps
+  }
 
   private async prepareProbeProfile(
     params: ProbeModelParams,
     context?: OpenCodePhaseContext,
   ): Promise<OpenCodePreparedProfile> {
+    if (this.custody) {
+      context?.throwIfExpired()
+      if (params.projectPath && params.projectPath !== this.custody.expected.profile.projectPath) {
+        throw new Error('OpenCode supervised execution project mismatch')
+      }
+      // The supervisor owns profile construction and credentials. The probe
+      // uses the same retained profile as sessions and approval effects.
+      return this.custody.readPreparedProfile()
+    }
     const options: OpenCodePrepareProfileOptions = {
       includeAppMcp: false,
       modelOutputLimitOverrides: [
@@ -783,6 +831,7 @@ export class OpenCodeExecutionProbe {
   }
 
   private get cursorNativeFailureProbe() {
+    if (this.custody) return null
     // Custom clients are hermetic unit/fixture probes. The production singleton
     // gets the native Cursor fallback unless a test explicitly injects one.
     if (this.deps.cursorNativeFailureProbe) return this.deps.cursorNativeFailureProbe
@@ -1317,7 +1366,7 @@ export class OpenCodeExecutionProbe {
     cacheFilePath: string | null
   }): Promise<OpenCodeExecutionProbeResult> {
     const providerId = parseProviderScopedModel(input.params.selectedModel).providerID
-    if (providerId !== 'xai') {
+    if (this.custody || providerId !== 'xai') {
       return this.runProbeModelWithHostUnlocked(input)
     }
 
@@ -1357,7 +1406,7 @@ export class OpenCodeExecutionProbe {
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
-      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
+      if (!this.custody && parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
         await this.fanOutOAuthCredential({
           providerId: 'xai',
           sourceAuthPath: host.profile.managedAuthPath,

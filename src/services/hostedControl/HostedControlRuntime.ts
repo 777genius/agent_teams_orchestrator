@@ -1,8 +1,11 @@
 import { join } from 'node:path'
+import type { HostedControlBootstrapAdmissionV2 } from './HostedControlBootstrapV2.js'
+import type { DeferredManifestExpectationV2 } from './HostedApprovalDeferredManifestV2.js'
 import {
   readHostedControlSecret,
   resolveHostedControlOwnerBinding,
   validateHostedControlOwnerBinding,
+  validateHostedControlOwnerBindingSync,
 } from './ownerProof.js'
 import { HostedControlDispatcher } from './HostedControlDispatcher.js'
 import type {
@@ -45,6 +48,8 @@ export type HostedControlRuntimePorts = {
   activationSessionFactory?: HostedApprovalActivationSessionFactory
   /** Synchronously fences the stable approval port; returned work is cleanup only. */
   revoke?(): Promise<void>
+  /** Native provider adoption runs after the retained ready write and lifecycle lease. */
+  activateProviders?(): Promise<void>
   close(): Promise<void>
 }
 
@@ -62,6 +67,13 @@ export type HostedControlRuntimePortFactoryContext = {
   teamRoot: string
   /** Present only for the authenticated inherited-descriptor activation-v2 bootstrap. */
   activationV2?: HostedControlApprovalActivationV2Context
+  nativeActivationV2?: Readonly<{
+    proofKey: Uint8Array
+    expectation: Omit<DeferredManifestExpectationV2, 'ownerBinding'>
+    assertBootstrapCurrent(): boolean | Promise<boolean>
+    assertRootCurrent(): boolean | Promise<boolean>
+    prepareRetainedProviderToken(): { consume(): boolean } | null
+  }>
   isCurrentAuthority(authority: HostedControlAuthority | HostedLifecycleAuthority): Promise<boolean>
 }
 
@@ -83,7 +95,7 @@ export class HostedControlRuntime {
   #portsRevocation: Promise<void> | null = null
 
   constructor(
-    private readonly source: string | HostedControlBootstrapAdmission,
+    private readonly source: string | HostedControlBootstrapAdmission | HostedControlBootstrapAdmissionV2,
     private readonly createPorts: HostedControlRuntimePortFactory,
   ) {}
 
@@ -109,6 +121,7 @@ export class HostedControlRuntime {
 
   async #start(startup: { cancelled: boolean }): Promise<void> {
     const descriptorAdmission = typeof this.source === 'string' ? null : this.source
+    const nativeAdmission = descriptorAdmission && 'protocol' in descriptorAdmission ? descriptorAdmission : null
     if (descriptorAdmission) {
       this.#secret = descriptorAdmission.secret
       this.#descriptorGuard = descriptorAdmission.guard
@@ -145,6 +158,8 @@ export class HostedControlRuntime {
       await rootLease?.acquire()
       this.#rootLease = rootLease
       let startupRecovery = true
+      let nativeProvidersReady = nativeAdmission === null
+      let adoptingNativeProviders = false
       const validateOwner = async (): Promise<boolean> => {
         if (!this.#acceptingEffects) return false
         const validRoot = await validateHostedControlOwnerBinding({
@@ -154,11 +169,12 @@ export class HostedControlRuntime {
         })
         if (!validRoot) return false
         if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) return false
-        return startupRecovery || !!server && await server.hasActiveLease()
+        return startupRecovery || !!server && (!nativeAdmission || server.hasRetainedActivation()) && await server.hasActiveLease()
       }
       const isCurrentAuthority = async (
         candidate: HostedControlAuthority | HostedLifecycleAuthority,
-      ): Promise<boolean> => authorityMatches(candidate, authority) && await validateOwner()
+      ): Promise<boolean> => authorityMatches(candidate, authority) &&
+        (nativeProvidersReady || adoptingNativeProviders) && await validateOwner()
       const assertRootCurrent = async (): Promise<boolean> => {
         if (!this.#acceptingEffects) return false
         return validateHostedControlOwnerBinding({
@@ -172,7 +188,7 @@ export class HostedControlRuntime {
         legacyKey: config.legacyKey,
         authority,
         wal,
-        validateOwner,
+        validateOwner: () => (startupRecovery || nativeProvidersReady) ? validateOwner() : false,
       })
       if (startup.cancelled || this.#descriptorAuthorityLost) {
         throw new Error('Hosted control launcher authority is no longer current')
@@ -195,7 +211,7 @@ export class HostedControlRuntime {
         authority,
         legacyKey: config.legacyKey,
         teamRoot: ownerScope.canonicalTeamRoot,
-        ...(descriptorAdmission ? {
+        ...(descriptorAdmission && !('protocol' in descriptorAdmission) ? {
           activationV2: Object.freeze({
             proofKey: secret,
             expectation: Object.freeze({
@@ -212,12 +228,36 @@ export class HostedControlRuntime {
             assertRootCurrent,
           }),
         } : {}),
+        ...(nativeAdmission ? {
+          nativeActivationV2: Object.freeze({
+            proofKey: secret,
+            expectation: Object.freeze({ authority, socketPath: config.socketPath,
+              ...nativeAdmission.approvalActivationV2 }),
+            assertBootstrapCurrent: () => this.#acceptingEffects &&
+              this.#descriptorGuard === nativeAdmission.guard && nativeAdmission.guard.assertCurrent(),
+            assertRootCurrent,
+            prepareRetainedProviderToken: () => {
+              const rootCurrent = () => validateHostedControlOwnerBindingSync({
+                claudeRoot: config.claudeRoot, legacyKey: config.legacyKey,
+                expectedRootIdentity: ownerScope.rootIdentity,
+              })
+              if (!this.#acceptingEffects || !(nativeProvidersReady || adoptingNativeProviders) || !rootCurrent()) return null
+              const retainedServer = server
+              const token = retainedServer?.prepareRetainedProviderToken()
+              if (!token) return null
+              return Object.freeze({ consume: () => {
+                const current = token.consume()
+                return current && rootCurrent() && this.#acceptingEffects && server === retainedServer &&
+                  (nativeProvidersReady || adoptingNativeProviders)
+              } })
+            },
+          }),
+        } : {}),
         isCurrentAuthority,
       }))
-      // Port composition performs lifecycle recovery before the socket exists.
-      // Keep the exclusive root/descriptor authority usable for that exact
-      // pre-publication interval, then require the live server lease for every
-      // subsequent effect.
+      // Local state recovery is complete. Native provider adoption is deferred
+      // until the retained activation write and separate lifecycle lease; legacy
+      // composition retains its existing pre-publication recovery ordering.
       startupRecovery = false
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       server = new HostedControlServer({
@@ -229,6 +269,29 @@ export class HostedControlRuntime {
         bootstrapBinding: descriptorAdmission?.bootstrapBinding,
         dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
         activationSessionFactory: ports.activationSessionFactory,
+        ...(nativeAdmission ? {
+          activationTransport: 'inherited-v2' as const,
+          isEffectReady: () => this.#acceptingEffects && nativeProvidersReady && !!server?.hasRetainedActivation(),
+          onProviderAuthorityLost: () => {
+            nativeProvidersReady = false
+            this.#acceptingEffects = false
+            // revoke() synchronously cancels admitted provider exchanges and
+            // binding pins; its promise only accounts for subsequent drain.
+            void this.#revokePorts().catch(() => undefined)
+          },
+          onActivationReady: async () => {
+            if (!this.#acceptingEffects || !await server!.hasActiveLease() ||
+              !await nativeAdmission.guard.assertCurrent()) throw new Error('Hosted native activation authority lost')
+            adoptingNativeProviders = true
+            try {
+              if (!ports!.activateProviders) throw new Error('Hosted native provider recovery missing')
+              await ports!.activateProviders()
+              if (!this.#acceptingEffects || !await server!.hasActiveLease() ||
+                !await nativeAdmission.guard.assertCurrent()) throw new Error('Hosted native provider adoption lost authority')
+              nativeProvidersReady = true
+            } finally { adoptingNativeProviders = false }
+          },
+        } : {}),
       })
       dispatcher = new HostedControlDispatcher({
         secret,
@@ -248,9 +311,11 @@ export class HostedControlRuntime {
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       this.#ports = ports
       this.#server = server
+      if (nativeAdmission) server.attachInheritedActivationV2(nativeAdmission.activation)
     } catch (error) {
       this.#acceptingEffects = false
       this.#ports = null
+      this.#server = null
       let revocation: Promise<void> = Promise.resolve()
       try { revocation = ports?.revoke?.() ?? revocation } catch { /* cleanup remains mandatory */ }
       // Activation invalidation and handler draining must precede composed

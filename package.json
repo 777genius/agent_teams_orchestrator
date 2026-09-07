@@ -18,7 +18,7 @@
     "build:dev:full": "bun run ./scripts/build.ts --dev --feature-set=dev-full",
     "compile": "bun run ./scripts/build.ts --compile",
     "dev": "bun run ./src/entrypoints/cli.tsx",
-    "compile:hosted-actual-owner": "bun build scripts/e2e/hosted-actual-owner-owner.ts --target=bun --outfile=/dev/null --external='*/protectedNamespace.js'",
+    "compile:hosted-actual-owner": "bun build scripts/e2e/hosted-actual-owner-owner.ts --target=bun --define=HOSTED_ACTUAL_OWNER_NATIVE_BUILD=true --outfile=/dev/null --external='*/protectedNamespace.js'",
     "test:hosted-actual-owner": "bun test scripts/e2e/hosted-actual-owner/cli-source.test.ts",
     "ci:hosted-actual-owner": "bun run compile:hosted-actual-owner && bun run test:hosted-actual-owner",
     "test:hosted-control": "bun test --path-ignore-patterns='src/services/hostedControl/HostedControlBootstrap.test.ts' scripts/build.test.ts src/services/hostedControl src/services/teamLifecycleOwner src/utils/swarm/teamHelpers.taskCleanup.test.ts src/utils/taskMutationCoordinator.test.ts src/utils/tasks.coordination.test.ts src/utils/tasks.hostedCompatibility.test.ts src/utils/teammateMailbox.test.ts src/utils/udsMessaging.test.ts && bun test src/services/hostedControl/HostedControlBootstrap.test.ts && bun test --timeout 15000 src/services/opencode/OpenCodeBridgeCommandHandler.test.ts src/services/opencode/OpenCodeSessionBridge.test.ts",

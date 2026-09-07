@@ -12,7 +12,7 @@ import type {
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
 import { bindOwnerDeliveryRequest, HostedApprovalOwnerPublicationError, type HostedApprovalDeliveryState, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
-import { createOwnerOperationNonce } from './HostedApprovalOwnerProvenance.js'
+import { createOwnerOperationNonce, type OwnerWalInitialDeliveryWitness } from './HostedApprovalOwnerProvenance.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import { ingressRecordForObservedPermission, OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 
@@ -21,7 +21,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
   constructor(private readonly options: {
     store: HostedApprovalOwnerStore
     admission: HostedApprovalRuntimeAdmission
-    runtime: OpenCodeHostedApprovalRuntimeAdapter
+    runtime: Pick<OpenCodeHostedApprovalRuntimeAdapter, 'observe' | 'deliver'>
     isCurrentOuterAuthority(): Promise<boolean>
     now?: () => number
     createToken?: () => string
@@ -168,7 +168,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         throw error
       }
       if (!(await this.#routeCurrent(bound.route))) {
-        return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce)
+        return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce, { request: input.request, payloadFingerprint: input.payloadFingerprint })
       }
       const result = await this.options.runtime.deliver({
         route: bound.route,
@@ -193,9 +193,9 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       }
       startedState = fresh
       if (result === 'ambiguous') return operatorRequired(input.request.reconciliationRef)
-      if (result === 'not_started') return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce)
-      if (result === 'unavailable') return this.#settle(startedState, started, 'rejected', 'unavailable', operationNonce)
-      return this.#settle(startedState, started, 'completed', 'delivered', operationNonce)
+      if (result === 'not_started') return this.#settle(startedState, started, 'rejected', 'stale_generation', operationNonce, { request: input.request, payloadFingerprint: input.payloadFingerprint })
+      if (result === 'unavailable') return this.#settle(startedState, started, 'rejected', 'unavailable', operationNonce, { request: input.request, payloadFingerprint: input.payloadFingerprint })
+      return this.#settle(startedState, started, 'completed', 'delivered', operationNonce, { request: input.request, payloadFingerprint: input.payloadFingerprint })
     }) } catch (error) {
       if (error instanceof HostedApprovalOwnerPublicationError) {
         return !reconciliationOnly && error.stage === 'definitely-not-replaced'
@@ -271,7 +271,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     })
     return { status: result } as const
   }
-  async #settle(state: HostedApprovalOwnerState, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>, operationNonce: string) {
+  async #settle(state: HostedApprovalOwnerState, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>, operationNonce: string, initial: OwnerWalInitialDeliveryWitness) {
     // A provider receipt or proven terminal pre-effect failure is stronger than
     // a later admission rotation. Persist that evidence under the WAL CAS; do
     // not turn a proved outcome back into ambiguity.
@@ -282,7 +282,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         ? { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }
         : { kind: 'delivery-settled', phase: 'rejected', outcome: result as Exclude<typeof result, 'delivered'> },
       delivery: settled,
-      initial: null,
+      initial: structuredClone(initial),
     })
     return { status: result === 'delivered' ? 'delivered' as const : result }
   }

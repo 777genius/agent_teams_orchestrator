@@ -1,15 +1,16 @@
-import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readlinkSync, statSync } from 'node:fs'
+import { assertSelectedSupervisorArgvV1, type SelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
+import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from 'node:fs'
 import type { ExpectedSupervisedOpenCode } from '../opencode/OpenCodeSupervisedHostCustody.js'
 import { HOSTED_OWNER_PROVENANCE_CONTRACT, HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION } from './HostedApprovalOwnerProvenance.js'
 import { hashDescriptorV2, descriptorRowV2, type DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
 import { canonicalV2, hashV2, immutableV2, recordV2, requireV2, textV2, HEX_V2, type BootstrapHeaderV2, type RawRetentionBindingV2, type Immutable } from './HostedControlBootstrapV2Wire.js'
 
-/** Inputs retained by Product launchOwnerFromPlan/launchNativeOwner, selected
- * BEFORE the Owner frame. A mirror of those source contracts, not a new wire
- * document, environment authority, or constructor of TrustedOpenCodeCustody.
- * The built entry must supply these through its admitted composition closure. */
-export type OwnerV2LaunchSelection = Immutable<{
+/** Inputs retained by Product launchOwnerFromPlan/launchNativeOwner. The native
+ * entry transports actual per-exec observations in SelectedLaunchPhase; these
+ * pins become authority only after independent artifact admission. This type
+ * alone is not wire validation or a constructor of TrustedOpenCodeCustody. */
+export type OwnerV2LaunchSelection = Immutable<Partial<SelectedSupervisorEvidenceV1> & {
   expectedHost: ExpectedSupervisedOpenCode
   bootstrapV2HeaderSha256: string
   rawRetention: RawRetentionBindingV2
@@ -140,6 +141,7 @@ export function verifySelectedLaunchV2(input: {
   requireV2(canonicalV2(p.expectedHost) === canonicalV2(h.expectedHost) &&
     canonicalV2(p.rawRetention) === canonicalV2(h.rawRetention) &&
     p.bootstrapV2HeaderSha256 === hashV2(canonicalV2(h)), 'selected_bootstrap')
+  if (p.selectedSupervisor) verifySelectedSupervisorCurrentV1(p, deadline)
   const peer = processV2(h.expectedHost.process.pid), image = hashPath(`/proc/${peer.pid}/exe`, deadline)
   requireV2(peer.startTicks === h.expectedHost.process.startTicks && image.sha256 === h.expectedHost.executable.sha256 &&
     String(image.stat.dev) === h.expectedHost.executable.device && String(image.stat.ino) === h.expectedHost.executable.inode &&
@@ -150,6 +152,65 @@ export function verifySelectedLaunchV2(input: {
     processV2(held.callerPid).startTicks === held.callerStartTicks &&
     processV2(peer.pid).startTicks === peer.startTicks, 'launch_changed')
 }
+/** Check r1029's retained observations against this namespace's actual process
+ * tree and bytes. These comparisons supplement independent recipe admission;
+ * matching an untrusted observation does not select its own authority roots. */
+function verifySelectedSupervisorCurrentV1(selection: OwnerV2LaunchSelection, deadline: number): void {
+  const p = selection.selectedSupervisor!, control = selection.selectedControl, recipe = selection.selectedRecipe
+  requireV2(control && recipe, 'selected_supervisor_evidence')
+  const observed = processV2(p.pid), init = processV2(1), owner = processV2(process.pid)
+  requireV2(p.pid === selection.held.callerPid && p.pid > 1 && p.parentPid === 1 && observed.parentPid === 1 &&
+    observed.startTicks === p.startTicks && p.startTicks === selection.held.callerStartTicks &&
+    p.processStartToken === selection.supervisorProcessStartToken && p.namespaceInit.pid === 1 &&
+    p.namespaceInit.parentPid === 0 && init.parentPid === 0 && init.startTicks === p.namespaceInit.startTicks,
+    'selected_supervisor_process')
+  const mount = String(statSync(`/proc/${p.pid}/ns/mnt`, { bigint: true }).ino)
+  for (const actual of [observed, init, owner]) {
+    requireV2(actual.pidNamespaceInode === p.pidNamespaceInode &&
+      actual.networkNamespaceInode === p.networkNamespaceInode &&
+      String(statSync(`/proc/${actual.pid}/ns/mnt`, { bigint: true }).ino) === mount,
+      'selected_supervisor_namespace')
+  }
+  requireV2(p.mountNamespaceInode === mount && p.namespaceInit.mountNamespaceInode === mount &&
+    p.namespaceInit.pidNamespaceInode === p.pidNamespaceInode &&
+    p.namespaceInit.networkNamespaceInode === p.networkNamespaceInode &&
+    BigInt(p.observedMonotonicNs) <= BigInt(selection.held.beforeMonotonicNs), 'selected_supervisor_observation_order')
+  for (const [pid, expected] of [[p.pid, p.executable], [1, p.namespaceInit.executable]] as const) {
+    const actual = hashPath(`/proc/${pid}/exe`, deadline)
+    requireV2(actual.sha256 === expected.sha256 && String(actual.stat.dev) === expected.device &&
+      String(actual.stat.ino) === expected.inode && String(actual.stat.size) === expected.size &&
+      actual.stat.uid === 0n && actual.stat.gid === 0n && actual.stat.nlink === 1n, 'selected_supervisor_executable')
+  }
+  const cmdlineFd = openSync(`/proc/${p.pid}/cmdline`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const bytes = Buffer.alloc(64 * 1024 + 1)
+    let length = 0
+    while (length < bytes.length) {
+      const count = readSync(cmdlineFd, bytes, length, bytes.length - length, null)
+      if (count === 0) break
+      length += count
+    }
+    assertSelectedSupervisorArgvV1(bytes.subarray(0, length), p)
+  } finally { closeSync(cmdlineFd) }
+  requireV2(p.executable.sha256 === selection.supervisorExecutable.sha256 &&
+    p.executable.device === selection.supervisorExecutable.device &&
+    p.executable.inode === selection.supervisorExecutable.inode, 'selected_supervisor_selected_image')
+  for (const [file, root] of [[p.module, '/p3b2'], [p.loader, '/toolchain']] as const) {
+    requireV2(file.path === `${root}/${file.relativePath}` &&
+      !file.relativePath.includes('\\') && file.relativePath.split('/').every(part => part && part !== '.' && part !== '..'),
+      'selected_supervisor_module_path')
+    const actual = hashPath(file.path, deadline)
+    requireV2(actual.sha256 === file.sha256 && String(actual.stat.dev) === file.device &&
+      String(actual.stat.ino) === file.inode && actual.stat.size === BigInt(file.size) &&
+      Number(actual.stat.mode & 0o7777n) === file.mode && actual.stat.nlink === 1n && actual.stat.uid === 0n,
+      'selected_supervisor_module')
+  }
+  requireV2(control.controllerNonce === selection.expectedHost.activation.controllerNonce &&
+    recipe.sha256 === selection.recipeSha256, 'selected_supervisor_control')
+  requireV2(processV2(p.pid).startTicks === p.startTicks && processV2(1).startTicks === init.startTicks,
+    'selected_supervisor_changed')
+}
+
 function verifyProducerCapsuleV2(p: OwnerV2LaunchSelection, h: BootstrapHeaderV2, actual: ExecutingOwnerV2): void {
   requireV2(Buffer.byteLength(p.producerCapsule) <= 128 * 1024 && hashV2(p.producerCapsule) === h.supervisorBinding.ownerProducerCapsuleSha256, 'capsule_digest')
   const v = JSON.parse(p.producerCapsule)

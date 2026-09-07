@@ -1,3 +1,4 @@
+import { assertTrustedOpenCodeCustody, type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 import { Database } from 'bun:sqlite'
 import { stat } from 'node:fs/promises'
 import path from 'node:path'
@@ -164,9 +165,16 @@ async function readSqliteFingerprint(dbPath: string): Promise<OpenCodeSqliteFing
 }
 
 export class OpenCodeOfflineSessionReader {
+  constructor(private readonly custody?: TrustedOpenCodeCustody) {
+    if (custody) assertTrustedOpenCodeCustody(custody)
+  }
   resolveDbPath(profileRootKey: string): string | null {
     if (!isSafeProfileRootKey(profileRootKey)) {
       return null
+    }
+    if (this.custody) {
+      if (profileRootKey !== this.custody.expected.profile.profileRootKey) return null
+      return path.join(this.custody.expected.profile.profileRootPath, 'data', 'opencode', 'opencode.db')
     }
     const profileRoot = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'profiles')
     const dbPath = path.resolve(

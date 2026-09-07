@@ -16,7 +16,16 @@ type Waiter = (release: () => void) => void
 export class HostedApprovalRuntimeBindingFence {
   #held = false
   #generation = 0
+  #revoked = false
   readonly #waiters: Waiter[] = []
+
+  /** Custody loss invalidates pins immediately, including an in-flight capture. */
+  revoke(): void {
+    if (this.#revoked) return
+    this.#revoked = true
+    // Wake queued captures so loss cannot strand cleanup behind a retained pin.
+    for (const waiter of this.#waiters.splice(0)) waiter(() => {})
+  }
 
   /** A short, consistent binding capture. */
   async capture<T>(operation: () => Promise<T>): Promise<T> {
@@ -60,11 +69,11 @@ export class HostedApprovalRuntimeBindingFence {
    * semantics rather than queue past a request deadline.
    */
   tryAcquirePin(): HostedApprovalRuntimeBindingPin | null {
-    if (this.#held || this.#waiters.length > 0) return null
+    if (this.#revoked || this.#held || this.#waiters.length > 0) return null
     this.#held = true
     const generation = ++this.#generation
     let released = false
-    const isCurrent = () => !released && this.#held && this.#generation === generation
+    const isCurrent = () => !this.#revoked && !released && this.#held && this.#generation === generation
     const pin: HostedApprovalRuntimeBindingPin = {
       [PIN_FENCE]: this,
       isCurrent,
@@ -90,13 +99,17 @@ export class HostedApprovalRuntimeBindingFence {
   async #run<T>(operation: () => Promise<T>): Promise<T> {
     const release = await this.#acquire()
     try {
-      return await operation()
+      if (this.#revoked) throw new Error('Hosted approval runtime binding fence revoked')
+      const result = await operation()
+      if (this.#revoked) throw new Error('Hosted approval runtime binding fence revoked')
+      return result
     } finally {
       release()
     }
   }
 
   #acquire(): Promise<() => void> {
+    if (this.#revoked) return Promise.reject(new Error('Hosted approval runtime binding fence revoked'))
     if (!this.#held && this.#waiters.length === 0) {
       this.#held = true
       ++this.#generation
@@ -144,6 +157,12 @@ export type HostedApprovalRuntimeBindingWriterIntegrationSeam = {
 export class HostedApprovalRuntimeBindingFenceRegistry
 implements HostedApprovalRuntimeBindingMutationFence {
   readonly #teams = new Map<string, HostedApprovalRuntimeBindingFence>()
+  #revoked = false
+
+  revoke(): void {
+    this.#revoked = true
+    for (const fence of this.#teams.values()) fence.revoke()
+  }
 
   forTeam(teamId: string): HostedApprovalRuntimeBindingFence {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(teamId)) {
@@ -152,6 +171,7 @@ implements HostedApprovalRuntimeBindingMutationFence {
     let fence = this.#teams.get(teamId)
     if (!fence) {
       fence = new HostedApprovalRuntimeBindingFence()
+      if (this.#revoked) fence.revoke()
       this.#teams.set(teamId, fence)
     }
     return fence

@@ -681,7 +681,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     capture.producer.close()
   })
 
-  test('settlements require a start for completion and preserve every delivery identity field', async () => {
+  for (const retainWitness of [false, true]) test(`settlements preserve delivery identity with ${retainWitness ? 'original' : 'legacy null'} witness`, async () => {
     const { path } = await walPath(); const setup = new HostedApprovalOwnerWal(path)
     const initial = await setup.locked(current => setup.publish(current, withoutRevision(state())))
     const record = initial.ingress[0]!
@@ -691,9 +691,9 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       outboxId: record.outboxId, effectRef: record.effectRef, payloadFingerprint: witness.payloadFingerprint, phase: 'started', result: null,
     }
     const capture = publicationCapture(path); const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
-    const settle = (delivery: typeof started) => wal.locked(current => wal.publishMutation(current, {
+    const settle = (delivery: typeof started, initial: OwnerWalInitialDeliveryWitness | null = null) => wal.locked(current => wal.publishMutation(current, {
       ...withoutRevision(current!), deliveries: [delivery],
-    }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }, delivery, initial: null }))
+    }, { operationNonce: 'e'.repeat(64), mutation: { kind: 'delivery-settled', phase: 'completed', outcome: 'delivered' }, delivery, initial }))
     const completed = { ...started, phase: 'completed' as const, result: 'delivered' as const }
     await expect(settle(completed)).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
     expect(capture.lines).toHaveLength(1)
@@ -705,9 +705,15 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     for (const changed of [{ providerDeliveryId: 'delivery_other' }, { reconciliationRef: 'approval-reconciliation_other' }, { payloadFingerprint: 'd'.repeat(64) }]) {
       await expect(settle({ ...completed, ...changed })).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
     }
+    for (const invalid of [
+      { ...witness, payloadFingerprint: 'f'.repeat(64) },
+      { ...witness, request: { ...witness.request, requestId: 'permission_other' } },
+    ]) {
+      await expect(settle(completed, invalid)).rejects.toMatchObject({ stage: 'definitely-not-replaced', message: 'Hosted approval settlement publication witness mismatch' })
+    }
     expect(await readFile(path)).toEqual(bytes)
     expect(capture.lines).toHaveLength(2)
-    await settle(completed)
+    await settle(completed, retainWitness ? witness : null)
     expect((await wal.read())!.deliveries).toEqual([completed])
     expect(capture.lines).toHaveLength(3)
     capture.producer.close()

@@ -721,6 +721,58 @@ describe('HostedControlServer', () => {
     expect(readyRevokes).toBe(1)
   })
 
+  test('provider adoption requires the retained ready write and a separate lifecycle lease', async () => {
+    for (const withLease of [false, true]) {
+      let calls = 0; let revokes = 0; let readyWriteStarted = false; let authorityLosses = 0
+      const fixture = await activationServerFixture(true, true, {
+        beforeActivationFrameWriteForTest: phase => {
+          if (phase === 'ready') {
+            expect(calls).toBe(0)
+            expect(fixture.server.prepareRetainedProviderToken()).toBeNull()
+            readyWriteStarted = true
+          }
+        },
+        onActivationReady: async () => { expect(readyWriteStarted).toBe(true); calls++ },
+        onProviderAuthorityLost: () => { authorityLosses++ },
+      })
+      const lease = withLease ? await openReadiness(fixture.socketPath, fixture.server.ownerBinding!) : null
+      expect(fixture.server.prepareRetainedProviderToken()).toBeNull()
+      fixture.create(({ connection }) => ({
+        activate: async () => {
+          await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => { revokes++ },
+      }))
+      const client = await openStreamingSocket(fixture.socketPath)
+      client.socket.write(activationPrepare())
+      await client.nextLine()
+      client.socket.write('{"publication":"provider-adoption"}\n')
+      await client.nextLine()
+      if (withLease) {
+        await waitFor(() => calls === 1)
+        expect(fixture.server.hasRetainedActivation()).toBe(true)
+        const positive = fixture.server.prepareRetainedProviderToken()!
+        expect(positive.consume()).toBe(true)
+        expect(positive.consume()).toBe(false)
+        const pending = fixture.server.prepareRetainedProviderToken()!
+        lease!.socket.destroy()
+        await waitFor(() => fixture.server.prepareRetainedProviderToken() === null)
+        expect(authorityLosses).toBe(1)
+        expect(pending.consume()).toBe(false)
+        expect(pending.consume()).toBe(false)
+      } else {
+        await waitFor(() => revokes === 1)
+        expect(calls).toBe(0)
+        expect(fixture.server.hasRetainedActivation()).toBe(false)
+        expect(fixture.server.prepareRetainedProviderToken()).toBeNull()
+      }
+      client.socket.destroy(); lease?.socket.destroy()
+      await fixture.server.stop()
+      expect(authorityLosses).toBe(1)
+    }
+  })
+
   test('RST/error and parent drift destroy the exact activation socket and revoke once', async () => {
     let retainedServerSocket!: Socket
     const errored = await activationServerFixture(false, true, {
@@ -970,6 +1022,8 @@ async function activationServerFixture(
   options: {
     readDeadlineMs?: number
     activationRecoveryDeadlineMs?: number
+    onActivationReady?: () => Promise<void>
+    onProviderAuthorityLost?: () => void
     beforeActivationFrameWriteForTest?: (
       phase: 'owner_ready' | 'ready', socket: HostedControlConnection,
     ) => void | Promise<void>

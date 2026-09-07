@@ -78,6 +78,12 @@ export type HostedControlServerOptions = {
   activationSessionFactory?: HostedApprovalActivationSessionFactory
   /** Reserve activation for FD5 even during asynchronous socket publication. */
   activationTransport?: 'inherited-v2'
+  /** Runs only after the real ready write completes; failure revokes activation. */
+  onActivationReady?: () => Promise<void>
+  /** Synchronous revocation notification; resource draining remains runtime-owned. */
+  onProviderAuthorityLost?: () => void
+  /** Native entry keeps ordinary traffic closed until provider adoption settles. */
+  isEffectReady?: () => boolean
 }
 
 type ActivationPhase =
@@ -124,6 +130,7 @@ export class HostedControlServer {
   readonly #handlers = new Set<Promise<void>>()
   #stopping = false
   #stopPromise: Promise<void> | null = null
+  #providerAuthorityLost = false
 
   constructor(options: HostedControlServerOptions) {
     this.#options = options
@@ -135,6 +142,31 @@ export class HostedControlServer {
   async hasActiveLease(): Promise<boolean> {
     const expectedLease = this.#mutationLease.getStore() ?? this.#leaseSocket
     return !!expectedLease && this.#leaseSocket === expectedLease && !expectedLease.destroyed && await this.#hasCurrentSocketIdentity()
+  }
+
+  hasRetainedActivation(): boolean {
+    return !!this.#activation && this.#activation.phase === 'leased' && this.#isActivationCurrent(this.#activation)
+  }
+
+  /** Session component of native provider authority. Root/profile/process
+   * fences remain separate. Preparation cannot occur during recovery or the
+   * ready write, and consumption retains the exact lifecycle connection. */
+  prepareRetainedProviderToken(): { consume(): boolean } | null {
+    const candidate = this.#activation
+    const lease = this.#mutationLease.getStore() ?? this.#leaseSocket
+    if (this.#providerAuthorityLost || !candidate || candidate.phase !== 'leased' || !lease ||
+      this.#leaseSocket !== lease || lease.destroyed || !this.hasRetainedActivation()) return null
+    const activation = this.#prepareActivationEffectToken(candidate)
+    if (!activation) return null
+    let used = false
+    return Object.freeze({ consume: () => {
+      if (used) return false
+      used = true
+      // Consume even on lease loss; one-use activation authority must not leak.
+      const activationCurrent = activation.consume()
+      return activationCurrent && !this.#stopping && candidate.phase === 'leased' &&
+        this.#activation === candidate && this.#leaseSocket === lease && !lease.destroyed
+    } })
   }
 
   /** Transfers the exact admitted FD5; publication remains the actual socket
@@ -422,6 +454,13 @@ export class HostedControlServer {
         throw new Error('Hosted approval activation became stale while publishing ready')
       }
       candidate.phase = 'leased'
+      if (this.#options.onActivationReady) {
+        if (!await this.hasActiveLease()) throw new Error('Hosted approval lifecycle lease missing')
+        await this.#options.onActivationReady()
+        if (!this.#isActivationCurrent(candidate) || !await this.hasActiveLease()) {
+          throw new Error('Hosted approval authority lost during provider adoption')
+        }
+      }
       this.#clearActivationRecoveryDeadline(candidate)
     } catch (error) {
       await this.#revokeActivation(candidate, asError(error)).catch(() => undefined)
@@ -545,6 +584,7 @@ export class HostedControlServer {
   #revokeActivation(candidate: ActivationCandidate, error: Error): Promise<void> {
     if (candidate.revokePromise) return candidate.revokePromise
     candidate.phase = 'revoked'
+    this.#loseProviderAuthority()
     this.#activationGeneration += 1
     this.#clearActivationRecoveryDeadline(candidate)
     if (candidate.monitor) clearInterval(candidate.monitor)
@@ -574,6 +614,13 @@ export class HostedControlServer {
   #clearActivationRecoveryDeadline(candidate: ActivationCandidate): void {
     if (candidate.recoveryDeadline) clearTimeout(candidate.recoveryDeadline)
     candidate.recoveryDeadline = null
+  }
+
+  #loseProviderAuthority(): void {
+    if (this.#providerAuthorityLost) return
+    this.#providerAuthorityLost = true
+    // Cleanup notification cannot prevent exact socket/session revocation.
+    try { this.#options.onProviderAuthorityLost?.() } catch {}
   }
 
   #admitBrokerConnection(
@@ -611,6 +658,7 @@ export class HostedControlServer {
       return
     }
     if (message.operation === 'readiness') { await this.#handleReadiness(socket, line, message); return }
+    if (this.#options.isEffectReady && !this.#options.isEffectReady()) { socket.destroy(); return }
     if (message.operation !== HOSTED_CONTROL_OPERATION) {
       const leaseSocket = this.#leaseSocket
       const ownerBinding = this.#ownerBinding
@@ -688,7 +736,11 @@ export class HostedControlServer {
     } catch { socket.destroy(); return }
     this.#leaseConsumed = true
     this.#leaseSocket = socket
-    socket.once('close', () => { if (this.#leaseSocket === socket) this.#leaseSocket = null })
+    socket.once('close', () => {
+      if (this.#leaseSocket !== socket) return
+      this.#leaseSocket = null
+      this.#loseProviderAuthority()
+    })
     if (admission.protocol === 'legacy') {
       const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, ownerBinding }
       socket.write(`${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned) })}\n`)

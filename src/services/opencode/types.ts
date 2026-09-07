@@ -1,4 +1,4 @@
-export type OpenCodeAuthSource = 'credentials' | 'environment'
+export type OpenCodeAuthSource = 'credentials' | 'environment' | 'supervised-host'
 
 export type OpenCodeAgentMode = 'primary' | 'subagent' | 'unknown'
 
@@ -267,7 +267,7 @@ export type OpenCodeMcpResponse = Record<string, OpenCodeMcpStatusEntry>
 
 export type OpenCodeAppMcpStatus = 'present' | 'attached' | 'missing' | 'attach_failed'
 
-export type OpenCodeAppMcpLaunchSource = 'env-override' | 'workspace-dist' | 'workspace-src'
+export type OpenCodeAppMcpLaunchSource = 'env-override' | 'workspace-dist' | 'workspace-src' | 'supervised-profile'
 
 export type OpenCodeAppMcpSummary = {
   serverName: string

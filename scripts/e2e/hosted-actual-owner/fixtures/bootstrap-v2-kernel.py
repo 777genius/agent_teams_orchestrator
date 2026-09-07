@@ -81,6 +81,9 @@ try:
     activation, activation_child = pair(); live, live_child = pair()
     for endpoint in (boot, auth, activation): endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
     raw = own(os.open(result_path + '.raw', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600))
+    if scenario.startswith('raw-'):
+        os.write(raw, b'actual inherited prefix\n')
+        os.fsync(raw)
     wal = own(os.open(result_path + '.wal', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600))
     anchor = own(os.open(image, os.O_RDONLY))
     source = [ro, boot_child.fileno(), activation_child.fileno(), live_child.fileno(), auth_child.fileno(), raw, wal, anchor]
@@ -122,7 +125,11 @@ try:
     command = command_wait()
     lease_bytes = base64.b64decode(command['lease']); os.write(lease, lease_bytes)
     if scenario != 'missing-seals': fcntl.fcntl(lease, 1033, 15)
+    construction = row(lease, 3)
     drop(lease)
+    construction_closed = str(time.monotonic_ns())
+    sealed = dict(construction=construction, constructionClosedMonotonicNs=construction_closed,
+        observedMonotonicNs=str(time.monotonic_ns()))
     os.write(release_write, b'x'); drop(release_write)
     while True:
         bounded(); observed, status = os.waitpid(child, os.WNOHANG)
@@ -135,7 +142,7 @@ try:
     if actual.st_dev != int(rows[7]['device']) or actual.st_ino != int(rows[7]['inode']):
         raise RuntimeError('fixture executed another image')
     x = dict(rows[7]); x['size'] = str(actual.st_size)
-    emit({'type': 'executed', 'executed': dict(ownerPid=child, ownerStartTicks=ticks(child),
+    emit({'type': 'executed', 'sealed': sealed, 'executed': dict(ownerPid=child, ownerStartTicks=ticks(child),
         observedMonotonicNs=str(time.monotonic_ns()), executable=x)})
     command_wait() # Selection persisted only after the actual exec observation.
     trace(17, child) # PTRACE_DETACH; then drain both streams while Owner reads.

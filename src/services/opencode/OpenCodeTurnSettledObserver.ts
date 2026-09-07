@@ -1,3 +1,5 @@
+import { createOpenCodeSupervisedEventFetch } from './OpenCodeSupervisedEventStream.js'
+import type { OpenCodeHostAcquisitionPolicy } from './OpenCodeSupervisedHostCustody.js'
 import {
   getOpenCodeSseMessageId,
   getOpenCodeSseMessageParentId,
@@ -49,6 +51,7 @@ export type OpenCodeTurnSettledObservation = {
 }
 
 export interface OpenCodeTurnSettledObserverDeps {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   fetchImpl?: OpenCodeSseFetch
   now?: () => Date
   promptMessageIdFactory?: () => string
@@ -194,7 +197,20 @@ function findTranscriptResponseForPrompt(
 }
 
 export class OpenCodeTurnSettledObserver {
-  constructor(private readonly deps: OpenCodeTurnSettledObserverDeps = {}) {}
+  private readonly deps: OpenCodeTurnSettledObserverDeps
+  constructor(deps: OpenCodeTurnSettledObserverDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy?.mode === 'supervisor-adopt-only') {
+      if (deps.fetchImpl || deps.promptMessageIdFactory || new.target !== OpenCodeTurnSettledObserver) {
+        throw new Error('OpenCode supervised turn observation substituted')
+      }
+      this.deps = Object.freeze({ fetchImpl: createOpenCodeSupervisedEventFetch(policy.custody, true),
+        now: deps.now?.bind(deps),
+      })
+      Object.defineProperty(this, 'observe', { value: this.observe.bind(this) })
+      Object.freeze(this)
+    } else this.deps = deps
+  }
 
   observe(params: {
     baseUrl: string

@@ -15,6 +15,54 @@ function recorder(overrides: Partial<OpenCodeRawRetentionSink> = {}) {
 }
 
 describe('OpenCode bounded raw retention', () => {
+  test('inherited prefix consumes the aggregate budget before the first new append', async () => {
+    let writes = 0
+    const { port } = recorder({ initialByteLength: 64 * 1024 * 1024 - 5,
+      async write(_bytes, _offset, length) { writes++; return length } })
+    await expect(port.retainRequest(port.bindOperation({ kind: 'capability' }), {
+      method: 'GET', path: '/capability', bytes: Buffer.alloc(0),
+    })).rejects.toThrow('append failed')
+    expect(writes).toBe(0)
+    expect(port.isCurrent()).toBe(false)
+    await port.close()
+  })
+
+  test('bounded event cancellation retains the incomplete prefix and permits subsequent observations', async () => {
+    const { port, records } = recorder()
+    const request = await port.retainRequest(port.bindOperation({ kind: 'events', path: '/event' }), {
+      method: 'GET', path: '/event', bytes: Buffer.alloc(0),
+    })
+    const bytes = Buffer.from('data: {"partial":')
+    await port.retainResponse(request, { status: 200, contentEncoding: null,
+      peerOperationNonce: null, bytes, complete: false, observationCancelled: true })
+    expect(records[1]).toMatchObject({ phase: 'response', complete: false,
+      body: { bodyBase64: bytes.toString('base64') } })
+    expect(port.isCurrent()).toBe(true)
+    await port.retainRequest(port.bindOperation({ kind: 'capability' }), {
+      method: 'GET', path: '/capability', bytes: Buffer.alloc(0),
+    })
+    expect(records.map(record => record.phase)).toEqual(['request', 'response', 'request'])
+    await port.close()
+  })
+
+  test('cancellation cannot exempt transcript, mismatched event paths or encoded responses from poisoning', async () => {
+    for (const variant of ['transcript', 'wrong-path', 'encoded', 'transport-loss'] as const) {
+      const { port } = recorder()
+      const operation = variant === 'transcript'
+        ? { kind: 'transcript' as const, sessionId: 'ses_1', limit: 50 as const }
+        : { kind: 'events' as const, path: '/event' as const }
+      const request = await port.retainRequest(port.bindOperation(operation), {
+        method: 'GET', path: variant === 'wrong-path' ? '/permission' : '/event', bytes: Buffer.alloc(0),
+      })
+      await port.retainResponse(request, { status: 200,
+        contentEncoding: variant === 'encoded' ? 'gzip' : null,
+        peerOperationNonce: null, bytes: Buffer.from('partial'), complete: false,
+        observationCancelled: variant !== 'transport-loss' })
+      expect(port.isCurrent()).toBe(false)
+      await port.close()
+    }
+  })
+
   test('copies bytes before async append, loops partial writes and waits for sync', async () => {
     let release!: () => void
     const sync = new Promise<void>(resolve => { release = resolve })
@@ -149,4 +197,32 @@ describe('OpenCode bounded raw retention', () => {
       peerOperationNonce: null, bytes: Buffer.alloc(0), complete: true })).rejects.toThrow()
     await a.close(); await b.close()
   })
+})
+
+
+test('close drains an admitted request without inventing a transport outcome', async () => {
+  let release!: () => void
+  let entered!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let closed = false
+  const { port, records } = recorder({
+    async sync() { entered(); await gate },
+    async close() { closed = true },
+  })
+  const pending = port.retainRequest(port.bindOperation({ kind: 'capability' }), {
+    method: 'GET', path: '/capability', bytes: Buffer.alloc(0),
+  })
+  await started
+  const closing = port.close()
+  expect(port.close()).toBe(closing)
+  expect(port.isCurrent()).toBe(false)
+  expect(closed).toBe(false)
+  release()
+  const request = await pending
+  await closing
+  expect(request.recordId).toBe('a'.repeat(64))
+  expect(closed).toBe(true)
+  expect(records.map(record => record.phase)).toEqual(['request'])
+  await expect(port.recordFailure(request, { phase: 'before-end', code: 'late' })).rejects.toThrow()
 })

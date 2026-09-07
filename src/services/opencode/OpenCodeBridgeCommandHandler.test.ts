@@ -10,6 +10,7 @@ import {
   createOwnedOpenCodeLifecycleCommandExecutor,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
+import type { OpenCodeLifecycleRuntime } from './OpenCodeLifecycleRuntime.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -5831,6 +5832,56 @@ describe('OpenCodeBridgeCommandHandler', () => {
         memberName: 'alice',
       },
     ])
+  })
+
+  test('owned stop retains the explicit runtime across awaits without returning to global consumers', async () => {
+    const gate = createDeferred<void>()
+    const calls: string[] = []
+    const record = buildRecord({ laneId: 'opencode-lane', memberName: 'alice', runId: 'run-explicit' })
+    const provisioning = {
+      probe: async () => { calls.push('probe'); await gate.promise; return snapshot },
+      probeRetainingHost: openCodeProvisioningProbe.probeRetainingHost.bind(openCodeProvisioningProbe),
+    }
+    const sessions = {
+      get: openCodeSessionStore.get.bind(openCodeSessionStore),
+      list: async () => { calls.push('list'); return [record] },
+      upsert: openCodeSessionStore.upsert.bind(openCodeSessionStore),
+      markStale: openCodeSessionStore.markStale.bind(openCodeSessionStore),
+      delete: openCodeSessionStore.delete.bind(openCodeSessionStore),
+    }
+    const bridge = {
+      ensureSession: openCodeSessionBridge.ensureSession.bind(openCodeSessionBridge),
+      ensureSessionAppMcpReady: openCodeSessionBridge.ensureSessionAppMcpReady.bind(openCodeSessionBridge),
+      injectAppManagedBootstrapContext: openCodeSessionBridge.injectAppManagedBootstrapContext.bind(openCodeSessionBridge),
+      refreshSessionEnvironment: openCodeSessionBridge.refreshSessionEnvironment.bind(openCodeSessionBridge),
+      reconcileSession: openCodeSessionBridge.reconcileSession.bind(openCodeSessionBridge),
+      abort: async () => { calls.push('abort'); return true },
+      releaseSession: async () => { calls.push('release') },
+    }
+    const runtime: OpenCodeLifecycleRuntime = {
+      provisioning, sessions, bridge,
+      execution: { probeModel: openCodeExecutionProbe.probeModel.bind(openCodeExecutionProbe) },
+      hosts: { reconcilePersistentHosts: async () => {
+        calls.push('cleanup'); return { cleaned: 0, remaining: 0, hosts: [], diagnostics: [] }
+      } },
+      proveAppMcpTools: async () => { throw new Error('stop must not launch MCP') },
+    }
+    const execute = createOwnedOpenCodeLifecycleCommandExecutor(runtime)
+    const unavailable = async (): Promise<never> => { throw new Error('substituted consumer') }
+    openCodeProvisioningProbe.probe = unavailable
+    openCodeSessionStore.list = unavailable
+    openCodeSessionBridge.abort = unavailable
+    openCodeSessionBridge.releaseSession = unavailable
+    openCodeHostManager.reconcilePersistentHosts = unavailable
+    const pending = execute(buildEnvelope('opencode.stopTeam', {
+      runId: 'run-explicit', laneId: 'opencode-lane', teamId: 'team-a',
+      expectedMembers: [{ name: 'alice' }],
+    }))
+    sessions.list = unavailable; bridge.abort = unavailable
+    gate.resolve()
+    const result = await pending
+    expect(result.ok).toBe(true)
+    expect(calls).toEqual(['probe', 'list', 'abort', 'release', 'cleanup'])
   })
 
   test('lifecycle-owner reconcile rejects extra same-lane sessions outside the admitted member set', async () => {

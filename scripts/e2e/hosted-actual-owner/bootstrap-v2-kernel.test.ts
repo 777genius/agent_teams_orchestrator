@@ -11,6 +11,7 @@ import { HOSTED_APPROVAL_ACTIVATION_CAPABILITY, createHostedApprovalActivationV2
 import { HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256 } from '../../../src/services/hostedControl/HostedApprovalOwnerProvenance.js'
 import { activationGolden, assembleFixtureV2, fixtureHeaderV2 } from '../../../src/services/hostedControl/fixtures/bootstrapV2Producer.js'
 import { OwnedKernelChild, KernelChannel as Channel } from './kernel-fixture-ownership.js'
+import { SELECTED_LAUNCH_PHASE, SELECTED_LAUNCH_MAGIC, SELECTED_LAUNCH_MAXIMUM } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
 
 let directory: string, image: string, imageSha: string, peer: ChildProcessWithoutNullStreams
 const owned = new Set<OwnedKernelChild>()
@@ -67,6 +68,11 @@ async function fixture(scenario = 'valid', mutate?: (header: any, selection: any
   const channel = new Channel(helper), first = await channel.next()
   expect(first.type).toBe('held'); const held = first.held
   const h = fixtureHeaderV2(), self = processV2(process.pid), host = processV2(peer.pid!)
+  if (scenario.startsWith('raw-')) {
+    const prefix = readFileSync(result + '.raw')
+    h.rawRetention = { ...h.rawRetention, initialByteLength: prefix.length,
+      initialSha256: scenario === 'raw-prefix-mismatch' ? '0'.repeat(64) : hashV2(prefix), nextSequence: 2 }
+  }
   const hostExe = statSync(`/proc/${host.pid}/exe`, { bigint: true }), ownerExe = statSync(image, { bigint: true })
   const selfExe = statSync('/proc/self/exe', { bigint: true })
   h.socketPath = join(root, 'owner.sock')
@@ -114,6 +120,21 @@ async function fixture(scenario = 'valid', mutate?: (header: any, selection: any
   const exec = await channel.next(); expect(exec.type).toBe('executed')
   selection.executed = { ...exec.executed, executableSha256: imageSha }
   writeFileSync(selected, JSON.stringify(selection), { mode: 0o600 }); channel.send({ release: true })
+  if (scenario.startsWith('selection-')) {
+    const phase = { contract: SELECTED_LAUNCH_PHASE, launch: structuredClone(selection), sealed: structuredClone(exec.sealed) }
+    if (scenario === 'selection-wrong-launch') phase.launch.ownerProcessStartToken = '9'.repeat(64)
+    if (scenario === 'selection-wrong-sealing') phase.sealed.observedMonotonicNs = phase.launch.executed.observedMonotonicNs
+    const body = Buffer.from(canonicalV2(phase)), prefix = Buffer.alloc(8)
+    prefix.writeUInt32BE(SELECTED_LAUNCH_MAGIC); prefix.writeUInt32BE(body.length, 4)
+    let frame = Buffer.concat([prefix, body])
+    if (scenario === 'selection-oversize') {
+      prefix.writeUInt32BE(SELECTED_LAUNCH_MAXIMUM + 1, 4); frame = prefix
+    }
+    if (scenario === 'selection-premature-activation') frame = Buffer.from('{"kind":"prepare"}\n')
+    if (scenario === 'selection-truncated') frame = frame.subarray(0, frame.length - 1)
+    channel.send({ activation: frame.toString('base64'),
+      ...(scenario === 'selection-truncated' ? { inject: 'half-close' } : {}) })
+  }
   const until = performance.now() + 10000
   while (!existsSync(result) && performance.now() < until && helper.alive) await new Promise(r => setTimeout(r, 5))
   if (!existsSync(result)) throw new Error('kernel fixture has no result: ' + helper.stderr)
@@ -189,6 +210,51 @@ async function waitForFile(path: string) {
   }
 }
 describe('actual inherited Linux bootstrap-v2 descriptors', () => {
+  linuxTest('native WAL images reserve one actual inherited Owner generation', async () => {
+    const f = await fixture('wal-images')
+    try {
+      expect(f.report).toMatchObject({ ok: true, checked: 'wal-images' })
+      expect(statSync(f.result + '.wal').size).toBe(0)
+    } finally { await f.close() }
+  })
+  for (const scenario of ['raw-prefix', 'raw-prefix-mismatch', 'raw-codec-invalid', 'raw-replacement', 'raw-flags']) {
+    linuxTest(scenario + ' preserves actual FD8 prefix and ownership', async () => {
+      const f = await fixture(scenario)
+      try {
+        expect(f.report.ok).toBe(true)
+        expect(f.report.checked).toBe(scenario)
+        expect(readFileSync(f.result + '.raw', 'utf8')).toBe(scenario === 'raw-prefix'
+          ? 'actual inherited prefix\nactual append\n' : 'actual inherited prefix\n')
+        expect(statSync(f.result + '.wal').size).toBe(0)
+      } finally { await f.close() }
+    })
+  }
+  linuxTest('consumes fragmented selected-launch phase on the actual FD5 before retaining activation', async () => {
+    const f = await fixture('selection-valid')
+    try {
+      expect(f.report.ok).toBe(true)
+      expect(f.report.oneUseClosed).toEqual([true, true, true])
+      expect(statSync(f.result + '.wal').size).toBe(0)
+    } finally { await f.close() }
+  }, 20000)
+  for (const [scenario, reason] of [
+    ['selection-wrong-launch', 'selection_phase_admitted_binding'],
+    ['selection-wrong-sealing', 'selection_sealed_order'],
+    ['selection-oversize', 'selection_phase_header'],
+    ['selection-premature-activation', 'selection_phase_header'],
+    ['selection-truncated', 'selection_phase_eof'],
+  ]) {
+    linuxTest(scenario + ' fails before provider or WAL activity', async () => {
+      const f = await fixture(scenario)
+      try {
+        expect(f.report.ok).toBe(false)
+        expect(f.report.error).toContain(reason)
+        expect(f.report.oneUseClosed).toEqual([true, true, true])
+        expect(statSync(f.result + '.raw').size).toBe(0)
+        expect(statSync(f.result + '.wal').size).toBe(0)
+      } finally { await f.close() }
+    }, 20000)
+  }
   for (const scenario of ['pretransfer-drift-take', 'pretransfer-drift-close', 'pretransfer-replacement']) {
     linuxTest(scenario + ' distinguishes ownership from admission and preserves exact FD5 reuse', async () => {
       const f = await fixture(scenario)

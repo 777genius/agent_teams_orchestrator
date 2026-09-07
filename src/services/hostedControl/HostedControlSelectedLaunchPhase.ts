@@ -1,0 +1,60 @@
+import { parseSelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
+import { canonicalV2, immutableV2, recordV2, requireV2 } from './HostedControlBootstrapV2Wire.js'
+import type { DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
+import type { OwnerV2LaunchSelection } from './HostedControlBootstrapV2Launch.js'
+
+export const SELECTED_LAUNCH_PHASE = 'agent-teams.hosted-owner-selected-launch/v1'
+export const SELECTED_LAUNCH_MAGIC = 0x48534c31 // HSL1; distinct from activation JSON
+export const SELECTED_LAUNCH_MAXIMUM = 256 * 1024
+export type SelectedLaunchPhase = Readonly<{
+  contract: typeof SELECTED_LAUNCH_PHASE
+  launch: OwnerV2LaunchSelection
+  sealed: Readonly<{
+    observedMonotonicNs: string
+    constructionClosedMonotonicNs: string
+    construction: Readonly<{
+      sourceFd: number; childFd: number; kind: string; accessMode: string; append: boolean
+      mode: number; uid: number; gid: number; seals: number | null
+      device: string; inode: string; size: string; nlink: string; mtimeNs: string; ctimeNs: string; closedMonotonicNs: string
+    }>
+  }>
+}>
+
+/** Decoding supplies data only. Independent artifact admission must precede use
+ * of launch pins; neither this envelope nor the FD4 MAC supplies public roots. */
+export function decodeSelectedLaunchPhase(bytes: Buffer): SelectedLaunchPhase {
+  requireV2(bytes.length >= 8 && bytes.readUInt32BE(0) === SELECTED_LAUNCH_MAGIC, 'selection_phase_magic')
+  const length = bytes.readUInt32BE(4)
+  requireV2(length > 0 && length <= SELECTED_LAUNCH_MAXIMUM && bytes.length === length + 8, 'selection_phase_length')
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(8))
+    const value = recordV2(JSON.parse(text), 'contract,launch,sealed')
+    requireV2(value.contract === SELECTED_LAUNCH_PHASE && canonicalV2(value) === text, 'selection_phase_contract')
+    const evidenceKeys = ['selectedSupervisor', 'selectedControl', 'selectedRecipe'] as const
+    const launch = value.launch as Record<string, unknown>
+    const extended = !!launch && evidenceKeys.some(key => Object.hasOwn(launch, key))
+    recordV2(launch, 'expectedHost,bootstrapV2HeaderSha256,rawRetention,supervisorProcessStartToken,ownerProcessStartToken,recipeSha256,harnessContractSha256,ownerModule,ownerArtifactManifestSha256,ownerExecutable,supervisorExecutable,refs,serializedProductBootstrap,producerCapsule,runtimeManifestSha256,harnessContractPath,held,executed' +
+      (extended ? ',selectedSupervisor,selectedControl,selectedRecipe' : ''))
+    if (extended) parseSelectedSupervisorEvidenceV1(Object.fromEntries(evidenceKeys.map(key => [key, launch[key]])))
+    const sealed = recordV2(value.sealed, 'observedMonotonicNs,constructionClosedMonotonicNs,construction')
+    recordV2(sealed.construction, 'sourceFd,childFd,kind,accessMode,append,mode,uid,gid,seals,device,inode,size,nlink,mtimeNs,ctimeNs,closedMonotonicNs')
+    return immutableV2(value as unknown as SelectedLaunchPhase)
+  } catch { throw new Error('hosted_owner_v2_selection_phase_rejected') }
+}
+
+/** The sealed event is a distinct retained native observation, not inferred
+ * from a header, final memfd seals, or the mere existence of an exec event. */
+export function verifySelectedLaunchSealing(phase: SelectedLaunchPhase, lease: DescriptorSnapshotV2): void {
+  const { sealed, launch } = phase, construction = sealed.construction
+  const held = launch.held.descriptors.find(row => row.childFd === 3)
+  requireV2(held && construction.kind === 'regular-file' && construction.accessMode === 'read-write' &&
+    !construction.append && construction.mode === 0o600 && construction.seals === 15 && construction.nlink === '0' &&
+    construction.device === held.device && construction.inode === held.inode, 'selection_sealed_construction')
+  for (const key of ['device', 'inode', 'size', 'uid', 'gid', 'mode', 'seals', 'nlink'] as const)
+    requireV2(construction[key] === lease[key], 'selection_sealed_lease')
+  const times = [launch.held.heldMonotonicNs, sealed.constructionClosedMonotonicNs,
+    sealed.observedMonotonicNs, launch.executed.observedMonotonicNs]
+  for (const time of times) requireV2(typeof time === 'string' && /^[1-9][0-9]{0,19}$/.test(time), 'selection_sealed_clock')
+  requireV2(BigInt(times[0]) <= BigInt(times[1]) && BigInt(times[1]) <= BigInt(times[2]) &&
+    BigInt(times[2]) < BigInt(times[3]), 'selection_sealed_order')
+}

@@ -8,7 +8,7 @@ import * as lockfile from '../../utils/lockfile.js'
 import {
   writeToMailboxAtCanonicalTeamRootVerified,
   type ExplicitRootVerifiedMailboxWriteResult,
-} from '../../utils/teammateMailbox.js'
+} from '../../utils/teammateMailboxExplicitRoot.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
 import type {

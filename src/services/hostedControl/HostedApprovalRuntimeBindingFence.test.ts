@@ -6,6 +6,39 @@ import {
 } from './HostedApprovalRuntimeBindingFence.js'
 
 describe('HostedApprovalRuntimeBindingFence', () => {
+  test('revocation invalidates retained pins and rejects queued writes without waiting for release', async () => {
+    const registry = new HostedApprovalRuntimeBindingFenceRegistry()
+    const fence = registry.forTeam('team_1')
+    const pin = fence.tryAcquirePin()!
+    let writes = 0
+    const queued = fence.write(async () => { writes++ })
+    registry.revoke()
+    expect(pin.isCurrent()).toBe(false)
+    await expect(queued).rejects.toThrow('revoked')
+    expect(writes).toBe(0)
+    expect(fence.tryAcquirePin()).toBeNull()
+    expect(registry.forTeam('team_2').tryAcquirePin()).toBeNull()
+    await expect(pin.capture(async () => 'stale')).rejects.toThrow('not current')
+    pin.release()
+    registry.revoke()
+    await expect(fence.write(async () => { writes++ })).rejects.toThrow('revoked')
+    expect(writes).toBe(0)
+  })
+
+  test('revocation during capture rejects its late result', async () => {
+    const fence = new HostedApprovalRuntimeBindingFence()
+    let entered!: () => void
+    let complete!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const pending = new Promise<void>(resolve => { complete = resolve })
+    const capture = fence.capture(async () => { entered(); await pending; return 'late binding' })
+    await started
+    fence.revoke()
+    complete()
+    await expect(capture).rejects.toThrow('revoked')
+    expect(fence.tryAcquirePin()).toBeNull()
+  })
+
   test('serializes controlled writes behind the single transition pin', async () => {
     const fence = new HostedApprovalRuntimeBindingFence()
     const pin = fence.tryAcquirePin()

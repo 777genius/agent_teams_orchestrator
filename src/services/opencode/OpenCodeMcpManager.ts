@@ -1,3 +1,5 @@
+import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy, type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
+import { isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
 import path from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
@@ -70,6 +72,7 @@ type OpenCodeMcpClient = {
 }
 
 type OpenCodeMcpManagerDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   clientFactory?: {
     create(baseUrl: string, context?: OpenCodeClientRequestContext): OpenCodeMcpClient
   }
@@ -704,10 +707,40 @@ function inferMcpConnected(entry: OpenCodeMcpStatusEntry | null): boolean | null
   return null
 }
 
+const supervisedManagers = new WeakMap<object, TrustedOpenCodeCustody>()
+export function isOpenCodeMcpManagerBoundToCustody(value: object, custody: TrustedOpenCodeCustody): boolean {
+  return supervisedManagers.get(value) === custody
+}
+
 export class OpenCodeMcpManager {
   private readonly ensureAppMcpInFlight = new Map<string, Promise<EnsureAppMcpResult>>()
 
-  constructor(private readonly deps: OpenCodeMcpManagerDeps = {}) {}
+  private readonly deps: OpenCodeMcpManagerDeps
+  private readonly custody?: TrustedOpenCodeCustody
+  constructor(deps: OpenCodeMcpManagerDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy?.mode === 'supervisor-adopt-only') {
+      const custody = policy.custody
+      assertTrustedOpenCodeCustody(custody)
+      if (new.target !== OpenCodeMcpManager || !deps.clientFactory ||
+        !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) ||
+        deps.resolveLaunchConfig || deps.env || deps.pathExists) {
+        throw new Error('OpenCode supervised MCP requires the custody-bound client and profile')
+      }
+      this.custody = custody
+      this.deps = Object.freeze({ ...deps,
+        clientFactory: Object.freeze({ create: deps.clientFactory.create.bind(deps.clientFactory) }),
+        env: Object.freeze({}),
+      })
+      supervisedManagers.set(this, custody)
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(OpenCodeMcpManager.prototype))) {
+        if (name === 'constructor') continue
+        if (typeof descriptor.value === 'function') Object.defineProperty(this, name, { value: descriptor.value.bind(this) })
+        else if (descriptor.get) Object.defineProperty(this, name, { get: descriptor.get.bind(this) })
+      }
+      Object.freeze(this)
+    } else this.deps = deps
+  }
 
   private get clientFactory() {
     return this.deps.clientFactory ?? openCodeClientFactory
@@ -730,6 +763,18 @@ export class OpenCodeMcpManager {
   }
 
   private async resolveLaunchConfig(): Promise<ResolvedAppMcpLaunchConfig> {
+    if (this.custody) {
+      const profile = await this.custody.readPreparedProfile()
+      const mcp = asRecord(profile.managedConfig.mcp)
+      const config = mcp && asRecord(mcp[OPEN_CODE_APP_MCP_SERVER_NAME])
+      if (!config || (config.type !== 'local' && config.type !== 'remote') ||
+        (config.type === 'local' && (!Array.isArray(config.command) || config.command.length === 0 ||
+          !config.command.every(part => typeof part === 'string' && part.length > 0))) ||
+        (config.type === 'remote' && typeof config.url !== 'string')) {
+        throw new Error('OpenCode supervised profile MCP configuration unavailable')
+      }
+      return { source: 'supervised-profile', config: structuredClone(config) as OpenCodeMcpServerConfig }
+    }
     if (this.deps.resolveLaunchConfig) {
       return this.deps.resolveLaunchConfig()
     }
@@ -776,7 +821,7 @@ export class OpenCodeMcpManager {
       const connected = inferMcpConnected(existingMatch.entry)
       let launchConfig: ResolvedAppMcpLaunchConfig | null = null
       const currentEnv = this.deps.env ?? process.env
-      const shouldVerifyExistingConfig = shouldVerifyExistingAppMcpConfig(
+      const shouldVerifyExistingConfig = !!this.custody || shouldVerifyExistingAppMcpConfig(
         existingMatch.entry,
         client,
         currentEnv,

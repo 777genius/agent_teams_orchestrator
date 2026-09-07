@@ -1065,7 +1065,7 @@ function validateMutationWitness(
         intent.delivery.phase === 'started' || !validSettlementTransition(previous.deliveries, proposed.deliveries, intent.delivery) ||
         (proposed.deliveries.length > previous.deliveries.length
           ? !validInitialDeliveryWitness(previous, intent.delivery, intent.initial)
-          : intent.initial !== null) ||
+          : intent.initial !== null && !validInitialDeliveryWitness(previous, intent.delivery, intent.initial)) ||
         intent.mutation.phase !== intent.delivery.phase || intent.mutation.outcome !== intent.delivery.result) throw new Error('Hosted approval settlement publication witness mismatch')
   }
 }

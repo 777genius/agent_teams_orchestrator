@@ -7,6 +7,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
+import { retainOpenCodeLifecycleRuntime, type OpenCodeLifecycleRuntime, type OpenCodeAppMcpToolProof } from './OpenCodeLifecycleRuntime.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import {
   buildOpenCodeExecutionProof,
@@ -786,20 +787,21 @@ async function waitForLaunchSessionAppMcpReady(
     runtimeDeadline: OpenCodeRuntimeDeadline
     synchronizeLateCompletion: boolean
   },
-): Promise<Awaited<ReturnType<typeof openCodeSessionBridge.ensureSessionAppMcpReady>>> {
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
+): Promise<Awaited<ReturnType<typeof runtime.bridge.ensureSessionAppMcpReady>>> {
   const delays = [0, 250, 750, 1_500]
   const attachIfMissing = options.attachIfMissing ?? true
-  let latest: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSessionAppMcpReady>> | null = null
+  let latest: Awaited<ReturnType<typeof runtime.bridge.ensureSessionAppMcpReady>> | null = null
   for (const [index, delay] of delays.entries()) {
     if (delay > 0) {
       await delayMs(delay)
     }
     latest = await runBoundedLaunchMutation(
       options.runtimeDeadline,
-      () => openCodeSessionBridge.ensureSessionAppMcpReady(record, {
+      () => runtime.bridge.ensureSessionAppMcpReady(record, {
         attachIfMissing: attachIfMissing && (index === 0 || latest?.connected !== true),
       }),
-      () => cleanupFailedLaunchSession(record),
+      () => cleanupFailedLaunchSession(record, runtime),
       options.effectGuard,
       options.synchronizeLateCompletion,
     )
@@ -810,8 +812,8 @@ async function waitForLaunchSessionAppMcpReady(
   if (latest) return latest
   return runBoundedLaunchMutation(
     options.runtimeDeadline,
-    () => openCodeSessionBridge.ensureSessionAppMcpReady(record, { attachIfMissing }),
-    () => cleanupFailedLaunchSession(record),
+    () => runtime.bridge.ensureSessionAppMcpReady(record, { attachIfMissing }),
+    () => cleanupFailedLaunchSession(record, runtime),
     options.effectGuard,
     options.synchronizeLateCompletion,
   )
@@ -1271,13 +1273,7 @@ function validateEnvelope(input: unknown): BridgeEnvelope {
   }
 }
 
-type AppMcpToolProof = {
-  ok: boolean
-  observedTools: string[]
-  missingTools: string[]
-  diagnostics: string[]
-  route: string | null
-}
+type AppMcpToolProof = OpenCodeAppMcpToolProof
 
 // Cold workspace/source MCP startup can take longer than a model turn on dev
 // machines. Keep this below the outer readiness timeout but avoid false launch
@@ -1742,7 +1738,7 @@ async function withTimeout<T>(
   }
 }
 
-function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolProof {
+export function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolProof {
   const observed = new Set(observedTools.map(canonicalizeAppMcpToolId))
   const missingTools = REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS.filter(tool => !observed.has(tool))
   return {
@@ -2171,6 +2167,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
   snapshot: OpenCodeProvisioningSnapshot,
   executionProof?: OpenCodeExecutionProof | null,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ): Promise<void> {
   const catalog = getOpenCodeAccessPolicyCatalog(snapshot)
   const access = evaluateOpenCodeModelAccess({
@@ -2202,7 +2199,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
     }
   }
 
-  const executionOutcome = await openCodeExecutionProbe.probeModel({
+  const executionOutcome = await runtime.execution.probeModel({
     selectedModel,
     projectPath: snapshot.projectPath,
     bypassCache: true,
@@ -2711,10 +2708,11 @@ function assertOpenCodeLaunchRuntimeAvailable(
 async function assertOpenCodeLaunchMcpReady(
   snapshot: OpenCodeProvisioningSnapshot,
   runtimeDeadline: OpenCodeRuntimeDeadline,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ): Promise<void> {
   const toolProof = await runtimeDeadline.runPhase(
     'mcp_preflight',
-    context => proveAppMcpTools(snapshot, context),
+    context => runtime.proveAppMcpTools(snapshot, context),
   )
   if (!isAppMcpConnected(snapshot) || !toolProof.ok) {
     throw new Error(
@@ -2727,10 +2725,11 @@ async function assertOpenCodeLaunchMcpReady(
 
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
   try {
-    await openCodeSessionStore.markStale(
+    await runtime.sessions.markStale(
       record.teamId,
       record.laneId,
       record.memberName,
@@ -2745,7 +2744,7 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionBridge.releaseSession(record)
+    await runtime.bridge.releaseSession(record)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_release_failed',
@@ -2755,7 +2754,7 @@ async function cleanupFailedLaunchSession(
   }
 
   try {
-    await openCodeSessionStore.delete(record.teamId, record.laneId, record.memberName)
+    await runtime.sessions.delete(record.teamId, record.laneId, record.memberName)
   } catch (error) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_failed_session_delete_failed',
@@ -2838,6 +2837,7 @@ async function runLaunch(
   runtimeDeadline: OpenCodeRuntimeDeadline,
   effectGuard?: () => boolean | Promise<boolean>,
   synchronizeLateCompletion = false,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -2852,12 +2852,12 @@ async function runLaunch(
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
 
   const probeStartedAt = Date.now()
-  let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
-  let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
+  let pendingProbe: ReturnType<typeof runtime.provisioning.probeRetainingHost> | null = null
+  let retainedProbe: Awaited<ReturnType<typeof runtime.provisioning.probeRetainingHost>>
   try {
     retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
       return assertLifecycleEffectCurrent(effectGuard).then(() => {
-        pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+        pendingProbe = runtime.provisioning.probeRetainingHost(
           asString(body.projectPath) ?? envelope.cwd,
           { toolApprovalMode, phaseContext: context },
         )
@@ -2883,6 +2883,7 @@ async function runLaunch(
       { provisioningProbeMs },
       effectGuard,
       synchronizeLateCompletion,
+      runtime,
     )
   } finally {
     await retainedProbe.release().catch(() => undefined)
@@ -2896,6 +2897,7 @@ async function runLaunchWithProvisioningSnapshot(
   timings: { provisioningProbeMs?: number } = {},
   effectGuard?: () => boolean | Promise<boolean>,
   synchronizeLateCompletion = false,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   const launchStartedAt = Date.now()
   const body = envelope.body
@@ -2932,6 +2934,7 @@ async function runLaunchWithProvisioningSnapshot(
     snapshot,
     parseOpenCodeExecutionProof(body.executionProof),
     runtimeDeadline,
+    runtime,
   )
   const memberModels = new Map<string, string>()
   for (const item of membersRaw) {
@@ -2948,11 +2951,12 @@ async function runLaunchWithProvisioningSnapshot(
         snapshot,
         parseOpenCodeExecutionProof(body.executionProof),
         runtimeDeadline,
+        runtime,
       )
     }
     memberModels.set(name, apiMemberModel)
   }
-  await assertOpenCodeLaunchMcpReady(snapshot, runtimeDeadline)
+  await assertOpenCodeLaunchMcpReady(snapshot, runtimeDeadline, runtime)
   runtimeDeadline.throwIfExpired('post_probe_refresh')
   const members: Record<string, LaunchMemberDraft> = {}
   const memberTimings = new Map<string, {
@@ -2973,7 +2977,7 @@ async function runLaunchWithProvisioningSnapshot(
     memberTimings.set(name, memberTiming)
     try {
       const ensureStartedAt = Date.now()
-      record = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.ensureSession({
+      record = await runBoundedLaunchMutation(runtimeDeadline, () => runtime.bridge.ensureSession({
         teamId,
         laneId,
         memberName: name,
@@ -2985,11 +2989,11 @@ async function runLaunchWithProvisioningSnapshot(
         runId,
         fresh: true,
         toolApprovalMode,
-      }), created => cleanupFailedLaunchSession(created), effectGuard, synchronizeLateCompletion)
+      }), created => cleanupFailedLaunchSession(created, runtime), effectGuard, synchronizeLateCompletion)
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
       let mcpReady = await waitForLaunchSessionAppMcpReady(record, {
         effectGuard, runtimeDeadline, synchronizeLateCompletion,
-      })
+      }, runtime)
       if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
         record = { ...record, runtimePid: mcpReady.runtimePid }
       }
@@ -3005,7 +3009,7 @@ async function runLaunchWithProvisioningSnapshot(
         // If MCP was attached after the session was created, the existing
         // OpenCode session may not see the new tools. Recreate once before
         // injecting app-managed bootstrap context to avoid a hidden bad session.
-        await openCodeSessionStore.markStale(
+        await runtime.sessions.markStale(
           teamId,
           laneId,
           name,
@@ -3017,7 +3021,7 @@ async function runLaunchWithProvisioningSnapshot(
             'warning',
           ))
         })
-        record = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.ensureSession({
+        record = await runBoundedLaunchMutation(runtimeDeadline, () => runtime.bridge.ensureSession({
           teamId,
           laneId,
           memberName: name,
@@ -3029,7 +3033,7 @@ async function runLaunchWithProvisioningSnapshot(
           runId,
           fresh: true,
           toolApprovalMode,
-        }), created => cleanupFailedLaunchSession(created), effectGuard, synchronizeLateCompletion)
+        }), created => cleanupFailedLaunchSession(created, runtime), effectGuard, synchronizeLateCompletion)
         diagnostics.push(teamDiagnostic(
           'opencode_launch_session_recreated_after_mcp_attach',
           `Recreated OpenCode session for ${name} after Agent Teams MCP attach so launch bootstrap sees the newly attached tools.`,
@@ -3037,7 +3041,7 @@ async function runLaunchWithProvisioningSnapshot(
         ))
         mcpReady = await waitForLaunchSessionAppMcpReady(record, {
           attachIfMissing: false, effectGuard, runtimeDeadline, synchronizeLateCompletion,
-        })
+        }, runtime)
         if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
           record = { ...record, runtimePid: mcpReady.runtimePid }
         }
@@ -3078,19 +3082,19 @@ async function runLaunchWithProvisioningSnapshot(
         contextHash,
       })
       const injectionStartedAt = Date.now()
-      const injected = await runBoundedLaunchMutation(runtimeDeadline, () => openCodeSessionBridge.injectAppManagedBootstrapContext(record!, {
+      const injected = await runBoundedLaunchMutation(runtimeDeadline, () => runtime.bridge.injectAppManagedBootstrapContext(record!, {
         messageID,
         text: contextText,
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
         contextHash,
         briefingHash,
-      }), () => cleanupFailedLaunchSession(record!), effectGuard, synchronizeLateCompletion)
+      }), () => cleanupFailedLaunchSession(record!, runtime), effectGuard, synchronizeLateCompletion)
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
       try {
         record = await runBoundedLaunchMutation(
           runtimeDeadline,
-          () => openCodeSessionBridge.refreshSessionEnvironment(record!),
-          refreshed => cleanupFailedLaunchSession(refreshed),
+          () => runtime.bridge.refreshSessionEnvironment(record!),
+          refreshed => cleanupFailedLaunchSession(refreshed, runtime),
           effectGuard,
           synchronizeLateCompletion,
         )
@@ -3119,7 +3123,7 @@ async function runLaunchWithProvisioningSnapshot(
         appManagedBootstrap,
         updatedAt: candidateAt,
       }
-      await openCodeSessionStore.upsert(record)
+      await runtime.sessions.upsert(record)
       const candidate: OpenCodeAppManagedBootstrapCandidate = {
         schemaVersion: 1,
         source: 'app_managed_bootstrap',
@@ -3168,7 +3172,7 @@ async function runLaunchWithProvisioningSnapshot(
       if (isOpenCodeRuntimeDeadlineError(error)) throw error
       const reason = error instanceof Error ? error.message : String(error)
       const cleanupDiagnostics = record
-        ? await withTimeout(cleanupFailedLaunchSession(record), 5_000).catch(cleanupError => [teamDiagnostic(
+        ? await withTimeout(cleanupFailedLaunchSession(record, runtime), 5_000).catch(cleanupError => [teamDiagnostic(
             'opencode_launch_compensation_timeout',
             `${name}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
             'warning',
@@ -3222,6 +3226,7 @@ async function runReconcile(
   lifecycleOwner: boolean,
   effectGuard?: () => boolean | Promise<boolean>,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -3234,8 +3239,8 @@ async function runReconcile(
   assertUniqueOpenCodeMemberNames(expectedMembers, 'opencode.reconcileTeam expectedMembers')
   if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
   const snapshot = runtimeDeadline
-    ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeProvisioningProbe.probe(envelope.cwd))
-    : await openCodeProvisioningProbe.probe(envelope.cwd)
+    ? await runtimeDeadline.runPhase('provider_mutation', () => runtime.provisioning.probe(envelope.cwd))
+    : await runtime.provisioning.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
@@ -3245,7 +3250,7 @@ async function runReconcile(
   let selectedModel = 'unknown/unknown'
 
   const lifecycleRecords = lifecycleOwner
-    ? (await runtimeDeadline!.runPhase('provider_mutation', () => openCodeSessionStore.list()))
+    ? (await runtimeDeadline!.runPhase('provider_mutation', () => runtime.sessions.list()))
       .filter(record => record.teamId === teamId && record.laneId === laneId)
     : null
   const expectedNames = expectedMembers
@@ -3267,7 +3272,7 @@ async function runReconcile(
     if (!name) continue
     const record = lifecycleOwner
       ? lifecycleRecordsByMember.get(name) ?? null
-      : await openCodeSessionStore.get(teamId, laneId, name)
+      : await runtime.sessions.get(teamId, laneId, name)
     if (!record) {
       diagnostics.push(teamDiagnostic('member_session_missing', `No stored OpenCode session for ${teamId}/${name}`, 'warning'))
       continue
@@ -3332,9 +3337,9 @@ async function runReconcile(
       const reconciled = runtimeDeadline
         ? await runtimeDeadline.runPhase(
             'provider_mutation',
-            () => openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
+            () => runtime.bridge.reconcileSession(record, { limit: 50 }),
           )
-        : await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+        : await runtime.bridge.reconcileSession(record, { limit: 50 })
       const bootstrapFailure = summarizeBootstrapMcpFailure(record, reconciled.summary)
       const memberDiagnostics = [
         ...reconciled.summary.diagnostics,
@@ -3401,6 +3406,7 @@ async function runStop(
   lifecycleOwner: boolean,
   effectGuard?: () => boolean | Promise<boolean>,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -3421,15 +3427,15 @@ async function runStop(
   }
   if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
   const snapshot = runtimeDeadline
-    ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeProvisioningProbe.probe(envelope.cwd))
-    : await openCodeProvisioningProbe.probe(envelope.cwd)
+    ? await runtimeDeadline.runPhase('provider_mutation', () => runtime.provisioning.probe(envelope.cwd))
+    : await runtime.provisioning.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
   const records = (await (runtimeDeadline
-    ? runtimeDeadline.runPhase('provider_mutation', () => openCodeSessionStore.list())
-    : openCodeSessionStore.list())).filter(
+    ? runtimeDeadline.runPhase('provider_mutation', () => runtime.sessions.list())
+    : runtime.sessions.list())).filter(
     record => record.teamId === teamId && record.laneId === laneId,
   )
   const staleRun = lifecycleOwner ? records.find(record => record.runId !== runId) : undefined
@@ -3473,8 +3479,8 @@ async function runStop(
     try {
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
       stopped = runtimeDeadline
-        ? await runtimeDeadline.runPhase('provider_mutation', () => openCodeSessionBridge.abort(record))
-        : await openCodeSessionBridge.abort(record)
+        ? await runtimeDeadline.runPhase('provider_mutation', () => runtime.bridge.abort(record))
+        : await runtime.bridge.abort(record)
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
     } catch (error) {
       operationError = error
@@ -3484,7 +3490,7 @@ async function runStop(
       // independent teardown and must still run so owner shutdown cannot retain
       // the host solely because the abort RPC failed to acknowledge.
       if (!operationError || lifecycleOwner) {
-        await openCodeSessionBridge.releaseSession(record).catch(error => {
+        await runtime.bridge.releaseSession(record).catch(error => {
           memberDiagnostics.push(error instanceof Error ? error.message : String(error))
         })
       }
@@ -3507,7 +3513,7 @@ async function runStop(
   for (const projectPath of cleanupProjectPaths) {
     try {
       if (lifecycleOwner) await assertLifecycleEffectCurrent(effectGuard)
-      const cleanupHosts = () => openCodeHostManager.reconcilePersistentHosts({
+      const cleanupHosts = () => runtime.hosts.reconcilePersistentHosts({
         mode: 'stale',
         reason: 'stopTeam',
         projectPath,
@@ -4617,6 +4623,7 @@ async function handleEnvelope(
   runtimeDeadline?: OpenCodeRuntimeDeadline,
   lifecycleOwner = false,
   effectGuard?: () => boolean | Promise<boolean>,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -4658,17 +4665,17 @@ async function handleEnvelope(
       if (!runtimeDeadline) {
         throw new Error('OpenCode launch preflight deadline was not initialized')
       }
-      return runLaunch(envelope, runtimeDeadline, effectGuard, lifecycleOwner)
+      return runLaunch(envelope, runtimeDeadline, effectGuard, lifecycleOwner, runtime)
     case 'opencode.reconcileTeam':
       if (lifecycleOwner && !runtimeDeadline) {
         throw new Error('OpenCode reconcile deadline was not initialized')
       }
-      return runReconcile(envelope, lifecycleOwner, effectGuard, runtimeDeadline)
+      return runReconcile(envelope, lifecycleOwner, effectGuard, runtimeDeadline, runtime)
     case 'opencode.stopTeam':
       if (lifecycleOwner && !runtimeDeadline) {
         throw new Error('OpenCode stop deadline was not initialized')
       }
-      return runStop(envelope, lifecycleOwner, effectGuard, runtimeDeadline)
+      return runStop(envelope, lifecycleOwner, effectGuard, runtimeDeadline, runtime)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery':
@@ -4716,6 +4723,12 @@ export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
   return executeOpenCodeBridgeCommandEnvelopeInternal(input)
 }
 
+const desktopLifecycleRuntime: OpenCodeLifecycleRuntime = Object.freeze({
+  provisioning: openCodeProvisioningProbe, execution: openCodeExecutionProbe,
+  hosts: openCodeHostManager, sessions: openCodeSessionStore, bridge: openCodeSessionBridge,
+  proveAppMcpTools,
+})
+
 const HOSTED_LIFECYCLE_OWNER_CAPABILITY = Symbol('hosted-lifecycle-owner')
 
 /**
@@ -4724,7 +4737,8 @@ const HOSTED_LIFECYCLE_OWNER_CAPABILITY = Symbol('hosted-lifecycle-owner')
  * public entrypoint intentionally retains the legacy runtime command surface
  * for non-hosted callers.
  */
-export function createOwnedOpenCodeLifecycleCommandExecutor() {
+export function createOwnedOpenCodeLifecycleCommandExecutor(runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime) {
+  runtime = retainOpenCodeLifecycleRuntime(runtime)
   const capability = HOSTED_LIFECYCLE_OWNER_CAPABILITY
   return async (input: unknown, options: {
     signal?: AbortSignal
@@ -4742,6 +4756,7 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
       HOSTED_LIFECYCLE_OWNER_CAPABILITY,
       options.signal,
       options.effectGuard,
+      runtime,
     )
   }
 }
@@ -4751,6 +4766,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
   ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
   externalSignal?: AbortSignal,
   effectGuard?: () => boolean | Promise<boolean>,
+  runtime: OpenCodeLifecycleRuntime = desktopLifecycleRuntime,
 ) {
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
@@ -4800,6 +4816,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
       runtimeDeadline,
       lifecycleOwner,
       fencedEffectGuard,
+      runtime,
     )
     // The hosted owner must not return while an aborted provider operation can
     // still settle and mutate state. Its guarded launch path synchronously

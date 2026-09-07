@@ -16,6 +16,7 @@ export class HostedApprovalOwnerStore {
   constructor(readonly wal: HostedApprovalOwnerWal, private readonly now: () => number = Date.now) {}
 
   reconcileAdmission(admission: HostedApprovalRuntimeAdmission): Promise<HostedApprovalOwnerState> {
+    admission = snapshotAdmission(admission)
     const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
@@ -53,6 +54,7 @@ export class HostedApprovalOwnerStore {
   }
 
   admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay' | 'quarantined'> {
+    admission = snapshotAdmission(admission)
     record = structuredClone(record)
     const operationNonce = createOwnerOperationNonce()
     return this.wal.locked(async state => {
@@ -193,4 +195,15 @@ export class HostedApprovalOwnerStore {
 
 export function withoutRevision(state: HostedApprovalOwnerState): Omit<HostedApprovalOwnerState, 'revision' | 'writerFence'> {
   const { revision: _revision, writerFence: _writerFence, ...rest } = state; return rest
+}
+
+/** Retain data before lock acquisition/recovery awaits; authority checks stay live. */
+function snapshotAdmission(source: HostedApprovalRuntimeAdmission): HostedApprovalRuntimeAdmission {
+  return Object.freeze({
+    ...structuredClone({ schemaVersion: source.schemaVersion,
+      admissionGeneration: source.admissionGeneration, outerAuthority: source.outerAuthority,
+      routes: source.routes, actorMembers: source.actorMembers, digest: source.digest }),
+    isCurrent: source.isCurrent.bind(source),
+    prepareEffectToken: source.prepareEffectToken.bind(source),
+  })
 }

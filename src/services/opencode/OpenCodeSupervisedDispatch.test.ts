@@ -26,6 +26,38 @@ function replyCase(requestId = 'per_test') {
 const { condition, receipt, reply, payload } = replyCase()
 
 describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', () => {
+  test('ordinary provider operations retain actual request and response through operation admission', async () => {
+    const fixture = await supervisedFixture({
+      handle(_request, response) { response.end('{"id":"ses_actual"}') },
+    })
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl)
+      expect(await client.createSession({ title: 'actual request' })).toEqual({ id: 'ses_actual' })
+      expect(fixture.requests).toHaveLength(1)
+      expect(fixture.observations).toHaveLength(2)
+      expect(fixture.observations[0]).toMatchObject({ phase: 'request', method: 'POST', path: '/session',
+        binding: { operation: { kind: 'provider', name: 'session-create', method: 'POST', path: '/session' } },
+        body: { bodyBase64: Buffer.from('{"title":"actual request"}').toString('base64') } })
+      expect(fixture.observations[1]).toMatchObject({ phase: 'response', complete: true,
+        body: { bodyBase64: Buffer.from('{"id":"ses_actual"}').toString('base64') } })
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test('native credential effects reject before retention or socket creation', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      const client = new OpenCodeClientFactory({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+        .create(fixture.expected.endpoint.baseUrl)
+      await expect(client.deleteProviderAuth('provider_test')).rejects.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+      expect(fixture.connections).toHaveLength(0)
+      expect(fixture.observations).toHaveLength(0)
+      expect(custody.rawRetention.isCurrent()).toBe(true)
+    } finally { await fixture.close() }
+  }, 120_000)
+
   test('oversized UTF-8 request is rejected before retaining or connecting', async () => {
     const fixture = await supervisedFixture()
     try {
@@ -403,23 +435,27 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
         expect(retainedWaiting.phase === 'request' && JSON.parse(Buffer.from(retainedWaiting.body.bodyBase64, 'base64').toString()))
           .toEqual(waitingCase.payload)
         const failed = client.answerPermission(failedCase.reply).catch(error => error)
-        // Malformed-body failure evidence is best effort: the public rejection
-        // may settle before its queued append starts. Bound that rendezvous too.
-        if (mode === 'malformed') await supervisedTestWait(stalled, `${mode} terminal evidence`)
-        else await supervisedTestStage(stalled, failed, `${mode} terminal evidence`)
+        await supervisedTestStage(stalled, failed, `${mode} terminal evidence`)
         expect(custody.rawRetention.isCurrent()).toBe(false)
         releasePeer()
-        expect(await waiting).toBeInstanceOf(OpenCodeRequestNotDispatchedError)
-        expect(waitingFinalized).toBe(true)
+        // Socket cancellation precedes terminal persistence. Both client
+        // completions remain pending behind the same retained append queue.
         await supervisedTestWait(fixture.connections[0]!.closed, 'revoked waiting socket close')
+        expect(waitingFinalized).toBe(true)
         expect(fixture.connections[0]!.chunks).toHaveLength(0)
         expect(fixture.connections).toHaveLength(2)
         expect(fixture.requests).toHaveLength(1)
         expect(fixture.observations.filter(record => record.phase === 'request')).toHaveLength(2)
         expect(fixture.requests[0]!.url).toContain('/permission/per_failed/reply')
         expect(JSON.parse(fixture.requests[0]!.body.toString())).toEqual(failedCase.payload)
-        // Terminal storage is still stalled: failure delivery has a real bound.
-        const failure = await supervisedTestWait(failed, 'bounded failure during terminal retention')
+        let settled = false
+        void Promise.all([waiting, failed]).then(() => { settled = true })
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        releaseEvidence()
+        expect(await supervisedTestWait(waiting, 'waiting terminal persistence'))
+          .toBeInstanceOf(OpenCodeRequestNotDispatchedError)
+        const failure = await supervisedTestWait(failed, 'failure after terminal retention')
         expect(failure).toBeInstanceOf(Error)
         expect(failure).not.toBeInstanceOf(OpenCodePermissionConditionRejectedError)
         expect(failure).not.toBeInstanceOf(OpenCodeRequestNotDispatchedError)
@@ -587,7 +623,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
     }
   }
 
-  test('valid chunked reply retains only exact entity bytes and keeps unadmitted nonce metadata unavailable', async () => {
+  test('valid chunked reply retains exact entity bytes and actual nonce header without claiming a join', async () => {
     const bytes = Buffer.from(canonicalHostedApprovalJson(receipt))
     const fixture = await supervisedFixture({ rawResponse(_request, socket) {
       socket.end(Buffer.concat([
@@ -606,7 +642,9 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised dispatch', ()
       expect(fixture.requests).toHaveLength(1)
       const retained = fixture.observations.find(record => record.phase === 'response')!
       expect(retained).toMatchObject({ status: 200, complete: true, contentEncoding: 'identity',
-        peerOperationNonce: null, correlation: 'unavailable' })
+        peerOperationNonce: 'a'.repeat(64), nonceStatus: 'present', correlation: 'unavailable',
+        responseHeaders: [['content-encoding', 'identity'], ['x-agent-teams-hosted-operation-nonce', 'a'.repeat(64)]],
+        connectedPeer: fixture.connections[0]!.identity })
       expect(retained.phase === 'response' && Buffer.from(retained.body.bodyBase64, 'base64')).toEqual(bytes)
       expect(custody.rawRetention.isCurrent()).toBe(true)
     } finally { await fixture.close() }

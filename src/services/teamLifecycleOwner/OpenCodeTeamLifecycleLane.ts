@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 
+import type { OpenCodeLifecycleRuntime } from '../opencode/OpenCodeLifecycleRuntime.js'
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
 import type { TeamLifecycleLaunchLane } from './TeamLifecycleLaunchPlan.js'
 
@@ -35,8 +36,8 @@ export type TeamLifecycleLaneInput = {
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
 
-export function createProductionOpenCodeTeamLifecycleLane(): OpenCodeTeamLifecycleLane {
-  const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor()
+export function createProductionOpenCodeTeamLifecycleLane(runtime?: OpenCodeLifecycleRuntime): OpenCodeTeamLifecycleLane {
+  const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor(runtime)
   return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, () => true)
 }
 

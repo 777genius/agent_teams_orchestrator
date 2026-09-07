@@ -1,3 +1,5 @@
+import { createOpenCodeSupervisedEventFetch } from './OpenCodeSupervisedEventStream.js'
+import type { OpenCodeHostAcquisitionPolicy } from './OpenCodeSupervisedHostCustody.js'
 import {
   extractOpenCodeSseData,
   getOpenCodeSseMessageId,
@@ -16,6 +18,7 @@ import type {
 type OpenCodePreviewFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
 
 type OpenCodePreviewObserverDeps = {
+  acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   fetchImpl?: OpenCodePreviewFetch
 }
 
@@ -90,7 +93,19 @@ function getOpenCodeSsePartId(properties: Record<string, unknown>): string | nul
 }
 
 export class OpenCodePreviewObserver {
-  constructor(private readonly deps: OpenCodePreviewObserverDeps = {}) {}
+  private readonly deps: OpenCodePreviewObserverDeps
+  constructor(deps: OpenCodePreviewObserverDeps = {}) {
+    const policy = deps.acquisitionPolicy
+    if (policy?.mode === 'supervisor-adopt-only') {
+      if (deps.fetchImpl || new.target !== OpenCodePreviewObserver) {
+        throw new Error('OpenCode supervised preview transport substituted')
+      }
+      this.deps = Object.freeze({ fetchImpl: createOpenCodeSupervisedEventFetch(policy.custody) })
+      Object.defineProperty(this, 'observeSession', { value: this.observeSession.bind(this) })
+      Object.defineProperty(this, 'fetchImpl', { value: this.deps.fetchImpl })
+      Object.freeze(this)
+    } else this.deps = deps
+  }
 
   private get fetchImpl(): OpenCodePreviewFetch {
     return this.deps.fetchImpl ?? fetch

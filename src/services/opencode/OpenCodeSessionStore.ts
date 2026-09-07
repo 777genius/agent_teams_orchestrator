@@ -60,8 +60,7 @@ export class OpenCodeSessionStore {
     filePath?: string,
     bindingMutationFence: HostedApprovalRuntimeBindingMutationFence = hostedApprovalRuntimeBindingFences,
   ) {
-    const paths = resolveClaudeMultimodelPaths()
-    this.filePath = filePath ?? path.join(paths.data, 'opencode', 'session-store.json')
+    this.filePath = filePath ?? path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'session-store.json')
     this.lockPath = `${this.filePath}.lock`
     this.bindingMutationFence = bindingMutationFence
   }

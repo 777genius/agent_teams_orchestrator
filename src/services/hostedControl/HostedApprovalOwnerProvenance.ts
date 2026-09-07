@@ -80,7 +80,10 @@ export type BoundOwnerEmission = Readonly<{
   descriptor: Readonly<{ fd: 9; device: string; inode: string }>
   operationNonce: string; emissionNonce: string; sequence: number; lineSha256: string
 }>
+export type OwnerWalImageReceipt = Readonly<{ stage: number; bindingSha256: string; emission: BoundOwnerEmission }>
 export type BoundWalPublication = Readonly<{
+  /** Exact successful custody return; absent for legacy non-disk custodians. */
+  receipt?: OwnerWalImageReceipt
   native: OwnerWalNative
   emission: BoundOwnerEmission
   previous: PreviousWalImage
@@ -91,7 +94,7 @@ export interface OwnerWalPreparedPublication { emit(): BoundWalPublication }
 export interface OwnerWalImageCustodian {
   /** Durably stages immutable P/N before WAL replacement; unbound stages are never publication facts. */
   prepare(previous: PreviousWalImage, next: RetainedWalImage): Readonly<{
-    bind(emission: BoundOwnerEmission): Readonly<{ previous: PreviousWalImage; next: RetainedWalImage }>
+    bind(emission: BoundOwnerEmission): Readonly<{ previous: PreviousWalImage; next: RetainedWalImage; receipt?: OwnerWalImageReceipt }>
   }>
 }
 export interface OwnerWalPublicationProducer {
@@ -216,7 +219,7 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
       used = true
       const lineSha256 = this.#writePrepared(line, sequence)
       const emission = Object.freeze({ stream: HOSTED_OWNER_PROVENANCE_STREAM, producer: this.#producer, activation: this.capsule.activation, descriptor: this.capsule.streams.ownerWalTimeline, operationNonce, emissionNonce, sequence, lineSha256 })
-      let bound: Readonly<{ previous: PreviousWalImage; next: RetainedWalImage }>
+      let bound: ReturnType<ReturnType<OwnerWalImageCustodian['prepare']>['bind']>
       try { bound = custody.bind(emission) } catch (error) { return this.poison(error instanceof Error ? error.message : 'owner-provenance-image-bind') }
       if (!sameRetainedImage(bound.next, next) ||
         bound.previous.kind !== previous.kind || bound.previous.kind === 'retained' && previous.kind === 'retained' &&
@@ -224,7 +227,9 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
         return this.poison('owner-provenance-image-custody-mismatch')
       }
       if (!this.isHealthy()) return this.poison('owner-provenance-health-lost-during-emission')
-      return Object.freeze({ native, previous, next, emission })
+      return Object.freeze({ native, previous, next, emission,
+        ...(bound.receipt === undefined ? {} : { receipt: freezeNativeMetadata(structuredClone(bound.receipt)) }),
+      })
     } })
   }
   poison(reason: string): never {

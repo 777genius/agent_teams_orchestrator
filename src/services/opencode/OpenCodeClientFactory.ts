@@ -5,6 +5,7 @@ import { encodeOpenCodeSocketHttpRequest, readOpenCodeSocketHttpResponse,
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
   type TrustedOpenCodeCustody, type OneUseFence } from './OpenCodeSupervisedHostCustody.js'
 import type { HostedHttpOperation, RetainedRequest } from './OpenCodeHostedRawRetention.js'
+import { classifySupervisedProviderOperation } from './OpenCodeSupervisedOperation.js'
 
 import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
 
@@ -372,6 +373,8 @@ export function canonicalHostedApprovalDigest(value: unknown): string {
 async function readBoundedUtf8Response(
   response: Response,
   maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+  stream?: { headers(status: number, headers: Headers): void; data(bytes: Uint8Array): void
+    isObservationCancelled?(): boolean },
 ): Promise<string> {
   const reader = response.body?.getReader()
   if (!reader) return ''
@@ -518,7 +521,7 @@ function awaitRequestAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise
   })
 }
 
-async function fetchHostedApprovalOverAuthorizedConnection(
+export async function fetchHostedApprovalOverAuthorizedConnection(
   urlValue: string,
   init: RequestInit,
   signal: AbortSignal,
@@ -528,6 +531,7 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   dispatch?: { endAttempted: boolean; body: Buffer; captured: boolean },
   custody?: TrustedOpenCodeCustody,
   maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+  stream?: { headers(status: number, headers: Headers): void; data(bytes: Uint8Array): void },
 ): Promise<OpenCodeSocketHttpResponse> {
   const url = new URL(urlValue)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
@@ -584,8 +588,12 @@ async function fetchHostedApprovalOverAuthorizedConnection(
     if (socket.destroyed) throw new Error('OpenCode authorized connection closed before dispatch')
 
     reader = readOpenCodeSocketHttpResponse(socket, signal, maximumBytes, code => {
+      // Only ordinary bounded SSE cancellation can exempt incomplete framing.
+      // Parser errors and byte limits arrive under their own codes first and
+      // remain sticky even if cancellation occurs during response persistence.
+      if (code === 'incomplete_body' && stream?.isObservationCancelled?.()) return
       if (dispatch?.captured) custody?.rawRetention.poison(code)
-    })
+    }, stream)
     let finalized = false
     try { finalized = finalizeConnected() } catch (error) {
       throw new OpenCodePermissionConditionRejectedError(error)
@@ -601,7 +609,7 @@ async function fetchHostedApprovalOverAuthorizedConnection(
     // Keep the existing marker: even a synchronous write throw is uncertain.
     if (dispatch) dispatch.endAttempted = true
     socket.write(wire)
-    return await reader.response
+    return { ...await reader.response, connectedPeer: connection }
   } finally {
     reader?.cancel()
     cleanupAbort()
@@ -624,11 +632,12 @@ async function retainSupervisedResponse(
   if (retained) await custody.rawRetention.retainResponse(retained, {
     status: response.status, contentEncoding: encoding,
     peerOperationNonce: null, bytes, complete,
+    responseHeaders: response.responseHeaders, connectedPeer: response.connectedPeer,
   })
   if (!complete || encoded) {
     if (retained) {
       custody.rawRetention.poison('response_unusable')
-      void custody.rawRetention.recordFailure(retained, {
+      await custody.rawRetention.recordFailure(retained, {
         phase: 'response-incomplete', code: complete ? 'unexpected_encoding' : 'incomplete_body',
       }).catch(() => undefined)
     }
@@ -761,6 +770,10 @@ export class OpenCodeClientFactory {
       ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>,
       operation?: HostedHttpOperation,
     ): Promise<T> => {
+      if (custody && !operation) {
+        try { operation = classifySupervisedProviderOperation(init?.method ?? 'GET', path) }
+        catch { throw new OpenCodeRequestNotDispatchedError() }
+      }
       // Freeze the wire body before retention or any other asynchronous boundary.
       // Bound the UTF-8 allocation itself; a short Unicode string can exceed
       // the transport byte limit even when its character count is smaller.
@@ -775,6 +788,7 @@ export class OpenCodeClientFactory {
       let custodyToken: OneUseFence | null = null
       let finished = false
       const unconsumed = new Set<OneUseFence>()
+      const preparations: Promise<unknown>[] = []
       const consume = (token: OneUseFence) => { unconsumed.delete(token); return token.consume() }
       const requestedTimeout = context.requestTimeoutMs
       const responseTimeout = requestedTimeout === undefined ? endpointTimeoutMs :
@@ -793,6 +807,9 @@ export class OpenCodeClientFactory {
       }
 
       const controller = new AbortController()
+      let completeExchange!: () => void
+      const completion = new Promise<void>(resolve => { completeExchange = resolve })
+      custody?.retainExchange(() => controller.abort(new Error('OpenCode custody revoked')), completion)
       if (custody && operation) controller.signal.addEventListener('abort', () => {
         custody.rawRetention.poison('exchange_aborted')
       }, { once: true })
@@ -814,7 +831,8 @@ export class OpenCodeClientFactory {
         return !controller.signal.aborted
       }
       armDeadline(custody ? remainingBudget(SUPERVISED_PREPARATION_TIMEOUT_MS) : timeoutMs)
-      const captureToken = (pending: Promise<OneUseFence | null>) => awaitRequestAbort(pending.then(token => {
+      const captureToken = (pending: Promise<OneUseFence | null>) => {
+        const prepared = pending.then(token => {
         if (finished || !deadlineCurrent()) {
           try { token?.consume() } catch {}
           return null
@@ -823,7 +841,10 @@ export class OpenCodeClientFactory {
         // in the same turn as cancellation but never assigned by its caller.
         if (token) unconsumed.add(token)
         return token
-      }), controller.signal)
+        })
+        preparations.push(prepared)
+        return awaitRequestAbort(prepared, controller.signal)
+      }
 
       try {
         let requestInit: RequestInit = {
@@ -844,9 +865,9 @@ export class OpenCodeClientFactory {
           if (operation) {
             operationToken = await captureToken(custody.prepareOperationToken(operation))
             if (!operationToken) throw new Error('OpenCode admitted HTTP operation unavailable')
-            retained = await awaitRequestAbort(custody.rawRetention.retainRequest(custody.rawRetention.bindOperation(operation), {
+            retained = await custody.rawRetention.retainRequest(custody.rawRetention.bindOperation(operation), {
               method: init?.method === 'POST' ? 'POST' : 'GET', path, bytes: dispatch!.body,
-            }), controller.signal)
+            })
           }
           requestInit = custody.authenticatedRequest(baseUrl + path, requestInit)
         }
@@ -888,16 +909,16 @@ export class OpenCodeClientFactory {
             })()
         const response = 'complete' in transported
           ? custody
-            ? await awaitRequestAbort(retainSupervisedResponse(transported, custody, retained), controller.signal)
+            ? await retainSupervisedResponse(transported, custody, retained)
             : socketHttpResponseToWeb(transported)
           : transported
         if (custody && !deadlineCurrent()) throw timeoutError
         if (custody && response.status >= 300 && response.status < 400) {
           throw new Error('OpenCode supervised redirect rejected')
         }
-        if (custody && !retained && response.headers.has('content-encoding') &&
+        if (custody && operation?.kind === 'provider' && response.headers.has('content-encoding') &&
           response.headers.get('content-encoding') !== 'identity') throw new Error('OpenCode supervised encoding rejected')
-        if (custody && !retained && (!response.ok || ((init?.method ?? 'GET') === 'GET' && response.status !== 200))) {
+        if (custody && operation?.kind === 'provider' && (!response.ok || ((init?.method ?? 'GET') === 'GET' && response.status !== 200))) {
           // Native framing and encoding have already been checked. Preserve the
           // authenticated status without exposing a generic failure body. Reads
           // used for admission still require exactly 200, including config.
@@ -909,7 +930,7 @@ export class OpenCodeClientFactory {
       } catch (error) {
         if (custody && operation && !(error instanceof OpenCodeValidatedConditionRejection)) {
           custody.rawRetention.poison('exchange_failed')
-          void custody.rawRetention.recordFailure(retained, {
+          await custody.rawRetention.recordFailure(retained, {
             phase: dispatch?.endAttempted ? 'end-attempted' : 'before-end', code: 'exchange_failed',
           }).catch(() => undefined)
         }
@@ -927,6 +948,10 @@ export class OpenCodeClientFactory {
         unconsumed.clear()
         clearTimeout(timeout)
         context.signal?.removeEventListener('abort', abortFromContext)
+        // Abort races revoke writes promptly, but cannot release bundle
+        // resources while a preparation still owns a late one-use token.
+        await Promise.allSettled(preparations)
+        completeExchange()
       }
     }
 

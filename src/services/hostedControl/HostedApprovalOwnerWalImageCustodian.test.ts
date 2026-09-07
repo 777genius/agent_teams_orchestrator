@@ -53,6 +53,31 @@ function emission(sequence = 1): BoundOwnerEmission {
 
 // Linux is the admitted actual Owner platform. No test claims a Darwin fallback.
 describe.skipIf(process.platform !== 'linux')('synchronous Owner W2 disk custody', () => {
+  test('publication returns the actual successful disk receipt independently of later custodian closure', async () => {
+    const { root, directory, walPath } = fixture()
+    const custodian = await openCustodian(directory)
+    const producer = nativeProducer(root, custodian, [])
+    const publications: ReturnType<ReturnType<typeof producer.prepare>['emit']>[] = []
+    const capturing = {
+      isHealthy: () => producer.isHealthy(),
+      poison: (reason: string): never => producer.poison(reason),
+      close: () => producer.close(),
+      prepare: (input: Parameters<typeof producer.prepare>[0]) => {
+        const prepared = producer.prepare(input)
+        return { emit() { const publication = prepared.emit(); publications.push(publication); return publication } }
+      },
+    }
+    await new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(walPath, undefined, capturing))
+      .reconcileAdmission(admission('a'))
+    expect(publications).toHaveLength(1)
+    const publication = publications[0]!
+    expect(publication.receipt).toEqual(custodian.receipts()[0])
+    expect(publication.receipt?.emission).toEqual(publication.emission)
+    custodian.close()
+    expect(() => custodian.receipts()).toThrow()
+    expect(publication.receipt?.bindingSha256).toBe(hash(readFileSync(join(directory, 'stage-1.binding'))))
+  })
+
   for (const errno of [5, 13]) {
     test(`late pre-rename fstatat errno ${errno} permanently poisons shared capture`, async () => {
       const { root, directory, walPath } = fixture()

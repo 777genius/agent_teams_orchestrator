@@ -156,6 +156,27 @@ describe('createHostedControlProductionPorts', () => {
     })
   })
 
+  test('native composition defers durable provider adoption and cannot adopt after revocation', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-native-deferred-')
+    const plan = await writePlan(teamRoot, 'opencode')
+    const lane = new ProductionRecoveryLane()
+    const previous = new DurableTeamLifecycleExecution(join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE), [lane])
+    const idle = await previous.inspect(plan)
+    const launching = await previous.launch({ plan, commandId: 'native-before-restart', runId: null,
+      expectedProviderGeneration: idle.providerGeneration })
+    await waitForDurablePhase(teamRoot, 'running')
+    const ports = await createHostedControlProductionPortFactory(() => lane, undefined,
+      'after-native-activation')(context(teamRoot))
+    expect(lane.inspectedRunIds).toEqual([])
+    await ports.activateProviders!()
+    await ports.activateProviders!()
+    expect(lane.inspectedRunIds).toEqual([launching.runId])
+    await ports.revoke!()
+    await expect(ports.activateProviders!()).rejects.toThrow('hosted_provider_recovery_revoked')
+    await ports.close()
+    expect(lane.stoppedRunIds).toEqual([launching.runId])
+  })
+
   test('fails startup closed and tears down the exact run when durable running adoption is partial', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-startup-partial-')
     const admittedPlan = await writePlan(teamRoot, 'opencode')

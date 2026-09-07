@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,6 +7,7 @@ import {
   parseStrictHostedProofLastJsonFrame,
   readHostedControlSecret,
   resolveHostedControlOwnerBinding,
+  validateHostedControlOwnerBindingSync,
 } from './ownerProof.js'
 
 const roots: string[] = []
@@ -82,4 +83,35 @@ describe('hosted owner proof identity', () => {
     await writeFile(path, 'ab'.repeat(32), { mode: 0o600 })
     expect(await readHostedControlSecret(path)).toEqual(Buffer.from('ab'.repeat(32), 'hex'))
   })
+})
+
+const nativeRootTest = process.platform === 'linux' ? test : test.skip
+nativeRootTest('synchronous native fence detects replaced directory after asynchronous admission', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'hosted-native-root-'))
+  roots.push(temporary)
+  const root = await realpath(temporary)
+  const team = join(root, 'teams', 'team')
+  await mkdir(team, { recursive: true })
+  const admitted = await resolveHostedControlOwnerBinding({ claudeRoot: root, legacyKey: 'team' })
+  const input = { claudeRoot: root, legacyKey: 'team', expectedRootIdentity: admitted.rootIdentity }
+  expect(validateHostedControlOwnerBindingSync(input)).toBe(true)
+  await rename(team, team + '-retained')
+  await mkdir(team)
+  expect(validateHostedControlOwnerBindingSync(input)).toBe(false)
+  await rm(team, { recursive: true })
+  await symlink(team + '-retained', team)
+  // Even a link to the original inode must not substitute the admitted path.
+  expect(validateHostedControlOwnerBindingSync(input)).toBe(false)
+})
+
+nativeRootTest('synchronous native fence rejects a replaced ancestor pointing at retained team', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'hosted-native-ancestor-'))
+  roots.push(temporary)
+  const root = await realpath(temporary)
+  await mkdir(join(root, 'teams', 'team'), { recursive: true })
+  const admitted = await resolveHostedControlOwnerBinding({ claudeRoot: root, legacyKey: 'team' })
+  await rename(join(root, 'teams'), join(root, 'original-teams'))
+  await symlink(join(root, 'original-teams'), join(root, 'teams'))
+  expect(validateHostedControlOwnerBindingSync({ claudeRoot: root, legacyKey: 'team',
+    expectedRootIdentity: admitted.rootIdentity })).toBe(false)
 })

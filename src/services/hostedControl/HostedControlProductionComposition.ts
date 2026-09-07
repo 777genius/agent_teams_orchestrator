@@ -50,6 +50,7 @@ export function createHostedControlProductionPortFactory(
    * owns its lifecycle; no environment lookup or ambient writer occurs here.
    */
   ownerWalPublication?: OwnerWalPublicationProducer,
+  providerRecovery: 'before-publication' | 'after-native-activation' = 'before-publication',
 ): HostedControlRuntimePortFactory {
   return async (context: HostedControlRuntimePortFactoryContext) => {
     const execution = new DurableTeamLifecycleExecution(
@@ -140,15 +141,27 @@ export function createHostedControlProductionPortFactory(
           },
         })
       : undefined
+    let providerRecoveryStarted = false
+    let revoked = false
+    let providerRecoveryPending: Promise<void> | undefined
+    const activateProviders = (): Promise<void> => {
+      if (revoked) return Promise.reject(new Error('hosted_provider_recovery_revoked'))
+      if (providerRecoveryStarted) return providerRecoveryPending!
+      providerRecoveryStarted = true
+      providerRecoveryPending = execution.recoverAtStartup(admission?.plan ?? null,
+        async () => !revoked && await startupGuard())
+      return providerRecoveryPending
+    }
     let revocation: Promise<void> | null = null
     const revoke = (): Promise<void> => {
+      revoked = true
       if (!revocation) revocation = approvals?.revoke() ?? Promise.resolve()
       return revocation
     }
     try {
-      // This is the final fallible startup step: no lifecycle/message/approval
-      // port can escape until every durable run is adopted by this execution.
-      await execution.recoverAtStartup(admission?.plan ?? null, startupGuard)
+      // Legacy callers adopt here. Native callers expose only fenced ports and
+      // let the serialized runtime invoke adoption after retained activation.
+      if (providerRecovery === 'before-publication') await activateProviders()
     } catch (error) {
       await revoke().catch(() => undefined)
       await Promise.all([
@@ -159,6 +172,7 @@ export function createHostedControlProductionPortFactory(
     }
     return {
       ...services,
+      ...(providerRecovery === 'after-native-activation' ? { activateProviders } : {}),
       ...(approvals ? { approvals } : {}),
       ...(activationSessionFactory ? { activationSessionFactory } : {}),
       revoke,
@@ -166,6 +180,7 @@ export function createHostedControlProductionPortFactory(
         // Calling revoke fences the delegate synchronously; all awaited work is
         // cleanup and therefore precedes lifecycle/authority resource release.
         await revoke().catch(() => undefined)
+        await providerRecoveryPending?.catch(() => undefined)
         await Promise.all([messageDelivery.close(), execution.shutdown()])
       },
     }

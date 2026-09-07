@@ -68,6 +68,7 @@ export interface TrustedOpenCodeCustody {
   prepareOperationToken(operation: HostedHttpOperation): Promise<OneUseFence | null>
   authorizeConnected(connection: OpenCodeConnectedSocketIdentity): Promise<OneUseFence | null>
   authenticatedRequest(url: string, init: RequestInit): RequestInit
+  retainExchange(cancel: () => void, completion: Promise<void>): void
   retainOwnerResource(close: () => void): () => void
   closeOwnerResources(): Promise<void>
 }
@@ -170,8 +171,11 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
     let lose!: () => void
     const lost = new Promise<void>(resolve => { lose = resolve })
     const resources = new Set<() => void>()
+    const exchanges = new Map<Promise<void>, () => void>()
     const revoke = () => {
+      if (revoked) return
       revoked = true; lose()
+      for (const cancel of exchanges.values()) { try { cancel() } catch {} }
       for (const closeResource of resources) {
         try { closeResource() } catch {}
       }
@@ -179,10 +183,10 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
     }
     const close = () => {
       revoke()
-      return closing ??= Promise.allSettled([
-        Promise.resolve().then(() => rawRetention?.close()),
-        Promise.resolve().then(closeBundle),
-      ]).then(() => undefined)
+      return closing ??= (async () => {
+        await Promise.allSettled([...exchanges.keys()])
+        try { await rawRetention?.close() } finally { await closeBundle() }
+      })().catch(() => undefined)
     }
     try {
       assertOpenCodeRawRetentionPort(rawRetention)
@@ -239,6 +243,7 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
             'projectBehaviorFingerprint', 'managedConfigFingerprint', 'sourceAuthFingerprint',
             'managedAuthFingerprint', 'sourceAuthSources'] as const) {
             if (canonical(profile[key]) !== canonical(expected.profile[key])) {
+              revoke()
               throw new Error('OpenCode supervised profile mismatch')
             }
           }
@@ -264,10 +269,18 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
           return token?.consume() ?? false
         },
         prepareEffectToken,
-        prepareLeaseToken: async (lease: OpenCodeHostLeaseInput) =>
-          captureFence(await prepareLease(Object.freeze({ ...lease }))),
-        prepareOperationToken: async (operation: HostedHttpOperation) =>
-          captureFence(await prepareOperation(Object.freeze({ ...operation }))),
+        async prepareLeaseToken(lease: OpenCodeHostLeaseInput) {
+          if (!current()) return null
+          const token = captureFence(await prepareLease(Object.freeze({ ...lease })))
+          if (!current()) { token?.consume(); return null }
+          return token
+        },
+        async prepareOperationToken(operation: HostedHttpOperation) {
+          if (!current()) return null
+          const token = captureFence(await prepareOperation(Object.freeze({ ...operation })))
+          if (!current()) { token?.consume(); return null }
+          return token
+        },
         async authorizeConnected(connection: OpenCodeConnectedSocketIdentity) {
           if (!current() || connection.remotePort !== expected.endpoint.port) return null
           const peer = await captureOpenCodeEstablishedPeerIdentity(expected.process.pid,
@@ -286,6 +299,11 @@ export function createOpenCodeSupervisedCustodyAcquirer(source: OpenCodeSupervis
           headers.set('x-opencode-directory', expected.profile.projectPath)
           headers.set('accept-encoding', 'identity')
           return { ...init, headers, redirect: 'manual' as const }
+        },
+        retainExchange(cancel: () => void, completion: Promise<void>) {
+          if (revoked) { cancel(); throw new Error('OpenCode supervisor custody lost') }
+          exchanges.set(completion, cancel)
+          void completion.then(() => exchanges.delete(completion), () => exchanges.delete(completion))
         },
         retainOwnerResource(closeResource: () => void) {
           if (!current()) { closeResource(); return () => {} }

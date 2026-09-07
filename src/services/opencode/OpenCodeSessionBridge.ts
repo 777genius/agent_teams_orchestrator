@@ -1,3 +1,4 @@
+import { isOpenCodeMcpManagerBoundToCustody } from './OpenCodeMcpManager.js'
 import { createHash } from 'node:crypto'
 import {
   closeSync,
@@ -511,6 +512,7 @@ export class OpenCodeSessionBridge {
       if (new.target !== OpenCodeSessionBridge) throw new Error('OpenCode supervised bridge must use the admitted implementation')
       if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
         !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) || !deps.sessionStore ||
+        (deps.mcpManager && !isOpenCodeMcpManagerBoundToCustody(deps.mcpManager, custody)) ||
         deps.prepareProfile || deps.preparePermissionProfileToken || deps.captureProcessIdentity ||
         deps.captureEstablishedPeerIdentity || deps.captureLoopbackEndpointIdentity) {
         throw new Error('OpenCode supervised bridge requires the complete custody-bound dependencies')
@@ -1006,6 +1008,11 @@ export class OpenCodeSessionBridge {
   ): Promise<T> {
     record = this.snapshotSession(record)
     let sessionProfile = await this.prepareProfileForSessionRecord(record)
+    if (this.custody) {
+      // The admitted supervisor owns credentials; this owner only uses its
+      // retained profile and the authenticated host's actual prompt path.
+      return this.withSessionHost(record, callback, sessionProfile.profile)
+    }
     const refreshResult = await this.oauthRefreshCoordinator.ensureFreshForPrompt({
       selectedModel: record.selectedModel,
       projectPath: record.projectPath,

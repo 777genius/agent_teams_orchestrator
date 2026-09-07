@@ -1,6 +1,8 @@
 import type { HostedControlDescriptorGuard } from './HostedControlBootstrap.js'
 import type { HostedControlRuntimeConfig } from './HostedControlRuntimeConfig.js'
 import { HostedControlInheritedActivationV2 } from './HostedControlInheritedActivationV2.js'
+import { readSelectedLaunchPhase } from './HostedControlSelectedLaunchReader.js'
+import { SELECTED_LAUNCH_PHASE, verifySelectedLaunchSealing, type SelectedLaunchPhase } from './HostedControlSelectedLaunchPhase.js'
 import { beforeDeadlineV2, descriptorRowV2, nonblockV2, OwnedDescriptorV2, readAvailableV2, readLeaseBytesV2,
   readOneUseV2, sameDescriptorV2, snapshotAllV2, snapshotV2, type DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
 import { freezeSelectionV2, observeExecutingOwnerV2, processV2, verifySelectedLaunchV2,
@@ -31,7 +33,8 @@ export type HostedControlBootstrapAdmissionV2 = Readonly<{
  * from fields parsed out of this self-MACed frame. */
 export async function readHostedControlBootstrapV2(options: {
   modulePath: string
-  selectLaunch(): OwnerV2LaunchSelection | Promise<OwnerV2LaunchSelection>
+  selectionPhase?: typeof SELECTED_LAUNCH_PHASE
+  selectLaunch(phase?: SelectedLaunchPhase): OwnerV2LaunchSelection | Promise<OwnerV2LaunchSelection>
 }): Promise<HostedControlBootstrapAdmissionV2> {
   const deadline = performance.now() + 5000
   const owners = new Map<OwnerV2Role, OwnedDescriptorV2>((Object.entries(OWNER_V2_ROLES) as [OwnerV2Role, number][])
@@ -76,7 +79,14 @@ export async function readHostedControlBootstrapV2(options: {
     requireV2(find('raw-opencode-retention').size === String(h.rawRetention.initialByteLength), 'raw_prefix_size')
     // Selected source may read its pinned manifest/contract after the one-use
     // descriptors and anchor have closed. It cannot create runtime effects.
-    const selection = freezeSelectionV2(await withinDeadline(options.selectLaunch(), deadline))
+    requireV2(options.selectionPhase === undefined || options.selectionPhase === SELECTED_LAUNCH_PHASE, 'selection_phase_version')
+    const phase = options.selectionPhase === SELECTED_LAUNCH_PHASE
+      ? await readSelectedLaunchPhase(owner('activation-v2'), deadline) : undefined
+    const selection = freezeSelectionV2(await withinDeadline(options.selectLaunch(phase), deadline))
+    if (phase) {
+      requireV2(canonicalV2(selection) === canonicalV2(phase.launch), 'selection_phase_admitted_binding')
+      verifySelectedLaunchSealing(phase, find('sealed-launcher-lease'))
+    }
     beforeDeadlineV2(deadline)
     requireV2(selection.ownerModule.path === options.modulePath, 'selected_module_path')
     verifySelectedLaunchV2({ selection, header: h, snapshots, executed, deadline })

@@ -21,7 +21,8 @@ type PreviousMetadata = Readonly<{ kind: 'absent' }> | Readonly<{ kind: 'retaine
 /** Storage projection of the existing P1 image and BoundOwnerEmission contracts.
  * File names are derived from stage, never supplied by metadata. No qualification. */
 type Binding = Readonly<{ previous: PreviousMetadata; next: ImageMetadata; emission: BoundOwnerEmission }>
-export type OwnerWalImageReceipt = Readonly<{ stage: number; bindingSha256: string; emission: BoundOwnerEmission }>
+export type { OwnerWalImageReceipt } from './HostedApprovalOwnerProvenance.js'
+import type { OwnerWalImageReceipt } from './HostedApprovalOwnerProvenance.js'
 export type OwnerWalImageIo = Readonly<{
   write: (fd: number, bytes: Uint8Array, offset: number, length: number, position: number) => number
   sync: typeof fsyncSync
