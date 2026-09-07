@@ -264,6 +264,14 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
           return summary.durableState === 'idle' && Boolean(summary.latestAssistantText?.includes(token))
         }
 
+        // A session is retired when the managed auth import changes, so the
+        // runtime rewriting its own auth store during a turn would silently end
+        // every session after the first message.
+        const managedAuthPath = path.join(profile.xdgDataHome, 'opencode', 'auth.json')
+        const managedAuthBytes = async () =>
+          await readFile(managedAuthPath, 'utf8').catch(() => '<absent>')
+        const authBeforeTurn = await managedAuthBytes()
+
         const warmToken = `warm-${randomUUID().slice(0, 8)}`
         await prompt(stopped.id, `TOKEN:${warmToken}`)
         await until('managed turn', () => replied(stopped.id, warmToken), 180_000)
@@ -315,6 +323,8 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
           mcpServer.stop(true)
         }
         expect(mcpCalls).toBe(1)
+
+        expect(await managedAuthBytes()).toBe(authBeforeTurn)
 
         // A completed turn must never seal the session.
         const followUpToken = `followup-${randomUUID().slice(0, 8)}`
