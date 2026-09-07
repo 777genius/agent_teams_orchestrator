@@ -19,6 +19,9 @@ import {
 } from './HostedApprovalRuntimeActivation.js'
 import {
   createHostedApprovalActivationV2PinsForTest,
+  createHostedApprovalActivationV2ProductionPins,
+  HOSTED_APPROVAL_ACTIVATION_V2_SPKI_ENV,
+  HOSTED_APPROVAL_ACTIVATION_V2_CONTRACT_DIGEST_ENV,
   type HostedApprovalActivationV2PinSource,
 } from './HostedApprovalActivationV2Pins.js'
 
@@ -347,7 +350,7 @@ describe('hosted approval product activation-v2 verifier', () => {
     )).toThrow(/actor_mapping_unbound/)
   })
 
-  test('keeps production authorship unavailable instead of trusting caller-selected pins', async () => {
+  test('keeps legacy production authorship unavailable without deployment pins', async () => {
     const fixture = await golden()
     const publication = publish(
       fixture,
@@ -627,3 +630,42 @@ function publicationWithExactBytes(fixture: Golden, target: number): {
   if (Buffer.byteLength(source) !== target) throw new Error('publication sizing drift')
   return { source, binding }
 }
+
+test('production unwrap verifies a fresh Ed25519 signer with explicit pins and preserves legacy env lookup', async () => {
+  const base = await golden()
+  const pair = generateKeyPairSync('ed25519')
+  const spki = pair.publicKey.export({ format: 'der', type: 'spki' })
+  const fixture: Golden = { ...base, publicKeySpkiDer: spki.toString('base64url'),
+    publicKeyDigest: sha256(spki), privateKeyPkcs8Pem: pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString() }
+  const source = publish(fixture, fixture.binding, JSON.parse(fixture.admissionDocument)).source
+  const input = { publicKeySpkiDerBase64url: fixture.publicKeySpkiDer, contractDigest: fixture.contractDigest }
+  const pins = createHostedApprovalActivationV2ProductionPins(input)
+  const names = [HOSTED_APPROVAL_ACTIVATION_V2_SPKI_ENV, HOSTED_APPROVAL_ACTIVATION_V2_CONTRACT_DIGEST_ENV]
+  const previous = names.map(name => process.env[name])
+  try {
+    for (const name of names) delete process.env[name]
+    input.publicKeySpkiDerBase64url = 'invalid'
+    input.contractDigest = `sha256:${'f'.repeat(64)}`
+    pins.publicKeySpkiDer.fill(0)
+    const verifyProduction = (selected = pins) => unwrapHostedApprovalActivation(source, fixture.proofKeyHex, expectation(fixture.binding), selected)
+    expect(verifyProduction().binding).toEqual(fixture.binding)
+    const foreign = generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64url')
+    for (const selected of [
+      createHostedApprovalActivationV2ProductionPins({ publicKeySpkiDerBase64url: foreign, contractDigest: fixture.contractDigest }),
+      createHostedApprovalActivationV2ProductionPins({ publicKeySpkiDerBase64url: fixture.publicKeySpkiDer, contractDigest: input.contractDigest }),
+    ]) expect(() => verifyProduction(selected)).toThrow(/pin/)
+    expect(() => verifyProduction(createHostedApprovalActivationV2PinsForTest(pins) as typeof pins)).toThrow(/pins_unavailable/)
+    const tampered = JSON.parse(source)
+    tampered.authorship.signature = Buffer.alloc(64).toString('base64url')
+    expect(() => unwrapHostedApprovalActivation(JSON.stringify(tampered) + '\n', fixture.proofKeyHex, expectation(fixture.binding), pins)).toThrow(/authorship_invalid/)
+    expect(() => unwrapHostedApprovalActivation(source, fixture.proofKeyHex, expectation(fixture.binding))).toThrow(/pins_unavailable/)
+    process.env[names[0]!] = fixture.publicKeySpkiDer
+    process.env[names[1]!] = fixture.contractDigest
+    expect(unwrapHostedApprovalActivation(source, fixture.proofKeyHex, expectation(fixture.binding)).binding).toEqual(fixture.binding)
+    process.env[names[0]!] = foreign
+    expect(() => unwrapHostedApprovalActivation(source, fixture.proofKeyHex, expectation(fixture.binding))).toThrow(/pin/)
+    expect(verifyProduction().binding).toEqual(fixture.binding)
+  } finally {
+    names.forEach((name, i) => { if (previous[i] === undefined) delete process.env[name]; else process.env[name] = previous[i] })
+  }
+})

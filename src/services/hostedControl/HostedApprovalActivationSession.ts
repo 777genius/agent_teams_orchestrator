@@ -17,7 +17,7 @@ import {
   type HostedApprovalActivationExpectation,
   type VerifiedHostedApprovalActivation,
 } from './HostedApprovalRuntimeActivation.js'
-import type { HostedApprovalActivationV2PinSource } from './HostedApprovalActivationV2Pins.js'
+import { requireHostedApprovalActivationV2ProductionPins, type HostedApprovalActivationV2ProductionPinSource, type HostedApprovalActivationV2PinSource } from './HostedApprovalActivationV2Pins.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
 import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
 import type { HostedControlOwnerBinding } from './protocol.js'
@@ -113,8 +113,11 @@ implements HostedApprovalActivationTransportSession {
 
   static production(
     options: HostedApprovalActivationSessionOptions,
+    pins?: HostedApprovalActivationV2ProductionPinSource,
   ): HostedApprovalActivationSession {
-    return new HostedApprovalActivationSession(options, unwrapHostedApprovalActivation)
+    const retained = pins === undefined ? undefined : requireHostedApprovalActivationV2ProductionPins(pins)
+    return new HostedApprovalActivationSession(options, (source, proofKey, expected) =>
+      unwrapHostedApprovalActivation(source, proofKey, expected, retained))
   }
 
   /** Explicit test-vector seam. It cannot replace production authentication. */

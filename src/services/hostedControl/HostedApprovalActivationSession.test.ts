@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { generateKeyPairSync } from 'node:crypto'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,7 +17,9 @@ import {
   type HostedApprovalActivationBinding,
   type HostedApprovalActivationExpectation,
 } from './HostedApprovalRuntimeActivation.js'
-import { createHostedApprovalActivationV2PinsForTest } from './HostedApprovalActivationV2Pins.js'
+import { createHostedApprovalActivationV2ProductionPins, HOSTED_APPROVAL_ACTIVATION_V2_SPKI_ENV, HOSTED_APPROVAL_ACTIVATION_V2_CONTRACT_DIGEST_ENV, createHostedApprovalActivationV2PinsForTest } from './HostedApprovalActivationV2Pins.js'
+import { HostedApprovalDeferredManifestV2 } from './HostedApprovalDeferredManifestV2.js'
+import { fixtureHeaderV2 } from './fixtures/bootstrapV2Producer.js'
 import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
 
 type Golden = {
@@ -70,7 +73,7 @@ describe('HostedApprovalActivationSession', () => {
     ])
   })
 
-  test('production authentication cannot be caller-selected and fails before recovery while pins are unavailable', async () => {
+  test('legacy production authentication fails before recovery while environment pins are unavailable', async () => {
     const harness = await createHarness()
     let recoveries = 0
     const session = HostedApprovalActivationSession.production({
@@ -563,3 +566,51 @@ function deferred<T>() {
   })
   return { promise, resolve, reject }
 }
+
+test('production factories retain explicit validated pins before prepare and across recovery', async () => {
+  const names = [HOSTED_APPROVAL_ACTIVATION_V2_SPKI_ENV, HOSTED_APPROVAL_ACTIVATION_V2_CONTRACT_DIGEST_ENV]
+  const previous = names.map(name => process.env[name])
+  try {
+    for (const name of names) delete process.env[name]
+    for (const deferred of [false, true]) {
+      for (const mismatch of ['none', 'key', 'contract']) {
+        for (const name of names) delete process.env[name]
+        const harness = await createHarness()
+        const input = { publicKeySpkiDerBase64url: mismatch === 'key' ?
+          generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64url') :
+          harness.golden.signing.publicKeySpkiDerBase64url,
+          contractDigest: mismatch === 'contract' ? `sha256:${'f'.repeat(64)}` : harness.golden.signing.contractDigest }
+        const pins = createHostedApprovalActivationV2ProductionPins(input)
+        let recovered = 0
+        harness.recover = async () => {
+          recovered++
+          // Mutation between first signature verification and the final fence.
+          pins.publicKeySpkiDer.fill(0)
+          for (const name of names) process.env[name] = 'malformed'
+          input.contractDigest = `sha256:${'e'.repeat(64)}`
+          return delegate
+        }
+        const { manifestDigest: _, ...pending } = harness.expectation.signedManifest
+        const options = { ...harness.options, expectedHost: fixtureHeaderV2().expectedHost,
+          authority: { ...harness.authority, snapshot: () => ({ ...harness.expectation, signedManifest: pending }) } }
+        const session = deferred ? HostedApprovalDeferredManifestV2.production(options, pins) :
+          HostedApprovalActivationSession.production(harness.options, pins)
+        input.publicKeySpkiDerBase64url = 'malformed'
+        pins.publicKeySpkiDer.fill(0)
+        if (mismatch !== 'none') {
+          await expect(session.activate(harness.golden.prepare.transportBytes)).rejects.toThrow(/pin/)
+          expect(recovered).toBe(0)
+          expect(harness.port.lifecycle.status).toBe(deferred ? 'revoked' : 'inactive')
+        } else {
+          expect(await session.activate(harness.golden.prepare.transportBytes)).toBe(harness.golden.ready.transportBytes)
+          expect(recovered).toBe(1)
+          expect(harness.port.lifecycle.status).toBe('active')
+        }
+        expect(() => HostedApprovalActivationSession.production(harness.options, harness.pins as typeof pins)).toThrow(/pins_unavailable/)
+        expect(() => HostedApprovalDeferredManifestV2.production(options, harness.pins as typeof pins)).toThrow(/pins_unavailable/)
+      }
+    }
+  } finally {
+    names.forEach((name, i) => { if (previous[i] === undefined) delete process.env[name]; else process.env[name] = previous[i] })
+  }
+})
