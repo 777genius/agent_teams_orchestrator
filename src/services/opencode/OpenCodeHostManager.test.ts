@@ -953,6 +953,135 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
+  async function withCachedAdoptedHost(
+    run: (fixture: {
+      manager: OpenCodeHostManager
+      registryPath: string
+      state: { alive: boolean; startedAtMs: number; reuseAfterDeath: boolean; spawnCount: number; healthChecks: number; prepare: () => void }
+      killedPids: number[]
+      oldPid: number
+    }) => Promise<void>,
+  ): Promise<void> {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-cached-adopted-TEST-'))
+    const registryPath = path.join(root, 'registry.json')
+    const oldPid = 43114
+    const state = { alive: true, startedAtMs: 1_000, reuseAfterDeath: false, spawnCount: 0,
+      healthChecks: 0, prepare: () => {} }
+    const killedPids: number[] = []
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2', hosts: { 'host-key': {
+          hostKey: 'host-key', profileRootKey: baseProfile.profileRootKey,
+          projectPath: baseProfile.projectPath,
+          projectBehaviorFingerprint: baseProfile.projectBehaviorFingerprint,
+          managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+          baseUrl: 'http://127.0.0.1:43114', port: 43114, pid: oldPid,
+          processStartedAtMs: 1_000, version: '1.4.0', resolvedConfigFingerprint: null,
+          updatedAt: new Date().toISOString(), leases: {},
+        } },
+      }))
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => { state.prepare(); return { ...baseProfile, tmpPath: path.join(root, 'tmp') } },
+        persistentRegistryPath: registryPath,
+        isProcessAlive: pid => {
+          if (pid !== oldPid) return true
+          const alive = state.alive
+          if (!alive && state.reuseAfterDeath) {
+            state.alive = true
+            state.startedAtMs = 2_000
+          }
+          return alive
+        },
+        readProcessStartTimeMs: async pid => pid === oldPid ? state.startedAtMs : 3_000,
+        killProcess: pid => { killedPids.push(pid) },
+        allocateLoopbackPort: async () => 43115,
+        spawnHostProcess: () => { state.spawnCount++; return createMockChildProcess(43115).child },
+        fetchJson: async () => {
+          state.healthChecks++
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        },
+      })
+      await manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false })
+      await run({ manager, registryPath, state, killedPids, oldPid })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+
+  test('reuses a live cached adopted host without another spawn or health request', async () => {
+    await withCachedAdoptedHost(async ({ manager, state }) => {
+      const cached = manager.getHost('host-key')
+      const healthChecks = state.healthChecks
+      expect(await manager.ensureHost({ hostKey: 'host-key' })).toBe(cached)
+      expect(state.spawnCount).toBe(0)
+      expect(state.healthChecks).toBe(healthChecks)
+    })
+  })
+
+  test.each([false, true])('recovers a dead unretained adopted host once for concurrent callers (PID reused: %s)', async reuseAfterDeath => {
+    await withCachedAdoptedHost(async ({ manager, registryPath, state, killedPids, oldPid }) => {
+      const old = manager.getHost('host-key')!
+      await manager.releaseHost('host-key', { keepPersistentAlive: true })
+      state.alive = false
+      state.reuseAfterDeath = reuseAfterDeath
+      const [first, second] = await Promise.all([
+        manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
+        manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
+      ])
+      expect(first).toBe(second)
+      expect(first.pid).not.toBe(oldPid)
+      expect(first.state).toBe('healthy')
+      expect(old.state).toBe('degraded')
+      expect(state.spawnCount).toBe(1)
+      expect(killedPids).toEqual([])
+      expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts['host-key'].pid).toBe(first.pid)
+      await manager.releaseHost('host-key')
+      expect(manager.getHost('host-key')).toBe(first)
+      expect(killedPids).toEqual([])
+    })
+  })
+
+  test('fences a dead retained adopted host until every old reference drains, even after PID reuse', async () => {
+    await withCachedAdoptedHost(async ({ manager, registryPath, state, killedPids }) => {
+      await manager.ensureHost({ hostKey: 'host-key' })
+      const before = await readFile(registryPath, 'utf8')
+      state.alive = false
+      await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow('terminated while retained')
+      state.alive = true
+      state.startedAtMs = 2_000
+      await manager.releaseHost('host-key', { keepPersistentAlive: true })
+      await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow('terminated while retained')
+      expect(manager.getHost('host-key')?.state).toBe('degraded')
+      expect(state.spawnCount).toBe(0)
+      expect(killedPids).toEqual([])
+      expect(await readFile(registryPath, 'utf8')).toBe(before)
+      await manager.releaseHost('host-key', { keepPersistentAlive: true })
+      expect((await manager.ensureHost({ hostKey: 'host-key' })).state).toBe('healthy')
+      expect(state.spawnCount).toBe(1)
+      expect(killedPids).toEqual([])
+    })
+  })
+
+  test.each(['before-call', 'during-profile'] as const)('aborted cached adopted recovery does not mutate the host or registry (%s)', async when => {
+    await withCachedAdoptedHost(async ({ manager, registryPath, state, killedPids }) => {
+      await manager.releaseHost('host-key', { keepPersistentAlive: true })
+      const cached = manager.getHost('host-key')
+      const before = await readFile(registryPath, 'utf8')
+      state.alive = false
+      const controller = new AbortController()
+      const abort = () => controller.abort(new Error('cancel cached recovery'))
+      if (when === 'before-call') abort()
+      else state.prepare = abort
+      await expect(manager.ensureHost({ hostKey: 'host-key', abortSignal: controller.signal }))
+        .rejects.toThrow('cancel cached recovery')
+      expect(manager.getHost('host-key')).toBe(cached)
+      expect(cached?.state).toBe('healthy')
+      expect(await readFile(registryPath, 'utf8')).toBe(before)
+      expect(state.spawnCount).toBe(0)
+      expect(killedPids).toEqual([])
+    })
+  })
+
   test('removes a reused registry pid without disposing or signaling the unrelated process', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')

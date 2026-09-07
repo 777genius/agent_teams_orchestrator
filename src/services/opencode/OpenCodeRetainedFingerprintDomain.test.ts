@@ -134,6 +134,19 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     expect(fresh.host?.resolvedConfigFingerprint).toBe(profile.managedConfigFingerprint)
     expect(children).toHaveLength(2)
     await fresh.release(true)
+    // A long-lived manager has no child exit listener for an adopted process.
+    const cachedManager = managers()
+    const cached = await probeFor(cachedManager).probeRetainingHost(project, { selectedModel })
+    expect(cached.host?.pid).toBe(fresh.host?.pid)
+    expect(children).toHaveLength(2)
+    await cached.release(true)
+    await stopFixtureChild(children[1])
+    const recovered = await probeFor(cachedManager).probeRetainingHost(project, { selectedModel })
+    expect(recovered.snapshot.hostHealthy).toBe(true)
+    expect(recovered.host?.pid).not.toBe(cached.host?.pid)
+    expect(recovered.host?.resolvedConfigFingerprint).toBe(profile.managedConfigFingerprint)
+    expect(children).toHaveLength(3)
+    await recovered.release(true)
   } finally {
     try {
       await Promise.all(children.map(stopFixtureChild))
