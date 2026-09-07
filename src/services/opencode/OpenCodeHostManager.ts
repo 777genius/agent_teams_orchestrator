@@ -1555,7 +1555,22 @@ export class OpenCodeHostManager {
     }
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
+    if (params.abortSignal?.aborted) {
+      throwOpenCodeAbortReason(params.abortSignal)
+    }
     const existing = this.hosts.get(hostKey)
+    if (existing && !existing.ownedByProcess && (
+      existing.handle.state === 'degraded'
+      || (existing.handle.state === 'healthy' && !this.isProcessAlive(existing.handle.pid))
+    )) {
+      existing.handle.state = 'degraded'
+      // Releases identify hosts by key, so old holders must drain before a
+      // replacement can occupy that key and receive their late releases.
+      if (existing.refCount > 0) {
+        throw new Error(`OpenCode host pid ${existing.handle.pid} terminated while retained; release existing host references before retrying`)
+      }
+      this.hosts.delete(hostKey)
+    }
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
       return existing.handle
