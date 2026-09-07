@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { posixNamespaceLookup } from './PosixNamespaceLookup.internal.js'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync,
   readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
@@ -52,6 +53,123 @@ function emission(sequence = 1): BoundOwnerEmission {
 
 // Linux is the admitted actual Owner platform. No test claims a Darwin fallback.
 describe.skipIf(process.platform !== 'linux')('synchronous Owner W2 disk custody', () => {
+  for (const errno of [5, 13]) { // EIO / EACCES, not fabricated absent images
+    for (const edge of ['snapshot', 'prepare', 'bind', 'reload'] as const) {
+      test(`real namespace ${errno} at ${edge} rejects without absence evidence`, async () => {
+        const { root, directory, walPath } = fixture()
+        let armed = false
+        let hits = 0
+        const original = posixNamespaceLookup.fstatat
+        const lookup = spyOn(posixNamespaceLookup, 'fstatat').mockImplementation((fd, child) => {
+          const target = edge === 'snapshot' ? 'owner.json' : 'stage-1.previous'
+          if (armed && child === target) { hits++; return { result: -1, errno } }
+          return original(fd, child)
+        })
+        try {
+          const c = await openCustodian(directory)
+          const wrapped: OwnerWalImageCustodian = { prepare(p, n) {
+            if (edge === 'prepare') armed = true
+            const stage = c.prepare(p, n)
+            return { bind(e) { if (edge === 'bind') armed = true; return stage.bind(e) } }
+          } }
+          const producer = nativeProducer(root, wrapped, [])
+          const wal = new HostedApprovalOwnerWal(walPath, undefined, producer)
+          const store = new HostedApprovalOwnerStore(wal)
+          armed = edge === 'snapshot'
+          if (edge === 'reload') {
+            await store.reconcileAdmission(admission('a'))
+            const receipt = c.receipts()[0]!
+            // Successful publication above exercised actual ENOENT at both boundaries.
+            expect((await readDiskOwnerWalImages(directory, receipt)).previous).toEqual({ kind: 'absent' })
+            armed = true
+            await expect(readDiskOwnerWalImages(directory, receipt)).rejects.toThrow('namespace lookup failed')
+          } else {
+            await expect(store.reconcileAdmission(admission('a'))).rejects.toThrow()
+            expect(producer.isHealthy()).toBe(false)
+            expect(wal.isPublicationCaptureCurrent()).toBe(false)
+            expect(existsSync(walPath)).toBe(edge === 'bind')
+            expect(existsSync(join(directory, 'stage-1.binding'))).toBe(false)
+            if (edge !== 'snapshot') expect(c.isHealthy()).toBe(false)
+            armed = false
+            await expect(store.reconcileAdmission(admission('b'))).rejects.toThrow()
+          }
+          expect(hits).toBeGreaterThan(0)
+        } finally { lookup.mockRestore() }
+      })
+    }
+  }
+
+  test('reload revalidates ancestry changed after its own directory admission', async () => {
+    const { root } = fixture()
+    const ancestor = join(root, 'owned'); mkdirSync(ancestor, { mode: 0o700 })
+    const directory = join(ancestor, 'images'); mkdirSync(directory, { mode: 0o700 })
+    const c = await openCustodian(directory)
+    const producer = nativeProducer(root, c, [])
+    const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(join(root, 'owner.json'), undefined, producer))
+    await store.reconcileAdmission(admission('a'))
+    const receipt = c.receipts()[0]!
+    const original = posixNamespaceLookup.fstatat
+    let attacked = false
+    const lookup = spyOn(posixNamespaceLookup, 'fstatat').mockImplementation((fd, child) => {
+      const result = original(fd, child)
+      if (child === 'stage-1.previous' && !attacked) {
+        attacked = true
+        renameSync(ancestor, join(root, 'moved'))
+        symlinkSync(join(root, 'moved'), ancestor)
+      }
+      return result
+    })
+    try {
+      await expect(readDiskOwnerWalImages(directory, receipt)).rejects.toThrow('ancestry')
+      expect(attacked).toBe(true)
+      await expect(store.reconcileAdmission(admission('b'))).rejects.toThrow()
+      expect(c.isHealthy()).toBe(false)
+      expect(producer.isHealthy()).toBe(false)
+      expect(readFileSync(join(directory, 'stage-1.binding')).length).toBeGreaterThan(0)
+    } finally { lookup.mockRestore() }
+  })
+
+  for (const edge of ['prepare', 'bind', 'reload'] as const) {
+    test(`ancestor renamed and aliased to the same leaf is rejected at ${edge}`, async () => {
+      const { root } = fixture()
+      const ancestor = join(root, 'owned'); mkdirSync(ancestor, { mode: 0o700 })
+      const directory = join(ancestor, 'images'); mkdirSync(directory, { mode: 0o700 })
+      const c = await openCustodian(directory)
+      const walPath = join(root, 'owner.json')
+      const moved = join(root, 'moved')
+      const attack = () => {
+        renameSync(ancestor, moved); symlinkSync(moved, ancestor)
+        writeFileSync(join(moved, 'unrelated'), 'keep')
+      }
+      const wrapped: OwnerWalImageCustodian = { prepare(p, n) {
+        if (edge === 'prepare') attack()
+        const stage = c.prepare(p, n)
+        return { bind(e) { if (edge === 'bind') attack(); return stage.bind(e) } }
+      } }
+      const producer = nativeProducer(root, wrapped, [])
+      const wal = new HostedApprovalOwnerWal(walPath, undefined, producer)
+      const store = new HostedApprovalOwnerStore(wal)
+      if (edge === 'reload') {
+        await store.reconcileAdmission(admission('a'))
+        const receipt = c.receipts()[0]!
+        attack()
+        await expect(readDiskOwnerWalImages(directory, receipt)).rejects.toThrow('directory-symlink')
+        // The already admitted writer must also reject the changed ancestry.
+        await expect(store.reconcileAdmission(admission('b'))).rejects.toThrow()
+      } else {
+        await expect(store.reconcileAdmission(admission('a'))).rejects.toThrow()
+        expect(existsSync(join(directory, 'stage-1.binding'))).toBe(false)
+        expect(existsSync(walPath)).toBe(edge === 'bind')
+      }
+      expect(c.isHealthy()).toBe(false)
+      expect(producer.isHealthy()).toBe(false)
+      expect(readFileSync(join(moved, 'unrelated'), 'utf8')).toBe('keep')
+      // Restoring the original links cannot revive a poisoned generation.
+      rmSync(ancestor); renameSync(moved, ancestor)
+      await expect(store.reconcileAdmission(admission('c'))).rejects.toThrow()
+    })
+  }
+
   test('owns exact noncanonical predecessor bytes and LF-inclusive N before binding; reload requires successful receipt', async () => {
     const { directory } = fixture(); const custodian = await openCustodian(directory)
     const raw = Buffer.from('\ufeff{ "schemaVersion": 1, "literal":"é" }\r\n')

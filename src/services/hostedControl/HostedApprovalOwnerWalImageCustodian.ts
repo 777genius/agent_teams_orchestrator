@@ -221,7 +221,7 @@ async function openDirectory(path: string): Promise<PinnedPosixDirectory> {
     const stat = lstatSync(current)
     requireImage(stat.isDirectory() && !stat.isSymbolicLink(), 'directory-symlink')
   }
-  return PinnedPosixDirectory.open(path)
+  return PinnedPosixDirectory.open(path, { retainAncestry: true })
 }
 function readFile(parent: PinnedPosixDirectory, name: string, maximum: number): Buffer {
   parent.assertLinked()

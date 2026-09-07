@@ -1,3 +1,4 @@
+import { existsInPosixDirectory, PosixNamespaceLookupError } from './PosixNamespaceLookup.internal.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { dlopen, FFIType, ptr, read, type Pointer } from 'bun:ffi'
 import { createHash, randomUUID } from 'node:crypto'
@@ -95,7 +96,6 @@ const WRITER_RETRY_MS = 5
 const LOCK_EX = 2
 const LOCK_NB = 4
 const LOCK_UN = 8
-const AT_SYMLINK_NOFOLLOW = process.platform === 'darwin' ? 0x0020 : 0x0100
 const libcPath = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6'
 const libc = process.platform === 'win32' ? null : dlopen(libcPath, {
   // openat(2) is variadic when O_CREAT is present. Keep this declaration to
@@ -106,7 +106,6 @@ const libc = process.platform === 'win32' ? null : dlopen(libcPath, {
   renameat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
   unlinkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   linkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
-  fstatat: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 } as const)
 const darwinSpawnLibc = process.platform === 'darwin' ? dlopen(libcPath, {
@@ -245,9 +244,7 @@ function flock(fd: number, operation: number): boolean {
   return libc.symbols.flock(fd, operation) === 0
 }
 function existsAt(parentFd: number, name: string): boolean {
-  if (!libc) throw new Error('Hosted approval durable namespace requires POSIX dirfd support')
-  const encoded = cString(name); const stat = Buffer.alloc(512)
-  return libc.symbols.fstatat(parentFd, ptr(encoded), ptr(stat), AT_SYMLINK_NOFOLLOW) === 0
+  return existsInPosixDirectory(parentFd, name)
 }
 
 export class HostedApprovalOwnerWal {
@@ -329,6 +326,7 @@ export class HostedApprovalOwnerWal {
     } catch (error) {
       failed = true
       failure = error
+      if (error instanceof PosixNamespaceLookupError) this.#invalidatePublicationCapture('owner-wal-namespace-lookup-failed')
       if (this.#activePublicationStage) this.#invalidatePublicationCapture('owner-wal-failure-after-publication')
     } finally {
       // Revoke effect authority before releasing descriptors, but retain the
