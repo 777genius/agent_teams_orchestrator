@@ -95,8 +95,6 @@ describe('Cursor App MCP live e2e', () => {
       const configFile = path.join(profile.xdgConfigHome, 'opencode', 'opencode.json')
       expect(Object.keys(JSON.parse(await readFile(configFile, 'utf8')).mcp ?? {}))
         .toContain('agent-teams')
-      expect(await readFile(path.join(profile.profileRootPath,
-        'native-subscription-cli-bin/mcptool'), 'utf8')).toContain('mcptool.js')
 
       const binaryPath = resolveOpenCodeBinaryPath()
       if (!binaryPath) throw new Error('OpenCode binary is unavailable for the App MCP live E2E')
@@ -117,14 +115,17 @@ describe('Cursor App MCP live e2e', () => {
       const session = await client.createSession({ title: `app mcp ${token}` })
       await client.promptSessionAsync(session.id, {
         agent: 'teammate', model: { providerID: 'cursor-acp', modelID: 'auto' },
+        // Deliberately does not name a tool or a command: the agent must find
+        // the App MCP tool from what the profile published to it.
         parts: [{ type: 'text', text: [
-          'Run this shell command exactly once: mcptool call agent-teams team_receipt',
-          'Do not explore the project. Then reply with exactly what the tool returned.',
+          'Get the Agent Teams receipt by calling the tool that returns it. Call it exactly once.',
+          'Do not explore the project. Then reply with exactly what the tool returned, nothing else.',
         ].join('\n') }],
       })
 
       const deadline = Date.now() + 300_000
       let assistantText = ''
+      let toolNames: string[] = []
       while (Date.now() < deadline) {
         const [statuses, messages] = await Promise.all([
           client.getSessionStatus(), client.getSessionMessages(session.id),
@@ -136,11 +137,20 @@ describe('Cursor App MCP live e2e', () => {
           sessionId: session.id, rawStatus: statuses[session.id] ?? null, messages,
         })
         assistantText = summary.latestAssistantText ?? ''
+        toolNames = messages.flatMap(message => (message.parts ?? [])
+          .filter((part: { type?: string }) => part.type === 'tool')
+          .map((part: { tool?: string; state?: { status?: string } }) =>
+            `${part.tool}:${part.state?.status}`))
         if (summary.durableState === 'idle') break
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
 
-      expect(await readFile(callLog, 'utf8').catch(() => '')).toContain('team_receipt')
+      // Printed so a failure names what the agent did instead of calling the tool.
+      console.log('[live] tools:', JSON.stringify(toolNames))
+      // Exactly one call: presence alone would hide a retry loop billing the user.
+      const calls = (await readFile(callLog, 'utf8').catch(() => ''))
+        .split('\n').filter(line => line.trim().length > 0)
+      expect(calls.map(line => JSON.parse(line).tool)).toEqual(['team_receipt'])
       expect(assistantText).toContain(token)
       // The whole point of using the plugin's own bridge: the user's Cursor
       // configuration is never a party to this.

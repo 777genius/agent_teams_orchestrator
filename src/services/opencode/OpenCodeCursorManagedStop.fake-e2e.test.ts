@@ -31,7 +31,44 @@ const ENVIRONMENT_KEYS = [
   CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV, CURSOR_MANAGED_ASSET_ROOT_ENV,
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'CURSOR_AGENT_EXECUTABLE',
   'FAKE_CURSOR_PID_FILE',
+  'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+  'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
 ]
+
+/**
+ * Stands in for the desktop app's MCP server over HTTP, which is the transport
+ * the product actually registers. A stdio stand-in would pass while the shipped
+ * configuration could not connect at all.
+ */
+function serveAppMcpOverHttp(): { port: number; calls: () => number; stop: () => void } {
+  let calls = 0
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0, idleTimeout: 0,
+    async fetch(request: Request) {
+      // The client opens a GET stream and may DELETE the session. Declining the
+      // stream is allowed and keeps this stand-in to the one path under test.
+      if (request.method !== 'POST') {
+        return new Response(null, { status: request.method === 'GET' ? 405 : 200 })
+      }
+      const body = await request.json() as { id?: number; method?: string }
+      if (body.id === undefined) return new Response(null, { status: 202 })
+      const result = body.method === 'initialize'
+        ? {
+          protocolVersion: '2024-11-05', capabilities: { tools: {} },
+          serverInfo: { name: 'agent-teams', version: '1' },
+        }
+        : body.method === 'tools/list'
+          ? { tools: [{
+            name: 'team_receipt', description: 'Returns an Agent Teams receipt.',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          }] }
+          : (calls += 1, { content: [{ type: 'text', text: 'receipt' }] })
+      return Response.json({ jsonrpc: '2.0', id: body.id, result },
+        { headers: { 'content-type': 'application/json' } })
+    },
+  })
+  return { port: server.port, calls: () => calls, stop: () => server.stop(true) }
+}
 
 /** The fake records its own pid, so Stop has something observable to end. */
 function agentPid(pidFile: string): number {
@@ -148,6 +185,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
       const projectPath = path.join(root, 'project')
       const pidFile = path.join(root, 'agent.pid')
       const original = Object.fromEntries(ENVIRONMENT_KEYS.map(key => [key, process.env[key]]))
+      let appMcp: { port: number; calls: () => number; stop: () => void } | null = null
       let hostManager: OpenCodeHostManager | null = null
       let hostKey: string | null = null
       try {
@@ -167,10 +205,13 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         process.env.XDG_CACHE_HOME = path.join(root, 'source-cache')
         process.env.CURSOR_AGENT_EXECUTABLE = fakeAgent
         process.env.FAKE_CURSOR_PID_FILE = pidFile
+        appMcp = serveAppMcpOverHttp()
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL =
+          `http://127.0.0.1:${appMcp.port}/mcp`
 
         const profileManager = new OpenCodeProfileManager()
         const profile = await profileManager.prepareProfile(projectPath, {
-          includeAppMcp: false, includeManagedSubscriptionPlugins: true, toolApprovalMode: 'auto',
+          includeAppMcp: true, includeManagedSubscriptionPlugins: true, toolApprovalMode: 'auto',
         })
         const assignedPort = profile.env.AGENT_TEAMS_CURSOR_PROXY_PORT
         expect(JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}').plugin)
@@ -178,6 +219,13 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         expect(Number(assignedPort)).toBeGreaterThan(1024)
         expect(assignedPort).not.toBe('32124')
         expect(profile.env.AGENT_TEAMS_CURSOR_READINESS).toMatch(/^[a-f0-9]{64}$/)
+        // OpenCode merges this file with OPENCODE_CONFIG_CONTENT. Arrays append,
+        // so a `plugin` key here loads the plugin twice and the launch readiness
+        // authority rejects the host on selected_config_match:plugin.
+        const bridgeConfig = JSON.parse(await readFile(
+          path.join(profile.xdgConfigHome, 'opencode', 'opencode.json'), 'utf8'))
+        expect(Object.keys(bridgeConfig.mcp ?? {})).toContain('agent-teams')
+        expect(bridgeConfig).not.toHaveProperty('plugin')
         // The agent must be able to reach this profile's MCP servers.
         expect(await readFile(path.join(profile.profileRootPath,
           'native-subscription-cli-bin/cursor-agent'), 'utf8')).toContain('OPENCODE_CONFIG=')
@@ -199,6 +247,12 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         hostKey = host.hostKey
         const client = new OpenCodeClientFactory().create(host.baseUrl)
         expect((await client.getProviders()).connected).toContain('cursor-acp')
+        // The product path for App MCP: the plugin bridge reads the materialized
+        // config and publishes each App MCP tool as a first-class OpenCode tool,
+        // so an agent reaches Agent Teams without any ~/.cursor registration.
+        const toolIds = await fetch(new URL('/experimental/tool/ids', host.baseUrl))
+          .then(response => response.json() as Promise<string[]>)
+        expect(toolIds).toContain('mcp__agent_teams__team_receipt')
 
         const stopped = await client.createSession({ title: `FAKE_MANAGED_STOP ${randomUUID()}` })
         const sibling = await client.createSession({ title: `FAKE_MANAGED_SIBLING ${randomUUID()}` })
@@ -292,6 +346,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         expect(JSON.stringify((await summarize(client, sibling.id)).messages)).not.toContain(warmToken)
         expect(alive(running)).toBe(false)
       } finally {
+        appMcp?.stop()
         if (hostManager && hostKey) {
           await hostManager.releaseHost(hostKey).catch(() => undefined)
           await hostManager.disposeHost(hostKey).catch(() => undefined)

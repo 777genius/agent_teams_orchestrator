@@ -2270,6 +2270,19 @@ export function buildManagedConfigFingerprint(
   )))
 }
 
+/**
+ * Per-section fingerprints of the same config the whole fingerprint covers.
+ * A stale session otherwise reports only "some hash changed", which is exactly
+ * the question a launch failure leaves you asking.
+ */
+export function buildManagedConfigSectionFingerprints(
+  managedConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  return Object.fromEntries(Object.keys(managedConfig).sort().map(section =>
+    [section, buildManagedConfigFingerprint({ [section]: managedConfig[section] }, env)]))
+}
+
 export function orderOpenCodeAuthSyncSources(input: {
   globalAuthPath: string
   globalAuthFingerprint: string | null
@@ -2526,6 +2539,18 @@ export class OpenCodeProfileManager {
     }
     enterStep('resolve project and scope')
     try {
+    // Cursor executes its own shell tool, so OpenCode's permission rules never
+    // see the call and manual approval cannot be honoured. Measured: with
+    // approval set to manual the command still ran and no request was raised.
+    // Refusing is the honest answer; silently running everything is not.
+    if (options.toolApprovalMode === 'manual'
+      && options.profileScope
+      && canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp') {
+      throw new Error(
+        'Cursor runs its own tools, so manual tool approval cannot be enforced for it. '
+        + 'Choose automatic approval for this team, or a different provider.',
+      )
+    }
     const configSnapshot = options.profileScope
       ? openCodeEffectiveConfigSnapshots.get(options.profileScope.scopeToken)
       : undefined
@@ -2723,10 +2748,20 @@ export class OpenCodeProfileManager {
         ? path.join(xdgConfigHome, 'opencode', 'opencode.json')
         : null
       if (managedConfigPath) {
+        // Only the sections the bridge actually reads. OpenCode merges this file
+        // with OPENCODE_CONFIG_CONTENT, and `plugin` is an array, so writing the
+        // whole config appended the plugin a second time and the launch readiness
+        // authority rejected the host on selected_config_match:plugin. Objects
+        // merge by key and stay identical; arrays do not.
+        const bridgeConfig = Object.fromEntries(
+          (['mcp', 'agent'] as const)
+            .filter(section => managedConfig[section] && !Array.isArray(managedConfig[section]))
+            .map(section => [section, managedConfig[section]]),
+        )
         await mkdir(path.dirname(managedConfigPath), { recursive: true })
         await writeFile(
           managedConfigPath,
-          `${JSON.stringify(managedConfig, null, 2)}\n`,
+          `${JSON.stringify(bridgeConfig, null, 2)}\n`,
           { encoding: 'utf8', mode: 0o600 },
         )
       }

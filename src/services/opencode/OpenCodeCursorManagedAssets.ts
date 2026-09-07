@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, lstat, readFile } from 'node:fs/promises'
+import { access, lstat, readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 export const CURSOR_MANAGED_ASSET_ROOT_ENV = 'AGENT_TEAMS_CURSOR_MANAGED_ASSETS'
@@ -32,6 +32,44 @@ export type OpenCodeCursorManagedAssetsResult =
   | ({ available: false } & OpenCodeCursorManagedAssetsUnavailable)
 
 const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * Assets ship beside the built runtime, so a packaged install needs no manual
+ * staging. The directory is only trusted when it belongs to this user and is not
+ * group or world writable: it decides which plugin code OpenCode loads, and a
+ * writable sibling of the executable would be an easy way to swap it.
+ */
+export async function resolveShippedCursorManagedAssetRoot(input: {
+  execPath?: string
+  moduleDir?: string
+  stat?: (target: string) => Promise<{ uid: number; mode: number; isDirectory: () => boolean }>
+  uid?: number
+} = {}): Promise<string | null> {
+  // Two homes, because the runtime has two shapes: the compiled binary sits
+  // beside its own assets, while the bundle is started by an interpreter whose
+  // executable is somewhere else entirely. The app does not forward this
+  // location in the environment, so guessing from argv alone would leave the
+  // managed path off in development.
+  const candidates = [
+    path.dirname(input.execPath ?? process.execPath),
+    input.moduleDir ?? import.meta.dir,
+  ].map(directory => path.join(directory, 'cursor-managed'))
+  const currentUid = input.uid ?? process.getuid?.() ?? -1
+  for (const candidate of candidates) {
+    try {
+      // Resolve through symlinks on purpose: `lstat` reports the link's own
+      // mode, so a link pointing at a world-writable directory looked safe.
+      const stats = input.stat ? await input.stat(candidate) : await stat(candidate)
+      if (!stats.isDirectory()) continue
+      if (stats.uid !== currentUid) continue
+      if ((stats.mode & 0o022) !== 0) continue
+      return candidate
+    } catch {
+      continue
+    }
+  }
+  return null
+}
 
 /**
  * The MCP CLI is a standalone bundle, so the profile shim needs a real
@@ -114,7 +152,9 @@ export async function resolveOpenCodeCursorManagedAssets(input: {
     return { available: false, reason: 'unsupported_platform' }
   }
   const configured = (input.env ?? process.env)[CURSOR_MANAGED_ASSET_ROOT_ENV]?.trim()
-  const root = configured || input.defaultRoot
+  const root = configured
+    || input.defaultRoot
+    || await resolveShippedCursorManagedAssetRoot()
   if (!root) return { available: false, reason: 'not_staged' }
   const pluginRoot = path.join(root, 'plugin')
   let pluginFingerprint: string

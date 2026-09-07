@@ -47,6 +47,7 @@ export async function buildCursorPluginArtifact(outputDirectory: string): Promis
     await writeFile(path.join(staging, 'src/agent-teams-mcptool-entry.ts'), [
       "import '@modelcontextprotocol/sdk/client/index.js'",
       "import '@modelcontextprotocol/sdk/client/stdio.js'",
+      "import '@modelcontextprotocol/sdk/client/streamableHttp.js'",
       "import './cli/mcptool.js'",
       '',
     ].join('\n'))

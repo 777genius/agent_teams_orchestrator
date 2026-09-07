@@ -79,9 +79,9 @@ export async function isCursorNativeAccountAuthorized(input: {
  * agent would otherwise keep running under an identity the app no longer believes.
  */
 /**
- * Deduplicates bursts inside one launch sequence only. A trust window longer
- * than this would hide exactly what this check exists to catch: a sign-out or an
- * account switch that happens between two launches.
+ * Deduplicates bursts inside one launch sequence only, and bounds how stale an
+ * answer can be to this window measured from the probe. Anything longer, or a
+ * window that slides on access, hides exactly what this check exists to catch.
  */
 export const CURSOR_NATIVE_AUTHORITY_DEDUPE_MS = 5_000
 let recentProbe: { at: number; key: string; accountHash: string | null } | null = null
@@ -107,14 +107,20 @@ export async function reconcileCursorNativeAuthority(input: {
   // a change can be reported; it never stands in for a fresh answer.
   const probeKey = `${input.probeExecutablePath ?? input.executablePath}|${executableHash}`
   const dedupeMs = input.dedupeMs ?? CURSOR_NATIVE_AUTHORITY_DEDUPE_MS
-  const accountHash = recentProbe && recentProbe.key === probeKey
+  // Freshness is counted from the probe itself. Counting it from the last
+  // question makes the window slide: steady traffic would keep a signed-out
+  // account looking valid forever.
+  const reusable = recentProbe && recentProbe.key === probeKey
     && now - recentProbe.at < dedupeMs
-    ? recentProbe.accountHash
+    ? recentProbe
+    : null
+  const accountHash = reusable
+    ? reusable.accountHash
     : await (input.probe ?? probeCursorAccountIdentity)(
       input.probeExecutablePath ?? input.executablePath,
       input.platform ?? process.platform, input.abortSignal,
     ).catch(() => null)
-  recentProbe = { at: now, key: probeKey, accountHash }
+  if (!reusable) recentProbe = { at: now, key: probeKey, accountHash }
   if (!accountHash) return { authority: null, state: 'signed-out' }
   const authority: CursorNativeAuthority = { version: 1, accountHash, executableHash, probedAt: now }
   await writeAuthority(input.statePath, authority)

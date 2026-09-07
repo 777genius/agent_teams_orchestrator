@@ -180,3 +180,29 @@ test('executable identity follows the resolved target, not the path used to reac
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('steady traffic cannot keep a stale account alive: the window never slides', async () => {
+  const { root, executable, statePath } = await sandbox()
+  try {
+    let account: string | null = 'a'.repeat(64)
+    let probes = 0
+    const probe = async () => { probes += 1; return account }
+    const reconcile = (now: number) => reconcileCursorNativeAuthority({
+      statePath, executablePath: executable, probe, now: () => now, dedupeMs: 5_000,
+    })
+
+    // Asked every four seconds, inside a five second window. A window measured
+    // from the last question would answer from cache forever.
+    await reconcile(0)
+    expect(probes).toBe(1)
+    account = null
+    let last = await reconcile(4_000)
+    expect(probes).toBe(1)
+    for (let at = 8_000; at <= 80_000; at += 4_000) last = await reconcile(at)
+
+    expect(probes).toBeGreaterThan(1)
+    expect(last).toEqual({ authority: null, state: 'signed-out' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

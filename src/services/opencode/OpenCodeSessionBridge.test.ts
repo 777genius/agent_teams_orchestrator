@@ -4066,12 +4066,14 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'bob',
     }))
 
+    // The reason names what moved: here only the managed copy's bytes did,
+    // with the same profile, the same selected identity and the same source.
     expect(staleMarks).toEqual([{
       laneId: 'secondary:opencode:bob',
-      staleReason: 'managed_auth_changed',
+      staleReason: 'managed_auth_changed:managed_store_bytes',
     }])
     expect(result.summary.previewOutcome).toBe('stale')
-    expect(result.summary.staleReason).toBe('managed_auth_changed')
+    expect(result.summary.staleReason).toBe('managed_auth_changed:managed_store_bytes')
     expect(result.summary.streamConnected).toBe(false)
   })
 

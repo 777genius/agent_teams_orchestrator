@@ -438,6 +438,25 @@ export function buildOpenCodeHostSpawnOptions(
   }
 }
 
+/**
+ * A caller-supplied host key skips key derivation entirely, so every identity the
+ * derived key encodes has to be re-checked here. Readiness is the one that moves
+ * on its own: the account can sign out while the host keeps running.
+ */
+export function assertOpenCodeHostReuseIdentity(
+  explicitHostKey: string | undefined,
+  profile: OpenCodePreparedProfile,
+): void {
+  if (!explicitHostKey) return
+  if (profile.scopeToken && !explicitHostKey.includes(`::scope:${profile.scopeToken}::`)) {
+    throw new Error('OpenCode host reuse rejected because the profile scope token changed')
+  }
+  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS
+  if (readiness && !explicitHostKey.endsWith(`::readiness:${readiness}`)) {
+    throw new Error('OpenCode host reuse rejected because Cursor readiness changed')
+  }
+}
+
 export function buildOpenCodeHostProfileIdentity(
   profile: OpenCodePreparedProfile,
   binaryHostIdentity: string,
@@ -453,7 +472,11 @@ export function buildOpenCodeHostProfileIdentity(
       ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
       : value)
   const transportIdentity = hashText(transportJson)
-  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}::mcp:${transportIdentity}`
+  // Cursor readiness is a live identity: the signed-in account, the real binary,
+  // the staged assets and the retained proxy port. A running host outlives all of
+  // them, so it has to be part of reuse or a signed-out account keeps serving.
+  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS ?? 'absent'
+  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}::mcp:${transportIdentity}::readiness:${readiness}`
 }
 
 function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
@@ -1546,13 +1569,7 @@ export class OpenCodeHostManager {
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
         : baseHostKey
     })()
-    if (
-      explicitHostKey
-      && profile.scopeToken
-      && !explicitHostKey.includes(`::scope:${profile.scopeToken}::`)
-    ) {
-      throw new Error('OpenCode host reuse rejected because the profile scope token changed')
-    }
+    assertOpenCodeHostReuseIdentity(explicitHostKey, profile)
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
     const existing = this.hosts.get(hostKey)

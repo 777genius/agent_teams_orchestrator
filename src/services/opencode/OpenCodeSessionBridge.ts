@@ -18,6 +18,7 @@ import {
   assertOpenCodePreparedProfileScope,
   openCodeProfileManager,
   resolveOpenCodeProfileScope,
+  buildManagedConfigSectionFingerprints,
 } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import type { MaterializationOwnerToken } from './OpenCodeSessionStore.js'
@@ -190,6 +191,42 @@ function extractManagedConfigFingerprintFromHostKey(hostKey: string | null | und
   const fingerprint = parts[3]
   const trimmed = fingerprint?.trim()
   return trimmed ? trimmed : null
+}
+
+/**
+ * Names the config sections that actually moved. Two opaque hashes leave the
+ * next person guessing which part of the launch profile drifted.
+ */
+/**
+ * Says what actually moved. "managed_auth_changed" on its own cannot distinguish
+ * a real credential change from the session being compared against a different
+ * profile, and only the first of those should end a session.
+ */
+function describeManagedAuthChange(
+  record: OpenCodeSessionRecord,
+  profile: OpenCodePreparedProfile,
+): string {
+  const detail: string[] = []
+  if (record.profileRootKey !== profile.profileRootKey) detail.push('profile_root')
+  if (record.profileScope?.selectedAuthIdentity !== profile.profileScope?.selectedAuthIdentity) {
+    detail.push('selected_identity')
+  }
+  if (record.sourceAuthFingerprint !== profile.sourceAuthFingerprint) detail.push('source_store')
+  if (detail.length === 0) detail.push('managed_store_bytes')
+  return `managed_auth_changed:${detail.join(',')}`
+}
+
+function describeManagedConfigChange(
+  stored: string,
+  next: string,
+  storedSections: Record<string, string> | undefined,
+  nextSections: Record<string, string>,
+): string {
+  const changed = storedSections
+    ? [...new Set([...Object.keys(storedSections), ...Object.keys(nextSections)])]
+      .filter(section => storedSections[section] !== nextSections[section]).sort()
+    : []
+  return `managed_config_changed:${changed.length > 0 ? `${changed.join(',')}:` : ''}${stored}->${next}`
 }
 
 function getRecordManagedConfigFingerprint(record: OpenCodeSessionRecord): string | null {
@@ -457,10 +494,13 @@ export class OpenCodeSessionBridge {
       return { profile: autoProfile, toolApprovalMode: 'auto' }
     }
 
+    // This is a probe asking "was the stored session a manual one?", not a launch.
+    // Providers that cannot enforce manual approval refuse it outright, and that
+    // refusal is the answer -- the stored session cannot have been manual either.
     const manualProfile = await this.prepareProfile(projectPath, {
       toolApprovalMode: 'manual', profileScope, abortSignal: options.signal,
-    })
-    if (this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
+    }).catch(() => null)
+    if (manualProfile && this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
       return { profile: manualProfile, toolApprovalMode: 'manual' }
     }
 
@@ -478,9 +518,13 @@ export class OpenCodeSessionBridge {
         : profile.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
           ? 'project_behavior_changed'
           : managedConfigFingerprint && managedConfigFingerprint !== profile.managedConfigFingerprint
-            ? `managed_config_changed:${managedConfigFingerprint}->${profile.managedConfigFingerprint}`
+            ? describeManagedConfigChange(
+              managedConfigFingerprint, profile.managedConfigFingerprint,
+              record.managedConfigSectionFingerprints,
+              buildManagedConfigSectionFingerprints(profile.managedConfig, profile.env),
+            )
             : profile.managedAuthFingerprint !== record.managedAuthFingerprint
-              ? 'managed_auth_changed'
+              ? describeManagedAuthChange(record, profile)
               : !profileScopeMetadataMatches(record.profileScope, profile.profileScope)
                 ? 'profile_scope_changed'
                 : null)
@@ -511,6 +555,8 @@ export class OpenCodeSessionBridge {
       ...record,
       toolApprovalMode: sessionProfile.toolApprovalMode,
       managedConfigFingerprint: sessionProfile.profile.managedConfigFingerprint,
+      managedConfigSectionFingerprints:
+        buildManagedConfigSectionFingerprints(sessionProfile.profile.managedConfig, sessionProfile.profile.env),
       profileScope: sessionProfile.profile.profileScope ?? null,
       updatedAt: buildNowIso(),
     }
@@ -581,6 +627,8 @@ export class OpenCodeSessionBridge {
         managedAuthFingerprint: host.profile.managedAuthFingerprint,
         projectBehaviorFingerprint: host.projectBehaviorFingerprint,
         managedConfigFingerprint: host.profile.managedConfigFingerprint,
+        managedConfigSectionFingerprints:
+          buildManagedConfigSectionFingerprints(host.profile.managedConfig, host.profile.env),
         opencodeVersion: host.version ?? undefined,
         bootstrapMode: 'app_managed_context',
         staleReason: null,
@@ -1128,9 +1176,13 @@ export class OpenCodeSessionBridge {
             : existing.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
               ? 'project_behavior_changed'
               : existingManagedConfigFingerprint && existingManagedConfigFingerprint !== profile.managedConfigFingerprint
-                ? `managed_config_changed:${existingManagedConfigFingerprint}->${profile.managedConfigFingerprint}`
+                ? describeManagedConfigChange(
+                  existingManagedConfigFingerprint, profile.managedConfigFingerprint,
+                  existing.managedConfigSectionFingerprints,
+                  buildManagedConfigSectionFingerprints(profile.managedConfig, profile.env),
+                )
                 : existing.managedAuthFingerprint !== profile.managedAuthFingerprint
-                  ? 'managed_auth_changed'
+                  ? describeManagedAuthChange(existing, profile)
                   : !profileScopeMetadataMatches(existing.profileScope, profile.profileScope)
                     ? 'profile_scope_changed'
                     : existing.staleReason ?? 'session_refresh_required'
@@ -1301,6 +1353,8 @@ export class OpenCodeSessionBridge {
       managedAuthFingerprint: params.host.profile.managedAuthFingerprint,
       projectBehaviorFingerprint: params.host.projectBehaviorFingerprint,
       managedConfigFingerprint: params.host.profile.managedConfigFingerprint,
+      managedConfigSectionFingerprints:
+        buildManagedConfigSectionFingerprints(params.host.profile.managedConfig, params.host.profile.env),
       expectedBehaviorFingerprint: params.expectedBehaviorFingerprint,
       opencodeVersion: params.host.version ?? undefined,
       bootstrapMode: 'app_managed_context',
@@ -1389,6 +1443,8 @@ export class OpenCodeSessionBridge {
       managedAuthFingerprint: profile.managedAuthFingerprint,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
       managedConfigFingerprint: profile.managedConfigFingerprint,
+      managedConfigSectionFingerprints:
+        buildManagedConfigSectionFingerprints(profile.managedConfig, profile.env),
       resolvedBehaviorFingerprint: resolvedBehaviorFingerprint ?? record.resolvedBehaviorFingerprint,
     }
     const changed =

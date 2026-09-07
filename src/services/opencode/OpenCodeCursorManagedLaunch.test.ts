@@ -6,6 +6,7 @@ import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.j
 import {
   CURSOR_MANAGED_ASSET_ROOT_ENV,
   resolveOpenCodeCursorManagedAssets,
+  resolveShippedCursorManagedAssetRoot,
 } from './OpenCodeCursorManagedAssets.js'
 import { CURSOR_MANAGED_PROXY_PORT_ENV } from './OpenCodeCursorManagedPort.js'
 import {
@@ -16,6 +17,10 @@ import {
   ensureOpenCodeNativeCliCredentialBridge,
   OpenCodeProfileManager,
 } from './OpenCodeProfileManager.js'
+import {
+  assertOpenCodeHostReuseIdentity,
+  buildOpenCodeHostProfileIdentity,
+} from './OpenCodeHostManager.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 
 const scope = {
@@ -156,3 +161,93 @@ test.skipIf(process.platform !== 'darwin')('binds readiness to the account, bina
     await rm(root, { recursive: true, force: true })
   }
 }, 120_000)
+
+test('manual tool approval is refused for Cursor instead of silently auto-approving', async () => {
+  const manager = new OpenCodeProfileManager()
+  const refusal = /manual tool approval cannot be enforced/
+  const messageOf = async (providerId: string): Promise<string> => await manager
+    .prepareProfile('/tmp/cursor-manual-approval', {
+      toolApprovalMode: 'manual', profileScope: { ...scope, providerId },
+    } as never).then(() => '', (error: Error) => error.message)
+  // Measured: Cursor runs its own shell tool, OpenCode never sees the call, and
+  // the command executes whatever the approval setting says. Refuse, do not lie.
+  expect(await messageOf('cursor-acp')).toMatch(refusal)
+  // Manual approval keeps working for providers whose tools OpenCode executes,
+  // and the refusal must not depend on staged assets being present.
+  expect(await messageOf('kiro')).not.toMatch(refusal)
+  expect(await manager.prepareProfile('/tmp/cursor-manual-approval', {
+    toolApprovalMode: 'auto', profileScope: scope,
+  } as never).then(() => '', (error: Error) => error.message)).not.toMatch(refusal)
+})
+
+test('a running host is not reused across a Cursor readiness change', () => {
+  const profile = {
+    projectPath: '/p', profileRootKey: 'root', projectBehaviorFingerprint: 'behaviour',
+    managedConfigFingerprint: 'config', managedConfig: {}, scopeToken: 'token',
+    env: { AGENT_TEAMS_CURSOR_READINESS: 'a'.repeat(64) },
+  } as never
+  const other = {
+    ...(profile as object),
+    env: { AGENT_TEAMS_CURSOR_READINESS: 'b'.repeat(64) },
+  } as never
+  // Readiness covers the signed-in account, the binary, the staged assets and
+  // the port. A sign-out or account switch must not keep the old host alive.
+  expect(buildOpenCodeHostProfileIdentity(profile, 'binary'))
+    .not.toBe(buildOpenCodeHostProfileIdentity(other, 'binary'))
+  expect(buildOpenCodeHostProfileIdentity(profile, 'binary'))
+    .toBe(buildOpenCodeHostProfileIdentity(profile, 'binary'))
+})
+
+test('shipped assets are found beside the executable or the bundle, and only when safe', async () => {
+  const ok = { uid: 501, mode: 0o755, isDirectory: () => true }
+  const beside = (root: string) => path.join(root, 'cursor-managed')
+  const only = (allowed: string) => async (target: string) => {
+    if (target !== allowed) throw new Error('ENOENT')
+    return ok
+  }
+  expect(await resolveShippedCursorManagedAssetRoot({
+    execPath: '/opt/app/cli', moduleDir: '/opt/bundle', uid: 501, stat: only(beside('/opt/app')),
+  })).toBe(beside('/opt/app'))
+  // The app starts the bundle through an interpreter and forwards no asset
+  // path, so the bundle's own directory has to be tried as well.
+  expect(await resolveShippedCursorManagedAssetRoot({
+    execPath: '/usr/bin/bun', moduleDir: '/opt/bundle', uid: 501, stat: only(beside('/opt/bundle')),
+  })).toBe(beside('/opt/bundle'))
+  // A directory this user does not own, or that anyone else may write to,
+  // decides which plugin code OpenCode loads. Refuse every such candidate.
+  // A symlink is followed on purpose: its own mode says nothing about the
+  // directory it points at, and that directory is what OpenCode loads.
+  for (const rejected of [
+    { uid: 0, mode: 0o755, isDirectory: () => true },
+    { uid: 501, mode: 0o775, isDirectory: () => true },
+    { uid: 501, mode: 0o757, isDirectory: () => true },
+    { uid: 501, mode: 0o755, isDirectory: () => false },
+  ]) {
+    expect(await resolveShippedCursorManagedAssetRoot({
+      execPath: '/opt/app/cli', moduleDir: '/opt/bundle', uid: 501, stat: async () => rejected,
+    })).toBeNull()
+  }
+  expect(await resolveShippedCursorManagedAssetRoot({
+    execPath: '/opt/app/cli', moduleDir: '/opt/bundle', uid: 501,
+    stat: async () => { throw new Error('ENOENT') },
+  })).toBeNull()
+})
+
+test('a stored host key cannot reattach a host across a Cursor readiness change', () => {
+  const readiness = 'a'.repeat(64)
+  const profile = { scopeToken: 'token', env: { AGENT_TEAMS_CURSOR_READINESS: readiness } } as never
+  const reuse = (hostKey?: string) => {
+    try {
+      assertOpenCodeHostReuseIdentity(hostKey, profile)
+      return ''
+    } catch (error) {
+      return (error as Error).message
+    }
+  }
+  // An explicit key skips key derivation, so the guard has to live on this path.
+  expect(reuse(`k::scope:token::readiness:${'b'.repeat(64)}`)).toContain('Cursor readiness changed')
+  expect(reuse('k::scope:token::mcp:none')).toContain('Cursor readiness changed')
+  expect(reuse(`k::scope:token::readiness:${readiness}`)).toBe('')
+  expect(reuse(undefined)).toBe('')
+  expect(reuse(`k::scope:other::readiness:${readiness}`)).toContain('scope token changed')
+})

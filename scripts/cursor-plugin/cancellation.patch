@@ -1,6 +1,18 @@
 --- a/src/plugin.ts
 +++ b/src/plugin.ts
-@@ -1328,6 +1328,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -277,6 +277,11 @@ export function buildCursorAgentCommand(
+   }
+   if (FORCE_TOOL_MODE) {
+     cmd.push("--force");
++  } else {
++    // --force conflates two decisions: trusting the workspace and approving
++    // every tool call. Turning it off to restore approvals must not also make
++    // the agent refuse the directory it was pointed at.
++    cmd.push("--trust");
+   }
+   return cmd;
+ }
+@@ -1328,6 +1333,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
        }
  
        reqPerf.mark("child-create-start");
@@ -8,7 +20,7 @@
        const child = createBunChildForBackend({
          backend,
          sdkApiKey,
-@@ -1337,6 +1338,19 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1337,6 +1343,19 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
          resumeChatId,
        });
        reqPerf.mark("child-created");
@@ -28,7 +40,7 @@
  
        if (!stream) {
          const [stdoutText, stderrText] = await Promise.all([
-@@ -1484,6 +1498,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1484,6 +1503,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
            let sawSuccessfulStreamOutput = false;
            let usage: OpenAiUsage | undefined;
            const enqueueSse = (payload: string) => {
@@ -36,7 +48,7 @@
              if (!firstSseWritten) {
                perf.mark("first-sse-write");
                firstSseWritten = true;
-@@ -1792,9 +1807,10 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1792,9 +1812,10 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
            } finally {
              perf.mark("request:done");
              perf.summarize();
@@ -48,7 +60,7 @@
        });
  
        return new Response(sse, {
-@@ -1831,6 +1847,35 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1831,6 +1852,35 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
      }
    }
  
@@ -84,3 +96,53 @@
    // Use Node.js http server (works in both Node and Bun)
    const http = await import("http");
  
+diff --git a/src/cli/mcptool.ts b/src/cli/mcptool.ts
+index d549b8d..a141ddf 100644
+--- a/src/cli/mcptool.ts
++++ b/src/cli/mcptool.ts
+@@ -115,6 +115,13 @@ async function main(): Promise<void> {
+     }
+ 
+     await manager.connectServer(config);
++    // connectServer reports a failed connection by logging and returning, and
++    // callTool then answers with an error string. Printing that string and
++    // exiting 0 tells the agent the call succeeded.
++    if (!manager.connectedServers.includes(config.name)) {
++      console.error(`mcptool error: could not connect to MCP server ${config.name}`);
++      process.exit(1);
++    }
+     const result = await manager.callTool(serverName, toolName, toolArgs);
+     console.log(result);
+ 
+diff --git a/src/mcp/client-manager.ts b/src/mcp/client-manager.ts
+index af08e2c..38e86a2 100644
+--- a/src/mcp/client-manager.ts
++++ b/src/mcp/client-manager.ts
+@@ -29,6 +29,9 @@ async function loadDefaultDeps(): Promise<McpClientManagerDeps> {
+   if (defaultDeps) return defaultDeps;
+   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+   const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
++  const { StreamableHTTPClientTransport } = await import(
++    "@modelcontextprotocol/sdk/client/streamableHttp.js"
++  );
+ 
+   defaultDeps = {
+     createClient: () =>
+@@ -42,8 +45,15 @@ async function loadDefaultDeps(): Promise<McpClientManagerDeps> {
+           stderr: "pipe",
+         });
+       }
+-      // Remote servers: StreamableHTTPClientTransport can be added later.
+-      throw new Error(`Remote MCP transport not yet implemented for ${config.name}`);
++      // Agent Teams registers its MCP server over HTTP, so refusing remote
++      // servers left every app-provided tool unreachable from the bridge and
++      // from mcptool alike.
++      if (!config.url) {
++        throw new Error(`Remote MCP server ${config.name} has no url`);
++      }
++      return new StreamableHTTPClientTransport(new URL(config.url), {
++        requestInit: config.headers ? { headers: config.headers } : undefined,
++      });
+     },
+   };
+   return defaultDeps;

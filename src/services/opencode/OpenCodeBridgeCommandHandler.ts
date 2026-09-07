@@ -2507,6 +2507,19 @@ function unsupportedExtensionBoundReadinessData(selectedModel: string, providerI
   }
 }
 
+/**
+ * Cursor is extension-bound and stays refused unless this build ships verified
+ * managed assets: the reviewed plugin artifact the launch depends on. Kiro has no
+ * such path. Every gate on the launch route must agree, or a launch passes one
+ * check and dies at the next one with a different message.
+ */
+async function isManagedCursorLaunchSupported(providerId: string): Promise<boolean> {
+  if (providerId !== 'cursor-acp') return false
+  return await resolveOpenCodeCursorManagedAssets()
+    .then(result => result.available)
+    .catch(() => false)
+}
+
 async function runReadiness(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
@@ -2525,14 +2538,7 @@ async function runReadiness(
   if (qualifiedSelectedModel
     && (qualifiedSelectedModel.providerId === 'kiro'
       || qualifiedSelectedModel.providerId === 'cursor-acp')) {
-    // Cursor launches only once the staged managed assets verify, because those
-    // carry the ownership barrier and the Stop control that make a terminal Stop
-    // provable. Without them, and for Kiro, the guard stays closed.
-    const managedCursorReady = qualifiedSelectedModel.providerId === 'cursor-acp'
-      && await resolveOpenCodeCursorManagedAssets()
-        .then(result => result.available)
-        .catch(() => false)
-    if (!managedCursorReady) {
+    if (!await isManagedCursorLaunchSupported(qualifiedSelectedModel.providerId)) {
       return {
         snapshot: null,
         data: unsupportedExtensionBoundReadinessData(
@@ -3221,7 +3227,8 @@ async function runLaunch(
   if (!selectedModelRef) {
     throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
   }
-  if (selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp') {
+  if ((selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp')
+    && !await isManagedCursorLaunchSupported(selectedModelRef.providerId)) {
     throw new Error(
       `OpenCode launch_runtime does not support extension-bound provider ${selectedModelRef.providerId}`,
     )
@@ -5709,7 +5716,8 @@ async function handleEnvelope(
         if (!selected) {
           throw new Error('OpenCode launch handshake requires a provider-qualified selectedModel')
         }
-        if (selected.providerId === 'kiro' || selected.providerId === 'cursor-acp') {
+        if ((selected.providerId === 'kiro' || selected.providerId === 'cursor-acp')
+          && !await isManagedCursorLaunchSupported(selected.providerId)) {
           throw new Error(`OpenCode launch handshake does not support extension-bound provider ${selected.providerId}`)
         }
         const mode = envelope.body.toolApprovalMode
