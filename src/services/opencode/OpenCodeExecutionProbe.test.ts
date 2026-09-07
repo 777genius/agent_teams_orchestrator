@@ -2449,6 +2449,87 @@ describe('OpenCodeExecutionProbe', () => {
     )
   })
 
+  test.each([
+    [401, 'Доступ відхилено', 'not_authenticated'],
+    [403, 'Доступ відхилено', 'not_authenticated'],
+    ['401', 'Доступ відхилено', 'not_authenticated'],
+    ['403', 'Доступ відхилено', 'not_authenticated'],
+    [401, 'RESOURCE_EXHAUSTED', 'unavailable'],
+    [200, 'Доступ відхилено', 'unknown'],
+  ] as const)('classifies structural HTTP %s with message %s as %s', async (statusCode, message, outcome) => {
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 10, pollIntervalMs: 1,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listExperimentalToolIds: async () => { throw new Error('not used') },
+          listExperimentalTools: async () => { throw new Error('not used') },
+          answerPermission: async () => { throw new Error('not used') },
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({
+            'session-1': {
+              type: 'retry',
+              attempt: 1,
+            },
+          }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-error',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+                error: { name: 'APIError', data: { statusCode, message, usage: { tokens: 401 } } },
+              },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-error' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/ling-2.6-flash-free',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.verifiedAt).toBeUndefined()
+    expect(result.outcome).toBe(outcome)
+    expect(result.reason).toBe(outcome === 'not_authenticated' ? `HTTP ${statusCode}: ${message}` : message)
+    expect(result.durableState).toBe('retrying')
+  })
+
   test('runs every generic execution proof fresh, including concurrent requests', async () => {
     let createSessionCount = 0
     const probe = new OpenCodeExecutionProbe({

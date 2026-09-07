@@ -1,3 +1,4 @@
+import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
@@ -20,7 +21,9 @@ import {
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
-import { buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -156,7 +159,7 @@ function expectedFingerprintForModel(
   const fullModelId = model.includes('/') ? model : `openrouter/${model}`
   const providerId = fullModelId.slice(0, fullModelId.indexOf('/')).toLowerCase()
   return computeOpenCodeExpectedBehaviorFingerprint({
-    canonicalProjectPathFingerprint: hash('/tmp/project'),
+    canonicalProjectPathFingerprint: hash(normalizeOpenCodeProjectIdentity('/tmp/project')),
     modelProviderId: providerId,
     fullModelId: `${providerId}${fullModelId.slice(fullModelId.indexOf('/'))}`,
     projectBehaviorFingerprint: 'b'.repeat(64),
@@ -909,6 +912,21 @@ function createDeferred<T>() {
   return { promise, resolve, reject }
 }
 
+async function waitForCommandStage(
+  stage: Promise<void>,
+  command: ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>,
+  stageName: string,
+): Promise<void> {
+  await Promise.race([
+    stage,
+    command.then(result => {
+      throw new Error(`Command settled before ${stageName}: ${
+        'error' in result ? result.error.message : 'completed successfully'
+      }`)
+    }),
+  ])
+}
+
 type ManualTimer = { callback: () => void; timeoutMs: number; cancelled: boolean }
 type RetainedProbe = Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
 async function withManualTimers<T>(run: (timers: ManualTimer[]) => Promise<T>): Promise<T> {
@@ -1248,7 +1266,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('confirmed stop receipts survive partial stop and lost responses without probing or re-aborting', async () => {
-    const projectPath = await mkdtemp('/tmp/opencode-terminal-stop-')
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-terminal-stop-'))
     try {
       const store = new OpenCodeSessionStore(path.join(projectPath, 'sessions.json'))
       const record = buildRecord({ projectPath, runId: 'run-1', selectedModel: 'openai/gpt-5.6-sol', toolApprovalMode: 'auto',
@@ -2266,6 +2284,78 @@ describe('OpenCodeBridgeCommandHandler', () => {
           ? 'changed during execution proof' : 'authority is unavailable')
       }
       expect(executionCalls).toBe(rejectAfterExecution ? 1 : 0)
+    }
+  })
+
+  test('selected readiness bounds real authority auth reads before and after execution and ignores late results', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    const successfulExecution = openCodeExecutionProbe.probeModelOnHost
+    const retain = openCodeProvisioningProbe.probeRetainingHost
+    for (const afterExecution of [false, true]) {
+      for (const lateReject of [false, true]) {
+        let refreshCalls = 0
+        let executionCalls = 0
+        let releases = 0
+        let reachedAuth = false
+        let settle!: () => void
+        let capturedSignal: AbortSignal | undefined
+        openCodeProvisioningProbe.probeRetainingHost = (async (...args) => {
+          const retained = await retain(...args)
+          return { ...retained, release: async () => { releases += 1; await retained.release() } }
+        }) as typeof retain
+        openCodeExecutionProbe.probeModelOnHost = (async input => {
+          executionCalls += 1
+          return successfulExecution(input)
+        }) as typeof successfulExecution
+        openCodeProvisioningProbe.refreshSelectedProfileAuthority = async input => {
+          refreshCalls += 1
+          expect(input.phaseContext?.phase).toBe('post_probe_refresh')
+          if (afterExecution && refreshCalls === 1) return input.host.profile
+          capturedSignal = input.phaseContext?.signal
+          const managedConfig = buildManagedConfig(retainedAppMcpConfig)
+          const env = { ...input.host.profile.env, XDG_DATA_HOME: path.join(os.tmpdir(), 'readiness-authority-TEST-data') }
+          const profile = { ...input.host.profile, managedConfig, env,
+            managedConfigFingerprint: buildManagedConfigFingerprint(managedConfig, env) }
+          input = { ...input, host: { ...input.host, profile } }
+          const live = JSON.parse(JSON.stringify(profile.managedConfig)
+            .replace(/\{env:([^}]+)\}/g, (_match, name: string) => profile.env[name] || ''))
+          return refreshSelectedProfileAuthority(input, {
+            clientFactory: { create: () => ({ getConfig: async () => live,
+              listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME) }) as never },
+            mcpManager: { ensureAppMcp: async () => ({ summary: {
+              matchedServerName: 'agent-teams', connected: true,
+            } }) as never },
+            collectBehavior: async () => ({ projectBehaviorFingerprint: profile.projectBehaviorFingerprint }) as never,
+            resolveScope: async () => profile.profileScope!,
+            buildEvidence: () => {
+              reachedAuth = true
+              return new Promise((resolve, reject) => {
+                settle = () => lateReject ? reject(new Error('late secret auth error'))
+                  : resolve({ expectedBehaviorFingerprint: input.expectedBehaviorFingerprint } as never)
+              })
+            },
+          })
+        }
+        const envelope = buildEnvelope('opencode.readiness', {
+          projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free',
+          requireExecutionProbe: true,
+        })
+        envelope.timeoutMs = 500
+        const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+        expect({ reachedAuth, refreshCalls, result }).toMatchObject({ reachedAuth: true })
+        expect(capturedSignal?.aborted).toBe(true)
+        expect(result.ok).toBe(false)
+        if ('error' in result) expect(result.error.message).toContain('post_probe_refresh')
+        expect(executionCalls).toBe(afterExecution ? 1 : 0)
+        expect(releases).toBe(1)
+        const serializedResult = JSON.stringify(result)
+        settle()
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(executionCalls).toBe(afterExecution ? 1 : 0)
+        expect(releases).toBe(1)
+        expect(JSON.stringify(result)).toBe(serializedResult)
+        expect(serializedResult).not.toContain('late secret')
+      }
     }
   })
 
@@ -3792,6 +3882,26 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(events).toEqual(['proof:host-key', 'member:bob:host-key'])
   })
 
+  test('reports rejected preflight instead of waiting for an unreached launch stage', async () => {
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot, host: snapshot.host, release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    await withManualTimers(async () => {
+      const envelope = buildEnvelope('opencode.launchTeam', {
+        runId: 'run-rejected-preflight', laneId: 'primary', teamId: 'team-a',
+        selectedModel: 'openrouter/minimax-m2.5-free', members: [{ name: 'alice' }],
+      })
+      ;(envelope.body.preconditions as Record<string, unknown>).expectedBehaviorFingerprint =
+        '0'.repeat(64)
+      const command = executeOpenCodeBridgeCommandEnvelope(envelope)
+      await expect(waitForCommandStage(
+        createDeferred<void>().promise, command, 'bootstrap injection',
+      )).rejects.toThrow(
+        'Command settled before bootstrap injection: OpenCode strict launch behavior precondition mismatch',
+      )
+    })
+  })
+
   test('waits for tracked cancellation cleanup before bounded owner release', async () => {
     const realNow = Date.now
     const originalReleaseMaterializationOwner = openCodeSessionStore.releaseMaterializationOwner
@@ -3861,7 +3971,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         })
         envelope.timeoutMs = 1_000
         const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-        await injectionStarted.promise
+        await waitForCommandStage(injectionStarted.promise, resultPromise, 'bootstrap injection')
         const workTimer = timers.find(timer => !timer.cancelled && timer.timeoutMs === 750)
         expect(workTimer).toBeDefined()
         now = 1_750
@@ -4460,7 +4570,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       })
       envelope.timeoutMs = 1_000
       const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-      await refreshStarted.promise
+      await waitForCommandStage(refreshStarted.promise, resultPromise, 'authority refresh')
       expect(refreshSignal).not.toBeNull()
       const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
       expect(workTimer).toBeDefined()

@@ -1,3 +1,4 @@
+import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { describe, expect, test } from 'bun:test'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -257,7 +258,9 @@ describe('OpenCodeProvisioningProbe', () => {
         ...host, projectPath, profileRootKey: prepared.profileRootKey, profile: prepared,
         resolvedConfigFingerprint: prepared.managedConfigFingerprint,
       }
-      let liveConfig = structuredClone(prepared.managedConfig)
+      const livePrepared = () => JSON.parse(JSON.stringify(prepared.managedConfig)
+        .replace(/\{env:([^}]+)\}/g, (_match, name: string) => prepared.env[name] || ''))
+      let liveConfig = livePrepared()
       let connected = true
       let matchedServerName = 'agent-teams'
       let configError: unknown = null
@@ -265,7 +268,7 @@ describe('OpenCodeProvisioningProbe', () => {
         clientFactory: { create: () => ({ getConfig: async () => {
           if (configError) throw configError
           return liveConfig
-        } }) as never },
+        }, listAgents: async () => effectiveAgentsFixture(prepared.managedConfig, prepared.env.XDG_DATA_HOME) }) as never },
         mcpManager: { ensureAppMcp: async () => ({
           mcp: { 'agent-teams': { connected } },
           summary: {
@@ -301,7 +304,7 @@ describe('OpenCodeProvisioningProbe', () => {
         prepared.managedConfig.agent as Record<string, Record<string, unknown>>,
       ).map(([name, agent]) => [name, { ...agent, options: {} }]))
       const normalizedLiveConfig = {
-        ...structuredClone(prepared.managedConfig), agent: normalizedAgents, command: {},
+        ...livePrepared(), agent: normalizedAgents, command: {},
       }
       const preparedBeforeNormalization = structuredClone(prepared)
       liveConfig = normalizedLiveConfig
@@ -344,7 +347,7 @@ describe('OpenCodeProvisioningProbe', () => {
         expect(await refresh()).toBeNull()
         expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: [field] })
       }
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       matchedServerName = 'secret-server-name'
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'mcp_name' })
@@ -388,7 +391,7 @@ describe('OpenCodeProvisioningProbe', () => {
       }
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'mcp_config_match' })
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-two'
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'mutated-command'
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify({ ROUTE: 'mutated' })
@@ -398,7 +401,7 @@ describe('OpenCodeProvisioningProbe', () => {
       liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: ['permission'] })
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'behavior_match' })
