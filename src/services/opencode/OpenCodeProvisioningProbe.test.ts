@@ -239,7 +239,13 @@ describe('OpenCodeProvisioningProbe', () => {
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
       process.env.DEEPINFRA_API_KEY = 'focused-test-static-authority'
       process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-        provider: { deepinfra: { options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' } } },
+        provider: { deepinfra: {
+          options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' },
+          models: { chosen: {
+            name: 'Chosen', structured_output: true,
+            limit: { context: 200_000, output: 65_536 },
+          } },
+        } },
       })
       const scope = await resolveOpenCodeProfileScope({
         projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
@@ -307,6 +313,21 @@ describe('OpenCodeProvisioningProbe', () => {
         effectiveConfigFingerprint: prepared.managedConfigFingerprint,
       })).toEqual(evidence)
       expect(diagnostics).toEqual([])
+      // OpenCode drops model fields its config schema does not know (for example
+      // structured_output) when serving GET /config; that alone must not reject.
+      const liveProviders = structuredClone(
+        (normalizedLiveConfig as Record<string, unknown>).provider,
+      ) as Record<string, { models: Record<string, Record<string, unknown>> }>
+      expect(liveProviders.deepinfra.models.chosen.structured_output).toBe(true)
+      delete liveProviders.deepinfra.models.chosen.structured_output
+      liveConfig = { ...normalizedLiveConfig, provider: liveProviders }
+      expect(await refresh()).not.toBeNull()
+      expect(diagnostics).toEqual([])
+      const mutatedProviders = structuredClone(liveProviders)
+      mutatedProviders.deepinfra.models.chosen.limit = { context: 1, output: 1 }
+      liveConfig = { ...normalizedLiveConfig, provider: mutatedProviders }
+      expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: ['provider'] })
       for (const [field, value] of [
         ['command', { injected: { template: 'unexpected-command' } }],
         ['command', null],
