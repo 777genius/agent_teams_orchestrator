@@ -1,3 +1,4 @@
+import { validatePreparedProfileBinding } from '../opencode/OpenCodePreparedProfileContract.js'
 import { parseSelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
 import { canonicalV2, immutableV2, recordV2, requireV2 } from './HostedControlBootstrapV2Wire.js'
 import type { DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
@@ -34,7 +35,9 @@ export function decodeSelectedLaunchPhase(bytes: Buffer): SelectedLaunchPhase {
     const launch = value.launch as Record<string, unknown>
     const extended = !!launch && evidenceKeys.some(key => Object.hasOwn(launch, key))
     recordV2(launch, 'expectedHost,bootstrapV2HeaderSha256,rawRetention,supervisorProcessStartToken,ownerProcessStartToken,recipeSha256,harnessContractSha256,ownerModule,ownerArtifactManifestSha256,ownerExecutable,supervisorExecutable,refs,serializedProductBootstrap,producerCapsule,runtimeManifestSha256,harnessContractPath,held,executed' +
-      (extended ? ',selectedSupervisor,selectedControl,selectedRecipe' : ''))
+      (extended ? ',selectedSupervisor,selectedControl,selectedRecipe' : '') +
+      (Object.hasOwn(launch, 'preparedProfileBinding') ? ',preparedProfileBinding' : ''))
+    if (Object.hasOwn(launch, 'preparedProfileBinding')) validatePreparedProfileBinding(launch.preparedProfileBinding)
     if (extended) parseSelectedSupervisorEvidenceV1(Object.fromEntries(evidenceKeys.map(key => [key, launch[key]])))
     const sealed = recordV2(value.sealed, 'observedMonotonicNs,constructionClosedMonotonicNs,construction')
     recordV2(sealed.construction, 'sourceFd,childFd,kind,accessMode,append,mode,uid,gid,seals,device,inode,size,nlink,mtimeNs,ctimeNs,closedMonotonicNs')

@@ -21,7 +21,8 @@ import type {
   OpenCodeMcpStatusEntry,
 } from './types.js'
 
-export const OPEN_CODE_APP_MCP_SERVER_NAME = 'agent-teams'
+import { OPEN_CODE_APP_MCP_SERVER_NAME } from './OpenCodeAppMcpName.js'
+export { OPEN_CODE_APP_MCP_SERVER_NAME } from './OpenCodeAppMcpName.js'
 const OPEN_CODE_APP_MCP_SERVER_ALIASES = [
   OPEN_CODE_APP_MCP_SERVER_NAME,
   'agent_teams',

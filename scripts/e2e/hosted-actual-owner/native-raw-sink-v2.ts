@@ -34,7 +34,7 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
   const context = snapshotHttpContext(contextValue)
   const state = inspectNativeRawPrefix(prefix, binding, context.activation.controllerNonce)
   let sequence = state.nextSequence, previous = state.lastMonotonicNs
-  const requests = new Map<string, { nonce: string; responded: boolean }>()
+  const requests = new Map<string, { nonce: string; responded: boolean; privateConfiguration: boolean }>()
   const nonces = new Set<string>()
   let failed = false
   return (input: OpenCodeRawObservation): { bytes: Uint8Array; recordId: string } => {
@@ -42,6 +42,8 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
     try {
       let observation: Record<string, unknown>
       if (input.phase === 'request') {
+        // No admitted nonsecret body contract exists for configuration writes.
+        httpCheck(!(input.method === 'POST' && input.path === '/mcp'), 'private_configuration_body')
         httpCheck(!nonces.has(input.binding.ownerExchangeNonce), 'encoder_nonce_reuse')
         observation = { phase: 'request-retained', ownerExchangeNonce: input.binding.ownerExchangeNonce,
           operation: input.binding.operation, method: input.method, path: input.path, body: input.body }
@@ -51,6 +53,9 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
         httpCheck(!request || retained?.nonce === request.ownerExchangeNonce, 'encoder_request_binding')
         if (input.phase === 'response') {
           httpCheck(retained && !retained.responded && input.connectedPeer, 'encoder_response_binding')
+          // Base64 and normalized fingerprints cannot establish nonsecret bytes.
+          // Refuse publication before building any record/body hash envelope.
+          httpCheck(!retained.privateConfiguration, 'private_configuration_body')
           observation = { phase: 'response-retained', ownerExchangeNonce: request!.ownerExchangeNonce,
             requestRecordId: request!.recordId, status: input.status, responseHeaders: input.responseHeaders,
             peerOperationNonce: input.peerOperationNonce, nonceStatus: input.nonceStatus,
@@ -74,7 +79,7 @@ export function createNativeHttpEncoderV2(contextValue: HostedHttpContext,
       if (input.phase === 'request') {
         httpCheck(requests.size < 65536, 'encoder_request_limit')
         nonces.add(input.binding.ownerExchangeNonce)
-        requests.set(encoded.recordId, { nonce: input.binding.ownerExchangeNonce, responded: false })
+        requests.set(encoded.recordId, { nonce: input.binding.ownerExchangeNonce, responded: false, privateConfiguration: input.path === '/config' || input.path === '/config/providers' })
       } else if (input.phase === 'response') requests.get(input.request.recordId)!.responded = true
       sequence += 1; previous = clock
       return encoded

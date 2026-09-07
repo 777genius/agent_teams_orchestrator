@@ -3,7 +3,25 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 
-import { Database } from 'bun:sqlite'
+import { createRequire } from 'node:module'
+import type { Database } from 'bun:sqlite'
+
+const requireSqlite = createRequire(import.meta.url)
+
+// Keep the same SQLite transaction/lease algorithm for Bun and selected Node ESM.
+// Node requires its built-in DatabaseSync (Node >=22.13); no alternate lock authority.
+function createCoordinationDatabase(databasePath: string): Database {
+  if ('Bun' in globalThis) {
+    const { Database: BunDatabase } = requireSqlite('bun:sqlite') as typeof import('bun:sqlite')
+    return new BunDatabase(databasePath, { create: true, strict: true })
+  }
+  const { DatabaseSync } = requireSqlite('node:sqlite') as { DatabaseSync: new (path: string) => {
+    exec(sql: string): void; prepare(sql: string): unknown; close(): void
+  } }
+  const db = new DatabaseSync(databasePath)
+  return { exec: (sql: string) => db.exec(sql), query: (sql: string) => db.prepare(sql),
+    close: () => db.close() } as unknown as Database
+}
 
 import {
   throwOpenCodeAbortReason,
@@ -71,7 +89,7 @@ function getCoordinationDatabasePath(authPath: string): string {
 }
 
 function openCoordinationDatabase(databasePath: string): Database {
-  const database = new Database(databasePath, { create: true, strict: true })
+  const database = createCoordinationDatabase(databasePath)
   database.exec('PRAGMA busy_timeout = 0')
   return database
 }

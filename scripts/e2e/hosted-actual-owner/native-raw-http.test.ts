@@ -109,3 +109,26 @@ test('encoder fails permanently on exchange nonce reuse without fabricating anot
   expect(() => encode({ ...request, binding: { ...request.binding,
     ownerExchangeNonce: 'b'.repeat(64) } })).toThrow('encoder_failed')
 })
+
+test('credential-capable configuration never reaches a public raw envelope', () => {
+  const secret = Buffer.from('{"nested":{"environment":{"TOKEN":"synthetic-private-config"}}}')
+  const body = { byteLength:secret.length,bodyBase64:secret.toString('base64'),sha256:sha256(secret) }
+  const write = createNativeHttpEncoderV2(context,Buffer.alloc(0),emptyBinding)
+  expect(()=>write({phase:'request',method:'POST',path:'/mcp',body,
+    binding:{ownerExchangeNonce:hex,operation:{kind:'provider',name:'mcp-add',method:'POST',path:'/mcp'}} as TrustedHttpOperationBinding})).toThrow('private_configuration_body')
+  const read = createNativeHttpEncoderV2(context,Buffer.alloc(0),emptyBinding)
+  const empty = {byteLength:0,bodyBase64:'',sha256:sha256(Buffer.alloc(0))}
+  const request = read({phase:'request',method:'GET',path:'/config',body:empty,
+    binding:{ownerExchangeNonce:hex,operation:{kind:'provider',name:'config',method:'GET',path:'/config'}} as TrustedHttpOperationBinding})
+  try {
+    read({phase:'response',request:{recordId:request.recordId,ownerExchangeNonce:hex,body:empty} as any,
+      status:200,contentEncoding:null,peerOperationNonce:null,nonceStatus:'missing',responseHeaders:[],
+      connectedPeer:{localAddress:'127.0.0.1',localPort:50000,remoteAddress:'127.0.0.1',remotePort:4096},
+      correlation:'unavailable',body,complete:true})
+    throw new Error('expected rejection')
+  } catch(error) {
+    expect(String(error)).toContain('private_configuration_body')
+    expect(String(error)).not.toContain('synthetic-private-config')
+    expect(String(error)).not.toContain(body.bodyBase64)
+  }
+})

@@ -1,3 +1,4 @@
+import { PRIVATE_PROFILE_AUTH, PRIVATE_PROFILE_DOCUMENT_MAXIMUM, type PreparedProfileProjection } from '../opencode/OpenCodePreparedProfileContract.js'
 import type { HostedControlDescriptorGuard } from './HostedControlBootstrap.js'
 import type { HostedControlRuntimeConfig } from './HostedControlRuntimeConfig.js'
 import { HostedControlInheritedActivationV2 } from './HostedControlInheritedActivationV2.js'
@@ -7,7 +8,7 @@ import { beforeDeadlineV2, descriptorRowV2, nonblockV2, OwnedDescriptorV2, readA
   readOneUseV2, sameDescriptorV2, snapshotAllV2, snapshotV2, type DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
 import { freezeSelectionV2, observeExecutingOwnerV2, processV2, verifySelectedLaunchV2,
   type ExecutingOwnerV2, type OwnerV2LaunchSelection } from './HostedControlBootstrapV2Launch.js'
-import { canonicalV2, decodeFramesV2, immutableV2, OWNER_V2_ROLES, requireV2, verifyLeaseV2,
+import { AUTH_V2, canonicalV2, decodeFramesV2, immutableV2, OWNER_V2_ROLES, requireV2, verifyLeaseV2,
   type BootstrapHeaderV2, type Immutable, type OwnerV2Role, type ServerCredentialsV2 } from './HostedControlBootstrapV2Wire.js'
 
 export type HostedControlBootstrapAdmissionV2 = Readonly<{
@@ -18,6 +19,7 @@ export type HostedControlBootstrapAdmissionV2 = Readonly<{
   approvalActivationV2: BootstrapHeaderV2['approvalActivationV2']
   bootstrapV2HeaderSha256: string
   expectedHost: BootstrapHeaderV2['expectedHost']
+  preparedProfile?: PreparedProfileProjection
   serverAuth: ServerCredentialsV2
   rawRetention: Readonly<{ fd: 8; resource: OwnedDescriptorV2; descriptor: DescriptorSnapshotV2; binding: BootstrapHeaderV2['rawRetention'] }>
   ownerNative: Readonly<{ fd: 9; resource: OwnedDescriptorV2; descriptor: DescriptorSnapshotV2; producerCapsule: string }>
@@ -33,6 +35,7 @@ export type HostedControlBootstrapAdmissionV2 = Readonly<{
  * from fields parsed out of this self-MACed frame. */
 export async function readHostedControlBootstrapV2(options: {
   modulePath: string
+  privateAuthFormat?: typeof AUTH_V2 | typeof PRIVATE_PROFILE_AUTH
   selectionPhase?: typeof SELECTED_LAUNCH_PHASE
   selectLaunch(phase?: SelectedLaunchPhase): OwnerV2LaunchSelection | Promise<OwnerV2LaunchSelection>
 }): Promise<HostedControlBootstrapAdmissionV2> {
@@ -43,6 +46,7 @@ export async function readHostedControlBootstrapV2(options: {
   let secret: Buffer | undefined
   let guard: HostedControlDescriptorGuard | undefined
   let activation: HostedControlInheritedActivationV2 | undefined
+  let preparedProfile: PreparedProfileProjection | undefined
   let credentials: ServerCredentialsV2 | undefined
   let success = false
   try {
@@ -57,7 +61,7 @@ export async function readHostedControlBootstrapV2(options: {
     // sibling; allSettled retains and zeroes a successful sibling on failure.
     const read = (role: 'bootstrap' | 'private-server-auth', max: number) =>
       readOneUseV2(owner(role), max, deadline, abort.signal).catch(error => { abort.abort(); throw error })
-    const pending = [read('bootstrap', 65604), read('private-server-auth', 8196)] as const
+    const pending = [read('bootstrap', 65604), read('private-server-auth', options.privateAuthFormat === PRIVATE_PROFILE_AUTH ? PRIVATE_PROFILE_DOCUMENT_MAXIMUM + 4 : 8196)] as const
     const results = await Promise.allSettled(pending)
     if (results[0].status !== 'fulfilled' || results[1].status !== 'fulfilled') {
       for (const result of results) if (result.status === 'fulfilled') result.value.fill(0)
@@ -65,8 +69,8 @@ export async function readHostedControlBootstrapV2(options: {
     }
     let h: BootstrapHeaderV2, bootstrapV2HeaderSha256: string
     {
-      const decoded = decodeFramesV2(results[0].value, results[1].value)
-      credentials = decoded.credentials; secret = decoded.secret
+      const decoded = decodeFramesV2(results[0].value, results[1].value, options.privateAuthFormat ?? AUTH_V2)
+      credentials = decoded.credentials; secret = decoded.secret; preparedProfile = decoded.preparedProfile
       h = decoded.header; bootstrapV2HeaderSha256 = decoded.bootstrapV2HeaderSha256
     }
     for (const row of h.descriptorMap.descriptors) {
@@ -106,15 +110,16 @@ export async function readHostedControlBootstrapV2(options: {
     const result: HostedControlBootstrapAdmissionV2 = Object.freeze({
       protocol: 'v2', config, header: h, bootstrapBinding: b, approvalActivationV2: h.approvalActivationV2,
       bootstrapV2HeaderSha256, expectedHost: h.expectedHost,
+      get preparedProfile() { requireV2(!closed, 'profile_released'); return preparedProfile },
       get serverAuth() { requireV2(!closed && credentials, 'credentials_released'); return credentials },
       rawRetention: Object.freeze({ fd: 8, resource: owner('raw-opencode-retention'), descriptor: find('raw-opencode-retention'), binding: h.rawRetention }),
       ownerNative: Object.freeze({ fd: 9, resource: owner('owner-wal-native'), descriptor: find('owner-wal-native'), producerCapsule: selection.producerCapsule }),
       executedOwner: executed, secret, guard, activation,
       async close() {
         if (closed) return
-        closed = true; credentials = undefined; secret!.fill(0); activation!.close()
-        await guard!.close()
-        for (const resource of owners.values()) resource.close()
+        closed = true; credentials = undefined; preparedProfile = undefined; secret!.fill(0)
+        try { try { activation!.close() } finally { await guard!.close() } }
+        finally { for (const resource of owners.values()) resource.close() }
       },
     })
     success = true
@@ -127,8 +132,9 @@ export async function readHostedControlBootstrapV2(options: {
     // Detached owners of FD4/7/11 are no-ops here, even if those slots were reused.
     owner('bootstrap').close(); owner('private-server-auth').close(); owner('executable-anchor').close()
     if (!success) {
-      credentials = undefined; secret?.fill(0); activation?.close(); await guard?.close()
-      for (const resource of owners.values()) resource.close()
+      credentials = undefined; preparedProfile = undefined; secret?.fill(0)
+      try { try { activation?.close() } finally { await guard?.close() } }
+      finally { for (const resource of owners.values()) resource.close() }
     }
   }
 }

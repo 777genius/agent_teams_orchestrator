@@ -1,3 +1,4 @@
+import type { PreparedProfileBinding } from '../opencode/OpenCodePreparedProfileContract.js'
 import { assertSelectedSupervisorArgvV1, type SelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
 import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from 'node:fs'
 import type { ExpectedSupervisedOpenCode } from '../opencode/OpenCodeSupervisedHostCustody.js'
@@ -11,6 +12,7 @@ import { canonicalV2, hashV2, immutableV2, recordV2, requireV2, textV2, HEX_V2, 
  * pins become authority only after independent artifact admission. This type
  * alone is not wire validation or a constructor of TrustedOpenCodeCustody. */
 export type OwnerV2LaunchSelection = Immutable<Partial<SelectedSupervisorEvidenceV1> & {
+  preparedProfileBinding?: PreparedProfileBinding
   expectedHost: ExpectedSupervisedOpenCode
   bootstrapV2HeaderSha256: string
   rawRetention: RawRetentionBindingV2
@@ -146,6 +148,7 @@ export function verifySelectedLaunchV2(input: {
   requireV2(peer.startTicks === h.expectedHost.process.startTicks && image.sha256 === h.expectedHost.executable.sha256 &&
     String(image.stat.dev) === h.expectedHost.executable.device && String(image.stat.ino) === h.expectedHost.executable.inode &&
     String(image.stat.size) === h.expectedHost.executable.size, 'peer_image')
+  requireV2(canonicalV2(p.preparedProfileBinding ?? null) === canonicalV2(h.preparedProfileBinding ?? null), 'selected_profile_binding')
   requireV2(hashV2(p.serializedProductBootstrap) === h.bootstrapBinding.bootstrapDigest, 'product_bootstrap_digest')
   verifyProducerCapsuleV2(p, h, actual)
   requireV2(processV2(held.parentPid).startTicks === held.parentStartTicks &&

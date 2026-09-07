@@ -1,3 +1,4 @@
+import { PRIVATE_PROFILE_AUTH, PRIVATE_PROFILE_DOCUMENT_MAXIMUM, PREPARED_PROFILE_MAXIMUM, canonicalPreparedProfile, decodePrivateProfileJson, decodePreparedProfile, validatePreparedProfileBinding, verifyPreparedProfileBinding, type PreparedProfileBinding, type PreparedProfileProjection } from '../opencode/OpenCodePreparedProfileContract.js'
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import type { ExpectedSupervisedOpenCode } from '../opencode/OpenCodeSupervisedHostCustody.js'
 import type { HostedControlBootstrapHeader, HostedApprovalActivationV2BootstrapExpectation } from './HostedControlBootstrap.js'
@@ -42,7 +43,8 @@ export type BootstrapHeaderV2 = Immutable<Omit<HostedControlBootstrapHeader,
   leaseEvidence: HostedControlBootstrapHeader['leaseEvidence'] & { leaseArtifactSha256: string }
   expectedHost: ExpectedSupervisedOpenCode; supervisorBinding: SupervisorBindingV2
   descriptorMap: OwnerDescriptorMapV2; rawRetention: RawRetentionBindingV2
-  serverAuthBinding: { format: typeof AUTH_V2; serverAuthId: string; expectedHostSha256: string
+  preparedProfileBinding?: PreparedProfileBinding
+  serverAuthBinding: { format: typeof AUTH_V2 | typeof PRIVATE_PROFILE_AUTH; serverAuthId: string; expectedHostSha256: string
     descriptorMapSha256: string; authHmacSha256: string }
 }>
 export type ServerCredentialsV2 = Readonly<{ id: string; username: string; password: string }>
@@ -111,7 +113,9 @@ function requireMac(key: Buffer, domain: string, bytes: Buffer, supplied: Buffer
 }
 
 export function decodeHeaderV2(bytes: Buffer): BootstrapHeaderV2 {
-  const r = recordV2(decodeCanonicalV2(bytes, 65536), 'format,restoreGeneration,teamId,declaredRootHash,ownerAuthority,ownerGeneration,ownerSessionId,claudeRoot,socketPath,legacyKey,approvalActivationV2,bootstrapBinding,leaseEvidence,expectedHost,supervisorBinding,descriptorMap,serverAuthBinding,rawRetention')
+  const decoded = decodeCanonicalV2(bytes, 65536)
+  const hasProfile = !!decoded && typeof decoded === 'object' && Object.hasOwn(decoded, 'preparedProfileBinding')
+  const r = recordV2(decoded, 'format,restoreGeneration,teamId,declaredRootHash,ownerAuthority,ownerGeneration,ownerSessionId,claudeRoot,socketPath,legacyKey,approvalActivationV2,bootstrapBinding,leaseEvidence,expectedHost,supervisorBinding,descriptorMap,serverAuthBinding,rawRetention' + (hasProfile ? ',preparedProfileBinding' : ''))
   requireV2(r.format === BOOTSTRAP_V2, 'format')
   integerV2(r.restoreGeneration, 0); integerV2(r.ownerGeneration)
   textV2(r.teamId, /^team_[0-9a-f]{32}$/); textV2(r.declaredRootHash, HEX_V2)
@@ -140,7 +144,8 @@ export function decodeHeaderV2(bytes: Buffer): BootstrapHeaderV2 {
   for (const k of ['supervisorStartToken', 'supervisorExecutableSha256', 'recipeSha256', 'ownerEntrySha256', 'ownerProcessStartToken', 'harnessContractSha256', 'ownerProducerCapsuleSha256']) textV2(s[k], HEX_V2)
   validateMap(r.descriptorMap)
   const auth = recordV2(r.serverAuthBinding, 'format,serverAuthId,expectedHostSha256,descriptorMapSha256,authHmacSha256')
-  requireV2(auth.format === AUTH_V2, 'auth_format'); textV2(auth.serverAuthId)
+  requireV2(auth.format === (hasProfile ? PRIVATE_PROFILE_AUTH : AUTH_V2), 'auth_format');
+  if (hasProfile) validatePreparedProfileBinding(r.preparedProfileBinding); textV2(auth.serverAuthId)
   for (const k of ['expectedHostSha256', 'descriptorMapSha256', 'authHmacSha256']) textV2(auth[k], HEX_V2)
   const raw = recordV2(r.rawRetention, 'format,captureId,initialByteLength,initialSha256,nextSequence')
   requireV2(raw.format === 'agent-teams.hosted-control.opencode-raw-retention/v1', 'raw_format')
@@ -202,8 +207,8 @@ function validateMap(value: unknown): void {
 }
 
 /** Consumes mutable frames on success AND failure; returned key has a single new owner. */
-export function decodeFramesV2(bootstrap: Buffer, auth: Buffer): {
-  header: BootstrapHeaderV2; secret: Buffer; credentials: ServerCredentialsV2; bootstrapV2HeaderSha256: string
+export function decodeFramesV2(bootstrap: Buffer, auth: Buffer, authFormat: typeof AUTH_V2 | typeof PRIVATE_PROFILE_AUTH = AUTH_V2): {
+  header: BootstrapHeaderV2; secret: Buffer; credentials: ServerCredentialsV2; preparedProfile?: PreparedProfileProjection; bootstrapV2HeaderSha256: string
 } {
   let secret: Buffer | undefined
   try {
@@ -214,16 +219,37 @@ export function decodeFramesV2(bootstrap: Buffer, auth: Buffer): {
     requireMac(secret, BOOTSTRAP_V2, bootstrap.subarray(0, n + 4), bootstrap.subarray(n + 36))
     const header = decodeHeaderV2(bootstrap.subarray(4, n + 4))
     requireV2(hashV2(secret) === header.bootstrapBinding.proofKeyId, 'proof_key')
-    requireV2(auth.length >= 6 && auth.length <= 8196 && auth.readUInt32BE(0) === auth.length - 4, 'auth_length')
-    requireMac(secret, AUTH_V2, auth, Buffer.from(header.serverAuthBinding.authHmacSha256, 'hex'))
-    const a = recordV2(decodeCanonicalV2(auth.subarray(4), 8192), 'format,bootstrapDigest,spawnNonce,expectedHostSha256,descriptorMapSha256,serverAuthId,username,password')
+    requireV2(authFormat === AUTH_V2 || authFormat === PRIVATE_PROFILE_AUTH, 'auth_format')
+    requireV2(header.serverAuthBinding.format === authFormat, 'auth_selection')
+    const maximum = authFormat === PRIVATE_PROFILE_AUTH ? PRIVATE_PROFILE_DOCUMENT_MAXIMUM : 8192
+    requireV2(auth.length >= 6 && auth.length <= maximum + 4 && auth.readUInt32BE(0) === auth.length - 4, 'auth_length')
+    requireMac(secret, authFormat, auth, Buffer.from(header.serverAuthBinding.authHmacSha256, 'hex'))
+    const a = recordV2(authFormat === PRIVATE_PROFILE_AUTH ? decodePrivateProfileJson(auth.subarray(4), maximum) : decodeCanonicalV2(auth.subarray(4), maximum),
+      'format,bootstrapDigest,spawnNonce,expectedHostSha256,descriptorMapSha256,serverAuthId,username,password' +
+      (authFormat === PRIVATE_PROFILE_AUTH ? ',publicationId,preparedProfileSha256,preparedProfile' : ''))
     const b = header.serverAuthBinding
-    requireV2(a.format === AUTH_V2 && a.bootstrapDigest === header.bootstrapBinding.bootstrapDigest &&
+    requireV2(a.format === authFormat && a.bootstrapDigest === header.bootstrapBinding.bootstrapDigest &&
       a.spawnNonce === header.descriptorMap.spawnNonce && a.expectedHostSha256 === b.expectedHostSha256 &&
       a.descriptorMapSha256 === b.descriptorMapSha256 && a.serverAuthId === b.serverAuthId, 'auth_binding')
     const username = textV2(a.username, /^[^:\r\n\0]+$/); const password = textV2(a.password, /^[^\r\n\0]+$/)
     requireV2(Buffer.byteLength(username) <= 128 && Buffer.byteLength(password) <= 4096, 'credentials_size')
-    return { header, secret, credentials: Object.freeze({ id: b.serverAuthId, username, password }),
+    let preparedProfile: PreparedProfileProjection | undefined
+    if (authFormat === PRIVATE_PROFILE_AUTH) {
+      const bytes = Buffer.from(canonicalPreparedProfile(a.preparedProfile))
+      try {
+        requireV2(bytes.length <= PREPARED_PROFILE_MAXIMUM && hashV2(bytes) === a.preparedProfileSha256 &&
+          a.publicationId === header.preparedProfileBinding?.publicationId, 'profile_binding')
+        verifyPreparedProfileBinding(bytes, header.preparedProfileBinding!, secret, {
+          expectedHostSha256: b.expectedHostSha256,
+          ownerProcessStartToken: header.supervisorBinding.ownerProcessStartToken,
+          bootstrapDigest: header.bootstrapBinding.bootstrapDigest,
+        })
+        preparedProfile = decodePreparedProfile(bytes)
+        for (const field of ['projectPath','profileRootKey','profileRootPath','projectBehaviorFingerprint','managedConfigFingerprint','sourceAuthFingerprint','managedAuthFingerprint','sourceAuthSources'] as const)
+          requireV2(canonicalPreparedProfile(preparedProfile[field]) === canonicalPreparedProfile(header.expectedHost.profile[field]), 'profile_expected')
+      } finally { bytes.fill(0) }
+    }
+    return { header, secret, ...(preparedProfile ? { preparedProfile } : {}), credentials: Object.freeze({ id: b.serverAuthId, username, password }),
       bootstrapV2HeaderSha256: hashV2(bootstrap.subarray(4, n + 4)) }
   } catch { secret?.fill(0); throw new Error('hosted_owner_v2_frame_rejected') }
   finally { bootstrap.fill(0); auth.fill(0) }
