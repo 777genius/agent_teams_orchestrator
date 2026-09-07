@@ -1,15 +1,34 @@
 import { validatePreparedProfileBinding } from '../opencode/OpenCodePreparedProfileContract.js'
 import { parseSelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
-import { canonicalV2, immutableV2, recordV2, requireV2 } from './HostedControlBootstrapV2Wire.js'
+import { immutableV2, recordV2, requireV2 } from './HostedControlBootstrapV2Wire.js'
 import type { DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
 import type { OwnerV2LaunchSelection } from './HostedControlBootstrapV2Launch.js'
 
 export const SELECTED_LAUNCH_PHASE = 'agent-teams.hosted-owner-selected-launch/v1'
 export const SELECTED_LAUNCH_MAGIC = 0x48534c31 // HSL1; distinct from activation JSON
 export const SELECTED_LAUNCH_MAXIMUM = 256 * 1024
+/** Product canonicalJson wire algorithm. Unlike bootstrap-v2 integer fields,
+ * signed native JSON permits all safe integers. Keep this scoped to HSL1. */
+export function canonicalSelectedLaunchJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    requireV2(Number.isSafeInteger(value), 'selection_phase_number'); return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalSelectedLaunchJson).join(',')}]`
+  requireV2(value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype, 'selection_phase_json')
+  return `{${Object.entries(value).sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalSelectedLaunchJson(item)}`).join(',')}}`
+}
+const bootstrapDeadlines = new WeakMap<object, number>()
+/** Retained local timing, never a field authenticated by the selected caller. */
+export function selectedLaunchBootstrapDeadline(phase: SelectedLaunchPhase): number {
+  const deadline = bootstrapDeadlines.get(phase)
+  requireV2(deadline !== undefined, 'selection_phase_deadline_missing')
+  return deadline
+}
 export type SelectedLaunchPhase = Readonly<{
   contract: typeof SELECTED_LAUNCH_PHASE
-  nativeAdmission?: unknown
+  nativeAdmission: unknown
   launch: OwnerV2LaunchSelection
   sealed: Readonly<{
     observedMonotonicNs: string
@@ -24,16 +43,15 @@ export type SelectedLaunchPhase = Readonly<{
 
 /** Decoding supplies data only. Independent artifact admission must precede use
  * of launch pins; neither this envelope nor the FD4 MAC supplies public roots. */
-export function decodeSelectedLaunchPhase(bytes: Buffer): SelectedLaunchPhase {
+export function decodeSelectedLaunchPhase(bytes: Buffer, bootstrapDeadline?: number): SelectedLaunchPhase {
   requireV2(bytes.length >= 8 && bytes.readUInt32BE(0) === SELECTED_LAUNCH_MAGIC, 'selection_phase_magic')
   const length = bytes.readUInt32BE(4)
   requireV2(length > 0 && length <= SELECTED_LAUNCH_MAXIMUM && bytes.length === length + 8, 'selection_phase_length')
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(8))
     const parsed = JSON.parse(text)
-    const value = recordV2(parsed, 'contract,launch,sealed' +
-      (parsed && Object.hasOwn(parsed, 'nativeAdmission') ? ',nativeAdmission' : ''))
-    requireV2(value.contract === SELECTED_LAUNCH_PHASE && canonicalV2(value) === text, 'selection_phase_contract')
+    const value = recordV2(parsed, 'contract,launch,sealed,nativeAdmission')
+    requireV2(value.contract === SELECTED_LAUNCH_PHASE && canonicalSelectedLaunchJson(value) === text, 'selection_phase_contract')
     const evidenceKeys = ['selectedSupervisor', 'selectedControl', 'selectedRecipe'] as const
     const launch = value.launch as Record<string, unknown>
     const extended = !!launch && evidenceKeys.some(key => Object.hasOwn(launch, key))
@@ -44,7 +62,12 @@ export function decodeSelectedLaunchPhase(bytes: Buffer): SelectedLaunchPhase {
     if (extended) parseSelectedSupervisorEvidenceV1(Object.fromEntries(evidenceKeys.map(key => [key, launch[key]])))
     const sealed = recordV2(value.sealed, 'observedMonotonicNs,constructionClosedMonotonicNs,construction')
     recordV2(sealed.construction, 'sourceFd,childFd,kind,accessMode,append,mode,uid,gid,seals,device,inode,size,nlink,mtimeNs,ctimeNs,closedMonotonicNs')
-    return immutableV2(value as unknown as SelectedLaunchPhase)
+    const phase = immutableV2(value as unknown as SelectedLaunchPhase)
+    if (bootstrapDeadline !== undefined) {
+      requireV2(Number.isFinite(bootstrapDeadline), 'selection_phase_deadline')
+      bootstrapDeadlines.set(phase, bootstrapDeadline)
+    }
+    return phase
   } catch { throw new Error('hosted_owner_v2_selection_phase_rejected') }
 }
 

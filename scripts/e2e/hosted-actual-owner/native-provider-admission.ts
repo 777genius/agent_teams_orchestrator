@@ -12,14 +12,16 @@ import type { HostedApprovalRuntimeAdmission } from '../../../src/services/hoste
 import { createOpenCodeSupervisedCustodyAcquirer, type OpenCodeSupervisorAdmissionSource, type OneUseFence, type TrustedOpenCodeCustody } from '../../../src/services/opencode/OpenCodeSupervisedHostCustody.js'
 import { createOpenCodeRawRetention } from '../../../src/services/opencode/OpenCodeHostedRawRetention.js'
 import { retainOpenCodeProfileCurrentness } from '../../../src/services/opencode/OpenCodeProfileCurrentness.js'
-import { createNativeRawSinkV2 } from './native-raw-sink-v2.js'
+import { canonicalJson, sha256 } from './native-http-contract.js'
+import { requireNativeAllocationConsumers } from './native-allocation-consumers.js'
+import { RetainedProductObservationResults } from './native-operation-results.js'
 import { assertNativeAdmittedLaunch, type NativeAdmittedLaunch } from './native-launch-admission.js'
 
-const scenarios = new WeakSet<object>()
-export type NativeAdmittedScenario = ReturnType<typeof retainNativeActivatedScenario>
+const allocations = new WeakSet<object>()
+export type NativeAdmittedAllocation = ReturnType<typeof retainNativeActivatedAllocation>
 /** Called only with the real production-verifier result and its exact activated
  * file/epoch admission. Recovery itself remains provider-free. */
-export function retainNativeActivatedScenario(launch: NativeAdmittedLaunch,
+export function retainNativeActivatedAllocation(launch: NativeAdmittedLaunch,
   admission: HostedApprovalRuntimeAdmission, activation: VerifiedHostedApprovalActivation) {
   assertNativeAdmittedLaunch(launch)
   assertHostedApprovalProductionActivation(activation)
@@ -29,13 +31,26 @@ export function retainNativeActivatedScenario(launch: NativeAdmittedLaunch,
     activation.binding.ownerArtifactDigest === selected.activation.ownerArtifactDigest &&
     activation.binding.ownerBinding.ownerGeneration === selected.activation.ownerGeneration &&
     activation.binding.ownerBinding.ownerSessionId === selected.activation.ownerSessionId &&
+    activation.binding.signedManifest.manifestDigest === `sha256:${launch.generation.manifestSha256}` &&
     activation.binding.signedManifest.releasePinDigest === launch.releasePinDigest &&
-    activation.binding.signedManifest.launcherKeyId === launch.launcherKeyId, 'native_scenario_activation')
-  const routes = admission.routes.filter(route => route.routeId === launch.scenario.routeId)
-  requireV2(routes.length === 1 && routes[0]!.authority.runtimeInstanceId === selected.hosted.runtimeInstanceId &&
-    routes[0]!.openCodeBinding.openCodeArtifactDigest === `sha256:${selected.executable.sha256}`, 'native_scenario_route')
-  const value = Object.freeze({ launch, admission, route: routes[0]!, row: launch.scenario.row })
-  scenarios.add(value)
+    activation.binding.signedManifest.launcherKeyId === launch.launcherKeyId, 'native_selection_activation')
+  // Existing activation admission is per team. Select that authenticated team,
+  // retaining the full generation for later A/B batch custody installation.
+  const activatedSlots = launch.generation.slots.filter(slot => slot.teamId === activation.binding.teamId &&
+    slot.teamId === admission.outerAuthority.teamId && slot.lifecycleEndpoint === activation.binding.socketPath)
+  requireV2(activatedSlots.length === 1 && admission.routes.length === activatedSlots.length, 'native_allocation_routes')
+  const routes = Object.freeze(activatedSlots.map(slot => {
+    const matches = admission.routes.filter(route => route.routeId === slot.routeId &&
+      route.scope.teamId === slot.teamId && sha256(canonicalJson(route)) === slot.routeDigest)
+    requireV2(matches.length === 1, 'native_allocation_route')
+    const route = matches.find(route => route.routeId === slot.routeId)!
+    requireV2(route.authority.runtimeInstanceId === selected.hosted.runtimeInstanceId &&
+      route.openCodeBinding.openCodeArtifactDigest === `sha256:${selected.executable.sha256}`, 'native_allocation_route_host')
+    return Object.freeze({ slot, route })
+  }))
+  const value = Object.freeze({ launch, admission, routes,
+    allocation: launch.allocation, allocationSha256: launch.allocationSha256, generation: launch.generation })
+  allocations.add(value)
   return value
 }
 
@@ -43,19 +58,29 @@ export async function acquireNativeProviderCustody(input: Readonly<{
   bootstrap: HostedControlBootstrapAdmissionV2
   runtimeContext: HostedControlRuntimePortFactoryContext
   admittedLaunch: NativeAdmittedLaunch
-  admittedScenario: NativeAdmittedScenario
+  admittedAllocation: NativeAdmittedAllocation
 }>) {
-  const { bootstrap, runtimeContext: context, admittedLaunch: launch, admittedScenario: scenario } = input
+  const { bootstrap, runtimeContext: context, admittedLaunch: launch, admittedAllocation: selection } = input
   assertHostedControlBootstrapAdmissionV2(bootstrap)
   assertHostedControlNativeRuntimeContext(context, bootstrap)
   assertNativeAdmittedLaunch(launch)
-  requireV2(scenarios.has(scenario) && scenario.launch === launch && bootstrap.preparedProfile &&
-    context.nativeActivationV2 && canonicalV2(context.authority) === canonicalV2(scenario.admission.outerAuthority) &&
+  requireV2(allocations.has(selection) && selection.launch === launch && bootstrap.preparedProfile &&
+    context.nativeActivationV2 && canonicalV2(context.authority) === canonicalV2(selection.admission.outerAuthority) &&
     launch.launch.bootstrapV2HeaderSha256 === bootstrap.bootstrapV2HeaderSha256 &&
     canonicalV2(launch.launch.expectedHost) === canonicalV2(bootstrap.expectedHost) &&
     launch.releasePinDigest === bootstrap.approvalActivationV2.signedManifest.releasePinDigest &&
     launch.launcherKeyId === bootstrap.approvalActivationV2.signedManifest.launcherKeyId &&
     launch.proofKeyId === createHash('sha256').update(bootstrap.secret).digest('hex'), 'native_provider_admission')
+  requireV2(selection.generation.generation === bootstrap.header.ownerGeneration &&
+    selection.generation.ownerSessionId === bootstrap.header.ownerSessionId &&
+    selection.routes.filter(({ slot }) => slot.teamId === bootstrap.header.teamId &&
+      slot.teamRoot === context.teamRoot && slot.lifecycleEndpoint === bootstrap.header.socketPath).length === 1,
+  'native_provider_generation_root')
+  // Required installed resource retention AND permit consumers. No selected row,
+  // first route, or statement JSON can manufacture either implementation.
+  const consumers = requireNativeAllocationConsumers()
+  requireV2(consumers.retainedResults instanceof RetainedProductObservationResults &&
+    consumers.retainedResults.allocation === selection.allocation, 'native_allocation_retention')
   const profile = retainOpenCodeProfileCurrentness(bootstrap.preparedProfile,
     createNativeBehaviorNamespaceCheck(bootstrap.preparedProfile.projectPath))
   const preflights = new OpenCodePreflightLeaseRegistry()
@@ -70,7 +95,8 @@ export async function acquireNativeProviderCustody(input: Readonly<{
   const current = () => {
     try {
       if (!revoked && bootstrap.guard.assertCurrentSync() && bootstrap.activation.isCurrent() &&
-        launch.isCurrent() && profile.isCurrent() && isHostedApprovalActivatedAdmissionCurrent(scenario.admission)) {
+        launch.isCurrent() && profile.isCurrent() && consumers.isCurrent(selection) &&
+        isHostedApprovalActivatedAdmissionCurrent(selection.admission)) {
         const activation = context.nativeActivationV2!.prepareRetainedProviderToken()
         if (activation?.consume()) return true
       }
@@ -84,7 +110,7 @@ export async function acquireNativeProviderCustody(input: Readonly<{
     const tokens: OneUseFence[] = []
     let transferred = false
     try {
-      const admitted = await scenario.admission.prepareEffectToken()
+      const admitted = await selection.admission.prepareEffectToken()
       if (!admitted) return null
       tokens.push(admitted)
       if (!current() || !await context.isCurrentAuthority({ actorId: 'hosted-approval-owner', ...context.authority })) return null
@@ -105,8 +131,7 @@ export async function acquireNativeProviderCustody(input: Readonly<{
 
   try {
     requireV2(current(), 'native_provider_currentness')
-    raw = createOpenCodeRawRetention(await createNativeRawSinkV2(bootstrap,
-      { row: scenario.row, routeId: scenario.route.routeId }, performance.now() + 5000))
+    raw = createOpenCodeRawRetention(await consumers.openRawRetention(bootstrap, selection))
     requireV2(current(), 'native_provider_currentness')
     monitor = setInterval(current, 250); monitor.unref?.()
     void bootstrap.guard.lost.then(revoke, revoke)
@@ -128,13 +153,24 @@ export async function acquireNativeProviderCustody(input: Readonly<{
           },
           releasePreflightLease(lease) { preflights.release(lease) },
           async prepareLeaseToken(lease) {
-            const route = scenario.route
-            const scoped = () => preflights.has(lease) || matchesNativeLifecycleLease(lease, route)
+            const scoped = () => preflights.has(lease) ||
+              selection.routes.filter(({ route }) => matchesNativeLifecycleLease(lease, route)).length === 1
             if (!scoped()) return null
             const token = await prepare()
-            return token && Object.freeze({ consume() { const valid = token.consume(); return valid && scoped() } })
+            if (!token) return null
+            let permit: OneUseFence | null = null
+            try { permit = await consumers.prepareLeaseToken(selection, lease) }
+            finally { if (!permit) { try { token.consume() } finally { revoke() } } }
+            return permit && combineNativeProviderFences([token, permit], () => current() && scoped(), revoke)
           },
-          prepareOperationToken: prepare,
+          async prepareOperationToken(operation) {
+            const token = await prepare()
+            if (!token) return null
+            let permit: OneUseFence | null = null
+            try { permit = await consumers.prepareOperationToken(selection, operation) }
+            finally { if (!permit) { try { token.consume() } finally { revoke() } } }
+            return permit && combineNativeProviderFences([token, permit], current, revoke)
+          },
           async closeOwnerResources() {
             revoke(); clearInterval(monitor); profile.close()
             credentials.username = ''; credentials.password = ''

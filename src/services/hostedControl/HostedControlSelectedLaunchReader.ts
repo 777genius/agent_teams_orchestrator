@@ -31,6 +31,9 @@ export async function readSelectedLaunchPhase(owner: OwnedDescriptorV2, deadline
     const extra = Buffer.alloc(1)
     try { requireV2(readAvailableV2(owner.fd, extra) < 0, 'selection_phase_trailing') }
     finally { extra.fill(0) }
-    return decodeSelectedLaunchPhase(frame)
+    beforeDeadlineV2(deadline)
+    const phase = decodeSelectedLaunchPhase(frame, deadline)
+    beforeDeadlineV2(deadline)
+    return phase
   } finally { header.fill(0); frame?.fill(0) }
 }

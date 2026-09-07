@@ -12,6 +12,7 @@ import { HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256 } from '../../../src/services/h
 import { activationGolden, assembleFixtureV2, fixtureHeaderV2 } from '../../../src/services/hostedControl/fixtures/bootstrapV2Producer.js'
 import { OwnedKernelChild, KernelChannel as Channel } from './kernel-fixture-ownership.js'
 import { SELECTED_LAUNCH_PHASE, SELECTED_LAUNCH_MAGIC, SELECTED_LAUNCH_MAXIMUM } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
+import { nativeAdmissionFixture, signFixtureStatement } from './native-admission.fixture.js'
 
 let directory: string, image: string, imageSha: string, peer: ChildProcessWithoutNullStreams
 const owned = new Set<OwnedKernelChild>()
@@ -121,7 +122,13 @@ async function fixture(scenario = 'valid', mutate?: (header: any, selection: any
   selection.executed = { ...exec.executed, executableSha256: imageSha }
   writeFileSync(selected, JSON.stringify(selection), { mode: 0o600 }); channel.send({ release: true })
   if (scenario.startsWith('selection-')) {
-    const phase = { contract: SELECTED_LAUNCH_PHASE, launch: structuredClone(selection), sealed: structuredClone(exec.sealed) }
+    // Public RFC8032 fixture signature only. This kernel suite checks framing,
+    // descriptor/process/sealing integration; production root admission is separate.
+    const fixtureStatement = nativeAdmissionFixture().statement
+    const nativeAdmission = signFixtureStatement({ ...fixtureStatement,
+      launchSha256: hashV2(canonicalV2(selection)), sealedSha256: hashV2(canonicalV2(exec.sealed)),
+      ownerProcessStartToken: selection.ownerProcessStartToken })
+    const phase = { contract: SELECTED_LAUNCH_PHASE, launch: structuredClone(selection), sealed: structuredClone(exec.sealed), nativeAdmission }
     if (scenario === 'selection-wrong-launch') phase.launch.ownerProcessStartToken = '9'.repeat(64)
     if (scenario === 'selection-wrong-sealing') phase.sealed.observedMonotonicNs = phase.launch.executed.observedMonotonicNs
     const body = Buffer.from(canonicalV2(phase)), prefix = Buffer.alloc(8)

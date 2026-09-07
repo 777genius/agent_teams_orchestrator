@@ -1,5 +1,5 @@
 import type { NativeOwnerComposition } from './native-composition.js'
-import { acquireNativeProviderCustody, retainNativeActivatedScenario, type NativeAdmittedScenario } from './native-provider-admission.js'
+import { acquireNativeProviderCustody, retainNativeActivatedAllocation, type NativeAdmittedAllocation } from './native-provider-admission.js'
 import type { NativeAdmittedLaunch } from './native-launch-admission.js'
 import { PRIVATE_PROFILE_AUTH } from '../../../src/services/opencode/OpenCodePreparedProfileContract.js'
 import { join } from 'node:path'
@@ -49,7 +49,7 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
     // FD9 and image custody exist before any approval recovery can publish WAL.
     walImages = await createNativeWalImagesV2(bootstrap, context.teamRoot)
     native = createNativePublicationV2(bootstrap, modulePath, walImages)
-    let admittedScenario: NativeAdmittedScenario | undefined
+    let admittedAllocation: NativeAdmittedAllocation | undefined
     let provider: Promise<ReturnType<typeof createOpenCodeSupervisedProviderBundle>> | undefined
     let execute: ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor> | undefined
     let providerRevoked = false
@@ -63,9 +63,9 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
     }
     const getProvider = () => {
       if (providerRevoked) return Promise.reject(new Error('hosted_owner_v2_provider_revoked'))
-      if (!admittedLaunch || !admittedScenario) return Promise.reject(new Error('hosted_owner_v2_scenario_unavailable'))
+      if (!admittedLaunch || !admittedAllocation) return Promise.reject(new Error('hosted_owner_v2_allocation_unavailable'))
       return provider ??= acquireNativeProviderCustody({ bootstrap, runtimeContext: context,
-        admittedLaunch, admittedScenario }).then(async custody => {
+        admittedLaunch, admittedAllocation }).then(async custody => {
       activeCustody = custody
       if (providerRevoked) {
         revokeProvider()
@@ -117,7 +117,7 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
           if (!await activation.assertBootstrapCurrent() || !await activation.assertRootCurrent()) {
             throw new Error('hosted_owner_v2_guard_lost')
           }
-          admittedScenario = retainNativeActivatedScenario(admittedLaunch!, admission, verifiedActivation)
+          admittedAllocation = retainNativeActivatedAllocation(admittedLaunch!, admission, verifiedActivation)
           const owner = new HostedApprovalOwnerService({ store, admission, runtime: approvalRuntime,
             isCurrentOuterAuthority: () => context.isCurrentAuthority({
               actorId: 'hosted-approval-owner', ...context.authority,

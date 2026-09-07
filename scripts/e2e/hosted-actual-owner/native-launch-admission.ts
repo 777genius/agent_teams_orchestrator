@@ -1,10 +1,11 @@
-import { createPublicKey, verify } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync } from 'node:fs'
-import { canonicalV2, hashV2, immutableV2, recordV2, requireV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Wire.js'
+import { canonicalV2, requireV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Wire.js'
 import { freezeSelectionV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
-import type { SelectedLaunchPhase } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
+import { selectedLaunchBootstrapDeadline, type SelectedLaunchPhase } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
+import { beforeDeadlineV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Descriptors.js'
 import { createHostedApprovalActivationV2ProductionPins } from '../../../src/services/hostedControl/HostedApprovalActivationV2Pins.js'
-import { MATRIX_ROWS, type MatrixRow } from './native-http-contract.js'
+import { verifyNativeLaunchAdmission } from './native-admission-codec.js'
+import { requireNativePredecessorObservation, verifyNativePredecessorObservation } from './native-allocation-consumers.js'
 import { parseIntegrationDescriptor } from './native-controller-contract.js'
 import { parseControllerTrustAnchor } from './native-controller-verification.js'
 import { admitSelectedControlDocuments } from './native-selected-control.js'
@@ -12,7 +13,7 @@ import { readReadonlyArtifact } from './native-readonly-artifact.js'
 import { verifyP3B2Recipe } from './native-owner-recipe.js'
 import { retainNativeDeploymentTrust } from './native-deployment-trust.js'
 
-export const NATIVE_LAUNCH_ADMISSION = 'agent-teams.owner-native-launch-admission/v1'
+export { NATIVE_LAUNCH_ADMISSION } from './native-admission-codec.js'
 const admissions = new WeakSet<object>()
 export type NativeAdmittedLaunch = ReturnType<typeof admitNativeOwnerLaunch>
 export function assertNativeAdmittedLaunch(value: NativeAdmittedLaunch): void {
@@ -21,23 +22,17 @@ export function assertNativeAdmittedLaunch(value: NativeAdmittedLaunch): void {
 
 /** Data verifier only. It cannot mint NativeAdmittedLaunch or select roots. */
 export function verifyNativeLaunchAdmissionSignature(phase: SelectedLaunchPhase, launcherPublicKey: string) {
-  const envelope = recordV2(phase.nativeAdmission, 'statement,signatureBase64url')
-  const s = recordV2(envelope.statement, 'format,launchSha256,sealedSha256,controllerDescriptor,controllerTrustAnchor,activation,scenario')
   const launch = freezeSelectionV2(phase.launch)
-  requireV2(s.format === NATIVE_LAUNCH_ADMISSION && s.launchSha256 === hashV2(canonicalV2(launch)) &&
-    s.sealedSha256 === hashV2(canonicalV2(phase.sealed)), 'native_launch_statement')
-  requireV2(typeof envelope.signatureBase64url === 'string' && /^[A-Za-z0-9_-]{86}$/.test(envelope.signatureBase64url), 'native_launch_signature')
-  const signature = Buffer.from(envelope.signatureBase64url, 'base64url')
-  requireV2(signature.length === 64 && signature.toString('base64url') === envelope.signatureBase64url, 'native_launch_signature')
-  const key = createPublicKey({ format: 'jwk', key: { kty: 'OKP', crv: 'Ed25519', x: launcherPublicKey } })
-  requireV2(verify(null, Buffer.from(`${NATIVE_LAUNCH_ADMISSION}\0${canonicalV2(s)}`), key, signature), 'native_launch_signature')
-  return { statement: s, launch }
+  const { statement } = verifyNativeLaunchAdmission(phase.nativeAdmission, launcherPublicKey, launch, phase.sealed)
+  return { statement, launch }
 }
 
 /** Authenticates the actual FD5 selection with the independently installed
  * existing launcher release root, then checks the existing control/recipe chain.
  * The signed statement can select public Product pins, never its own root key. */
 export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
+  const deadline = selectedLaunchBootstrapDeadline(phase)
+  beforeDeadlineV2(deadline)
   const trust = retainNativeDeploymentTrust()
   const roots: { path: string; fd: number; stat: ReturnType<typeof fstatSync> }[] = []
   let closed = false
@@ -49,18 +44,20 @@ export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
   }
   try {
     const { statement: s, launch } = verifyNativeLaunchAdmissionSignature(phase, trust.pin.launcherPublicKey)
-    const key = createPublicKey({format:'jwk',key:{kty:'OKP',crv:'Ed25519',x:trust.pin.launcherPublicKey}})
+    beforeDeadlineV2(deadline)
     requireV2(trust.pin.artifactDigest === launch.expectedHost.activation.ownerArtifactDigest &&
       trust.pin.artifactDigest === `sha256:${launch.ownerExecutable.sha256}`, 'native_launch_release_image')
-    const scenario = recordV2(s.scenario, 'row,routeId')
-    requireV2(MATRIX_ROWS.includes(scenario.row as MatrixRow) && typeof scenario.routeId === 'string' &&
-      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(scenario.routeId), 'native_launch_scenario')
-    const activation = recordV2(s.activation, 'publicKeySpkiDerBase64url,contractDigest')
-    requireV2(typeof activation.publicKeySpkiDerBase64url === 'string' && typeof activation.contractDigest === 'string', 'native_launch_activation')
+    requireV2(s.generation.generation === launch.expectedHost.activation.ownerGeneration &&
+      s.generation.ownerSessionId === launch.expectedHost.activation.ownerSessionId &&
+      `sha256:${s.generation.admissionDocumentSha256}` === launch.expectedHost.activation.admissionDocumentDigest,
+    'native_launch_generation')
+    const predecessor = s.generation.generation === 4 ? requireNativePredecessorObservation() : undefined
+    verifyNativePredecessorObservation(s, predecessor)
+    beforeDeadlineV2(deadline)
+    const activation = s.activation
     const activationPins = createHostedApprovalActivationV2ProductionPins({
-      publicKeySpkiDerBase64url: activation.publicKeySpkiDerBase64url, contractDigest: activation.contractDigest })
-    requireV2(!Buffer.from(activationPins.publicKeySpkiDer).equals(Buffer.from(key.export({type:'spki',format:'der'}))), 'native_launch_distinct_keys')
-    const descriptor = parseIntegrationDescriptor(Buffer.from(canonicalV2(s.controllerDescriptor)))
+      publicKeySpkiDerBase64url: activation.publicKeySpkiDerBase64url, contractDigest: `sha256:${activation.contractDigest}` })
+    const descriptor = parseIntegrationDescriptor(Buffer.from(s.controllerDescriptor, 'utf8'))
     const policy = parseControllerTrustAnchor(s.controllerTrustAnchor)
     const root = (path: string) => {
       const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
@@ -97,12 +94,14 @@ export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
             linked.ino === root.stat.ino && retained.dev === root.stat.dev && retained.ino === root.stat.ino,
           'native_launch_root_changed')
         }
-        verifyPublic(); return trust.isCurrent()
+        verifyPublic(); verifyNativePredecessorObservation(s, predecessor); return trust.isCurrent()
       } catch { return false }
     }
     requireV2(isCurrent(), 'native_launch_currentness')
+    beforeDeadlineV2(deadline)
     const admitted = Object.freeze({ launch, activationPins,
-      scenario: immutableV2({ row: scenario.row as MatrixRow, routeId: scenario.routeId }),
+      allocation: s.allocation, allocationSha256: s.allocationSha256, generation: s.generation,
+      predecessorResults: s.predecessorResults,
       releasePinDigest: trust.releasePinDigest, launcherKeyId: trust.pin.launcherKeyId,
       proofKeyId: trust.proofKeyId, isCurrent, close })
     admissions.add(admitted)
