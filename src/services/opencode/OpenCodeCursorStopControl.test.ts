@@ -2,7 +2,10 @@ import { afterEach, expect, test } from 'bun:test'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { stopCursorSessionWithNativeCleanup } from './OpenCodeCursorStopControl.js'
+import {
+  shouldUseManagedCursorStop,
+  stopCursorSessionWithNativeCleanup,
+} from './OpenCodeCursorStopControl.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true }))) })
@@ -82,4 +85,23 @@ test('transport failure still waits for owned processes, then remains an error',
     }),
   })).rejects.toThrow('OpenCode cancellation failed')
   expect(events).toEqual(['begin', 'abort', 'wait'])
+})
+
+test('managed Stop is chosen only for Cursor profiles that published the control', () => {
+  const staged = {
+    AGENT_TEAMS_CURSOR_CONTROL_DIR: '/tmp/profile/cursor-control',
+    AGENT_TEAMS_CURSOR_PROFILE_SCOPE: 'scope-token',
+  }
+  const decide = (providerId: string, env: Record<string, string>) =>
+    shouldUseManagedCursorStop({ providerId, profile: { env } as never })
+
+  expect(decide('cursor-acp', staged)).toBe(true)
+  // A release build stages nothing, so Stop must stay on the transport abort
+  // instead of failing on a control descriptor that was never written.
+  expect(decide('cursor-acp', {})).toBe(false)
+  expect(decide('cursor-acp', { AGENT_TEAMS_CURSOR_CONTROL_DIR: staged.AGENT_TEAMS_CURSOR_CONTROL_DIR })).toBe(false)
+  expect(decide('cursor-acp', { ...staged, AGENT_TEAMS_CURSOR_PROFILE_SCOPE: '   ' })).toBe(false)
+  // Other providers never take this path, staged or not.
+  expect(decide('kiro', staged)).toBe(false)
+  expect(decide('openai', staged)).toBe(false)
 })

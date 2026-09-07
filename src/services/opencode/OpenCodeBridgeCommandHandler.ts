@@ -43,6 +43,7 @@ import {
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
 import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
@@ -2524,12 +2525,21 @@ async function runReadiness(
   if (qualifiedSelectedModel
     && (qualifiedSelectedModel.providerId === 'kiro'
       || qualifiedSelectedModel.providerId === 'cursor-acp')) {
-    return {
-      snapshot: null,
-      data: unsupportedExtensionBoundReadinessData(
-        qualifiedSelectedModel.raw,
-        qualifiedSelectedModel.providerId,
-      ),
+    // Cursor launches only once the staged managed assets verify, because those
+    // carry the ownership barrier and the Stop control that make a terminal Stop
+    // provable. Without them, and for Kiro, the guard stays closed.
+    const managedCursorReady = qualifiedSelectedModel.providerId === 'cursor-acp'
+      && await resolveOpenCodeCursorManagedAssets()
+        .then(result => result.available)
+        .catch(() => false)
+    if (!managedCursorReady) {
+      return {
+        snapshot: null,
+        data: unsupportedExtensionBoundReadinessData(
+          qualifiedSelectedModel.raw,
+          qualifiedSelectedModel.providerId,
+        ),
+      }
     }
   }
   const runProvisioningPhase = async (

@@ -15,6 +15,8 @@ export type OpenCodeCursorManagedAssets = {
   /** Directory holding the supervisor, preload, sweep and compiled gate. */
   nativeAssetsPath: string
   supervisorPath: string
+  /** The plugin's MCP CLI, which the agent shell needs to reach MCP servers. */
+  mcpToolPath: string
   /** Absolute interpreter the bridge uses to run the supervisor. */
   interpreterPath: string
   /** Identity of exactly what was staged, for readiness binding and drift checks. */
@@ -80,7 +82,9 @@ async function verifyStagedPlugin(root: string): Promise<string> {
   const manifestBytes = await readPrivateFile(path.join(root, 'manifest.json'), 64 * 1024)
   const manifest = JSON.parse(Buffer.from(manifestBytes).toString('utf8')) as Record<string, unknown>
   if (manifest.schema !== 1 || typeof manifest.entrypoint !== 'string'
-    || typeof manifest.artifactSha256 !== 'string' || manifest.backend !== 'cursor-agent') {
+    || typeof manifest.artifactSha256 !== 'string' || manifest.backend !== 'cursor-agent'
+    || typeof manifest.mcpToolEntrypoint !== 'string'
+    || typeof manifest.mcpToolSha256 !== 'string') {
     throw new Error('Cursor managed plugin manifest is not the reviewed shape')
   }
   const entrypoint = path.join(root, manifest.entrypoint)
@@ -90,6 +94,11 @@ async function verifyStagedPlugin(root: string): Promise<string> {
   const artifact = await readPrivateFile(entrypoint, 32 * 1024 * 1024)
   if (digest(artifact) !== manifest.artifactSha256) {
     throw new Error('Cursor managed plugin artifact does not match its manifest')
+  }
+  const mcpTool = await readPrivateFile(
+    path.join(root, manifest.mcpToolEntrypoint as string), 32 * 1024 * 1024)
+  if (digest(mcpTool) !== manifest.mcpToolSha256) {
+    throw new Error('Cursor managed MCP CLI does not match its manifest')
   }
   return digest(manifestBytes)
 }
@@ -147,11 +156,14 @@ export async function resolveOpenCodeCursorManagedAssets(input: {
   }
   const interpreterPath = await resolveCursorManagedInterpreter(input.env ?? process.env)
   if (!interpreterPath) return { available: false, reason: 'no_interpreter' }
-  const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'manifest.json'), 'utf8')) as { entrypoint: string }
+  const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'manifest.json'), 'utf8')) as {
+    entrypoint: string; mcpToolEntrypoint: string
+  }
   return {
     available: true,
     assets: {
       pluginEntryPath: path.join(pluginRoot, manifest.entrypoint),
+      mcpToolPath: path.join(pluginRoot, manifest.mcpToolEntrypoint),
       nativeAssetsPath: nativeRoot,
       supervisorPath: path.join(nativeRoot, 'supervisor.mjs'),
       interpreterPath,

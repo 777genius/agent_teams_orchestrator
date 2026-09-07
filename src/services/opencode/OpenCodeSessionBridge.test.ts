@@ -4074,4 +4074,5 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.staleReason).toBe('managed_auth_changed')
     expect(result.summary.streamConnected).toBe(false)
   })
+
 })

@@ -3,7 +3,10 @@ import { createHash } from 'node:crypto'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
-import { stopCursorSessionWithNativeCleanup } from './OpenCodeCursorStopControl.js'
+import {
+  shouldUseManagedCursorStop,
+  stopCursorSessionWithNativeCleanup,
+} from './OpenCodeCursorStopControl.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
@@ -1761,7 +1764,10 @@ export class OpenCodeSessionBridge {
   ): Promise<boolean> {
     return this.withSessionHost(record, async ({ baseUrl, profile, runtimePid }) => {
       const client = this.clientFactory.create(baseUrl, options)
-      if (parseProviderScopedModel(record.selectedModel).providerID === 'cursor-acp') {
+      if (shouldUseManagedCursorStop({
+        providerId: parseProviderScopedModel(record.selectedModel).providerID,
+        profile,
+      })) {
         return stopCursorSessionWithNativeCleanup({
           profile, runtimePid, sessionId: record.opencodeSessionId, options,
           abortTransport: () => client.abortSession(record.opencodeSessionId),

@@ -55,6 +55,26 @@ export const probeCursorAccountIdentity: CursorAccountProbe = async (
 })
 
 /**
+ * Cursor authentication lives in the native CLI, not in an OpenCode credential,
+ * so the only honest proof that a launch is authorized is a live account probe.
+ */
+export async function isCursorNativeAccountAuthorized(input: {
+  env?: NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+  probe?: CursorAccountProbe
+  abortSignal?: AbortSignal
+} = {}): Promise<boolean> {
+  const env = input.env ?? process.env
+  const configured = env.CURSOR_AGENT_EXECUTABLE?.trim()
+  const executable = configured || Bun.which('cursor-agent')
+  if (!executable) return false
+  const account = await (input.probe ?? probeCursorAccountIdentity)(
+    executable, input.platform ?? process.platform, input.abortSignal,
+  ).catch(() => null)
+  return account !== null
+}
+
+/**
  * A stale record is not a signed-out one: only an actual probe may conclude that.
  * A changed account or executable invalidates readiness immediately, because the
  * agent would otherwise keep running under an identity the app no longer believes.

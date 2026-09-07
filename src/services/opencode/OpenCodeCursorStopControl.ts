@@ -52,6 +52,20 @@ async function readDescriptor(profile: ControlProfile, pid: number): Promise<Des
   }
 }
 
+/**
+ * Only a profile that published the managed control can prove its own cleanup.
+ * Deciding on the provider alone turns Stop into a hard failure on every host
+ * without staged assets, which is every release build today.
+ */
+export function shouldUseManagedCursorStop(input: {
+  providerId: string
+  profile: ControlProfile
+}): boolean {
+  return input.providerId === 'cursor-acp'
+    && Boolean(input.profile.env.AGENT_TEAMS_CURSOR_CONTROL_DIR?.trim())
+    && Boolean(input.profile.env.AGENT_TEAMS_CURSOR_PROFILE_SCOPE?.trim())
+}
+
 /** Terminal team Stop only. Normal transport cancellation must not seal a session. */
 export async function stopCursorSessionWithNativeCleanup(input: {
   profile: ControlProfile

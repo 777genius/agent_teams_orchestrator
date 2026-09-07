@@ -164,30 +164,39 @@ export class OpenCodeProvisioningProbe {
       const prepared = inventory.profile
       const preparedScope = prepared?.profileScope
       const authIdentity = prepared?.selectedSourceAuthIdentity
-      if (
-        !prepared
-        || !preparedScope
-        || inventory.projectPath !== prepared.canonicalProjectPath
-        || prepared.projectPath !== prepared.canonicalProjectPath
-        || prepared.scopeToken !== profileScope.scopeToken
-        || preparedScope.scopeToken !== profileScope.scopeToken
-        || preparedScope.purpose !== 'launch_runtime'
-        || preparedScope.providerId !== selectedModel!.providerId
-        || preparedScope.configFingerprint !== profileScope.configFingerprint
-        || preparedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
-        || !prepared.managedConfig
-        || Array.isArray(prepared.managedConfig)
-        || buildManagedConfigFingerprint(prepared.managedConfig, prepared.env)
-          !== prepared.managedConfigFingerprint
-        || authIdentity === undefined
-        || authIdentity === 'error'
-        || prepared.selectedManagedAuthIdentity === undefined
-        || prepared.selectedManagedAuthIdentity === 'error'
-        || authIdentity !== prepared.selectedManagedAuthIdentity
-        || authIdentity !== profileScope.selectedAuthIdentity
-        || prepared.authState !== 'ok'
-      ) {
-        throw new Error('OpenCode strict launch profile scope evidence is invalid')
+      // Naming the failing check turns an opaque launch refusal into something
+      // a user or a bug report can act on. No identity value is disclosed.
+      const evidenceFailures = !prepared || !preparedScope
+        ? ['prepared_profile_missing']
+        : Object.entries({
+          project_path_mismatch: inventory.projectPath !== prepared.canonicalProjectPath,
+          project_path_not_canonical: prepared.projectPath !== prepared.canonicalProjectPath,
+          scope_token_mismatch: prepared.scopeToken !== profileScope.scopeToken
+            || preparedScope.scopeToken !== profileScope.scopeToken,
+          scope_purpose_mismatch: preparedScope.purpose !== 'launch_runtime',
+          scope_provider_mismatch: preparedScope.providerId !== selectedModel!.providerId,
+          config_fingerprint_mismatch:
+            preparedScope.configFingerprint !== profileScope.configFingerprint,
+          scope_auth_identity_mismatch:
+            preparedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity,
+          managed_config_missing: !prepared.managedConfig || Array.isArray(prepared.managedConfig),
+          managed_config_fingerprint_mismatch: Boolean(prepared.managedConfig)
+            && !Array.isArray(prepared.managedConfig)
+            && buildManagedConfigFingerprint(prepared.managedConfig, prepared.env)
+              !== prepared.managedConfigFingerprint,
+          source_auth_identity_unavailable:
+            authIdentity === undefined || authIdentity === 'error',
+          managed_auth_identity_unavailable:
+            prepared.selectedManagedAuthIdentity === undefined
+            || prepared.selectedManagedAuthIdentity === 'error',
+          auth_identity_mismatch: authIdentity !== prepared.selectedManagedAuthIdentity
+            || authIdentity !== profileScope.selectedAuthIdentity,
+          auth_state_not_ok: prepared.authState !== 'ok',
+        }).filter(([, failed]) => failed).map(([name]) => name)
+      if (evidenceFailures.length > 0) {
+        throw new Error(
+          `OpenCode strict launch profile scope evidence is invalid: ${evidenceFailures.join(', ')}`,
+        )
       }
     }
     const cacheKey = [

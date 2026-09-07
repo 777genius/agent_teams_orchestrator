@@ -71,6 +71,7 @@ import {
 } from './OpenCodeCursorManagedPort.js'
 import {
   buildCursorReadinessFingerprint,
+  isCursorNativeAccountAuthorized,
   reconcileCursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
@@ -1312,6 +1313,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
   cursorManagedAssets: OpenCodeCursorManagedAssets | null = null,
+  managedConfigPath: string | null = null,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
   const hostHomePath = (
     platform === 'win32'
@@ -1331,6 +1333,20 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     buildCursorAgentResourceExhaustedPreloadScript(),
     { encoding: 'utf8', mode: 0o600 },
   )
+
+  // The plugin registers OpenCode MCP servers as tools, but an agent can only
+  // reach them through the plugin's own mcptool CLI. A global npm install would
+  // provide it; a bundled artifact does not, so the profile ships its own shim.
+  if (cursorManagedAssets && platform !== 'win32') {
+    const shimPath = path.join(binPath, 'mcptool')
+    await writeFile(shimPath, [
+      '#!/bin/sh',
+      `exec ${quotePosixShellValue(cursorManagedAssets.interpreterPath)}`
+        + ` ${quotePosixShellValue(cursorManagedAssets.mcpToolPath)} "$@"`,
+      '',
+    ].join('\n'), 'utf8')
+    await chmod(shimPath, 0o700)
+  }
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
     const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
@@ -1364,7 +1380,17 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `export HOME=${quotePosixShellValue(hostHomePath)}`,
       `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
       'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
-      `export PATH=${quotePosixShellValue(hostPath)}`,
+      command === 'cursor-agent' && cursorManagedAssets
+        // mcptool lives here, and the agent shell is where it gets called. The
+        // profile bins go last: this directory also holds a wrapper named
+        // cursor-agent, and putting it first makes the wrapper exec itself.
+        ? `export PATH=${quotePosixShellValue(`${hostPath}${path.delimiter}${binPath}`)}`
+        : `export PATH=${quotePosixShellValue(hostPath)}`,
+      ...(command === 'cursor-agent' && managedConfigPath
+        // The bridge clears XDG_*, so mcptool needs the config named outright or
+        // it would resolve the user's own OpenCode config instead of this profile.
+        ? [`export OPENCODE_CONFIG=${quotePosixShellValue(managedConfigPath)}`]
+        : []),
       ...(command === 'cursor-agent'
           ? [
             `if [ "\${${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}:-}" != "1" ]; then`,
@@ -2024,9 +2050,16 @@ export async function resolveOpenCodeProfileScope(input: {
   }
   if (isStrictAuthorityPurpose(input.purpose)
     && (providerId === 'kiro' || providerId === 'cursor-acp')) {
-    throw new Error(
-      `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`,
-    )
+    // Cursor is admitted only once the staged managed assets verify: they carry
+    // the ownership barrier and the Stop control that make a terminal Stop
+    // provable. Unstaged Cursor, and Kiro, stay blocked.
+    const managedCursorReady = providerId === 'cursor-acp'
+      && (await resolveManagedCursorAssets(env)) !== null
+    if (!managedCursorReady) {
+      throw new Error(
+        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`,
+      )
+    }
   }
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
@@ -2081,11 +2114,19 @@ export async function resolveOpenCodeProfileScope(input: {
         providerConfig: selectedProviderConfig,
       })
     : null
+  // The Cursor marker credential is deliberately not proof. A live native account
+  // probe is, and it is only consulted when the managed assets verify.
+  const cursorNativeAuthorized = isStrictAuthorityPurpose(input.purpose)
+    && providerId === 'cursor-acp'
+    && !selectedAuthIsCredential
+    && (await resolveManagedCursorAssets(env)) !== null
+    && await isCursorNativeAccountAuthorized({ env })
   if (
     isStrictAuthorityPurpose(input.purpose)
     && !selectedAuthIsCredential
     && !authoritySources.hasStaticCredential
     && authlessAuthorityMode === null
+    && !cursorNativeAuthorized
   ) {
     throw new Error('OpenCode strict profile requires explicit selected authentication')
   }
@@ -2685,11 +2726,26 @@ export class OpenCodeProfileManager {
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
       enterStep('repair plugin caches and native bridge')
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
+      // The plugin's MCP bridge reads servers from a config file, not from
+      // OPENCODE_CONFIG_CONTENT. Without this file it discovers nothing and the
+      // agent has no Agent Teams tools at all.
+      const managedConfigPath = cursorManagedAssets
+        ? path.join(xdgConfigHome, 'opencode', 'opencode.json')
+        : null
+      if (managedConfigPath) {
+        await mkdir(path.dirname(managedConfigPath), { recursive: true })
+        await writeFile(
+          managedConfigPath,
+          `${JSON.stringify(managedConfig, null, 2)}\n`,
+          { encoding: 'utf8', mode: 0o600 },
+        )
+      }
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
         profileRootPath,
         runtimeEnv,
         process.platform,
         cursorManagedAssets,
+        managedConfigPath,
       )
     }
     enterStep('coordinate shared node_modules')

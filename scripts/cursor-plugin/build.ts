@@ -29,18 +29,35 @@ export async function buildCursorPluginArtifact(outputDirectory: string): Promis
       })
       if (result.exitCode !== 0) throw new Error('Reviewed Cursor cancellation patch did not apply')
     }
-    const result = await Bun.build({
-      entrypoints: [path.join(staging, 'src/plugin-entry.ts')],
-      target: 'bun', format: 'esm', minify: true, splitting: false,
-      external: ['@cursor/sdk'],
-    })
-    if (!result.success || result.outputs.length !== 1) {
-      throw new AggregateError(result.logs, 'Cursor plugin artifact build failed')
+    const build = async (entry: string, target: 'bun' | 'node' = 'bun') => {
+      const result = await Bun.build({
+        entrypoints: [path.join(staging, entry)],
+        target, format: 'esm', minify: true, splitting: false,
+        external: ['@cursor/sdk'],
+      })
+      if (!result.success || result.outputs.length !== 1) {
+        throw new AggregateError(result.logs, `Cursor artifact build failed: ${entry}`)
+      }
+      return new Uint8Array(await result.outputs[0]!.arrayBuffer())
     }
-    const artifact = new Uint8Array(await result.outputs[0]!.arrayBuffer())
+    const artifact = await build('src/plugin-entry.ts')
+    // The plugin's own MCP CLI is how an agent reaches OpenCode MCP servers.
+    // Without it on the agent's PATH the bridge registers tools nobody can call.
+    // The CLI loads the MCP SDK through a dynamic import, which a standalone
+    // bundle cannot resolve at runtime, so pull it into the module graph first.
+    await writeFile(path.join(staging, 'src/agent-teams-mcptool-entry.ts'), [
+      "import '@modelcontextprotocol/sdk/client/index.js'",
+      "import '@modelcontextprotocol/sdk/client/stdio.js'",
+      "import './cli/mcptool.js'",
+      '',
+    ].join('\n'))
+    // The CLI runs standalone from the agent shell, where node is far more
+    // likely to exist than bun, so it is built for node rather than the runtime.
+    const mcpToolArtifact = await build('src/agent-teams-mcptool-entry.ts', 'node')
     const destination = path.resolve(outputDirectory)
-    await mkdir(path.join(destination, 'dist'), { recursive: true })
+    await mkdir(path.join(destination, 'dist/cli'), { recursive: true })
     await writeFile(path.join(destination, 'dist/plugin-entry.js'), artifact)
+    await writeFile(path.join(destination, 'dist/cli/mcptool.js'), mcpToolArtifact)
     // Native backend does not use SDK fallback. Keep upstream runner locations valid.
     await cp(path.join(packageRoot, 'scripts'), path.join(destination, 'scripts'), { recursive: true })
     await writeFile(path.join(destination, 'package.json'), JSON.stringify({
@@ -54,6 +71,7 @@ export async function buildCursorPluginArtifact(outputDirectory: string): Promis
       lockSha256: sha256(await readFile(path.join(root, 'bun.lock'))),
       artifactSha256: sha256(artifact), bunVersion: Bun.version,
       entrypoint: 'dist/plugin-entry.js', backend: 'cursor-agent',
+      mcpToolEntrypoint: 'dist/cli/mcptool.js', mcpToolSha256: sha256(mcpToolArtifact),
     }
     await writeFile(path.join(destination, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
     return path.join(destination, manifest.entrypoint)
