@@ -1,56 +1,69 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createPrivateKey, sign } from 'node:crypto'
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { processV2, type OwnerV2LaunchSelection } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
 import { canonicalV2, hashV2, OWNER_V2_ROLES } from '../../../src/services/hostedControl/HostedControlBootstrapV2Wire.js'
 import { createHostedApprovalActivationV2Proof } from '../../../src/services/hostedControl/HostedApprovalRuntimeActivation.js'
 import { HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256 } from '../../../src/services/hostedControl/HostedApprovalOwnerProvenance.js'
 import { activationGolden, assembleFixtureV2, fixtureHeaderV2 } from '../../../src/services/hostedControl/fixtures/bootstrapV2Producer.js'
+import { OwnedKernelChild, KernelChannel as Channel } from './kernel-fixture-ownership.js'
 
 let directory: string, image: string, imageSha: string, peer: ChildProcessWithoutNullStreams
+const owned = new Set<OwnedKernelChild>()
+let failed = false
+const own = (child: ChildProcessWithoutNullStreams, group = false) => {
+  const owner = new OwnedKernelChild(child, group); owned.add(owner); return owner
+}
 const childModule = fileURLToPath(new URL('./fixtures/bootstrap-v2-child.ts', import.meta.url))
 const python = fileURLToPath(new URL('./fixtures/bootstrap-v2-kernel.py', import.meta.url))
 beforeAll(() => {
   if (process.platform !== 'linux') return
+  try {
   directory = mkdtempSync(join(tmpdir(), 'owner-v2-kernel-')); image = join(directory, 'bun')
   copyFileSync(process.execPath, image); chmodSync(image, 0o500); imageSha = hashV2(readFileSync(image))
   // Process identity fixture only: no HTTP server or simulated provider.
-  peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'pipe' })
+  peer = own(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'pipe' })).child
+  } catch (error) { failed = true; throw error }
 })
 afterAll(async () => {
-  if (peer && peer.exitCode === null) { const exited = new Promise<void>(r => peer.once('exit', () => r())); peer.kill(); await exited }
-  if (directory) rmSync(directory, { recursive: true, force: true })
-})
-const linuxTest = test.skipIf(process.platform !== 'linux')
-class Channel {
-  private queue: any[] = []
-  private waiting?: (value: any) => void
-  constructor(readonly child: ChildProcessWithoutNullStreams) {
-    createInterface({ input: child.stdout }).on('line', line => {
-      const value = JSON.parse(line)
-      if (this.waiting) { const accept = this.waiting; this.waiting = undefined; accept(value) } else this.queue.push(value)
-    })
-  }
-  send(value: unknown) { this.child.stdin.write(JSON.stringify(value) + '\n') }
-  async next() {
-    if (this.queue.length) return this.queue.shift()
-    let timer: ReturnType<typeof setTimeout>
-    return new Promise<any>((resolve, reject) => {
-      timer = setTimeout(() => { this.waiting = undefined; reject(new Error('kernel fixture observation timeout')) }, 12000)
-      this.waiting = v => { clearTimeout(timer); resolve(v) }
-    })
+  const stopped = await Promise.allSettled([...owned].map(child => child.stop(0)))
+  failed ||= stopped.some(result => result.status === 'rejected')
+  try {
+    if (directory && !failed) {
+      // This is a newly created task-only sandbox. PATH resolves the mandatory
+      // host Git/Docker/liveness guard; a refusal retains the entire directory.
+      if (!existsSync('/usr/local/bin/rm')) throw new Error('Mandatory cleanup guard is unavailable')
+      const cleanup = new OwnedKernelChild(spawn('rm', ['-r', '--', directory], {
+        env: { PATH: '/usr/local/bin:/usr/bin:/bin' }, stdio: 'pipe',
+      }))
+      try {
+        if (!await cleanup.wait(5000) || cleanup.child.exitCode !== 0) throw new Error('Guarded cleanup failed: ' + cleanup.stderr)
+      } finally { await cleanup.stop(0) }
+    }
+    const error = stopped.find(result => result.status === 'rejected')
+    if (error?.status === 'rejected') throw error.reason
+  } catch (error) { failed = true; throw error }
+  finally { if (failed && directory) console.error('Retained kernel diagnostics: ' + directory) }
+}, 10000)
+const linuxTest = (name: string, run: () => Promise<void>, timeout = 20000) =>
+  test.skipIf(process.platform !== 'linux')(name, async () => {
+    try { await run() } catch (error) { failed = true; throw error }
+  }, timeout)
+async function saveAndStop(owner: OwnedKernelChild, root: string): Promise<void> {
+  try { await owner.stop() } finally {
+    writeFileSync(join(root, 'helper-stderr.log'), owner.stderr)
   }
 }
 async function fixture(scenario = 'valid', mutate?: (header: any, selection: any) => void) {
   const root = mkdtempSync(join(directory, 'case-')), selected = join(root, 'selection.json'), result = join(root, 'result.json')
-  const helper = spawn('/usr/bin/python3', [python, image, childModule, selected, result, scenario], { stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } })
-  let stderr = ''; helper.stderr.on('data', chunk => { stderr += String(chunk) })
-  const exited = new Promise<void>(resolve => helper.once('exit', () => resolve()))
+  const helper = own(spawn('/usr/bin/python3', [python, image, childModule, selected, result, scenario], {
+    stdio: 'pipe', detached: true, env: { PATH: '/usr/bin:/bin' },
+  }), true)
+  try {
   const channel = new Channel(helper), first = await channel.next()
   expect(first.type).toBe('held'); const held = first.held
   const h = fixtureHeaderV2(), self = processV2(process.pid), host = processV2(peer.pid!)
@@ -102,17 +115,30 @@ async function fixture(scenario = 'valid', mutate?: (header: any, selection: any
   selection.executed = { ...exec.executed, executableSha256: imageSha }
   writeFileSync(selected, JSON.stringify(selection), { mode: 0o600 }); channel.send({ release: true })
   const until = performance.now() + 10000
-  while (!existsSync(result) && performance.now() < until && helper.exitCode === null) await new Promise(r => setTimeout(r, 5))
-  if (!existsSync(result)) { helper.stdin.end(); await exited; throw new Error('kernel fixture has no result: ' + stderr) }
+  while (!existsSync(result) && performance.now() < until && helper.alive) await new Promise(r => setTimeout(r, 5))
+  if (!existsSync(result)) throw new Error('kernel fixture has no result: ' + helper.stderr)
   const report = JSON.parse(readFileSync(result, 'utf8'))
   return { root, result, report, header: h, channel, globalAdmission, selection: selection as OwnerV2LaunchSelection,
     async waitForActivationClose() {
       let timer: ReturnType<typeof setTimeout> | undefined
-      try { await Promise.race([exited, new Promise<never>((_, reject) => {
+      const observed = async () => {
+        for (;;) {
+          const event = await channel.next()
+          if (event.type === 'activation_closed') return
+          if (event.type !== 'delivered') throw new Error('Unexpected bytes before activation close')
+        }
+      }
+      try { await Promise.race([observed(), new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('inherited activation was not revoked')), 8000)
       })]) } finally { clearTimeout(timer) }
     },
-    async close() { helper.stdin.end(); await exited } }
+    async close() { await saveAndStop(helper, root) } }
+  } catch (error) {
+    try { await saveAndStop(helper, root) } catch (cleanup) {
+      throw new AggregateError([error, cleanup], 'Kernel fixture setup and cleanup failed; retained at ' + root)
+    }
+    throw error
+  }
 }
 function proof(value: any, direction: 'owner-ready-request' | 'admission') {
   const controllerProof = createHostedApprovalActivationV2Proof(Buffer.alloc(32, 42), direction, JSON.stringify(value))
@@ -137,12 +163,33 @@ async function activationLine(channel: Channel): Promise<any> {
   let bytes = ''
   for (;;) {
     const event = await channel.next()
-    if (event.type !== 'activation') continue
+    if (event.type === 'delivered') continue
+    if (event.type !== 'activation') throw new Error('Activation closed before its expected frame')
     bytes += Buffer.from(event.bytes, 'base64').toString('utf8')
+    if (Buffer.byteLength(bytes) > 65536) throw new Error('Activation response overflow')
     if (bytes.endsWith('\n')) return JSON.parse(bytes)
   }
 }
 describe('actual inherited Linux bootstrap-v2 descriptors', () => {
+  linuxTest('early setup failure reaps the immediately registered held child and helper', async () => {
+    let childPid = 0
+    const before = new Set(owned)
+    await expect(fixture('valid', h => {
+      childPid = h.supervisorBinding.ownerPid; throw new Error('injected setup failure')
+    })).rejects.toThrow('injected setup failure')
+    expect(childPid).toBeGreaterThan(0); expect(existsSync(`/proc/${childPid}`)).toBe(false)
+    expect([...owned].filter(child => !before.has(child)).every(child => !child.alive)).toBe(true)
+  })
+  linuxTest('observation rejects terminal helpers and already signalled peer teardown is bounded', async () => {
+    const owner = own(spawn('/usr/bin/python3', ['-c', 'import os,signal; os.kill(os.getpid(),signal.SIGTERM)'], { stdio: 'pipe' }))
+    const channel = new Channel(owner)
+    try {
+      await expect(channel.next()).rejects.toThrow()
+      expect(await owner.wait(1000)).toBe(true)
+      expect(owner.child.signalCode).toBe('SIGTERM'); expect(owner.child.exitCode).toBeNull()
+      await owner.stop(); await owner.stop()
+    } finally { await owner.stop(0) }
+  })
   linuxTest('partial simultaneous streams reach EOF, close one-use/anchor, retain role FD9', async () => {
     const f = await fixture('large')
     try {
@@ -173,6 +220,7 @@ describe('actual inherited Linux bootstrap-v2 descriptors', () => {
     const f = await fixture('activation')
     try {
       expect(f.report.ok).toBe(true); expect(f.report.repeatedRejected).toBe(true)
+      expect(f.report.repeatedAttachmentRejected).toBe(true)
       const frames = activationFrames(f)
       f.channel.send({ activation: Buffer.from(frames.prepare).toString('base64') })
       expect((await activationLine(f.channel)).kind).toBe('owner_ready')

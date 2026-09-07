@@ -49,7 +49,10 @@ try {
     let repeatedRejected = false
     // Repeated take rejects without destroying the first admitted connection.
     try { admitted.activation.take() } catch { repeatedRejected = true }
-    writeFileSync(resultPath, JSON.stringify({ ok: true, oneUseClosed, ownerBinding: server.ownerBinding, repeatedRejected }))
+    let repeatedAttachmentRejected = false
+    try { server.attachInheritedActivationV2(admitted.activation) } catch { repeatedAttachmentRejected = true }
+    writeFileSync(resultPath, JSON.stringify({ ok: true, oneUseClosed, ownerBinding: server.ownerBinding,
+      repeatedRejected, repeatedAttachmentRejected }))
   }
   await bootstrap.guard.lost
 } catch (error) {

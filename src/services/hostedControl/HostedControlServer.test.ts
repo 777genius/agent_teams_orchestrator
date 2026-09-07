@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { chmod, lstat, mkdir, mkdtemp, rename, rm, unlink } from 'node:fs/promises'
-import { connect, createServer, type Socket } from 'node:net'
+import { connect, createServer, Socket } from 'node:net'
+import type { HostedControlConnection } from './HostedControlConnection.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
@@ -724,7 +725,10 @@ describe('HostedControlServer', () => {
     let retainedServerSocket!: Socket
     const errored = await activationServerFixture(false, true, {
       beforeActivationFrameWriteForTest: (phase, socket) => {
-        if (phase === 'ready') retainedServerSocket = socket
+        if (phase === 'ready') {
+          if (!(socket instanceof Socket)) throw new Error('Legacy transport must remain a node:net Socket')
+          retainedServerSocket = socket
+        }
       },
     })
     let errorRevokes = 0
@@ -967,7 +971,7 @@ async function activationServerFixture(
     readDeadlineMs?: number
     activationRecoveryDeadlineMs?: number
     beforeActivationFrameWriteForTest?: (
-      phase: 'owner_ready' | 'ready', socket: Socket,
+      phase: 'owner_ready' | 'ready', socket: HostedControlConnection,
     ) => void | Promise<void>
   } = {},
 ): Promise<{

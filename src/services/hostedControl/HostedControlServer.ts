@@ -13,6 +13,7 @@ import {
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import type { HostedControlInheritedActivationV2 } from './HostedControlInheritedActivationV2.js'
+import type { HostedControlConnection } from './HostedControlConnection.js'
 import { decodeHostedReadinessRequest, HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_READINESS_MAX_LINE_BYTES,
   type HostedReadinessAdmission } from './HostedControlReadiness.js'
 export { decodeHostedReadinessRequest, admitHostedReadiness, HOSTED_READINESS_MAX_LINE_BYTES,
@@ -70,7 +71,7 @@ export type HostedControlServerOptions = {
   beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
   /** Deterministic retained-write seam for activation transport regression tests. */
   beforeActivationFrameWriteForTest?: (
-    phase: 'owner_ready' | 'ready', socket: Socket,
+    phase: 'owner_ready' | 'ready', socket: HostedControlConnection,
   ) => void | Promise<void>
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
   /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
@@ -89,7 +90,7 @@ type ActivationPhase =
   | 'revoked'
 
 type ActivationCandidate = {
-  readonly socket: Socket
+  readonly socket: HostedControlConnection
   readonly generation: number
   phase: ActivationPhase
   session: HostedApprovalActivationTransportSession | null
@@ -107,19 +108,19 @@ export class HostedControlServer {
   #server: Server | null = null
   #broker: ChildProcess | null = null
   #ownsSocket = false
-  readonly #sockets = new Set<Socket>()
+  readonly #sockets = new Set<HostedControlConnection>()
   #ownerBinding: HostedControlOwnerBinding | null = null
   #socketParentIdentity: { device: number; inode: number } | null = null
   #ownedSocketIdentity: { device: number; inode: number } | null = null
   #listenPath: string | null = null
-  #leaseSocket: Socket | null = null
+  #leaseSocket: HostedControlConnection | null = null
   #leaseConsumed = false
   #activationConsumed = false
   #activationGeneration = 0
   #activation: ActivationCandidate | null = null
   #inheritedActivation: HostedControlInheritedActivationV2 | null = null
-  #inheritedSocket: Socket | null = null
-  readonly #mutationLease = new AsyncLocalStorage<Socket>()
+  #inheritedSocket: HostedControlConnection | null = null
+  readonly #mutationLease = new AsyncLocalStorage<HostedControlConnection>()
   readonly #handlers = new Set<Promise<void>>()
   #stopping = false
   #stopPromise: Promise<void> | null = null
@@ -139,6 +140,7 @@ export class HostedControlServer {
   /** Transfers the exact admitted FD5; publication remains the actual socket
    * identity used by the existing activation verifier. No broker or reconnect. */
   attachInheritedActivationV2(resource: HostedControlInheritedActivationV2): void {
+    if (this.#inheritedActivation === resource) throw new Error('Hosted control inherited activation already attached')
     if (!this.#server || !this.#ownerBinding || !this.#options.activationSessionFactory ||
       this.#options.activationTransport !== 'inherited-v2' || this.#inheritedActivation ||
       this.#stopping || !this.#isCurrentSocketIdentitySync()) {
@@ -289,7 +291,7 @@ export class HostedControlServer {
     }
   }
 
-  #handleConnection(socket: Socket, initialData = Buffer.alloc(0)): void {
+  #handleConnection(socket: HostedControlConnection, initialData = Buffer.alloc(0)): void {
     if (this.#stopping || !this.#server) { socket.destroy(); return }
     socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     let chunks: Buffer[] = []
@@ -325,7 +327,7 @@ export class HostedControlServer {
         void this.#revokeActivation(activation, new Error('Hosted approval activation lease closed'))
       }
     })
-    socket.on('data', chunk => {
+    const onData = (chunk: Buffer) => {
       const activation = this.#activation
       if (activation?.socket === socket) {
         this.#handleActivationData(activation, chunk)
@@ -365,11 +367,12 @@ export class HostedControlServer {
         .catch(failClosed)
       this.#handlers.add(handler)
       void handler.finally(() => this.#handlers.delete(handler))
-    })
-    if (initialData.byteLength > 0) socket.emit('data', initialData)
+    }
+    socket.on('data', onData)
+    if (initialData.byteLength > 0) onData(initialData)
   }
 
-  async #beginActivation(socket: Socket, prepareFrame: string): Promise<void> {
+  async #beginActivation(socket: HostedControlConnection, prepareFrame: string): Promise<void> {
     if ((this.#options.activationTransport === 'inherited-v2' && socket !== this.#inheritedSocket) ||
       this.#activationConsumed || this.#activation || this.#stopping ||
       Buffer.byteLength(prepareFrame, 'utf8') > HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES) {
@@ -414,7 +417,7 @@ export class HostedControlServer {
       }
       candidate.phase = 'ready_writing'
       await this.#options.beforeActivationFrameWriteForTest?.('ready', socket)
-      await writeRetainedFrame(socket, ready)
+      await writeRetainedFrame(socket, ready, () => this.#isActivationCurrent(candidate))
       if (!this.#isActivationCurrent(candidate) || candidate.phase !== 'ready_writing') {
         throw new Error('Hosted approval activation became stale while publishing ready')
       }
@@ -489,7 +492,7 @@ export class HostedControlServer {
     candidate.socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     try {
       await this.#options.beforeActivationFrameWriteForTest?.('owner_ready', candidate.socket)
-      await writeRetainedFrame(candidate.socket, ownerReady)
+      await writeRetainedFrame(candidate.socket, ownerReady, () => this.#isActivationCurrent(candidate))
     } catch (error) {
       void this.#revokeActivation(candidate, asError(error))
       throw error
@@ -596,7 +599,7 @@ export class HostedControlServer {
     socket.on('data', onData)
   }
 
-  async #processLine(socket: Socket, line: string): Promise<void> {
+  async #processLine(socket: HostedControlConnection, line: string): Promise<void> {
     if (this.#stopping) { socket.destroy(); return }
     const parsed = JSON.parse(line) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { socket.destroy(); return }
@@ -667,7 +670,7 @@ export class HostedControlServer {
     socket.end(`${JSON.stringify(response)}\n`)
   }
 
-  async #handleReadiness(socket: Socket, line: string, message: Record<string, unknown>): Promise<void> {
+  async #handleReadiness(socket: HostedControlConnection, line: string, message: Record<string, unknown>): Promise<void> {
     if (Buffer.byteLength(line) > HOSTED_READINESS_MAX_LINE_BYTES || this.#leaseConsumed || this.#leaseSocket || !this.#options.dispatchCoexistingOperation) { socket.destroy(); return }
     const ownerBinding = this.#ownerBinding
     if (!ownerBinding) { socket.destroy(); return }
@@ -721,11 +724,14 @@ function isActivationPrepare(line: string): boolean {
   }
 }
 
-function writeRetainedFrame(socket: Socket, frame: string): Promise<void> {
+function writeRetainedFrame(socket: HostedControlConnection, frame: string, isCurrent: () => boolean): Promise<void> {
   if (!frame.endsWith('\n') || frame.slice(0, -1).includes('\n')) {
     return Promise.reject(new Error('Hosted approval activation response is not one frame'))
   }
   return new Promise<void>((resolve, reject) => {
+    // Revalidate synchronously after any retained-write await/seam, before the
+    // first write. The inherited adapter checks the FD again on every send.
+    if (!isCurrent()) { reject(new Error('Hosted approval activation write is stale')); return }
     socket.write(frame, error => error ? reject(error) : resolve())
   })
 }
@@ -757,7 +763,7 @@ function taskResultMatchesRequest(
     result.receipt.sourceGeneration === command.expectedSourceGeneration
 }
 
-function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): void {
+function writeBoundedResponse(socket: HostedControlConnection, value: Record<string, unknown>): void {
   const line = `${JSON.stringify(value)}\n`
   const maximum = isApprovalOperation(value.operation)
     ? HOSTED_CONTROL_MAX_LINE_BYTES
