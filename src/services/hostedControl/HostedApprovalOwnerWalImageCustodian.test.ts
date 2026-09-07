@@ -1,8 +1,8 @@
-import { posixNamespaceLookup } from './PosixNamespaceLookup.internal.js'
+import { PosixNamespaceLookupError, posixNamespaceLookup } from './PosixNamespaceLookup.internal.js'
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync,
-  readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
+  readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
@@ -15,7 +15,7 @@ import {
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, retainedWalImage,
   type BoundOwnerEmission, type OwnerWalImageCustodian,
 } from './HostedApprovalOwnerProvenance.js'
-import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
+import { HostedApprovalOwnerPublicationError, HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
 
@@ -53,6 +53,99 @@ function emission(sequence = 1): BoundOwnerEmission {
 
 // Linux is the admitted actual Owner platform. No test claims a Darwin fallback.
 describe.skipIf(process.platform !== 'linux')('synchronous Owner W2 disk custody', () => {
+  for (const errno of [5, 13]) {
+    test(`late pre-rename fstatat errno ${errno} permanently poisons shared capture`, async () => {
+      const { root, directory, walPath } = fixture()
+      await new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(walPath)).reconcileAdmission(admission('a'))
+      const predecessor = readFileSync(walPath)
+      const identity = statSync(walPath)
+      const c = await openCustodian(directory)
+      const producer = nativeProducer(root, c, [])
+      const nativeBefore = readFileSync(join(root, 'native.ndjson'))
+      let armed = false; let fsyncHits = 0; let lookupHits = 0; let renameHits = 0
+      const original = posixNamespaceLookup.fstatat
+      const lookup = spyOn(posixNamespaceLookup, 'fstatat').mockImplementation((fd, child) => {
+        if (armed && child === 'owner.json') {
+          lookupHits++
+          expect(fsyncHits).toBe(1)
+          return { result: -1, errno }
+        }
+        return original(fd, child)
+      })
+      try {
+        const wal = new HostedApprovalOwnerWal(walPath, {
+          afterWalTempFsync: async () => { fsyncHits++; armed = true },
+          afterWalRename: async () => { renameHits++ },
+        }, producer)
+        const store = new HostedApprovalOwnerStore(wal)
+        let failure: unknown
+        try { await store.reconcileAdmission(admission('b')) } catch (error) { failure = error }
+        expect(failure).toBeInstanceOf(HostedApprovalOwnerPublicationError)
+        expect(failure).toMatchObject({ stage: 'definitely-not-replaced',
+          message: 'Hosted approval WAL publication failed', cause: { errno } })
+        expect((failure as Error).cause).toBeInstanceOf(PosixNamespaceLookupError)
+        expect(fsyncHits).toBe(1)
+        expect(lookupHits).toBe(1)
+        expect(renameHits).toBe(0)
+        expect(readFileSync(walPath)).toEqual(predecessor)
+        expect(statSync(walPath).ino).toBe(identity.ino)
+        expect(statSync(walPath).dev).toBe(identity.dev)
+        expect(readFileSync(join(directory, 'stage-1.previous'))).toEqual(predecessor)
+        expect(existsSync(join(directory, 'stage-1.binding'))).toBe(false)
+        expect(c.receipts()).toEqual([])
+        expect(readFileSync(join(root, 'native.ndjson'))).toEqual(nativeBefore)
+        expect(producer.isHealthy()).toBe(false)
+        expect(wal.isPublicationCaptureCurrent()).toBe(false)
+        armed = false
+        lookup.mockRestore()
+        const replacement = new HostedApprovalOwnerWal(walPath, undefined, producer)
+        for (const retry of [store, new HostedApprovalOwnerStore(replacement)]) {
+          await expect(retry.reconcileAdmission(admission('b'))).rejects.toMatchObject({
+            stage: 'definitely-not-replaced', message: 'Hosted approval WAL capture poisoned',
+          })
+        }
+        expect(producer.isHealthy()).toBe(false)
+        expect(wal.isPublicationCaptureCurrent()).toBe(false)
+        expect(replacement.isPublicationCaptureCurrent()).toBe(false)
+        expect(fsyncHits).toBe(1)
+        expect(readFileSync(walPath)).toEqual(predecessor)
+        expect(statSync(walPath).ino).toBe(identity.ino)
+        expect(readFileSync(join(root, 'native.ndjson'))).toEqual(nativeBefore)
+        expect(c.receipts()).toEqual([])
+      } finally { lookup.mockRestore() }
+    })
+  }
+
+  test('ordinary definite pre-rename failure remains retryable with valid capture', async () => {
+    const { root, directory, walPath } = fixture()
+    await new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(walPath)).reconcileAdmission(admission('a'))
+    const predecessor = readFileSync(walPath)
+    const c = await openCustodian(directory)
+    const producer = nativeProducer(root, c, [])
+    let fail = true
+    const cause = new Error('definite pre-rename precondition failure')
+    const wal = new HostedApprovalOwnerWal(walPath, {
+      afterWalTempFsync: async () => { if (fail) throw cause },
+    }, producer)
+    const store = new HostedApprovalOwnerStore(wal)
+    await expect(store.reconcileAdmission(admission('b'))).rejects.toMatchObject({
+      stage: 'definitely-not-replaced', cause,
+    })
+    expect(readFileSync(walPath)).toEqual(predecessor)
+    expect(c.receipts()).toEqual([])
+    expect(producer.isHealthy()).toBe(true)
+    expect(wal.isPublicationCaptureCurrent()).toBe(true)
+    fail = false
+    const published = await store.reconcileAdmission(admission('b'))
+    expect(published.admissionDigest).toBe(admission('b').digest)
+    expect(c.receipts()).toHaveLength(1)
+    const retained = await readDiskOwnerWalImages(directory, c.receipts()[0]!)
+    expect(retained.previous).toEqual({ kind: 'retained', image: retainedWalImage(predecessor) })
+    expect(retained.next.bytes).toEqual(new Uint8Array(readFileSync(walPath)))
+    expect(producer.isHealthy()).toBe(true)
+    expect(wal.isPublicationCaptureCurrent()).toBe(true)
+  })
+
   for (const errno of [5, 13]) { // EIO / EACCES, not fabricated absent images
     for (const edge of ['snapshot', 'prepare', 'bind', 'reload'] as const) {
       test(`real namespace ${errno} at ${edge} rejects without absence evidence`, async () => {

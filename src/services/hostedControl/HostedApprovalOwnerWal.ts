@@ -411,7 +411,14 @@ export class HostedApprovalOwnerWal {
   }
 
   #readPinnedSnapshot(parent: FileHandle): LockedWalSnapshot {
-    if (!existsAt(parent.fd, basename(this.path))) return { state: null, raw: null, stored: null, identity: null }
+    try {
+      if (!existsAt(parent.fd, basename(this.path))) return { state: null, raw: null, stored: null, identity: null }
+    } catch (error) {
+      // Revoke at the lookup boundary: late pre-rename failures are wrapped as
+      // definitely-not-replaced before the outer locked catch can see them.
+      if (error instanceof PosixNamespaceLookupError) this.#invalidatePublicationCapture('owner-wal-namespace-lookup-failed')
+      throw error
+    }
     const fd = openAt(parent.fd, basename(this.path), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
     try {
       const stat = fstatSync(fd)
