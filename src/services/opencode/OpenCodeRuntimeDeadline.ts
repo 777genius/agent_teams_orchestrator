@@ -94,14 +94,17 @@ export async function waitForOpenCodeAbortableDelay(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  if (!signal) {
-    await new Promise<void>(resolve => setTimeout(resolve, timeoutMs))
-    return
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await raceOpenCodeAbortSignal(
+      new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs) }),
+      signal,
+    )
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
-  await raceOpenCodeAbortSignal(
-    new Promise<void>(resolve => setTimeout(resolve, timeoutMs)),
-    signal,
-  )
 }
 
 export class OpenCodeRuntimeDeadline {
