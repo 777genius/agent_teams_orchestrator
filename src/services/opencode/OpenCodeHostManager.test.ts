@@ -434,6 +434,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => 43139,
       spawnHostProcess: () => spawned.child,
+      readProcessStartTimeMs: async () => 1000,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
@@ -500,6 +501,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => nextPort++,
       spawnHostProcess: () => spawnedHosts[spawnIndex++].child,
+      readProcessStartTimeMs: async () => 1000,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
