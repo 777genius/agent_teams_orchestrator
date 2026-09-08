@@ -1001,7 +1001,7 @@ async function probeStoredLaneAuthority(
   if (records.length === 0) {
     throw new Error('OpenCode lifecycle selected lane authority is unavailable')
   }
-  if (!expectedCapabilitySnapshotId(body)) {
+  if (!expectedCapabilitySnapshotId(body) && command !== 'opencode.observeMessageDelivery') {
     throw new Error('OpenCode lifecycle existing lane requires a capability snapshot')
   }
   const runId = asString(body.runId) ?? asString(body.expectedRunId)
@@ -1017,6 +1017,10 @@ async function probeStoredLaneAuthority(
   }
   if (authorityRecords.length === 0) {
     throw new Error('OpenCode lifecycle selected run authority is unavailable')
+  }
+  if ((command === 'opencode.sendMessage' || command === 'opencode.observeMessageDelivery')
+    && authorityRecords.some(isOpenCodeSessionStopped)) {
+    throw new Error('OpenCode delivery lane is stopped; launch a new run')
   }
   const projectPath = await canonicalizeOpenCodeProjectPath(asString(body.projectPath) ?? envelope.cwd)
   const selectedModel = parseOpenCodeProviderScopedModelRef(authorityRecords[0].selectedModel)
@@ -1060,10 +1064,57 @@ async function probeStoredLaneAuthority(
       release: async () => {},
     }
   }
+  const existingHostKey = authorityRecords[0].hostKey
+  if (!existingHostKey || authorityRecords.some(record => record.hostKey !== existingHostKey)) {
+    throw new Error('OpenCode lifecycle lane host authority is ambiguous')
+  }
+  const runtimePids = new Set(authorityRecords.map(record => record.runtimePid).filter(
+    (pid): pid is number => typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0,
+  ))
+  if (runtimePids.size > 1) throw new Error('OpenCode lifecycle lane process authority is ambiguous')
+  const expectedRuntimePid = runtimePids.values().next().value
   const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
     selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
+    existingHostKey,
+    ...(expectedRuntimePid !== undefined ? { expectedRuntimePid } : {}),
+    ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
   })
   return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+}
+
+// Keep authority discovery within the command budget, including cancellation and
+// late host acquisition by a dependency that does not honor its abort signal.
+async function withStoredLaneAuthority<T>(
+  envelope: BridgeEnvelope,
+  command: string,
+  deadline: OpenCodeRuntimeDeadline,
+  externalSignal: AbortSignal | undefined,
+  operation: (authority: Awaited<ReturnType<typeof probeStoredLaneAuthority>>) => Promise<T>,
+): Promise<T> {
+  const signal = externalSignal ? AbortSignal.any([deadline.signal, externalSignal]) : deadline.signal
+  const retained = await deadline.runPhase('host_start', async context => {
+    const phaseContext = { ...context, signal, throwIfExpired: () => {
+      signal.throwIfAborted()
+      context.throwIfExpired()
+    } }
+    phaseContext.throwIfExpired()
+    const pending = probeStoredLaneAuthority(envelope, command, phaseContext)
+    let retained: Awaited<typeof pending>
+    try {
+      retained = await raceOpenCodeAbortSignal(pending, signal)
+      phaseContext.throwIfExpired()
+    } catch (error) {
+      void pending.then(late => late.release(true)).catch(() => undefined)
+      throw error
+    }
+    return retained
+  })
+  try {
+    signal.throwIfAborted()
+    return await operation(retained)
+  } finally {
+    await retained.release(envelope.command !== 'opencode.handshake' ? true : undefined)
+  }
 }
 
 function createBridgeServerIdentity(
@@ -3251,6 +3302,22 @@ async function runLaunch(
       },
     }
     phaseContext.throwIfExpired()
+    const launchProjectPath = await canonicalizeOpenCodeProjectPath(asString(body.projectPath) ?? envelope.cwd)
+    const oldRecords = (await openCodeSessionStore.list()).filter(record =>
+      record.teamId === teamId && (record.laneId ?? 'primary') === laneId
+      && record.profileScope?.purpose === 'launch_runtime'
+      && record.runId && record.runId !== runId && !isOpenCodeSessionStopped(record))
+    for (const record of oldRecords) {
+      if (await canonicalizeOpenCodeProjectPath(record.projectPath) !== launchProjectPath) {
+        throw new Error('OpenCode dead runtime recovery project authority mismatch')
+      }
+      await openCodeHostManager.withConfirmedAbsentHostAuthority(record, async () => {
+        const retired = await openCodeSessionStore.retireAbsentRuntimeIfSession(record, runId, provisioningSignal)
+        if (!retired) throw new Error('OpenCode dead runtime recovery session authority changed or is owned')
+        return retired
+      }, provisioningSignal)
+    }
+    phaseContext.throwIfExpired()
     pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
       asString(body.projectPath) ?? envelope.cwd,
       { toolApprovalMode, phaseContext, selectedModel: apiSelectedModel,
@@ -4288,7 +4355,19 @@ async function runStop(
   }
   const retained = expectedCapabilitySnapshotId(body) || asRecord(body.preconditions)
     || body.allowEmptyLaneStop === true
-    ? await probeStoredLaneAuthority(envelope, 'opencode.stopTeam', stopPreflightContext)
+    ? await runtimeDeadline.runPhase('stop_abort', async () => {
+      stopSignal.throwIfAborted()
+      const pending = probeStoredLaneAuthority(envelope, 'opencode.stopTeam', stopPreflightContext)
+      try {
+        const acquired = await raceOpenCodeAbortSignal(pending, stopSignal)
+        stopSignal.throwIfAborted()
+        return acquired
+      } catch (error) {
+        // A dependency may finish acquiring after the command has timed out.
+        void pending.then(late => late.release(true)).catch(() => undefined)
+        throw error
+      }
+    })
     : null
   let authorityReleased = false
   const releaseAuthority = async () => {
@@ -4633,7 +4712,10 @@ async function runStop(
   }
 }
 
-async function runSendMessage(envelope: BridgeEnvelope): Promise<{
+async function runSendMessage(
+  envelope: BridgeEnvelope,
+  authoritySnapshot?: OpenCodeProvisioningSnapshot | null,
+): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   data: SendMessageCommandData
 }> {
@@ -4665,7 +4747,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
 
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
-    runtime: createRuntimePreconditionSnapshot(null),
+    runtime: createRuntimePreconditionSnapshot(authoritySnapshot),
   })
   await markSendMessageOutcome(outcomeBase, {
     status: 'preconditions_checked',
@@ -4679,8 +4761,11 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     })
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
+  if (record.profileScope?.purpose === 'launch_runtime' && !authoritySnapshot) {
+    throw new Error('OpenCode selected delivery requires persisted lane capability authority')
+  }
   let deliveryRecord = record
-  let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
+  let snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
   const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
@@ -4707,7 +4792,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId,
       toolApprovalMode: record.toolApprovalMode,
     })
-    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
+    snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_stale_record',
@@ -4727,7 +4812,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId,
       toolApprovalMode: record.toolApprovalMode,
     })
-    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
+    snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_forced_refresh',
@@ -4741,7 +4826,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     runId,
     diagnostics: mcpDiagnostics,
   })
-  snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
+  snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   await markSendMessageOutcome(outcomeBase, {
     status: 'session_resolved',
     sessionId: deliveryRecord.opencodeSessionId,
@@ -4799,7 +4884,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId: asString(body.runId),
       toolApprovalMode: record.toolApprovalMode,
     })
-    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
+    snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_mcp_failure',
@@ -5227,7 +5312,10 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   }
 }
 
-async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
+async function runObserveMessageDelivery(
+  envelope: BridgeEnvelope,
+  authoritySnapshot?: OpenCodeProvisioningSnapshot | null,
+): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   data: ObserveMessageDeliveryCommandData
 }> {
@@ -5248,10 +5336,16 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
-  const snapshot = await openCodeProvisioningProbe.probe(
-    asString(body.projectPath) ?? record.projectPath,
-    { toolApprovalMode: record.toolApprovalMode },
-  )
+  const projectPath = asString(body.projectPath) ?? envelope.cwd
+  if (await canonicalizeOpenCodeProjectPath(projectPath)
+    !== await canonicalizeOpenCodeProjectPath(record.projectPath)
+    || (record.profileScope?.purpose === 'launch_runtime'
+      && (!record.runId || asString(body.runId) !== record.runId || isOpenCodeSessionStopped(record)))) {
+    throw new Error('OpenCode delivery observation does not match active session authority')
+  }
+  const snapshot = authoritySnapshot ?? await openCodeProvisioningProbe.probe(projectPath, {
+    toolApprovalMode: record.toolApprovalMode,
+  })
   validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
@@ -5728,12 +5822,14 @@ async function handleEnvelope(
           await retained.release()
         }
       } else if (envelope.body.requiredCommand === 'opencode.reconcileTeam'
-        || envelope.body.requiredCommand === 'opencode.stopTeam') {
-        const retained = await probeStoredLaneAuthority(envelope, envelope.body.requiredCommand as string)
-        try {
-          snapshot = retained.snapshot
-          confirmedStopRuntime = retained.confirmedStopRuntime
-        } finally { await retained.release() }
+        || envelope.body.requiredCommand === 'opencode.stopTeam'
+        || envelope.body.requiredCommand === 'opencode.sendMessage') {
+        if (!runtimeDeadline) throw new Error('OpenCode lane authority deadline was not initialized')
+        await withStoredLaneAuthority(envelope, envelope.body.requiredCommand as string,
+          runtimeDeadline, externalSignal, async retained => {
+            snapshot = retained.snapshot
+            confirmedStopRuntime = retained.confirmedStopRuntime
+          })
       } else if (!lightweightLaunchHandshake) {
         snapshot = await openCodeProvisioningProbe.probe(envelope.cwd, {
           disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
@@ -5781,9 +5877,22 @@ async function handleEnvelope(
       }
       return runStop(envelope, runtimeDeadline, externalSignal)
     case 'opencode.sendMessage':
+      if (expectedCapabilitySnapshotId(envelope.body)) {
+        if (!runtimeDeadline) throw new Error('OpenCode delivery authority deadline was not initialized')
+        return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
+          retained => runSendMessage(envelope, retained.snapshot))
+      }
       return runSendMessage(envelope)
-    case 'opencode.observeMessageDelivery':
+    case 'opencode.observeMessageDelivery': {
+      const record = await openCodeSessionStore.get(asString(envelope.body.teamId) ?? asString(envelope.body.teamName) ?? '',
+        asString(envelope.body.laneId) ?? '', asString(envelope.body.memberName) ?? '')
+      if (record?.profileScope?.purpose === 'launch_runtime') {
+        if (!runtimeDeadline) throw new Error('OpenCode observation authority deadline was not initialized')
+        return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
+          retained => runObserveMessageDelivery(envelope, retained.snapshot))
+      }
       return runObserveMessageDelivery(envelope)
+    }
     case 'opencode.answerPermission':
       return runAnswerPermission(envelope)
     case 'opencode.listRuntimePermissions':
@@ -5854,8 +5963,11 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     envelope.command === 'opencode.readiness'
     || envelope.command === 'opencode.launchTeam'
     || envelope.command === 'opencode.stopTeam'
+    || envelope.command === 'opencode.observeMessageDelivery'
+    || (envelope.command === 'opencode.sendMessage' && !!expectedCapabilitySnapshotId(envelope.body))
     || (envelope.command === 'opencode.handshake'
-      && envelope.body.requiredCommand === 'opencode.launchTeam'
+      && ['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam', 'opencode.sendMessage']
+        .includes(envelope.body.requiredCommand as string)
       && !shouldUseLightweightLaunchHandshake(envelope.body))
   )
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)

@@ -68,6 +68,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
       }, markStale: async () => { throw new Error('unexpected stale write') } },
       hostManager: {
         ensureHost: async input => {
+          expect(input?.existingOnly).toBe(true)
           expect(input?.resolveConfigFingerprint).toBe(false)
           expect(input?.prewarmManagedSubscriptionPlugins).toBe(false)
           // Models persistent adoption: the default broad path would change

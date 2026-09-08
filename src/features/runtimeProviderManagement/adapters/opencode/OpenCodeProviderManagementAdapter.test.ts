@@ -3901,6 +3901,87 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test.each(['inventory', 'config', 'live'] as const)(
+    'excludes three free SuperGrok image models before text verification using %s metadata',
+    async metadataSource => {
+      const imageIds = ['grok-imagine-image', 'grok-imagine-image-2.0', 'grok-imagine-image-quality']
+      const textId = 'grok-4.6'
+      const descriptions = Object.fromEntries([
+        ...imageIds.map(id => [id, { modalities: { input: ['text', 'image'], output: ['image', 'pdf'] } }]),
+        [textId, { modalities: { input: ['text', 'image', 'pdf'], output: ['text'] }, tool_call: false }],
+      ])
+      const modelIds = [...imageIds, textId].map(id => `xai/${id}`)
+      const modelProbes: string[] = []
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => inventory({
+          connectedProviders: [{ id: 'xai', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }],
+          availableProviders: ['xai'], models: modelIds,
+          modelMetadata: modelIds.map(id => ({
+            id, cost: null, context: null, limits: null, free: id !== `xai/${textId}`,
+            raw: metadataSource === 'inventory' ? descriptions[id.slice(4)] : {},
+          })),
+        }) },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'xai', models: metadataSource === 'config' ? descriptions : {} }],
+            default: { xai: textId },
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xai', models: metadataSource === 'live' ? descriptions : {} }],
+            connected: ['xai'], default: { xai: textId },
+          }),
+          getProviderAuth: async () => ({ xai: [{ type: 'api' }] }),
+          setProviderAuth: async () => true,
+        }) },
+        authStore: authStore(),
+        executionProbe: { probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          if (input.selectedModel !== `xai/${textId}`) throw new Error('Image endpoint cannot answer a text probe')
+          return executionProbeResult(input.selectedModel)
+        } },
+      })
+
+      const result = await adapter.connectWithApiKey({
+        runtimeId: 'opencode', providerId: 'xai', apiKey: 'test-only-key',
+      })
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.value.verifiedModelId).toBe('xai/grok-4.6')
+      expect(modelProbes).toEqual(['xai/grok-4.6'])
+    },
+  )
+
+  test.each([
+    { modalities: { input: ['text'], output: ['video'] } },
+    { capabilities: { output: { text: false, image: true } } },
+    { capabilities: { output: { image: true } } },
+  ])('reports image/video-only catalogs as unsupported for credential verification: %j', async raw => {
+    let probes = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({
+        connectedProviders: [{ id: 'xai', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }],
+        availableProviders: ['xai'], models: ['xai/render-frame'],
+        modelMetadata: [{ id: 'xai/render-frame', cost: null, context: null, limits: null, free: true, raw }],
+      }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'xai' }], connected: ['xai'], default: {} }),
+        getProviderAuth: async () => ({ xai: [{ type: 'api' }] }),
+        setProviderAuth: async () => true,
+      }) },
+      authStore: authStore(),
+      executionProbe: { probeModel: async input => { probes++; return executionProbeResult(input.selectedModel) } },
+    })
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode', providerId: 'xai', apiKey: 'test-only-key',
+    })
+    expect(expectFailure(result)).toMatchObject({
+      code: 'model-missing', message: expect.stringContaining('text-response model'),
+    })
+    expect(probes).toBe(0)
+  })
+
   test('verifies every API-key provider instead of trusting an accepted auth write', async () => {
     const modelProbes: string[] = []
     const adapter = new OpenCodeProviderManagementAdapter({

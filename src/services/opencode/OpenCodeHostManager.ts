@@ -125,6 +125,7 @@ type OpenCodeHostManagerDeps = {
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
   isProcessAlive?: (pid: number) => boolean
+  inspectProcessLiveness?: (pid: number) => Promise<'alive' | 'gone' | 'unknown'>
   readProcessCommandLine?: (pid: number) => Promise<string | null>
   readProcessStartTimeMs?: (pid: number) => Promise<number | null>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
@@ -1493,6 +1494,138 @@ export class OpenCodeHostManager {
     }
   }
 
+  // A new launch can retire an orphaned record only while startup of its old
+  // exact host is excluded. A matching dead registry entry is removed only after
+  // terminal CAS evidence; absence is never inferred from health or registry errors.
+  async withConfirmedAbsentHostAuthority<T>(
+    record: { hostKey: string; runtimePid?: number | null },
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath || !record.hostKey.trim()
+      || !Number.isSafeInteger(record.runtimePid) || (record.runtimePid ?? 0) <= 0) {
+      throw new Error('OpenCode dead runtime recovery requires exact host and process authority')
+    }
+    return this.withPersistentHostStartupLock(record.hostKey, async () => {
+      return this.withPersistentRegistryLock(async () => {
+        let registry: PersistentHostRegistryShape = { schemaVersion: 1, hosts: {} }
+        let hosts: Record<string, unknown> = registry.hosts
+        try {
+          const parsed = JSON.parse(await readFile(registryPath, 'utf8'))
+          if (parsed?.schemaVersion !== 1 || !parsed.hosts
+            || typeof parsed.hosts !== 'object' || Array.isArray(parsed.hosts)) {
+            throw new Error('OpenCode dead runtime recovery registry is invalid')
+          }
+          registry = parsed
+          hosts = parsed.hosts
+        } catch (error) {
+          if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
+        }
+        const registered = hosts[record.hostKey]
+        if (Object.hasOwn(hosts, record.hostKey) && (!registered || typeof registered !== 'object'
+          || !('pid' in registered) || registered.pid !== record.runtimePid
+          || !('hostKey' in registered) || registered.hostKey !== record.hostKey
+          || !('processStartedAtMs' in registered) || typeof registered.processStartedAtMs !== 'number'
+          || !Number.isFinite(registered.processStartedAtMs) || registered.processStartedAtMs <= 0)) {
+          throw new Error('OpenCode dead runtime recovery registry process identity differs or is unverified')
+        }
+        const assertAbsent = () => {
+          if (this.hosts.has(record.hostKey)
+            || this.pendingHosts.has(record.hostKey)) {
+            throw new Error('OpenCode dead runtime recovery found existing host authority')
+          }
+        }
+        assertAbsent()
+        const inspect = async (): Promise<'alive' | 'gone' | 'unknown'> => {
+          if (this.deps.inspectProcessLiveness) return this.deps.inspectProcessLiveness(record.runtimePid!)
+          try {
+            process.kill(record.runtimePid!, 0)
+            return 'alive'
+          } catch (error) {
+            return error && typeof error === 'object' && 'code' in error && error.code === 'ESRCH'
+              ? 'gone' : 'unknown'
+          }
+        }
+        const liveness = await raceOpenCodeAbortSignal(inspect(), signal)
+        if (liveness !== 'gone') throw new Error('OpenCode old runtime process is alive or unverified')
+        assertAbsent()
+        if (signal?.aborted) throwOpenCodeAbortReason(signal)
+        const result = await operation()
+        // The callback returns terminal CAS evidence. A rejected CAS leaves the
+        // exact dead registry record and its leases intact for the winner.
+        if (registered && result != null && result !== false) {
+          delete registry.hosts[record.hostKey]
+          await writeJsonFileAtomic(registryPath, registry, { indent: 2 })
+        }
+        return result
+      })
+    }, signal)
+  }
+
+  // Stop may retain an exact existing authority, but must never create, migrate,
+  // dispose, or remove a host as a side effect of discovering that authority.
+  private async retainExistingHost(
+    hostKey: string,
+    profile: OpenCodePreparedProfile,
+    abortSignal?: AbortSignal,
+  ): Promise<OpenCodeHostHandle> {
+    return this.withPersistentHostStartupLock(hostKey, async () => {
+      const cached = this.hosts.get(hostKey)
+      const record = cached
+        ? this.buildPersistentHostRecord(cached.handle)
+        : (await this.readPersistentRegistry()).hosts[hostKey]
+      if (!record || record.hostKey !== hostKey
+        || record.projectPath !== profile.projectPath
+        || record.profileRootKey !== profile.profileRootKey
+        || record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
+        || record.managedConfigFingerprint !== profile.managedConfigFingerprint
+        || record.resolvedConfigFingerprint !== profile.managedConfigFingerprint
+        || !Number.isFinite(record.processStartedAtMs)
+        || record.processStartedAtMs == null
+        || (cached && cached.handle.state !== 'healthy')) {
+        throw new Error('OpenCode existing host authority is unavailable or changed')
+      }
+      const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
+        throw new Error('OpenCode existing host process identity is unavailable or changed')
+      }
+      const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl), abortSignal)
+      const after = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (!health || after.state !== 'confirmed' || after.startedAtMs !== record.processStartedAtMs) {
+        throw new Error('OpenCode existing host is unhealthy or its process identity changed')
+      }
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+      if (cached) {
+        // Another holder may release the entry while the bounded health probe runs.
+        if (this.hosts.get(hostKey) !== cached || cached.handle.state !== 'healthy') {
+          throw new Error('OpenCode existing host authority changed during acquisition')
+        }
+        cached.refCount += 1
+        return cached.handle
+      }
+      const handle: OpenCodeHostHandle = {
+        hostKey,
+        profileRootKey: record.profileRootKey,
+        projectPath: record.projectPath,
+        projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+        baseUrl: record.baseUrl,
+        port: record.port,
+        pid: record.pid,
+        processStartedAtMs: record.processStartedAtMs,
+        version: health.version ?? record.version,
+        state: 'healthy',
+        profile,
+        resolvedConfigFingerprint: record.resolvedConfigFingerprint,
+        diagnostics: [`retained existing OpenCode host pid=${record.pid}`],
+      }
+      this.hosts.set(hostKey, {
+        handle, child: null, refCount: 1, ownedByProcess: false, lifetime: 'persistent',
+      })
+      return handle
+    }, abortSignal)
+  }
+
   async ensureHost(
     params: {
       projectPath?: string | null
@@ -1503,6 +1636,7 @@ export class OpenCodeHostManager {
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
       prewarmManagedSubscriptionPlugins?: boolean
+      existingOnly?: boolean
       abortSignal?: AbortSignal
     } = {},
   ): Promise<OpenCodeHostHandle> {
@@ -1517,6 +1651,13 @@ export class OpenCodeHostManager {
       params.abortSignal,
     )
     await assertOpenCodePreparedProfileScope(profile, params.projectPath)
+    if (params.existingOnly) {
+      const hostKey = params.hostKey?.trim()
+      if (!hostKey || (profile.scopeToken && !hostKey.includes(`::scope:${profile.scopeToken}::`))) {
+        throw new Error('OpenCode existing host requires an exact matching scoped host key')
+      }
+      return this.retainExistingHost(hostKey, profile, params.abortSignal)
+    }
     const binaryPath = resolveOpenCodeBinaryPath()
     if (binaryPath && params.prewarmManagedSubscriptionPlugins !== false) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({

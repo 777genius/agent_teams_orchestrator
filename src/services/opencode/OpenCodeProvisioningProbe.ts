@@ -113,6 +113,9 @@ export class OpenCodeProvisioningProbe {
     options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> & {
       selectedModel?: string
       leaseId?: string
+      existingHostKey?: string
+      expectedRuntimePid?: number
+      attachAppMcp?: boolean
     } = {},
   ): Promise<RetainedOpenCodeProvisioningProbe> {
     return this.probeWithHost(projectPath, {
@@ -122,6 +125,9 @@ export class OpenCodeProvisioningProbe {
       phaseContext: options.phaseContext,
       selectedModel: options.selectedModel,
       leaseId: options.leaseId,
+      existingHostKey: options.existingHostKey,
+      expectedRuntimePid: options.expectedRuntimePid,
+      attachAppMcp: options.attachAppMcp,
     })
   }
 
@@ -136,6 +142,9 @@ export class OpenCodeProvisioningProbe {
       phaseContext?: OpenCodePhaseContext
       selectedModel?: string
       leaseId?: string
+      existingHostKey?: string
+      expectedRuntimePid?: number
+      attachAppMcp?: boolean
     },
   ): Promise<RetainedOpenCodeProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
@@ -253,12 +262,13 @@ export class OpenCodeProvisioningProbe {
       released = true
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (options.disposeHostOnRelease !== false) {
-        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive })
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive || Boolean(options.existingHostKey) })
       }
     }
     try {
       const ensurePromise = hostManager.ensureHost({
         projectPath: inventory.projectPath,
+        ...(options.existingHostKey ? { hostKey: options.existingHostKey, existingOnly: true } : {}),
         preparedProfile: inventory.profile ?? undefined,
         ...(options.phaseContext
           ? { healthTimeoutMs: options.phaseContext.remainingMs() }
@@ -273,8 +283,14 @@ export class OpenCodeProvisioningProbe {
         } : {}),
       })
       host = await ensurePromise
+      if (options.expectedRuntimePid !== undefined && host.pid !== options.expectedRuntimePid) {
+        const acquired = host
+        host = undefined
+        await hostManager.releaseHost(acquired.hostKey, { keepPersistentAlive: true })
+        throw new Error(`OpenCode selected session runtime process changed (expected pid=${options.expectedRuntimePid}, actual pid=${acquired.pid}); relaunch the lane`)
+      }
       if (options.phaseContext?.signal.aborted) {
-        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: Boolean(options.existingHostKey) }).catch(() => undefined)
         host = undefined
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
@@ -283,6 +299,7 @@ export class OpenCodeProvisioningProbe {
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
+      if (options.existingHostKey) throw error
       const probeFailure = error instanceof Error ? error.message : String(error)
       const diagnostics = [
         ...inventory.diagnostics,
@@ -346,7 +363,7 @@ export class OpenCodeProvisioningProbe {
         }
         const appMcp = await mcpManager.ensureAppMcp({
           baseUrl: host.baseUrl,
-          attachIfMissing: true,
+          attachIfMissing: options.attachAppMcp !== false,
           requestContext,
         })
         const appMcpReady = appMcp.summary.status === 'attached'
