@@ -1,3 +1,4 @@
+import { resolveBoundedAuthPath, validateOpenCodeBoundedPaths, assertBoundedAuthObjects, boundedCoordinationDatabase, type OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { readFile } from 'node:fs/promises'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -10,17 +11,57 @@ export type OpenCodeAuthCredential = Record<string, unknown>
 type OpenCodeAuthEntry = OpenCodeAuthCredential
 export type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 
+// Only leaf read/modify/replace operations enter this queue. The enclosing SQLite
+// lease remains reentrant for preparation and OAuth refresh; sibling mutations
+// inheriting that lease must still serialize their entire read/replace interval.
+const boundedMutationTails = new Map<string, Promise<void>>()
+async function serializeBoundedMutation<T>(
+  c: OpenCodeBoundedExecutionPaths,
+  operation: () => Promise<T>,
+  abortSignal?: AbortSignal,
+): Promise<T> {
+  const key = boundedCoordinationDatabase(c.globalAuthPath, c)
+  const previous = boundedMutationTails.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const tail = new Promise<void>(resolve => { release = resolve })
+  boundedMutationTails.set(key, tail)
+  await previous
+  try {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    return await operation()
+  } finally {
+    release()
+    if (boundedMutationTails.get(key) === tail) boundedMutationTails.delete(key)
+  }
+}
+
 async function withAuthStoreWriteLock<T>(
   filePath: string,
   operation: () => Promise<T>,
   abortSignal?: AbortSignal,
+  boundedPaths?: OpenCodeBoundedExecutionPaths,
 ): Promise<T> {
+  if (boundedPaths) {
+    resolveBoundedAuthPath(filePath, boundedPaths, true)
+    await assertBoundedAuthDocuments(boundedPaths)
+  }
   return withOpenCodeAuthCoordinationLock({
     authPath: filePath,
-    operation,
+    boundedPaths,
+    operation: boundedPaths ? () => serializeBoundedMutation(boundedPaths, async () => {
+      // Recheck after waiting: an admitted sibling may have replaced a document.
+      await assertBoundedAuthDocuments(boundedPaths)
+      return operation()
+    }, abortSignal) : operation,
     description: 'OpenCode auth store coordination lock',
     abortSignal,
   })
+}
+
+async function assertBoundedAuthDocuments(c: OpenCodeBoundedExecutionPaths): Promise<void> {
+  await assertBoundedAuthObjects(c)
+  await Promise.all([...c.immutableAuthPaths, ...c.authStores.map(s => s.logicalPath)]
+    .map(p => readOpenCodeAuthStore(p, c)))
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -35,42 +76,49 @@ function normalizeProviderId(value: string): string | null {
 }
 
 export async function withOpenCodeOAuthRefreshLock<T>(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   authPath: string
   providerId: string
   operation: () => Promise<T>
   abortSignal?: AbortSignal
 }): Promise<T> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
     throw new Error('OpenCode OAuth refresh provider id is invalid')
   }
 
+  if (input.boundedPaths) await assertBoundedAuthDocuments(input.boundedPaths)
   return withOpenCodeAuthCoordinationLock({
     authPath: input.authPath,
+    boundedPaths: input.boundedPaths,
     operation: input.operation,
     description: `OpenCode ${providerId} OAuth refresh coordination lock`,
     abortSignal: input.abortSignal,
   })
 }
 
-async function readOptionalJson(filePath: string): Promise<unknown | null> {
+const missingAuthDocument = Symbol('missing auth document')
+async function readOptionalJson(filePath: string, strict = false): Promise<unknown> {
   try {
     const raw = await readFile(filePath, 'utf8')
     if (!raw.trim()) {
+      if (strict) throw new Error(`OpenCode auth store is not a JSON object: ${filePath}`)
       return {}
     }
     return JSON.parse(raw) as unknown
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
-      return null
+      return missingAuthDocument
     }
     throw error
   }
 }
 
-export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeAuthStore> {
-  const parsed = await readOptionalJson(filePath)
-  if (!parsed) {
+export async function readOpenCodeAuthStore(filePath: string, boundedPaths?: OpenCodeBoundedExecutionPaths): Promise<OpenCodeAuthStore> {
+  if (boundedPaths) boundedPaths = validateOpenCodeBoundedPaths(boundedPaths)
+  const parsed = await readOptionalJson(resolveBoundedAuthPath(filePath, boundedPaths), !!boundedPaths)
+  if (parsed === missingAuthDocument || (!boundedPaths && !parsed)) {
     return {}
   }
 
@@ -84,6 +132,7 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
     const providerId = normalizeProviderId(rawProviderId)
     const entry = asRecord(rawEntry)
     if (!providerId || !entry) {
+      if (boundedPaths) throw new Error(`OpenCode auth store has an invalid entry: ${filePath}`)
       continue
     }
     authStore[providerId] = { ...entry }
@@ -92,14 +141,16 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
 }
 
 export async function readOpenCodeAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   authPath: string
   providerId: string
 }): Promise<OpenCodeAuthCredential | null> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
   }
-  const authStore = await readOpenCodeAuthStore(input.authPath)
+  const authStore = await readOpenCodeAuthStore(input.authPath, input.boundedPaths)
   const credential = authStore[providerId]
   return credential ? { ...credential } : null
 }
@@ -107,8 +158,9 @@ export async function readOpenCodeAuthCredential(input: {
 async function writeOpenCodeAuthStore(
   filePath: string,
   authStore: OpenCodeAuthStore,
+  boundedPaths?: OpenCodeBoundedExecutionPaths,
 ): Promise<void> {
-  await writeJsonFileAtomic(filePath, authStore, { indent: 2, mode: 0o600 })
+  await writeJsonFileAtomic(resolveBoundedAuthPath(filePath, boundedPaths, true), authStore, { indent: 2, mode: 0o600 })
 }
 
 export function mergeOpenCodeAuthStores(input: {
@@ -199,55 +251,101 @@ export function doesOpenCodeAuthStoreIncludeSource(input: {
 }
 
 export async function syncOpenCodeManagedAuthStore(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   sourceAuthPath: string
   managedAuthPath: string
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
+  if (input.boundedPaths) resolveBoundedAuthPath(input.sourceAuthPath, input.boundedPaths)
   await withAuthStoreWriteLock(input.managedAuthPath, async () => {
-    const source = await readOpenCodeAuthStore(input.sourceAuthPath)
-    const managed = await readOpenCodeAuthStore(input.managedAuthPath)
+    const source = await readOpenCodeAuthStore(input.sourceAuthPath, input.boundedPaths)
+    const managed = await readOpenCodeAuthStore(input.managedAuthPath, input.boundedPaths)
     const merged = mergeOpenCodeAuthStores({ source, managed })
 
     if (JSON.stringify(merged) !== JSON.stringify(managed)) {
-      await writeOpenCodeAuthStore(input.managedAuthPath, merged)
+      await writeOpenCodeAuthStore(input.managedAuthPath, merged, input.boundedPaths)
     }
-  })
+  }, undefined, input.boundedPaths)
+}
+
+/** Global first, then immutable admission order. Only ENOENT may omit a source;
+ * present invalid bytes always reject. Later imports win OAuth ties, global API
+ * wins regardless of position; imported OAuth ties beat selected, then sorted peers.
+ */
+async function assertBoundedReconciliationSources(
+  sourceAuthPaths: readonly string[], c: OpenCodeBoundedExecutionPaths,
+): Promise<void> {
+  const expected: string[] = []
+  for (const logical of [c.globalAuthPath, ...c.immutableAuthPaths]) {
+    const parsed = await readOptionalJson(resolveBoundedAuthPath(logical, c), true)
+    if (parsed === missingAuthDocument) continue
+    // Use the exported reader's complete shape validation before any mutation.
+    await readOpenCodeAuthStore(logical, c)
+    expected.push(logical)
+  }
+  if (JSON.stringify(sourceAuthPaths) !== JSON.stringify(expected)) {
+    throw new Error('opencode_bounded_auth_sources')
+  }
 }
 
 export async function reconcileOpenCodeManagedAuthStore(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   sourceAuthPaths: readonly string[]
   managedAuthPath: string
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths), sourceAuthPaths: input.sourceAuthPaths ? [...input.sourceAuthPaths] : [] }
+  if (input.boundedPaths) {
+    return reconcileOpenCodeManagedAuthStores({ ...input,
+      globalAuthPath: input.boundedPaths.globalAuthPath,
+      peerManagedAuthPaths: input.boundedPaths.authStores.filter(s => s.logicalPath !== input.boundedPaths!.globalAuthPath).map(s => s.logicalPath),
+    })
+  }
   await withAuthStoreWriteLock(input.managedAuthPath, async () => {
     let expected: OpenCodeAuthStore = {}
     for (const sourceAuthPath of input.sourceAuthPaths) {
       expected = mergeOpenCodeAuthStores({
-        source: await readOpenCodeAuthStore(sourceAuthPath),
+        source: await readOpenCodeAuthStore(sourceAuthPath, input.boundedPaths),
         managed: expected,
       })
     }
 
-    const managed = await readOpenCodeAuthStore(input.managedAuthPath)
+    const managed = await readOpenCodeAuthStore(input.managedAuthPath, input.boundedPaths)
     if (JSON.stringify(expected) !== JSON.stringify(managed)) {
-      await writeOpenCodeAuthStore(input.managedAuthPath, expected)
+      await writeOpenCodeAuthStore(input.managedAuthPath, expected, input.boundedPaths)
     }
-  })
+  }, undefined, input.boundedPaths)
 }
 
 export async function reconcileOpenCodeManagedAuthStores(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   sourceAuthPaths: readonly string[]
   globalAuthPath: string
   managedAuthPath: string
   peerManagedAuthPaths?: readonly string[]
   abortSignal?: AbortSignal
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths), sourceAuthPaths: input.sourceAuthPaths ? [...input.sourceAuthPaths] : [], peerManagedAuthPaths: input.peerManagedAuthPaths ? [...input.peerManagedAuthPaths] : undefined }
+  if (input.boundedPaths) {
+    const c = validateOpenCodeBoundedPaths(input.boundedPaths)
+    const peers = c.authStores.filter(s => s.logicalPath !== c.globalAuthPath).map(s => s.logicalPath).sort()
+    if (input.globalAuthPath !== c.globalAuthPath || input.managedAuthPath !== c.selectedAuthPath
+      || JSON.stringify([...new Set([input.managedAuthPath, ...(input.peerManagedAuthPaths ?? [])])].sort()) !== JSON.stringify(peers)) {
+      throw new Error('opencode_bounded_auth_membership')
+    }
+    await assertBoundedAuthObjects(c)
+    await assertBoundedReconciliationSources(input.sourceAuthPaths, c)
+  }
   await withAuthStoreWriteLock(input.globalAuthPath, async () => {
+    if (input.boundedPaths) await assertBoundedReconciliationSources(input.sourceAuthPaths, input.boundedPaths)
+    // Selected wins equal-expiry peer ties; other peers use code-unit path order.
+    const otherPeers = (input.peerManagedAuthPaths ?? []).filter(p => p !== input.managedAuthPath)
     const peerManagedAuthPaths = Array.from(new Set([
       input.managedAuthPath,
-      ...(input.peerManagedAuthPaths ?? []),
+      ...(input.boundedPaths ? [...otherPeers].sort() : otherPeers),
     ]))
     const [sourceStores, peerStores] = await Promise.all([
-      Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore)),
-      Promise.all(peerManagedAuthPaths.map(readOpenCodeAuthStore)),
+      Promise.all(input.sourceAuthPaths.map(p => readOpenCodeAuthStore(p, input.boundedPaths))),
+      Promise.all(peerManagedAuthPaths.map(p => readOpenCodeAuthStore(p, input.boundedPaths))),
     ])
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
 
@@ -275,14 +373,14 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
       expected[providerId] = freshest
     }
 
-    const globalStore = await readOpenCodeAuthStore(input.globalAuthPath)
+    const globalStore = await readOpenCodeAuthStore(input.globalAuthPath, input.boundedPaths)
     const nextGlobalStore = { ...globalStore }
     for (const providerId of oauthProviderIds) {
       nextGlobalStore[providerId] = expected[providerId]
     }
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     if (JSON.stringify(nextGlobalStore) !== JSON.stringify(globalStore)) {
-      await writeOpenCodeAuthStore(input.globalAuthPath, nextGlobalStore)
+      await writeOpenCodeAuthStore(input.globalAuthPath, nextGlobalStore, input.boundedPaths)
     }
 
     for (let index = 0; index < peerManagedAuthPaths.length; index += 1) {
@@ -299,26 +397,37 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
         nextPeerStore[providerId] = expected[providerId]
       }
       if (JSON.stringify(nextPeerStore) !== JSON.stringify(peerStore)) {
-        await writeOpenCodeAuthStore(authPath, nextPeerStore)
+        await writeOpenCodeAuthStore(authPath, nextPeerStore, input.boundedPaths)
       }
     }
-  }, input.abortSignal)
+  }, input.abortSignal, input.boundedPaths)
 }
 
 export async function fanOutOpenCodeOAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   providerId: string
   sourceAuthPath: string
   targetAuthPaths: readonly string[]
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths), targetAuthPaths: input.targetAuthPaths ? [...input.targetAuthPaths] : [] }
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
   }
-  const targetAuthPaths = Array.from(new Set(input.targetAuthPaths))
+  if (input.boundedPaths) {
+    const c = validateOpenCodeBoundedPaths(input.boundedPaths)
+    const members = [...new Set([input.sourceAuthPath, ...input.targetAuthPaths])].sort()
+    if (JSON.stringify(members) !== JSON.stringify(c.authStores.map(s => s.logicalPath).sort())) throw new Error('opencode_bounded_auth_membership')
+  }
+  // Source wins ties, then global, then selected, then canonical other peers.
+  const targetAuthPaths = Array.from(new Set(input.boundedPaths
+    ? [input.boundedPaths.globalAuthPath, input.boundedPaths.selectedAuthPath,
+      ...input.targetAuthPaths.slice().sort()].filter(p => p !== input.sourceAuthPath)
+    : input.targetAuthPaths))
   const coordinationPath = targetAuthPaths[0] ?? input.sourceAuthPath
   await withAuthStoreWriteLock(coordinationPath, async () => {
     const authPaths = Array.from(new Set([input.sourceAuthPath, ...targetAuthPaths]))
-    const stores = await Promise.all(authPaths.map(readOpenCodeAuthStore))
+    const stores = await Promise.all(authPaths.map(p => readOpenCodeAuthStore(p, input.boundedPaths)))
     let freshest: OpenCodeAuthCredential | null = null
     for (const store of stores) {
       const candidate = store[providerId]
@@ -341,29 +450,33 @@ export async function fanOutOpenCodeOAuthCredential(input: {
       await writeOpenCodeAuthStore(authPaths[index], {
         ...authStore,
         [providerId]: freshest,
-      })
+      }, input.boundedPaths)
     }
-  })
+  }, undefined, input.boundedPaths)
 }
 
 export async function upsertOpenCodeApiAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   authPath: string
   providerId: string
   apiKey: string
   metadata?: Record<string, string> | null
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
   await upsertOpenCodeApiAuth(input.authPath, input.providerId, {
     type: 'api',
     key: input.apiKey,
     ...(input.metadata ? { metadata: input.metadata } : {}),
-  })
+  }, input.boundedPaths)
 }
 
 export async function upsertOpenCodeAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   authPath: string
   providerId: string
   credential: OpenCodeAuthCredential
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
@@ -375,17 +488,19 @@ export async function upsertOpenCodeAuthCredential(input: {
   }
 
   await withAuthStoreWriteLock(input.authPath, async () => {
-    const authStore = await readOpenCodeAuthStore(input.authPath)
+    const authStore = await readOpenCodeAuthStore(input.authPath, input.boundedPaths)
     authStore[providerId] = { ...input.credential, type: credentialType }
-    await writeOpenCodeAuthStore(input.authPath, authStore)
-  })
+    await writeOpenCodeAuthStore(input.authPath, authStore, input.boundedPaths)
+  }, undefined, input.boundedPaths)
 }
 
 export async function upsertOpenCodeApiAuth(
   authPath: string,
   rawProviderId: string,
   auth: OpenCodeApiAuthInput,
+  boundedPaths?: OpenCodeBoundedExecutionPaths,
 ): Promise<void> {
+  if (boundedPaths) boundedPaths = validateOpenCodeBoundedPaths(boundedPaths)
   const providerId = normalizeProviderId(rawProviderId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
@@ -406,44 +521,47 @@ export async function upsertOpenCodeApiAuth(
   }
 
   await withAuthStoreWriteLock(authPath, async () => {
-    const authStore = await readOpenCodeAuthStore(authPath)
+    const authStore = await readOpenCodeAuthStore(authPath, boundedPaths)
     authStore[providerId] = {
       type: 'api',
       key: apiKey,
       ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     }
-    await writeOpenCodeAuthStore(authPath, authStore)
-  })
+    await writeOpenCodeAuthStore(authPath, authStore, boundedPaths)
+  }, undefined, boundedPaths)
 }
 
 export async function removeOpenCodeAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   authPath: string
   providerId: string
 }): Promise<void> {
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
   }
 
   await withAuthStoreWriteLock(input.authPath, async () => {
-    const authStore = await readOpenCodeAuthStore(input.authPath)
+    const authStore = await readOpenCodeAuthStore(input.authPath, input.boundedPaths)
     if (!(providerId in authStore)) {
       return
     }
     delete authStore[providerId]
-    await writeOpenCodeAuthStore(input.authPath, authStore)
-  })
+    await writeOpenCodeAuthStore(input.authPath, authStore, input.boundedPaths)
+  }, undefined, input.boundedPaths)
 }
 
 export async function readOpenCodeAuthProviderSummaries(
   authPath: string | null | undefined,
   credentialScopes?: Array<'managed' | 'local'>,
+  boundedPaths?: OpenCodeBoundedExecutionPaths,
 ): Promise<OpenCodeConnectedProvider[]> {
   if (!authPath) {
     return []
   }
 
-  const authStore = await readOpenCodeAuthStore(authPath)
+  const authStore = await readOpenCodeAuthStore(authPath, boundedPaths)
   return Object.entries(authStore)
     .map(([providerId, entry]) => ({
       id: providerId,

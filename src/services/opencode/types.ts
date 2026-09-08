@@ -1,3 +1,5 @@
+import type { OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
+export type { OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 export type OpenCodeAuthSource = 'credentials' | 'environment' | 'supervised-host'
 
 export type OpenCodeAgentMode = 'primary' | 'subagent' | 'unknown'
@@ -23,6 +25,8 @@ export type OpenCodePrepareProfileOptions = {
 }
 
 export type OpenCodePreparedProfile = {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
+  boundedAuthSources?: Array<{ path: string; fingerprint: string | null }>
   custody?: 'desktop' | 'supervisor'
   projectPath: string
   profileRootKey: string
@@ -223,6 +227,7 @@ export type OpenCodeHostedApprovalObservation = {
 }
 
 export type OpenCodeMcpServerConfig = {
+  cwd?: string
   type: 'local' | 'remote'
   command?: string[]
   environment?: Record<string, string>

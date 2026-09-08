@@ -1,3 +1,4 @@
+import type { OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { isOpenCodeMcpManagerBoundToCustody } from './OpenCodeMcpManager.js'
 import { createHash } from 'node:crypto'
 import {
@@ -88,6 +89,7 @@ type OpenCodeSessionBridgeDeps = {
     options?: OpenCodePrepareProfileOptions,
   ) => Promise<OpenCodePreparedProfile>
   fanOutOAuthCredential?: (input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     providerId: string
     sourceAuthPath: string
   }) => Promise<void>
@@ -614,12 +616,13 @@ export class OpenCodeSessionBridge {
     const input = {
       providerId: 'xai',
       sourceAuthPath: profile.managedAuthPath,
+      boundedPaths: profile.boundedPaths,
     }
     if (this.deps.fanOutOAuthCredential) {
       await this.deps.fanOutOAuthCredential(input)
       return
     }
-    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath)
+    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath, input.boundedPaths)
   }
 
   private async prepareProfile(

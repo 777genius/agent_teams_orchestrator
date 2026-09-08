@@ -1,3 +1,4 @@
+import { validateBoundedRuntimeEnvironment, validateOpenCodeBoundedPaths, applyBoundedLocalMcp, type OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import path from 'node:path'
 import { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
@@ -11,6 +12,9 @@ export const PRIVATE_PROFILE_AUTH = 'agent-teams.hosted-control.opencode-server-
 export const PROFILE_PATH_ENVIRONMENT = ['HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'NPM_CONFIG_CACHE', 'PLAYWRIGHT_BROWSERS_PATH', 'PUPPETEER_CACHE_DIR', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_devdir', 'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME'] as const
 const FIELDS = 'format,projectPath,profileRootKey,profileRootPath,projectBehaviorFingerprint,behaviorSources,managedConfigJson,managedConfigFingerprint,homePath,tmpPath,xdgConfigHome,xdgDataHome,xdgCacheHome,managedAuthPath,sourceAuthPath,sourceAuthSources,sourceAuthFingerprint,managedAuthFingerprint,authState,runtimePathEnvironment'
 export type PreparedProfileProjection = Pick<OpenCodePreparedProfile, 'projectPath' | 'profileRootKey' | 'profileRootPath' | 'projectBehaviorFingerprint' | 'behaviorSources' | 'managedConfigFingerprint' | 'homePath' | 'tmpPath' | 'xdgConfigHome' | 'xdgDataHome' | 'xdgCacheHome' | 'managedAuthPath' | 'sourceAuthPath' | 'sourceAuthFingerprint' | 'managedAuthFingerprint' | 'authState'> & {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
+  boundedAuthSources?: { path: string; fingerprint: string | null }[]
+  boundedRuntimeEnvironment?: Record<string, string>
   format: typeof PREPARED_PROFILE
   managedConfigJson: string
   sourceAuthSources: { path: string; fingerprint: string | null }[]
@@ -58,7 +62,10 @@ function absolute(value: unknown): asserts value is string {
 }
 export function decodePreparedProfile(bytes: Buffer): PreparedProfileProjection {
   try {
-    const r = decodePrivateProfileJson(bytes, PREPARED_PROFILE_MAXIMUM); exact(r, FIELDS)
+    const r = decodePrivateProfileJson(bytes, PREPARED_PROFILE_MAXIMUM)
+    check(r && typeof r === 'object')
+    const bounded = Object.hasOwn(r, 'boundedPaths')
+    exact(r, FIELDS + (bounded ? ',boundedPaths,boundedAuthSources,boundedRuntimeEnvironment' : ''))
     check(r.format === PREPARED_PROFILE)
     for (const k of ['projectPath','profileRootPath','homePath','tmpPath','xdgConfigHome','xdgDataHome','xdgCacheHome','managedAuthPath']) absolute(r[k])
     check(r.profileRootKey === digest(r.projectPath as string).slice(0,16))
@@ -87,6 +94,31 @@ export function decodePreparedProfile(bytes: Buffer): PreparedProfileProjection 
     for (const [field, suffix] of Object.entries({homePath:'home',tmpPath:'tmp',xdgConfigHome:'config',xdgDataHome:'data'})) check(r[field] === path.posix.join(r.profileRootPath as string,suffix))
     check(r.managedAuthPath === path.posix.join(r.xdgDataHome as string, 'opencode/auth.json'))
     for (const [key, suffix] of Object.entries({NPM_CONFIG_CACHE:'npm',PLAYWRIGHT_BROWSERS_PATH:'tools/ms-playwright',PUPPETEER_CACHE_DIR:'tools/puppeteer',PIP_CACHE_DIR:'tools/pip',UV_CACHE_DIR:'tools/uv',npm_config_devdir:'tools/node-gyp'})) check(env[key] === path.posix.join(r.xdgCacheHome as string,suffix))
+    if (bounded) {
+      const c = validateOpenCodeBoundedPaths(r.boundedPaths)
+      check(c.selectedAuthPath === r.managedAuthPath && c.globalAuthPath === path.posix.join(env.CLAUDE_MULTIMODEL_DATA_HOME as string,'opencode/auth.json'))
+      check(c.localMcp.cwd === r.projectPath)
+      check(canonicalPreparedProfile(c.immutableAuthPaths) === canonicalPreparedProfile(sources.map(s=>s.path)))
+      check(Array.isArray(r.boundedAuthSources) && r.boundedAuthSources.length === c.authStores.length)
+      for (let i=0;i<c.authStores.length;i++) {
+        const source = r.boundedAuthSources[i]; exact(source,'path,fingerprint')
+        check(source.path === c.authStores[i].outputPath && (source.fingerprint === null || hex(source.fingerprint)))
+        if (source.path === r.managedAuthPath) check(source.fingerprint === r.managedAuthFingerprint)
+      }
+      check(r.boundedRuntimeEnvironment && typeof r.boundedRuntimeEnvironment === 'object' && !Array.isArray(r.boundedRuntimeEnvironment))
+      const runtime = r.boundedRuntimeEnvironment as Record<string,unknown>
+      check(Object.keys(runtime).length <= 256)
+      validateBoundedRuntimeEnvironment(runtime,c)
+      for (const [k,v] of Object.entries(runtime)) check(/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && typeof v === 'string' && v.length <= PREPARED_PROFILE_MAXIMUM && !v.includes('\0'))
+      for (const [k,v] of Object.entries(env)) check(runtime[k] === v)
+      check(runtime.OPENCODE_CONFIG_CONTENT === r.managedConfigJson)
+      check(runtime.CURSOR_ACP_HOME_DIR === c.nativeSubscriptionHomePath)
+      check(runtime.CURSOR_AGENT_EXECUTABLE === path.posix.join(r.profileRootPath as string,'native-subscription-cli-bin/cursor-agent'))
+      check(runtime.PATH === [path.posix.join(r.profileRootPath as string,'native-subscription-cli-bin'),...c.nativeExecutables.path].join(':'))
+      const effective = structuredClone(config)
+      applyBoundedLocalMcp(effective,c,env.CLAUDE_MULTIMODEL_DATA_HOME as string,env.CLAUDE_MULTIMODEL_CACHE_HOME as string)
+      check(canonicalPreparedProfile(effective) === canonicalPreparedProfile(config))
+    }
     return freezeProfile(r as unknown as PreparedProfileProjection)
   } catch { throw new Error('opencode_private_profile_rejected') }
 }
@@ -97,6 +129,8 @@ export function projectPreparedProfile(profile: OpenCodePreparedProfile): Prepar
     check(typeof managedConfigJson === 'string' && canonicalPreparedProfile(JSON.parse(managedConfigJson)) === canonicalPreparedProfile(profile.managedConfig))
     const projection: Record<string, unknown> = {}
     for (const key of FIELDS.split(',')) if (key in profile) projection[key] = profile[key as keyof OpenCodePreparedProfile]
+    if (profile.boundedPaths) check(profile.globalAuthPath === profile.boundedPaths.globalAuthPath)
+    if (profile.boundedPaths) Object.assign(projection, { boundedPaths: profile.boundedPaths, boundedAuthSources: profile.boundedAuthSources, boundedRuntimeEnvironment: Object.fromEntries(Object.entries(profile.env).filter(([,v])=>v !== undefined)) })
     Object.assign(projection, {format: PREPARED_PROFILE, managedConfigJson, runtimePathEnvironment: Object.fromEntries(PROFILE_PATH_ENVIRONMENT.map(k=>[k,profile.env[k]]))})
     const bytes = Buffer.from(canonicalPreparedProfile(projection))
     try { return decodePreparedProfile(bytes) } finally { bytes.fill(0) }
@@ -108,8 +142,8 @@ export function restorePreparedProfile(projection: PreparedProfileProjection): O
     // This exported entry must not trust a caller's TypeScript assertion or expose
     // native JSON parser diagnostics containing private configuration bytes.
     bytes = Buffer.from(canonicalPreparedProfile(projection))
-    const { format, managedConfigJson, runtimePathEnvironment, ...fields } = decodePreparedProfile(bytes)
-    return { ...fields, custody: 'supervisor', managedConfig: JSON.parse(managedConfigJson), env: { ...runtimePathEnvironment, OPENCODE_CONFIG_CONTENT: managedConfigJson } }
+    const { format, managedConfigJson, runtimePathEnvironment, boundedRuntimeEnvironment, ...fields } = decodePreparedProfile(bytes)
+    return { ...fields, ...(fields.boundedPaths ? { globalAuthPath: fields.boundedPaths.globalAuthPath } : {}), custody: 'supervisor', managedConfig: JSON.parse(managedConfigJson), env: { ...runtimePathEnvironment, ...boundedRuntimeEnvironment, OPENCODE_CONFIG_CONTENT: managedConfigJson } }
   } catch { throw new Error('opencode_private_profile_rejected') }
   finally { bytes?.fill(0) }
 }

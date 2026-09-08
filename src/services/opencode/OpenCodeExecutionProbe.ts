@@ -1,3 +1,6 @@
+import type { OpenCodeBoundedProfileLifetime } from './OpenCodeBoundedPaths.js'
+import { canonicalPreparedProfile, projectPreparedProfile } from './OpenCodePreparedProfileContract.js'
+import type { OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy, type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 import { isOpenCodeHostManagerBoundToCustody } from './OpenCodeHostManager.js'
 import { isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
@@ -71,6 +74,7 @@ const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
 const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
+  boundedProfileLifetime?: OpenCodeBoundedProfileLifetime
   acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   hostManager?: Pick<
     typeof openCodeHostManager,
@@ -91,6 +95,7 @@ type OpenCodeExecutionProbeDeps = {
   persistentCache?: boolean
   persistentCacheRoot?: string
   fanOutOAuthCredential?: (input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     providerId: string
     sourceAuthPath: string
   }) => Promise<void>
@@ -110,6 +115,7 @@ type PersistentProbeCachePaths = {
 }
 
 type ProbeModelParams = {
+  preparedProfile?: OpenCodePreparedProfile
   selectedModel: string
   projectPath?: string | null
   prompt?: string
@@ -688,6 +694,9 @@ export class OpenCodeExecutionProbe {
   private readonly custody?: TrustedOpenCodeCustody
   constructor(deps: OpenCodeExecutionProbeDeps = {}) {
     const policy = deps.acquisitionPolicy
+    if (deps.boundedProfileLifetime && policy?.mode !== 'supervisor-adopt-only') {
+      throw new Error('opencode_bounded_runtime_UNMOUNTED')
+    }
     if (policy?.mode === 'supervisor-adopt-only') {
       const custody = policy.custody
       assertTrustedOpenCodeCustody(custody)
@@ -732,8 +741,9 @@ export class OpenCodeExecutionProbe {
       }
       // The supervisor owns profile construction and credentials. The probe
       // uses the same retained profile as sessions and approval effects.
-      return this.custody.readPreparedProfile()
+      return params.preparedProfile ?? this.custody.readPreparedProfile()
     }
+    if (params.preparedProfile) return params.preparedProfile
     const options: OpenCodePrepareProfileOptions = {
       includeAppMcp: false,
       modelOutputLimitOverrides: [
@@ -756,7 +766,7 @@ export class OpenCodeExecutionProbe {
     params: ProbeModelParams,
     context?: OpenCodePhaseContext,
   ): Promise<CursorNativeProbeContext> {
-    if (this.deps.prepareProfile) {
+    if (params.preparedProfile || this.deps.prepareProfile) {
       const profile = await this.prepareProbeProfile(params, context)
       return {
         projectPath: profile.tmpPath,
@@ -831,7 +841,7 @@ export class OpenCodeExecutionProbe {
   }
 
   private get cursorNativeFailureProbe() {
-    if (this.custody) return null
+    if (this.custody) return this.deps.boundedProfileLifetime ? openCodeCursorNativeFailureProbe : null
     // Custom clients are hermetic unit/fixture probes. The production singleton
     // gets the native Cursor fallback unless a test explicitly injects one.
     if (this.deps.cursorNativeFailureProbe) return this.deps.cursorNativeFailureProbe
@@ -971,6 +981,7 @@ export class OpenCodeExecutionProbe {
   }
 
   private async fanOutOAuthCredential(input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     providerId: string
     sourceAuthPath: string
   }): Promise<void> {
@@ -978,10 +989,30 @@ export class OpenCodeExecutionProbe {
       await this.deps.fanOutOAuthCredential(input)
       return
     }
-    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath)
+    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath, input.boundedPaths)
   }
 
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
+    if (this.deps.boundedProfileLifetime && !params.preparedProfile) throw new Error('opencode_bounded_refresh_profile')
+    if (params.preparedProfile) {
+      const profile = params.preparedProfile
+      if (!profile.boundedPaths || params.projectPath !== profile.projectPath) throw new Error('opencode_bounded_refresh_profile')
+      projectPreparedProfile(profile)
+      const lifetime = this.deps.boundedProfileLifetime
+      if (!this.custody || !lifetime) throw new Error('opencode_bounded_runtime_UNMOUNTED')
+      const custody = this.custody
+      return lifetime.withCurrentProfile(profile, async () => {
+        const retained = await custody.readPreparedProfile()
+        if (canonicalPreparedProfile(projectPreparedProfile(profile)) !==
+          canonicalPreparedProfile(projectPreparedProfile(retained))) throw new Error('opencode_bounded_refresh_profile')
+        return this.runProbeModel({ ...params, preparedProfile: retained, bypassCache: true, disposeHostOnRelease: true })
+      })
+    }
+    if (this.custody && (await this.custody.readPreparedProfile()).boundedPaths) {
+      // A bounded retained host may not enter the legacy cache/lease route by
+      // omitting its profile or the live lifetime capability.
+      throw new Error('opencode_bounded_runtime_UNMOUNTED')
+    }
     const cacheKey = buildProbeCacheKey(params)
     let shouldRegisterInFlight = !params.bypassCache
     if (!params.bypassCache) {
@@ -1137,6 +1168,9 @@ export class OpenCodeExecutionProbe {
         hostStartupState.promise = (async () => {
           const ensuredHost = await this.hostManager.ensureHost({
             projectPath: params.projectPath,
+            preparedProfile: params.preparedProfile,
+            ...(params.preparedProfile && !this.custody ? { hostKey: 'bounded-refresh:' + createHash('sha256')
+              .update(canonicalPreparedProfile(projectPreparedProfile(params.preparedProfile))).digest('hex') } : {}),
             profileOptions: this.custody ? { toolApprovalMode: 'manual' } : {
               includeAppMcp: false,
               modelOutputLimitOverrides: [
@@ -1377,6 +1411,7 @@ export class OpenCodeExecutionProbe {
     input.params.runtimeDeadline?.throwIfExpired('execution_submit')
     return withOAuthRefreshLock({
       authPath: input.host.profile.managedAuthPath,
+      boundedPaths: input.host.profile.boundedPaths,
       providerId,
       abortSignal: input.params.runtimeDeadline?.signal,
       operation: () => this.runProbeModelWithHostUnlocked(input),
@@ -1412,6 +1447,7 @@ export class OpenCodeExecutionProbe {
         await this.fanOutOAuthCredential({
           providerId: 'xai',
           sourceAuthPath: host.profile.managedAuthPath,
+          boundedPaths: host.profile.boundedPaths,
         }).catch(error => {
           result.diagnostics.push(
             `OpenCode xAI OAuth credential sync failed: ${error instanceof Error ? error.message : String(error)}`,

@@ -1,3 +1,4 @@
+import { canonicalPreparedProfile, projectPreparedProfile } from './OpenCodePreparedProfileContract.js'
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodePreflightLease.js'
 export { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID, createOpenCodePreflightHostLeaseInput } from './OpenCodePreflightLease.js'
 import { buildResolvedConfigFingerprint } from './OpenCodeResolvedConfigFingerprint.js'
@@ -1674,6 +1675,7 @@ export class OpenCodeHostManager {
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
+    if (params.preparedProfile?.boundedPaths) throw new Error('opencode_bounded_runtime_UNMOUNTED')
     const profile = params.preparedProfile ?? await raceOpenCodeAbortSignal(
       this.prepareProfile(params.projectPath, {
         ...params.profileOptions,
@@ -1681,6 +1683,7 @@ export class OpenCodeHostManager {
       }),
       params.abortSignal,
     )
+    if (profile.boundedPaths) throw new Error('opencode_bounded_runtime_UNMOUNTED')
     const binaryPath = resolveOpenCodeBinaryPath()
     // Test/custom process factories do not prove which executable they run;
     // only the production resolver/spawn path may publish artifact identity.
@@ -1844,6 +1847,11 @@ export class OpenCodeHostManager {
       const initialLease = await prepare(() => custody.prepareLeaseToken(params.lease!))
       if (!consume(initialLease)) throw new Error('OpenCode supervised session admission unavailable')
       const profile = await wait(() => custody.readPreparedProfile())
+      if ((profile.boundedPaths || params.preparedProfile?.boundedPaths) &&
+        (!params.preparedProfile || canonicalPreparedProfile(projectPreparedProfile(params.preparedProfile)) !==
+          canonicalPreparedProfile(projectPreparedProfile(profile)))) {
+        throw new Error('OpenCode supervised bounded profile substitution')
+      }
       if (params.preparedProfile && ['projectPath', 'profileRootKey', 'profileRootPath',
         'projectBehaviorFingerprint', 'managedConfigFingerprint', 'managedAuthFingerprint',
         'sourceAuthFingerprint', 'sourceAuthSources'].some(key =>

@@ -1,3 +1,5 @@
+import { canonicalPreparedProfile, projectPreparedProfile } from '../../../../services/opencode/OpenCodePreparedProfileContract.js'
+import { boundedPeerAuthPaths, type OpenCodeBoundedExecutionPaths, type OpenCodeBoundedProfileLifetime } from '../../../../services/opencode/OpenCodeBoundedPaths.js'
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
@@ -60,6 +62,7 @@ import type {
   OpenCodeExecutionProbeResult,
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
+  OpenCodePreparedProfile,
   OpenCodeProviderAuthMethod,
   OpenCodeProviderOAuthAuthorization,
   OpenCodeProviderOAuthAuthorizeInput,
@@ -116,10 +119,15 @@ import type {
 } from '../../ports/ProviderManagementPorts.js'
 
 type OpenCodeInventoryServiceLike = {
+  /** In a bounded installation Root supplies an admitted retained-inventory
+   * lookup here, under its own live custody; never desktop discovery/preparation. */
   probe(
     projectPath?: string | null,
     options?: Parameters<typeof openCodeInventoryService.probe>[1],
   ): ReturnType<typeof openCodeInventoryService.probe>
+  /** Observe the retained view after an action; never prepare or discover ambient paths. */
+  probePrepared?(profile: OpenCodePreparedProfile,
+    options?: Parameters<typeof openCodeInventoryService.probe>[1]): ReturnType<typeof openCodeInventoryService.probe>
   clearCache?(): void
 }
 
@@ -153,37 +161,43 @@ type OpenCodeClientFactoryLike = {
 }
 
 type OpenCodeProviderManagementAdapterDeps = {
+  boundedProfileLifetime?: OpenCodeBoundedProfileLifetime
   inventoryService?: OpenCodeInventoryServiceLike
   hostManager?: OpenCodeHostManagerLike
   clientFactory?: OpenCodeClientFactoryLike
   authStore?: {
     upsertApiAuth?(input: {
+      boundedPaths?: OpenCodeBoundedExecutionPaths
       authPath: string
       providerId: string
       auth: OpenCodeApiAuthInput
     }): Promise<void>
     upsertApiKey?(input: {
+      boundedPaths?: OpenCodeBoundedExecutionPaths
       authPath: string
       providerId: string
       apiKey: string
       metadata?: Record<string, string> | null
     }): Promise<void>
     readCredential?(input: {
+      boundedPaths?: OpenCodeBoundedExecutionPaths
       authPath: string
       providerId: string
     }): Promise<OpenCodeAuthCredential | null>
     upsertCredential?(input: {
+      boundedPaths?: OpenCodeBoundedExecutionPaths
       authPath: string
       providerId: string
       credential: OpenCodeAuthCredential
     }): Promise<void>
-    removeCredential(input: { authPath: string; providerId: string }): Promise<void>
+    removeCredential(input: { boundedPaths?: OpenCodeBoundedExecutionPaths; authPath: string; providerId: string }): Promise<void>
   }
   profileManager?: {
     listManagedAuthPaths(): Promise<string[]>
   }
   executionProbe?: {
     probeModel(input: {
+      preparedProfile?: OpenCodePreparedProfile
       selectedModel: string
       projectPath?: string | null
       prompt?: string
@@ -2986,7 +3000,11 @@ export class OpenCodeProviderManagementAdapter
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
   private hostLeaseSequence = 0
 
-  constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
+  constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {
+    if (deps.boundedProfileLifetime && !deps.inventoryService) {
+      throw new Error('opencode_bounded_inventory_UNMOUNTED')
+    }
+  }
 
   private createProviderManagementHostLease(): OpenCodeHostLeaseInput {
     return {
@@ -3078,7 +3096,16 @@ export class OpenCodeProviderManagementAdapter
     inventoryService: OpenCodeInventoryServiceLike,
     projectPath?: string | null,
     options?: Parameters<typeof openCodeInventoryService.probe>[1],
+    preparedProfile?: OpenCodePreparedProfile,
   ): Promise<OpenCodeInventorySnapshot> {
+    if (preparedProfile?.boundedPaths) {
+      if (!inventoryService.probePrepared) throw new Error('opencode_bounded_inventory_UNMOUNTED')
+      const refreshed = await inventoryService.probePrepared(preparedProfile, options)
+      if (refreshed.profile !== preparedProfile || refreshed.projectPath !== preparedProfile.projectPath) {
+        throw new Error('opencode_bounded_inventory_profile')
+      }
+      return refreshed
+    }
     const abortController = new AbortController()
     const progress = createOpenCodeInventoryProbeProgressTracker()
     return withOpenCodeInventoryProbeTimeout(
@@ -3101,7 +3128,7 @@ export class OpenCodeProviderManagementAdapter
     )
   }
 
-  private getAuthStore() {
+  private getAuthStore(boundedPaths?: OpenCodeBoundedExecutionPaths) {
     const configured = this.deps.authStore
     return {
       upsertApiAuth: async (input: {
@@ -3110,11 +3137,12 @@ export class OpenCodeProviderManagementAdapter
         auth: OpenCodeApiAuthInput
       }) => {
         if (configured?.upsertApiAuth) {
-          await configured.upsertApiAuth(input)
+          await configured.upsertApiAuth({ ...input, boundedPaths })
           return
         }
         if (configured?.upsertApiKey) {
           await configured.upsertApiKey({
+            boundedPaths,
             authPath: input.authPath,
             providerId: input.providerId,
             apiKey: input.auth.key,
@@ -3122,13 +3150,12 @@ export class OpenCodeProviderManagementAdapter
           })
           return
         }
-        await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth)
+        await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth, boundedPaths)
       },
-      upsertApiKey: configured?.upsertApiKey ?? upsertOpenCodeApiAuthCredential,
-      readCredential: configured?.readCredential ?? readOpenCodeAuthCredential,
-      upsertCredential: configured?.upsertCredential ?? upsertOpenCodeAuthCredential,
-      removeCredential: removeOpenCodeAuthCredential,
-      ...(configured?.removeCredential ? { removeCredential: configured.removeCredential } : {}),
+      upsertApiKey: (input: Parameters<typeof upsertOpenCodeApiAuthCredential>[0]) => (configured?.upsertApiKey ?? upsertOpenCodeApiAuthCredential)({ ...input, boundedPaths }),
+      readCredential: (input: Parameters<typeof readOpenCodeAuthCredential>[0]) => (configured?.readCredential ?? readOpenCodeAuthCredential)({ ...input, boundedPaths }),
+      upsertCredential: (input: Parameters<typeof upsertOpenCodeAuthCredential>[0]) => (configured?.upsertCredential ?? upsertOpenCodeAuthCredential)({ ...input, boundedPaths }),
+      removeCredential: (input: Parameters<typeof removeOpenCodeAuthCredential>[0]) => (configured?.removeCredential ?? removeOpenCodeAuthCredential)({ ...input, boundedPaths }),
     }
   }
 
@@ -3160,6 +3187,7 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async rollbackProviderAuth(input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     client: OpenCodeProviderManagementClient
     providerId: string
     authPaths: readonly (string | null | undefined)[]
@@ -3170,7 +3198,7 @@ export class OpenCodeProviderManagementAdapter
       await input.client.deleteProviderAuth(input.providerId).catch(() => undefined)
     }
 
-    const authStore = this.getAuthStore()
+    const authStore = this.getAuthStore(input.boundedPaths)
     await Promise.all(
       input.authPaths
         .filter((authPath): authPath is string => Boolean(authPath))
@@ -3192,10 +3220,11 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async captureProviderAuthSnapshot(input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     providerId: string
     authPaths: readonly string[]
   }): Promise<ReadonlyMap<string, OpenCodeAuthCredential | null>> {
-    const authStore = this.getAuthStore()
+    const authStore = this.getAuthStore(input.boundedPaths)
     const uniquePaths = Array.from(new Set(input.authPaths))
     const credentials = await Promise.all(
       uniquePaths.map(authPath =>
@@ -3222,6 +3251,7 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async clearOAuthCredentialBaseline(input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     client: OpenCodeProviderManagementClient
     providerId: string
     authPaths: readonly string[]
@@ -3238,7 +3268,7 @@ export class OpenCodeProviderManagementAdapter
       return { ok: true, value: false }
     }
 
-    const authStore = this.getAuthStore()
+    const authStore = this.getAuthStore(input.boundedPaths)
     try {
       const deleted = await input.client.deleteProviderAuth(input.providerId)
       if (deleted !== true) {
@@ -3250,6 +3280,7 @@ export class OpenCodeProviderManagementAdapter
         ),
       )
       const cleared = await this.captureProviderAuthSnapshot({
+        boundedPaths: input.boundedPaths,
         providerId: input.providerId,
         authPaths: input.authPaths,
       })
@@ -3259,6 +3290,7 @@ export class OpenCodeProviderManagementAdapter
       return { ok: true, value: true }
     } catch (error) {
       await this.rollbackProviderAuth({
+        boundedPaths: input.boundedPaths,
         client: input.client,
         providerId: input.providerId,
         authPaths: input.authPaths,
@@ -3275,13 +3307,14 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async waitForNewOAuthCredential(input: {
+    boundedPaths?: OpenCodeBoundedExecutionPaths
     authPath: string
     providerId: string
     previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
     acceptEquivalentCredential?: boolean
     signal: AbortSignal
   }): Promise<OpenCodeAuthCredential | null> {
-    const authStore = this.getAuthStore()
+    const authStore = this.getAuthStore(input.boundedPaths)
     while (!input.signal.aborted) {
       try {
         const credential = await authStore.readCredential({
@@ -3348,6 +3381,7 @@ export class OpenCodeProviderManagementAdapter
         probeResult = await this.getExecutionProbe().probeModel({
           selectedModel: validationModelId,
           projectPath: input.inventory.projectPath,
+          ...(input.inventory.profile?.boundedPaths ? { preparedProfile: input.inventory.profile } : {}),
           // Keep the probe's provider-safe output budget. Reasoning models can
           // exhaust tiny overrides before emitting the verification response.
           bypassCache: true,
@@ -3426,6 +3460,7 @@ export class OpenCodeProviderManagementAdapter
       secretToRedact?: string | null
       inventoryMode?: 'full' | 'summary' | 'profile'
       hostLifetime?: 'persistent' | 'process'
+      preparedInventory?: OpenCodeInventorySnapshot
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3437,7 +3472,7 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, projectPath, {
+    const inventory = options.preparedInventory ?? await this.probeInventory(inventoryService, projectPath, {
       mode: options.inventoryMode ?? 'full',
     })
 
@@ -3451,6 +3486,12 @@ export class OpenCodeProviderManagementAdapter
       )
     }
 
+    const boundedProfile = inventory.profile?.boundedPaths ? inventory.profile : undefined
+    const lifetime = this.deps.boundedProfileLifetime
+    if (boundedProfile && (!lifetime || !inventoryService.probePrepared
+      || !this.deps.hostManager || !this.deps.clientFactory || !this.deps.executionProbe)) {
+      return providerManagementError('runtime-unhealthy', 'opencode_bounded_runtime_UNMOUNTED')
+    }
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
@@ -3459,33 +3500,52 @@ export class OpenCodeProviderManagementAdapter
       ? this.createProviderManagementHostLease()
       : null
 
+    const execute = async (): Promise<ProviderManagementResult<T>> => {
+      try {
+        if (boundedProfile && inventory.projectPath !== boundedProfile.projectPath) {
+          throw new Error('opencode_bounded_inventory_profile')
+        }
+        host = await hostManager.ensureHost({
+          projectPath: inventory.projectPath,
+          ...(boundedProfile ? { preparedProfile: boundedProfile } : {}),
+          hostLifetime,
+          resolveConfigFingerprint: false,
+          ...(hostLease ? { lease: hostLease } : {}),
+        })
+        if (boundedProfile && host.profile !== boundedProfile) {
+          // The actual host manager may restore an equivalent retained profile.
+          if (canonicalPreparedProfile(projectPreparedProfile(host.profile)) !==
+            canonicalPreparedProfile(projectPreparedProfile(boundedProfile))) {
+            throw new Error('opencode_bounded_host_profile')
+          }
+        }
+        if (hostLease) {
+          hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+        }
+        const client = clientFactory.create(host.baseUrl)
+        return await run({ inventory, inventoryService, host, client })
+      } catch (error) {
+        const rawMessage = error instanceof Error ? error.message : String(error)
+        return providerManagementError(
+          options.failureCode ?? 'runtime-unhealthy',
+          redactSecret(rawMessage, options.secretToRedact),
+        )
+      } finally {
+        if (host) {
+          await this.releaseProviderManagementHost(hostManager, host, hostLease)
+          await hostManager
+            .releaseHost(host.hostKey, {
+              keepPersistentAlive: hostLifetime === 'persistent',
+            })
+            .catch(() => undefined)
+        }
+      }
+    }
     try {
-      host = await hostManager.ensureHost({
-        projectPath: inventory.projectPath,
-        hostLifetime,
-        resolveConfigFingerprint: false,
-        ...(hostLease ? { lease: hostLease } : {}),
-      })
-      if (hostLease) {
-        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
-      }
-      const client = clientFactory.create(host.baseUrl)
-      return await run({ inventory, inventoryService, host, client })
+      return await (boundedProfile ? lifetime!.withCurrentProfile(boundedProfile, execute) : execute())
     } catch (error) {
-      const rawMessage = error instanceof Error ? error.message : String(error)
-      return providerManagementError(
-        options.failureCode ?? 'runtime-unhealthy',
-        redactSecret(rawMessage, options.secretToRedact),
-      )
-    } finally {
-      if (host) {
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        await hostManager
-          .releaseHost(host.hostKey, {
-            keepPersistentAlive: hostLifetime === 'persistent',
-          })
-          .catch(() => undefined)
-      }
+      return providerManagementError(options.failureCode ?? 'runtime-unhealthy',
+        redactSecret(error instanceof Error ? error.message : String(error), options.secretToRedact))
     }
   }
 
@@ -3533,56 +3593,69 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     }
+    const boundedProfile = inventory.profile?.boundedPaths ? inventory.profile : undefined
+    const lifetime = this.deps.boundedProfileLifetime
+    if (boundedProfile && (!lifetime || !this.deps.hostManager || !this.deps.clientFactory)) {
+      return providerManagementError('runtime-unhealthy', 'opencode_bounded_runtime_UNMOUNTED')
+    }
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = this.createProviderManagementHostLease()
 
-    try {
-      host = await hostManager.ensureHost({
-        projectPath: inventory.projectPath,
-        preparedProfile: inventory.profile ?? undefined,
-        profileOptions: {
-          includeAppMcp: false,
-        },
-        hostLifetime: 'persistent',
-        resolveConfigFingerprint: false,
-        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
-        lease: hostLease,
-      })
-      hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
-      const client = clientFactory.create(host.baseUrl)
+    const execute = async (): Promise<ProviderManagementResult<ProviderManagementView>> => {
+      try {
+        if (boundedProfile && inventory.projectPath !== boundedProfile.projectPath) throw new Error('opencode_bounded_inventory_profile')
+        host = await hostManager.ensureHost({
+          projectPath: inventory.projectPath,
+          preparedProfile: inventory.profile ?? undefined,
+          profileOptions: boundedProfile ? { toolApprovalMode: 'manual' } : { includeAppMcp: false },
+          hostLifetime: 'persistent',
+          resolveConfigFingerprint: false,
+          healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+          lease: hostLease,
+        })
+        if (boundedProfile && canonicalPreparedProfile(projectPreparedProfile(host.profile)) !==
+          canonicalPreparedProfile(projectPreparedProfile(boundedProfile))) throw new Error('opencode_bounded_host_profile')
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+        const client = clientFactory.create(host.baseUrl)
 
-      return {
-        ok: true,
-        value: await readLiveView({
-          inventory,
-          host,
-          client,
-          diagnostics: inventory.diagnostics,
-        }),
+        return {
+          ok: true,
+          value: await readLiveView({
+            inventory,
+            host,
+            client,
+            diagnostics: inventory.diagnostics,
+          }),
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return {
+          ok: true,
+          value: buildView({
+            inventory,
+            host,
+            configProviders: null,
+            providers: null,
+            providerAuth: null,
+            diagnostics: [...inventory.diagnostics, message],
+            hostStartError: host ? null : message,
+          }),
+        }
+      } finally {
+        if (host) {
+          await this.releaseProviderManagementHost(hostManager, host, hostLease)
+          await hostManager
+            .releaseHost(host.hostKey, { keepPersistentAlive: true })
+            .catch(() => undefined)
+        }
       }
+    }
+    try {
+      return await (boundedProfile ? lifetime!.withCurrentProfile(boundedProfile, execute) : execute())
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return {
-        ok: true,
-        value: buildView({
-          inventory,
-          host,
-          configProviders: null,
-          providers: null,
-          providerAuth: null,
-          diagnostics: [...inventory.diagnostics, message],
-          hostStartError: host ? null : message,
-        }),
-      }
-    } finally {
-      if (host) {
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: true })
-          .catch(() => undefined)
-      }
+      return providerManagementError('runtime-unhealthy', error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -3649,6 +3722,11 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
+    const boundedProfile = inventory.profile?.boundedPaths ? inventory.profile : undefined
+    const lifetime = this.deps.boundedProfileLifetime
+    if (boundedProfile && (!lifetime || !this.deps.hostManager || !this.deps.clientFactory)) {
+      return providerManagementError('runtime-unhealthy', 'opencode_bounded_runtime_UNMOUNTED')
+    }
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = input.refresh ? 'process' : 'persistent'
@@ -3657,141 +3735,149 @@ export class OpenCodeProviderManagementAdapter
       ? this.createProviderManagementHostLease()
       : null
 
-    try {
-      host = await hostManager.ensureHost({
-        projectPath: inventory.projectPath,
-        preparedProfile: inventory.profile ?? undefined,
-        profileOptions: {
-          includeAppMcp: false,
-        },
-        hostLifetime,
-        resolveConfigFingerprint: false,
-        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
-        ...(hostLease ? { lease: hostLease } : {}),
-      })
-      if (hostLease) {
-        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
-      }
-      const cacheKey = this.getDirectoryCacheKey({
-        runtimeId: input.runtimeId,
-        inventory,
-        host,
-      })
-      if (!input.refresh) {
-        const cached = this.readDirectoryCache(cacheKey)
-        if (cached) {
-          return {
-            ok: true,
-            value: filterAndPageProviderDirectory({
-              directory: cached.value,
-              modelIdsByProviderId: cached.modelIdsByProviderId,
-              query: input.query,
-              filter: input.filter,
-              limit: input.limit,
-              cursor: input.cursor,
-            }),
+    const execute = async (): Promise<ProviderManagementResult<ProviderDirectoryView>> => {
+      try {
+        if (boundedProfile && inventory.projectPath !== boundedProfile.projectPath) throw new Error('opencode_bounded_inventory_profile')
+        host = await hostManager.ensureHost({
+          projectPath: inventory.projectPath,
+          preparedProfile: inventory.profile ?? undefined,
+          profileOptions: boundedProfile ? { toolApprovalMode: 'manual' } : { includeAppMcp: false },
+          hostLifetime,
+          resolveConfigFingerprint: false,
+          healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+          ...(hostLease ? { lease: hostLease } : {}),
+        })
+        if (boundedProfile && canonicalPreparedProfile(projectPreparedProfile(host.profile)) !==
+          canonicalPreparedProfile(projectPreparedProfile(boundedProfile))) throw new Error('opencode_bounded_host_profile')
+        if (hostLease) {
+          hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+        }
+        const cacheKey = this.getDirectoryCacheKey({
+          runtimeId: input.runtimeId,
+          inventory,
+          host,
+        })
+        if (!input.refresh) {
+          const cached = this.readDirectoryCache(cacheKey)
+          if (cached) {
+            return {
+              ok: true,
+              value: filterAndPageProviderDirectory({
+                directory: cached.value,
+                modelIdsByProviderId: cached.modelIdsByProviderId,
+                query: input.query,
+                filter: input.filter,
+                limit: input.limit,
+                cursor: input.cursor,
+              }),
+            }
           }
         }
-      }
 
-      const client = clientFactory.create(host.baseUrl)
-      const serverDocRead = client.getServerDoc
-        ? safeRead(() => client.getServerDoc!())
-        : Promise.resolve({
-            ok: true,
-            value: null,
-          } as SafeValue<OpenCodeServerDocResponse | null>)
-      const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
-        await Promise.all([
-          safeRead(() => client.getConfigProviders()),
-          safeRead(() => client.getProviders()),
-          safeRead(() => client.getProviderAuth()),
-          serverDocRead,
-        ])
-      const directoryVersion = inventory.version ?? host.version
-      const {
-        connectedProviders: directoryConnectedProviders,
-        unsupportedSuperGrokOAuth,
-      } = filterOpenCodeConnectedProvidersForRuntime({
-        providers: inventory.connectedProviders,
-        version: directoryVersion,
-      })
-      const directoryInventory = {
-        ...inventory,
-        version: directoryVersion,
-        connectedProviders: directoryConnectedProviders,
-        diagnostics: [
-          ...inventory.diagnostics.filter(
-            diagnostic => !diagnostic.startsWith('SuperGrok OAuth requires OpenCode '),
-          ),
-          ...(unsupportedSuperGrokOAuth
-            ? [
-                `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${directoryVersion}`,
-              ]
-            : []),
-        ],
-      }
-      const diagnostics = [
-        ...directoryInventory.diagnostics,
-        ...safeReadDiagnostics(configProvidersResult),
-        ...safeReadDiagnostics(providersResult),
-        ...safeReadDiagnostics(providerAuthResult),
-        ...safeReadDiagnostics(serverDocResult),
-      ]
-      const directorySource = {
-        inventory: directoryInventory,
-        configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-        providers: providersResult.ok ? providersResult.value : null,
-        providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
-        capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
-        diagnostics,
-      }
-      const uncachedDirectory = buildProviderDirectory({
-        ...directorySource,
-        query: null,
-        filter: 'all',
-        limit: Number.MAX_SAFE_INTEGER,
-        cursor: null,
-      })
-      this.writeDirectoryCache(
-        cacheKey,
-        uncachedDirectory,
-        buildProviderDirectoryModelSearchIndex(directorySource),
-      )
-
-      return {
-        ok: true,
-        value: buildProviderDirectory({
+        const client = clientFactory.create(host.baseUrl)
+        const serverDocRead = client.getServerDoc
+          ? safeRead(() => client.getServerDoc!())
+          : Promise.resolve({
+              ok: true,
+              value: null,
+            } as SafeValue<OpenCodeServerDocResponse | null>)
+        const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+          await Promise.all([
+            safeRead(() => client.getConfigProviders()),
+            safeRead(() => client.getProviders()),
+            safeRead(() => client.getProviderAuth()),
+            serverDocRead,
+          ])
+        const directoryVersion = inventory.version ?? host.version
+        const {
+          connectedProviders: directoryConnectedProviders,
+          unsupportedSuperGrokOAuth,
+        } = filterOpenCodeConnectedProvidersForRuntime({
+          providers: inventory.connectedProviders,
+          version: directoryVersion,
+        })
+        const directoryInventory = {
+          ...inventory,
+          version: directoryVersion,
+          connectedProviders: directoryConnectedProviders,
+          diagnostics: [
+            ...inventory.diagnostics.filter(
+              diagnostic => !diagnostic.startsWith('SuperGrok OAuth requires OpenCode '),
+            ),
+            ...(unsupportedSuperGrokOAuth
+              ? [
+                  `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${directoryVersion}`,
+                ]
+              : []),
+          ],
+        }
+        const diagnostics = [
+          ...directoryInventory.diagnostics,
+          ...safeReadDiagnostics(configProvidersResult),
+          ...safeReadDiagnostics(providersResult),
+          ...safeReadDiagnostics(providerAuthResult),
+          ...safeReadDiagnostics(serverDocResult),
+        ]
+        const directorySource = {
+          inventory: directoryInventory,
+          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
+          providers: providersResult.ok ? providersResult.value : null,
+          providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+          capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
+          diagnostics,
+        }
+        const uncachedDirectory = buildProviderDirectory({
           ...directorySource,
-          query: input.query,
-          filter: input.filter,
-          limit: input.limit,
-          cursor: input.cursor,
-        }),
+          query: null,
+          filter: 'all',
+          limit: Number.MAX_SAFE_INTEGER,
+          cursor: null,
+        })
+        this.writeDirectoryCache(
+          cacheKey,
+          uncachedDirectory,
+          buildProviderDirectoryModelSearchIndex(directorySource),
+        )
+
+        return {
+          ok: true,
+          value: buildProviderDirectory({
+            ...directorySource,
+            query: input.query,
+            filter: input.filter,
+            limit: input.limit,
+            cursor: input.cursor,
+          }),
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return {
+          ok: true,
+          value: buildProviderDirectory({
+            inventory,
+            configProviders: null,
+            providers: null,
+            providerAuth: null,
+            diagnostics: [...inventory.diagnostics, message],
+            query: input.query,
+            filter: input.filter,
+            limit: input.limit,
+            cursor: input.cursor,
+          }),
+        }
+      } finally {
+        if (host) {
+          await this.releaseProviderManagementHost(hostManager, host, hostLease)
+          await hostManager
+            .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
+            .catch(() => undefined)
+        }
       }
+    }
+    try {
+      return await (boundedProfile ? lifetime!.withCurrentProfile(boundedProfile, execute) : execute())
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return {
-        ok: true,
-        value: buildProviderDirectory({
-          inventory,
-          configProviders: null,
-          providers: null,
-          providerAuth: null,
-          diagnostics: [...inventory.diagnostics, message],
-          query: input.query,
-          filter: input.filter,
-          limit: input.limit,
-          cursor: input.cursor,
-        }),
-      }
-    } finally {
-      if (host) {
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
-          .catch(() => undefined)
-      }
+      return providerManagementError('runtime-unhealthy', error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -3960,16 +4046,33 @@ export class OpenCodeProviderManagementAdapter
       )
     }
 
-    return withOpenCodeOAuthRefreshLock({
+    const profile = inventory.profile!
+    const lifetime = this.deps.boundedProfileLifetime
+    if (profile.boundedPaths && (!lifetime || !inventoryService.probePrepared
+      || !this.deps.hostManager || !this.deps.clientFactory || !this.deps.executionProbe)) {
+      return providerManagementError('runtime-unhealthy', 'opencode_bounded_runtime_UNMOUNTED')
+    }
+    const execute = () => withOpenCodeOAuthRefreshLock({
       authPath: managedAuthPath,
+      boundedPaths: profile.boundedPaths,
       providerId: 'xai',
-      operation: () => this.connectProviderWithOAuthUnlocked(input, observer),
+      // The bounded outer lease and inner action must share this admission.
+      operation: () => this.connectProviderWithOAuthUnlocked(input, observer,
+        profile.boundedPaths ? inventory : undefined),
     })
+    if (!profile.boundedPaths) return execute()
+    try {
+      if (inventory.projectPath !== profile.projectPath) throw new Error('opencode_bounded_inventory_profile')
+      return await lifetime!.withCurrentProfile(profile, execute)
+    } catch (error) {
+      return providerManagementError('auth-failed', error instanceof Error ? error.message : String(error))
+    }
   }
 
   private async connectProviderWithOAuthUnlocked(
     input: ConnectProviderInput,
     observer: ProviderOAuthFlowObserver | undefined,
+    preparedInventory?: OpenCodeInventorySnapshot,
   ): Promise<ProviderManagementResult<ProviderConnection>> {
     const providerId = normalizeProviderId(input.providerId)
     const methodIndex = normalizeOAuthMethodIndex(input.authMethodIndex)
@@ -4089,7 +4192,7 @@ export class OpenCodeProviderManagementAdapter
 
         const authPaths = new Set<string>([managedAuthPath, globalAuthPath])
         try {
-          for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
+          for (const authPath of (inventory.profile?.boundedPaths ? boundedPeerAuthPaths(inventory.profile.boundedPaths) : await this.getProfileManager().listManagedAuthPaths())) {
             authPaths.add(authPath)
           }
         } catch (error) {
@@ -4103,6 +4206,7 @@ export class OpenCodeProviderManagementAdapter
         let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
         try {
           previousCredentials = await this.captureProviderAuthSnapshot({
+            boundedPaths: inventory.profile?.boundedPaths,
             providerId,
             authPaths: Array.from(authPaths),
           })
@@ -4164,6 +4268,7 @@ export class OpenCodeProviderManagementAdapter
         }
 
         const credentialBaselineResult = await this.clearOAuthCredentialBaseline({
+          boundedPaths: inventory.profile?.boundedPaths,
           client,
           providerId,
           authPaths: Array.from(authPaths),
@@ -4202,6 +4307,7 @@ export class OpenCodeProviderManagementAdapter
           callbackOutcome = await Promise.race([
             callbackOutcomePromise,
             this.waitForNewOAuthCredential({
+              boundedPaths: inventory.profile?.boundedPaths,
               authPath: managedAuthPath,
               providerId,
               previousCredentials,
@@ -4223,6 +4329,7 @@ export class OpenCodeProviderManagementAdapter
 
         if (callbackOutcome.kind === 'callback-error') {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4238,6 +4345,7 @@ export class OpenCodeProviderManagementAdapter
         }
         if (callbackOutcome.kind === 'callback' && callbackOutcome.completed !== true) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4250,7 +4358,7 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        const authStore = this.getAuthStore()
+        const authStore = this.getAuthStore(inventory.profile?.boundedPaths)
         if (!oauthCredential) {
           try {
             oauthCredential = await authStore.readCredential({
@@ -4259,6 +4367,7 @@ export class OpenCodeProviderManagementAdapter
             })
           } catch (error) {
             await this.rollbackProviderAuth({
+              boundedPaths: inventory.profile?.boundedPaths,
               client,
               providerId,
               authPaths: Array.from(authPaths),
@@ -4281,6 +4390,7 @@ export class OpenCodeProviderManagementAdapter
           )
         ) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4303,6 +4413,7 @@ export class OpenCodeProviderManagementAdapter
           }
         } catch (error) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4331,6 +4442,7 @@ export class OpenCodeProviderManagementAdapter
           {
             bypassCache: true,
           },
+          inventory.profile ?? undefined,
         )
         const refresh = useActionRefreshInventory(
           inventory,
@@ -4353,6 +4465,7 @@ export class OpenCodeProviderManagementAdapter
           !provider.ownership.includes('managed')
         ) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4372,6 +4485,7 @@ export class OpenCodeProviderManagementAdapter
         })
         if (!executionProof.ok) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: Array.from(authPaths),
@@ -4392,6 +4506,7 @@ export class OpenCodeProviderManagementAdapter
       {
         failureCode: 'auth-failed',
         hostLifetime: 'process',
+        preparedInventory,
       },
     )
   }
@@ -4527,6 +4642,7 @@ export class OpenCodeProviderManagementAdapter
         let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
         try {
           previousCredentials = await this.captureProviderAuthSnapshot({
+            boundedPaths: inventory.profile?.boundedPaths,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
           })
@@ -4544,6 +4660,7 @@ export class OpenCodeProviderManagementAdapter
           authApplied = await client.setProviderAuth(providerId, { ...authBody })
         } catch (error) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4557,6 +4674,7 @@ export class OpenCodeProviderManagementAdapter
         }
         if (authApplied !== true) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4576,7 +4694,7 @@ export class OpenCodeProviderManagementAdapter
         // from the updated managed auth store, and then prove providers that need
         // credential validation with a real model request.
 
-        const authStore = this.getAuthStore()
+        const authStore = this.getAuthStore(inventory.profile?.boundedPaths)
         try {
           await authStore.upsertApiAuth({
             authPath: globalAuthPath,
@@ -4590,6 +4708,7 @@ export class OpenCodeProviderManagementAdapter
           })
         } catch (error) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4608,6 +4727,7 @@ export class OpenCodeProviderManagementAdapter
           {
             bypassCache: true,
           },
+          inventory.profile ?? undefined,
         )
         const refresh = useActionRefreshInventory(
           inventory,
@@ -4624,6 +4744,7 @@ export class OpenCodeProviderManagementAdapter
         const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4637,6 +4758,7 @@ export class OpenCodeProviderManagementAdapter
         }
         if (provider.state !== 'connected' || !provider.ownership.includes('managed')) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4658,6 +4780,7 @@ export class OpenCodeProviderManagementAdapter
         })
         if (!executionProof.ok) {
           await this.rollbackProviderAuth({
+            boundedPaths: inventory.profile?.boundedPaths,
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
@@ -4714,10 +4837,10 @@ export class OpenCodeProviderManagementAdapter
         const authPaths = new Set<string>()
         if (inventory.profile?.globalAuthPath) authPaths.add(inventory.profile.globalAuthPath)
         if (inventory.profile?.managedAuthPath) authPaths.add(inventory.profile.managedAuthPath)
-        for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
+        for (const authPath of (inventory.profile?.boundedPaths ? boundedPeerAuthPaths(inventory.profile.boundedPaths) : await this.getProfileManager().listManagedAuthPaths())) {
           authPaths.add(authPath)
         }
-        const authStore = this.getAuthStore()
+        const authStore = this.getAuthStore(inventory.profile?.boundedPaths)
         for (const authPath of authPaths) {
           await authStore.removeCredential({ authPath, providerId })
         }
@@ -4728,6 +4851,7 @@ export class OpenCodeProviderManagementAdapter
           {
             bypassCache: true,
           },
+          inventory.profile ?? undefined,
         )
         const refresh = useActionRefreshInventory(
           inventory,
@@ -4847,6 +4971,7 @@ export class OpenCodeProviderManagementAdapter
           const probeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
             projectPath: inventory.projectPath,
+            ...(inventory.profile?.boundedPaths ? { preparedProfile: inventory.profile } : {}),
             bypassCache: true,
           })
           if (probeResult.outcome !== 'available') {
@@ -4895,6 +5020,7 @@ export class OpenCodeProviderManagementAdapter
           {
             bypassCache: true,
           },
+          inventory.profile ?? undefined,
         )
         const refresh = useActionRefreshInventory(
           inventory,
@@ -4953,6 +5079,7 @@ export class OpenCodeProviderManagementAdapter
             bypassCache: true,
             mode: 'summary',
           },
+          inventory.profile ?? undefined,
         )
         const refresh = useActionRefreshInventory(
           inventory,
@@ -5035,6 +5162,7 @@ export class OpenCodeProviderManagementAdapter
         const probe = await this.getExecutionProbe().probeModel({
           selectedModel: modelId,
           projectPath: inventory.projectPath,
+          ...(inventory.profile?.boundedPaths ? { preparedProfile: inventory.profile } : {}),
           bypassCache: true,
         })
         return {
@@ -5136,6 +5264,7 @@ export class OpenCodeProviderManagementAdapter
         const probe = await this.getExecutionProbe().probeModel({
           selectedModel: modelId,
           projectPath: inventory.projectPath,
+          ...(inventory.profile?.boundedPaths ? { preparedProfile: inventory.profile } : {}),
           contextTokens,
           outputTokens,
           bypassCache: true,

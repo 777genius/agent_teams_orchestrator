@@ -1,3 +1,4 @@
+import { boundedPathsIdentity, validateOpenCodeBoundedPaths, assertBoundedAuthObjects, boundedCoordinationDatabase, type OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir } from 'node:fs/promises'
@@ -39,6 +40,8 @@ type AuthCoordinationLockRow = {
 }
 
 type AuthCoordinationLease = {
+  logicalAuthority: string
+  boundedIdentity: string | null
   active: boolean
 }
 
@@ -84,7 +87,8 @@ export function resolveOpenCodeAuthCoordinationPath(filePath: string): string {
   return path.join(resolved.slice(0, profileMarkerIndex), 'opencode', 'auth.json')
 }
 
-function getCoordinationDatabasePath(authPath: string): string {
+export function getCoordinationDatabasePath(authPath: string, boundedPaths?: OpenCodeBoundedExecutionPaths): string {
+  if (boundedPaths) return boundedCoordinationDatabase(authPath, boundedPaths)
   return `${resolveOpenCodeAuthCoordinationPath(authPath)}.agent-teams-coordination.sqlite`
 }
 
@@ -194,19 +198,28 @@ async function releaseCoordinationLock(input: {
 
 export async function withOpenCodeAuthCoordinationLock<T>(input: {
   authPath: string
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   operation: () => Promise<T>
   timeoutMs?: number
   description?: string
   abortSignal?: AbortSignal
 }): Promise<T> {
   if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
-  const databasePath = getCoordinationDatabasePath(input.authPath)
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths) }
+  const databasePath = getCoordinationDatabasePath(input.authPath, input.boundedPaths)
   const inheritedLocks = heldCoordinationLocks.getStore()
+  const logicalAuthority = resolveOpenCodeAuthCoordinationPath(input.authPath)
+  const boundedIdentity = input.boundedPaths ? boundedPathsIdentity(input.boundedPaths) : null
+  for (const [heldPath, lease] of inheritedLocks ?? []) {
+    if (lease.active && lease.logicalAuthority === logicalAuthority
+      && (heldPath !== databasePath || lease.boundedIdentity !== boundedIdentity)) throw new Error('opencode_bounded_coordination_mismatch')
+  }
   if (inheritedLocks?.get(databasePath)?.active) {
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     return input.operation()
   }
 
+  if (input.boundedPaths) await assertBoundedAuthObjects(input.boundedPaths)
   await mkdir(path.dirname(databasePath), { recursive: true })
   const timeoutMs = Math.max(1, input.timeoutMs ?? AUTH_COORDINATION_LOCK_TIMEOUT_MS)
   const deadlineMs = Date.now() + timeoutMs
@@ -227,7 +240,7 @@ export async function withOpenCodeAuthCoordinationLock<T>(input: {
     )
   }
 
-  const lease: AuthCoordinationLease = { active: true }
+  const lease: AuthCoordinationLease = { active: true, logicalAuthority, boundedIdentity }
   const activeLocks = new Map(inheritedLocks)
   activeLocks.set(databasePath, lease)
   try {

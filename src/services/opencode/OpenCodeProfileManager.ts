@@ -1,3 +1,4 @@
+import { boundedPeerAuthPaths, validateOpenCodeBoundedPaths, type OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import os from 'node:os'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
@@ -30,11 +31,13 @@ export class OpenCodeProfileManager {
   }
 
   async listManagedAuthPaths(): Promise<string[]> { return listPreparedAuthPaths(this.paths.data) }
-  async fanOutOAuthCredential(providerId: string, sourceAuthPath: string): Promise<void> {
+  async fanOutOAuthCredential(providerId: string, sourceAuthPath: string, boundedPaths?: OpenCodeBoundedExecutionPaths): Promise<void> {
+    if (boundedPaths) boundedPaths = validateOpenCodeBoundedPaths(boundedPaths)
     await fanOutOpenCodeOAuthCredential({
+      boundedPaths,
       providerId,
       sourceAuthPath,
-      targetAuthPaths: [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
+      targetAuthPaths: boundedPaths ? [boundedPaths.globalAuthPath,...boundedPeerAuthPaths(boundedPaths)] : [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
     })
   }
 

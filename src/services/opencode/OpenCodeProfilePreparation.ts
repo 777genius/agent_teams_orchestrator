@@ -1,5 +1,6 @@
+import { boundedPeerAuthPaths, assertBoundedPeerEntries, removeBoundedSelectionEnvironment, validateOpenCodeBoundedPaths, validateBoundedPreparationEnvironment, applyBoundedLocalMcp, resolveBoundedAuthPath, assertBoundedAuthObjects, type OpenCodeBoundedExecutionPaths } from './OpenCodeBoundedPaths.js'
 import { retainOpenCodeBehaviorInventory } from './OpenCodeBehaviorInventory.js'
-import { resolveOpenCodeAuthCoordinationPath } from './OpenCodeAuthCoordinationLock.js'
+import { withOpenCodeAuthCoordinationLock, resolveOpenCodeAuthCoordinationPath } from './OpenCodeAuthCoordinationLock.js'
 import { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
 export { buildManagedConfigFingerprint } from './OpenCodeManagedConfigFingerprint.js'
 import { execFile } from 'node:child_process'
@@ -259,20 +260,22 @@ function normalizePositiveInteger(value: number | undefined): number | null {
   return normalized > 0 ? normalized : null
 }
 
-async function readFingerprint(filePath: string): Promise<string | null> {
+async function readFingerprint(filePath: string, strict = false): Promise<string | null> {
   try {
     const content = await readFile(filePath)
     return hashBuffer(content)
-  } catch {
+  } catch (error) {
+    if (strict && getErrnoCode(error) !== 'ENOENT') throw error
     return null
   }
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
+async function fileExists(filePath: string, strict = false): Promise<boolean> {
   try {
     await stat(filePath)
     return true
-  } catch {
+  } catch (error) {
+    if (strict && getErrnoCode(error) !== 'ENOENT') throw error
     return false
   }
 }
@@ -795,6 +798,7 @@ function isFreshCursorAgentAuthMarker(
 }
 
 export async function ensureOpenCodeCursorPluginAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   globalAuthPath: string
   managedAuthPath: string
   cursorAgentExecutablePath: string
@@ -803,10 +807,19 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   probe?: CursorAgentAuthProbe
   now?: () => number
 }): Promise<boolean> {
+  if (input.boundedPaths) {
+    const c = validateOpenCodeBoundedPaths(input.boundedPaths)
+    const root = path.dirname(path.dirname(path.dirname(c.selectedAuthPath)))
+    if (input.globalAuthPath !== c.globalAuthPath || input.managedAuthPath !== c.selectedAuthPath
+      || input.cursorAgentExecutablePath !== path.join(root,'native-subscription-cli-bin','cursor-agent')
+      || input.platform !== 'linux' || input.probe || input.now) throw new Error('opencode_bounded_native_probe')
+    validateBoundedPreparationEnvironment(input.environment ?? {},c)
+    input = { ...input, boundedPaths:c }
+  }
   const now = (input.now ?? Date.now)()
   const [globalCredential, managedCredential] = await Promise.all([
-    readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
-    readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'cursor-acp' }),
+    readOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
+    readOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.managedAuthPath, providerId: 'cursor-acp' }),
   ])
   const explicitCredential = [globalCredential, managedCredential].find(
     credential => credential && !isCursorAgentAuthMarker(credential),
@@ -815,14 +828,14 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
     await Promise.all([
       globalCredential === explicitCredential
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.globalAuthPath,
             providerId: 'cursor-acp',
             credential: explicitCredential,
           }),
       managedCredential === explicitCredential
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.managedAuthPath,
             providerId: 'cursor-acp',
             credential: explicitCredential,
@@ -839,14 +852,14 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
     await Promise.all([
       JSON.stringify(globalCredential) === JSON.stringify(freshMarker)
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.globalAuthPath,
             providerId: 'cursor-acp',
             credential: freshMarker,
           }),
       JSON.stringify(managedCredential) === JSON.stringify(freshMarker)
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.managedAuthPath,
             providerId: 'cursor-acp',
             credential: freshMarker,
@@ -863,13 +876,13 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   if (!authenticated) {
     await Promise.all([
       isCursorAgentAuthMarker(globalCredential)
-        ? removeOpenCodeAuthCredential({
+        ? removeOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.globalAuthPath,
             providerId: 'cursor-acp',
           })
         : Promise.resolve(),
       isCursorAgentAuthMarker(managedCredential)
-        ? removeOpenCodeAuthCredential({
+        ? removeOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.managedAuthPath,
             providerId: 'cursor-acp',
           })
@@ -886,14 +899,14 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   await Promise.all([
     JSON.stringify(globalCredential) === JSON.stringify(credential)
       ? Promise.resolve()
-      : upsertOpenCodeAuthCredential({
+      : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
           authPath: input.globalAuthPath,
           providerId: 'cursor-acp',
           credential,
         }),
     JSON.stringify(managedCredential) === JSON.stringify(credential)
       ? Promise.resolve()
-      : upsertOpenCodeAuthCredential({
+      : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
           authPath: input.managedAuthPath,
           providerId: 'cursor-acp',
           credential,
@@ -903,6 +916,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
 }
 
 export async function ensureOpenCodeKiroPluginAuthCredential(input: {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   globalAuthPath: string
   managedAuthPath: string
   kiroCliExecutablePath: string
@@ -911,10 +925,19 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   probe?: KiroCliAuthProbe
   now?: () => number
 }): Promise<boolean> {
+  if (input.boundedPaths) {
+    const c = validateOpenCodeBoundedPaths(input.boundedPaths)
+    const root = path.dirname(path.dirname(path.dirname(c.selectedAuthPath)))
+    if (input.globalAuthPath !== c.globalAuthPath || input.managedAuthPath !== c.selectedAuthPath
+      || input.kiroCliExecutablePath !== path.join(root,'native-subscription-cli-bin','kiro-cli')
+      || input.platform !== 'linux' || input.probe || input.now) throw new Error('opencode_bounded_native_probe')
+    validateBoundedPreparationEnvironment(input.environment ?? {},c)
+    input = { ...input, boundedPaths:c }
+  }
   const now = (input.now ?? Date.now)()
   const [globalCredential, managedCredential] = await Promise.all([
-    readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
-    readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
+    readOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.globalAuthPath, providerId: 'kiro' }),
+    readOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.managedAuthPath, providerId: 'kiro' }),
   ])
   const existingCredential = globalCredential ?? managedCredential
   const authenticated = await (input.probe ?? probeKiroCliAuth)(
@@ -925,8 +948,8 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   if (!authenticated) {
     if (existingCredential) {
       await Promise.all([
-        removeOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
-        removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
+        removeOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.globalAuthPath, providerId: 'kiro' }),
+        removeOpenCodeAuthCredential({ boundedPaths: input.boundedPaths, authPath: input.managedAuthPath, providerId: 'kiro' }),
       ])
     }
     return false
@@ -943,14 +966,14 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
     await Promise.all([
       JSON.stringify(globalCredential) === JSON.stringify(existingCredential)
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.globalAuthPath,
             providerId: 'kiro',
             credential: existingCredential,
           }),
       JSON.stringify(managedCredential) === JSON.stringify(existingCredential)
         ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
+        : upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
             authPath: input.managedAuthPath,
             providerId: 'kiro',
             credential: existingCredential,
@@ -968,12 +991,12 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
     expires: now + 8 * 60 * 60 * 1000,
   }
   await Promise.all([
-    upsertOpenCodeAuthCredential({
+    upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
       authPath: input.globalAuthPath,
       providerId: 'kiro',
       credential,
     }),
-    upsertOpenCodeAuthCredential({
+    upsertOpenCodeAuthCredential({ boundedPaths: input.boundedPaths,
       authPath: input.managedAuthPath,
       providerId: 'kiro',
       credential,
@@ -994,13 +1017,21 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  boundedPaths?: OpenCodeBoundedExecutionPaths,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
-  const hostHomePath = (
+  const hostHomePath = boundedPaths?.nativeSubscriptionHomePath ?? ((
     platform === 'win32'
       ? hostEnv.USERPROFILE?.trim() || hostEnv.HOME?.trim()
       : hostEnv.HOME?.trim() || hostEnv.USERPROFILE?.trim()
-  ) || os.homedir()
-  const hostPath = hostEnv.PATH ?? ''
+  ) || os.homedir())
+  if (boundedPaths) {
+    boundedPaths = validateOpenCodeBoundedPaths(boundedPaths)
+    if (platform !== 'linux' || profileRootPath !== path.dirname(path.dirname(path.dirname(boundedPaths.selectedAuthPath)))) throw new Error('opencode_bounded_platform')
+    await assertBoundedAuthObjects(boundedPaths)
+    validateBoundedPreparationEnvironment(hostEnv, boundedPaths)
+    await mkdir(hostHomePath, { recursive: true })
+  }
+  const hostPath = boundedPaths?.nativeExecutables.path.join(path.delimiter) ?? hostEnv.PATH ?? ''
   const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
   await mkdir(binPath, { recursive: true })
@@ -1015,7 +1046,9 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   )
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
-    const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
+    const hostCommand = boundedPaths
+      ? (command === 'cursor-agent' ? boundedPaths.nativeExecutables.cursor : boundedPaths.nativeExecutables.kiro)
+      : command === 'cursor-agent' ? cursorAgentCommand : command
     if (platform === 'win32') {
       const bridgePath = path.join(binPath, `${command}.cmd`)
       const content = [
@@ -1046,6 +1079,15 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `export HOME=${quotePosixShellValue(hostHomePath)}`,
       `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
       'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
+      ...(boundedPaths ? [
+        `export XDG_STATE_HOME=${quotePosixShellValue(path.join(hostHomePath, '.local/state'))}`,
+        `export CURSOR_ACP_HOME_DIR=${quotePosixShellValue(hostHomePath)}`,
+        `export TMPDIR=${quotePosixShellValue(path.join(profileRootPath, 'tmp'))}`,
+        'export TMP="$TMPDIR" TEMP="$TMPDIR"',
+        'unset NODE_OPTIONS NODE_PATH BUN_OPTIONS LD_PRELOAD LD_LIBRARY_PATH',
+        'unset OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT CLAUDE_MULTIMODEL_DATA_HOME CLAUDE_MULTIMODEL_CACHE_HOME',
+        'unset NPM_CONFIG_CACHE npm_config_devdir PLAYWRIGHT_BROWSERS_PATH PUPPETEER_CACHE_DIR PIP_CACHE_DIR UV_CACHE_DIR',
+      ] : []),
       `export PATH=${quotePosixShellValue(hostPath)}`,
       ...(command === 'cursor-agent'
           ? [
@@ -1195,6 +1237,7 @@ export function orderOpenCodeAuthSyncSources(input: {
 }
 
 export interface OpenCodeProfilePreparationInput {
+  boundedPaths?: OpenCodeBoundedExecutionPaths
   projectPath: string
   paths: { data: string; cache: string }
   sourceHomePath: string
@@ -1208,7 +1251,16 @@ export interface OpenCodeProfilePreparationInput {
 }
 
 const profilePreparationLocks = new Map<string, Promise<void>>()
-export async function listPreparedAuthPaths(dataRoot: string): Promise<string[]> {
+export async function listPreparedAuthPaths(dataRoot: string, boundedPaths?: OpenCodeBoundedExecutionPaths): Promise<string[]> {
+    if (boundedPaths) {
+      const c = validateOpenCodeBoundedPaths(boundedPaths)
+      if (path.join(dataRoot,'opencode/auth.json') !== c.globalAuthPath) throw new Error('opencode_bounded_auth_authority')
+      let entries: Dirent[]
+      try { entries = await readdir(path.join(dataRoot,'opencode/profiles'),{withFileTypes:true}) }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; entries = [] }
+      assertBoundedPeerEntries(entries,c)
+      return boundedPeerAuthPaths(c)
+    }
     const profilesRootPath = path.join(dataRoot, 'opencode', 'profiles')
     let entries: Dirent[]
     try {
@@ -1266,6 +1318,9 @@ export async function withOpenCodeProfilePreparationLock<T>(
 /** Real preparation, with no desktop resolver or prepared-result callback. */
 export async function prepareOpenCodeProfile(input: OpenCodeProfilePreparationInput): Promise<OpenCodePreparedProfile> {
   validatePreparationInput(input)
+  if (input.boundedPaths) input = { ...input, boundedPaths: validateOpenCodeBoundedPaths(input.boundedPaths),
+    environment: { ...input.environment }, sourceAuthPaths: [...input.sourceAuthPaths], options: { ...input.options },
+    appMcpConfig: input.appMcpConfig ? structuredClone(input.appMcpConfig) : null }
   return withOpenCodeProfilePreparationLock(
     hashString(input.projectPath).slice(0, 16),
     () => prepareOpenCodeProfileUnderLock(input),
@@ -1286,11 +1341,44 @@ function validatePreparationInput(input: OpenCodeProfilePreparationInput): void 
   if (resolveOpenCodeAuthCoordinationPath(input.globalAuthPath) !== resolveOpenCodeAuthCoordinationPath(managedAuthPath)) {
     throw new Error('opencode_preparation_auth_authority')
   }
+  if (input.boundedPaths) {
+    const c = validateOpenCodeBoundedPaths(input.boundedPaths)
+    const root = path.dirname(path.dirname(path.dirname(managedAuthPath)))
+    const overlaps = (a: string, b: string) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/')
+    if (input.platform !== 'linux' || c.globalAuthPath !== input.globalAuthPath || c.selectedAuthPath !== managedAuthPath
+      || JSON.stringify(c.immutableAuthPaths) !== JSON.stringify(input.sourceAuthPaths)
+      || input.options.includeManagedSubscriptionPlugins === false || input.options.includeAppMcp === false || !input.appMcpConfig || input.workingDirectory !== input.projectPath
+      || c.localMcp.cwd !== input.projectPath) throw new Error('opencode_bounded_preparation_input')
+    if (c.nativeSubscriptionHomePath !== path.join(root,'native-subscription-home')
+      && [input.paths.data,input.paths.cache,input.projectPath].some(p=>overlaps(p,c.nativeSubscriptionHomePath))) throw new Error('opencode_bounded_native_overlap')
+    const outputs = [c.nativeSubscriptionHomePath, c.authCoordinationOutputDirectory, ...c.authStores.map(s=>path.dirname(s.outputPath)),c.localMcp.home,c.localMcp.tmp,c.localMcp.claudeDir]
+    for (const output of outputs) if (overlaps(output,input.sourceHomePath)) throw new Error('opencode_bounded_import_overlap')
+    for (const output of [c.authCoordinationOutputDirectory,...c.authStores.filter(s=>s.logicalPath !== managedAuthPath).map(s=>path.dirname(s.outputPath))]) {
+      if (overlaps(output,root) || overlaps(output,input.paths.cache) || overlaps(output,input.projectPath)) throw new Error('opencode_bounded_output_overlap')
+    }
+    validateBoundedPreparationEnvironment(input.environment,c)
+    applyBoundedLocalMcp({mcp:{app:structuredClone(input.appMcpConfig)}},c,input.paths.data,input.paths.cache)
+  }
 }
 
 /** Internal desktop adapter entry: caller must already hold the shared project queue. */
 export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePreparationInput): Promise<OpenCodePreparedProfile> {
   validatePreparationInput(input)
+  if (input.boundedPaths) {
+    const boundedPaths = validateOpenCodeBoundedPaths(input.boundedPaths)
+    input = { ...input, boundedPaths, environment: { ...input.environment }, sourceAuthPaths: [...input.sourceAuthPaths],
+      options: { ...input.options }, appMcpConfig: input.appMcpConfig ? structuredClone(input.appMcpConfig) : null }
+    await assertBoundedAuthObjects(boundedPaths)
+    await listPreparedAuthPaths(input.paths.data,boundedPaths)
+    await Promise.all([...boundedPaths.immutableAuthPaths, ...boundedPaths.authStores.map(s => s.logicalPath)]
+      .map(p => readOpenCodeAuthStore(p, boundedPaths)))
+    return withOpenCodeAuthCoordinationLock({ authPath: input.globalAuthPath, boundedPaths,
+      abortSignal: input.options.abortSignal, operation: () => prepareOpenCodeProfileBody(input) })
+  }
+  return prepareOpenCodeProfileBody(input)
+}
+
+async function prepareOpenCodeProfileBody(input: OpenCodeProfilePreparationInput): Promise<OpenCodePreparedProfile> {
   const resolvedProjectPath = input.projectPath
   const options = input.options
   const profileRootKey = hashString(resolvedProjectPath).slice(0, 16)
@@ -1353,6 +1441,7 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: input.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: input.paths.cache,
     })
+    if (input.boundedPaths) applyBoundedLocalMcp(managedConfig, input.boundedPaths, input.paths.data, input.paths.cache)
     const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
@@ -1367,10 +1456,10 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
     const globalAuthPath = input.globalAuthPath
     const sourceAuthSources = await Promise.all(
       input.sourceAuthPaths.map(async sourceAuthPath => {
-        const exists = await fileExists(sourceAuthPath)
+        const exists = await fileExists(sourceAuthPath, Boolean(input.boundedPaths))
         return {
           path: sourceAuthPath,
-          fingerprint: exists ? await readFingerprint(sourceAuthPath) : null,
+          fingerprint: exists ? await readFingerprint(sourceAuthPath, Boolean(input.boundedPaths)) : null,
         }
       }),
     )
@@ -1388,14 +1477,15 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (options.includeManagedSubscriptionPlugins !== false) {
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
-      nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath, { ...input.environment, HOME: input.sourceHomePath, USERPROFILE: input.sourceHomePath }, input.platform)
+      nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath, { ...input.environment, HOME: input.sourceHomePath, USERPROFILE: input.sourceHomePath }, input.platform, input.boundedPaths)
     }
     await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
-    const globalAuthExists = await fileExists(globalAuthPath)
+    const effectiveGlobalAuthPath = resolveBoundedAuthPath(globalAuthPath, input.boundedPaths)
+    const globalAuthExists = await fileExists(effectiveGlobalAuthPath, Boolean(input.boundedPaths))
     const globalAuthFingerprint = globalAuthExists
-      ? await readFingerprint(globalAuthPath)
+      ? await readFingerprint(effectiveGlobalAuthPath, Boolean(input.boundedPaths))
       : null
     const sourceAuthFingerprint = sourceAuthSources.some(source => source.fingerprint)
       ? hashString(sourceAuthSources
@@ -1412,12 +1502,14 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
       sourceAuthPaths: authSourcePaths,
       globalAuthPath,
       managedAuthPath,
-      peerManagedAuthPaths: await listPreparedAuthPaths(input.paths.data),
+      boundedPaths: input.boundedPaths,
+      peerManagedAuthPaths: await listPreparedAuthPaths(input.paths.data,input.boundedPaths),
       abortSignal: options.abortSignal,
     })
     if (nativeCliCredentialBridge) {
       await Promise.all([
         ensureOpenCodeCursorPluginAuthCredential({
+          boundedPaths: input.boundedPaths,
           globalAuthPath,
           managedAuthPath,
           cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
@@ -1425,6 +1517,7 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
           environment: input.environment,
         }),
         ensureOpenCodeKiroPluginAuthCredential({
+          boundedPaths: input.boundedPaths,
           globalAuthPath,
           managedAuthPath,
           kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
@@ -1435,7 +1528,7 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
     }
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
-    const managedAuthFingerprint = await readFingerprint(managedAuthPath)
+    const managedAuthFingerprint = await readFingerprint(managedAuthPath, Boolean(input.boundedPaths))
     const authState = await (async () => {
       if (!managedAuthFingerprint) {
         return 'missing' as const
@@ -1444,8 +1537,8 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
         return 'ok' as const
       }
       try {
-        const managed = await readOpenCodeAuthStore(managedAuthPath)
-        const sourceStores = await Promise.all(authSourcePaths.map(readOpenCodeAuthStore))
+        const managed = await readOpenCodeAuthStore(managedAuthPath, input.boundedPaths)
+        const sourceStores = await Promise.all(authSourcePaths.map(p => readOpenCodeAuthStore(p, input.boundedPaths)))
         const expectedAuth = mergeOpenCodeManagedAuthSources({
           sourceAuthPaths: authSourcePaths,
           sourceStores,
@@ -1481,18 +1574,23 @@ export async function prepareOpenCodeProfileUnderLock(input: OpenCodeProfilePrep
       OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
     }
     if (nativeCliCredentialBridge) {
-      env.PATH = [nativeCliCredentialBridge.binPath, input.environment.PATH]
+      env.PATH = [nativeCliCredentialBridge.binPath, input.boundedPaths?.nativeExecutables.path.join(path.delimiter) ?? input.environment.PATH]
         .filter((value): value is string => Boolean(value))
         .join(path.delimiter)
       env.CURSOR_ACP_HOME_DIR =
-        input.environment.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
+        input.boundedPaths?.nativeSubscriptionHomePath ?? (input.environment.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath)
       env.CURSOR_AGENT_EXECUTABLE =
         nativeCliCredentialBridge.cursorAgentExecutablePath
     }
+    if (input.boundedPaths) removeBoundedSelectionEnvironment(env)
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
+    const boundedAuthSources = input.boundedPaths ? await Promise.all(input.boundedPaths.authStores.map(async store => ({
+      path: store.outputPath, fingerprint: await readFingerprint(store.outputPath, true),
+    }))) : undefined
     return {
+      ...(input.boundedPaths ? { boundedPaths: input.boundedPaths, boundedAuthSources } : {}),
       projectPath: resolvedProjectPath,
       profileRootKey,
       profileRootPath,

@@ -1,3 +1,4 @@
+import type { OpenCodeBoundedProfileLifetime } from './OpenCodeBoundedPaths.js'
 import {
   readOpenCodeAuthCredential,
   withOpenCodeOAuthRefreshLock,
@@ -11,6 +12,7 @@ const XAI_PROVIDER_ID = 'xai'
 const XAI_OAUTH_REFRESH_SKEW_MS = 120_000
 
 type OpenCodeOAuthRefreshCoordinatorDeps = {
+  boundedProfileLifetime?: OpenCodeBoundedProfileLifetime
   readCredential?: typeof readOpenCodeAuthCredential
   withRefreshLock?: typeof withOpenCodeOAuthRefreshLock
   probeModel?: typeof openCodeExecutionProbe.probeModel
@@ -85,11 +87,30 @@ export class OpenCodeOAuthRefreshCoordinator {
       return { checked: false, refreshed: false }
     }
 
+    if (input.profile.boundedPaths) {
+      const lifetime = this.deps.boundedProfileLifetime
+      // Fail before the refresh lease creates a database or invokes a provider.
+      // Root supplies the actual custody-bound probe and the same retained view.
+      if (!lifetime || !this.deps.probeModel) throw new Error('opencode_bounded_runtime_UNMOUNTED')
+      return lifetime.withCurrentProfile(input.profile, () => this.ensureFreshUnderLifetime(input))
+    }
+    return this.ensureFreshUnderLifetime(input)
+  }
+
+  private async ensureFreshUnderLifetime(input: {
+    selectedModel: string
+    projectPath: string
+    profile: OpenCodePreparedProfile
+  }): Promise<OpenCodeOAuthRefreshResult> {
+    if (input.profile.boundedPaths && input.projectPath !== input.profile.projectPath) {
+      throw new Error('opencode_bounded_refresh_profile')
+    }
     const readCredential = this.deps.readCredential ?? readOpenCodeAuthCredential
     const nowMs = this.deps.nowMs ?? Date.now
     const refreshSkewMs = this.deps.refreshSkewMs ?? XAI_OAUTH_REFRESH_SKEW_MS
     const credential = await readCredential({
       authPath: input.profile.managedAuthPath,
+      boundedPaths: input.profile.boundedPaths,
       providerId: XAI_PROVIDER_ID,
     })
     if (credential?.type !== 'oauth') {
@@ -102,10 +123,12 @@ export class OpenCodeOAuthRefreshCoordinator {
     const withRefreshLock = this.deps.withRefreshLock ?? withOpenCodeOAuthRefreshLock
     return withRefreshLock({
       authPath: input.profile.managedAuthPath,
+      boundedPaths: input.profile.boundedPaths,
       providerId: XAI_PROVIDER_ID,
       operation: async () => {
         const latestCredential = await readCredential({
           authPath: input.profile.managedAuthPath,
+          boundedPaths: input.profile.boundedPaths,
           providerId: XAI_PROVIDER_ID,
         })
         if (!isOpenCodeOAuthCredentialExpiring({
@@ -120,6 +143,7 @@ export class OpenCodeOAuthRefreshCoordinator {
           ?? openCodeExecutionProbe.probeModel.bind(openCodeExecutionProbe)
         const probe = await probeModel({
           selectedModel: input.selectedModel,
+          ...(input.profile.boundedPaths ? { preparedProfile: input.profile } : {}),
           projectPath: input.projectPath,
           bypassCache: true,
         })
@@ -131,6 +155,7 @@ export class OpenCodeOAuthRefreshCoordinator {
 
         const refreshedCredential = await readCredential({
           authPath: input.profile.managedAuthPath,
+          boundedPaths: input.profile.boundedPaths,
           providerId: XAI_PROVIDER_ID,
         })
         if (isOpenCodeOAuthCredentialExpiring({

@@ -1,5 +1,6 @@
+import { assertBoundedPeerEntries } from './OpenCodeBoundedPaths.js'
 import { createHash } from 'node:crypto'
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, type BigIntStats } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, readSync, type BigIntStats } from 'node:fs'
 import path from 'node:path'
 import { retainOpenCodeBehaviorInventory, type BehaviorNamespaceCheck } from './OpenCodeBehaviorInventory.js'
 import { canonicalPreparedProfile, restorePreparedProfile, type PreparedProfileProjection } from './OpenCodePreparedProfileContract.js'
@@ -109,7 +110,14 @@ export function retainOpenCodeProfileCurrentness(projection: PreparedProfileProj
     observedBytes = 0
     for (const target of [profile!.projectPath, profile!.profileRootPath, profile!.homePath,
       profile!.tmpPath, profile!.xdgConfigHome, profile!.xdgDataHome, profile!.xdgCacheHome]) check(directory(target))
-    for (const source of [...profile!.sourceAuthSources!,
+    if (profile!.boundedPaths) {
+      const c = profile!.boundedPaths
+      for (const target of [c.nativeSubscriptionHomePath,c.authCoordinationOutputDirectory]) check(directory(target))
+      const peers = directory(path.join(path.dirname(c.globalAuthPath),'profiles'))
+      check(peers)
+      assertBoundedPeerEntries(readdirSync(proc(peers!.fd,'.'),{withFileTypes:true}),c)
+    }
+    for (const source of [...profile!.sourceAuthSources!, ...(profile!.boundedAuthSources ?? []),
       { path: profile!.managedAuthPath, fingerprint: profile!.managedAuthFingerprint }]) {
       check(fingerprint(source.path) === source.fingerprint)
     }
