@@ -1,0 +1,2 @@
+# Reviewed patch bytes must be identical on Windows and POSIX.
+scripts/cursor-plugin/cancellation.patch text eol=lf

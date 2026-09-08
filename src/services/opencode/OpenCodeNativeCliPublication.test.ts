@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { promisify } from 'node:util'
@@ -108,3 +108,77 @@ for (let i = 0; i < 100; i++) {
   for (const result of results) expect(result.status === 'fulfilled' ? null : result.reason).toBeNull()
   expect((await readdir(root)).filter(name => name.endsWith('.tmp'))).toEqual([])
 }, 20_000)
+
+for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+  test(`Windows ${code} rename contention retries the same prepared inode`, async () => {
+    const root = await fixture()
+    const target = path.join(root, 'kiro-cli.cmd')
+    await writeFile(target, 'old')
+    const original = await lstat(target)
+    let attempts = 0
+    let prepared: Awaited<ReturnType<typeof lstat>> | undefined
+    let preparedPath: unknown
+    await publishNativeCliFile(target, 'complete new generation', 0o700, {
+      platform: 'win32',
+      rename: async (source, destination) => {
+        const current = await lstat(source)
+        if (!prepared) { prepared = current; preparedPath = source }
+        expect(source).toBe(preparedPath)
+        expect(current.ino).toBe(prepared.ino)
+        expect(current.mtimeMs).toBe(prepared.mtimeMs)
+        expect(await readFile(source, 'utf8')).toBe('complete new generation')
+        expect(await readFile(target, 'utf8')).toBe('old')
+        expect((await lstat(target)).ino).toBe(original.ino)
+        if (++attempts < 3) throw Object.assign(new Error('sharing violation'), { code, syscall: 'rename' })
+        await rename(source, destination)
+      },
+    })
+    expect(attempts).toBe(3)
+    expect((await lstat(target)).ino).toBe(prepared!.ino)
+    expect(await readFile(target, 'utf8')).toBe('complete new generation')
+    expect(await readdir(root)).toEqual(['kiro-cli.cmd'])
+    await publishNativeCliFile(target, 'complete new generation', 0o700, {
+      platform: 'win32', rename: async () => { throw new Error('matching publication must be a no-op') },
+    })
+  })
+}
+
+for (const [platform, code, syscall, expectedAttempts] of [
+  ['win32', 'EPERM', 'rename', 8],
+  ['win32', 'EACCES', 'rename', 8],
+  ['win32', 'EBUSY', 'rename', 8],
+  ['linux', 'EPERM', 'rename', 1],
+  ['darwin', 'EBUSY', 'rename', 1],
+  ['win32', 'ENOENT', 'rename', 1],
+  ['win32', 'EIO', 'rename', 1],
+  ['win32', 'EPERM', 'open', 1],
+] as const) {
+  test(`${platform} persistent ${code}/${syscall} fails after ${expectedAttempts} attempts and cleans temp`, async () => {
+    const root = await fixture()
+    const target = path.join(root, 'kiro-cli.cmd')
+    await writeFile(target, 'old')
+    const original = await lstat(target)
+    const denial = Object.assign(new Error('denied'), { code, syscall })
+    let attempts = 0
+    let preparedPath: unknown
+    let preparedInode: number | undefined
+    await expect(publishNativeCliFile(target, 'new', 0o700, {
+      platform,
+      rename: async source => {
+        const current = await lstat(source)
+        if (!attempts) { preparedPath = source; preparedInode = current.ino }
+        expect(source).toBe(preparedPath)
+        expect(current.ino).toBe(preparedInode)
+        expect(await readFile(source, 'utf8')).toBe('new')
+        expect(await readFile(target, 'utf8')).toBe('old')
+        attempts++
+        throw denial
+      },
+    })).rejects.toBe(denial)
+    expect(attempts).toBe(expectedAttempts)
+    expect(await readFile(target, 'utf8')).toBe('old')
+    expect((await lstat(target)).ino).toBe(original.ino)
+    expect((await lstat(target)).mtimeMs).toBe(original.mtimeMs)
+    expect(await readdir(root)).toEqual(['kiro-cli.cmd'])
+  })
+}
