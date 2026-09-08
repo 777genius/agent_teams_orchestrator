@@ -6,6 +6,7 @@ import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.j
 import {
   CURSOR_MANAGED_ASSET_ROOT_ENV,
   resolveOpenCodeCursorManagedAssets,
+  resolveCursorManagedInterpreter,
   resolveShippedCursorManagedAssetRoot,
 } from './OpenCodeCursorManagedAssets.js'
 import { CURSOR_MANAGED_PROXY_PORT_ENV } from './OpenCodeCursorManagedPort.js'
@@ -250,4 +251,16 @@ test('a stored host key cannot reattach a host across a Cursor readiness change'
   expect(reuse(`k::scope:token::readiness:${readiness}`)).toBe('')
   expect(reuse(undefined)).toBe('')
   expect(reuse(`k::scope:other::readiness:${readiness}`)).toContain('scope token changed')
+})
+
+test('an interpreter is found even when the caller passes a curated environment', async () => {
+  // The desktop app hands the runtime a curated launch environment that need
+  // not carry an interpreter on PATH. Answering "none" there disabled managed
+  // Cursor entirely, and the failure was indistinguishable from unstaged assets.
+  expect(await resolveCursorManagedInterpreter({} as NodeJS.ProcessEnv)).toBeTruthy()
+  expect(await resolveCursorManagedInterpreter({ PATH: '' } as NodeJS.ProcessEnv)).toBeTruthy()
+  // An explicit override still wins, and a bad one still fails closed.
+  expect(await resolveCursorManagedInterpreter({
+    AGENT_TEAMS_CURSOR_SUPERVISOR_NODE: '/nonexistent/interpreter',
+  } as NodeJS.ProcessEnv)).toBeNull()
 })

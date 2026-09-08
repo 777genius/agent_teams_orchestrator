@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import path from 'node:path'
 
 /** A logged-in check alone cannot tell one account or one binary from another. */
@@ -57,6 +59,38 @@ export const probeCursorAccountIdentity: CursorAccountProbe = async (
  * Cursor authentication lives in the native CLI, not in an OpenCode credential,
  * so the only honest proof that a launch is authorized is a live account probe.
  */
+/**
+ * A desktop app inherits the launch services PATH, which on macOS is a short
+ * system list and not the user's shell PATH. Cursor installs its CLI into
+ * ~/.local/bin, so a PATH-only lookup reports "no Cursor CLI" on a machine where
+ * the user has been using it all day, and the launch fails as unauthenticated.
+ */
+export async function resolveCursorAgentExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  const configured = env.CURSOR_AGENT_EXECUTABLE?.trim()
+  if (configured) return configured
+  const onPath = Bun.which('cursor-agent', env.PATH ? { PATH: env.PATH } : undefined)
+  if (onPath) return onPath
+  // The caller's HOME describes the environment being launched, so its install
+  // location outranks whatever happens to be on this process's own PATH.
+  const home = env.HOME?.trim() || homedir()
+  const wellKnown = [
+    path.join(home, '.local/bin/cursor-agent'),
+    '/opt/homebrew/bin/cursor-agent',
+    '/usr/local/bin/cursor-agent',
+  ]
+  for (const candidate of wellKnown) {
+    try {
+      await access(candidate, constants.X_OK)
+      return candidate
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
 export async function isCursorNativeAccountAuthorized(input: {
   env?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
@@ -65,7 +99,7 @@ export async function isCursorNativeAccountAuthorized(input: {
 } = {}): Promise<boolean> {
   const env = input.env ?? process.env
   const configured = env.CURSOR_AGENT_EXECUTABLE?.trim()
-  const executable = configured || Bun.which('cursor-agent')
+  const executable = configured || await resolveCursorAgentExecutable(env)
   if (!executable) return false
   const account = await (input.probe ?? probeCursorAccountIdentity)(
     executable, input.platform ?? process.platform, input.abortSignal,

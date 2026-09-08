@@ -6,6 +6,7 @@ import {
   buildCursorReadinessFingerprint,
   probeCursorAccountIdentity,
   reconcileCursorNativeAuthority,
+  resolveCursorAgentExecutable,
   resolveCursorExecutableIdentity,
   type CursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
@@ -205,4 +206,23 @@ test('steady traffic cannot keep a stale account alive: the window never slides'
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('the Cursor CLI is found from its install location, not only from PATH', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'cursor-home-'))
+  await mkdir(path.join(home, '.local/bin'), { recursive: true })
+  const installed = path.join(home, '.local/bin/cursor-agent')
+  await writeFile(installed, '#!/bin/sh\nexit 0\n')
+  await chmod(installed, 0o700)
+  // A desktop app runs with the launch services PATH, which does not include
+  // ~/.local/bin, and Cursor installs its CLI exactly there.
+  expect(await resolveCursorAgentExecutable({ PATH: '/nonexistent', HOME: home } as NodeJS.ProcessEnv))
+    .toBe(installed)
+  // An explicit override still wins over any discovery.
+  expect(await resolveCursorAgentExecutable({
+    CURSOR_AGENT_EXECUTABLE: '/explicit/cursor-agent', PATH: '/nonexistent', HOME: home,
+  } as NodeJS.ProcessEnv)).toBe('/explicit/cursor-agent')
+  expect(await resolveCursorAgentExecutable({
+    PATH: '/nonexistent', HOME: path.join(home, 'empty'),
+  } as NodeJS.ProcessEnv)).toBeNull()
 })

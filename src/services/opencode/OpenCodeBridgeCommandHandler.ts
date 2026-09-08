@@ -2478,10 +2478,26 @@ function preHostCursorFailureReadinessData(input: {
   }
 }
 
-function unsupportedExtensionBoundReadinessData(selectedModel: string, providerId: string) {
+/** One rendering of an authority rejection, so every gate reports it the same. */
+function describeAuthorityRejection(diagnostic: OpenCodeAuthorityRejection): string {
+  return diagnostic.check === 'exception'
+    ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
+    : diagnostic.check === 'selected_config_match'
+      ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
+      : ` (${diagnostic.check})`
+}
+
+function unsupportedExtensionBoundReadinessData(
+  selectedModel: string,
+  providerId: string,
+  // Naming why the managed path was unavailable turns "not supported" into
+  // something actionable: staging missing, platform, or a failed probe.
+  supportReason = 'unknown',
+) {
   const reason =
     `OpenCode model ${selectedModel} uses extension-bound provider ${providerId}, `
-    + 'which is not supported by the current Agent Teams launch runtime. Choose another OpenCode model.'
+    + 'which is not supported by the current Agent Teams launch runtime. Choose another OpenCode model. '
+    + `(managed path unavailable: ${supportReason})`
   return {
     state: 'model_unavailable',
     launchAllowed: false,
@@ -2513,11 +2529,15 @@ function unsupportedExtensionBoundReadinessData(selectedModel: string, providerI
  * such path. Every gate on the launch route must agree, or a launch passes one
  * check and dies at the next one with a different message.
  */
-async function isManagedCursorLaunchSupported(providerId: string): Promise<boolean> {
-  if (providerId !== 'cursor-acp') return false
+async function resolveManagedCursorLaunchSupport(
+  providerId: string,
+): Promise<{ supported: boolean; reason: string }> {
+  if (providerId !== 'cursor-acp') return { supported: false, reason: 'provider_has_no_managed_path' }
   return await resolveOpenCodeCursorManagedAssets()
-    .then(result => result.available)
-    .catch(() => false)
+    .then(result => result.available
+      ? { supported: true, reason: 'staged' }
+      : { supported: false, reason: result.reason })
+    .catch(error => ({ supported: false, reason: `asset_probe_failed:${String(error).slice(0, 80)}` }))
 }
 
 async function runReadiness(
@@ -2538,12 +2558,14 @@ async function runReadiness(
   if (qualifiedSelectedModel
     && (qualifiedSelectedModel.providerId === 'kiro'
       || qualifiedSelectedModel.providerId === 'cursor-acp')) {
-    if (!await isManagedCursorLaunchSupported(qualifiedSelectedModel.providerId)) {
+    const managedSupport = await resolveManagedCursorLaunchSupport(qualifiedSelectedModel.providerId)
+    if (!managedSupport.supported) {
       return {
         snapshot: null,
         data: unsupportedExtensionBoundReadinessData(
           qualifiedSelectedModel.raw,
           qualifiedSelectedModel.providerId,
+          managedSupport.reason,
         ),
       }
     }
@@ -2663,11 +2685,7 @@ async function runReadiness(
       }
       let authorityDiagnostic = ''
       const onRejection = (diagnostic: OpenCodeAuthorityRejection) => {
-        authorityDiagnostic = diagnostic.check === 'exception'
-          ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
-          : diagnostic.check === 'selected_config_match'
-            ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
-            : ` (${diagnostic.check})`
+        authorityDiagnostic = describeAuthorityRejection(diagnostic)
       }
       const refreshedBefore = await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
@@ -3228,7 +3246,7 @@ async function runLaunch(
     throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
   }
   if ((selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp')
-    && !await isManagedCursorLaunchSupported(selectedModelRef.providerId)) {
+    && !(await resolveManagedCursorLaunchSupport(selectedModelRef.providerId)).supported) {
     throw new Error(
       `OpenCode launch_runtime does not support extension-bound provider ${selectedModelRef.providerId}`,
     )
@@ -3412,12 +3430,16 @@ async function runLaunch(
     }
   }
   let requiredMcpContractConfigIdentity: string | null = null
+  // Bootstrap reported only "behavior changed", which is the one thing every
+  // rejection has in common and the one thing that cannot be acted on.
+  let lastAuthorityRejection = ''
   const matchesCurrentExpectedBehavior = async (signal: AbortSignal): Promise<boolean> => {
     return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
       host,
       selectedModel: apiSelectedModel,
       expectedBehaviorFingerprint,
       contractConfigIdentity: requiredMcpContractConfigIdentity,
+      onRejection: diagnostic => { lastAuthorityRejection = describeAuthorityRejection(diagnostic) },
       phaseContext: {
         phase: 'post_probe_refresh',
         signal,
@@ -3449,7 +3471,10 @@ async function runLaunch(
         return { kind: 'failure', error: 'retained host identity mismatch' }
       }
       if (!await matchesCurrentExpectedBehavior(signal)) {
-        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before proof' }
+        return {
+          kind: 'failure',
+          error: `OpenCode strict launch behavior changed before proof${lastAuthorityRejection}`,
+        }
       }
       const remainingMs = () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs)
       const phaseContext = (phase: OpenCodePhaseContext['phase']): OpenCodePhaseContext => ({
@@ -3686,7 +3711,7 @@ async function runLaunch(
         if (!await matchesCurrentExpectedBehavior(signal)) {
           return {
             kind: 'failure',
-            error: 'OpenCode strict launch behavior changed during bootstrap',
+            error: `OpenCode strict launch behavior changed during bootstrap${lastAuthorityRejection}`,
             ...ownedUncommittedResources,
           }
         }
@@ -5717,7 +5742,7 @@ async function handleEnvelope(
           throw new Error('OpenCode launch handshake requires a provider-qualified selectedModel')
         }
         if ((selected.providerId === 'kiro' || selected.providerId === 'cursor-acp')
-          && !await isManagedCursorLaunchSupported(selected.providerId)) {
+          && !(await resolveManagedCursorLaunchSupport(selected.providerId)).supported) {
           throw new Error(`OpenCode launch handshake does not support extension-bound provider ${selected.providerId}`)
         }
         const mode = envelope.body.toolApprovalMode

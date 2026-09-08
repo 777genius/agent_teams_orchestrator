@@ -82,14 +82,22 @@ export async function resolveCursorManagedInterpreter(
   if (explicit) {
     return await isExecutable(explicit) ? path.resolve(explicit) : null
   }
-  const directories = (env.PATH ?? '').split(path.delimiter).filter(Boolean)
-  for (const name of ['node', 'bun']) {
-    for (const directory of directories) {
-      const candidate = path.resolve(directory, name)
-      if (await isExecutable(candidate)) return candidate
+  // The caller's PATH is a curated launch environment that need not contain an
+  // interpreter, and answering "no interpreter" then turns managed Cursor off
+  // with no way to tell that from unstaged assets. This process is already
+  // running on one, so search its own PATH next and accept itself last.
+  const searchPaths = [env.PATH, env.PATH === process.env.PATH ? undefined : process.env.PATH]
+  for (const searchPath of searchPaths) {
+    const directories = (searchPath ?? '').split(path.delimiter).filter(Boolean)
+    for (const name of ['node', 'bun']) {
+      for (const directory of directories) {
+        const candidate = path.resolve(directory, name)
+        if (await isExecutable(candidate)) return candidate
+      }
     }
   }
-  return null
+  const self = process.execPath
+  return /(^|\/)(node|bun)$/.test(self) && await isExecutable(self) ? self : null
 }
 
 async function isExecutable(candidate: string): Promise<boolean> {

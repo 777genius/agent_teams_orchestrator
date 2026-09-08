@@ -2043,11 +2043,16 @@ export async function resolveOpenCodeProfileScope(input: {
     // Cursor is admitted only once the staged managed assets verify: they carry
     // the ownership barrier and the Stop control that make a terminal Stop
     // provable. Unstaged Cursor, and Kiro, stay blocked.
-    const managedCursorReady = providerId === 'cursor-acp'
-      && (await resolveManagedCursorAssets(env)) !== null
-    if (!managedCursorReady) {
+    const managedCursor = providerId === 'cursor-acp'
+      ? await resolveOpenCodeCursorManagedAssets({ env })
+        .catch(error => ({ available: false as const, reason: `probe_failed:${String(error).slice(0, 60)}` }))
+      : { available: false as const, reason: 'provider_has_no_managed_path' }
+    if (!managedCursor.available) {
+      // The reason is the whole difference between "this build ships no assets"
+      // and "the environment hid the interpreter", and both used to read alike.
       throw new Error(
-        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`,
+        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`
+        + ` (managed path unavailable: ${managedCursor.reason})`,
       )
     }
   }
@@ -2866,8 +2871,20 @@ export class OpenCodeProfileManager {
 
     enterStep('verify auth and finalize environment')
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
+    // Cursor authenticates through its own CLI account, not through an OpenCode
+    // credential, so comparing credentials decides nothing here. A managed store
+    // that still holds a cursor-acp entry from an earlier design then reads as an
+    // identity mismatch against a source store that correctly has none, and the
+    // launch is refused while the account is perfectly valid. Readiness binds the
+    // live native account instead, which is the identity that matters.
+    const cursorNativeAuthenticated = policy
+      && canonicalizeOpenCodeProviderId(policy.scope.providerId) === 'cursor-acp'
+      && cursorManagedAssets !== null
+      && await isCursorNativeAccountAuthorized({ env: runtimeEnv })
     const selectedManagedAuthIdentity = policy
-      ? await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
+      ? cursorNativeAuthenticated
+        ? selectedSourceAuthIdentity
+        : await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
       : undefined
     const authState = await (async () => {
       if (policy) {
