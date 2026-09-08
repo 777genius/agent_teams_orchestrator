@@ -210,6 +210,8 @@ describe('OpenCodeProvisioningProbe', () => {
     })
   }
 
+  // This integration matrix performs many filesystem authority refreshes. On Windows,
+  // the default 5 s can expire before finally restores the process-wide fixture env.
   test('refreshes selected config/project/auth/MCP authority and fails closed on each mutation', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-selected-refresh-'))
     const keys = [
@@ -424,7 +426,7 @@ describe('OpenCodeProvisioningProbe', () => {
       }
       await rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({

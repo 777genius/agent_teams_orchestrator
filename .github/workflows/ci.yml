@@ -23,6 +23,25 @@ permissions:
   contents: read
 
 jobs:
+  cursor-managed-plugin:
+    name: Cursor managed plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install pinned plugin dependencies
+        working-directory: scripts/cursor-plugin
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Verify scoped shell cancellation and MCP dispatch
+        run: node --test scripts/cursor-plugin/shell-cancellation.test.mjs scripts/cursor-plugin/managed-mcp-dispatch.test.mjs
+      - name: Verify reproducible managed plugin artifact
+        run: bun test scripts/cursor-plugin/build.test.ts
+
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

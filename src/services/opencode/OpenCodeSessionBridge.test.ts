@@ -10,7 +10,7 @@ import {
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
-import { isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { sessionManagedAuthMatches, isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import {
@@ -1164,69 +1164,68 @@ describe('OpenCodeSessionBridge', () => {
     }])
   })
 
-  test('keeps the stop observer host retained until observer disposal', async () => {
+  test('Stop, status and observer use exact stored ownership after authority loss and bridge restart', async () => {
+    const record = buildRecord({ runId: 'run-1', selectedModel: 'cursor-acp/auto',
+      profileScope: { purpose: 'launch_runtime', providerId: 'cursor-acp', scopeToken: 'scope',
+        configFingerprint: 'config', selectedAuthIdentity: `known:${'a'.repeat(64)}` } })
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'stop-sessions.json'))
+    await store.upsert(record)
     const events: string[] = []
-    const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async () => profile,
-      hostManager: {
-        ensureHost: async () => host,
-        retainHostLease: async () => { events.push('lease retained') },
-        releaseHost: async (_hostKey, options) => {
-          events.push(`host released:${options.keepPersistentAlive === true}`)
-        },
-      },
-      stopObserverFactory: async () => ({
-        arm: () => {},
-        currentStatus: () => null,
-        waitForIdle: async () => false,
-        dispose: async () => { events.push('observer disposed') },
-      }),
-    })
-    const observer = await bridge.observeStopIdle(buildRecord({
-      profileScope: null,
-      managedConfigFingerprint: profile.managedConfigFingerprint,
-    }))
-
-    expect(events).toEqual(['lease retained'])
-    await observer.dispose()
-    expect(events).toEqual([
-      'lease retained',
-      'observer disposed',
-      'host released:true',
-    ])
-  })
-
-  test('threads stop cancellation and remaining budget through profile, host, and client', async () => {
     const controller = new AbortController()
     const remainingMs = () => 321
-    let profileSignal: AbortSignal | undefined
-    let hostSignal: AbortSignal | undefined
-    let clientContext: { signal?: AbortSignal; remainingMs?: () => number } | undefined
-    const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async (_projectPath, options) => {
-        profileSignal = options?.abortSignal
-        return profile
-      },
+    const makeBridge = () => new OpenCodeSessionBridge({
+      sessionStore: store,
+      prepareProfile: async () => { throw new Error('signed out/assets missing/config changed') },
       hostManager: {
-        ensureHost: async input => {
-          hostSignal = input.abortSignal
-          return host
+        ensureHost: async () => { throw new Error('must not authorize or spawn cleanup') },
+        releaseHost: async () => { throw new Error('cleanup must not acquire a host reference') },
+        retainHostLease: async () => { throw new Error('must not reacquire cleanup lease') },
+        resolveOwnedSessionEndpoint: async (key, lease, signal) => {
+          expect(key).toBe(record.hostKey)
+          expect(lease).toEqual({ teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+            runId: record.runId, sessionId: record.opencodeSessionId, projectPath: record.projectPath })
+          expect(signal).toBe(controller.signal)
+          return { baseUrl: host.baseUrl, pid: host.pid }
         },
-        releaseHost: async () => {},
       },
-      clientFactory: {
-        create: (_baseUrl, context) => {
-          clientContext = context
-          return { abortSession: async () => true } as never
-        },
-      },
+      clientFactory: { create: (url, options) => {
+        expect(url).toBe(host.baseUrl)
+        expect(options?.signal).toBe(controller.signal)
+        expect(options?.remainingMs?.()).toBe(321)
+        return { abortSession: async (sessionId: string) => { events.push(sessionId); return true },
+          getSessionStatus: async () => ({ [record.opencodeSessionId]: { type: 'idle' } }) } as never
+      } },
+      stopObserverFactory: async () => ({ arm: () => {}, currentStatus: () => 'idle',
+        waitForIdle: async () => true, dispose: async () => { events.push('disposed') } }),
     })
+    const options = { signal: controller.signal, remainingMs }
+    const bridge = makeBridge()
+    const observer = await bridge.observeStopIdle(record, options)
+    expect(await bridge.abort(record, options)).toBe(true)
+    expect(await bridge.getRawStatus(record, options)).toEqual({ type: 'idle' })
+    await observer.dispose()
+    expect(await makeBridge().abort(record, options)).toBe(true)
+    await store.markStoppedIfSession(record)
+    expect(await makeBridge().abort(record, options)).toBe(true)
+    expect(events).toEqual(['session-1', 'disposed', 'session-1'])
+    for (const patch of [{ runId: 'foreign' }, { hostKey: 'foreign' }, { opencodeSessionId: 'foreign' }]) {
+      await expect(makeBridge().abort({ ...record, ...patch }, options)).rejects.toThrow('ownership changed')
+    }
+    await expect(bridge.promptAsync(record, { text: 'new work' })).rejects.toThrow()
+  })
 
-    expect(await bridge.abort(buildRecord(), { signal: controller.signal, remainingMs })).toBe(true)
-    expect(profileSignal).toBe(controller.signal)
-    expect(hostSignal).toBe(controller.signal)
-    expect(clientContext?.signal).toBe(controller.signal)
-    expect(clientContext?.remainingMs?.()).toBe(321)
+  test('Cursor session compatibility survives marker TTL but refuses missing readiness/account change', () => {
+    const selectedAuthIdentity = `known:${'a'.repeat(64)}` as const
+    const scope = { purpose: 'launch_runtime', providerId: 'cursor-acp', scopeToken: 'scope',
+      configFingerprint: 'config', selectedAuthIdentity } as const
+    const record = buildRecord({ selectedModel: 'cursor-acp/auto', profileScope: scope,
+      managedAuthFingerprint: 'marker-before-ttl' })
+    const current = { ...profile, profileScope: scope, selectedManagedAuthIdentity: selectedAuthIdentity,
+      managedAuthFingerprint: 'marker-after-31-minutes', env: { AGENT_TEAMS_CURSOR_READINESS: 'ready' } }
+    expect(sessionManagedAuthMatches(record, current)).toBe(true)
+    expect(sessionManagedAuthMatches(record, { ...current, env: {} })).toBe(false)
+    expect(sessionManagedAuthMatches(record, { ...current, selectedManagedAuthIdentity: `known:${'b'.repeat(64)}` })).toBe(false)
+    expect(sessionManagedAuthMatches(buildRecord(), current)).toBe(false)
   })
 
   test('confirmed stop fails on a real registry lock filesystem error', async () => {
@@ -4066,12 +4065,15 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'bob',
     }))
 
+    // The reason names what moved: here only the managed copy's bytes did,
+    // with the same profile, the same selected identity and the same source.
     expect(staleMarks).toEqual([{
       laneId: 'secondary:opencode:bob',
-      staleReason: 'managed_auth_changed',
+      staleReason: 'managed_auth_changed:managed_store_bytes',
     }])
     expect(result.summary.previewOutcome).toBe('stale')
-    expect(result.summary.staleReason).toBe('managed_auth_changed')
+    expect(result.summary.staleReason).toBe('managed_auth_changed:managed_store_bytes')
     expect(result.summary.streamConnected).toBe(false)
   })
+
 })

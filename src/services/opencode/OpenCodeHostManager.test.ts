@@ -10,13 +10,15 @@ import { describe, expect, test } from 'bun:test'
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
+  assertOpenCodeHostReuseIdentity,
   buildOpenCodeHostProfileIdentity,
   buildOpenCodeHostSpawnOptions,
   resolveOpenCodeBinaryHostIdentity,
   shouldRetryPersistentHostStartupLock,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
-import { resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
+import { buildOpenCodeHostTransportIdentity } from './OpenCodeHostIdentity.js'
+import { buildCursorHostGeneration, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
 
@@ -432,6 +434,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => 43139,
       spawnHostProcess: () => spawned.child,
+      readProcessStartTimeMs: async () => 1000,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
@@ -498,6 +501,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => nextPort++,
       spawnHostProcess: () => spawnedHosts[spawnIndex++].child,
+      readProcessStartTimeMs: async () => 1000,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
@@ -595,6 +599,7 @@ describe('OpenCodeHostManager', () => {
       },
       sleepMs: async () => {},
       isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async () => 1000,
       killProcess: (_pid, signal) => {
         spawned.killedSignals.push(signal)
         processAlive = false
@@ -673,6 +678,7 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async () => 1000,
       sleepMs: async () => {},
       killProcess: (_pid, signal) => {
         spawned.killedSignals.push(signal)
@@ -2983,4 +2989,106 @@ describe('OpenCodeHostManager', () => {
     expect(refreshedFingerprint).toBeNull()
     expect(manager.getHost('host-key')?.resolvedConfigFingerprint).toBeNull()
   })
+})
+
+
+test('new-work host reuse compares Cursor readiness presence and absence', () => {
+  const ready = { ...baseProfile, env: { AGENT_TEAMS_CURSOR_READINESS: 'account-a' } }
+  const key = buildOpenCodeHostProfileIdentity(ready, 'binary')
+  expect(() => assertOpenCodeHostReuseIdentity(key, ready)).not.toThrow()
+  expect(() => assertOpenCodeHostReuseIdentity(key, { ...ready, env: {} })).toThrow('readiness changed')
+  expect(() => assertOpenCodeHostReuseIdentity(key, { ...ready, env: { AGENT_TEAMS_CURSOR_READINESS: 'account-b' } }))
+    .toThrow('readiness changed')
+  expect(() => assertOpenCodeHostReuseIdentity('legacy-unmanaged', baseProfile)).not.toThrow()
+})
+
+test('cleanup resolves exact persistent ownership across restart without profile preparation or provider requests', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-stop-owned-'))
+  try {
+    const registryPath = path.join(root, 'hosts.json')
+    const now = new Date().toISOString()
+    const lease = { teamId: 'team', laneId: 'primary', memberName: 'alice', runId: 'run', sessionId: 'session' }
+    const leaseKey = 'team::primary::alice'
+    const record = { hostKey: 'owned', profileRootKey: 'profile', projectPath: root,
+      projectBehaviorFingerprint: 'old-config', managedConfigFingerprint: 'old-config',
+      baseUrl: 'http://127.0.0.1:43210', port: 43210, pid: 12345, processStartedAtMs: 100,
+      version: 'fixture', resolvedConfigFingerprint: 'old-config', updatedAt: now,
+      leases: { [leaseKey]: { ...lease, leaseKey, createdAt: now, updatedAt: now } } }
+    const write = (patch = {}) => writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+      processIdentityFormat: 'platform-native-v2', hosts: { owned: { ...record, ...patch } } }))
+    await write()
+    let startedAt = 100
+    const manager = () => new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+      readProcessStartTimeMs: async () => startedAt, isProcessAlive: () => true,
+      prepareProfile: async () => { throw new Error('signed out/assets missing/config drift') },
+      fetchJson: async () => { throw new Error('cleanup must not probe launch') },
+      spawnHostProcess: () => { throw new Error('cleanup must not spawn') } })
+    const before = await readFile(registryPath, 'utf8')
+    expect(await manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root }))
+      .toEqual({ baseUrl: record.baseUrl, pid: 12345 })
+    expect(await manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root }))
+      .toEqual({ baseUrl: record.baseUrl, pid: 12345 })
+    expect(await readFile(registryPath, 'utf8')).toBe(before)
+    for (const patch of [{ runId: 'foreign' }, { sessionId: 'foreign' }, { memberName: 'bob' },
+      { teamId: 'other' }, { laneId: 'other' }, { projectPath: '/foreign' }]) {
+      await expect(manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root, ...patch }))
+        .rejects.toThrow('ownership')
+    }
+    await write({ baseUrl: 'https://example.invalid/foreign' })
+    await expect(manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root })).rejects.toThrow('endpoint')
+    await write()
+    startedAt = 101
+    await expect(manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root })).rejects.toThrow('process ownership')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+// Regression for integration finding #4: each actual host-key change must also
+// partition the retained port, including transport bytes normalized out of scope.
+test('Cursor port generation follows project behavior, OpenCode binary and raw MCP host identity', () => {
+  const profile = { ...baseProfile, managedConfig: { ...baseProfile.managedConfig,
+    mcp: { 'agent-teams': { type: 'remote', url: 'http://127.0.0.1:43210/mcp#one' } } } }
+  const generation = (value: OpenCodePreparedProfile, binaryHostIdentity: string) => buildCursorHostGeneration({
+    assetsIdentity: 'assets', nativeIdentity: 'account', scopeToken: 'same-normalized-scope',
+    configFingerprint: value.managedConfigFingerprint, projectPath: value.projectPath,
+    profileRootKey: value.profileRootKey, projectBehaviorFingerprint: value.projectBehaviorFingerprint,
+    binaryHostIdentity, transportIdentity: buildOpenCodeHostTransportIdentity(value.managedConfig),
+  })
+  const original = generation(profile, 'binary-one')
+  expect(generation(structuredClone(profile), 'binary-one')).toBe(original)
+  for (const [changed, binary] of [
+    [{ ...profile, projectBehaviorFingerprint: 'edited-AGENTS.md' }, 'binary-one'],
+    [profile, 'binary-two'],
+    [{ ...profile, managedConfig: { ...profile.managedConfig, mcp: {
+      'agent-teams': { type: 'remote', url: 'http://127.0.0.1:43210/mcp#two' },
+    } } }, 'binary-one'],
+  ] as Array<[OpenCodePreparedProfile, string]>) {
+    expect(buildOpenCodeHostProfileIdentity(changed, binary)).not.toBe(buildOpenCodeHostProfileIdentity(profile, 'binary-one'))
+    expect(generation(changed, binary)).not.toBe(original)
+  }
+})
+
+test('Cursor rejects binary drift after port preparation before starting or adopting a host', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-generation-binary-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+  try {
+    const binary = path.join(root, 'synthetic-opencode')
+    await writeFile(binary, 'synthetic only; never execute')
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binary
+    const profile = { ...baseProfile, env: { ...baseProfile.env,
+      AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY: await resolveOpenCodeBinaryHostIdentity(binary) } }
+    await writeFile(binary, 'different synthetic binary; never execute')
+    let spawns = 0
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => profile,
+      spawnHostProcess: () => { spawns++; throw new Error('must not launch') },
+    })
+    for (const hostKey of [undefined, 'retained-host']) {
+      await expect(manager.ensureHost({ hostKey })).rejects.toThrow('binary changed after Cursor port generation')
+    }
+    expect(spawns).toBe(0)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    else process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = previous
+    await rm(root, { recursive: true, force: true })
+  }
 })

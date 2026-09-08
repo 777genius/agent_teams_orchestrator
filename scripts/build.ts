@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { dirname, join, relative, resolve } from 'path'
+import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -449,3 +450,10 @@ if (compile) {
 
   console.log(`Built ${outfile} -> ${bundleEntrypoint}`)
 }
+
+// Ship the reviewed Cursor plugin next to the built runtime. Without this the
+// managed path only works for someone who staged assets by hand, which is not a
+// delivery mechanism.
+const cursorManagedRoot = `${compile ? './dist' : bundleOutdir}/cursor-managed`
+await stageCursorManagedAssets(cursorManagedRoot)
+console.log(`Staged Cursor managed assets -> ${cursorManagedRoot}`)

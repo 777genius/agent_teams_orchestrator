@@ -1,3 +1,4 @@
+import { readOpenCodeLegacyStopCapability } from './OpenCodeLegacyStopAuthority.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
@@ -43,6 +44,7 @@ import {
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
 import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
@@ -94,6 +96,7 @@ import {
 } from './OpenCodeCommandOutcomeStore.js'
 import {
   getClaudeConfigHomeDir,
+  getTeamsDir,
   isEnvDefinedFalsy,
 } from '../../utils/envUtils.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -1047,23 +1050,45 @@ async function probeStoredLaneAuthority(
       throw new Error('OpenCode lifecycle lane scope is ambiguous')
     }
   }
-  if (command === 'opencode.stopTeam' && authorityRecords.every(isOpenCodeSessionStopped)) {
-    const authority = authorityRecords[0].stopAuthority
-    if (!authority || authority.runtime.providerId !== 'opencode'
-      || !/^opencode:[a-f0-9]{32}$/.test(authority.runtime.capabilitySnapshotId)
-      || authorityRecords.some(record => !record.stopAuthority
-        || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
-        || record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
-        || hashStable(record.stopAuthority.runtime) !== hashStable(authority.runtime))
-      || expectedCapabilitySnapshotId(body) !== authority.runtime.capabilitySnapshotId
+  if (command === 'opencode.stopTeam' && (selectedModel.providerId === 'cursor-acp'
+    || authorityRecords.every(record => record.stopAuthority || isOpenCodeSessionStopped(record)))) {
+    const allHaveReceipt = authorityRecords.every(record => record.stopAuthority)
+    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp') {
+      throw new Error('OpenCode confirmed stop authority mismatch')
+    }
+    // Pre-fix Cursor records lack the receipt, but the desktop persists the
+    // original launch capability. Preserve that exact capability for cleanup.
+    const legacyCursor = selectedModel.providerId === 'cursor-acp' && !allHaveReceipt
+    const legacyVersion = authorityRecords[0].opencodeVersion ?? null
+    const runtime: ConfirmedStopRuntime = legacyCursor ? {
+      providerId: 'opencode', binaryPath: 'opencode', version: legacyVersion,
+      binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
+      capabilitySnapshotId: await readOpenCodeLegacyStopCapability({
+        teamsPath: getTeamsDir(), teamId, laneId, runId,
+      }),
+    } : authorityRecords[0].stopAuthority!.runtime
+    if (runtime.providerId !== 'opencode'
+      || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
+      || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
+        || (record.stopAuthority
+          ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
+            || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
+          : !legacyCursor))
+      || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
       || (preconditions?.expectedBehaviorFingerprint
         && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
       throw new Error('OpenCode confirmed stop authority mismatch')
     }
+    for (const record of authorityRecords.filter(record => !isOpenCodeSessionStopped(record))) {
+      await openCodeHostManager.resolveOwnedSessionEndpoint(record.hostKey, {
+        teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+        runId: record.runId, sessionId: record.opencodeSessionId, projectPath: record.projectPath,
+      }, phaseContext?.signal)
+    }
     return {
       snapshot: null,
       records: authorityRecords,
-      confirmedStopRuntime: authority.runtime,
+      confirmedStopRuntime: runtime,
       release: async () => {},
     }
   }
@@ -2572,10 +2597,26 @@ function preHostCursorFailureReadinessData(input: {
   }
 }
 
-function unsupportedExtensionBoundReadinessData(selectedModel: string, providerId: string) {
+/** One rendering of an authority rejection, so every gate reports it the same. */
+function describeAuthorityRejection(diagnostic: OpenCodeAuthorityRejection): string {
+  return diagnostic.check === 'exception'
+    ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
+    : diagnostic.check === 'selected_config_match'
+      ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
+      : ` (${diagnostic.check})`
+}
+
+function unsupportedExtensionBoundReadinessData(
+  selectedModel: string,
+  providerId: string,
+  // Naming why the managed path was unavailable turns "not supported" into
+  // something actionable: staging missing, platform, or a failed probe.
+  supportReason = 'unknown',
+) {
   const reason =
     `OpenCode model ${selectedModel} uses extension-bound provider ${providerId}, `
-    + 'which is not supported by the current Agent Teams launch runtime. Choose another OpenCode model.'
+    + 'which is not supported by the current Agent Teams launch runtime. Choose another OpenCode model. '
+    + `(managed path unavailable: ${supportReason})`
   return {
     state: 'model_unavailable',
     launchAllowed: false,
@@ -2601,6 +2642,23 @@ function unsupportedExtensionBoundReadinessData(selectedModel: string, providerI
   }
 }
 
+/**
+ * Cursor is extension-bound and stays refused unless this build ships verified
+ * managed assets: the reviewed plugin artifact the launch depends on. Kiro has no
+ * such path. Every gate on the launch route must agree, or a launch passes one
+ * check and dies at the next one with a different message.
+ */
+async function resolveManagedCursorLaunchSupport(
+  providerId: string,
+): Promise<{ supported: boolean; reason: string }> {
+  if (providerId !== 'cursor-acp') return { supported: false, reason: 'provider_has_no_managed_path' }
+  return await resolveOpenCodeCursorManagedAssets()
+    .then(result => result.available
+      ? { supported: true, reason: 'staged' }
+      : { supported: false, reason: result.reason })
+    .catch(error => ({ supported: false, reason: `asset_probe_failed:${String(error).slice(0, 80)}` }))
+}
+
 async function runReadiness(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
@@ -2619,12 +2677,16 @@ async function runReadiness(
   if (qualifiedSelectedModel
     && (qualifiedSelectedModel.providerId === 'kiro'
       || qualifiedSelectedModel.providerId === 'cursor-acp')) {
-    return {
-      snapshot: null,
-      data: unsupportedExtensionBoundReadinessData(
-        qualifiedSelectedModel.raw,
-        qualifiedSelectedModel.providerId,
-      ),
+    const managedSupport = await resolveManagedCursorLaunchSupport(qualifiedSelectedModel.providerId)
+    if (!managedSupport.supported) {
+      return {
+        snapshot: null,
+        data: unsupportedExtensionBoundReadinessData(
+          qualifiedSelectedModel.raw,
+          qualifiedSelectedModel.providerId,
+          managedSupport.reason,
+        ),
+      }
     }
   }
   const runProvisioningPhase = async (
@@ -2742,11 +2804,7 @@ async function runReadiness(
       }
       let authorityDiagnostic = ''
       const onRejection = (diagnostic: OpenCodeAuthorityRejection) => {
-        authorityDiagnostic = diagnostic.check === 'exception'
-          ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
-          : diagnostic.check === 'selected_config_match'
-            ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
-            : ` (${diagnostic.check})`
+        authorityDiagnostic = describeAuthorityRejection(diagnostic)
       }
       const refreshedBefore = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
@@ -3308,7 +3366,8 @@ async function runLaunch(
   if (!selectedModelRef) {
     throw new Error('OpenCode strict launch requires a provider-qualified selectedModel')
   }
-  if (selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp') {
+  if ((selectedModelRef.providerId === 'kiro' || selectedModelRef.providerId === 'cursor-acp')
+    && !(await resolveManagedCursorLaunchSupport(selectedModelRef.providerId)).supported) {
     throw new Error(
       `OpenCode launch_runtime does not support extension-bound provider ${selectedModelRef.providerId}`,
     )
@@ -3508,12 +3567,16 @@ async function runLaunch(
     }
   }
   let requiredMcpContractConfigIdentity: string | null = null
+  // Bootstrap reported only "behavior changed", which is the one thing every
+  // rejection has in common and the one thing that cannot be acted on.
+  let lastAuthorityRejection = ''
   const matchesCurrentExpectedBehavior = async (signal: AbortSignal): Promise<boolean> => {
     return (await openCodeProvisioningProbe.refreshSelectedProfileAuthority({
       host,
       selectedModel: apiSelectedModel,
       expectedBehaviorFingerprint,
       contractConfigIdentity: requiredMcpContractConfigIdentity,
+      onRejection: diagnostic => { lastAuthorityRejection = describeAuthorityRejection(diagnostic) },
       phaseContext: {
         phase: 'post_probe_refresh',
         signal,
@@ -3545,7 +3608,10 @@ async function runLaunch(
         return { kind: 'failure', error: 'retained host identity mismatch' }
       }
       if (!await matchesCurrentExpectedBehavior(signal)) {
-        return { kind: 'failure', error: 'OpenCode strict launch behavior changed before proof' }
+        return {
+          kind: 'failure',
+          error: `OpenCode strict launch behavior changed before proof${lastAuthorityRejection}`,
+        }
       }
       const remainingMs = () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs)
       const phaseContext = (phase: OpenCodePhaseContext['phase']): OpenCodePhaseContext => ({
@@ -3694,6 +3760,11 @@ async function runLaunch(
           remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
           toolApprovalMode,
           expectedBehaviorFingerprint,
+          ...(apiSelectedModel.startsWith('cursor-acp/') ? { stopAuthority: {
+            runtime: { ...createRuntimeSnapshot(snapshot),
+              capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId! },
+            expectedBehaviorFingerprint,
+          } } : {}),
           expectedBootstrapForSession: sessionId =>
             strictSessionCompatibility(sessionId, input).bootstrap,
         })
@@ -3782,7 +3853,7 @@ async function runLaunch(
         if (!await matchesCurrentExpectedBehavior(signal)) {
           return {
             kind: 'failure',
-            error: 'OpenCode strict launch behavior changed during bootstrap',
+            error: `OpenCode strict launch behavior changed during bootstrap${lastAuthorityRejection}`,
             ...ownedUncommittedResources,
           }
         }
@@ -4447,10 +4518,7 @@ async function runStop(
     }
   }
   const records = laneRecords.filter(record => record.runId === runId)
-  const snapshot = retained ? retained.snapshot
-    : records.length ? await openCodeProvisioningProbe.probe(envelope.cwd, {
-      phaseContext: stopPreflightContext,
-    }) : null
+  const snapshot = retained?.snapshot ?? null
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot, { confirmedStopRuntime: retained?.confirmedStopRuntime }),
@@ -4595,7 +4663,7 @@ async function runStop(
         // Once the atomic lease mutation starts, await it to completion. Racing an
         // uncancellable registry write could remove a lease after a timeout response.
         await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
-        const runtime = createRuntimeSnapshot(snapshot)
+        const runtime = retained?.confirmedStopRuntime ?? record.stopAuthority?.runtime ?? createRuntimeSnapshot(snapshot)
         let terminal: OpenCodeSessionRecord | null
         try {
           terminal = await openCodeSessionStore.markStoppedIfSession(record,
@@ -5852,7 +5920,8 @@ async function handleEnvelope(
         if (!selected) {
           throw new Error('OpenCode launch handshake requires a provider-qualified selectedModel')
         }
-        if (selected.providerId === 'kiro' || selected.providerId === 'cursor-acp') {
+        if ((selected.providerId === 'kiro' || selected.providerId === 'cursor-acp')
+          && !(await resolveManagedCursorLaunchSupport(selected.providerId)).supported) {
           throw new Error(`OpenCode launch handshake does not support extension-bound provider ${selected.providerId}`)
         }
         const mode = envelope.body.toolApprovalMode

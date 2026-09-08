@@ -161,60 +161,167 @@ test('existing-only host retention verifies identity and never spawns or cleans 
   }
 })
 
-test('stop ignores historical markers only for exact current sealed session authority', async () => {
+test('Cursor Stop uses exact persisted ownership without fresh authority and repeats idempotently', async () => {
+  const scope = {
+    purpose: 'launch_runtime' as const, providerId: 'cursor-acp', scopeToken: 'test-scope',
+    configFingerprint: 'config', selectedAuthIdentity: 'known:auth' as const,
+  }
+  const records = ['lead', 'Alice', 'Bob'].map(memberName => buildRecord({
+    memberName, runId: 'run', selectedModel: 'cursor-acp/auto', toolApprovalMode: 'auto', profileScope: scope,
+    runtimePid: host.pid, managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+    expectedBehaviorFingerprint: 'a'.repeat(64), resolvedBehaviorFingerprint: baseProfile.managedConfigFingerprint,
+    staleReason: memberName === 'lead' ? 'managed_config_changed' : null,
+  }))
+  let current: OpenCodeSessionRecord | null = records[0]
+  let processStartedAtMs = 1000
+  let endpointCalls = 0
+  let prepareCalls = 0
+  let acquireCalls = 0
+  let spawnCalls = 0
+  let replaceDuringResolution: Partial<OpenCodeSessionRecord> | null = null
+  const aborted: string[] = []
+  const registryPath = path.join(isolatedRoot, 'cursor-owned-hosts.json')
+  const now = new Date().toISOString()
+  const leases = Object.fromEntries(records.map(record => {
+    const leaseKey = `${record.teamId}::${record.laneId}::${record.memberName}`
+    return [leaseKey, { leaseKey, teamId: record.teamId, laneId: record.laneId,
+      memberName: record.memberName, runId: record.runId, sessionId: record.opencodeSessionId,
+      createdAt: now, updatedAt: now }]
+  }))
+  await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, processIdentityFormat: 'platform-native-v2',
+    hosts: { [host.hostKey]: { ...host, profile: undefined,
+      managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+      processStartedAtMs, updatedAt: now, leases } } }))
+  const before = await readFile(registryPath, 'utf8')
+  const prepareProfile = async (): Promise<OpenCodePreparedProfile> => {
+    prepareCalls++
+    throw new Error('Cursor signed out/assets missing/config changed')
+  }
+  const manager = new OpenCodeHostManager({
+    persistentRegistryPath: registryPath, prepareProfile,
+    isProcessAlive: () => true,
+    readProcessStartTimeMs: async pid => { expect(pid).toBe(host.pid); return processStartedAtMs },
+    spawnHostProcess: () => { spawnCalls++; throw new Error('must not spawn') },
+    killProcess: () => { throw new Error('must not kill') },
+    fetchJson: async () => { throw new Error('must not probe fresh authority') },
+  })
+  const bridge = new OpenCodeSessionBridge({
+    prepareProfile,
+    hostManager: {
+      ensureHost: async () => { acquireCalls++; throw new Error('must not acquire') },
+      releaseHost: async () => { throw new Error('must not release an unacquired reference') },
+      resolveOwnedSessionEndpoint: async (key, lease, signal) => {
+        endpointCalls++
+        const endpoint = await manager.resolveOwnedSessionEndpoint(key, lease, signal)
+        if (replaceDuringResolution) current = { ...records[0], ...replaceDuringResolution }
+        return endpoint
+      },
+    },
+    sessionStore: { get: async () => current } as never,
+    clientFactory: { create: (url: string) => {
+      expect(url).toBe(host.baseUrl)
+      return { abortSession: async (id: string) => { aborted.push(id); return true } }
+    } } as never,
+    mcpManager: { ensureAppMcp: async () => { throw new Error('MCP disconnected') } },
+  })
+  for (const record of records) { current = record; expect(await bridge.abort(record)).toBe(true) }
+  expect(aborted).toEqual(records.map(record => record.opencodeSessionId))
+  expect(endpointCalls).toBe(3)
+  expect(records[0].staleReason).toBe('managed_config_changed')
+  // Historical launch fingerprints cannot prevent cleanup of the same stored owner.
+  for (const change of [
+    { managedConfigFingerprint: 'rotated' }, { managedAuthFingerprint: 'rotated' },
+    { projectBehaviorFingerprint: 'changed' }, { profileScope: { ...scope, scopeToken: 'foreign' } },
+  ]) {
+    current = { ...records[0], ...change }
+    expect(await bridge.abort(current)).toBe(true)
+  }
+  expect(aborted).toHaveLength(7)
+  const ownershipChanges = [
+    { runId: 'replacement' }, { opencodeSessionId: 'replacement' },
+    { hostKey: 'foreign' }, { projectPath: '/foreign' },
+  ]
+  for (const stoppedAt of [undefined, now]) {
+    for (const change of ownershipChanges) {
+      current = { ...records[0], ...change, stoppedAt }
+      await expect(bridge.abort(records[0])).rejects.toThrow('ownership changed')
+    }
+  }
+  current = null
+  await expect(bridge.abort(records[0])).rejects.toThrow('ownership changed')
+  current = { ...records[0], runId: undefined }
+  await expect(bridge.abort(current)).rejects.toThrow('ownership changed')
+  expect(endpointCalls).toBe(7)
+  // Even matching session-store data cannot authorize a foreign persistent lease.
+  for (const change of ownershipChanges) {
+    current = { ...records[0], ...change }
+    await expect(bridge.abort(current)).rejects.toThrow('host ownership is unavailable')
+  }
+  // Reused PID: the real resolver compares the persisted process start identity.
+  current = records[0]
+  processStartedAtMs = 2000
+  await expect(bridge.abort(records[0])).rejects.toThrow('process ownership is unavailable')
+  processStartedAtMs = 1000
+  for (const change of [...ownershipChanges, { stoppedAt: now }]) {
+    current = records[0]
+    replaceDuringResolution = change
+    await expect(bridge.abort(records[0])).rejects.toThrow('no longer active')
+  }
+  replaceDuringResolution = null
+  const resolvedBeforeRepeat = endpointCalls
+  current = { ...records[0], stoppedAt: now }
+  expect(await bridge.abort(records[0])).toBe(true)
+  expect(await bridge.abort(current)).toBe(true)
+  expect(endpointCalls).toBe(resolvedBeforeRepeat)
+  expect(aborted).toHaveLength(7)
+  expect(prepareCalls).toBe(0)
+  expect(acquireCalls).toBe(0)
+  expect(spawnCalls).toBe(0)
+  expect(await readFile(registryPath, 'utf8')).toBe(before)
+})
+
+test('new work still rejects stale selected authority and a replacement runtime PID', async () => {
   const scope = {
     purpose: 'launch_runtime' as const, providerId: 'openai', scopeToken: 'test-scope',
     configFingerprint: 'config', selectedAuthIdentity: 'known:auth' as const,
   }
   const profile = { ...baseProfile, profileScope: scope, scopeToken: scope.scopeToken }
-  const records = ['lead', 'Alice', 'Bob'].map(memberName => buildRecord({
-    memberName, runId: 'run', toolApprovalMode: 'auto', profileScope: scope,
+  let current = buildRecord({ runId: 'run', toolApprovalMode: 'auto', profileScope: scope,
     runtimePid: host.pid, managedConfigFingerprint: profile.managedConfigFingerprint,
     expectedBehaviorFingerprint: 'a'.repeat(64), resolvedBehaviorFingerprint: profile.managedConfigFingerprint,
-    staleReason: memberName === 'lead' ? 'managed_config_changed' : null,
-  }))
-  let current = records[0]
+    staleReason: 'managed_config_changed' })
   let prepared = profile
-  let liveHost = { ...host, profile, resolvedConfigFingerprint: profile.managedConfigFingerprint }
   let acquired = 0
-  let expectedExistingOnly = true
-  const aborted: string[] = []
+  let released = 0
   const bridge = new OpenCodeSessionBridge({
     prepareProfile: async () => prepared,
     hostManager: {
-      ensureHost: async options => { expect(options?.existingOnly === true).toBe(expectedExistingOnly); acquired++; return liveHost },
-      releaseHost: async (_key, options) => { expect(options?.keepPersistentAlive).toBe(expectedExistingOnly) },
+      ensureHost: async options => {
+        expect(options?.existingOnly).toBe(true)
+        acquired++
+        return { ...host, profile, pid: host.pid + 1, resolvedConfigFingerprint: profile.managedConfigFingerprint }
+      },
+      releaseHost: async (_key, options) => { expect(options?.keepPersistentAlive).toBe(true); released++ },
     },
     sessionStore: { get: async () => current } as never,
-    clientFactory: { create: () => ({ abortSession: async (id: string) => { aborted.push(id); return true } }) } as never,
-    mcpManager: { ensureAppMcp: async () => { throw new Error('MCP disconnected') } },
+    clientFactory: { create: () => { throw new Error('must not send new work') } } as never,
+    mcpManager: { ensureAppMcp: async () => { throw new Error('must not attach MCP') } },
   })
-  for (const record of records) { current = record; expect(await bridge.abort(record)).toBe(true) }
-  expect(aborted).toHaveLength(3)
-  expect(records[0].staleReason).toBe('managed_config_changed')
-  current = records[0]
-  await expect(bridge.promptAsync(records[0], { text: 'must not send' })).rejects.toThrow('authority is stale')
+  await expect(bridge.promptAsync(current, { text: 'must not send' })).rejects.toThrow('authority is stale')
+  current = { ...current, staleReason: null }
   for (const change of [
     { managedConfigFingerprint: 'rotated' }, { managedAuthFingerprint: 'rotated' },
     { projectBehaviorFingerprint: 'changed' }, { profileScope: { ...scope, scopeToken: 'foreign' } },
   ]) {
     prepared = { ...profile, ...change }
-    await expect(bridge.abort(records[0])).rejects.toThrow('authority is stale')
+    await expect(bridge.promptAsync(current, { text: 'must not send' })).rejects.toThrow('authority is stale')
   }
+  expect(acquired).toBe(0)
   prepared = profile
-  current = { ...records[0], runId: 'replacement' }
-  await expect(bridge.abort(records[0])).rejects.toThrow('no longer active')
-  current = { ...records[0], hostKey: 'foreign' }
-  await expect(bridge.abort(records[0])).rejects.toThrow('no longer active')
-  current = { ...records[0], stoppedAt: new Date().toISOString() }
-  await expect(bridge.abort(records[0])).rejects.toThrow('no longer active')
-  expect(acquired).toBe(3)
-  current = records[0]
-  liveHost = { ...liveHost, pid: host.pid + 1 }
-  await expect(bridge.abort(records[0])).rejects.toThrow(`runtime process changed (expected pid=${host.pid}, actual pid=${host.pid + 1})`)
-  current = { ...records[0], staleReason: null }
-  await expect(bridge.promptAsync(current, { text: 'must not bind replacement process' })).rejects.toThrow('runtime process changed')
-  expect(aborted).toHaveLength(3)
+  await expect(bridge.promptAsync(current, { text: 'must not bind replacement process' }))
+    .rejects.toThrow(`runtime process changed (expected pid=${host.pid}, actual pid=${host.pid + 1})`)
+  expect(acquired).toBe(1)
+  expect(released).toBe(1)
 })
 
 test('existing-only acquisition honors cancellation during process and health verification without mutation', async () => {

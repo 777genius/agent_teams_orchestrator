@@ -142,3 +142,23 @@ describe('OpenCode expected behavior fingerprint v2', () => {
     })).rejects.toThrow('effective live config fingerprint is unavailable')
   })
 })
+
+
+test('Cursor marker expiry/refresh does not change strict expected behavior; native account does', async () => {
+  const native = `known:${'d'.repeat(64)}` as const
+  const prepared: OpenCodePreparedProfile = { ...profile(), authoritySourceFingerprint: 'a'.repeat(64),
+    selectedManagedAuthIdentity: native, env: { AGENT_TEAMS_CURSOR_READINESS: 'ready' },
+    profileScope: { purpose: 'launch_runtime', providerId: 'cursor-acp',
+      configFingerprint: 'c'.repeat(64), scopeToken: 'scope', selectedAuthIdentity: native } }
+  const evidence = (at: number) => buildOpenCodeExpectedBehaviorEvidence({ profile: prepared,
+    fullModelId: 'cursor-acp/auto', effectiveConfigFingerprint: prepared.managedConfigFingerprint,
+    readCredential: async () => ({ type: 'oauth', access: 'cursor-agent', refresh: 'cursor-agent', expires: at + 30 * 60_000 }) })
+  const first = await evidence(0)
+  expect((await evidence(31 * 60_000)).expectedBehaviorFingerprint).toBe(first.expectedBehaviorFingerprint)
+  prepared.profileScope!.selectedAuthIdentity = `known:${'e'.repeat(64)}`
+  await expect(evidence(32 * 60_000)).rejects.toThrow('native Cursor')
+  prepared.selectedManagedAuthIdentity = prepared.profileScope!.selectedAuthIdentity
+  expect((await evidence(32 * 60_000)).expectedBehaviorFingerprint).not.toBe(first.expectedBehaviorFingerprint)
+  delete prepared.env.AGENT_TEAMS_CURSOR_READINESS
+  await expect(evidence(33 * 60_000)).rejects.toThrow('native Cursor')
+})
