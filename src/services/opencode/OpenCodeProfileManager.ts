@@ -1,10 +1,10 @@
+import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
-  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -1359,24 +1359,25 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     binPath,
     'cursor-resource-exhausted-preload.cjs',
   )
-  await writeFile(
-    cursorResourceExhaustedPreloadPath,
-    buildCursorAgentResourceExhaustedPreloadScript(),
-    { encoding: 'utf8', mode: 0o600 },
-  )
+  if (platform === 'win32') {
+    await writeFile(cursorResourceExhaustedPreloadPath,
+      buildCursorAgentResourceExhaustedPreloadScript(), { encoding: 'utf8', mode: 0o600 })
+  } else {
+    await publishNativeCliFile(cursorResourceExhaustedPreloadPath,
+      buildCursorAgentResourceExhaustedPreloadScript(), 0o600)
+  }
 
   // The plugin registers OpenCode MCP servers as tools, but an agent can only
   // reach them through the plugin's own mcptool CLI. A global npm install would
   // provide it; a bundled artifact does not, so the profile ships its own shim.
   if (cursorManagedAssets && platform !== 'win32') {
     const shimPath = path.join(binPath, 'mcptool')
-    await writeFile(shimPath, [
+    await publishNativeCliFile(shimPath, [
       '#!/bin/sh',
       `exec ${quotePosixShellValue(cursorManagedAssets.interpreterPath)}`
         + ` ${quotePosixShellValue(cursorManagedAssets.mcpToolPath)} "$@"`,
       '',
-    ].join('\n'), 'utf8')
-    await chmod(shimPath, 0o700)
+    ].join('\n'), 0o700)
   }
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
@@ -1434,8 +1435,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
-    await writeFile(bridgePath, content, 'utf8')
-    await chmod(bridgePath, 0o700)
+    await publishNativeCliFile(bridgePath, content, 0o700)
     return bridgePath
   }
 

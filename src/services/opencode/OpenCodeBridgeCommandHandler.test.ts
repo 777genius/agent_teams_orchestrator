@@ -1525,7 +1525,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   for (const legacy of [false, true]) {
     test(`Cursor desktop Stop preserves ${legacy ? 'persisted desktop capability' : 'retained launch receipt'} after signout/assets/config loss and restart`, async () => {
-      const projectPath = await mkdtemp('/tmp/cursor-desktop-stop-owned-')
+      const projectPath = await mkdtemp(path.join(os.tmpdir(), 'cursor-desktop-stop-owned-'))
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
       process.env.CLAUDE_CONFIG_DIR = projectPath
       try {
