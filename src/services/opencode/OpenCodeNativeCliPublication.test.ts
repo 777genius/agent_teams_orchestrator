@@ -18,6 +18,21 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 
+test('publishes concurrent wrapper generations without truncation on every platform', async () => {
+  const root = await fixture()
+  const target = path.join(root, 'kiro-cli.cmd')
+  const initial = '@echo off\r\necho ready\r\n'
+  await Promise.all(Array.from({ length: 32 }, () => publishNativeCliFile(target, initial, 0o700)))
+  expect(await readFile(target, 'utf8')).toBe(initial)
+  const before = await lstat(target)
+  await Promise.all(Array.from({ length: 32 }, () => publishNativeCliFile(target, initial, 0o700)))
+  expect((await lstat(target)).mtimeMs).toBe(before.mtimeMs)
+  const changed = `${initial}rem ${'complete-generation'.repeat(1024)}\r\n`
+  await Promise.all(Array.from({ length: 32 }, () => publishNativeCliFile(target, changed, 0o700)))
+  expect(await readFile(target, 'utf8')).toBe(changed)
+  expect(await readdir(root)).toEqual(['kiro-cli.cmd'])
+})
+
 test.skipIf(process.platform === 'win32')('preserves matching identity, repairs mode, replaces symlinks and cleans failed publication', async () => {
   const root = await fixture()
   const target = path.join(root, 'kiro-cli')

@@ -1359,13 +1359,8 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     binPath,
     'cursor-resource-exhausted-preload.cjs',
   )
-  if (platform === 'win32') {
-    await writeFile(cursorResourceExhaustedPreloadPath,
-      buildCursorAgentResourceExhaustedPreloadScript(), { encoding: 'utf8', mode: 0o600 })
-  } else {
-    await publishNativeCliFile(cursorResourceExhaustedPreloadPath,
-      buildCursorAgentResourceExhaustedPreloadScript(), 0o600)
-  }
+  await publishNativeCliFile(cursorResourceExhaustedPreloadPath,
+    buildCursorAgentResourceExhaustedPreloadScript(), 0o600)
 
   // The plugin registers OpenCode MCP servers as tools, but an agent can only
   // reach them through the plugin's own mcptool CLI. A global npm install would
@@ -1402,7 +1397,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
-      await writeFile(bridgePath, content, 'utf8')
+      await publishNativeCliFile(bridgePath, content, 0o700)
       return bridgePath
     }
 
