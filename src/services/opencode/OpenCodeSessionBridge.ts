@@ -587,6 +587,10 @@ export class OpenCodeSessionBridge {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
+      // Selected launches seal the managed-config domain used by strict host reuse.
+      ...(params.profile.profileScope?.purpose === 'launch_runtime'
+        ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false }
+        : {}),
     })
 
     try {
@@ -729,6 +733,7 @@ export class OpenCodeSessionBridge {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
       preparedProfile: profile,
+      ...(scoped ? { existingOnly: true } : {}),
       ...(scoped ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false } : {}),
       abortSignal: options.signal,
     })
@@ -736,13 +741,14 @@ export class OpenCodeSessionBridge {
     try {
       // A selected launch seals the managed-config domain, not the broad
       // provider inventory hash. Revalidate its live authority before reuse.
+      if (record.runtimePid != null && host.pid !== record.runtimePid) {
+        throw new Error(`OpenCode selected session runtime process changed (expected pid=${record.runtimePid}, actual pid=${host.pid}); relaunch the lane`)
+      }
       if (host.hostKey !== record.hostKey
         || host.resolvedConfigFingerprint !== record.managedConfigFingerprint) {
         throw new Error('OpenCode selected session fingerprint domain changed; relaunch the lane')
       }
-      // Stop uses exact store/session/host identity and the sealed config fingerprint.
-      // It must remain available when the app MCP is disconnected because abort,
-      // status, and SSE are direct OpenCode HTTP operations.
+      // New work requires live selected authority; Stop resolves stored ownership separately.
       const refreshed = await refreshSelectedProfileAuthority({
         host,
         selectedModel: record.selectedModel,
@@ -764,7 +770,7 @@ export class OpenCodeSessionBridge {
       await this.assertExactSessionAuthority(record)
       return host
     } catch (error) {
-      await this.hostManager.releaseHost(host.hostKey)
+      await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: scoped })
       throw error
     }
   }
@@ -939,7 +945,7 @@ export class OpenCodeSessionBridge {
         runtimePid: host.pid > 0 ? host.pid : null,
       })
     } finally {
-      await this.hostManager.releaseHost(host.hostKey)
+      await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: record.profileScope?.purpose === 'launch_runtime' })
     }
   }
 

@@ -1365,21 +1365,31 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         npm: '@ai-sdk/github-copilot',
         api: 'https://api.githubcopilot.com',
         models: {
-          'gpt-5-mini': {
-            name: 'GPT-5 Mini',
-            family: 'gpt-mini',
+          'gpt-5.6-luna': {
+            name: 'GPT-5.6 Luna',
+            family: 'gpt-5.6-luna',
+            attachment: true,
+            modalities: { input: ['text', 'image'], output: ['text'] },
             reasoning: true,
             tool_call: true,
             structured_output: true,
             limit: {
-              context: 264_000,
-              input: 128_000,
-              output: 64_000,
+              context: 1_050_000,
+              input: 922_000,
+              output: 128_000,
             },
           },
         },
       },
     })
+  })
+
+  test('preserves an explicit Copilot model selection when seeding Luna', () => {
+    const managedConfig = buildManagedConfig(undefined, {
+      defaultModelId: 'github-copilot/gpt-5-mini',
+    })
+
+    expect(managedConfig.model).toBe('github-copilot/gpt-5-mini')
   })
 
   test('seeds Xiaomi MiMo Token Plan OpenCode providers for regional Token Plan endpoints', () => {

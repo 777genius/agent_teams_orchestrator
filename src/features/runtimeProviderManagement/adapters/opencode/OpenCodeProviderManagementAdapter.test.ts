@@ -2683,11 +2683,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.',
     )
     expect(probedModelIds).toEqual([
+      'github-copilot/gpt-5.6-luna',
       'github-copilot/gpt-5-mini',
       'github-copilot/gpt-5.5',
       'github-copilot/claude-haiku-4.5',
       'github-copilot/claude-sonnet-4.6',
-      'github-copilot/gpt-5.6-luna',
     ])
     expect(callbackStarted).toBe(true)
     rejectCallback(new Error('late callback shutdown'))
@@ -2706,7 +2706,26 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
   })
 
-  test('keeps a paid Copilot connection when a later policy fallback is available', async () => {
+  test.each([
+    {
+      name: 'prefers Luna when it is present in the discovered Copilot catalog',
+      modelIds: ['gpt-5-mini', 'gpt-5.5', 'gpt-5.6-luna'],
+      supportedModelId: 'gpt-5.6-luna',
+      expectedProbeIds: ['gpt-5.6-luna'],
+    },
+    {
+      name: 'does not probe Luna when it is absent from the combined Copilot catalog',
+      modelIds: ['gpt-5-mini', 'gpt-5.5'],
+      supportedModelId: 'gpt-5-mini',
+      expectedProbeIds: ['gpt-5-mini'],
+    },
+    {
+      name: 'keeps a paid Copilot connection when a later policy fallback is available',
+      modelIds: ['gpt-5-mini', 'gpt-5.5', 'gpt-5.6-luna', 'claude-haiku-4.5', 'claude-sonnet-4.6'],
+      supportedModelId: 'claude-sonnet-4.6',
+      expectedProbeIds: ['gpt-5.6-luna', 'gpt-5-mini', 'gpt-5.5', 'claude-haiku-4.5', 'claude-sonnet-4.6'],
+    },
+  ])('$name', async ({ modelIds, supportedModelId, expectedProbeIds }) => {
     let connected = false
     const probedModelIds: string[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -2724,13 +2743,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
                 ]
               : [],
             availableProviders: ['github-copilot'],
-            models: [
-              'github-copilot/gpt-5-mini',
-              'github-copilot/gpt-5.5',
-              'github-copilot/gpt-5.6-luna',
-              'github-copilot/claude-haiku-4.5',
-              'github-copilot/claude-sonnet-4.6',
-            ],
+            models: modelIds.map(modelId => `github-copilot/${modelId}`),
           }),
       },
       hostManager: {
@@ -2782,7 +2795,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       executionProbe: {
         probeModel: async input => {
           probedModelIds.push(input.selectedModel)
-          return input.selectedModel === 'github-copilot/gpt-5.6-luna'
+          return input.selectedModel === `github-copilot/${supportedModelId}`
             ? executionProbeResult(input.selectedModel)
             : executionProbeResult(
                 input.selectedModel,
@@ -2808,14 +2821,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.value.verifiedModelId).toBe('github-copilot/gpt-5.6-luna')
-    expect(probedModelIds).toEqual([
-      'github-copilot/gpt-5-mini',
-      'github-copilot/gpt-5.5',
-      'github-copilot/claude-haiku-4.5',
-      'github-copilot/claude-sonnet-4.6',
-      'github-copilot/gpt-5.6-luna',
-    ])
+    expect(result.value.verifiedModelId).toBe(`github-copilot/${supportedModelId}`)
+    expect(probedModelIds).toEqual(
+      expectedProbeIds.map(modelId => `github-copilot/${modelId}`),
+    )
   })
 
   test('does not accept a stale pre-existing Copilot credential as OAuth completion evidence', async () => {
@@ -3890,6 +3899,87 @@ describe('OpenCodeProviderManagementAdapter', () => {
       ownership: ['managed'],
       verifiedModelId: 'openrouter/openrouter/free',
     })
+  })
+
+  test.each(['inventory', 'config', 'live'] as const)(
+    'excludes three free SuperGrok image models before text verification using %s metadata',
+    async metadataSource => {
+      const imageIds = ['grok-imagine-image', 'grok-imagine-image-2.0', 'grok-imagine-image-quality']
+      const textId = 'grok-4.6'
+      const descriptions = Object.fromEntries([
+        ...imageIds.map(id => [id, { modalities: { input: ['text', 'image'], output: ['image', 'pdf'] } }]),
+        [textId, { modalities: { input: ['text', 'image', 'pdf'], output: ['text'] }, tool_call: false }],
+      ])
+      const modelIds = [...imageIds, textId].map(id => `xai/${id}`)
+      const modelProbes: string[] = []
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => inventory({
+          connectedProviders: [{ id: 'xai', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }],
+          availableProviders: ['xai'], models: modelIds,
+          modelMetadata: modelIds.map(id => ({
+            id, cost: null, context: null, limits: null, free: id !== `xai/${textId}`,
+            raw: metadataSource === 'inventory' ? descriptions[id.slice(4)] : {},
+          })),
+        }) },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'xai', models: metadataSource === 'config' ? descriptions : {} }],
+            default: { xai: textId },
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xai', models: metadataSource === 'live' ? descriptions : {} }],
+            connected: ['xai'], default: { xai: textId },
+          }),
+          getProviderAuth: async () => ({ xai: [{ type: 'api' }] }),
+          setProviderAuth: async () => true,
+        }) },
+        authStore: authStore(),
+        executionProbe: { probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          if (input.selectedModel !== `xai/${textId}`) throw new Error('Image endpoint cannot answer a text probe')
+          return executionProbeResult(input.selectedModel)
+        } },
+      })
+
+      const result = await adapter.connectWithApiKey({
+        runtimeId: 'opencode', providerId: 'xai', apiKey: 'test-only-key',
+      })
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.value.verifiedModelId).toBe('xai/grok-4.6')
+      expect(modelProbes).toEqual(['xai/grok-4.6'])
+    },
+  )
+
+  test.each([
+    { modalities: { input: ['text'], output: ['video'] } },
+    { capabilities: { output: { text: false, image: true } } },
+    { capabilities: { output: { image: true } } },
+  ])('reports image/video-only catalogs as unsupported for credential verification: %j', async raw => {
+    let probes = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({
+        connectedProviders: [{ id: 'xai', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }],
+        availableProviders: ['xai'], models: ['xai/render-frame'],
+        modelMetadata: [{ id: 'xai/render-frame', cost: null, context: null, limits: null, free: true, raw }],
+      }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'xai' }], connected: ['xai'], default: {} }),
+        getProviderAuth: async () => ({ xai: [{ type: 'api' }] }),
+        setProviderAuth: async () => true,
+      }) },
+      authStore: authStore(),
+      executionProbe: { probeModel: async input => { probes++; return executionProbeResult(input.selectedModel) } },
+    })
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode', providerId: 'xai', apiKey: 'test-only-key',
+    })
+    expect(expectFailure(result)).toMatchObject({
+      code: 'model-missing', message: expect.stringContaining('text-response model'),
+    })
+    expect(probes).toBe(0)
   })
 
   test('verifies every API-key provider instead of trusting an accepted auth write', async () => {

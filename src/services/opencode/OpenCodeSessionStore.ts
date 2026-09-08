@@ -383,7 +383,7 @@ export class OpenCodeSessionStore {
     }
   }
 
-  private async readStore(): Promise<SessionStoreShape> {
+  private async readStore(preserveMaterializationFences = false): Promise<SessionStoreShape> {
     if (!(await fileExists(this.filePath))) {
       return {
         schemaVersion: 1,
@@ -400,7 +400,7 @@ export class OpenCodeSessionStore {
       }
     }
 
-    return normalizeMaterializationOwners(parsed)
+    return preserveMaterializationFences ? parsed : normalizeMaterializationOwners(parsed)
   }
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
@@ -661,6 +661,34 @@ export class OpenCodeSessionStore {
       await this.writeStore(store)
       return true
     })
+  }
+
+  // Called only under the old host startup/registry fence after proven process
+  // absence. Preserve the record as terminal evidence rather than deleting it.
+  async retireAbsentRuntimeIfSession(
+    record: OpenCodeSessionRecord,
+    requestedRunId: string,
+    signal?: AbortSignal,
+  ): Promise<OpenCodeSessionRecord | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const key = buildRecordKey(record)
+      const previous = store.records[key]
+      const hasFence = (map: unknown) => map !== undefined && (
+        map === null || typeof map !== 'object' || Array.isArray(map) || Object.hasOwn(map, key)
+      )
+      if (!previous || jsonStringify(previous) !== jsonStringify(record)
+        || previous.profileScope?.purpose !== 'launch_runtime'
+        || !previous.runId || !requestedRunId.trim() || previous.runId === requestedRunId.trim()
+        || isOpenCodeSessionStopped(previous)
+        || hasFence(store.materializationClaims) || hasFence(store.materializationOwners)) return null
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
+      const stoppedAt = new Date().toISOString()
+      const next = { ...previous, stoppedAt, staleReason: 'runtime_process_gone', updatedAt: stoppedAt }
+      store.records[key] = next
+      await this.writeStore(store)
+      return next
+    }, signal)
   }
 
   async markStoppedIfSession(

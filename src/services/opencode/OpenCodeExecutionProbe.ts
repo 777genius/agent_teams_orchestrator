@@ -493,7 +493,10 @@ function extractNestedKnownFailureMessage(value: unknown, depth = 0): string | n
   }
   for (const key of ['statusCode', 'status_code', 'httpStatus', 'http_status']) {
     const candidate = record[key]
-    if (candidate === 429 || candidate === '429') {
+    if (candidate === 401 || candidate === '401' || candidate === 403 || candidate === '403') {
+      const providerMessage = extractNestedErrorMessage(record)
+      consider(`HTTP ${candidate}${providerMessage ? `: ${providerMessage}` : ''}`)
+    } else if (candidate === 429 || candidate === '429') {
       consider('HTTP 429')
     } else {
       consider(extractNestedKnownFailureMessage(candidate, depth + 1))
