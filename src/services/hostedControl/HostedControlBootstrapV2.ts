@@ -6,7 +6,7 @@ import { readSelectedLaunchPhase } from './HostedControlSelectedLaunchReader.js'
 import { SELECTED_LAUNCH_PHASE, verifySelectedLaunchSealing, type SelectedLaunchPhase } from './HostedControlSelectedLaunchPhase.js'
 import { beforeDeadlineV2, descriptorRowV2, nonblockV2, OwnedDescriptorV2, readAvailableV2, readLeaseBytesV2,
   readOneUseV2, sameDescriptorV2, snapshotAllV2, snapshotV2, type DescriptorSnapshotV2 } from './HostedControlBootstrapV2Descriptors.js'
-import { freezeSelectionV2, observeExecutingOwnerV2, processV2, verifySelectedLaunchV2,
+import { COMPILED_OWNER_MODULE_PATH, assertCompiledOwnerImageCurrent, freezeSelectionV2, observeExecutingOwnerV2, processV2, verifySelectedLaunchV2,
   type ExecutingOwnerV2, type OwnerV2LaunchSelection } from './HostedControlBootstrapV2Launch.js'
 import { AUTH_V2, canonicalV2, decodeFramesV2, immutableV2, OWNER_V2_ROLES, requireV2, verifyLeaseV2,
   type BootstrapHeaderV2, type Immutable, type OwnerV2Role, type ServerCredentialsV2 } from './HostedControlBootstrapV2Wire.js'
@@ -102,7 +102,8 @@ export async function readHostedControlBootstrapV2(options: {
     for (const role of ['sealed-launcher-lease', 'activation-v2', 'liveness', 'raw-opencode-retention', 'owner-wal-native'] as const)
       requireV2(sameDescriptorV2(find(role), snapshotV2(role)), 'descriptor_changed')
     beforeDeadlineV2(deadline)
-    guard = retainGuard(owner('sealed-launcher-lease'), owner('liveness'), find('sealed-launcher-lease'), find('liveness'), h)
+    guard = retainGuard(owner('sealed-launcher-lease'), owner('liveness'), find('sealed-launcher-lease'), find('liveness'), h, selection.ownerModule.path === COMPILED_OWNER_MODULE_PATH
+      ? () => assertCompiledOwnerImageCurrent(selection.ownerExecutable) : undefined)
     activation = HostedControlInheritedActivationV2.retain(owner('activation-v2'), find('activation-v2'))
     requireV2(await guard.assertCurrent(), 'guard_lost')
     const { bootstrapBinding: b } = h
@@ -152,7 +153,7 @@ async function withinDeadline<T>(pending: T | Promise<T>, deadline: number): Pro
   })]) } finally { clearTimeout(timer) }
 }
 function retainGuard(lease: OwnedDescriptorV2, live: OwnedDescriptorV2, leaseSnapshot: DescriptorSnapshotV2,
-  liveSnapshot: DescriptorSnapshotV2, header: BootstrapHeaderV2): HostedControlDescriptorGuard & { assertCurrentSync(): boolean } {
+  liveSnapshot: DescriptorSnapshotV2, header: BootstrapHeaderV2, assertImageCurrent?: () => void): HostedControlDescriptorGuard & { assertCurrentSync(): boolean } {
   let current = true, closed = false
   let lose!: () => void; const lost = new Promise<void>(resolve => { lose = resolve })
   const markLost = () => { if (current) { current = false; lose() } }
@@ -161,6 +162,7 @@ function retainGuard(lease: OwnedDescriptorV2, live: OwnedDescriptorV2, leaseSna
   const check = () => {
     if (!current || closed) return false
     try {
+      assertImageCurrent?.()
       const owner = processV2(process.pid), parent = processV2(header.descriptorMap.wrapperPid)
       requireV2(owner.startTicks === header.supervisorBinding.ownerStartTicks && owner.parentPid === parent.pid &&
         parent.startTicks === header.descriptorMap.wrapperStartTicks, 'guard_process')

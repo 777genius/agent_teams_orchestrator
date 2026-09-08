@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync } from 'node:fs'
 import { canonicalV2, requireV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Wire.js'
-import { freezeSelectionV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
+import { freezeSelectionV2, assertCompiledOwnerImageCurrent } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
 import { selectedLaunchBootstrapDeadline, type SelectedLaunchPhase } from '../../../src/services/hostedControl/HostedControlSelectedLaunchPhase.js'
 import { beforeDeadlineV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Descriptors.js'
 import { createHostedApprovalActivationV2ProductionPins } from '../../../src/services/hostedControl/HostedApprovalActivationV2Pins.js'
@@ -9,7 +9,7 @@ import { requireNativePredecessorObservation, verifyNativePredecessorObservation
 import { parseIntegrationDescriptor } from './native-controller-contract.js'
 import { parseControllerTrustAnchor } from './native-controller-verification.js'
 import { admitSelectedControlDocuments } from './native-selected-control.js'
-import { readReadonlyArtifact } from './native-readonly-artifact.js'
+import { readReadonlyArtifact, retainReadonlyImage } from './native-readonly-artifact.js'
 import { verifyP3B2Recipe } from './native-owner-recipe.js'
 import { retainNativeDeploymentTrust } from './native-deployment-trust.js'
 
@@ -35,12 +35,15 @@ export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
   beforeDeadlineV2(deadline)
   const trust = retainNativeDeploymentTrust()
   const roots: { path: string; fd: number; stat: ReturnType<typeof fstatSync> }[] = []
+  let image: ReturnType<typeof retainReadonlyImage> | undefined
   let closed = false
   const close = () => {
     if (closed) return
-    closed = true; trust.close()
-    for (const root of roots.reverse()) { try { closeSync(root.fd) } catch {} }
-    roots.length = 0
+    closed = true
+    try { try { image?.close() } finally { trust.close() } } finally {
+      for (const root of roots.reverse()) { try { closeSync(root.fd) } catch {} }
+      roots.length = 0
+    }
   }
   try {
     const { statement: s, launch } = verifyNativeLaunchAdmissionSignature(phase, trust.pin.launcherPublicKey)
@@ -70,7 +73,7 @@ export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
       const recipe = verifyP3B2Recipe(readReadonlyArtifact(payload, descriptor.p3b2.recipe, 16 * 1024 * 1024), descriptor)
       requireV2(recipe?.supervisor && launch.selectedSupervisor && launch.selectedRecipe, 'native_launch_recipe')
       requireV2(recipe.recipeSha256 === launch.recipeSha256 &&
-        canonicalV2(recipe.source.module) === canonicalV2(launch.ownerModule) &&
+        canonicalV2((recipe.compiled ?? recipe.source)!.module) === canonicalV2(launch.ownerModule) &&
         recipe.executable.sha256 === launch.ownerExecutable.sha256 &&
         recipe.executable.device === launch.ownerExecutable.device && recipe.executable.inode === launch.ownerExecutable.inode &&
         recipe.executable.size === launch.ownerExecutable.size &&
@@ -82,7 +85,16 @@ export function admitNativeOwnerLaunch(phase: SelectedLaunchPhase) {
         descriptor.p3b2.closure.manifestSha256 === launch.ownerArtifactManifestSha256 &&
         descriptor.openCode.linuxX64Binary.sha256 === launch.expectedHost.executable.sha256 &&
         descriptor.controllerNonce === launch.expectedHost.activation.controllerNonce, 'native_launch_selected_binding')
-      readReadonlyArtifact(payload, descriptor.p3b2.entry, 32 * 1024 * 1024)
+      if (recipe.compiled) {
+        assertCompiledOwnerImageCurrent(launch.ownerExecutable)
+        if (image) image.assertCurrent()
+        else image = retainReadonlyImage(payload, recipe.executable, deadline)
+      } else {
+        requireV2(!image, 'native_launch_variant_changed')
+        readReadonlyArtifact(payload, descriptor.p3b2.entry, 32 * 1024 * 1024)
+      }
+      if (recipe.preparationModule) readReadonlyArtifact(payload, recipe.preparationModule, 32 * 1024 * 1024)
+      if (recipe.kernelModule) readReadonlyArtifact(payload, recipe.kernelModule, 32 * 1024 * 1024)
       readReadonlyArtifact(payload, recipe.supervisor.module, 32 * 1024 * 1024)
     }
     const isCurrent = () => {

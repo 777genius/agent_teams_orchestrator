@@ -33,7 +33,9 @@ test('wrong domains, keys, signatures and changed actual launch/sealed/start/hea
   assert.throws(() => verify(f.admission, f.phase.launch, f.phase.sealed, Buffer.from(RFC8032_ACTIVATION_HEX, 'hex').toString('base64url')))
   for (const signatureBase64url of ['', f.admission.signatureBase64url + '=', 'A'.repeat(86), 'A'.repeat(85) + 'B'])
     assert.throws(() => verify({ ...f.admission, signatureBase64url }))
-  for (const patch of [{ ownerProcessStartToken: '0'.repeat(64) }, { bootstrapV2HeaderSha256: '0'.repeat(64) }])
+  for (const patch of [{ ownerProcessStartToken: '0'.repeat(64) }, { bootstrapV2HeaderSha256: '0'.repeat(64) },
+    { ownerModule: { ...f.phase.launch.ownerModule, path: '/p3b2/bin/hosted-owner' } },
+    { ownerExecutable: { ...f.phase.launch.ownerExecutable, inode: '999999' } }])
     assert.throws(() => verify(f.admission, { ...f.phase.launch, ...patch }))
   assert.throws(() => verify(f.admission, f.phase.launch, { ...f.phase.sealed, observedMonotonicNs: '999' }))
   const equalKeys = { ...f.statement, activation: { ...f.statement.activation,

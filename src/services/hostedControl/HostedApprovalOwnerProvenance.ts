@@ -503,13 +503,24 @@ function sameRetainedImage(left: RetainedWalImage, right: RetainedWalImage): boo
   return left.byteSize === leftBytes.byteLength && left.sha256 === sha256(leftBytes) &&
     left.byteSize === right.byteSize && left.sha256 === right.sha256 && Buffer.from(leftBytes).equals(Buffer.from(rightBytes))
 }
-function identifyFile(path: string): { dev: string; ino: string; sha256: string } {
-  const fd = openSync(path, constants.O_RDONLY)
+function identifyFile(path: string, maximum?: bigint): { dev: string; ino: string; sha256: string } {
+  const fd = openSync(path, constants.O_RDONLY |
+    (path === '/p3b2/bin/hosted-owner' ? constants.O_NOFOLLOW : 0))
   try {
     const stat = fstatSync(fd, { bigint: true })
-    if (!stat.isFile()) throw new TypeError('owner-provenance-identity-not-file')
+    if (!stat.isFile() || maximum !== undefined && (stat.size < 1n || stat.size > maximum)) {
+      throw new TypeError('owner-provenance-identity-not-file')
+    }
     const digest = createHash('sha256'); const buffer = Buffer.allocUnsafe(64 * 1024)
-    for (;;) { const count = readSync(fd, buffer, 0, buffer.length, null); if (count === 0) break; digest.update(buffer.subarray(0, count)) }
+    let offset = 0
+    while (BigInt(offset) < stat.size) {
+      const count = readSync(fd, buffer, 0, Math.min(buffer.length, Number(stat.size) - offset), offset)
+      if (count === 0) throw new TypeError('owner-provenance-image-truncated')
+      digest.update(buffer.subarray(0, count)); offset += count
+    }
+    const after = fstatSync(fd, { bigint: true })
+    if (!(['dev', 'ino', 'size', 'mode', 'nlink', 'uid', 'gid', 'mtimeNs', 'ctimeNs'] as const)
+      .every(key => after[key] === stat[key])) throw new TypeError('owner-provenance-image-changed')
     return { dev: stat.dev.toString(), ino: stat.ino.toString(), sha256: digest.digest('hex') }
   } finally { closeSync(fd) }
 }
@@ -519,7 +530,13 @@ export function createOwnerProvenanceNodeOperations(): OwnerProvenanceOperations
     identity(modulePath: string) {
       const stat = readFileSync('/proc/self/stat', 'utf8'); const end = stat.lastIndexOf(') '); const startTicks = stat.slice(end + 2).trim().split(/\s+/u)[19] ?? ''
       if (end < 0) throw new TypeError('owner-provenance-process-stat')
-      const executable = identifyFile('/proc/self/exe'); const module = identifyFile(modulePath)
+      const maximum = modulePath === '/p3b2/bin/hosted-owner' ? 1024n ** 3n : undefined
+      const executable = identifyFile('/proc/self/exe', maximum)
+      const module = identifyFile(modulePath, maximum)
+      if (modulePath === '/p3b2/bin/hosted-owner' && (module.dev !== executable.dev ||
+        module.ino !== executable.ino || module.sha256 !== executable.sha256)) {
+        throw new TypeError('owner-provenance-compiled-image')
+      }
       return Object.freeze({ pid: process.pid, startTicks, exeDev: executable.dev, exeIno: executable.ino, exeSha256: executable.sha256, moduleSha256: module.sha256 })
     },
     descriptor(fd: number) {

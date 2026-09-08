@@ -19,6 +19,62 @@ const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() a
 const args = process.argv.slice(2)
 const compile = args.includes('--compile')
 const dev = args.includes('--dev')
+// The Hosted artifact has its own fixed closure and never enters desktop setup.
+const profileArgs = args.filter(arg => arg === '--profile' || arg.startsWith('--profile='))
+if (profileArgs.length > 0) {
+  if (profileArgs.length !== 1 || profileArgs[0] !== '--profile=hosted-owner') {
+    throw new Error('Expected exactly one --profile=hosted-owner')
+  }
+  if (!compile) {
+    throw new Error('hosted-owner requires --compile')
+  }
+  const allowedArgs = new Set(['--profile=hosted-owner', '--compile', '--print-build-plan'])
+  for (const arg of args) {
+    if (!allowedArgs.has(arg)) {
+      throw new Error(`Unsupported hosted-owner option: ${arg}`)
+    }
+  }
+
+  // Initial qualification scope is Linux x64; never silently follow the host.
+  const target = process.env.BUN_COMPILE_TARGET?.trim() || 'bun-linux-x64'
+  if (target !== 'bun-linux-x64') {
+    throw new Error(`Unsupported hosted-owner BUN_COMPILE_TARGET: ${target}`)
+  }
+  const entrypoint = './scripts/e2e/hosted-actual-owner-owner.ts'
+  const outfile = './dist/hosted-owner'
+  const features = ['HOSTED_CONTROL']
+  const defines = {
+    HOSTED_ACTUAL_OWNER_NATIVE_BUILD: 'true',
+    // Match the public external build identity so envUtils can eliminate the
+    // internal-only protectedNamespace require. This is a string expression.
+    'process.env.USER_TYPE': JSON.stringify('external'),
+  }
+  const cmd = [
+    process.execPath, 'build', entrypoint, '--compile', '--target', target,
+    '--format', 'esm', '--outfile', outfile, '--minify', '--packages', 'bundle',
+    '--conditions', 'bun',
+    ...features.map(feature => `--feature=${feature}`),
+    ...Object.entries(defines).flatMap(([key, value]) => ['--define', `${key}=${value}`]),
+  ]
+  if (args.includes('--print-build-plan')) {
+    console.log(JSON.stringify({
+      profile: 'hosted-owner', compile, dev: false, entrypoint, outfile,
+      target, features, defines, command: cmd,
+    }))
+    process.exit(0)
+  }
+
+  mkdirSync(dirname(outfile), { recursive: true })
+  runBuild(cmd)
+  // A successful compiler exit without the fixed image is not a delivery.
+  if (!statSync(outfile).isFile()) {
+    throw new Error('hosted-owner compiler did not produce a regular file')
+  }
+  chmodSync(outfile, 0o500)
+  console.log(`Built ${outfile}`)
+  process.exit(0)
+}
+
 const compileTarget = process.env.BUN_COMPILE_TARGET?.trim() || 'bun'
 
 const supportedCompileTargets = new Set([

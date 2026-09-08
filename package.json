@@ -17,6 +17,7 @@
     "build:dev": "bun run ./scripts/build.ts --dev",
     "build:dev:full": "bun run ./scripts/build.ts --dev --feature-set=dev-full",
     "compile": "bun run ./scripts/build.ts --compile",
+    "compile:hosted-owner": "bun run ./scripts/build.ts --profile=hosted-owner --compile",
     "dev": "bun run ./src/entrypoints/cli.tsx",
     "compile:hosted-actual-owner": "bun build scripts/e2e/hosted-actual-owner-owner.ts --target=bun --define=HOSTED_ACTUAL_OWNER_NATIVE_BUILD=true --outfile=/dev/null --external='*/protectedNamespace.js'",
     "test:hosted-actual-owner": "bun test scripts/e2e/hosted-actual-owner/cli-source.test.ts",

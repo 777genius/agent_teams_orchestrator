@@ -1,3 +1,4 @@
+import { COMPILED_OWNER_MODULE_PATH } from '../../../src/services/hostedControl/HostedControlBootstrapV2Launch.js'
 import type { NativeOwnerComposition } from './native-composition.js'
 import { acquireNativeProviderCustody, retainNativeActivatedAllocation, type NativeAdmittedAllocation } from './native-provider-admission.js'
 import type { NativeAdmittedLaunch } from './native-launch-admission.js'
@@ -30,7 +31,8 @@ export async function runActualOwnerV2(args: readonly string[], composition?: Ac
   // close its one-use descriptors. There is no legacy argv or FD fallback.
   let activationPins: HostedApprovalActivationV2ProductionPinSource | undefined
   let admittedLaunch: NativeAdmittedLaunch | undefined
-  const modulePath = process.argv[1]
+  const modulePath = typeof Bun !== 'undefined' && Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length > 0
+    ? COMPILED_OWNER_MODULE_PATH : process.argv[1]
   const bootstrap = await readHostedControlBootstrapV2({ modulePath, privateAuthFormat: PRIVATE_PROFILE_AUTH, selectionPhase: SELECTED_LAUNCH_PHASE,
     async selectLaunch(phase) {
       const path = parseOwnerV2Invocation(args)

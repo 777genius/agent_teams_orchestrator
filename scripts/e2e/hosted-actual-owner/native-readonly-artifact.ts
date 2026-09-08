@@ -1,6 +1,6 @@
 // Owner port of frozen r1029 namespace public artifact admission.
-import { beforeDeadlineV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Descriptors.js';
-import { constants, closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { beforeDeadlineV2, hashDescriptorV2 } from '../../../src/services/hostedControl/HostedControlBootstrapV2Descriptors.js';
+import { constants, closeSync, fstatSync, openSync, readSync, type BigIntStats } from 'node:fs';
 import { sha256 } from './native-http-contract.js';
 
 /** Selected public evidence only. Roots are independently provisioned in the
@@ -11,6 +11,7 @@ export interface ReadonlyArtifactPin {
   readonly inode: string;
   readonly size: number;
   readonly sha256: string;
+  readonly mode?: number;
 }
 
 function check(value: unknown, reason: string): asserts value {
@@ -46,16 +47,19 @@ function readonlyMount(fd: number): void {
   const matches = mounts.split('\n').filter(line => line.startsWith(`${id} `));
   check(matches.length === 1, 'mount_identity');
   const fields = matches[0].split(' ');
-  check(fields.length >= 10 && fields[5].split(',').includes('ro'), 'mount_writable');
+  const separator = fields.indexOf('-');
+  check(separator >= 6 && fields.length === separator + 4 && fields[5].split(',').includes('ro') &&
+    !fields[5].split(',').includes('rw'), 'mount_writable');
 }
 
 /** Walk each component under a retained root with O_NOFOLLOW. No path supplied
  * by a document can switch roots, traverse a symlink, or resolve in /sandbox.
  * The caller owns the root descriptor throughout this synchronous operation. */
-export function readReadonlyArtifact(rootFd: number, pin: ReadonlyArtifactPin, maximum: number, deadline = Infinity): Buffer {
+function withReadonlyArtifact<T>(rootFd: number, pin: ReadonlyArtifactPin, maximum: number,
+  deadline: number, consume: (fd: number, stat: BigIntStats) => T): T {
   beforeDeadlineV2(deadline);
   const selected = { ...pin };
-  check(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 32 * 1024 * 1024 &&
+  check(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 1024 ** 3 &&
     Number.isSafeInteger(selected.size) && selected.size > 0 && selected.size <= maximum &&
     /^[0-9a-f]{64}$/u.test(selected.sha256) &&
     /^(?:0|[1-9][0-9]{0,19})$/u.test(selected.device) &&
@@ -82,22 +86,14 @@ export function readReadonlyArtifact(rootFd: number, pin: ReadonlyArtifactPin, m
       readonlyMount(fd);
       if (!last) { check(stat.isDirectory(), 'directory'); parent = fd; continue; }
       check(stat.isFile() && stat.nlink === 1n && stat.size === BigInt(selected.size) &&
-        String(stat.dev) === selected.device && String(stat.ino) === selected.inode, 'identity');
-      const bytes = Buffer.alloc(selected.size);
-      let offset = 0;
-      while (offset < bytes.length) {
-        beforeDeadlineV2(deadline);
-        const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
-        check(count > 0, 'truncated'); offset += count;
-      }
+        String(stat.dev) === selected.device && String(stat.ino) === selected.inode &&
+        (selected.mode === undefined || Number(stat.mode & 0o7777n) === selected.mode), 'identity');
+      const result = consume(fd, stat);
       const after = fstatSync(fd, { bigint: true });
-      check(after.dev === stat.dev && after.ino === stat.ino && after.size === stat.size &&
-        after.mode === stat.mode && after.nlink === stat.nlink && after.uid === stat.uid &&
-        after.gid === stat.gid && after.mtimeNs === stat.mtimeNs && after.ctimeNs === stat.ctimeNs &&
-        sha256(bytes) === selected.sha256, 'changed');
+      check(sameImageStat(stat, after), 'changed');
       readonlyMount(fd);
       beforeDeadlineV2(deadline);
-      return bytes;
+      return result;
     }
     throw new Error('selected_readonly_artifact_empty');
   } finally {
@@ -108,4 +104,65 @@ export function readReadonlyArtifact(rootFd: number, pin: ReadonlyArtifactPin, m
     }
     if (failed) throw failed;
   }
+}
+
+function sameImageStat(a: BigIntStats, b: BigIntStats): boolean {
+  return (['dev', 'ino', 'size', 'mode', 'nlink', 'uid', 'gid', 'mtimeNs', 'ctimeNs'] as const)
+    .every(key => a[key] === b[key]);
+}
+
+/** Buffered documents/source keep their original 32 MiB hard ceiling. */
+export function readReadonlyArtifact(rootFd: number, pin: ReadonlyArtifactPin, maximum: number, deadline = Infinity): Buffer {
+  beforeDeadlineV2(deadline);
+  check(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 32 * 1024 * 1024, 'pin');
+  return withReadonlyArtifact(rootFd, pin, maximum, deadline, (fd, stat) => {
+    const bytes = Buffer.alloc(Number(stat.size));
+    let offset = 0;
+    while (offset < bytes.length) {
+      beforeDeadlineV2(deadline);
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      check(count > 0, 'truncated'); offset += count;
+    }
+    check(sha256(bytes) === pin.sha256, 'changed');
+    return bytes;
+  });
+}
+
+/** Retain a separate CLOEXEC handle after FD11 consumption. The borrowed root
+ * must outlive this handle. Currentness re-walks the selected path and mount;
+ * a retained old inode alone cannot authorize a substituted path. */
+export function retainReadonlyImage(rootFd: number, pin: ReadonlyArtifactPin & { mode: number }, deadline = Infinity) {
+  const selected = Object.freeze({ ...pin });
+  check(selected.mode === 0o500, 'image_mode');
+  let retained: number | undefined;
+  let identity!: BigIntStats;
+  const verify = (fd: number, stat: BigIntStats, limit: number) => {
+    check(Number(stat.mode & 0o7777n) === 0o500 && stat.gid === 0n, 'image_mode');
+    const magic = Buffer.alloc(4);
+    check(readSync(fd, magic, 0, 4, 0) === 4 && magic.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])), 'image_elf');
+    check(hashDescriptorV2(fd, stat, limit) === selected.sha256, 'changed');
+  };
+  try {
+    withReadonlyArtifact(rootFd, selected, 1024 ** 3, deadline, (fd, stat) => {
+      verify(fd, stat, deadline);
+      retained = openSync(`/proc/self/fd/${fd}`, constants.O_RDONLY | 0o2000000 /* O_CLOEXEC */);
+      identity = fstatSync(retained, { bigint: true });
+      check(sameImageStat(stat, identity), 'changed');
+    });
+  } catch (error) { if (retained !== undefined) closeSync(retained); throw error; }
+  return Object.freeze({
+    assertCurrent(limit = Infinity) {
+      check(retained !== undefined, 'image_closed');
+      check(sameImageStat(identity, fstatSync(retained, { bigint: true })), 'changed');
+      readonlyMount(retained);
+      withReadonlyArtifact(rootFd, selected, 1024 ** 3, limit, (fd, stat) => {
+        check(sameImageStat(identity, stat), 'changed');
+        verify(fd, stat, limit);
+      });
+    },
+    close() {
+      const fd = retained; retained = undefined;
+      if (fd !== undefined) closeSync(fd);
+    },
+  });
 }

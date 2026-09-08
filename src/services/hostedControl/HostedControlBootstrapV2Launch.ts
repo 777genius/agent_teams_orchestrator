@@ -1,6 +1,6 @@
 import type { PreparedProfileBinding } from '../opencode/OpenCodePreparedProfileContract.js'
 import { assertSelectedSupervisorArgvV1, type SelectedSupervisorEvidenceV1 } from './HostedControlSelectedSupervisorV1.js'
-import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, lstatSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from 'node:fs'
 import type { ExpectedSupervisedOpenCode } from '../opencode/OpenCodeSupervisedHostCustody.js'
 import { HOSTED_OWNER_PROVENANCE_CONTRACT, HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
   HOSTED_OWNER_PROVENANCE_IMPLEMENTATION } from './HostedApprovalOwnerProvenance.js'
@@ -55,11 +55,32 @@ export function processV2(pid: number) {
     pidNamespaceInode: String(statSync(`/proc/${pid}/ns/pid`, { bigint: true }).ino),
     networkNamespaceInode: String(statSync(`/proc/${pid}/ns/net`, { bigint: true }).ino) }
 }
-function hashPath(path: string, deadline: number) {
-  const fd = openSync(path, constants.O_RDONLY | 0o2000000 /* Linux O_CLOEXEC */)
-  try { const stat = fstatSync(fd, { bigint: true }); return { stat, sha256: hashDescriptorV2(fd, stat, deadline) } }
+function hashPath(path: string, deadline: number, maximum = 1024n ** 3n) {
+  const fd = openSync(path, constants.O_RDONLY | 0o2000000 /* Linux O_CLOEXEC */ |
+    (path === COMPILED_OWNER_MODULE_PATH ? constants.O_NOFOLLOW : 0))
+  try {
+    const stat = fstatSync(fd, { bigint: true })
+    requireV2(stat.size <= maximum, 'module_size')
+    return { stat, sha256: hashDescriptorV2(fd, stat, deadline) }
+  }
   finally { closeSync(fd) }
 }
+export const COMPILED_OWNER_MODULE_PATH = '/p3b2/bin/hosted-owner'
+
+/** A compiled module is the fixed mounted image, never an embedded Bun path.
+ * Reject consumed-FD execPath: publication must be able to reopen the same ELF. */
+export function assertCompiledOwnerImageCurrent(expected: { device: string; inode: string; size: number }): void {
+  requireV2(!process.execPath.startsWith('/proc/') && !process.execPath.includes('$bunfs'), 'compiled_exec_path')
+  const image = lstatSync(COMPILED_OWNER_MODULE_PATH, { bigint: true })
+  const executing = statSync('/proc/self/exe', { bigint: true })
+  const spawn = statSync(process.execPath, { bigint: true })
+  for (const stat of [image, executing, spawn]) {
+    requireV2(stat.isFile() && String(stat.dev) === expected.device && String(stat.ino) === expected.inode &&
+      stat.size === BigInt(expected.size) && Number(stat.mode & 0o7777n) === 0o500 &&
+      stat.nlink === 1n && stat.uid === 0n && stat.gid === 0n, 'compiled_image_identity')
+  }
+}
+
 /** FD11 is compared with the EXECUTING image, not with the .ts module. Caller
  * closes it before reading any configuration or creating a runtime/helper. */
 export function observeExecutingOwnerV2(anchor: DescriptorSnapshotV2, modulePath: string, deadline: number): ExecutingOwnerV2 {
@@ -68,7 +89,11 @@ export function observeExecutingOwnerV2(anchor: DescriptorSnapshotV2, modulePath
   const executableSha256 = hashDescriptorV2(11, fstatSync(11, { bigint: true }), deadline)
   // Source entry is already selected by exec argv. A built entry's module is its
   // image; a source entry must retain a separate module digest and source path.
-  const module = hashPath(modulePath, deadline)
+  const compiled = modulePath === COMPILED_OWNER_MODULE_PATH
+  if (compiled) assertCompiledOwnerImageCurrent({ device: anchor.device, inode: anchor.inode, size: Number(anchor.size) })
+  const module = hashPath(modulePath, deadline, compiled ? 1024n ** 3n : 32n * 1024n * 1024n)
+  if (compiled) requireV2(module.sha256 === executableSha256 && String(module.stat.dev) === anchor.device &&
+    String(module.stat.ino) === anchor.inode, 'compiled_module_anchor')
   requireV2(processV2(process.pid).startTicks === current.startTicks, 'owner_start_changed')
   return Object.freeze({ ...current, executableSha256, moduleSha256: module.sha256,
     executableDevice: anchor.device, executableInode: anchor.inode, executableSize: anchor.size })

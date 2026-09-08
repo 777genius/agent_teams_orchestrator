@@ -1,5 +1,7 @@
 // Compile-time selector only. Source invocations retain the legacy acceptance
-// command; the supported native build excludes its desktop dependency closure.
+// command; --profile=hosted-owner --compile defines this true for dist/hosted-owner
+// and excludes the legacy desktop dependency closure. The /dev/null source bundle
+// check uses the same selector but does not produce a compiled artifact.
 declare const HOSTED_ACTUAL_OWNER_NATIVE_BUILD: boolean
 
 const args = process.argv.slice(2)
