@@ -2111,11 +2111,13 @@ export async function resolveOpenCodeProfileScope(input: {
     : null
   // The Cursor marker credential is deliberately not proof. A live native account
   // probe is, and it is only consulted when the managed assets verify.
-  const cursorNativeAuthorized = isStrictAuthorityPurpose(input.purpose)
+  const cursorCandidate = isStrictAuthorityPurpose(input.purpose)
     && providerId === 'cursor-acp'
     && !selectedAuthIsCredential
-    && (await resolveManagedCursorAssets(env)) !== null
+  const cursorAssetsReady = cursorCandidate && (await resolveManagedCursorAssets(env)) !== null
+  const cursorAccountAuthorized = cursorAssetsReady
     && await isCursorNativeAccountAuthorized({ env })
+  const cursorNativeAuthorized = cursorAccountAuthorized
   if (
     isStrictAuthorityPurpose(input.purpose)
     && !selectedAuthIsCredential
@@ -2123,7 +2125,14 @@ export async function resolveOpenCodeProfileScope(input: {
     && authlessAuthorityMode === null
     && !cursorNativeAuthorized
   ) {
-    throw new Error('OpenCode strict profile requires explicit selected authentication')
+    // Which of the three conditions failed is the difference between "stage the
+    // assets", "sign in to Cursor" and "this provider needs a credential".
+    const cursorDetail = !cursorCandidate
+      ? 'not_cursor_native_candidate'
+      : !cursorAssetsReady ? 'managed_assets_unavailable' : 'cursor_account_not_authorized'
+    throw new Error(
+      `OpenCode strict profile requires explicit selected authentication (${cursorDetail})`,
+    )
   }
   const authlessAuthorityFingerprint = authlessAuthorityMode === null
     ? null
