@@ -690,3 +690,109 @@ pnpm vitest run src/main/services/team/opencode/bridge/OpenCodeReadinessBridge.t
 `transport.test.ts`, `build.test.ts` — проверяют сборку артефакта и транспорт
 плагина без Cursor и без квоты. Если правишь патч — это первое, что должно
 позеленеть.
+
+### 12.10. Исходник хелпера (он неотслеживаемый — сохрани себе)
+
+`.cdp-e2e.mjs` лежит в worktree фронта и не закоммичен, поэтому дублирую целиком.
+Запускать из worktree фронта (там есть зависимость `ws`).
+
+```js
+import http from 'node:http'
+import WebSocket from 'ws'
+
+const expression = process.argv[2]
+// One connection that waits inside the page beats a shell loop that pays node's
+// startup cost every few seconds just to ask whether the app is up yet.
+const waitMs = Number(process.env.CDP_WAIT_MS ?? 0)
+const fetchTargets = port => new Promise((resolve, reject) => {
+  http.get(`http://127.0.0.1:${port}/json/list`, res => {
+    let body = ''
+    res.on('data', c => { body += c })
+    res.on('end', () => { try { resolve(JSON.parse(body)) } catch (error) { reject(error) } })
+  }).on('error', reject)
+})
+// Pinned on purpose: another Agent Teams dev app can hold the default port, and
+// probing means driving whichever instance answered first. Read the real port
+// from <userDataDir>/DevToolsActivePort.
+const port = process.env.CDP_PORT ?? 9223
+const deadline = Date.now() + waitMs
+let targets = null
+for (;;) {
+  targets = await fetchTargets(port).catch(() => null)
+  if (targets?.some(target => /^https?:\/\/localhost/.test(target.url ?? ''))) break
+  targets = null
+  if (Date.now() >= deadline) throw new Error(`No Electron CDP endpoint on ${port}`)
+  await new Promise(resolve => setTimeout(resolve, 2000))
+}
+// DevTools and a not-yet-initialised window both answer as pages, and the
+// second one has no IPC handlers yet, which reads as "the app is broken".
+const page = targets.find(t => t.type === 'page' && /^https?:\/\/localhost/.test(t.url ?? ''))
+  ?? targets.find(t => t.type === 'page' && t.title !== 'DevTools')
+if (!page) throw new Error('No renderer page target')
+const socket = new WebSocket(page.webSocketDebuggerUrl, { maxPayload: 64 * 1024 * 1024 })
+await new Promise(resolve => socket.once('open', resolve))
+const result = await new Promise((resolve, reject) => {
+  socket.on('message', raw => {
+    const message = JSON.parse(raw.toString())
+    if (message.id !== 1) return
+    if (message.error) reject(new Error(JSON.stringify(message.error)))
+    else resolve(message.result)
+  })
+  socket.send(JSON.stringify({
+    id: 1, method: 'Runtime.evaluate',
+    params: { expression, awaitPromise: true, returnByValue: true, timeout: 600000 },
+  }))
+})
+socket.close()
+if (result.exceptionDetails) {
+  console.log('EXCEPTION:', JSON.stringify(result.exceptionDetails).slice(0, 1500))
+  process.exit(1)
+}
+console.log(typeof result.result.value === 'string'
+  ? result.result.value
+  : JSON.stringify(result.result.value, null, 1))
+```
+
+Использование:
+
+```bash
+CDP_PORT=<порт из DevToolsActivePort> CDP_WAIT_MS=120000 \
+  node .cdp-e2e.mjs "window.electronAPI.teams.list().then(t => JSON.stringify(t).length)"
+```
+
+### 12.11. Вход в Cursor: только руками пользователя
+
+Логин интерактивный, агент сам его не пройдёт:
+
+```bash
+cursor-agent login       # печатает ссылку вида https://cursor.com/loginDeepControl?...
+```
+
+Ссылку надо отдать пользователю, он открывает её в браузере и выбирает аккаунт.
+Окно ожидания — час, поэтому запускай логин в фоне и не держи на нём таймаут.
+Проверка состояния без раскрытия деталей:
+
+```bash
+cursor-agent status | grep -c "logged in"
+```
+
+⚠️ Не передавай `cursor-agent --model <имя>`: это перезаписывает
+`~/.cursor/cli-config.json` пользователя (модель и историю выбора). Я так один раз
+сделал и восстанавливал вручную.
+
+### 12.12. Откуда всё началось
+
+`CURSOR_HANDOFF.md` в репозитории фронтенда — исходная постановка предыдущего
+этапа. Часть её уже неактуальна (там ещё жив нативный барьер), но полезна как
+контекст, зачем всё это затевалось.
+
+### 12.13. Состояние на момент передачи
+
+- Изолированный инстанс приложения был поднят и жив на порту **9336**
+  (claude-root и userData — в scratchpad сессии). Если он ещё работает, можно
+  продолжать с шага 1 моего плана, не пересобирая окружение.
+- Последний оставшийся шаг перед прогоном пары: `testModel` на этом инстансе.
+  Предыдущая попытка вернула `OpenCode strict profile requires explicit selected
+  authentication` — теперь этот отказ называет конкретное условие
+  (`managed_assets_unavailable` или `cursor_account_not_authorized`), так что
+  первый же прогон должен показать, куда копать.
