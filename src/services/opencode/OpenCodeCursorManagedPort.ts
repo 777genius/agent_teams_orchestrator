@@ -1,34 +1,53 @@
 import { createServer } from 'node:net'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rename, rm } from 'node:fs/promises'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { lock } from '../../utils/lockfile.js'
 
 export const CURSOR_MANAGED_PROXY_PORT_ENV = 'AGENT_TEAMS_CURSOR_PROXY_PORT'
 export const CURSOR_PROVIDER_ID = 'cursor-acp'
 
-/**
- * The upstream plugin binds one well-known port for every Cursor profile on the
- * machine, and the provider config points at exactly that address. A stale or
- * foreign holder therefore receives another profile's traffic. A managed profile
- * gets its own retained port instead, so there is nothing to hijack.
- */
+/** Retains an endpoint assignment, not a live OS reservation. The plugin must
+ * bind this exact port and fail on EADDRINUSE; only host ownership can authorize
+ * reuse of a running listener. statePath must belong to one host generation. */
 export async function reserveCursorManagedProxyPort(statePath: string): Promise<number> {
-  const retained = await readRetainedPort(statePath)
-  if (retained) return retained
-  const port = await allocateLoopbackPort()
   await mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 })
-  await writeFile(statePath, JSON.stringify({ version: 1, port }) + '\n', { mode: 0o600 })
-  // A racing preparation may have retained a different port first; honour theirs.
-  return await readRetainedPort(statePath) ?? port
+  const release = await lock(statePath, {
+    realpath: false, stale: 10_000,
+    retries: { retries: 100, minTimeout: 10, maxTimeout: 100, factor: 1.2 },
+  })
+  try {
+    const retained = await readRetainedPort(statePath)
+    // A live owned host also occupies this port. Do not probe or reject reuse
+    // here: this API has no host identity. Exclusive plugin bind is the gate.
+    if (retained !== null) return retained
+    const port = await allocateLoopbackPort()
+    const temporary = `${statePath}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, JSON.stringify({ version: 1, port }) + '\n', { mode: 0o600, flag: 'wx' })
+      await rename(temporary, statePath)
+    } finally {
+      await rm(temporary, { force: true })
+    }
+    return port
+  } finally {
+    await release()
+  }
 }
 
 async function readRetainedPort(statePath: string): Promise<number | null> {
+  let raw: string
   try {
-    const parsed = JSON.parse(await readFile(statePath, 'utf8')) as { version?: unknown; port?: unknown }
-    if (parsed.version !== 1) return null
-    return isUsablePort(parsed.port) ? parsed.port : null
-  } catch {
-    return null
+    raw = await readFile(statePath, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
   }
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed.version === 1 && isUsablePort(parsed.port)) return parsed.port
+  } catch { /* report corrupt state without silently changing identity */ }
+  throw new Error('Cursor managed proxy port state is corrupt')
 }
 
 function isUsablePort(value: unknown): value is number {

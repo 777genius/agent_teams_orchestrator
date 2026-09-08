@@ -23,4 +23,11 @@ if (process.env.AGENT_TEAMS_CURSOR_CONTROL_DIR) {
     headers[name!] = result.headers
   }
 }
-await writeFile(readyPath, JSON.stringify({ baseURL: output.options.baseURL, headers }))
+const mcpResults: Record<string, unknown> = {}
+if (process.env.CURSOR_TRANSPORT_TEST_MCP) {
+  for (const name of ['receipt', 'failure', 'protocol']) {
+    try { mcpResults[name] = await hooks.tool[`mcp__fixture__${name}`].execute({ id: 'bridge' }, {}) }
+    catch { mcpResults[name] = { failed: true } }
+  }
+}
+await writeFile(readyPath, JSON.stringify({ baseURL: output.options.baseURL, headers, mcpResults }))

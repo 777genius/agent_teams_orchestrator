@@ -74,9 +74,8 @@ test.skipIf(process.platform !== 'darwin')('the bridge gives the agent the MCP C
     // mcptool must be reachable, and it must resolve this profile's servers.
     expect(source).toContain(bridge.binPath)
     expect(source).toContain(`export OPENCODE_CONFIG='${configPath}'`)
-    // The profile bins go last: this directory also holds a cursor-agent wrapper,
-    // and putting it first makes the wrapper exec itself forever.
-    expect(source.indexOf(hostBin)).toBeLessThan(source.indexOf(bridge.binPath))
+    // Absolute native execution permits the managed mcptool shim to win PATH.
+    expect(source).toContain(`export PATH='${bridge.binPath}${path.delimiter}${hostBin}'`)
     expect(await readFile(path.join(bridge.binPath, 'mcptool'), 'utf8'))
       .toContain(resolved.assets.mcpToolPath)
 

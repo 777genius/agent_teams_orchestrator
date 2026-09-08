@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -473,6 +473,7 @@ const originalRefreshSelectedProfileAuthority =
 const originalInventoryProbe = openCodeInventoryService.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalProbeModelOnHost = openCodeExecutionProbe.probeModelOnHost
+const originalResolveOwnedSessionEndpoint = openCodeHostManager.resolveOwnedSessionEndpoint
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalRefreshResolvedConfigFingerprint = openCodeHostManager.refreshResolvedConfigFingerprint
 const originalEnsureSession = openCodeSessionBridge.ensureSession
@@ -827,6 +828,7 @@ afterEach(async () => {
   openCodeInventoryService.probe = originalInventoryProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
   openCodeExecutionProbe.probeModelOnHost = originalProbeModelOnHost
+  openCodeHostManager.resolveOwnedSessionEndpoint = originalResolveOwnedSessionEndpoint
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeHostManager.refreshResolvedConfigFingerprint = originalRefreshResolvedConfigFingerprint
   openCodeSessionBridge.ensureSession = originalEnsureSession
@@ -1246,6 +1248,77 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.error.message).toContain('uncertain preflight release')
     expect(events).toEqual(['abort', 'release-session', 'release-preflight'])
   })
+
+  for (const legacy of [false, true]) {
+    test(`Cursor desktop Stop preserves ${legacy ? 'persisted desktop capability' : 'retained launch receipt'} after signout/assets/config loss and restart`, async () => {
+      const projectPath = await mkdtemp('/tmp/cursor-desktop-stop-owned-')
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+      process.env.CLAUDE_CONFIG_DIR = projectPath
+      try {
+        const store = new OpenCodeSessionStore(path.join(projectPath, 'sessions.json'))
+        const runtime = { providerId: 'opencode' as const, binaryPath: 'opencode', binaryFingerprint: 'version:fixture',
+          version: 'fixture', capabilitySnapshotId: `opencode:${'a'.repeat(32)}` }
+        const record = buildRecord({ projectPath, runId: 'run-1', selectedModel: 'cursor-acp/auto', toolApprovalMode: 'auto',
+          profileScope: { purpose: 'launch_runtime', providerId: 'cursor-acp', scopeToken: 'scope',
+            configFingerprint: 'config', selectedAuthIdentity: `known:${'c'.repeat(64)}` },
+          expectedBehaviorFingerprint: 'b'.repeat(64), stopAuthority: { runtime, expectedBehaviorFingerprint: 'b'.repeat(64) } })
+        if (legacy) {
+          delete record.stopAuthority
+          const manifestPath = path.join(projectPath, 'teams', record.teamId,
+            '.opencode-runtime', 'lanes', record.laneId ?? 'primary', 'manifest.json')
+          await mkdir(path.dirname(manifestPath), { recursive: true })
+          await writeFile(manifestPath, JSON.stringify({ data: { schemaVersion: 1,
+            teamName: record.teamId, activeRunId: record.runId,
+            activeCapabilitySnapshotId: runtime.capabilitySnapshotId } }))
+        }
+        await store.upsert(record)
+        openCodeSessionStore.list = store.list.bind(store)
+        openCodeSessionStore.get = store.get.bind(store)
+        openCodeSessionStore.markStoppedIfSession = store.markStoppedIfSession.bind(store)
+        openCodeProvisioningProbe.probe = async () => { throw new Error('signed out/assets missing/config drift') }
+        openCodeProvisioningProbe.probeRetainingHost = async () => { throw new Error('no new launch authorization for cleanup') }
+        openCodeHostManager.resolveOwnedSessionEndpoint = async (key, lease) => {
+          expect(key).toBe(record.hostKey)
+          expect(lease.runId).toBe(record.runId)
+          expect(lease.sessionId).toBe(record.opencodeSessionId)
+          return { baseUrl: 'http://127.0.0.1:43210', pid: 123 }
+        }
+        let aborts = 0
+        openCodeSessionBridge.abort = async () => { aborts++; return true }
+        openCodeSessionBridge.getRawStatus = async () => 'idle'
+        openCodeSessionBridge.releaseSession = async () => {}
+        const body = { projectPath, teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+          expectedCapabilitySnapshotId: runtime.capabilitySnapshotId }
+        const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          ...body, requiredCommand: 'opencode.stopTeam',
+        }))
+        expect(handshake.ok).toBe(true)
+        if (!('data' in handshake) || !('server' in handshake.data)) throw new Error('missing handshake')
+        // Desktop rejects the command unless this equals its persisted launch ID.
+        expect(handshake.data.server.runtime.capabilitySnapshotId).toBe(runtime.capabilitySnapshotId)
+        const rejected = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          ...body, requiredCommand: 'opencode.stopTeam', expectedCapabilitySnapshotId: `opencode:${'f'.repeat(32)}`,
+        }))
+        expect(rejected.ok).toBe(false)
+        expect(aborts).toBe(0)
+        const first = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))
+        expect(first.ok).toBe(true)
+        expect((await store.get(record.teamId, record.laneId!, record.memberName))?.stoppedAt).toBeDefined()
+        const restarted = new OpenCodeSessionStore(path.join(projectPath, 'sessions.json'))
+        openCodeSessionStore.list = restarted.list.bind(restarted)
+        openCodeSessionStore.get = restarted.get.bind(restarted)
+        expect((await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))).ok).toBe(true)
+        expect(aborts).toBe(1)
+        for (const patch of [{ runId: 'foreign' }, { expectedCapabilitySnapshotId: 'foreign' }]) {
+          expect((await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', { ...body, ...patch }))).ok).toBe(false)
+        }
+      } finally {
+        if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+        else process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+        await rm(projectPath, { recursive: true, force: true })
+      }
+    })
+  }
 
   test('confirmed stop receipts survive partial stop and lost responses without probing or re-aborting', async () => {
     const projectPath = await mkdtemp('/tmp/opencode-terminal-stop-')

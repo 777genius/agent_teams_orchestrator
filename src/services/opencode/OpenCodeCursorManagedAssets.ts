@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, lstat, readFile, stat } from 'node:fs/promises'
+import { access, lstat, readFile, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 export const CURSOR_MANAGED_ASSET_ROOT_ENV = 'AGENT_TEAMS_CURSOR_MANAGED_ASSETS'
@@ -111,15 +111,40 @@ async function isExecutable(candidate: string): Promise<boolean> {
   }
 }
 
+function assertProtected(stats: { uid: number; mode: number }): void {
+  if (stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
+    throw new Error('Cursor managed asset is not protected')
+  }
+}
+
+async function protectedEntrypoint(root: string, relative: string): Promise<string> {
+  const parts = relative.split(/[\\/]/)
+  if (path.isAbsolute(relative) || parts.some(part => !part || part === '..' || part === '.')) {
+    throw new Error('Cursor managed entrypoint escapes its asset root')
+  }
+  let target = root
+  for (const part of parts.slice(0, -1)) {
+    target = path.join(target, part)
+    const stats = await lstat(target)
+    assertProtected(stats)
+    if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error('Unsafe asset directory')
+  }
+  return path.join(target, parts[parts.length - 1]!)
+}
+
 async function readPrivateFile(filePath: string, maxBytes: number): Promise<Uint8Array> {
   const stats = await lstat(filePath)
+  assertProtected(stats)
   if (!stats.isFile() || stats.isSymbolicLink() || stats.size > maxBytes) {
     throw new Error('Cursor managed asset is not a plain file')
   }
   return readFile(filePath)
 }
 
-async function verifyStagedPlugin(root: string): Promise<string> {
+async function verifyStagedPlugin(root: string) {
+  const rootStats = await lstat(root)
+  assertProtected(rootStats)
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error('Unsafe plugin root')
   const manifestBytes = await readPrivateFile(path.join(root, 'manifest.json'), 64 * 1024)
   const manifest = JSON.parse(Buffer.from(manifestBytes).toString('utf8')) as Record<string, unknown>
   if (manifest.schema !== 1 || typeof manifest.entrypoint !== 'string'
@@ -128,20 +153,18 @@ async function verifyStagedPlugin(root: string): Promise<string> {
     || typeof manifest.mcpToolSha256 !== 'string') {
     throw new Error('Cursor managed plugin manifest is not the reviewed shape')
   }
-  const entrypoint = path.join(root, manifest.entrypoint)
-  if (path.relative(root, entrypoint).startsWith('..')) {
-    throw new Error('Cursor managed plugin entrypoint escapes its asset root')
-  }
+  const entrypoint = await protectedEntrypoint(root, manifest.entrypoint)
+  const mcpToolPath = await protectedEntrypoint(root, manifest.mcpToolEntrypoint)
   const artifact = await readPrivateFile(entrypoint, 32 * 1024 * 1024)
   if (digest(artifact) !== manifest.artifactSha256) {
     throw new Error('Cursor managed plugin artifact does not match its manifest')
   }
   const mcpTool = await readPrivateFile(
-    path.join(root, manifest.mcpToolEntrypoint as string), 32 * 1024 * 1024)
+    mcpToolPath, 32 * 1024 * 1024)
   if (digest(mcpTool) !== manifest.mcpToolSha256) {
     throw new Error('Cursor managed MCP CLI does not match its manifest')
   }
-  return digest(manifestBytes)
+  return { fingerprint: digest(manifestBytes), entrypoint, mcpToolPath }
 }
 
 /**
@@ -164,25 +187,25 @@ export async function resolveOpenCodeCursorManagedAssets(input: {
     || input.defaultRoot
     || await resolveShippedCursorManagedAssetRoot()
   if (!root) return { available: false, reason: 'not_staged' }
-  const pluginRoot = path.join(root, 'plugin')
-  let pluginFingerprint: string
+  let verified: Awaited<ReturnType<typeof verifyStagedPlugin>>
   try {
-    pluginFingerprint = await verifyStagedPlugin(pluginRoot)
+    const canonicalRoot = await realpath(root)
+    const rootStats = await stat(canonicalRoot)
+    assertProtected(rootStats)
+    if (!rootStats.isDirectory()) throw new Error('Unsafe asset root')
+    verified = await verifyStagedPlugin(path.join(canonicalRoot, 'plugin'))
   } catch (error) {
     return { available: false, reason: isMissing(error) ? 'not_staged' : 'plugin_artifact_mismatch' }
   }
   const interpreterPath = await resolveCursorManagedInterpreter(input.env ?? process.env)
   if (!interpreterPath) return { available: false, reason: 'no_interpreter' }
-  const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'manifest.json'), 'utf8')) as {
-    entrypoint: string; mcpToolEntrypoint: string
-  }
   return {
     available: true,
     assets: {
-      pluginEntryPath: path.join(pluginRoot, manifest.entrypoint),
-      mcpToolPath: path.join(pluginRoot, manifest.mcpToolEntrypoint),
+      pluginEntryPath: verified.entrypoint,
+      mcpToolPath: verified.mcpToolPath,
       interpreterPath,
-      fingerprint: digest(Buffer.from(`${pluginFingerprint}:${platform}:${arch}`)),
+      fingerprint: digest(Buffer.from(`${verified.fingerprint}:${platform}:${arch}`)),
     },
   }
 }

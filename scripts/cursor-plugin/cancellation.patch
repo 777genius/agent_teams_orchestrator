@@ -1,6 +1,6 @@
 --- a/src/plugin.ts
 +++ b/src/plugin.ts
-@@ -277,6 +277,11 @@ export function buildCursorAgentCommand(
+@@ -277,6 +277,11 @@
    }
    if (FORCE_TOOL_MODE) {
      cmd.push("--force");
@@ -12,35 +12,94 @@
    }
    return cmd;
  }
-@@ -1328,6 +1333,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -529,6 +534,8 @@
+     stdout: "pipe",
+     stderr: "pipe",
+     env: bunAny.Bun.env,
++    // Bun supports a separate POSIX process group. Never signal the host group.
++    detached: process.platform !== "win32",
+   });
+ 
+   child.stdin.write(prompt);
+@@ -1183,6 +1190,10 @@
+ }
+ 
+ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?: ToolRouter): Promise<string> {
++  if (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT &&
++      (TOOL_LOOP_MODE !== "opencode" || process.platform === "win32")) {
++    throw new Error("Managed Cursor requires POSIX and CURSOR_ACP_TOOL_LOOP_MODE=opencode");
++  }
+   const key = getGlobalKey();
+   const g = globalThis as any;
+   const normalizedWorkspace = normalizeWorkspaceForCompare(workspaceDirectory);
+@@ -1327,7 +1338,11 @@
+         );
        }
  
++      if (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT && backend !== "cursor-agent") {
++        throw new Error("Managed Cursor requires CURSOR_ACP_BACKEND=cursor-agent");
++      }
        reqPerf.mark("child-create-start");
 +      if (req.signal.aborted) return new Response(null, { status: 499 });
        const child = createBunChildForBackend({
          backend,
          sdkApiKey,
-@@ -1337,6 +1343,19 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1337,6 +1352,44 @@
          resumeChatId,
        });
        reqPerf.mark("child-created");
 +      let requestCancelled = false;
++      let cancellation: Promise<void> | undefined;
 +      const cancelRequest = () => {
 +        if (requestCancelled) return;
 +        requestCancelled = true;
-+        // Ending the child is the whole contract: the caller asked to stop.
-+        try { child.kill(); } catch { /* child already exited */ }
++        cancellation = (async () => {
++          const grouped = backend === "cursor-agent" && process.platform !== "win32";
++          const signal = (value: NodeJS.Signals) => {
++            try {
++              if (grouped) process.kill(-child.pid, value);
++              else child.kill(value);
++            } catch (error: any) {
++              if (error?.code !== "ESRCH") throw error;
++            }
++          };
++          signal("SIGTERM");
++          // Parent exit is not descendant exit. Keep escalation alive even when
++          // the parent exits promptly and closes its output streams.
++          await new Promise(resolve => setTimeout(resolve, 500));
++          signal("SIGKILL");
++          const deadline = Date.now() + 1500;
++          while (Date.now() < deadline) {
++            try {
++              if (grouped) process.kill(-child.pid, 0);
++              else if (child.exitCode !== null) return;
++            } catch (error: any) {
++              if (error?.code === "ESRCH") return;
++              throw error;
++            }
++            await new Promise(resolve => setTimeout(resolve, 25));
++          }
++          throw new Error("Cursor cancellation exit observation timed out");
++        })();
++        void cancellation.catch(error => log.error("Cursor cancellation failed", { error: String(error) }));
 +      };
 +      req.signal.addEventListener("abort", cancelRequest, { once: true });
 +      if (req.signal.aborted) cancelRequest();
-+      void child.exited.then(
-+        () => req.signal.removeEventListener("abort", cancelRequest),
-+        () => req.signal.removeEventListener("abort", cancelRequest),
-+      );
++      // Keep the listener until the response is consumed, not just parent exit.
  
        if (!stream) {
          const [stdoutText, stderrText] = await Promise.all([
-@@ -1484,6 +1503,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1347,6 +1400,9 @@
+         const stdout = (stdoutText || "").trim();
+         const stderr = (stderrText || "").trim();
+         const exitCode = await child.exited;
++        if (cancellation) await cancellation;
++        req.signal.removeEventListener("abort", cancelRequest);
++        if (requestCancelled) return new Response(null, { status: 499 });
+         log.debug("cursor-agent completed (bun non-stream)", {
+           exitCode,
+           stdoutChars: stdout.length,
+@@ -1484,6 +1540,7 @@
            let sawSuccessfulStreamOutput = false;
            let usage: OpenAiUsage | undefined;
            const enqueueSse = (payload: string) => {
@@ -48,8 +107,12 @@
              if (!firstSseWritten) {
                perf.mark("first-sse-write");
                firstSseWritten = true;
-@@ -1792,9 +1812,10 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1790,11 +1847,14 @@
+             }
+             enqueueSse(formatSseDone());
            } finally {
++            if (cancellation) await cancellation;
++            req.signal.removeEventListener("abort", cancelRequest);
              perf.mark("request:done");
              perf.summarize();
 -            controller.close();
@@ -60,7 +123,16 @@
        });
  
        return new Response(sse, {
-@@ -1831,6 +1852,35 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?:
+@@ -1814,7 +1874,7 @@
+     }
+   };
+ 
+-  if (REUSE_EXISTING_PROXY) {
++  if (REUSE_EXISTING_PROXY && !process.env.AGENT_TEAMS_CURSOR_PROXY_PORT) {
+     // Check if another process already started a proxy on the default port
+     try {
+       const res = await fetchProxyHealthWithTimeout(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`);
+@@ -1831,6 +1891,38 @@
      }
    }
  
@@ -93,17 +165,19 @@
 +    return baseURL;
 +  }
 +
++  if (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT) {
++    throw new Error("Managed Cursor requires Bun request cancellation support");
++  }
    // Use Node.js http server (works in both Node and Bun)
    const http = await import("http");
  
-diff --git a/src/cli/mcptool.ts b/src/cli/mcptool.ts
-index d549b8d..a141ddf 100644
 --- a/src/cli/mcptool.ts
 +++ b/src/cli/mcptool.ts
-@@ -115,6 +115,13 @@ async function main(): Promise<void> {
+@@ -115,7 +115,14 @@
      }
  
      await manager.connectServer(config);
+-    const result = await manager.callTool(serverName, toolName, toolArgs);
 +    // connectServer reports a failed connection by logging and returning, and
 +    // callTool then answers with an error string. Printing that string and
 +    // exiting 0 tells the agent the call succeeded.
@@ -111,14 +185,13 @@ index d549b8d..a141ddf 100644
 +      console.error(`mcptool error: could not connect to MCP server ${config.name}`);
 +      process.exit(1);
 +    }
-     const result = await manager.callTool(serverName, toolName, toolArgs);
++    const result = await manager.callTool(serverName, toolName, toolArgs, true);
      console.log(result);
  
-diff --git a/src/mcp/client-manager.ts b/src/mcp/client-manager.ts
-index af08e2c..38e86a2 100644
+     await manager.disconnectAll();
 --- a/src/mcp/client-manager.ts
 +++ b/src/mcp/client-manager.ts
-@@ -29,6 +29,9 @@ async function loadDefaultDeps(): Promise<McpClientManagerDeps> {
+@@ -29,6 +29,9 @@
    if (defaultDeps) return defaultDeps;
    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
@@ -128,7 +201,7 @@ index af08e2c..38e86a2 100644
  
    defaultDeps = {
      createClient: () =>
-@@ -42,8 +45,15 @@ async function loadDefaultDeps(): Promise<McpClientManagerDeps> {
+@@ -42,8 +45,15 @@
            stderr: "pipe",
          });
        }
@@ -146,3 +219,125 @@ index af08e2c..38e86a2 100644
      },
    };
    return defaultDeps;
+@@ -119,9 +129,11 @@
+     serverName: string,
+     toolName: string,
+     args: Record<string, unknown>,
++    throwOnError = false,
+   ): Promise<string> {
+     const conn = this.connections.get(serverName);
+     if (!conn) {
++      if (throwOnError) throw new Error(`MCP server "${serverName}" not connected`);
+       return `Error: MCP server "${serverName}" not connected`;
+     }
+ 
+@@ -131,6 +143,9 @@
+         arguments: args,
+       });
+ 
++      if (result?.isError) {
++        throw new Error(`MCP tool "${toolName}" reported isError: ${JSON.stringify(result.content)}`);
++      }
+       // MCP callTool returns { content: Array<{ type, text }> }
+       if (Array.isArray(result?.content)) {
+         return result.content
+@@ -144,6 +159,7 @@
+         tool: toolName,
+         error: String(err?.message || err),
+       });
++      if (throwOnError) throw err;
+       return `Error: MCP tool "${toolName}" failed: ${err?.message || err}`;
+     }
+   }
+--- /dev/null
++++ b/src/proxy/managed-mcp-dispatch.ts
+@@ -0,0 +1,20 @@
++import { dirname, isAbsolute, join } from "node:path";
++import { resolveOpenCodeConfigPath } from "../plugin-toggle.js";
++
++/** Managed app transport, resolved in the OpenCode host before native env isolation. */
++export function managedMcpDispatchInstructions(env: NodeJS.ProcessEnv = process.env): string {
++  if (!env.AGENT_TEAMS_CURSOR_PROXY_PORT) return "";
++  const executable = env.CURSOR_AGENT_EXECUTABLE;
++  if (!executable || !isAbsolute(executable) || !env.XDG_CONFIG_HOME) {
++    throw new Error("Managed Cursor MCP dispatch requires the scoped CLI bridge and config home");
++  }
++  const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
++  const command = `OPENCODE_CONFIG=${quote(resolveOpenCodeConfigPath(env))} ${quote(join(dirname(executable), "mcptool"))}`;
++  return `SYSTEM: Managed Cursor app MCP dispatch
++The listed OpenCode tool schemas are descriptions, not additional native Cursor tools. For app MCP calls use the approved managed mcptool transport through your native shell tool (intercepted by OpenCode bash). Do not emit an OpenAI tool_call in text or try nonexistent native agent-teams_* / mcp__agent-teams__* tools.
++This is the managed transport for the MCP server named agent-teams, including when instructions refer to GetMcpTools / CallMcpTool or listed agent-teams_* names. It is not permission to call raw HTTP, discover endpoints, create helper scripts, or change configuration. Keep all action-mode and message-envelope constraints.
++Discover available tool names with: ${command} tools agent-teams
++Call with: ${command} call agent-teams '<tool-name>' '<JSON-arguments>'
++Use the exact discovered tool name (for listed agent-teams_message_send or mcp__agent-teams__message_send, the server is agent-teams and tool is message_send). Preserve the listed schema and required message envelope. Shell-quote JSON as one argument; escape an apostrophe inside single quotes as '\"'\"'. Use the absolute command and scoped OPENCODE_CONFIG above on every call; do not depend on native wrapper PATH or inherit its environment in OpenCode bash.
++Wait for the shell result before proceeding. If the server/tool is absent or a call fails, report the failure; do not switch to raw HTTP or blindly retry a side effect. Text claiming a tool call is not execution.`;
++}
+--- a/src/proxy/prompt-builder.ts
++++ b/src/proxy/prompt-builder.ts
+@@ -1,3 +1,4 @@
++import { managedMcpDispatchInstructions } from "./managed-mcp-dispatch.js";
+ import { createHash } from "node:crypto";
+ import { buildToolSchemaMap, applyToolSchemaCompat, tryRerouteEditToWrite } from "../provider/tool-schema-compat.js";
+ import type { OpenAiToolCall } from "./tool-loop.js";
+@@ -42,7 +43,7 @@
+ }
+ 
+ function buildToolSchemaBlock(tools: Array<any>): string {
+-  const fingerprint = buildToolFingerprint(tools);
++  const fingerprint = `${Boolean(process.env.AGENT_TEAMS_CURSOR_PROXY_PORT)}:${buildToolFingerprint(tools)}`;
+   if (fingerprint && fingerprint === _cachedToolFingerprint) {
+     return _cachedToolBlock;
+   }
+@@ -59,7 +60,9 @@
+     .join("\n");
+ 
+   const block =
+-    `SYSTEM: You have access to the following tools. When you need to use one, respond with a tool_call in the standard OpenAI format.\n` +
++    (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT
++      ? `SYSTEM: The following are OpenCode tool schemas. Use native tools for local operations and the managed MCP dispatch instructions for app calls.\n`
++      : `SYSTEM: You have access to the following tools. When you need to use one, respond with a tool_call in the standard OpenAI format.\n`) +
+     `Tool guidance: prefer write/edit for file changes; use bash mainly to run commands/tests.\n\nAvailable tools:\n${toolDescs}`;
+ 
+   if (fingerprint) {
+@@ -160,7 +163,8 @@
+     });
+   }
+ 
+-  const lines: string[] = [];
++  const dispatch = managedMcpDispatchInstructions();
++  const lines: string[] = dispatch ? [dispatch] : [];
+   const toolCallNames = new Map<string, string>();
+   const allowedToolNames = new Set(
+     tools
+--- a/src/plugin.ts
++++ b/src/plugin.ts
+@@ -27,6 +27,7 @@
+ import { createLogger } from "./utils/logger.js";
+ import { RequestPerf } from "./utils/perf.js";
+ import { parseAgentError, formatErrorForUser, stripAnsi, isResumeSpecificFailure } from "./utils/errors.js";
++import { managedMcpDispatchInstructions } from "./proxy/managed-mcp-dispatch.js";
+ import { buildPromptFromMessages, buildToolFingerprint } from "./proxy/prompt-builder.js";
+ import {
+   applyBridgeJsonPrompt,
+@@ -149,7 +150,11 @@
+-    const lines: string[] = [
++    const lines: string[] = process.env.AGENT_TEAMS_CURSOR_PROXY_PORT ? [
++      "MCP TOOLS - For agent-teams use the managed mcptool dispatch instructions, not fabricated native tool calls.",
++      "The names below identify OpenCode schemas. The supplied scoped mcptool command is only for agent-teams; use other servers only through tools actually exposed to you.",
++      "",
++    ] : [
+       `MCP TOOLS — Call these tools by their FULL exact name (e.g. mcp__filesystem__read_file).`,
+       `Important: There is NO tool named 'mcp'. Every MCP tool has the format mcp__<server>__<tool>.`,
+       "Do NOT call a tool named 'mcp' with parameters. Always use the complete tool name below.",
+       "",
+     ];
+ 
+@@ -371,7 +372,7 @@
+         fullPromptChars: getFullPrompt().length,
+       });
+     }
+-    return { prompt: incremental, resumeChatId, sessionKey, usedIncremental: true, contentPrefix, recordContentPrefix, toolFingerprint, subagentFingerprint };
++    return { prompt: [managedMcpDispatchInstructions(), incremental].filter(Boolean).join("\n\n"), resumeChatId, sessionKey, usedIncremental: true, contentPrefix, recordContentPrefix, toolFingerprint, subagentFingerprint };
+   }
+ 
+   log.info("Session resume active but incremental prompt unavailable; using full prompt", {

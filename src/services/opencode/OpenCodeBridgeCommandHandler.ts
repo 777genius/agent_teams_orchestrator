@@ -1,3 +1,4 @@
+import { readOpenCodeLegacyStopCapability } from './OpenCodeLegacyStopAuthority.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
@@ -95,6 +96,7 @@ import {
 } from './OpenCodeCommandOutcomeStore.js'
 import {
   getClaudeConfigHomeDir,
+  getTeamsDir,
   isEnvDefinedFalsy,
 } from '../../utils/envUtils.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -1041,23 +1043,45 @@ async function probeStoredLaneAuthority(
       throw new Error('OpenCode lifecycle lane scope is ambiguous')
     }
   }
-  if (command === 'opencode.stopTeam' && authorityRecords.every(isOpenCodeSessionStopped)) {
-    const authority = authorityRecords[0].stopAuthority
-    if (!authority || authority.runtime.providerId !== 'opencode'
-      || !/^opencode:[a-f0-9]{32}$/.test(authority.runtime.capabilitySnapshotId)
-      || authorityRecords.some(record => !record.stopAuthority
-        || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
-        || record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
-        || hashStable(record.stopAuthority.runtime) !== hashStable(authority.runtime))
-      || expectedCapabilitySnapshotId(body) !== authority.runtime.capabilitySnapshotId
+  if (command === 'opencode.stopTeam' && (selectedModel.providerId === 'cursor-acp'
+    || authorityRecords.every(record => record.stopAuthority || isOpenCodeSessionStopped(record)))) {
+    const allHaveReceipt = authorityRecords.every(record => record.stopAuthority)
+    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp') {
+      throw new Error('OpenCode confirmed stop authority mismatch')
+    }
+    // Pre-fix Cursor records lack the receipt, but the desktop persists the
+    // original launch capability. Preserve that exact capability for cleanup.
+    const legacyCursor = selectedModel.providerId === 'cursor-acp' && !allHaveReceipt
+    const legacyVersion = authorityRecords[0].opencodeVersion ?? null
+    const runtime: ConfirmedStopRuntime = legacyCursor ? {
+      providerId: 'opencode', binaryPath: 'opencode', version: legacyVersion,
+      binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
+      capabilitySnapshotId: await readOpenCodeLegacyStopCapability({
+        teamsPath: getTeamsDir(), teamId, laneId, runId,
+      }),
+    } : authorityRecords[0].stopAuthority!.runtime
+    if (runtime.providerId !== 'opencode'
+      || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
+      || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
+        || (record.stopAuthority
+          ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
+            || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
+          : !legacyCursor))
+      || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
       || (preconditions?.expectedBehaviorFingerprint
         && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
       throw new Error('OpenCode confirmed stop authority mismatch')
     }
+    for (const record of authorityRecords.filter(record => !isOpenCodeSessionStopped(record))) {
+      await openCodeHostManager.resolveOwnedSessionEndpoint(record.hostKey, {
+        teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+        runId: record.runId, sessionId: record.opencodeSessionId, projectPath: record.projectPath,
+      }, phaseContext?.signal)
+    }
     return {
       snapshot: null,
       records: authorityRecords,
-      confirmedStopRuntime: authority.runtime,
+      confirmedStopRuntime: runtime,
       release: async () => {},
     }
   }
@@ -3623,6 +3647,11 @@ async function runLaunch(
           remainingMs: () => Math.max(0, deadlineAt - Date.now() - cleanupReserveMs),
           toolApprovalMode,
           expectedBehaviorFingerprint,
+          ...(apiSelectedModel.startsWith('cursor-acp/') ? { stopAuthority: {
+            runtime: { ...createRuntimeSnapshot(snapshot),
+              capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId! },
+            expectedBehaviorFingerprint,
+          } } : {}),
           expectedBootstrapForSession: sessionId =>
             strictSessionCompatibility(sessionId, input).bootstrap,
         })
@@ -4364,10 +4393,7 @@ async function runStop(
     }
   }
   const records = laneRecords.filter(record => record.runId === runId)
-  const snapshot = retained ? retained.snapshot
-    : records.length ? await openCodeProvisioningProbe.probe(envelope.cwd, {
-      phaseContext: stopPreflightContext,
-    }) : null
+  const snapshot = retained?.snapshot ?? null
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot, { confirmedStopRuntime: retained?.confirmedStopRuntime }),
@@ -4512,7 +4538,7 @@ async function runStop(
         // Once the atomic lease mutation starts, await it to completion. Racing an
         // uncancellable registry write could remove a lease after a timeout response.
         await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
-        const runtime = createRuntimeSnapshot(snapshot)
+        const runtime = retained?.confirmedStopRuntime ?? record.stopAuthority?.runtime ?? createRuntimeSnapshot(snapshot)
         let terminal: OpenCodeSessionRecord | null
         try {
           terminal = await openCodeSessionStore.markStoppedIfSession(record,

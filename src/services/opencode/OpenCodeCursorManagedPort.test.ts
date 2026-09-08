@@ -23,7 +23,7 @@ test('retains one port per profile so the endpoint and fingerprint stay stable',
     expect(first).toBeGreaterThan(1024)
     expect(first).toBeLessThan(65_536)
     expect(await reserveCursorManagedProxyPort(statePath)).toBe(first)
-    // Two profiles must never be handed the same endpoint.
+    // Independent assignments normally differ; neither is an OS reservation.
     const other = await reserveCursorManagedProxyPort(path.join(root, 'other/proxy-port.json'))
     expect(other).not.toBe(first)
     expect(JSON.parse(await readFile(statePath, 'utf8'))).toEqual({ version: 1, port: first })
@@ -34,9 +34,8 @@ test('retains one port per profile so the endpoint and fingerprint stay stable',
 
     for (const corrupt of ['{}', '{"version":2,"port":40000}', '{"version":1,"port":80}', 'not json']) {
       await writeFile(statePath, corrupt, 'utf8')
-      const replacement = await reserveCursorManagedProxyPort(statePath)
-      expect(replacement).toBeGreaterThan(1024)
-      expect(JSON.parse(await readFile(statePath, 'utf8')).port).toBe(replacement)
+      await expect(reserveCursorManagedProxyPort(statePath)).rejects.toThrow('state is corrupt')
+      expect(await readFile(statePath, 'utf8')).toBe(corrupt)
     }
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -73,3 +72,43 @@ test('never invents a provider entry and refuses an unusable port', () => {
       .toThrow('Cursor managed proxy port is invalid')
   }
 })
+
+test('concurrent preparations publish one complete retained assignment', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-port-race-'))
+  try {
+    const state = path.join(root, 'port.json')
+    const ports = await Promise.all(Array.from({ length: 16 }, () => reserveCursorManagedProxyPort(state)))
+    expect(new Set(ports).size).toBe(1)
+    expect(JSON.parse(await readFile(state, 'utf8')).port).toBe(ports[0])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('independent processes blocked before publication return the same assignment', async () => {
+  const { lock } = await import('../../utils/lockfile.js')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-port-process-race-'))
+  const state = path.join(root, 'port.json')
+  const release = await lock(state, { realpath: false })
+  const modulePath = new URL('./OpenCodeCursorManagedPort.ts', import.meta.url).href
+  const children = Array.from({ length: 4 }, () => Bun.spawn([process.execPath, '-e',
+    `import { reserveCursorManagedProxyPort } from ${JSON.stringify(modulePath)}; console.log('ready'); console.log(await reserveCursorManagedProxyPort(${JSON.stringify(state)}));`],
+  { stdout: 'pipe', stderr: 'pipe' }))
+  let released = false
+  try {
+    const readers = children.map(child => child.stdout.getReader())
+    for (const reader of readers) expect(new TextDecoder().decode((await reader.read()).value)).toContain('ready')
+    await release()
+    released = true
+    const ports = await Promise.all(readers.map(async reader => {
+      let text = ''
+      for (;;) { const chunk = await reader.read(); if (chunk.done) break; text += new TextDecoder().decode(chunk.value) }
+      return Number(text.trim())
+    }))
+    expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0, 0])
+    expect(new Set(ports).size).toBe(1)
+    expect(JSON.parse(await readFile(state, 'utf8')).port).toBe(ports[0])
+  } finally {
+    if (!released) await release()
+    for (const child of children) child.kill()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import net from 'node:net'
-import { mkdir, readlink, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
@@ -15,6 +15,8 @@ import {
   readProcessStartTimeMs,
 } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
+import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
+export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
 import {
@@ -45,7 +47,6 @@ const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS = 5
 const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS = 50
-const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
@@ -56,23 +57,6 @@ const OPENTUI_TEMP_DYLIB_RE = /^\.b[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
 
-export async function resolveOpenCodeBinaryHostIdentity(binaryPath: string): Promise<string> {
-  let resolvedPath = path.resolve(binaryPath)
-  try {
-    const target = await readlink(resolvedPath)
-    resolvedPath = path.resolve(path.dirname(resolvedPath), target)
-  } catch {
-    // The executable is not a symlink or cannot be resolved. Its absolute path
-    // remains a stable part of the identity.
-  }
-  const metadata = await stat(resolvedPath).catch(() => null)
-  const source = [
-    resolvedPath,
-    metadata?.size ?? 'unknown-size',
-    metadata?.mtimeMs ?? 'unknown-mtime',
-  ].join('\0')
-  return createHash('sha256').update(source).digest('hex').slice(0, 16)
-}
 
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
   retries: {
@@ -451,8 +435,9 @@ export function assertOpenCodeHostReuseIdentity(
   if (profile.scopeToken && !explicitHostKey.includes(`::scope:${profile.scopeToken}::`)) {
     throw new Error('OpenCode host reuse rejected because the profile scope token changed')
   }
-  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS
-  if (readiness && !explicitHostKey.endsWith(`::readiness:${readiness}`)) {
+  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS?.trim() || 'absent'
+  const retainedReadiness = /::readiness:([^:]*)$/.exec(explicitHostKey)?.[1] || 'absent'
+  if (readiness !== retainedReadiness) {
     throw new Error('OpenCode host reuse rejected because Cursor readiness changed')
   }
 }
@@ -466,12 +451,7 @@ export function buildOpenCodeHostProfileIdentity(
     ?? 'absent'
   // Capability fingerprints intentionally omit MCP URLs/environment. Host reuse
   // must still bind to the current transport, including the app-instance marker.
-  const mcp = profile.managedConfig.mcp as Record<string, unknown> | undefined
-  const transportJson = JSON.stringify(mcp?.['agent-teams'] ?? null, (_key, value) =>
-    value && typeof value === 'object' && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
-      : value)
-  const transportIdentity = hashText(transportJson)
+  const transportIdentity = buildOpenCodeHostTransportIdentity(profile.managedConfig)
   // Cursor readiness is a live identity: the signed-in account, the real binary,
   // the staged assets and the retained proxy port. A running host outlives all of
   // them, so it has to be part of reuse or a signed-out account keeps serving.
@@ -1043,6 +1023,38 @@ export class OpenCodeHostManager {
     })
   }
 
+  /** Cleanup resolves only an existing exact lease. No profile, status probe,
+   * asset verification, host spawn, or arbitrary caller-supplied endpoint. */
+  async resolveOwnedSessionEndpoint(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput & { projectPath: string },
+    abortSignal?: AbortSignal,
+  ): Promise<{ baseUrl: string; pid: number }> {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (!input.runId || !input.sessionId) throw new Error('OpenCode cleanup requires exact run and session')
+    return this.withPersistentRegistryLock(async () => {
+      const record = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
+      const lease = record && normalizePersistentHostLeases(record.leases)[buildLeaseKey(input)]
+      if (!record || record.hostKey !== hostKey || record.projectPath !== input.projectPath
+        || !lease || lease.teamId !== input.teamId
+        || lease.laneId !== (input.laneId?.trim() || 'primary')
+        || lease.memberName !== input.memberName
+        || lease.runId !== input.runId || lease.sessionId !== input.sessionId) {
+        throw new Error('OpenCode cleanup host ownership is unavailable')
+      }
+      // Registry metadata is not permission to contact a remote/arbitrary URL.
+      if (!Number.isSafeInteger(record.port) || record.port <= 0 || record.port > 65535
+        || record.baseUrl !== `http://127.0.0.1:${record.port}`) {
+        throw new Error('OpenCode cleanup endpoint is invalid')
+      }
+      if ((await this.inspectPersistentHostProcessIdentity(record)).state !== 'confirmed') {
+        throw new Error('OpenCode cleanup host process ownership is unavailable')
+      }
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+      return { baseUrl: record.baseUrl, pid: record.pid }
+    })
+  }
+
   async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
@@ -1541,6 +1553,17 @@ export class OpenCodeHostManager {
     )
     await assertOpenCodePreparedProfileScope(profile, params.projectPath)
     const binaryPath = resolveOpenCodeBinaryPath()
+    const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
+    const needsBinaryIdentity = Boolean(preparedBinaryIdentity) || !params.hostKey?.trim()
+    const binaryHostIdentity = binaryPath && needsBinaryIdentity
+      ? await raceOpenCodeAbortSignal(
+          resolveOpenCodeBinaryHostIdentity(binaryPath),
+          params.abortSignal,
+        )
+      : 'missing-binary'
+    if (preparedBinaryIdentity && preparedBinaryIdentity !== binaryHostIdentity) {
+      throw new Error('OpenCode binary changed after Cursor port generation preparation')
+    }
     if (binaryPath && params.prewarmManagedSubscriptionPlugins !== false) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
@@ -1558,12 +1581,6 @@ export class OpenCodeHostManager {
     const hostLifetime = params.hostLifetime ?? 'persistent'
     const explicitHostKey = params.hostKey?.trim()
     const hostKey = explicitHostKey || await (async () => {
-      const binaryHostIdentity = binaryPath
-        ? await raceOpenCodeAbortSignal(
-            resolveOpenCodeBinaryHostIdentity(binaryPath),
-            params.abortSignal,
-          )
-        : 'missing-binary'
       const baseHostKey = buildOpenCodeHostProfileIdentity(profile, binaryHostIdentity)
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`

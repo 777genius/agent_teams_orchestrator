@@ -11,6 +11,7 @@ export type CursorNativeAuthority = {
   /** Hashed: the account is identity, never stored or logged in the clear. */
   accountHash: string
   executableHash: string
+  environmentHash?: string
   probedAt: number
 }
 
@@ -23,26 +24,26 @@ export type CursorAccountProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
   abortSignal?: AbortSignal,
+  env?: NodeJS.ProcessEnv,
 ) => Promise<string | null>
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 
 /**
- * Cheap enough to run on every preparation, so a swapped or updated binary is
- * noticed without paying for a subprocess.
+ * Bind the real target and its bytes, including same-size timestamp-preserving
+ * replacements. No native command or credential file is read here.
  */
 export async function resolveCursorExecutableIdentity(executablePath: string): Promise<string> {
   const resolved = await realpath(executablePath)
-  const stats = await stat(resolved)
-  return digest(`${resolved}\n${stats.size}\n${Math.trunc(stats.mtimeMs)}`)
+  return digest(`${resolved}\n${createHash('sha256').update(await readFile(resolved)).digest('hex')}`)
 }
 
 /** Reads only the account line `status` prints; never any credential material. */
 export const probeCursorAccountIdentity: CursorAccountProbe = async (
-  executablePath, platform, abortSignal,
+  executablePath, platform, abortSignal, env = process.env,
 ) => await new Promise<string | null>(resolve => {
   execFile(executablePath, ['status'], {
-    signal: abortSignal, timeout: 15_000, windowsHide: true, shell: platform === 'win32',
+    env, signal: abortSignal, timeout: 15_000, windowsHide: true, shell: platform === 'win32',
   }, (error, stdout, stderr) => {
     const output = `${stdout}\n${stderr}`
     // "Not logged in" also contains "logged in": a signed-out CLI must not pass.
@@ -51,7 +52,7 @@ export const probeCursorAccountIdentity: CursorAccountProbe = async (
       return
     }
     const account = /logged in as\s+(\S+)/i.exec(output)?.[1]
-    resolve(digest(account ? account.toLowerCase() : output.replace(/\s+/g, ' ').trim()))
+    resolve(account ? digest(account.toLowerCase()) : null)
   })
 })
 
@@ -69,24 +70,29 @@ export async function resolveCursorAgentExecutable(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string | null> {
   const configured = env.CURSOR_AGENT_EXECUTABLE?.trim()
-  if (configured) return configured
-  const onPath = Bun.which('cursor-agent', env.PATH ? { PATH: env.PATH } : undefined)
-  if (onPath) return onPath
-  // The caller's HOME describes the environment being launched, so its install
-  // location outranks whatever happens to be on this process's own PATH.
-  const home = env.HOME?.trim() || homedir()
-  const wellKnown = [
-    path.join(home, '.local/bin/cursor-agent'),
-    '/opt/homebrew/bin/cursor-agent',
-    '/usr/local/bin/cursor-agent',
-  ]
-  for (const candidate of wellKnown) {
+  const resolveCandidate = async (candidate: string): Promise<string | null> => {
     try {
-      await access(candidate, constants.X_OK)
-      return candidate
-    } catch {
-      continue
+      const resolved = await realpath(candidate)
+      await access(resolved, constants.X_OK)
+      return (await stat(resolved)).isFile() ? resolved : null
+    } catch { return null }
+  }
+  const search = async (command: string): Promise<string | null> => {
+    for (const directory of (env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+      const resolved = await resolveCandidate(path.resolve(directory, command))
+      if (resolved) return resolved
     }
+    return null
+  }
+  if (configured) return path.isAbsolute(configured) || configured.includes(path.sep)
+    ? resolveCandidate(path.resolve(configured)) : search(configured)
+  const onPath = await search('cursor-agent')
+  if (onPath) return onPath
+  const home = env.HOME?.trim() || homedir()
+  for (const candidate of [path.join(home, '.local/bin/cursor-agent'),
+    '/opt/homebrew/bin/cursor-agent', '/usr/local/bin/cursor-agent']) {
+    const resolved = await resolveCandidate(candidate)
+    if (resolved) return resolved
   }
   return null
 }
@@ -98,11 +104,10 @@ export async function isCursorNativeAccountAuthorized(input: {
   abortSignal?: AbortSignal
 } = {}): Promise<boolean> {
   const env = input.env ?? process.env
-  const configured = env.CURSOR_AGENT_EXECUTABLE?.trim()
-  const executable = configured || await resolveCursorAgentExecutable(env)
+  const executable = await resolveCursorAgentExecutable(env)
   if (!executable) return false
   const account = await (input.probe ?? probeCursorAccountIdentity)(
-    executable, input.platform ?? process.platform, input.abortSignal,
+    executable, input.platform ?? process.platform, input.abortSignal, env,
   ).catch(() => null)
   return account !== null
 }
@@ -122,10 +127,11 @@ let recentProbe: { at: number; key: string; accountHash: string | null } | null 
 
 export async function reconcileCursorNativeAuthority(input: {
   statePath: string
+  env?: NodeJS.ProcessEnv
   /** The real native binary. Never a generated wrapper: those are rewritten on
    * every preparation, which would churn identity on every launch. */
   executablePath: string
-  /** Wrapper to probe through, so the native CLI sees its own home. */
+  /** Optional legacy probe adapter; production probes the exact binary with env. */
   probeExecutablePath?: string
   platform?: NodeJS.Platform
   dedupeMs?: number
@@ -139,24 +145,25 @@ export async function reconcileCursorNativeAuthority(input: {
   const executableChanged = Boolean(retained && retained.executableHash !== executableHash)
   // The account is always probed. The retained record only says what it was, so
   // a change can be reported; it never stands in for a fresh answer.
-  const probeKey = `${input.probeExecutablePath ?? input.executablePath}|${executableHash}`
+  const environmentHash = cursorNativeEnvironmentIdentity(input.env ?? process.env)
+  const probeKey = `${input.probeExecutablePath ?? input.executablePath}|${executableHash}|${environmentHash}`
   const dedupeMs = input.dedupeMs ?? CURSOR_NATIVE_AUTHORITY_DEDUPE_MS
   // Freshness is counted from the probe itself. Counting it from the last
   // question makes the window slide: steady traffic would keep a signed-out
   // account looking valid forever.
   const reusable = recentProbe && recentProbe.key === probeKey
-    && now - recentProbe.at < dedupeMs
+    && now >= recentProbe.at && now - recentProbe.at < dedupeMs
     ? recentProbe
     : null
   const accountHash = reusable
     ? reusable.accountHash
     : await (input.probe ?? probeCursorAccountIdentity)(
       input.probeExecutablePath ?? input.executablePath,
-      input.platform ?? process.platform, input.abortSignal,
+      input.platform ?? process.platform, input.abortSignal, input.env,
     ).catch(() => null)
   if (!reusable) recentProbe = { at: now, key: probeKey, accountHash }
   if (!accountHash) return { authority: null, state: 'signed-out' }
-  const authority: CursorNativeAuthority = { version: 1, accountHash, executableHash, probedAt: now }
+  const authority: CursorNativeAuthority = { version: 1, accountHash, executableHash, environmentHash, probedAt: now }
   await writeAuthority(input.statePath, authority)
   if (!retained) return { authority, state: 'refreshed' }
   if (retained.accountHash !== accountHash) return { authority, state: 'account-changed' }
@@ -210,9 +217,37 @@ export function buildCursorReadinessFingerprint(input: {
     1,
     input.authority.accountHash,
     input.authority.executableHash,
+    input.authority.environmentHash ?? null,
     input.assetsFingerprint,
     input.profileScopeToken,
     input.managedConfigFingerprint.trim(),
     input.proxyPort,
   ]))
+}
+
+// These are restored by the wrapper before invoking the exact native binary.
+export const CURSOR_NATIVE_ENV_KEYS = [
+  'HOME', 'USERPROFILE', 'PATH', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
+  'CURSOR_CONFIG_DIR', 'CURSOR_ACP_HOME_DIR', 'NODE_OPTIONS',
+] as const
+
+export function cursorNativeEnvironmentIdentity(env: NodeJS.ProcessEnv): string {
+  return digest(JSON.stringify(CURSOR_NATIVE_ENV_KEYS.map(key => [key, env[key] ?? null])))
+}
+
+export function cursorNativeSelectedIdentity(authority: CursorNativeAuthority): `known:${string}` {
+  return `known:${digest(JSON.stringify(['cursor-native-v1', authority.accountHash,
+    authority.executableHash, authority.environmentHash ?? null]))}`
+}
+
+/** Strict scope and final seals always probe CURRENT account state, bypassing burst dedupe. */
+export async function resolveCurrentCursorNativeAuthority(env: NodeJS.ProcessEnv, abortSignal?: AbortSignal) {
+  const executablePath = await resolveCursorAgentExecutable(env)
+  if (!executablePath) return null
+  const executableHash = await resolveCursorExecutableIdentity(executablePath)
+  const accountHash = await probeCursorAccountIdentity(executablePath, process.platform, abortSignal, env)
+  if (!accountHash || executableHash !== await resolveCursorExecutableIdentity(executablePath)) return null
+  const authority: CursorNativeAuthority = { version: 1, accountHash, executableHash,
+    environmentHash: cursorNativeEnvironmentIdentity(env), probedAt: Date.now() }
+  return { executablePath, authority, identity: cursorNativeSelectedIdentity(authority) }
 }

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -8,6 +8,8 @@ import {
   reconcileCursorNativeAuthority,
   resolveCursorAgentExecutable,
   resolveCursorExecutableIdentity,
+  resolveCurrentCursorNativeAuthority,
+  cursorNativeSelectedIdentity,
   type CursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
 
@@ -217,12 +219,53 @@ test('the Cursor CLI is found from its install location, not only from PATH', as
   // A desktop app runs with the launch services PATH, which does not include
   // ~/.local/bin, and Cursor installs its CLI exactly there.
   expect(await resolveCursorAgentExecutable({ PATH: '/nonexistent', HOME: home } as NodeJS.ProcessEnv))
-    .toBe(installed)
-  // An explicit override still wins over any discovery.
+    .toBe(await realpath(installed))
+  // An invalid explicit override fails closed instead of discovering another binary.
   expect(await resolveCursorAgentExecutable({
     CURSOR_AGENT_EXECUTABLE: '/explicit/cursor-agent', PATH: '/nonexistent', HOME: home,
-  } as NodeJS.ProcessEnv)).toBe('/explicit/cursor-agent')
+  } as NodeJS.ProcessEnv)).toBeNull()
   expect(await resolveCursorAgentExecutable({
     PATH: '/nonexistent', HOME: path.join(home, 'empty'),
   } as NodeJS.ProcessEnv)).toBeNull()
+})
+
+
+test('CURRENT authority uses the supplied environment and notices same-binary account switch/signout', async () => {
+  const { root, executable } = await sandbox()
+  try {
+    // This is a synthetic status fixture, not a credential file.
+    await writeFile(executable, '#!/bin/sh\nif [ -n "$FIXTURE_ACCOUNT" ]; then echo "Logged in as $FIXTURE_ACCOUNT"; else echo "Not logged in"; fi\n')
+    const env = { HOME: root, PATH: '/usr/bin:/bin', CURSOR_AGENT_EXECUTABLE: executable,
+      FIXTURE_ACCOUNT: 'account-a@example.invalid' }
+    const first = await resolveCurrentCursorNativeAuthority(env)
+    expect(first).not.toBeNull()
+    const again = await resolveCurrentCursorNativeAuthority(env)
+    expect(again?.identity).toBe(first?.identity)
+    const switched = await resolveCurrentCursorNativeAuthority({ ...env, FIXTURE_ACCOUNT: 'account-b@example.invalid' })
+    expect(switched?.authority.executableHash).toBe(first?.authority.executableHash)
+    expect(switched?.identity).not.toBe(first?.identity)
+    expect(await resolveCurrentCursorNativeAuthority({ ...env, FIXTURE_ACCOUNT: '' })).toBeNull()
+    const otherHome = await resolveCurrentCursorNativeAuthority({ ...env, HOME: path.join(root, 'other') })
+    expect(otherHome?.identity).not.toBe(first?.identity)
+    // Probe timestamp and marker TTL are not native account identity.
+    expect(cursorNativeSelectedIdentity({ ...first!.authority, probedAt: Date.now() + 31 * 60_000 }))
+      .toBe(first!.identity)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('dedupe never crosses supplied native environments', async () => {
+  const { root, executable, statePath } = await sandbox()
+  try {
+    let probes = 0
+    const probe = async (_exe: string, _platform: NodeJS.Platform, _signal?: AbortSignal, env?: NodeJS.ProcessEnv) => {
+      probes++
+      return env?.HOME?.endsWith('other') ? 'b'.repeat(64) : 'a'.repeat(64)
+    }
+    const first = await reconcileCursorNativeAuthority({ statePath, executablePath: executable,
+      env: { HOME: root }, probe, now: () => 100 })
+    const next = await reconcileCursorNativeAuthority({ statePath, executablePath: executable,
+      env: { HOME: path.join(root, 'other') }, probe, now: () => 101 })
+    expect(probes).toBe(2)
+    expect(next.authority?.accountHash).not.toBe(first.authority?.accountHash)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

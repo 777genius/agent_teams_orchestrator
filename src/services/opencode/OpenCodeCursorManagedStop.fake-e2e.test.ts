@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { serveAppMcpOverHttp } from '../../../scripts/cursor-plugin/app-mcp-http-fixture.js'
 import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OpenCodeClientFactory, type OpenCodeClient } from './OpenCodeClientFactory.js'
@@ -34,41 +35,6 @@ const ENVIRONMENT_KEYS = [
   'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
   'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
 ]
-
-/**
- * Stands in for the desktop app's MCP server over HTTP, which is the transport
- * the product actually registers. A stdio stand-in would pass while the shipped
- * configuration could not connect at all.
- */
-function serveAppMcpOverHttp(): { port: number; calls: () => number; stop: () => void } {
-  let calls = 0
-  const server = Bun.serve({
-    hostname: '127.0.0.1', port: 0, idleTimeout: 0,
-    async fetch(request: Request) {
-      // The client opens a GET stream and may DELETE the session. Declining the
-      // stream is allowed and keeps this stand-in to the one path under test.
-      if (request.method !== 'POST') {
-        return new Response(null, { status: request.method === 'GET' ? 405 : 200 })
-      }
-      const body = await request.json() as { id?: number; method?: string }
-      if (body.id === undefined) return new Response(null, { status: 202 })
-      const result = body.method === 'initialize'
-        ? {
-          protocolVersion: '2024-11-05', capabilities: { tools: {} },
-          serverInfo: { name: 'agent-teams', version: '1' },
-        }
-        : body.method === 'tools/list'
-          ? { tools: [{
-            name: 'team_receipt', description: 'Returns an Agent Teams receipt.',
-            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-          }] }
-          : (calls += 1, { content: [{ type: 'text', text: 'receipt' }] })
-      return Response.json({ jsonrpc: '2.0', id: body.id, result },
-        { headers: { 'content-type': 'application/json' } })
-    },
-  })
-  return { port: server.port, calls: () => calls, stop: () => server.stop(true) }
-}
 
 /** The fake records its own pid, so Stop has something observable to end. */
 function agentPid(pidFile: string): number {
@@ -101,15 +67,15 @@ async function summarize(client: OpenCodeClient, sessionId: string) {
 }
 
 /**
- * Speaks the same stream-json contract the plugin parses, and resolves MCP the way
- * the native CLI does: from the workspace registration file, over HTTP JSON-RPC.
+ * Speaks the plugin stream-json contract and invokes the managed mcptool shim.
+ * The staged CLI discovers App HTTP MCP through the materialized profile config.
  * A prompt containing SLOW keeps the turn open so Stop lands while the tree is alive.
  */
 function fakeCursorAgentSource(): string {
   return [
     '#!/usr/bin/env node',
     "const { readFileSync } = require('node:fs')",
-    "const path = require('node:path')",
+    "const { execFileSync } = require('node:child_process')",
     "if (process.argv.includes('status')) { console.log('Logged in as fake@example.com'); process.exit(0) }",
     "if (process.argv.includes('--version')) { console.log('fake-cursor-agent 0.0.0'); process.exit(0) }",
     `require('node:fs').writeFileSync(process.env.FAKE_CURSOR_PID_FILE, String(process.pid))`,
@@ -130,27 +96,7 @@ function fakeCursorAgentSource(): string {
     "process.on('SIGTERM', () => process.exit(143))",
     '',
     'async function callRegisteredMcpTool(value) {',
-    "  const workspace = process.argv[process.argv.indexOf('--workspace') + 1] || process.cwd()",
-    "  const registration = JSON.parse(readFileSync(path.join(workspace, '.cursor/mcp.json'), 'utf8'))",
-    '  const [name, server] = Object.entries(registration.mcpServers || {})',
-    "    .find(([, entry]) => entry && entry.type === 'http' && entry.url) || []",
-    '  if (!server) throw new Error(\'No HTTP MCP server registered for this workspace\')',
-    '  let id = 0',
-    '  const rpc = async (method, params) => {',
-    '    const response = await fetch(server.url, {',
-    "      method: 'POST', headers: { 'content-type': 'application/json' },",
-    "      body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),",
-    '    })',
-    '    const body = await response.json()',
-    '    if (body.error) throw new Error(JSON.stringify(body.error))',
-    '    return body.result',
-    '  }',
-    "  await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} })",
-    "  const listed = await rpc('tools/list', {})",
-    '  const tool = (listed.tools || [])[0]',
-    "  if (!tool) throw new Error('Registered MCP server exposed no tools')",
-    "  const called = await rpc('tools/call', { name: tool.name, arguments: { challenge: value } })",
-    "  return (called.content || []).map(part => part.text).filter(Boolean).join('') || 'empty-mcp-result'",
+    "  return execFileSync('mcptool', ['call', 'agent-teams', 'team_receipt', JSON.stringify({ challenge: value })], { encoding: 'utf8', timeout: 30000 })",
     '}',
     '',
     'async function main() {',
@@ -181,11 +127,11 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
   test.skipIf(process.platform !== 'darwin')(
     'runs a managed turn, stops it and leaves siblings and later turns working',
     async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-managed-fake-e2e-'))
+      const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'cursor-managed-fake-e2e-')))
       const projectPath = path.join(root, 'project')
       const pidFile = path.join(root, 'agent.pid')
       const original = Object.fromEntries(ENVIRONMENT_KEYS.map(key => [key, process.env[key]]))
-      let appMcp: { port: number; calls: () => number; stop: () => void } | null = null
+      let appMcp: ReturnType<typeof serveAppMcpOverHttp> | null = null
       let hostManager: OpenCodeHostManager | null = null
       let hostKey: string | null = null
       try {
@@ -205,6 +151,8 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         process.env.XDG_CACHE_HOME = path.join(root, 'source-cache')
         process.env.CURSOR_AGENT_EXECUTABLE = fakeAgent
         process.env.FAKE_CURSOR_PID_FILE = pidFile
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
         appMcp = serveAppMcpOverHttp()
         process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL =
           `http://127.0.0.1:${appMcp.port}/mcp`
@@ -227,8 +175,9 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         expect(Object.keys(bridgeConfig.mcp ?? {})).toContain('agent-teams')
         expect(bridgeConfig).not.toHaveProperty('plugin')
         // The agent must be able to reach this profile's MCP servers.
-        expect(await readFile(path.join(profile.profileRootPath,
-          'native-subscription-cli-bin/cursor-agent'), 'utf8')).toContain('OPENCODE_CONFIG=')
+        expect(await readFile(profile.env.CURSOR_AGENT_EXECUTABLE!, 'utf8')).toContain('OPENCODE_CONFIG=')
+        expect(await readFile(path.join(path.dirname(profile.env.CURSOR_AGENT_EXECUTABLE!), 'mcptool'), 'utf8'))
+          .toContain('assets/plugin/dist/cli/mcptool.js')
 
         const binaryPath = resolveOpenCodeBinaryPath()
         if (!binaryPath) throw new Error('OpenCode binary is unavailable for the managed Cursor fake E2E')
@@ -276,53 +225,15 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         await prompt(stopped.id, `TOKEN:${warmToken}`)
         await until('managed turn', () => replied(stopped.id, warmToken), 180_000)
 
-        // An Agent Teams style MCP tool must reach the native CLI from its own
-        // registration and return through the managed turn, not around it.
+        // Invoke the real staged CLI through the managed shim, against the same
+        // App server whose tool the first-class bridge published above.
         const challenge = randomUUID()
-        let mcpCalls = 0
-        let receipt = ''
-        const mcpServer = Bun.serve({
-          hostname: '127.0.0.1', port: 0, idleTimeout: 0,
-          async fetch(request: Request) {
-            const body = await request.json() as Record<string, any>
-            let result: unknown = {}
-            if (body.method === 'initialize') {
-              result = {
-                protocolVersion: '2024-11-05', capabilities: { tools: {} },
-                serverInfo: { name: 'agent-teams-fake-e2e', version: '1' },
-              }
-            }
-            if (body.method === 'tools/list') {
-              result = { tools: [{
-                name: 'team_receipt',
-                description: 'Returns a server-generated receipt that cannot be guessed.',
-                inputSchema: {
-                  type: 'object', properties: { challenge: { type: 'string' } },
-                  required: ['challenge'], additionalProperties: false,
-                },
-              }] }
-            }
-            if (body.method === 'tools/call') {
-              mcpCalls += 1
-              expect(body.params?.arguments?.challenge).toBe(challenge)
-              receipt = `receipt-${randomUUID().slice(0, 8)}`
-              result = { content: [{ type: 'text', text: receipt }] }
-            }
-            return Response.json({ jsonrpc: '2.0', id: body.id, result })
-          },
-        })
-        try {
-          await mkdir(path.join(projectPath, '.cursor'), { recursive: true })
-          await writeFile(path.join(projectPath, '.cursor/mcp.json'), `${JSON.stringify({
-            mcpServers: { 'agent-teams': { type: 'http', url: `http://127.0.0.1:${mcpServer.port}/mcp` } },
-          }, null, 2)}\n`, 'utf8')
-          await prompt(stopped.id, `MCP:${challenge}`)
-          await until('MCP result inside the managed turn',
-            () => replied(stopped.id, receipt || '\u0000'), 180_000)
-        } finally {
-          mcpServer.stop(true)
-        }
-        expect(mcpCalls).toBe(1)
+        expect(appMcp.calls).toHaveLength(0)
+        await prompt(stopped.id, `MCP:${challenge}`)
+        await until('MCP result inside the managed turn',
+          () => replied(stopped.id, appMcp!.calls[0]?.receipt || '\u0000'), 180_000)
+        expect(appMcp.calls).toHaveLength(1)
+        expect(appMcp.calls[0]).toMatchObject({ tool: 'team_receipt', arguments: { challenge } })
 
         expect(await managedAuthBytes()).toBe(authBeforeTurn)
 
@@ -338,8 +249,8 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
           return running > 0 && alive(running)
         }, 120_000)
 
-        // Stop is the transport abort. The plugin cancels the request on that
-        // signal and ends the agent child with it; nothing else is required.
+        // This host test observes parent exit and text. Ordinary descendant and
+        // delayed-effect coverage lives in the focused transport fixture.
         expect(await client.abortSession(stopped.id)).toBe(true)
         await sleep(2500)
         expect(alive(running)).toBe(false)

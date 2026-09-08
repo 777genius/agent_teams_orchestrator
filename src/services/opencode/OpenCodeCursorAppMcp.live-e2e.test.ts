@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 
+import { serveAppMcpOverHttp } from '../../../scripts/cursor-plugin/app-mcp-http-fixture.js'
 import { stageCursorManagedAssets } from '../../../scripts/cursor-plugin/stage.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
@@ -36,46 +36,28 @@ const liveTest = process.env.CURSOR_APP_MCP_LIVE_E2E === '1' && process.platform
 const ENVIRONMENT_KEYS = [
   CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV, CURSOR_MANAGED_ASSET_ROOT_ENV,
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
+  'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
   'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
 ]
 
 describe('Cursor App MCP live e2e', () => {
   liveTest('a Cursor agent calls an App MCP tool without touching the user Cursor config', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-app-mcp-live-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'cursor-app-mcp-live-')))
     const projectPath = path.join(root, 'project')
-    const callLog = path.join(root, 'calls.jsonl')
-    const token = `receipt-${randomUUID().slice(0, 8)}`
+    const sessionLabel = randomUUID()
     const userCursorConfig = path.join(os.homedir(), '.cursor', 'mcp.json')
     const original = Object.fromEntries(ENVIRONMENT_KEYS.map(key => [key, process.env[key]]))
     let hostManager: OpenCodeHostManager | null = null
     let hostKey: string | null = null
+    let appMcp: ReturnType<typeof serveAppMcpOverHttp> | null = null
+    const userConfigBefore = await readFile(userCursorConfig, 'utf8').catch(() => null)
     try {
-      const userConfigBefore = await readFile(userCursorConfig, 'utf8').catch(() => null)
       await mkdir(projectPath, { recursive: true })
       await Promise.all(['source-config', 'source-data', 'source-cache']
         .map(dir => mkdir(path.join(root, dir), { recursive: true })))
       await stageCursorManagedAssets(path.join(root, 'assets'))
 
-      const sdk = (file: string) => JSON.stringify(pathToFileURL(path.join(
-        import.meta.dir, `../../../node_modules/@modelcontextprotocol/sdk/dist/esm/${file}`)).href)
-      const serverPath = path.join(root, 'app-mcp-server.mjs')
-      await writeFile(serverPath, [
-        "import { appendFile } from 'node:fs/promises'",
-        `import { Server } from ${sdk('server/index.js')}`,
-        `import { StdioServerTransport } from ${sdk('server/stdio.js')}`,
-        `import { CallToolRequestSchema, ListToolsRequestSchema } from ${sdk('types.js')}`,
-        "const server = new Server({ name: 'agent-teams', version: '1.0.0' }, { capabilities: { tools: {} } })",
-        'server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{',
-        "  name: 'team_receipt',",
-        "  description: 'Returns an Agent Teams receipt that cannot be guessed.',",
-        "  inputSchema: { type: 'object', properties: {}, additionalProperties: false },",
-        '}] }))',
-        'server.setRequestHandler(CallToolRequestSchema, async request => {',
-        `  await appendFile(${JSON.stringify(callLog)}, JSON.stringify({ tool: request.params.name }) + '\\n', 'utf8')`,
-        `  return { content: [{ type: 'text', text: ${JSON.stringify(token)} }] }`,
-        '})',
-        'await server.connect(new StdioServerTransport())',
-      ].join('\n') + '\n', 'utf8')
+      appMcp = serveAppMcpOverHttp()
 
       process.env[CURSOR_MANAGED_ASSET_ROOT_ENV] = path.join(root, 'assets')
       process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(root, 'managed-data')
@@ -84,8 +66,9 @@ describe('Cursor App MCP live e2e', () => {
       process.env.XDG_DATA_HOME = path.join(root, 'source-data')
       process.env.XDG_CACHE_HOME = path.join(root, 'source-cache')
       // Stand in for the desktop app's MCP server through the supported override.
-      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
-      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = JSON.stringify([serverPath])
+      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = `http://127.0.0.1:${appMcp.port}/mcp`
 
       const profileManager = new OpenCodeProfileManager()
       const profile = await profileManager.prepareProfile(projectPath, {
@@ -112,7 +95,7 @@ describe('Cursor App MCP live e2e', () => {
       })
       hostKey = host.hostKey
       const client = new OpenCodeClientFactory().create(host.baseUrl)
-      const session = await client.createSession({ title: `app mcp ${token}` })
+      const session = await client.createSession({ title: `app mcp ${sessionLabel}` })
       await client.promptSessionAsync(session.id, {
         agent: 'teammate', model: { providerID: 'cursor-acp', modelID: 'auto' },
         // Deliberately does not name a tool or a command: the agent must find
@@ -148,14 +131,10 @@ describe('Cursor App MCP live e2e', () => {
       // Printed so a failure names what the agent did instead of calling the tool.
       console.log('[live] tools:', JSON.stringify(toolNames))
       // Exactly one call: presence alone would hide a retry loop billing the user.
-      const calls = (await readFile(callLog, 'utf8').catch(() => ''))
-        .split('\n').filter(line => line.trim().length > 0)
-      expect(calls.map(line => JSON.parse(line).tool)).toEqual(['team_receipt'])
-      expect(assistantText).toContain(token)
-      // The whole point of using the plugin's own bridge: the user's Cursor
-      // configuration is never a party to this.
-      expect(await readFile(userCursorConfig, 'utf8').catch(() => null)).toBe(userConfigBefore)
+      expect(appMcp.calls.map(call => call.tool)).toEqual(['team_receipt'])
+      expect(assistantText).toContain(appMcp.calls[0]!.receipt)
     } finally {
+      appMcp?.stop()
       if (hostManager && hostKey) {
         await hostManager.releaseHost(hostKey).catch(() => undefined)
         await hostManager.disposeHost(hostKey).catch(() => undefined)
@@ -165,6 +144,9 @@ describe('Cursor App MCP live e2e', () => {
         else process.env[key] = value
       }
       await rm(root, { recursive: true, force: true }).catch(() => undefined)
+      // Check even when startup or the turn fails; never print config contents.
+      const userConfigAfter = await readFile(userCursorConfig, 'utf8').catch(() => null)
+      expect(userConfigAfter === userConfigBefore).toBe(true)
     }
   }, 900_000)
 })
