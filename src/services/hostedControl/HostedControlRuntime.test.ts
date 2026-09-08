@@ -313,7 +313,7 @@ describe('HostedControlRuntime', () => {
     expect(closeCalls).toBe(1)
   })
 
-  test('owns one socket for readiness, lifecycle, message, and task operations and closes all on lease loss', async () => {
+  test('explicit legacy string-config caller owns readiness, lifecycle, message, and task socket and closes all on lease loss', async () => {
     const root = await realpath(await mkdtemp('/tmp/hosted-control-'))
     roots.push(root)
     const claudeRoot = join(root, 'claude')
@@ -399,6 +399,8 @@ describe('HostedControlRuntime', () => {
     expect(lease.line).toContain('"kind":"ready"')
     expect(await portContext.isCurrentAuthority({ actorId: 'actor-context', ...portContext.authority })).toBe(true)
     expect(portContext.legacyKey).toBe('legacy')
+    expect(portContext.nativeActivationV2).toBeUndefined()
+    expect(portContext.activationV2).toBeUndefined()
     expect(Object.isFrozen(portContext)).toBe(true)
     expect(await portContext.isCurrentAuthority({
       actorId: 'actor-context',

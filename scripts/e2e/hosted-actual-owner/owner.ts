@@ -740,6 +740,12 @@ export class AcceptanceRuntime {
 
 export async function runActualOwnerAcceptance(args: readonly string[], v2?: ActualOwnerV2Composition): Promise<void> {
   if (args[0] === HOSTED_CONTROL_SOCKET_BROKER_FLAG) {
+    const { isHostedControlSocketBrokerLegacyArgs, runHostedControlSocketBrokerLegacy } = await import(
+      '../../../src/services/hostedControl/HostedControlSocketBrokerLegacy.js'
+    )
+    if (!v2 && isHostedControlSocketBrokerLegacyArgs(args.slice(1))) {
+      await runHostedControlSocketBrokerLegacy([...args.slice(1)])
+    }
     await runHostedControlSocketBroker([...args.slice(1)])
   }
   if (args[0]?.startsWith('--hosted-actual-owner-sealed-protocol=')) {

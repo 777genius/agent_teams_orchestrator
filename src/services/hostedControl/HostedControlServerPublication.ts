@@ -1,12 +1,20 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lstatSync, type Stats } from 'node:fs'
-import { constants, chmod, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
+import { constants, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { connect, type Server, type Socket } from 'node:net'
-import { basename, dirname, join } from 'node:path'
-import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
+import { basename, dirname, join, resolve } from 'node:path'
+import { HOSTED_CONTROL_SOCKET_BROKER_FLAG, encodeSocketBrokerBatch,
+  type SocketBrokerIdentity, type SocketBrokerMapping } from './HostedControlSocketBroker.js'
 import type { HostedControlOwnerBinding } from './protocol.js'
 const HOSTED_CONTROL_READ_DEADLINE_MS = 5_000
+const brokerClosures = new WeakMap<ChildProcess, Promise<void>>()
+
+export type SocketBrokerLaunchForTest = {
+  pressureNotificationPipe?: boolean
+  afterSpawn?: (broker: ChildProcess) => void
+  entrypoint?: string
+}
 
 export function isSocketIdentityCurrentSync(
   socketPath: string,
@@ -49,19 +57,51 @@ export function socketPublicationPath(socketPath: string): string {
 }
 
 export async function listenLoopback(server: Server): Promise<void> {
-  server.listen({ host: '127.0.0.1', port: 0, exclusive: true })
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => { server.off('listening', onListening); reject(error) }
-    const onListening = () => { server.off('error', onError); resolve() }
+    const finish = (error?: Error) => {
+      server.off('error', onError)
+      server.off('listening', onListening)
+      server.off('close', onClose)
+      if (error) reject(error); else resolve()
+    }
+    const onError = (error: Error) => finish(error)
+    const onListening = () => finish()
+    const onClose = () => finish(new Error('Hosted control loopback target closed during preparation'))
     server.once('error', onError)
     server.once('listening', onListening)
+    server.once('close', onClose)
+    try { server.listen({ host: '127.0.0.1', port: 0, exclusive: true }) } catch (error) { finish(error as Error) }
   })
 }
 
-export async function startSocketBroker(
+export type SocketBrokerBorrow = Readonly<{
+  pid: number
+  identity: SocketBrokerIdentity
+  isCurrent(): boolean
+  release(): Promise<void>
+}>
+
+export type SocketBrokerBatch = Readonly<{
+  pid: number
+  isCurrent(): boolean
+  borrow(index: number, onLoss: () => void): SocketBrokerBorrow
+  /** Drop the launch reference after attachment; borrowers retain the child. */
+  release(): Promise<void>
+}>
+
+/** Current native singleton helper. Legacy composition must select startSocketBrokerLegacy explicitly. */
+export async function startSocketBroker(listenPath: string, targetPort: number, token: Buffer): Promise<ChildProcess> {
+  const parent = await lstat(dirname(listenPath))
+  return (await launchSocketBrokerBatch([{ listenPath: resolve(listenPath), targetPort, token,
+    parentIdentity: { device: parent.dev, inode: parent.ino } }])).broker
+}
+
+/** Explicit historical argv/raw32/schema1 transport. Never called by native batch. */
+export async function startSocketBrokerLegacy(
   listenPath: string,
   targetPort: number,
   token: Buffer,
+  forTest?: SocketBrokerLaunchForTest,
 ): Promise<ChildProcess> {
   const brokerArgs = [HOSTED_CONTROL_SOCKET_BROKER_FLAG, listenPath, String(targetPort)]
   const isCompiledBinary = Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length > 0
@@ -70,17 +110,21 @@ export async function startSocketBroker(
     if (!entrypoint) throw new Error('Hosted control socket broker entrypoint is unavailable')
     if (entrypoint.endsWith('.test.ts')) {
       brokerArgs.splice(0, 1,
-        new URL('./fixtures/hostedControlSocketBrokerChild.ts', import.meta.url).pathname)
+        new URL('./fixtures/hostedControlSocketBrokerLegacyChild.ts', import.meta.url).pathname)
     } else {
       brokerArgs.unshift(entrypoint)
     }
   }
+  if (forTest?.entrypoint) brokerArgs.splice(0, brokerArgs.length, forTest.entrypoint, listenPath, String(targetPort))
   const broker = spawn(process.execPath, brokerArgs, {
     stdio: ['pipe', 'pipe', 'inherit', 'pipe'],
   })
+  brokerClosures.set(broker, new Promise<void>(resolve => broker.once('close', () => resolve())))
+  broker.on('error', () => undefined)
+  broker.stdin?.on('error', () => { broker.kill('SIGKILL') })
   const tokenPipe = broker.stdio[3]
   if (!broker.stdin || !broker.stdout || !tokenPipe || !('write' in tokenPipe)) {
-    broker.kill('SIGKILL')
+    await killSocketBroker(broker)
     throw new Error('Hosted control socket broker pipes are unavailable')
   }
   await new Promise<void>((resolve, reject) => {
@@ -114,7 +158,10 @@ export async function startSocketBroker(
     tokenPipe.once('error', onTokenError)
     broker.once('error', onError)
     broker.once('exit', onExit)
-    tokenPipe.end(token)
+    try {
+      forTest?.afterSpawn?.(broker)
+      tokenPipe.end(token)
+    } catch (error) { finish(error as Error) }
   }).catch(async error => {
     await killSocketBroker(broker)
     throw error
@@ -122,11 +169,235 @@ export async function startSocketBroker(
   return broker
 }
 
+/** A single explicit legacy child; the server owns publication and inode cleanup.
+ * Schema1 has no native custody claim. Identity admission matches accepted 3bf. */
+export async function startLegacySocketBroker(
+  mapping: SocketBrokerMapping,
+  onLoss: () => void,
+  forTest?: Pick<SocketBrokerLaunchForTest, 'afterSpawn'>,
+): Promise<SocketBrokerBorrow> {
+  const broker = await startSocketBrokerLegacy(mapping.listenPath, mapping.targetPort, mapping.token, forTest)
+  let lost = false
+  let released: Promise<void> | null = null
+  const current = () => !lost && !released && broker.exitCode === null && broker.signalCode === null
+  const notify = () => {
+    if (lost) return
+    lost = true
+    onLoss()
+  }
+  try {
+    const stat = await lstat(mapping.listenPath)
+    if (!stat.isSocket() || (stat.mode & 0o777) !== 0o600 ||
+      (process.getuid?.() !== undefined && stat.uid !== process.getuid?.())) {
+      throw new Error('Hosted control publication socket is not privately owned')
+    }
+    if (!current()) throw new Error('Hosted control socket broker exited before attachment')
+    broker.once('exit', notify)
+    broker.once('error', notify)
+    return Object.freeze({
+      pid: broker.pid!,
+      identity: Object.freeze({ device: stat.dev, inode: stat.ino }),
+      isCurrent: current,
+      release(): Promise<void> {
+        if (released) return released
+        lost = true
+        broker.off('exit', notify)
+        broker.off('error', notify)
+        released = killSocketBroker(broker)
+        return released
+      },
+    })
+  } catch (error) {
+    await killSocketBroker(broker)
+    throw error
+  }
+}
+
+/** Owns only this batch's child and hidden paths, never a caller's credentials,
+ * server, canonical publication, bootstrap, guard, or capture descriptors. */
+export async function startSocketBrokerBatch(mappings: readonly SocketBrokerMapping[], forTest?: SocketBrokerLaunchForTest): Promise<SocketBrokerBatch> {
+  if (mappings.length !== 1 && mappings.length !== 2) throw new Error('Invalid hosted control broker batch count')
+  // Snapshot metadata before the first await; callers cannot retarget cleanup.
+  const launch = mappings.map(mapping => ({ ...mapping, parentIdentity: { ...mapping.parentIdentity } }))
+  const retained = launch.map(({ listenPath, parentIdentity }) => ({ listenPath, parentIdentity }))
+  const { broker, identities } = await launchSocketBrokerBatch(launch, forTest)
+  let references = 1
+  let ownerReleased = false
+  let lost = false
+  let drain: Promise<void> | null = null
+  const borrowed = new Set<number>()
+  const lossListeners = new Map<number, () => void>()
+  const current = () => !lost && references > 0 && broker.exitCode === null && broker.signalCode === null
+  const onLoss = () => {
+    if (lost) return
+    lost = true
+    for (const notify of lossListeners.values()) { try { notify() } catch {} }
+  }
+  broker.once('exit', onLoss)
+  broker.once('error', onLoss)
+  const releaseReference = (): Promise<void> => {
+    references -= 1
+    if (references !== 0) return Promise.resolve()
+    drain = (async () => {
+      await killSocketBroker(broker)
+      await Promise.allSettled(retained.map((mapping, index) => removeOwnedSocketPathIfCurrent(
+        mapping.listenPath, identities[index]!, mapping.parentIdentity,
+      )))
+      broker.off('exit', onLoss)
+      broker.off('error', onLoss)
+    })()
+    return drain
+  }
+  const batch: SocketBrokerBatch = Object.freeze({
+    pid: broker.pid!, isCurrent: current,
+    borrow(index: number, notify: () => void): SocketBrokerBorrow {
+      if (ownerReleased || !current() || !Number.isInteger(index) || index < 0 || index >= retained.length || borrowed.has(index)) {
+        throw new Error('Hosted control socket broker borrow is unavailable')
+      }
+      borrowed.add(index)
+      references += 1
+      lossListeners.set(index, notify)
+      let released: Promise<void> | null = null
+      return Object.freeze({ pid: broker.pid!, identity: Object.freeze({ ...identities[index]! }),
+        isCurrent: () => !released && current(),
+        release(): Promise<void> {
+          if (released) return released
+          lossListeners.delete(index)
+          released = releaseReference()
+          return released
+        },
+      })
+    },
+    release(): Promise<void> {
+      if (ownerReleased) return drain ?? Promise.resolve()
+      ownerReleased = true
+      return releaseReference()
+    },
+  })
+  if (!current()) {
+    await batch.release()
+    throw new Error('Hosted control socket broker exited before attachment')
+  }
+  return batch
+}
+
+async function launchSocketBrokerBatch(mappings: readonly SocketBrokerMapping[], forTest?: SocketBrokerLaunchForTest): Promise<{
+  broker: ChildProcess; identities: SocketBrokerIdentity[]
+}> {
+  const payload = encodeSocketBrokerBatch(mappings)
+  const brokerArgs = [HOSTED_CONTROL_SOCKET_BROKER_FLAG]
+  const isCompiledBinary = Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length > 0
+  if (!isCompiledBinary) {
+    const entrypoint = process.argv[1]
+    if (!entrypoint) { payload.fill(0); throw new Error('Hosted control socket broker entrypoint is unavailable') }
+    if (entrypoint.endsWith('.test.ts')) {
+      brokerArgs.splice(0, 1,
+        new URL('./fixtures/hostedControlSocketBrokerChild.ts', import.meta.url).pathname)
+    } else {
+      brokerArgs.unshift(entrypoint)
+    }
+  }
+  if (forTest?.entrypoint) brokerArgs.splice(0, brokerArgs.length, forTest.entrypoint)
+  let broker: ChildProcess
+  try {
+    broker = spawn(process.execPath, brokerArgs, { stdio: forTest?.pressureNotificationPipe
+      ? ['pipe', 'pipe', 'inherit', 'pipe', 'pipe']
+      : ['pipe', 'pipe', 'inherit', 'pipe'] })
+  } catch (error) { payload.fill(0); throw error }
+  // On failure wait for close, not just exit, so every bound record is drained.
+  const closed = new Promise<void>(resolve => broker.once('close', () => resolve()))
+  brokerClosures.set(broker, closed)
+  broker.on('error', () => undefined)
+  const identities: SocketBrokerIdentity[] = []
+  const tokenPipe = broker.stdio[3]
+  if (!broker.stdin || !broker.stdout || !tokenPipe || !('write' in tokenPipe)) {
+    payload.fill(0)
+    await killSocketBroker(broker)
+    await closed
+    throw new Error('Hosted control socket broker pipes are unavailable')
+  }
+  // A broken liveness pipe must not become an unhandled parent-process error.
+  broker.stdin.on('error', () => { broker.kill('SIGKILL') })
+  const stdout = broker.stdout
+  let bytes = Buffer.alloc(0)
+  let totalBytes = 0
+  let ready = false
+  let finish!: (error?: Error) => void
+  const onData = (chunk: Buffer) => {
+    totalBytes += chunk.length
+    if (totalBytes > 1024) { finish(new Error('Hosted control socket broker response was oversized')); return }
+    bytes = Buffer.concat([bytes, chunk])
+    let newline: number
+    while ((newline = bytes.indexOf(0x0a)) >= 0) {
+      const line = bytes.subarray(0, newline).toString('utf8')
+      bytes = bytes.subarray(newline + 1)
+      try {
+        const message = JSON.parse(line)
+        if (ready || message.schemaVersion !== 2) throw new Error()
+        if (message.kind === 'bound' && message.index === identities.length && identities.length < mappings.length &&
+          Object.keys(message).join(',') === 'schemaVersion,kind,index,device,inode' &&
+          Number.isSafeInteger(message.device) && message.device >= 0 && Number.isSafeInteger(message.inode) && message.inode > 0 &&
+          !identities.some(identity => identity.device === message.device && identity.inode === message.inode)) {
+          identities.push({ device: message.device, inode: message.inode })
+        } else if (line === '{"schemaVersion":2,"kind":"ready"}' && identities.length === mappings.length && bytes.length === 0) {
+          ready = true
+          finish()
+        } else throw new Error()
+      } catch { finish(new Error('Hosted control socket broker response was invalid')); return }
+    }
+  }
+  const onError = () => finish(new Error('Hosted control socket broker failed to start'))
+  const onTokenError = () => finish(new Error('Hosted control socket broker private batch write failed'))
+  const onClose = () => finish(new Error('Hosted control socket broker exited before readiness'))
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        if (error) reject(error); else resolve()
+      }
+      timeout = setTimeout(() => finish(new Error('Hosted control socket broker startup timed out')), HOSTED_CONTROL_READ_DEADLINE_MS)
+      stdout.on('data', onData)
+      tokenPipe.on('error', onTokenError)
+      broker.on('error', onError)
+      broker.once('close', onClose)
+      forTest?.afterSpawn?.(broker)
+      tokenPipe.end(payload, () => payload.fill(0))
+    })
+    return { broker, identities }
+  } catch (error) {
+    await killSocketBroker(broker)
+    await closed
+    await Promise.allSettled(identities.map((identity, index) => removeOwnedSocketPathIfCurrent(
+      mappings[index]!.listenPath, identity, mappings[index]!.parentIdentity,
+    )))
+    throw error
+  } finally {
+    clearTimeout(timeout)
+    payload.fill(0)
+    stdout.off('data', onData)
+    // Retain a harmless error listener until the private pipe is fully closed.
+    tokenPipe.off('error', onTokenError)
+    tokenPipe.on('error', () => undefined)
+    broker.off('error', onError)
+    broker.off('close', onClose)
+  }
+}
+
 export async function killSocketBroker(broker: ChildProcess): Promise<void> {
-  if (broker.exitCode !== null || broker.signalCode !== null) return
-  const exited = new Promise<void>(resolve => broker.once('exit', () => resolve()))
-  broker.kill('SIGKILL')
-  await exited
+  let closed = brokerClosures.get(broker)
+  if (!closed) {
+    // Historical callers may supply their own ChildProcess. A terminal child
+    // with every pipe closed has already delivered (or queued) final close.
+    if ((broker.exitCode !== null || broker.signalCode !== null) &&
+      broker.stdio.every(stream => !stream || ('closed' in stream && stream.closed))) return
+    closed = new Promise<void>(resolve => broker.once('close', () => resolve()))
+    brokerClosures.set(broker, closed)
+  }
+  if (broker.pid && broker.exitCode === null && broker.signalCode === null) broker.kill('SIGKILL')
+  await closed
 }
 
 export async function closeServer(server: Server): Promise<void> {
@@ -187,8 +458,19 @@ export function sameSocketIdentity(
 export async function prepareSocketPath(socketPath: string): Promise<{ device: number; inode: number }> {
   const parent = dirname(socketPath)
   await mkdir(parent, { recursive: true, mode: 0o700 })
-  await chmod(parent, 0o700)
-  const handle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0)); const stat = await handle.stat(); await handle.close()
+  const handle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
+  let stat: Stats
+  try {
+    stat = await handle.stat()
+    if (!stat.isDirectory() || (process.getuid?.() !== undefined && stat.uid !== process.getuid?.())) {
+      throw new Error('Hosted control socket parent is not privately owned')
+    }
+    await handle.chmod(0o700)
+    const current = await lstat(parent)
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== stat.dev || current.ino !== stat.ino) {
+      throw new Error('Hosted control socket parent was substituted')
+    }
+  } finally { await handle.close() }
   const parentIdentity = { device: stat.dev, inode: stat.ino }
   let existing
   try { existing = await lstat(socketPath) } catch (error) {

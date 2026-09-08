@@ -4,6 +4,14 @@ declare const HOSTED_ACTUAL_OWNER_NATIVE_BUILD: boolean
 
 const args = process.argv.slice(2)
 if (args[0] === '--hosted-control-socket-broker') {
+  if (typeof HOSTED_ACTUAL_OWNER_NATIVE_BUILD === 'undefined' || !HOSTED_ACTUAL_OWNER_NATIVE_BUILD) {
+    const { isHostedControlSocketBrokerLegacyArgs, runHostedControlSocketBrokerLegacy } = await import(
+      '../../src/services/hostedControl/HostedControlSocketBrokerLegacy.js'
+    )
+    if (isHostedControlSocketBrokerLegacyArgs(args.slice(1))) {
+      await runHostedControlSocketBrokerLegacy([...args.slice(1)])
+    }
+  }
   const { runHostedControlSocketBroker } = await import('../../src/services/hostedControl/HostedControlSocketBroker.js')
   await runHostedControlSocketBroker(args.slice(1))
 } else if (args[0]?.startsWith('--hosted-actual-owner-sealed-protocol=')) {

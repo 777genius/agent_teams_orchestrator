@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 MODE="${1:-focused}"
-IMAGE="${WORKSPACE_TRUST_SMOKE_IMAGE:-oven/bun:1.3.11}"
+IMAGE="${WORKSPACE_TRUST_SMOKE_IMAGE:-oven/bun:1.4.0}"
 NODE_MODULES_VOLUME="${WORKSPACE_TRUST_SMOKE_NODE_MODULES_VOLUME:-ato-workspace-trust-node-modules}"
 BUN_CACHE_VOLUME="${WORKSPACE_TRUST_SMOKE_BUN_CACHE_VOLUME:-ato-workspace-trust-bun-cache}"
 RED_GREEN_TEMP_DIR=''

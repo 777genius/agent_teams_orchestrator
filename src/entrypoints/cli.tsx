@@ -98,6 +98,12 @@ async function runHostedControlSocketBrokerFastPath(args: string[]): Promise<boo
   if (!feature('HOSTED_CONTROL')) {
     throw new Error('Hosted control is not included in this build')
   }
+  const { isHostedControlSocketBrokerLegacyArgs, runHostedControlSocketBrokerLegacy } = await import(
+    '../services/hostedControl/HostedControlSocketBrokerLegacy.js'
+  )
+  if (isHostedControlSocketBrokerLegacyArgs(args.slice(1))) {
+    await runHostedControlSocketBrokerLegacy([...args.slice(1)])
+  }
   const { runHostedControlSocketBroker } = await import(
     '../services/hostedControl/HostedControlSocketBroker.js'
   )

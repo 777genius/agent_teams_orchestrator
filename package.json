@@ -4,13 +4,13 @@
   "private": true,
   "description": "Reconstructed Bun CLI workspace for the Claude Code source snapshot.",
   "type": "module",
-  "packageManager": "bun@1.3.11",
+  "packageManager": "bun@1.4.0",
   "bin": {
     "claude": "./cli",
     "claude-multimodel": "./cli"
   },
   "engines": {
-    "bun": ">=1.3.11"
+    "bun": ">=1.4.0"
   },
   "scripts": {
     "build": "bun run ./scripts/build.ts",
@@ -21,7 +21,7 @@
     "compile:hosted-actual-owner": "bun build scripts/e2e/hosted-actual-owner-owner.ts --target=bun --define=HOSTED_ACTUAL_OWNER_NATIVE_BUILD=true --outfile=/dev/null --external='*/protectedNamespace.js'",
     "test:hosted-actual-owner": "bun test scripts/e2e/hosted-actual-owner/cli-source.test.ts",
     "ci:hosted-actual-owner": "bun run compile:hosted-actual-owner && bun run test:hosted-actual-owner",
-    "test:hosted-control": "bun test --path-ignore-patterns='src/services/hostedControl/HostedControlBootstrap.test.ts' scripts/build.test.ts src/services/hostedControl src/services/teamLifecycleOwner src/utils/swarm/teamHelpers.taskCleanup.test.ts src/utils/taskMutationCoordinator.test.ts src/utils/tasks.coordination.test.ts src/utils/tasks.hostedCompatibility.test.ts src/utils/teammateMailbox.test.ts src/utils/udsMessaging.test.ts && bun test src/services/hostedControl/HostedControlBootstrap.test.ts && bun test --timeout 15000 src/services/opencode/OpenCodeBridgeCommandHandler.test.ts src/services/opencode/OpenCodeSessionBridge.test.ts",
+    "test:hosted-control": "bun test --path-ignore-patterns='src/services/hostedControl/{HostedControlBootstrap.test.ts,HostedControlSocketBrokerCloseAdapter.contract.test.ts}' scripts/build.test.ts src/services/hostedControl src/services/teamLifecycleOwner src/utils/swarm/teamHelpers.taskCleanup.test.ts src/utils/taskMutationCoordinator.test.ts src/utils/tasks.coordination.test.ts src/utils/tasks.hostedCompatibility.test.ts src/utils/teammateMailbox.test.ts src/utils/udsMessaging.test.ts && bun test src/services/hostedControl/HostedControlBootstrap.test.ts && bun test src/services/hostedControl/HostedControlSocketBrokerCloseAdapter.contract.test.ts && bun test --timeout 15000 src/services/opencode/OpenCodeBridgeCommandHandler.test.ts src/services/opencode/OpenCodeSessionBridge.test.ts",
     "test:task-change-ledger": "bun test src/services/boardTaskActivity/BoardTaskTranscriptPersistence.test.ts src/services/taskChangeLedger",
     "smoke:anthropic-api": "bun run ./scripts/anthropic-api-smoke.ts",
     "smoke:workspace-trust:docker": "./scripts/docker/workspace-trust-smoke.sh",

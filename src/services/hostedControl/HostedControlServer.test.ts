@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
-import { chmod, lstat, mkdir, mkdtemp, rename, rm, unlink } from 'node:fs/promises'
-import { connect, createServer, Socket } from 'node:net'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { chmod, lstat, mkdir, mkdtemp, readdir, rename, rm, unlink } from 'node:fs/promises'
+import { connect, createServer, Socket, type Server } from 'node:net'
 import type { HostedControlConnection } from './HostedControlConnection.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
-import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
+import { decodeHostedTaskMutationRequest, hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
 import { admitHostedReadiness, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
@@ -246,18 +246,24 @@ describe('HostedControlServer', () => {
     const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9); const unsigned = hostedControlGoldenRequestFixture()
     let release!: () => void; let markStarted!: () => void
     const gate = new Promise<void>(resolve => { release = resolve }); const started = new Promise<void>(resolve => { markStarted = resolve })
+    let markCompleted!: () => void; let markLost!: () => void
+    const completed = new Promise<void>(resolve => { markCompleted = resolve })
+    const lost = new Promise<void>(resolve => { markLost = resolve })
     let server!: HostedControlServer
     let originalLeaseStillValid = true
-    const service = { mutate: async () => { markStarted(); await gate; originalLeaseStillValid = await server.hasActiveLease(); return { kind: 'unavailable' as const } } } satisfies HostedTaskMutationPort
+    const service = { mutate: async () => { markStarted(); await gate; originalLeaseStillValid = await server.hasActiveLease(); markCompleted(); return { kind: 'unavailable' as const } } } satisfies HostedTaskMutationPort
     const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
-    server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service, dispatchCoexistingOperation: async () => null }); servers.push(server); await server.start()
+    server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service, onProviderAuthorityLost: () => markLost(), dispatchCoexistingOperation: async () => null }); servers.push(server); await server.start()
     const lease = await openReadiness(socketPath, server.ownerBinding!)
     const requestUnsigned = { ...unsigned, ownerBinding: server.ownerBinding! }; const request = { ...requestUnsigned, ownerProof: createHostedControlProof(secret, 'request', requestUnsigned) }
     const pending = exchange(socketPath, `${JSON.stringify(request)}\n`); await started; lease.socket.destroy()
-    for (let attempt = 0; attempt < 50 && await server.hasActiveLease(); attempt += 1) await Bun.sleep(2)
+    await lost
     expect(await exchange(socketPath, `${JSON.stringify({ schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: server.ownerBinding!.socketIdentity, challenge: 'b'.repeat(64) })}\n`)).toBe('')
     release()
     expect(await pending).toBe('')
+    // Eager response close can settle pending before the released service resumes.
+    await completed
+    await server.stop() // Drain the actual handler, including its reply fence.
     expect(originalLeaseStillValid).toBe(false)
   })
 
@@ -1024,6 +1030,9 @@ async function activationServerFixture(
     activationRecoveryDeadlineMs?: number
     onActivationReady?: () => Promise<void>
     onProviderAuthorityLost?: () => void
+    beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
+    beforeActivationDrainForTest?: (revocation: Promise<void>) => void
+    afterBrokerTargetCreatedForTest?: (server: Server, token: Buffer) => void
     beforeActivationFrameWriteForTest?: (
       phase: 'owner_ready' | 'ready', socket: HostedControlConnection,
     ) => void | Promise<void>
@@ -1172,3 +1181,975 @@ function exchangeBytes(socketPath: string, input: Uint8Array): Promise<string> {
     socket.once('error', reject)
   })
 }
+
+// Existing real helper entrypoint; these are lifecycle server tests, not native
+// A+B runtime/admission fixtures. Root runs them in the authorized sandbox.
+describe('HostedControlServer bounded broker publication', () => {
+  async function pair(hooks: Array<Partial<ConstructorParameters<typeof HostedControlServer>[0]>> = []) {
+    const root = await mkdtemp('/tmp/hc-pair-'); roots.push(root)
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const secret = Buffer.alloc(32, 9)
+    const pids: number[] = []
+    const children = new Set<ChildProcess>()
+    const exitedChildren = new Set<ChildProcess>()
+    const closedChildren = new Set<ChildProcess>()
+    const targets: Array<{ server: Server; token: Buffer; originalToken: Buffer; closed: boolean;
+      accepted: Socket[]; closedPeers: Set<Socket> }> = []
+    const paths = [join(root, 'a.sock'), join(root, 'b.sock')]
+    const pair = paths.map((socketPath, index) => new HostedControlServer({
+      socketPath, secret, ownerIdentity, authority: fixture.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => ({ kind: `slot-${index}` }),
+      ...hooks[index],
+      afterBrokerSpawnForTest: child => {
+        if (!children.has(child)) {
+          children.add(child)
+          child.once('exit', () => exitedChildren.add(child))
+          child.once('close', () => closedChildren.add(child))
+        }
+        hooks[index]?.afterBrokerSpawnForTest?.(child)
+      },
+      afterBrokerTargetCreatedForTest: (server, token) => {
+        const target = { server, token, originalToken: Buffer.from(token), closed: false,
+          accepted: [] as Socket[], closedPeers: new Set<Socket>() }
+        targets.push(target)
+        server.once('close', () => { target.closed = true })
+        server.on('connection', socket => {
+          target.accepted.push(socket)
+          socket.once('close', () => target.closedPeers.add(socket))
+        })
+        hooks[index]?.afterBrokerTargetCreatedForTest?.(server, token)
+      },
+      afterSocketPublicationForTest: async pid => {
+        pids.push(pid)
+        await hooks[index]?.afterSocketPublicationForTest?.(pid)
+      },
+    }))
+    servers.push(...pair)
+    const holdTargetPeers = async () => {
+      await Promise.all(targets.map(async target => {
+        const address = target.server.address()
+        if (!address || typeof address === 'string') throw new Error('Missing actual target listener')
+        const accepted = new Promise<void>(resolve => target.server.once('connection', () => resolve()))
+        const client = connect({ host: '127.0.0.1', port: address.port })
+        client.on('error', () => undefined)
+        client.resume()
+        await accepted
+        expect(target.accepted.at(-1)!.destroyed).toBe(false)
+      }))
+    }
+    const assertDrained = async (names: string[] = [], targetCount = 2, childCount = 1) => {
+      expect(targets.length).toBe(targetCount)
+      expect(children.size).toBe(childCount)
+      expect(exitedChildren.size).toBe(childCount)
+      expect(closedChildren.size).toBe(childCount)
+      for (const target of targets) {
+        expect(target.server.listening).toBe(false)
+        expect(target.closed).toBe(true)
+        expect(target.token.equals(Buffer.alloc(32))).toBe(true)
+        expect(target.closedPeers.size).toBe(target.accepted.length)
+        expect(target.accepted.every(peer => peer.destroyed)).toBe(true)
+      }
+      for (const child of children) expect(() => process.kill(child.pid!, 0)).toThrow()
+      expect(secret.equals(Buffer.alloc(32, 9))).toBe(true)
+      expect((await readdir(root)).sort()).toEqual(names.sort())
+    }
+    return { root, paths, pair, secret, pids, targets, children, exitedChildren, closedChildren,
+      holdTargetPeers, assertDrained }
+  }
+
+  test('two lifecycle endpoints use one PID; stopping one preserves the sibling lease and parent secret', async () => {
+    const fixture = await pair()
+    await HostedControlServer.startBatch(fixture.pair)
+    const [a, b] = fixture.pair as [HostedControlServer, HostedControlServer]
+    expect(fixture.children.size).toBe(1)
+    expect(fixture.targets.length).toBe(2)
+    expect(fixture.targets.every(target => target.server.listening)).toBe(true)
+    expect((await readdir(fixture.root)).sort()).toEqual(['a.sock', 'b.sock'])
+    expect(fixture.pids.length).toBe(2)
+    expect(new Set(fixture.pids).size).toBe(1)
+    expect(a.ownerBinding!.socketIdentity).not.toEqual(b.ownerBinding!.socketIdentity)
+    const leases = await Promise.all(fixture.paths.map((path, index) => openReadiness(path, fixture.pair[index]!.ownerBinding!)))
+    expect(await a.hasActiveLease()).toBe(true)
+    expect(await b.hasActiveLease()).toBe(true)
+    await a.stop()
+    expect(await a.hasActiveLease()).toBe(false)
+    expect(await b.hasActiveLease()).toBe(true)
+    expect(fixture.targets[0]!.closed).toBe(true)
+    expect(fixture.targets[0]!.token.equals(Buffer.alloc(32))).toBe(true)
+    expect(fixture.targets[0]!.closedPeers.size).toBe(fixture.targets[0]!.accepted.length)
+    expect(fixture.targets[1]!.server.listening).toBe(true)
+    expect(fixture.targets[1]!.token.equals(fixture.targets[1]!.originalToken)).toBe(true)
+    expect(fixture.closedChildren.size).toBe(0)
+    expect(fixture.secret.equals(Buffer.alloc(32, 9))).toBe(true)
+    expect(await exchange(fixture.paths[1]!, '{"operation":"team_message"}\n')).toContain('slot-1')
+    expect(() => process.kill(fixture.pids[0]!, 0)).not.toThrow()
+    await b.stop()
+    expect(() => process.kill(fixture.pids[0]!, 0)).toThrow()
+    for (const path of fixture.paths) await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    for (const lease of leases) lease.socket.destroy()
+    await fixture.assertDrained()
+  })
+
+  test('shared broker loss fences every published server and readiness lease', async () => {
+    const lost = [false, false]
+    let allLost!: () => void
+    const loss = new Promise<void>(resolve => { allLost = resolve })
+    const fixture = await pair([0, 1].map(index => ({ onProviderAuthorityLost: () => {
+      lost[index] = true
+      if (lost.every(Boolean)) allLost()
+    } })))
+    await HostedControlServer.startBatch(fixture.pair)
+    const leases = await Promise.all(fixture.paths.map((path, index) => openReadiness(path, fixture.pair[index]!.ownerBinding!)))
+    // Hold target reads so a lease EOF cannot be mistaken for the shared child
+    // loss notification. Child exit must drive the synchronous owner fence.
+    for (const target of fixture.targets) for (const peer of target.accepted) if (!peer.destroyed) peer.pause()
+    const child = [...fixture.children][0]!
+    const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
+    process.kill(fixture.pids[0]!, 'SIGKILL')
+    await Promise.all([loss, exited])
+    for (const server of fixture.pair) {
+      expect(await server.hasActiveLease()).toBe(false)
+      expect(server.prepareRetainedProviderToken()).toBeNull()
+      expect(server.ownerBinding).toBeNull()
+    }
+    await Promise.all(fixture.pair.map(server => server.stop()))
+    for (const path of fixture.paths) await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    for (const lease of leases) lease.socket.destroy()
+    await fixture.assertDrained()
+  })
+
+  test('shared loss rejects sibling activation tokens before the sibling loss callback runs', async () => {
+    const connections: HostedApprovalActivationConnection[] = []
+    let siblingToken: { consume(): boolean } | null = null
+    let consumedDuringFirstLoss: boolean | undefined
+    let siblingLost = false
+    let siblingNotYetNotified = false
+    let bindingsDuringFirstLoss: Array<HostedControlServer['ownerBinding']> = []
+    let firstLost!: () => void
+    const loss = new Promise<void>(resolve => { firstLost = resolve })
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    fixture = await pair([0, 1].map(index => ({
+      activationSessionFactory: (connection: HostedApprovalActivationConnection) => {
+        connections[index] = connection
+        return {
+          activate: async () => {
+            await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+            return '{"kind":"ready"}\n'
+          },
+          revoke: async () => undefined,
+        }
+      },
+      onProviderAuthorityLost: () => {
+        if (index === 0) {
+          siblingNotYetNotified = !siblingLost
+          bindingsDuringFirstLoss = fixture.pair.map(server => server.ownerBinding)
+          consumedDuringFirstLoss = siblingToken?.consume()
+          firstLost()
+        } else siblingLost = true
+      },
+    })))
+    await HostedControlServer.startBatch(fixture.pair)
+    const clients = await Promise.all(fixture.paths.map(path => openStreamingSocket(path)))
+    for (const client of clients) {
+      client.socket.write(activationPrepare())
+      expect(await client.nextLine()).toContain('owner_ready')
+      client.socket.write('{"publication":1}\n')
+      expect(await client.nextLine()).toContain('ready')
+    }
+    await waitFor(() => fixture.pair.every(server => server.hasRetainedActivation()))
+    siblingToken = connections[1]!.prepareEffectToken()
+    expect(siblingToken).not.toBeNull()
+    expect(connections[1]!.isCurrent()).toBe(true)
+    // Keep actual accepted activation peers open until the broker's shared
+    // exit callback, rather than accidentally testing independent peer EOF.
+    for (const target of fixture.targets) for (const peer of target.accepted) if (!peer.destroyed) peer.pause()
+    process.kill(fixture.pids[0]!, 'SIGKILL')
+    await loss
+    expect(siblingNotYetNotified).toBe(true)
+    expect(bindingsDuringFirstLoss).toEqual([null, null])
+    expect(consumedDuringFirstLoss).toBe(false)
+    for (const server of fixture.pair) expect(server.hasRetainedActivation()).toBe(false)
+    await Promise.all(fixture.pair.map(server => server.stop()))
+    for (const client of clients) client.socket.destroy()
+    await fixture.assertDrained()
+  })
+
+  test('failure preparing B drains A before launching any broker', async () => {
+    const fixture = await pair()
+    await mkdir(fixture.paths[1]!)
+    await expect(HostedControlServer.startBatch(fixture.pair)).rejects.toThrow('unsafe')
+    expect(fixture.pids).toEqual([])
+    expect(fixture.children.size).toBe(0)
+    expect(fixture.pair.every(server => server.ownerBinding === null)).toBe(true)
+    await expect(lstat(fixture.paths[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await lstat(fixture.paths[1]!)).isDirectory()).toBe(true)
+    await fixture.assertDrained(['b.sock'], 1, 0)
+  })
+
+  test('partial attachment failure drains both publications and does not admit early traffic', async () => {
+    const hidden: string[] = []
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    fixture = await pair([
+      { beforeSocketCloseForTest: path => { hidden.push(path) } },
+      { afterSocketPublicationForTest: async () => {
+        const binding = fixture.pair[0]!.ownerBinding!
+        expect(binding).not.toBeNull()
+        const request = legacyReadinessLine(binding)
+        expect(admitHostedReadiness({ secret: fixture.secret, ownerBinding: binding,
+          line: request.trim(), message: JSON.parse(request) })).toBe(true)
+        expect(await exchange(fixture.paths[0]!, request)).toBe('')
+        await fixture.holdTargetPeers()
+        throw new Error('injected attachment failure')
+      }, beforeSocketCloseForTest: path => { hidden.push(path) } },
+    ])
+    await expect(HostedControlServer.startBatch(fixture.pair)).rejects.toThrow('injected attachment failure')
+    expect(new Set(fixture.pids).size).toBe(1)
+    expect(fixture.pair.every(server => server.ownerBinding === null)).toBe(true)
+    expect(() => process.kill(fixture.pids[0]!, 0)).toThrow()
+    expect(hidden.length).toBe(2)
+    for (const path of [...fixture.paths, ...hidden]) await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(fixture.targets.every(target => target.accepted.length >= 2)).toBe(true)
+    await fixture.assertDrained()
+  })
+
+  test('equivalent authenticated readiness is denied in B publication and succeeds after the batch', async () => {
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    let request = ''
+    fixture = await pair([{}, { afterSocketPublicationForTest: async () => {
+      const binding = fixture.pair[0]!.ownerBinding!
+      expect(binding).not.toBeNull()
+      request = legacyReadinessLine(binding)
+      expect(admitHostedReadiness({ secret: fixture.secret, ownerBinding: binding,
+        line: request.trim(), message: JSON.parse(request) })).toBe(true)
+      expect(await exchange(fixture.paths[0]!, request)).toBe('')
+      expect(await fixture.pair[0]!.hasActiveLease()).toBe(false)
+    } }])
+    await HostedControlServer.startBatch(fixture.pair)
+    expect(request).toBe(legacyReadinessLine(fixture.pair[0]!.ownerBinding!))
+    const ready = JSON.parse(await exchange(fixture.paths[0]!, request))
+    const { ownerProof, ...unsigned } = ready
+    expect(ready).toMatchObject({ kind: 'ready', ownerBinding: fixture.pair[0]!.ownerBinding })
+    expect(ownerProof).toBe(createHostedDomainProof(fixture.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned))
+    await Promise.all(fixture.pair.map(server => server.stop()))
+    await fixture.assertDrained()
+  })
+
+  test('partial publication detects substitution and preserves B replacement while cleaning A', async () => {
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    const replacement = createServer(socket => socket.end('replacement'))
+    let inode = 0
+    fixture = await pair([{}, { afterSocketPublicationForTest: async () => {
+      const path = fixture.paths[1]!
+      await unlink(path)
+      await new Promise<void>((resolve, reject) => { replacement.once('error', reject); replacement.listen(path, resolve) })
+      inode = (await lstat(path)).ino
+    } }])
+    try {
+      await expect(HostedControlServer.startBatch(fixture.pair)).rejects.toThrow('changed during publication')
+      await expect(lstat(fixture.paths[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await lstat(fixture.paths[1]!)).ino).toBe(inode)
+      expect(await exchange(fixture.paths[1]!, '')).toBe('replacement')
+      expect(() => process.kill(fixture.pids[0]!, 0)).toThrow()
+      await fixture.assertDrained(['b.sock'])
+    } finally {
+      await new Promise<void>(resolve => replacement.close(() => resolve()))
+    }
+  })
+
+  test('no-replace publication preserves a listener appearing at B after preparation', async () => {
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    const replacement = createServer(socket => socket.end('replacement'))
+    let inode = 0
+    fixture = await pair([{ afterSocketPublicationForTest: async () => {
+      await new Promise<void>((resolve, reject) => {
+        replacement.once('error', reject); replacement.listen(fixture.paths[1]!, resolve)
+      })
+      inode = (await lstat(fixture.paths[1]!)).ino
+    } }])
+    try {
+      await expect(HostedControlServer.startBatch(fixture.pair)).rejects.toMatchObject({ code: 'EEXIST' })
+      expect((await lstat(fixture.paths[1]!)).ino).toBe(inode)
+      expect(await exchange(fixture.paths[1]!, '')).toBe('replacement')
+      await expect(lstat(fixture.paths[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(() => process.kill(fixture.pids[0]!, 0)).toThrow()
+      await fixture.assertDrained(['b.sock'])
+    } finally { await new Promise<void>(resolve => replacement.close(() => resolve())) }
+  })
+
+  test('stopping a borrowed participant during attachment aborts and drains the whole batch', async () => {
+    let fixture!: Awaited<ReturnType<typeof pair>>
+    fixture = await pair([{ afterSocketPublicationForTest: async () => {
+      await fixture.holdTargetPeers()
+      await fixture.pair[1]!.stop()
+    } }])
+    await expect(HostedControlServer.startBatch(fixture.pair)).rejects.toThrow('attachment is unavailable')
+    expect(fixture.pair.every(server => server.ownerBinding === null)).toBe(true)
+    for (const path of fixture.paths) await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(() => process.kill(fixture.pids[0]!, 0)).toThrow()
+    expect(fixture.targets.every(target => target.accepted.length > 0)).toBe(true)
+    await fixture.assertDrained()
+  })
+
+  test('bounded count and overlapping batches cannot take or stop an existing participant', async () => {
+    const fixture = await pair()
+    await expect(HostedControlServer.startBatch([])).rejects.toThrow('one or two')
+    await expect(HostedControlServer.startBatch([...fixture.pair, fixture.pair[0]!])).rejects.toThrow('one or two')
+    await expect(HostedControlServer.startBatch([fixture.pair[0]!, fixture.pair[0]!])).rejects.toThrow('distinct')
+    const starting = HostedControlServer.startBatch(fixture.pair)
+    await expect(fixture.pair[0]!.start()).rejects.toThrow('already started')
+    await starting
+    expect(fixture.pair.every(server => server.ownerBinding !== null)).toBe(true)
+    await Promise.all(fixture.pair.map(server => server.stop()))
+    await fixture.assertDrained()
+  })
+})
+
+
+describe('HostedControlServer explicit legacy isolation', () => {
+  test('publishes explicit legacy readiness and drains only its owned paths and child', async () => {
+    const root = await mkdtemp('/tmp/hc-legacy-server-'); roots.push(root)
+    const socketPath = join(root, 'control.sock')
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const secret = Buffer.alloc(32, 9)
+    let child!: ChildProcess
+    let closed = false
+    let schema = ''
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity,
+      brokerTransport: 'legacy', authority: fixture.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null,
+      afterBrokerSpawnForTest: broker => {
+        child = broker
+        broker.stdout!.on('data', chunk => { schema += chunk.toString() })
+        broker.once('close', () => { closed = true })
+      },
+    })
+    servers.push(server)
+    await server.start()
+    expect(schema).toBe('{"schemaVersion":1,"kind":"ready"}\n')
+    expect(child.spawnargs.slice(-2)[0]).not.toBe(socketPath)
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    expect(JSON.parse(lease.line).kind).toBe('ready')
+    lease.socket.destroy()
+    await server.stop()
+    await server.stop()
+    expect(closed).toBe(true)
+    expect(server.ownerBinding).toBeNull()
+    expect(await readdir(root)).toEqual([])
+    expect(secret).toEqual(Buffer.alloc(32, 9))
+    expect(() => process.kill(child.pid!, 0)).toThrow()
+  }, 10_000)
+
+  test('rejects explicit legacy in startBatch and inherited-v2 before any spawn', async () => {
+    const root = await mkdtemp('/tmp/hc-no-downgrade-'); roots.push(root)
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    let spawns = 0
+    const options = { socketPath: join(root, 'control.sock'), secret: Buffer.alloc(32, 9),
+      ownerIdentity, authority: fixture.authority, brokerTransport: 'legacy' as const,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      afterBrokerSpawnForTest: () => { spawns += 1 },
+    }
+    const legacy = new HostedControlServer(options); servers.push(legacy)
+    await expect(HostedControlServer.startBatch([legacy])).rejects.toThrow('cannot select legacy')
+    const sealed = new HostedControlServer({ ...options, activationTransport: 'inherited-v2' })
+    servers.push(sealed)
+    await expect(sealed.start()).rejects.toThrow('requires native broker')
+    expect(spawns).toBe(0)
+    expect(await readdir(root)).toEqual([])
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Darwin native singleton rejects without launching legacy', async () => {
+    const root = await mkdtemp('/tmp/hc-darwin-native-'); roots.push(root)
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const args: string[][] = []
+    const server = new HostedControlServer({ socketPath: join(root, 'control.sock'),
+      secret: Buffer.alloc(32, 9), ownerIdentity, authority: fixture.authority,
+      brokerTransport: 'native-batch',
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      afterBrokerSpawnForTest: child => { args.push([...child.spawnargs]) },
+    })
+    servers.push(server)
+    await expect(server.start()).rejects.toThrow()
+    expect(args.length).toBe(1)
+    expect(args[0]!.length).toBe(2) // executable + native no-argv fixture
+    expect(await readdir(root)).toEqual([])
+    expect(server.ownerBinding).toBeNull()
+  }, 10_000)
+})
+
+// Actual server + native broker + canonical HMAC readiness. These source tests
+// require root's qualified Bun/helper environment; no selected-launch claim.
+describe('HostedControlServer actual request FIN', () => {
+  const deferred = () => {
+    let resolve!: () => void
+    const promise = new Promise<void>(accept => { resolve = accept })
+    return { promise, resolve }
+  }
+
+  async function fixture(withActivation = false) {
+    const root = await mkdtemp('/tmp/hc-fin-'); roots.push(root)
+    const socketPath = join(root, 'control.sock')
+    const secret = Buffer.alloc(32, 9)
+    const golden = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = golden.ownerBinding
+    const bootstrapBinding = {
+      deploymentId: golden.authority.deploymentId, bootId: golden.authority.bootId,
+      workspaceId: golden.authority.workspaceId,
+      mountGeneration: golden.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64), ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
+      proofKeyId: createHash('sha256').update(secret).digest('hex'),
+    }
+    const entered = deferred(), gate = deferred(), lost = deferred(), closing = deferred()
+    const peers: Socket[] = [], closedPeers = new Set<Socket>(), clients: Socket[] = []
+    let target!: Server, token!: Buffer, targetClosed = false, brokerExited = false, brokerClosed = false
+    const mutationInputs: unknown[] = []
+    let calls = 0, rejectHandler = false
+    const finish = async () => { calls++; entered.resolve(); await gate.promise; if (rejectHandler) throw new Error('port rejected after FIN') }
+    const { HostedControlDispatcher } = await import('./HostedControlDispatcher.js')
+    const dispatcher = new HostedControlDispatcher({ secret, authority: golden.authority,
+      getOwnerBinding: () => server.ownerBinding,
+      lifecycle: { dispatch: async () => { await finish(); return { payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null } } },
+      messages: { dispatch: async () => { throw new Error('unexpected message port') } },
+    })
+    const server: HostedControlServer = new HostedControlServer({ socketPath, secret, ownerIdentity,
+      authority: golden.authority, bootstrapBinding,
+      // Optional synthetic session exercises retained transport loss only.
+      activationSessionFactory: withActivation ? connection => ({
+        activate: async () => {
+          await connection.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => undefined,
+      }) : undefined,
+      service: { mutate: async request => { mutationInputs.push(request); await finish(); return { kind: 'unavailable' } } },
+      dispatchCoexistingOperation: (message, raw) => dispatcher.dispatch(message, raw),
+      onProviderAuthorityLost: () => lost.resolve(),
+      beforeSocketCloseForTest: () => closing.resolve(),
+      afterBrokerSpawnForTest: child => {
+        child.once('exit', () => { brokerExited = true })
+        child.once('close', () => { brokerClosed = true })
+      },
+      afterBrokerTargetCreatedForTest: (listener, credential) => {
+        target = listener; token = Buffer.from(credential)
+        listener.once('close', () => { targetClosed = true })
+        listener.on('connection', peer => { peers.push(peer); peer.once('close', () => closedPeers.add(peer)) })
+      },
+    })
+    servers.push(server)
+    await server.start()
+    const binding = server.ownerBinding!
+    const mutationLine = () => {
+      const unsigned = { ...golden, ownerBinding: binding }
+      return `${JSON.stringify({ ...unsigned, ownerProof: createHostedControlProof(secret, 'request', unsigned) })}\n`
+    }
+    const readinessLine = () => descriptorReadinessLine(secret, binding, bootstrapBinding)
+    const ready = async () => {
+      const lease = await openDescriptorReadiness(socketPath, secret, binding, bootstrapBinding)
+      clients.push(lease.socket)
+      const { ownerProof, ...unsigned } = JSON.parse(lease.line)
+      expect(unsigned).toEqual({ schemaVersion: 2, kind: 'ready', capability: 'hosted-lifecycle-command',
+        challenge: 'b'.repeat(64), bootstrapDigest: bootstrapBinding.bootstrapDigest, ownerBinding: binding })
+      expect(ownerProof).toBe(createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(unsigned)))
+      expect(await server.hasActiveLease()).toBe(true)
+      return { ...lease, peer: peers.at(-1)! }
+    }
+    const finite = async (input: string | Buffer, direct = false) => {
+      const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+      const address = target.address()
+      if (!address || typeof address === 'string') throw new Error('missing target')
+      const client = direct ? connect({ host: '127.0.0.1', port: address.port }) : connect(socketPath)
+      clients.push(client)
+      let output = '', ended = false
+      const errors: Error[] = []
+      client.setEncoding('utf8')
+      client.on('data', chunk => { output += chunk })
+      client.on('error', error => errors.push(error))
+      client.once('end', () => { ended = true })
+      const closed = new Promise<void>(resolve => client.once('close', () => resolve()))
+      // Install target observers before sending even a credential byte.
+      const peer = await accepted
+      let timeouts = 0
+      peer.on('timeout', () => { timeouts++ })
+      const fin = new Promise<void>(resolve => peer.once('end', () => resolve()))
+      const peerClosed = new Promise<void>(resolve => peer.once('close', () => resolve()))
+      client.end(input)
+      return { client, peer, fin, closed, peerClosed, errors, timeouts: () => timeouts, output: () => output, ended: () => ended }
+    }
+    const activate = async () => {
+      const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+      const client = await openStreamingSocket(socketPath)
+      clients.push(client.socket)
+      const peer = await accepted
+      client.socket.write(activationPrepare())
+      await client.nextLine()
+      client.socket.write('{"publication":1}\n')
+      await client.nextLine()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(server.hasRetainedActivation()).toBe(true)
+      return { socket: client.socket, peer }
+    }
+    const cleanup = async () => {
+      gate.resolve()
+      for (const client of clients) client.destroy()
+      await server.stop()
+      expect(targetClosed).toBe(true)
+      expect(brokerExited).toBe(true); expect(brokerClosed).toBe(true)
+      expect(closedPeers.size).toBe(peers.length)
+      await expect(lstat(socketPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    return { server, secret, golden, binding, ready, finite, mutationLine, readinessLine,
+      token, entered, gate, lost, closing, cleanup, activate, mutationInputs, calls: () => calls,
+      reject: () => { rejectHandler = true } }
+  }
+
+  for (const operation of ['mutation', 'lifecycle'] as const) test(`${operation} signs full response only after target FIN and authenticated port entry`, async () => {
+    const f = await fixture()
+    try {
+      await f.ready()
+      let line = f.mutationLine()
+      let lifecycleUnsigned: Record<string, any> | undefined
+      if (operation === 'lifecycle') {
+        const { createHostedLifecycleOwnerIdentityChecksum } = await import('./HostedControlDispatcher.js')
+        const a = f.golden.authority, b = f.binding
+        const ownerEffectFence = { grantRevision: '5'.repeat(64), identityChecksum: createHostedLifecycleOwnerIdentityChecksum(b, a) }
+        const exchangeId = `lifecycle-request_${'c'.repeat(32)}`
+        const context = { actorId: a.actorId, sessionId: 'session-fin', deploymentId: a.deploymentId,
+          bootId: a.bootId, requestId: 'request-fin', authorizedScope: 'hosted-lifecycle-command', deadlineAtMs: Date.now() + 60_000 }
+        lifecycleUnsigned = { schemaVersion: 2, exchangeId, operation: 'control_state',
+          provenance: {
+            from: { kind: 'controller', deploymentId: a.deploymentId, bootId: a.bootId, actorId: a.actorId, sessionId: context.sessionId },
+            to: { kind: 'owner', ownerAuthority: b.ownerAuthority, ownerGeneration: b.ownerGeneration, ownerSessionId: b.ownerSessionId },
+            target: { capability: 'hosted-lifecycle-command', exchangeId, operation: 'control_state', workspaceId: a.workspaceId, teamId: a.teamId },
+          }, ownerBinding: b, ownerEffectFence,
+          payload: { request: { schemaVersion: 1, workspaceId: a.workspaceId, teamId: a.teamId }, context,
+            authority: { actorId: a.actorId, workspaceId: a.workspaceId, teamId: a.teamId, deploymentId: a.deploymentId,
+              restoreGeneration: a.restoreGeneration, mountGeneration: a.mountBinding.mountGeneration,
+              bootId: a.bootId, resourceRevision: null, ownerEffectFence } },
+        }
+        line = `${JSON.stringify({ ...lifecycleUnsigned, ownerProof: createHostedRawDomainProof(f.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', JSON.stringify(lifecycleUnsigned)) })}\n`
+      }
+      const request = await f.finite(line)
+      await Promise.race([
+        Promise.all([request.fin, f.entered.promise]).then(() => new Promise<void>(resolve => setImmediate(resolve))),
+        request.closed.then(() => { throw new Error('response closed before port release') }),
+        request.peerClosed.then(() => { throw new Error('target closed before port release') }),
+      ])
+      expect(request.peer.destroyed).toBe(false); expect(request.peer.writableEnded).toBe(false)
+      expect(request.output()).toBe(''); expect(f.calls()).toBe(1)
+      expect(f.mutationInputs).toEqual(operation === 'mutation' ? [JSON.parse(line)] : [])
+      expect(await f.server.hasActiveLease()).toBe(true)
+      f.gate.resolve()
+      await Promise.all([request.closed, request.peerClosed])
+      expect(request.ended()).toBe(true); expect(request.errors).toEqual([])
+      expect(request.output().split('\n').length).toBe(2); expect(request.output().endsWith('\n')).toBe(true)
+      const response = JSON.parse(request.output())
+      if (operation === 'mutation') {
+        const { ownerProof: _, ...unsigned } = response
+        expect(unsigned).toEqual({ schemaVersion: f.golden.schemaVersion, exchangeId: f.golden.exchangeId,
+          operation: f.golden.operation, ownerBinding: f.binding, authority: f.golden.authority, payload: { kind: 'unavailable' } })
+        expect(verifyHostedControlProof(f.secret, 'response', response)).toBe(true)
+      } else {
+        const { ownerProof, ...unsigned } = response
+        expect(unsigned).toEqual({ schemaVersion: 2, exchangeId: lifecycleUnsigned!.exchangeId, operation: 'control_state',
+          provenance: { from: lifecycleUnsigned!.provenance.to, to: lifecycleUnsigned!.provenance.from, target: lifecycleUnsigned!.provenance.target },
+          ownerBinding: f.binding, ownerEffectFence: lifecycleUnsigned!.ownerEffectFence,
+          authority: lifecycleUnsigned!.payload.authority, payload: { schemaVersion: 1, kind: 'not_found' } })
+        expect(ownerProof).toBe(createHostedRawDomainProof(f.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'response', JSON.stringify(unsigned)))
+      }
+    } finally { await f.cleanup() }
+  })
+
+  test('credential and incomplete protocol EOF close without dispatch or consuming readiness', async () => {
+    const f = await fixture()
+    try {
+      for (const input of [Buffer.alloc(0), f.token.subarray(0, 12)]) {
+        const request = await f.finite(input, true)
+        await request.fin
+        // Credential handoff installs protocol end after the helper's observer.
+        await new Promise<void>(resolve => setImmediate(resolve))
+        expect(request.peer.destroyed).toBe(true)
+        expect(request.timeouts()).toBe(0)
+        await Promise.all([request.peerClosed, request.closed])
+        expect(request.timeouts()).toBe(0)
+        expect(request.output()).toBe('')
+        expect(f.mutationInputs).toEqual([])
+      }
+      for (const input of ['', f.mutationLine().slice(0, -1), Buffer.from([0x7b, 0x22, 0xe2, 0x82])]) {
+        const request = await f.finite(input)
+        await request.fin
+        // Credential handoff installs protocol end after the helper's observer.
+        await new Promise<void>(resolve => setImmediate(resolve))
+        expect(request.peer.destroyed).toBe(true)
+        expect(request.timeouts()).toBe(0)
+        await Promise.all([request.peerClosed, request.closed])
+        expect(request.timeouts()).toBe(0)
+        expect(request.output()).toBe('')
+        expect(f.mutationInputs).toEqual([])
+      }
+      expect(f.calls()).toBe(0); expect(await f.server.hasActiveLease()).toBe(false)
+      await f.ready()
+    } finally { await f.cleanup() }
+  })
+
+  test('complete bad proof, binding, authority, pipelined and oversized FIN requests never enter port', async () => {
+    const f = await fixture()
+    try {
+      await f.ready()
+      f.gate.resolve() // A wrongly admitted vector must settle so entry assertions run.
+      const valid = JSON.parse(f.mutationLine())
+      const wrongOwner = { ...valid, ownerBinding: { ...valid.ownerBinding, ownerSessionId: 'owner-session_' + '4'.repeat(32) } }
+      const wrongAuthority = { ...valid, authority: { ...valid.authority, bootId: 'wrong-boot' } }
+      const sign = ({ ownerProof: _, ...unsigned }: typeof valid) => JSON.stringify({ ...unsigned, ownerProof: createHostedControlProof(f.secret, 'request', unsigned) }) + '\n'
+      for (const vector of [wrongOwner, wrongAuthority]) {
+        const decoded = decodeHostedTaskMutationRequest(JSON.parse(sign(vector)))
+        expect(verifyHostedControlProof(f.secret, 'request', decoded)).toBe(true)
+      }
+      for (const input of [JSON.stringify({ ...valid, ownerProof: '0'.repeat(64) }) + '\n',
+        sign(wrongOwner), sign(wrongAuthority), f.mutationLine() + '{}\n', ' '.repeat(64 * 1024) + f.mutationLine()]) {
+        const request = await f.finite(input)
+        await Promise.all([request.closed, request.peerClosed])
+        expect(f.mutationInputs).toEqual([])
+        expect(f.calls()).toBe(0)
+        expect(request.output()).toBe('')
+      }
+      expect(f.calls()).toBe(0)
+    } finally { await f.cleanup() }
+  })
+
+  for (const terminal of ['readiness FIN', 'activation FIN', 'shutdown', 'reject', 'timeout event', 'error event'] as const) test(`${terminal} while finite handler held closes response and drains actual settlement`, async () => {
+    const f = await fixture(terminal === 'activation FIN')
+    try {
+      const lease = await f.ready()
+      const activation = terminal === 'activation FIN' ? await f.activate() : null
+      const request = await f.finite(f.mutationLine())
+      await Promise.all([request.fin, f.entered.promise])
+      expect(f.mutationInputs).toEqual([JSON.parse(f.mutationLine())])
+      if (terminal === 'readiness FIN') {
+        let synchronousLoss = false
+        const observed = new Promise<void>(resolve => lease.peer.once('end', () => {
+          // Server's end callback was installed first and has already fenced peers.
+          synchronousLoss = request.peer.destroyed
+          resolve()
+        }))
+        lease.socket.end()
+        await Promise.all([observed, f.lost.promise])
+        expect(synchronousLoss).toBe(true)
+        expect(await f.server.hasActiveLease()).toBe(false)
+        const reuse = await f.finite(f.readinessLine())
+        await reuse.closed; expect(reuse.output()).toBe('')
+      } else if (terminal === 'activation FIN') {
+        let responseDestroyedAtFin = false, retainedAtFin = true
+        const fin = new Promise<void>(resolve => activation!.peer.once('end', () => {
+          responseDestroyedAtFin = request.peer.destroyed
+          retainedAtFin = f.server.hasRetainedActivation()
+          resolve()
+        }))
+        activation!.socket.end()
+        await Promise.all([fin, f.lost.promise])
+        expect(responseDestroyedAtFin).toBe(true)
+        expect(retainedAtFin).toBe(false)
+        // Independent readiness remains retained; the activation is revoked.
+        expect(await f.server.hasActiveLease()).toBe(true)
+      } else if (terminal === 'reject') {
+        f.reject(); f.gate.resolve()
+      } else if (terminal === 'timeout event') {
+        // Cleanup wiring only: the read timer is disabled after LF.
+        request.peer.emit('timeout')
+      } else if (terminal === 'error event') {
+        request.peer.emit('error', new Error('injected terminal socket error'))
+      } else {
+        void f.server.stop()
+        await f.closing.promise
+      }
+      await Promise.all([request.closed, request.peerClosed])
+      expect(request.output()).toBe('')
+      let drained = false
+      const stopping = f.server.stop().then(() => { drained = true })
+      await f.closing.promise
+      await new Promise<void>(resolve => setImmediate(resolve))
+      if (terminal !== 'reject') expect(drained).toBe(false)
+      f.gate.resolve()
+      await stopping
+      expect(request.output()).toBe(''); expect(f.calls()).toBe(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('canonical readiness immediate FIN consumes and revokes the sole lease', async () => {
+    const f = await fixture()
+    try {
+      const request = await f.finite(f.readinessLine())
+      await Promise.all([request.fin, request.closed, f.lost.promise])
+      expect(await f.server.hasActiveLease()).toBe(false)
+      const reuse = await f.finite(f.readinessLine())
+      await reuse.closed; expect(reuse.output()).toBe(''); expect(f.calls()).toBe(0)
+    } finally { await f.cleanup() }
+  })
+})
+
+// Synthetic activation-session frames, actual server/broker/target EOF.
+// This preserves transport semantics; native FD5 authentication stays root-owned.
+for (const phase of ['owner_ready', 'publication', 'recovery', 'ready', 'leased'] as const) {
+  test(`activation target FIN revokes once during ${phase} and cannot install late`, async () => {
+    let release!: () => void, reached!: () => void, revoked!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const held = new Promise<void>(resolve => { reached = resolve })
+    const loss = new Promise<void>(resolve => { revoked = resolve })
+    let target!: Server, calls = 0, publicationRejected = false
+    let connection!: HostedApprovalActivationConnection
+    const fixture = await activationServerFixture(false, true, {
+      afterBrokerTargetCreatedForTest: listener => { target = listener },
+      beforeActivationFrameWriteForTest: async writePhase => {
+        if (writePhase === phase) { reached(); await gate }
+      },
+    })
+    fixture.create(({ connection: candidate }) => {
+      connection = candidate
+      return {
+        activate: async () => {
+          try { await candidate.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024) }
+          catch (error) { publicationRejected = true; throw error }
+          if (phase === 'recovery') { reached(); await gate }
+          return '{"kind":"ready"}\n'
+        },
+        revoke: async () => { calls++; revoked() },
+      }
+    })
+    let client: Awaited<ReturnType<typeof openStreamingSocket>> | undefined
+    try {
+      const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+      client = await openStreamingSocket(fixture.socketPath)
+      const peer = await accepted
+      const closed = new Promise<void>(resolve => peer.once('close', () => resolve()))
+      let output = ''
+      client.socket.on('data', chunk => { output += chunk })
+      client.socket.write(activationPrepare())
+      if (phase !== 'owner_ready') {
+        await client.nextLine()
+        if (phase === 'publication') reached()
+        else client.socket.write('{"publication":1}\n')
+      }
+      if (phase === 'leased') {
+        await client.nextLine()
+        await new Promise<void>(resolve => setImmediate(resolve))
+        expect(fixture.server.hasRetainedActivation()).toBe(true)
+      } else await held
+      const before = output
+      let currentAtFin = true, callsAtFin = 0
+      const fin = new Promise<void>(resolve => peer.once('end', () => {
+        currentAtFin = connection.isCurrent()
+        callsAtFin = calls
+        resolve()
+      }))
+      client.socket.end()
+      await Promise.all([fin, closed, loss])
+      expect(currentAtFin).toBe(false)
+      expect(callsAtFin).toBe(1)
+      expect(fixture.server.hasRetainedActivation()).toBe(false)
+      expect(connection.prepareEffectToken()).toBeNull()
+      release()
+      // The authenticated owner-ready transition consumed this generation.
+      expect(await exchange(fixture.socketPath, activationPrepare())).toBe('')
+      await fixture.server.stop()
+      expect(output).toBe(before)
+      expect(calls).toBe(1)
+      if (phase === 'publication' || phase === 'owner_ready') expect(publicationRejected).toBe(true)
+    } finally {
+      release(); client?.socket.destroy(); await fixture.server.stop()
+    }
+  })
+}
+
+test('activation target FIN provider-loss callback reenters stop and drains one gated cleanup', async () => {
+  let release!: () => void
+  const cleanup = new Promise<void>(resolve => { release = resolve })
+  let markDrain!: () => void
+  const drainEntered = new Promise<void>(resolve => { markDrain = resolve })
+  let retained: Promise<void> | undefined
+  let target!: Server, calls = 0, losses = 0, drained = false, cleanupCompleted = false
+  let stopping: Promise<void> | undefined
+  let connection!: HostedApprovalActivationConnection
+  let currentAtLoss: boolean | undefined
+  const fixture = await activationServerFixture(false, true, {
+    afterBrokerTargetCreatedForTest: listener => { target = listener },
+    beforeActivationDrainForTest: revocation => { retained = revocation; markDrain() },
+    onProviderAuthorityLost: () => {
+      losses++
+      currentAtLoss = connection.isCurrent()
+      stopping = fixture.server.stop().then(() => { drained = true })
+    },
+  })
+  fixture.create(({ connection: candidate }) => {
+    connection = candidate
+    return {
+      activate: async () => {
+        await candidate.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { calls++; await cleanup; cleanupCompleted = true },
+    }
+  })
+  let client: Awaited<ReturnType<typeof openStreamingSocket>> | undefined
+  try {
+    const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+    client = await openStreamingSocket(fixture.socketPath)
+    const peer = await accepted
+    const closed = new Promise<void>(resolve => peer.once('close', () => resolve()))
+    const targetClosed = new Promise<void>(resolve => target.once('close', () => resolve()))
+    client.socket.write(activationPrepare())
+    await client.nextLine()
+    client.socket.write('{"publication":1}\n')
+    await client.nextLine()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(fixture.server.hasRetainedActivation()).toBe(true)
+    let callsAtFin = 0, currentAtFin = true, destroyedAtFin = false
+    const fin = new Promise<void>(resolve => peer.once('end', () => {
+      callsAtFin = calls
+      currentAtFin = connection.isCurrent()
+      destroyedAtFin = peer.destroyed
+      resolve()
+    }))
+    client.socket.end()
+    await fin
+    expect(currentAtLoss).toBe(false)
+    expect(currentAtFin).toBe(false)
+    expect(destroyedAtFin).toBe(true)
+    expect(callsAtFin).toBe(1)
+    expect(losses).toBe(1)
+    expect(stopping).toBeDefined()
+    await Promise.all([closed, targetClosed])
+    await drainEntered
+    expect(retained).toBeDefined()
+    // Both race inputs are native promises. An already-resolved retained
+    // placeholder wins by registration order, regardless of filesystem I/O.
+    const pending = Symbol('actual cleanup pending')
+    expect(await Promise.race([retained!, Promise.resolve(pending)])).toBe(pending)
+    expect(calls).toBe(1)
+    expect(cleanupCompleted).toBe(false)
+    expect(drained).toBe(false)
+    release()
+    await stopping
+    expect(await retained).toBeUndefined()
+    expect(cleanupCompleted).toBe(true)
+    expect(drained).toBe(true)
+    expect(calls).toBe(1)
+    expect(connection.isCurrent()).toBe(false)
+  } finally {
+    release(); client?.socket.destroy(); await fixture.server.stop()
+    await stopping
+  }
+})
+
+test('activation target FIN rejecting cleanup is observed before the late shutdown drain', async () => {
+  let release!: () => void
+  const teardown = new Promise<void>(resolve => { release = resolve })
+  const failure = new Error('activation cleanup rejected after FIN')
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason) }
+  let markDrain!: () => void
+  const drainEntered = new Promise<void>(resolve => { markDrain = resolve })
+  let retained: Promise<void> | undefined
+  let target!: Server, calls = 0, losses = 0, drained = false, cleanupCompleted = false
+  let stopping: Promise<void> | undefined
+  let connection!: HostedApprovalActivationConnection
+  let currentAtLoss: boolean | undefined
+  const fixture = await activationServerFixture(false, true, {
+    afterBrokerTargetCreatedForTest: listener => { target = listener },
+    beforeSocketCloseForTest: () => teardown,
+    beforeActivationDrainForTest: revocation => { retained = revocation; markDrain() },
+    onProviderAuthorityLost: () => {
+      losses++
+      currentAtLoss = connection.isCurrent()
+      stopping = fixture.server.stop().then(() => { drained = true })
+    },
+  })
+  fixture.create(({ connection: candidate }) => {
+    connection = candidate
+    return {
+      activate: async () => {
+        await candidate.receivePublicationAfterOwnerReady('{"kind":"owner_ready"}\n', 512 * 1024)
+        return '{"kind":"ready"}\n'
+      },
+      revoke: async () => { calls++; cleanupCompleted = true; throw failure },
+    }
+  })
+  let client: Awaited<ReturnType<typeof openStreamingSocket>> | undefined
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+    client = await openStreamingSocket(fixture.socketPath)
+    const peer = await accepted
+    const closed = new Promise<void>(resolve => peer.once('close', () => resolve()))
+    const targetClosed = new Promise<void>(resolve => target.once('close', () => resolve()))
+    client.socket.write(activationPrepare())
+    await client.nextLine()
+    client.socket.write('{"publication":1}\n')
+    await client.nextLine()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(fixture.server.hasRetainedActivation()).toBe(true)
+    let callsAtFin = 0, currentAtFin = true, destroyedAtFin = false
+    const fin = new Promise<void>(resolve => peer.once('end', () => {
+      callsAtFin = calls
+      currentAtFin = connection.isCurrent()
+      destroyedAtFin = peer.destroyed
+      resolve()
+    }))
+    client.socket.end()
+    await fin
+    expect(currentAtLoss).toBe(false)
+    expect(currentAtFin).toBe(false)
+    expect(destroyedAtFin).toBe(true)
+    expect(callsAtFin).toBe(1)
+    expect(losses).toBe(1)
+    expect(stopping).toBeDefined()
+    // Stop is explicitly held before broker/filesystem/handler teardown. No
+    // test rejection handler touches the retained promise before this checkpoint.
+    // Complete the FIN turn's rejection reporting, not an elapsed-time window.
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(cleanupCompleted).toBe(true)
+    expect(retained).toBeUndefined()
+    expect(unhandled).toEqual([])
+    expect(calls).toBe(1)
+    expect(drained).toBe(false)
+    release()
+    await drainEntered
+    expect(retained).toBeDefined()
+    await expect(retained!).rejects.toBe(failure)
+    await stopping // Existing policy observes activation errors and completes stop.
+    await Promise.all([closed, targetClosed])
+    expect(unhandled).toEqual([])
+    expect(cleanupCompleted).toBe(true)
+    expect(drained).toBe(true)
+    expect(calls).toBe(1)
+    expect(connection.isCurrent()).toBe(false)
+  } finally {
+    release(); client?.socket.destroy()
+    try { await fixture.server.stop(); await stopping }
+    finally { process.off('unhandledRejection', onUnhandled) }
+  }
+})
+
+test('actual incomplete frame read deadline closes on observed timeout (not a handler deadline)', async () => {
+  let target!: Server
+  const fixture = await activationServerFixture(false, false, {
+    readDeadlineMs: 100,
+    afterBrokerTargetCreatedForTest: listener => { target = listener },
+  })
+  const accepted = new Promise<Socket>(resolve => target.once('connection', resolve))
+  const client = connect(fixture.socketPath)
+  client.on('error', () => undefined)
+  client.resume()
+  try {
+    const peer = await accepted
+    const timeout = new Promise<void>(resolve => peer.once('timeout', () => resolve()))
+    const closed = new Promise<void>(resolve => peer.once('close', () => resolve()))
+    client.write('{')
+    await Promise.all([timeout, closed])
+    expect(peer.destroyed).toBe(true)
+    expect(await fixture.server.hasActiveLease()).toBe(false)
+  } finally { client.destroy(); await fixture.server.stop() }
+})

@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { link, lstat } from 'node:fs/promises'
-import { createServer, type Server, type Socket } from 'node:net'
-import { dirname } from 'node:path'
+import { createServer, type Server, Socket } from 'node:net'
+import { basename, dirname, resolve } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import {
   createHostedControlProof,
@@ -18,10 +18,11 @@ import { decodeHostedReadinessRequest, HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_REA
   type HostedReadinessAdmission } from './HostedControlReadiness.js'
 export { decodeHostedReadinessRequest, admitHostedReadiness, HOSTED_READINESS_MAX_LINE_BYTES,
   HOSTED_LIFECYCLE_PROOF_DOMAIN, type HostedReadinessAdmission } from './HostedControlReadiness.js'
-import { isSocketIdentityCurrentSync, socketPublicationPath, listenLoopback, startSocketBroker,
-  killSocketBroker, closeServer, proveSocketPathIsServerOwned, consumePublicationProbe, sameSocketIdentity,
-  prepareSocketPath, removeOwnedSocketPathIfCurrent, removeSocketIfIdentityMatches,
-  type PublicationProbe } from './HostedControlServerPublication.js'
+import { isSocketIdentityCurrentSync, socketPublicationPath, listenLoopback, startSocketBrokerBatch, startLegacySocketBroker,
+  closeServer, proveSocketPathIsServerOwned, consumePublicationProbe, sameSocketIdentity,
+  prepareSocketPath, removeOwnedSocketPathIfCurrent,
+  type PublicationProbe, type SocketBrokerBorrow, type SocketBrokerBatch } from './HostedControlServerPublication.js'
+import type { SocketBrokerMapping } from './HostedControlSocketBroker.js'
 import {
   HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
   HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES,
@@ -56,6 +57,9 @@ export type HostedApprovalActivationSessionFactory = (
 ) => HostedApprovalActivationTransportSession
 
 export type HostedControlServerOptions = {
+  /** Explicit composition choice. Omission and startBatch always mean native. */
+  brokerTransport?: 'native-batch' | 'legacy'
+
   socketPath: string
   secret: Uint8Array
   ownerIdentity: Omit<HostedControlOwnerBinding, 'socketIdentity'>
@@ -66,9 +70,14 @@ export type HostedControlServerOptions = {
   activationRecoveryDeadlineMs?: number
   bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
   /** Deterministic publication-window seam for security regression tests. */
-  afterSocketPublicationForTest?: () => void | Promise<void>
+  afterSocketPublicationForTest?: (brokerPid: number) => void | Promise<void>
+  /** Observe the actual child and loopback resources, before publication. */
+  afterBrokerSpawnForTest?: (broker: ChildProcess) => void
+  afterBrokerTargetCreatedForTest?: (server: Server, token: Buffer) => void
   /** Deterministic close-window seam for hidden-path replacement regression tests. */
   beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
+  /** Observe the exact shutdown activation promise after preceding resource drains. */
+  beforeActivationDrainForTest?: (revocation: Promise<void>) => void
   /** Deterministic retained-write seam for activation transport regression tests. */
   beforeActivationFrameWriteForTest?: (
     phase: 'owner_ready' | 'ready', socket: HostedControlConnection,
@@ -112,7 +121,12 @@ type ActivationCandidate = {
 export class HostedControlServer {
   readonly #options: HostedControlServerOptions
   #server: Server | null = null
-  #broker: ChildProcess | null = null
+  #broker: SocketBrokerBorrow | null = null
+  #brokerToken: Buffer | null = null
+  #publicationProbe: PublicationProbe | null = null
+  #starting = false
+  #stopRevision = 0
+  #batchReady = false
   #ownsSocket = false
   readonly #sockets = new Set<HostedControlConnection>()
   #ownerBinding: HostedControlOwnerBinding | null = null
@@ -127,6 +141,7 @@ export class HostedControlServer {
   #inheritedActivation: HostedControlInheritedActivationV2 | null = null
   #inheritedSocket: HostedControlConnection | null = null
   readonly #mutationLease = new AsyncLocalStorage<HostedControlConnection>()
+  readonly #pendingResponses = new Set<{ lease: HostedControlConnection; close: () => void }>()
   readonly #handlers = new Set<Promise<void>>()
   #stopping = false
   #stopPromise: Promise<void> | null = null
@@ -137,11 +152,14 @@ export class HostedControlServer {
   }
 
   get ownerBinding(): HostedControlOwnerBinding | null {
-    return this.#ownerBinding
+    // Shared currency is fenced before the first borrower's loss callback;
+    // never expose a sibling's retained binding during that callback.
+    return this.#broker?.isCurrent() ? this.#ownerBinding : null
   }
   async hasActiveLease(): Promise<boolean> {
     const expectedLease = this.#mutationLease.getStore() ?? this.#leaseSocket
-    return !!expectedLease && this.#leaseSocket === expectedLease && !expectedLease.destroyed && await this.#hasCurrentSocketIdentity()
+    return !!expectedLease && await this.#hasCurrentSocketIdentity() &&
+      !this.#stopping && this.#leaseSocket === expectedLease && !expectedLease.destroyed
   }
 
   hasRetainedActivation(): boolean {
@@ -188,86 +206,224 @@ export class HostedControlServer {
   }
 
   async start(): Promise<void> {
-    if (this.#server) throw new Error('Hosted control server is already started')
-    if (this.#stopPromise) await this.#stopPromise
+    if (this.#options.brokerTransport === 'legacy') {
+      if (this.#options.activationTransport === 'inherited-v2') {
+        throw new Error('Hosted sealed-v2 activation requires native broker transport')
+      }
+      await this.#startLegacy()
+    } else {
+      await HostedControlServer.startBatch([this])
+    }
+  }
+
+  async #startLegacy(): Promise<void> {
+    if (this.#server || this.#starting) throw new Error('Hosted control server is already started')
     if (typeof Bun === 'undefined') throw new Error('Hosted control Unix socket publication requires the Bun runtime')
-    this.#stopping = false
-    const parentIdentity = await prepareSocketPath(this.#options.socketPath)
-    this.#socketParentIdentity = parentIdentity
-    const listenPath = socketPublicationPath(this.#options.socketPath)
-    const brokerToken = randomBytes(32)
-    let publicationProbe: PublicationProbe | null = null
-    const server = createServer(socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
-      if (publicationProbe) consumePublicationProbe(admitted, publicationProbe, initialData)
-      else this.#handleConnection(admitted, initialData)
-    }))
-    let admittedSocketIdentity: { device: number; inode: number } | null = null
+    this.#starting = true
+    const revision = this.#stopRevision
     try {
-      await listenLoopback(server)
-      this.#server = server
-      this.#listenPath = listenPath
-      const address = server.address()
-      if (!address || typeof address === 'string') throw new Error('Hosted control broker endpoint is unavailable')
-      const broker = await startSocketBroker(listenPath, address.port, brokerToken)
-      this.#broker = broker
+      await this.#stopPromise
+      if (this.#stopRevision !== revision) throw new Error('Hosted control server stopped during preparation')
+      this.#stopping = false
+      const mapping = await this.#prepareBrokerTarget()
+      this.#broker = await startLegacySocketBroker(mapping, () => {
+        this.#batchReady = false
+        this.#ownerBinding = null
+        void this.stop().catch(() => undefined)
+      }, { afterSpawn: broker => this.#options.afterBrokerSpawnForTest?.(broker) })
+      this.#ownedSocketIdentity = this.#broker.identity
       this.#ownsSocket = true
-      const admittedSocketStat = await lstat(listenPath)
-      admittedSocketIdentity = { device: admittedSocketStat.dev, inode: admittedSocketStat.ino }
-      this.#ownedSocketIdentity = admittedSocketIdentity
-      if (!admittedSocketStat.isSocket() || (admittedSocketStat.mode & 0o777) !== 0o600 ||
-        (process.getuid?.() !== undefined && admittedSocketStat.uid !== process.getuid?.())) {
-        throw new Error('Hosted control publication socket is not privately owned')
+      this.#assertPrepared()
+      await this.#publishBrokerSocket()
+      this.#assertPrepared()
+      if (!this.#broker.isCurrent() || !this.#ownerBinding || !this.#socketParentIdentity ||
+        !isSocketIdentityCurrentSync(this.#options.socketPath, this.#ownerBinding, this.#socketParentIdentity)) {
+        throw new Error('Hosted control socket broker attachment is stale')
       }
-      await proveSocketPathIsServerOwned(listenPath, probe => { publicationProbe = probe })
-      publicationProbe = null
-      const provedSocketStat = await lstat(listenPath)
-      if (!sameSocketIdentity(provedSocketStat, admittedSocketIdentity)) {
-        throw new Error('Hosted control publication socket changed during ownership proof')
-      }
-      await link(listenPath, this.#options.socketPath)
-      await removeOwnedSocketPathIfCurrent(listenPath, admittedSocketIdentity, parentIdentity)
-      await this.#options.afterSocketPublicationForTest?.()
-      const [socketStat, parentStat] = await Promise.all([
-        lstat(this.#options.socketPath), lstat(dirname(this.#options.socketPath)),
-      ])
-      if (!sameSocketIdentity(socketStat, admittedSocketIdentity) || (socketStat.mode & 0o777) !== 0o600 ||
-        (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.())) {
-        throw new Error('Hosted control socket changed during publication')
-      }
-      if (!parentStat.isDirectory() || parentStat.isSymbolicLink() ||
-        parentStat.dev !== parentIdentity.device || parentStat.ino !== parentIdentity.inode) {
-        throw new Error('Hosted control socket parent was substituted')
-      }
-      const publishedSocketStat = await lstat(this.#options.socketPath)
-      if (!sameSocketIdentity(publishedSocketStat, admittedSocketIdentity)) {
-        throw new Error('Hosted control socket changed after publication')
-      }
-      this.#ownerBinding = {
-        ...this.#options.ownerIdentity,
-        socketIdentity: {
-          device: String(publishedSocketStat.dev), inode: String(publishedSocketStat.ino),
-          uid: publishedSocketStat.uid, gid: publishedSocketStat.gid,
-          mode: publishedSocketStat.mode & 0o777,
-        },
-      }
-      broker.once('exit', () => {
-        if (this.#broker === broker) void this.stop().catch(() => undefined)
-      })
-      if (broker.exitCode !== null || broker.signalCode !== null) {
-        throw new Error('Hosted control socket broker exited during publication')
-      }
+      this.#batchReady = true
     } catch (error) {
-      publicationProbe?.reject(error)
-      publicationProbe = null
+      this.#batchReady = false
+      this.#publicationProbe?.reject(error)
+      this.#publicationProbe = null
       await this.stop().catch(() => undefined)
       throw error
+    } finally {
+      this.#starting = false
+    }
+  }
+
+  /** Thin helper prerequisite: prepares all loopback targets, borrows one
+   * supervised child, then publishes exactly one or two lifecycle endpoints.
+   * Native slot admission and generation ownership remain external. */
+  static async startBatch(input: readonly HostedControlServer[]): Promise<void> {
+    if (input.length !== 1 && input.length !== 2) throw new Error('Hosted control server batch requires one or two distinct endpoints')
+    const servers = [...input]
+    if (servers.some(server => server.#options.brokerTransport === 'legacy')) {
+      throw new Error('Hosted control native batch cannot select legacy transport')
+    }
+    if (new Set(servers).size !== servers.length ||
+      new Set(servers.map(server => resolve(server.#options.socketPath))).size !== servers.length) {
+      throw new Error('Hosted control server batch requires one or two distinct endpoints')
+    }
+    if (servers.some(server => server.#server || server.#starting)) throw new Error('Hosted control server is already started')
+    if (typeof Bun === 'undefined') throw new Error('Hosted control Unix socket publication requires the Bun runtime')
+    // Reserve every participant before yielding; overlapping starts cannot take
+    // or clean up a server belonging to another batch.
+    for (const server of servers) server.#starting = true
+    const revisions = servers.map(server => server.#stopRevision)
+    let batch: SocketBrokerBatch | null = null
+    try {
+      await Promise.all(servers.map(server => server.#stopPromise))
+      if (servers.some((server, index) => server.#stopRevision !== revisions[index])) {
+        throw new Error('Hosted control server stopped during preparation')
+      }
+      for (const server of servers) server.#stopping = false
+      const mappings: SocketBrokerMapping[] = []
+      for (const server of servers) mappings.push(await server.#prepareBrokerTarget())
+      // Parent-inode aliases must not name the same endpoint. Hidden paths must
+      // also be distinct from every selected canonical path.
+      for (let index = 0; index < servers.length; index += 1) {
+        const mapping = mappings[index]!
+        if (servers.some((server, other) => {
+          const parent = mappings[other]!.parentIdentity
+          const sameParent = parent.device === mapping.parentIdentity.device && parent.inode === mapping.parentIdentity.inode
+          return sameParent && (basename(server.#options.socketPath) === basename(mapping.listenPath) ||
+            (other !== index && basename(server.#options.socketPath) === basename(servers[index]!.#options.socketPath)))
+        })) {
+          throw new Error('Hosted control hidden publication path collides with a selected endpoint')
+        }
+      }
+      batch = await startSocketBrokerBatch(mappings, { afterSpawn: broker => {
+        for (const server of servers) server.#options.afterBrokerSpawnForTest?.(broker)
+      } })
+      for (const server of servers) server.#assertPrepared()
+      for (const [index, server] of servers.entries()) {
+        server.#broker = batch.borrow(index, () => {
+          // Every borrower is synchronously fenced in the shared exit turn.
+          server.#batchReady = false
+          server.#ownerBinding = null
+          void server.stop().catch(() => undefined)
+        })
+        server.#ownedSocketIdentity = server.#broker.identity
+        server.#ownsSocket = true
+      }
+      for (const server of servers) await server.#publishBrokerSocket()
+      for (const server of servers) {
+        server.#assertPrepared()
+        if (!server.#broker?.isCurrent() || !server.#ownerBinding || !server.#socketParentIdentity ||
+          !isSocketIdentityCurrentSync(server.#options.socketPath, server.#ownerBinding, server.#socketParentIdentity)) {
+          throw new Error('Hosted control socket broker attachment is stale')
+        }
+      }
+      // No ordinary traffic is admitted until all publications have attached.
+      for (const server of servers) server.#batchReady = true
+    } catch (error) {
+      for (const server of servers) {
+        server.#batchReady = false
+        server.#publicationProbe?.reject(error)
+        server.#publicationProbe = null
+      }
+      await Promise.allSettled(servers.map(server => server.stop()))
+      throw error
+    } finally {
+      try { await batch?.release() } finally {
+        for (const server of servers) server.#starting = false
+      }
+    }
+  }
+
+  #assertPrepared(): void {
+    if (this.#stopping || !this.#server || !this.#listenPath || !this.#socketParentIdentity) {
+      throw new Error('Hosted control socket broker attachment is unavailable')
+    }
+  }
+
+  async #prepareBrokerTarget(): Promise<SocketBrokerMapping> {
+    const parentIdentity = await prepareSocketPath(this.#options.socketPath)
+    if (this.#stopping) throw new Error('Hosted control server stopped during preparation')
+    this.#socketParentIdentity = parentIdentity
+    const listenPath = resolve(socketPublicationPath(this.#options.socketPath))
+    const brokerToken = randomBytes(32)
+    this.#brokerToken = brokerToken
+    const server = createServer({ allowHalfOpen: true }, socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
+      if (this.#publicationProbe) consumePublicationProbe(admitted, this.#publicationProbe, initialData)
+      else this.#handleConnection(admitted, initialData)
+    }))
+    this.#server = server
+    this.#listenPath = listenPath
+    this.#options.afterBrokerTargetCreatedForTest?.(server, brokerToken)
+    await listenLoopback(server)
+    this.#assertPrepared()
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Hosted control broker endpoint is unavailable')
+    return { listenPath, targetPort: address.port, token: brokerToken, parentIdentity }
+  }
+
+  async #publishBrokerSocket(): Promise<void> {
+    this.#assertPrepared()
+    const listenPath = this.#listenPath!
+    const parentIdentity = this.#socketParentIdentity!
+    const admittedSocketIdentity = this.#ownedSocketIdentity!
+    const broker = this.#broker!
+    const admittedSocketStat = await lstat(listenPath)
+    if (!sameSocketIdentity(admittedSocketStat, admittedSocketIdentity) || (admittedSocketStat.mode & 0o777) !== 0o600 ||
+      (process.getuid?.() !== undefined && admittedSocketStat.uid !== process.getuid?.())) {
+      throw new Error('Hosted control publication socket is not privately owned')
+    }
+    this.#assertPrepared()
+    await proveSocketPathIsServerOwned(listenPath, probe => { this.#publicationProbe = probe })
+    this.#publicationProbe = null
+    this.#assertPrepared()
+    const provedSocketStat = await lstat(listenPath)
+    if (!sameSocketIdentity(provedSocketStat, admittedSocketIdentity)) {
+      throw new Error('Hosted control publication socket changed during ownership proof')
+    }
+    this.#assertPrepared()
+    await link(listenPath, this.#options.socketPath)
+    // A concurrent stop may have checked the canonical path before link finished.
+    if (this.#stopping) {
+      await removeOwnedSocketPathIfCurrent(this.#options.socketPath, admittedSocketIdentity, parentIdentity)
+      throw new Error('Hosted control server stopped during publication')
+    }
+    await removeOwnedSocketPathIfCurrent(listenPath, admittedSocketIdentity, parentIdentity)
+    await this.#options.afterSocketPublicationForTest?.(broker.pid)
+    const [socketStat, parentStat] = await Promise.all([
+      lstat(this.#options.socketPath), lstat(dirname(this.#options.socketPath)),
+    ])
+    if (!sameSocketIdentity(socketStat, admittedSocketIdentity) || (socketStat.mode & 0o777) !== 0o600 ||
+      (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.())) {
+      throw new Error('Hosted control socket changed during publication')
+    }
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink() ||
+      parentStat.dev !== parentIdentity.device || parentStat.ino !== parentIdentity.inode) {
+      throw new Error('Hosted control socket parent was substituted')
+    }
+    const publishedSocketStat = await lstat(this.#options.socketPath)
+    if (!sameSocketIdentity(publishedSocketStat, admittedSocketIdentity)) {
+      throw new Error('Hosted control socket changed after publication')
+    }
+    this.#assertPrepared()
+    if (!this.#broker?.isCurrent()) throw new Error('Hosted control socket broker exited during publication')
+    this.#ownerBinding = {
+      ...this.#options.ownerIdentity,
+      socketIdentity: {
+        device: String(publishedSocketStat.dev), inode: String(publishedSocketStat.ino),
+        uid: publishedSocketStat.uid, gid: publishedSocketStat.gid,
+        mode: publishedSocketStat.mode & 0o777,
+      },
     }
   }
 
   async stop(): Promise<void> {
+    this.#stopRevision += 1
     if (this.#stopPromise) return this.#stopPromise
-    const stopping = this.#stop()
+    let resolve!: () => void
+    let reject!: (error: unknown) => void
+    const stopping = new Promise<void>((accept, decline) => { resolve = accept; reject = decline })
+    // Publish the drain promise before synchronous revocation callbacks can
+    // reenter stop(). Fencing itself still happens in this call's turn.
     this.#stopPromise = stopping
+    void this.#stop().then(resolve, reject)
     try {
       await stopping
     } finally {
@@ -277,7 +433,15 @@ export class HostedControlServer {
 
   async #stop(): Promise<void> {
     this.#stopping = true
-    this.#inheritedActivation?.close()
+    this.#batchReady = false
+    this.#ownerBinding = null
+    this.#loseProviderAuthority()
+    this.#publicationProbe?.reject(new Error('Hosted control server stopped'))
+    this.#publicationProbe = null
+    this.#brokerToken?.fill(0)
+    this.#brokerToken = null
+    const errors: unknown[] = []
+    try { this.#inheritedActivation?.close() } catch (error) { errors.push(error) }
     // The approval delegate is synchronously fenced before any listener,
     // handler, lifecycle port, root lease, or descriptor cleanup can begin.
     const activationRevocation = this.#activation
@@ -295,44 +459,49 @@ export class HostedControlServer {
     this.#socketParentIdentity = null
     this.#ownedSocketIdentity = null
     this.#listenPath = null
+    const peerClosures = [...this.#sockets].filter(socket => socket instanceof Socket)
+      .map(socket => new Promise<void>(resolve => socket.once('close', () => resolve())))
     for (const socket of this.#sockets) socket.destroy()
     this.#sockets.clear()
-    await this.#options.beforeSocketCloseForTest?.(listenPath ?? '')
-    if (broker) await killSocketBroker(broker)
-    if (server) await closeServer(server)
+    const drain = async (action: () => Promise<unknown> | unknown) => {
+      try { await action() } catch (error) { errors.push(error) }
+    }
+    // Cleanup failures (including substituted names) never skip another owned
+    // resource. Dropping this borrow cannot kill a still-borrowed sibling.
+    await drain(() => this.#options.beforeSocketCloseForTest?.(listenPath ?? ''))
+    if (broker) await drain(() => broker.release())
+    if (server) await drain(() => closeServer(server).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') throw error
+    }))
+    await Promise.all(peerClosures)
     if (listenPath && ownedSocketIdentity && parentIdentity) {
-      await removeOwnedSocketPathIfCurrent(
-        listenPath, ownedSocketIdentity, parentIdentity,
-      )
+      await drain(() => removeOwnedSocketPathIfCurrent(listenPath, ownedSocketIdentity, parentIdentity))
     }
     await Promise.allSettled([...this.#handlers])
+    try { this.#options.beforeActivationDrainForTest?.(activationRevocation) } catch {}
     await activationRevocation.catch(() => undefined)
     if (this.#ownsSocket) {
       this.#ownsSocket = false
-      const [socketStat, parentStat] = await Promise.all([
-        lstat(this.#options.socketPath).catch(() => null),
-        lstat(dirname(this.#options.socketPath)).catch(() => null),
-      ])
-      if (ownedSocketIdentity && parentIdentity && socketStat?.isSocket() && parentStat?.isDirectory() && !parentStat.isSymbolicLink() &&
-        socketStat.dev === ownedSocketIdentity.device && socketStat.ino === ownedSocketIdentity.inode &&
-        parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode) {
-        await removeSocketIfIdentityMatches(this.#options.socketPath, {
-          device: ownedSocketIdentity.device, inode: ownedSocketIdentity.inode,
-        }, parentIdentity)
+      if (ownedSocketIdentity && parentIdentity) {
+        await drain(() => removeOwnedSocketPathIfCurrent(this.#options.socketPath, ownedSocketIdentity, parentIdentity))
       }
     }
+    if (errors.length) throw errors[0]
   }
 
   #handleConnection(socket: HostedControlConnection, initialData = Buffer.alloc(0)): void {
-    if (this.#stopping || !this.#server) { socket.destroy(); return }
+    if (this.#stopping || !this.#server || !this.#batchReady) { socket.destroy(); return }
     socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     let chunks: Buffer[] = []
     let bytes = 0
     let finished = false
+    let terminal = false
 
     const failClosed = (cause: unknown = new Error('Hosted control connection failed closed')) => {
+      terminal = true
       finished = true
       chunks = []
+      this.#loseReadinessLease(socket)
       const activation = this.#activation
       if (activation?.socket === socket) {
         void this.#revokeActivation(activation, asError(cause))
@@ -341,24 +510,15 @@ export class HostedControlServer {
       }
     }
     socket.once('timeout', failClosed)
-    socket.once('error', error => {
-      finished = true
-      chunks = []
-      const activation = this.#activation
-      if (activation?.socket === socket) void this.#revokeActivation(activation, error)
-    })
+    socket.once('error', failClosed)
     socket.once('end', () => {
-      const activation = this.#activation
-      if (activation?.socket === socket) {
-        void this.#revokeActivation(activation, new Error('Hosted approval activation lease ended'))
+      // Retained channels lose authority on readable EOF, even with a full frame.
+      if (this.#activation?.socket === socket || this.#leaseSocket === socket || !finished || terminal) {
+        failClosed(new Error('Hosted control retained or incomplete connection ended'))
       }
+      // A finite response remains writable through end(response) flushing.
     })
-    socket.once('close', () => {
-      const activation = this.#activation
-      if (activation?.socket === socket) {
-        void this.#revokeActivation(activation, new Error('Hosted approval activation lease closed'))
-      }
-    })
+    socket.once('close', failClosed)
     const onData = (chunk: Buffer) => {
       const activation = this.#activation
       if (activation?.socket === socket) {
@@ -366,7 +526,7 @@ export class HostedControlServer {
         return
       }
       if (finished) {
-        socket.destroy()
+        failClosed()
         return
       }
       bytes += chunk.byteLength
@@ -384,6 +544,7 @@ export class HostedControlServer {
         return
       }
       finished = true
+      chunks = []
       socket.setTimeout(0)
       if (this.#stopping) { failClosed(); return }
       let line: string
@@ -395,7 +556,7 @@ export class HostedControlServer {
         return
       }
       if (this.#inheritedSocket === socket) { failClosed(); return }
-      const handler = this.#processLine(socket, line)
+      const handler = this.#processLine(socket, line, () => !terminal, failClosed)
         .catch(failClosed)
       this.#handlers.add(handler)
       void handler.finally(() => this.#handlers.delete(handler))
@@ -558,7 +719,8 @@ export class HostedControlServer {
       consume: (): boolean => {
         if (consumed) return false
         consumed = true
-        const current = !!ownerBinding && !!parentIdentity &&
+        const current = this.#batchReady && !this.#stopping && !!this.#broker?.isCurrent() &&
+          !!ownerBinding && !!parentIdentity &&
           this.#activation === candidate && this.#activationGeneration === generation &&
           candidate.socket === socket && !socket.destroyed &&
           (this.#inheritedSocket !== socket ||
@@ -583,6 +745,14 @@ export class HostedControlServer {
 
   #revokeActivation(candidate: ActivationCandidate, error: Error): Promise<void> {
     if (candidate.revokePromise) return candidate.revokePromise
+    let resolve!: () => void
+    let reject!: (error: unknown) => void
+    const revocation = new Promise<void>((accept, decline) => { resolve = accept; reject = decline })
+    // Reentrant provider-loss/stop callbacks must drain this exact cleanup.
+    candidate.revokePromise = revocation
+    // FIN/close/monitor callers may discard this promise before stop reaches
+    // its drain. Observe rejection now without changing its identity/settlement.
+    void candidate.revokePromise.catch(() => undefined)
     candidate.phase = 'revoked'
     this.#loseProviderAuthority()
     this.#activationGeneration += 1
@@ -595,15 +765,13 @@ export class HostedControlServer {
     if (!this.#activationConsumed && this.#activation === candidate) {
       this.#activation = null
     }
-    // Invocation, and therefore O2-C's synchronous O2-A linearization point,
-    // happens before this method exposes the cleanup promise.
-    candidate.revokePromise = Promise.resolve()
+    // Invoke synchronously to preserve O2-C's O2-A authority linearization;
+    // only settlement is asynchronous, and the published promise never changes.
     try {
-      candidate.revokePromise = candidate.session
-        ? Promise.resolve(candidate.session.revoke())
-        : Promise.resolve()
+      const cleanup = candidate.session?.revoke()
+      void Promise.resolve(cleanup).then(resolve, reject)
     } catch (cause) {
-      candidate.revokePromise = Promise.reject(cause)
+      reject(cause)
     }
     // Always close the exact retained connection in the same synchronous
     // revocation turn. Clearing the identity monitor can never orphan it.
@@ -616,9 +784,19 @@ export class HostedControlServer {
     candidate.recoveryDeadline = null
   }
 
+  #loseReadinessLease(socket: HostedControlConnection): void {
+    if (this.#leaseSocket !== socket) return
+    this.#leaseSocket = null
+    for (const pending of this.#pendingResponses) {
+      if (pending.lease === socket) pending.close()
+    }
+    this.#loseProviderAuthority()
+  }
+
   #loseProviderAuthority(): void {
     if (this.#providerAuthorityLost) return
     this.#providerAuthorityLost = true
+    for (const pending of this.#pendingResponses) pending.close()
     // Cleanup notification cannot prevent exact socket/session revocation.
     try { this.#options.onProviderAuthorityLost?.() } catch {}
   }
@@ -628,10 +806,12 @@ export class HostedControlServer {
     expectedToken: Buffer,
     admit: (socket: Socket, initialData: Buffer) => void,
   ): void {
+    if (this.#stopping) { socket.destroy(); return }
     this.#sockets.add(socket)
     socket.once('close', () => this.#sockets.delete(socket))
     let buffered = Buffer.alloc(0)
-    const reject = () => socket.destroy()
+    const reject = () => { buffered = Buffer.alloc(0); socket.destroy() }
+    socket.once('end', reject)
     socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS, reject)
     socket.once('error', () => undefined)
     const onData = (chunk: Buffer) => {
@@ -641,13 +821,16 @@ export class HostedControlServer {
       const token = buffered.subarray(0, expectedToken.byteLength)
       if (!timingSafeEqual(token, expectedToken)) { reject(); return }
       socket.setTimeout(0)
+      socket.off('timeout', reject)
+      socket.off('end', reject)
       const remainder = buffered.subarray(expectedToken.byteLength)
+      buffered = Buffer.alloc(0)
       admit(socket, remainder)
     }
     socket.on('data', onData)
   }
 
-  async #processLine(socket: HostedControlConnection, line: string): Promise<void> {
+  async #processLine(socket: HostedControlConnection, line: string, isNonterminal: () => boolean, failClosed: () => void): Promise<void> {
     if (this.#stopping) { socket.destroy(); return }
     const parsed = JSON.parse(line) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { socket.destroy(); return }
@@ -659,11 +842,19 @@ export class HostedControlServer {
     }
     if (message.operation === 'readiness') { await this.#handleReadiness(socket, line, message); return }
     if (this.#options.isEffectReady && !this.#options.isEffectReady()) { socket.destroy(); return }
+    const leaseSocket = this.#leaseSocket
+    const eligible = () => isNonterminal() && !socket.destroyed && !this.#stopping &&
+      !!leaseSocket && this.#leaseSocket === leaseSocket && !leaseSocket.destroyed &&
+      (!this.#options.isEffectReady || this.#options.isEffectReady())
+    if (!eligible() || !leaseSocket) { failClosed(); return }
+    // Subscribe before the first await; retain cleanup through response flush.
+    const pending = { lease: leaseSocket, close: failClosed }
+    this.#pendingResponses.add(pending)
+    socket.once('close', () => this.#pendingResponses.delete(pending))
     if (message.operation !== HOSTED_CONTROL_OPERATION) {
-      const leaseSocket = this.#leaseSocket
       const ownerBinding = this.#ownerBinding
       if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||
-        !ownerBinding || !this.#options.dispatchCoexistingOperation) {
+        !ownerBinding || !this.#options.dispatchCoexistingOperation || !eligible()) {
         socket.destroy()
         return
       }
@@ -672,20 +863,19 @@ export class HostedControlServer {
         () => this.#options.dispatchCoexistingOperation!(message, line),
       )
       if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
-        !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
+        !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding) || !eligible()) {
         socket.destroy()
         return
       }
-      writeBoundedResponse(socket, response)
+      writeBoundedResponse(socket, response, eligible)
       return
     }
-    const leaseSocket = this.#leaseSocket
     if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity())) { socket.destroy(); return }
     const request = decodeHostedTaskMutationRequest(message)
     const ownerBinding = this.#ownerBinding
     const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath).catch(() => null), lstat(dirname(this.#options.socketPath)).catch(() => null)])
     const parentIdentity = this.#socketParentIdentity
-    if (!ownerBinding || !socketStat?.isSocket() ||
+    if (!eligible() || !ownerBinding || !socketStat?.isSocket() ||
       (socketStat.mode & 0o077) !== 0 || (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.()) ||
       !parentIdentity || !parentStat?.isDirectory() || parentStat.isSymbolicLink() || parentIdentity.device !== parentStat.dev || parentIdentity.inode !== parentStat.ino ||
       ownerBinding.socketIdentity.device !== String(socketStat.dev) || ownerBinding.socketIdentity.inode !== String(socketStat.ino) ||
@@ -703,7 +893,7 @@ export class HostedControlServer {
     // never validate an in-flight mutation from the connection it replaced.
     const result = decodeHostedTaskMutationTerminalResult(await this.#mutationLease.run(leaseSocket, () => this.#options.service.mutate(request)))
     if (!taskResultMatchesRequest(request, result)) { socket.destroy(); return }
-    if (this.#leaseSocket !== leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) || JSON.stringify(request.ownerBinding) !== JSON.stringify(this.#ownerBinding)) { socket.destroy(); return }
+    if (this.#leaseSocket !== leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) || JSON.stringify(request.ownerBinding) !== JSON.stringify(this.#ownerBinding) || !eligible()) { socket.destroy(); return }
     const unsigned = {
       schemaVersion: HOSTED_CONTROL_SCHEMA_VERSION,
       exchangeId: request.exchangeId,
@@ -716,7 +906,9 @@ export class HostedControlServer {
       ...unsigned,
       ownerProof: createHostedControlProof(this.#options.secret, 'response', unsigned),
     }
-    socket.end(`${JSON.stringify(response)}\n`)
+    const responseLine = `${JSON.stringify(response)}\n`
+    if (!eligible()) { failClosed(); return }
+    socket.end(responseLine)
   }
 
   async #handleReadiness(socket: HostedControlConnection, line: string, message: Record<string, unknown>): Promise<void> {
@@ -736,11 +928,7 @@ export class HostedControlServer {
     } catch { socket.destroy(); return }
     this.#leaseConsumed = true
     this.#leaseSocket = socket
-    socket.once('close', () => {
-      if (this.#leaseSocket !== socket) return
-      this.#leaseSocket = null
-      this.#loseProviderAuthority()
-    })
+    socket.once('close', () => this.#loseReadinessLease(socket))
     if (admission.protocol === 'legacy') {
       const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, ownerBinding }
       socket.write(`${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned) })}\n`)
@@ -752,13 +940,16 @@ export class HostedControlServer {
   }
 
   async #hasCurrentSocketIdentity(): Promise<boolean> {
+    if (!this.#batchReady || !this.#broker?.isCurrent()) return false
     const ownerBinding = this.#ownerBinding; const parentIdentity = this.#socketParentIdentity
     if (!ownerBinding || !parentIdentity) return false
     const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath).catch(() => null), lstat(dirname(this.#options.socketPath)).catch(() => null)])
-    return !!socketStat?.isSocket() && (socketStat.mode & 0o077) === 0 && (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) && !!parentStat?.isDirectory() && !parentStat.isSymbolicLink() && String(socketStat.dev) === ownerBinding.socketIdentity.device && String(socketStat.ino) === ownerBinding.socketIdentity.inode && socketStat.uid === ownerBinding.socketIdentity.uid && socketStat.gid === ownerBinding.socketIdentity.gid && (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode && parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
+    return this.#batchReady && !!this.#broker?.isCurrent() && this.#ownerBinding === ownerBinding &&
+      !!socketStat?.isSocket() && (socketStat.mode & 0o077) === 0 && (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) && !!parentStat?.isDirectory() && !parentStat.isSymbolicLink() && String(socketStat.dev) === ownerBinding.socketIdentity.device && String(socketStat.ino) === ownerBinding.socketIdentity.inode && socketStat.uid === ownerBinding.socketIdentity.uid && socketStat.gid === ownerBinding.socketIdentity.gid && (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode && parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
   }
 
   #isCurrentSocketIdentitySync(): boolean {
+    if (!this.#batchReady || !this.#broker?.isCurrent()) return false
     const ownerBinding = this.#ownerBinding
     const parentIdentity = this.#socketParentIdentity
     return !!ownerBinding && !!parentIdentity && isSocketIdentityCurrentSync(
@@ -816,7 +1007,7 @@ function taskResultMatchesRequest(
     result.receipt.sourceGeneration === command.expectedSourceGeneration
 }
 
-function writeBoundedResponse(socket: HostedControlConnection, value: Record<string, unknown>): void {
+function writeBoundedResponse(socket: HostedControlConnection, value: Record<string, unknown>, eligible: () => boolean): void {
   const line = `${JSON.stringify(value)}\n`
   const maximum = isApprovalOperation(value.operation)
     ? HOSTED_CONTROL_MAX_LINE_BYTES
@@ -824,6 +1015,7 @@ function writeBoundedResponse(socket: HostedControlConnection, value: Record<str
   if (Buffer.byteLength(line) > maximum) {
     throw new Error('Hosted control response exceeds maximum line size')
   }
+  if (!eligible()) { socket.destroy(); return }
   socket.end(line)
 }
 

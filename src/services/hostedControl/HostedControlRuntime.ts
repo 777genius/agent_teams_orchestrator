@@ -272,6 +272,7 @@ export class HostedControlRuntime {
       startupRecovery = false
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       server = new HostedControlServer({
+        brokerTransport: nativeAdmission ? 'native-batch' : 'legacy',
         socketPath: config.socketPath,
         secret,
         ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
