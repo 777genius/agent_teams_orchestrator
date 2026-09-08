@@ -599,6 +599,7 @@ describe('OpenCodeHostManager', () => {
       },
       sleepMs: async () => {},
       isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async () => 1000,
       killProcess: (_pid, signal) => {
         spawned.killedSignals.push(signal)
         processAlive = false
@@ -677,6 +678,7 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async () => 1000,
       sleepMs: async () => {},
       killProcess: (_pid, signal) => {
         spawned.killedSignals.push(signal)
