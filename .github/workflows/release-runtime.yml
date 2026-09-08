@@ -15,6 +15,11 @@ on:
         description: Runtime version label, for example 2.1.87
         required: false
         type: string
+      publish_release:
+        description: Publish the verified draft after explicit owner approval for this version
+        required: false
+        default: false
+        type: boolean
       target_release_repo:
         description: Public repository that should receive the runtime assets
         required: false
@@ -409,6 +414,7 @@ jobs:
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -479,6 +485,11 @@ jobs:
             sleep 2
           done
 
+          if [[ "$PUBLISH_RELEASE" != "true" ]]; then
+            echo "Runtime draft ${TARGET_RELEASE_TAG} is complete; publication requires explicit approval."
+            exit 0
+          fi
+
           gh api \
             --method PATCH \
             "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
@@ -494,7 +505,8 @@ jobs:
     if: >-
       always() &&
       needs.prepare-release.result == 'success' &&
-      (needs.prepare-release.outputs.already_published == 'true' || needs.publish.result == 'success')
+      (needs.prepare-release.outputs.already_published == 'true' ||
+       (inputs.publish_release == true && needs.publish.result == 'success'))
 
     steps:
       - name: Verify exact public release assets
