@@ -2734,7 +2734,22 @@ function getProviderCredentialValidationModelIds(input: {
   configProviders: OpenCodeConfigProvidersResponse | null
   providers: OpenCodeProviderResponse | null
 }): string[] {
-  const modelIds = collectProviderModelIds(input)
+  const configModels = asRecord(input.configProviders?.providers?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )?.models)
+  const liveModels = asRecord(input.providers?.all?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )?.models)
+  const modelIds = collectProviderModelIds(input).filter(modelId => {
+    const nestedModelId = modelId.slice(input.providerId.length + 1)
+    // Credential verification sends a text prompt. Image/video input is fine,
+    // but models that cannot answer with text must not consume candidate slots.
+    return [
+      input.inventory.modelMetadata?.find(metadata => metadata.id === modelId)?.raw,
+      configModels?.[nestedModelId],
+      liveModels?.[nestedModelId],
+    ].every(supportsCredentialValidationTextOutput)
+  })
   if (modelIds.length === 0) {
     return []
   }
@@ -2769,6 +2784,23 @@ function getProviderCredentialValidationModelIds(input: {
     ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
     : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
   return candidates.slice(0, maxCandidates)
+}
+
+function supportsCredentialValidationTextOutput(value: unknown): boolean {
+  const model = asRecord(value)
+  const output = asRecord(asRecord(model?.capabilities)?.output)
+  if (output?.text === false) return false
+  if (output && output.text !== true && Object.values(output).some(enabled => enabled === true)) {
+    return false
+  }
+  const modalities = asRecord(model?.modalities)?.output
+  if (Array.isArray(modalities)) {
+    const declared = modalities.filter((modality): modality is string => typeof modality === 'string')
+      .map(modality => modality.trim().toLowerCase()).filter(Boolean)
+    if (declared.length > 0 && !declared.includes('text')) return false
+  }
+  // Older/custom catalogs may omit modality metadata. Keep their text probe path.
+  return true
 }
 
 function buildProviderDirectoryModelSearchIndex(input: {
@@ -3537,7 +3569,7 @@ export class OpenCodeProviderManagementAdapter
     if (validationModelIds.length === 0) {
       return providerManagementError(
         'model-missing',
-        `OpenCode did not expose a probeable model for provider ${input.providerId}`,
+        `OpenCode did not expose a text-response model for provider ${input.providerId} credential verification`,
       )
     }
 
