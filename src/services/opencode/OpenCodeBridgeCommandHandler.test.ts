@@ -1156,6 +1156,176 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(releases).toBe(3)
   })
 
+  async function setupSelectedDeliveryRegression(command: string) {
+    const record = buildRecord({
+      runId: 'run-1', selectedModel: 'zai/glm-5.2', toolApprovalMode: 'auto', runtimePid: 123,
+      profileScope: { purpose: 'launch_runtime', providerId: 'zai', scopeToken: 'lane-scope',
+        configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+    })
+    const state = { records: [record], probes: 0, releases: 0, mcp: 0, prompts: 0, reconciles: 0,
+      recreates: 0, targets: [] as string[] }
+    openCodeSessionStore.list = async () => state.records
+    openCodeSessionStore.get = async (teamId, laneId, memberName) => state.records.find(candidate =>
+      candidate.teamId === teamId && candidate.laneId === laneId && candidate.memberName === memberName) ?? null
+    openCodeProvisioningProbe.probe = async () => { throw new Error('broad inventory forbidden') }
+    openCodeProvisioningProbe.probeRetainingHost = async () => {
+      state.probes++
+      return { snapshot, host: snapshot.host, release: async () => { state.releases++ } }
+    }
+    openCodeSessionBridge.ensureSession = async () => { state.recreates++; throw new Error('unexpected recreate') }
+    openCodeSessionBridge.ensureSessionAppMcpReady = async target => {
+      state.mcp++
+      state.targets.push(target.opencodeSessionId)
+      return { ok: true, runtimePid: target.runtimePid, status: 'present', connected: true, diagnostics: [] }
+    }
+    openCodeSessionBridge.promptAsync = async target => {
+      state.prompts++
+      state.targets.push(target.opencodeSessionId)
+    }
+    openCodeSessionBridge.reconcileSession = async target => {
+      state.reconciles++
+      state.targets.push(target.opencodeSessionId)
+      return { record: target, summary: buildReconcileSummary() }
+    }
+    const body = { teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+      memberName: record.memberName, text: 'hello', noReply: true, messageId: 'inbound-1' }
+    const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+      ...body, requiredCommand: 'opencode.sendMessage', expectedCapabilitySnapshotId: 'selected',
+    }))
+    expect(handshake.ok).toBe(true)
+    if (!('runtime' in handshake)) throw new Error('missing handshake runtime')
+    state.probes = 0
+    state.releases = 0
+    return { record, state, envelope: buildEnvelope(command, {
+      ...body, expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
+    }) }
+  }
+
+  for (const command of ['opencode.sendMessage', 'opencode.observeMessageDelivery']) {
+    for (const change of ['replacement run', 'session', 'host', 'PID', 'scope', 'stopped', 'missing member']) {
+      test(`selected delivery rejects ${change} between preflight and dispatch: ${command}`, async () => {
+        const { record, state, envelope } = await setupSelectedDeliveryRegression(command)
+        const probeEntered = createDeferred<void>()
+        const resumeProbe = createDeferred<void>()
+        const probe = openCodeProvisioningProbe.probeRetainingHost
+        openCodeProvisioningProbe.probeRetainingHost = async (...args) => {
+          probeEntered.resolve()
+          await resumeProbe.promise
+          return probe(...args)
+        }
+        const pending = executeOpenCodeBridgeCommandEnvelope(envelope)
+        await waitForCommandStage(probeEntered.promise, pending, 'selected preflight')
+        const patches: Record<string, Partial<OpenCodeSessionRecord>> = {
+          'replacement run': { runId: 'run-B', opencodeSessionId: 'session-B' },
+          session: { opencodeSessionId: 'session-B' },
+          host: { hostKey: 'host-B' },
+          PID: { runtimePid: 456 },
+          scope: { profileScope: { ...record.profileScope!, scopeToken: 'scope-B' } },
+          stopped: { stoppedAt: '2026-09-08T00:00:00.000Z' },
+        }
+        state.records = change === 'missing member'
+          ? [buildRecord({ ...record, memberName: 'bob' })]
+          : [{ ...record, ...patches[change] }]
+        // A cached store implementation may mutate the same nested scope object.
+        if (change === 'scope') record.profileScope!.scopeToken = 'scope-B'
+        resumeProbe.resolve()
+        const result = await pending
+        expect(result.ok).toBe(false)
+        if ('error' in result) expect(result.error.message).toMatch(/authority changed|active session authority|No stored OpenCode session/)
+        expect(state.mcp).toBe(0)
+        expect(state.prompts).toBe(0)
+        expect(state.reconciles).toBe(0)
+        expect(state.recreates).toBe(0)
+        expect(state.releases).toBe(1)
+      })
+    }
+
+    test(`selected delivery permits historical stopped sibling: ${command}`, async () => {
+      const { record, state, envelope } = await setupSelectedDeliveryRegression(command)
+      state.records.push(buildRecord({ memberName: 'bob', runId: 'old-run',
+        opencodeSessionId: 'old-session', hostKey: 'old-host', selectedModel: 'other/model',
+        stoppedAt: '2026-09-08T00:00:00.000Z' }))
+      const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+      expect(result.ok).toBe(true)
+      if ('data' in result) expect(result.data).toMatchObject({ sessionId: record.opencodeSessionId,
+        ...(command === 'opencode.sendMessage' ? { accepted: true } : { observed: true }) })
+      expect(state.prompts).toBe(command === 'opencode.sendMessage' ? 1 : 0)
+      if (command === 'opencode.observeMessageDelivery') expect(state.reconciles).toBeGreaterThan(0)
+      expect([...new Set(state.targets)]).toEqual([record.opencodeSessionId])
+      expect(state.releases).toBe(1)
+    })
+
+    for (const laneState of ['foreign active run', 'same-run stopped sibling', 'empty lane', 'historical only']) {
+      test(`selected delivery rejects ${laneState}: ${command}`, async () => {
+        const { record, state, envelope } = await setupSelectedDeliveryRegression(command)
+        const sibling = buildRecord({ ...record, memberName: 'bob',
+          runId: laneState === 'same-run stopped sibling' ? record.runId : 'old-run',
+          ...(laneState !== 'foreign active run' ? { stoppedAt: '2026-09-08T00:00:00.000Z' } : {}) })
+        state.records = laneState === 'empty lane' ? []
+          : laneState === 'historical only' ? [sibling] : [record, sibling]
+        const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+        expect(result.ok).toBe(false)
+        if ('error' in result && laneState === 'foreign active run') {
+          expect(result.error.message).toContain('another run is active')
+        }
+        expect(state.probes).toBe(0)
+        expect(state.mcp).toBe(0)
+        expect(state.prompts).toBe(0)
+        expect(state.reconciles).toBe(0)
+      })
+    }
+  }
+
+  for (const stage of ['session_resolved', 'mcp_ready']) {
+    test(`selected delivery rechecks authority after awaited ${stage} outcome`, async () => {
+      const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+      const upsert = openCodeCommandOutcomeStore.upsert
+      openCodeCommandOutcomeStore.upsert = async patch => {
+        if (patch.status === stage) state.records = [{ ...record, runId: 'run-B', opencodeSessionId: 'session-B' }]
+        return upsert(patch)
+      }
+      const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+      expect(result.ok).toBe(false)
+      if ('error' in result) expect(result.error.message).toContain('authority changed')
+      expect(state.mcp).toBe(stage === 'mcp_ready' ? 1 : 0)
+      expect(state.prompts).toBe(0)
+      expect(state.recreates).toBe(0)
+      expect(state.releases).toBe(1)
+    })
+  }
+
+  test('selected delivery observation rejects authority changes during reconciliation', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.observeMessageDelivery')
+    const reconcile = openCodeSessionBridge.reconcileSession
+    openCodeSessionBridge.reconcileSession = async (...args) => {
+      state.records = [{ ...record, opencodeSessionId: 'session-B' }]
+      return reconcile(...args)
+    }
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    expect(result.ok).toBe(false)
+    if ('error' in result) expect(result.error.message).toContain('authority changed')
+    expect(state.reconciles).toBe(1)
+    expect(state.prompts).toBe(0)
+    expect(state.releases).toBe(1)
+  })
+
+  for (const reason of ['stale record', 'forced refresh', 'MCP unavailable']) {
+    test(`selected delivery requires relaunch instead of recovery: ${reason}`, async () => {
+      const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+      if (reason === 'stale record') state.records = [{ ...record, staleReason: 'changed' }]
+      if (reason === 'forced refresh') envelope.body.forceSessionRefreshReason = 'refresh'
+      if (reason === 'MCP unavailable') openCodeSessionBridge.ensureSessionAppMcpReady = async () => ({
+        ok: false, status: 'missing', connected: false, diagnostics: [],
+      })
+      const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+      expect(result.ok).toBe(false)
+      if ('error' in result) expect(result.error.message).toContain('relaunch the lane')
+      expect(state.recreates).toBe(0)
+      expect(state.prompts).toBe(0)
+      expect(state.releases).toBe(1)
+    })
+  }
+
   test('selected delivery handshake deadline cancels probe and releases late retained authority', async () => {
     const record = buildRecord({ runId: 'run-1', selectedModel: 'zai/glm-5.2', toolApprovalMode: 'auto',
       profileScope: { purpose: 'launch_runtime', providerId: 'zai', scopeToken: 'lane-scope',

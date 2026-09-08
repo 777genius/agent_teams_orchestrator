@@ -992,6 +992,7 @@ async function probeStoredLaneAuthority(
   }
   const records = (await openCodeSessionStore.list()).filter(record =>
     record.teamId === teamId && (record.laneId ?? 'primary') === laneId)
+    .map(record => structuredClone(record))
   if (body.allowEmptyLaneStop === true) {
     if (command !== 'opencode.stopTeam' || expectedCapabilitySnapshotId(body) || records.length) {
       throw new Error('OpenCode empty-lane stop authority mismatch')
@@ -1006,11 +1007,13 @@ async function probeStoredLaneAuthority(
   }
   const runId = asString(body.runId) ?? asString(body.expectedRunId)
   if (!runId) throw new Error('OpenCode lifecycle authority requires runId')
-  const authorityRecords = command === 'opencode.stopTeam'
+  const selectsRun = command === 'opencode.stopTeam'
+    || command === 'opencode.sendMessage' || command === 'opencode.observeMessageDelivery'
+  const authorityRecords = selectsRun
     ? records.filter(record => record.runId === runId)
     : records
   if (
-    command === 'opencode.stopTeam'
+    selectsRun
     && records.some(record => record.runId !== runId && !isOpenCodeSessionStopped(record))
   ) {
     throw new Error('OpenCode lifecycle stored run authority mismatch; another run is active')
@@ -1080,6 +1083,44 @@ async function probeStoredLaneAuthority(
     ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
   })
   return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+}
+
+// Bind delivery to the member captured before provisioning, including across
+// outcome-store and reconciliation awaits. SessionBridge still checks live host
+// authority and cancellation inside its operations.
+async function assertStoredDeliveryAuthority(
+  record: OpenCodeSessionRecord,
+  authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
+): Promise<void> {
+  if (!authority) {
+    if (record.profileScope?.purpose === 'launch_runtime') {
+      throw new Error('OpenCode selected delivery requires persisted lane capability authority')
+    }
+    return
+  }
+  const retained = authority.records.find(candidate => candidate.teamId === record.teamId
+    && (candidate.laneId ?? 'primary') === (record.laneId ?? 'primary')
+    && candidate.memberName === record.memberName)
+  const current = await openCodeSessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
+  if (!retained || [record, current].some(candidate => !candidate
+    || isOpenCodeSessionStopped(candidate)
+    || candidate.teamId !== retained.teamId
+    || (candidate.laneId ?? 'primary') !== (retained.laneId ?? 'primary')
+    || candidate.memberName !== retained.memberName
+    || candidate.runId !== retained.runId
+    || candidate.opencodeSessionId !== retained.opencodeSessionId
+    || candidate.hostKey !== retained.hostKey
+    || candidate.runtimePid !== retained.runtimePid
+    || candidate.projectPath !== retained.projectPath
+    || candidate.selectedModel !== retained.selectedModel
+    || candidate.selectedVariant !== retained.selectedVariant
+    || candidate.toolApprovalMode !== retained.toolApprovalMode
+    || candidate.expectedBehaviorFingerprint !== retained.expectedBehaviorFingerprint
+    || candidate.managedConfigFingerprint !== retained.managedConfigFingerprint
+    || candidate.resolvedBehaviorFingerprint !== retained.resolvedBehaviorFingerprint
+    || hashStable(candidate.profileScope ?? null) !== hashStable(retained.profileScope ?? null))) {
+    throw new Error('OpenCode selected delivery session authority changed; relaunch the lane')
+  }
 }
 
 // Keep authority discovery within the command budget, including cancellation and
@@ -2198,6 +2239,9 @@ async function recreateSessionAfterBootstrapMcpFailure(params: {
     return params.record
   }
 
+  if (params.record.profileScope?.purpose === 'launch_runtime') {
+    throw new Error('OpenCode selected session bootstrap MCP failed; relaunch the lane')
+  }
   params.diagnostics.push(bootstrapFailure)
   await openCodeSessionStore.markStale(
     params.record.teamId,
@@ -4714,11 +4758,12 @@ async function runStop(
 
 async function runSendMessage(
   envelope: BridgeEnvelope,
-  authoritySnapshot?: OpenCodeProvisioningSnapshot | null,
+  authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   data: SendMessageCommandData
 }> {
+  const authoritySnapshot = authority?.snapshot
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
@@ -4761,15 +4806,16 @@ async function runSendMessage(
     })
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
-  if (record.profileScope?.purpose === 'launch_runtime' && !authoritySnapshot) {
-    throw new Error('OpenCode selected delivery requires persisted lane capability authority')
-  }
+  await assertStoredDeliveryAuthority(record, authority)
   let deliveryRecord = record
   let snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
   const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
   const staleReason = record.staleReason ?? compatibilityStaleReason
+  if (authority && (staleReason || forceSessionRefreshReason)) {
+    throw new Error('OpenCode selected session cannot be recreated without strict launch proof; relaunch the lane')
+  }
   if (staleReason) {
     if (!record.staleReason) {
       await openCodeSessionStore.markStale(teamId, laneId, memberName, staleReason, record).catch(error => {
@@ -4834,6 +4880,7 @@ async function runSendMessage(
     prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
     diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
   })
+  await assertStoredDeliveryAuthority(deliveryRecord, authority)
   const initialMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
     attachIfMissing: true,
   })
@@ -4873,6 +4920,9 @@ async function runSendMessage(
         'warning',
       ),
     )
+    if (authority) {
+      throw new Error('OpenCode selected session app MCP is unavailable; relaunch the lane')
+    }
     await openCodeSessionStore.markStale(teamId, laneId, memberName, 'app_mcp_unavailable', deliveryRecord)
     deliveryRecord = await openCodeSessionBridge.ensureSession({
       teamId,
@@ -4986,6 +5036,7 @@ async function runSendMessage(
   let turnSettled: OpenCodeTurnSettledSummary | null = null
   let promptEndpointAccepted = false
   try {
+    await assertStoredDeliveryAuthority(deliveryRecord, authority)
     if (noReply) {
       await openCodeSessionBridge.promptAsync(deliveryRecord, {
         text: deliveryText,
@@ -5314,11 +5365,12 @@ async function runSendMessage(
 
 async function runObserveMessageDelivery(
   envelope: BridgeEnvelope,
-  authoritySnapshot?: OpenCodeProvisioningSnapshot | null,
+  authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   data: ObserveMessageDeliveryCommandData
 }> {
+  const authoritySnapshot = authority?.snapshot
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
@@ -5336,6 +5388,7 @@ async function runObserveMessageDelivery(
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
+  await assertStoredDeliveryAuthority(record, authority)
   const projectPath = asString(body.projectPath) ?? envelope.cwd
   if (await canonicalizeOpenCodeProjectPath(projectPath)
     !== await canonicalizeOpenCodeProjectPath(record.projectPath)
@@ -5350,6 +5403,8 @@ async function runObserveMessageDelivery(
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
+
+  await assertStoredDeliveryAuthority(record, authority)
 
   let runtimePid =
     typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
@@ -5381,6 +5436,7 @@ async function runObserveMessageDelivery(
     })
 
     if (responseObservation.needsFullHistory === true) {
+      await assertStoredDeliveryAuthority(limited.record, authority)
       const full = await withTimeout(
         openCodeSessionBridge.reconcileSession(limited.record, {
           sessionId: requestedSessionId,
@@ -5441,6 +5497,7 @@ async function runObserveMessageDelivery(
     responseObservation = reconcileFailedObservation(message)
   }
 
+  await assertStoredDeliveryAuthority(record, authority)
   return {
     snapshot,
     data: {
@@ -5880,7 +5937,7 @@ async function handleEnvelope(
       if (expectedCapabilitySnapshotId(envelope.body)) {
         if (!runtimeDeadline) throw new Error('OpenCode delivery authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runSendMessage(envelope, retained.snapshot))
+          retained => runSendMessage(envelope, retained))
       }
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery': {
@@ -5889,7 +5946,7 @@ async function handleEnvelope(
       if (record?.profileScope?.purpose === 'launch_runtime') {
         if (!runtimeDeadline) throw new Error('OpenCode observation authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runObserveMessageDelivery(envelope, retained.snapshot))
+          retained => runObserveMessageDelivery(envelope, retained))
       }
       return runObserveMessageDelivery(envelope)
     }
