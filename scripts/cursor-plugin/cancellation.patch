@@ -19,11 +19,11 @@
 +    // Bun supports a separate POSIX process group. Never signal the host group.
 +    detached: process.platform !== "win32",
    });
- 
+
    child.stdin.write(prompt);
 @@ -1183,6 +1190,10 @@
  }
- 
+
  async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?: ToolRouter): Promise<string> {
 +  if (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT &&
 +      (TOOL_LOOP_MODE !== "opencode" || process.platform === "win32")) {
@@ -35,7 +35,7 @@
 @@ -1327,7 +1338,11 @@
          );
        }
- 
+
 +      if (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT && backend !== "cursor-agent") {
 +        throw new Error("Managed Cursor requires CURSOR_ACP_BACKEND=cursor-agent");
 +      }
@@ -86,7 +86,7 @@
 +      req.signal.addEventListener("abort", cancelRequest, { once: true });
 +      if (req.signal.aborted) cancelRequest();
 +      // Keep the listener until the response is consumed, not just parent exit.
- 
+
        if (!stream) {
          const [stdoutText, stderrText] = await Promise.all([
 @@ -1347,6 +1400,9 @@
@@ -121,12 +121,12 @@
          },
 +        cancel() { cancelRequest(); },
        });
- 
+
        return new Response(sse, {
 @@ -1814,7 +1874,7 @@
      }
    };
- 
+
 -  if (REUSE_EXISTING_PROXY) {
 +  if (REUSE_EXISTING_PROXY && !process.env.AGENT_TEAMS_CURSOR_PROXY_PORT) {
      // Check if another process already started a proxy on the default port
@@ -135,7 +135,7 @@
 @@ -1831,6 +1891,38 @@
      }
    }
- 
+
 +  // Bun's native transport carries the request abort signal, which is what makes
 +  // a Stop end the agent child instead of merely closing the response.
 +  const bunRuntime = (globalThis as any).Bun;
@@ -170,12 +170,12 @@
 +  }
    // Use Node.js http server (works in both Node and Bun)
    const http = await import("http");
- 
+
 --- a/src/cli/mcptool.ts
 +++ b/src/cli/mcptool.ts
 @@ -115,7 +115,14 @@
      }
- 
+
      await manager.connectServer(config);
 -    const result = await manager.callTool(serverName, toolName, toolArgs);
 +    // connectServer reports a failed connection by logging and returning, and
@@ -187,7 +187,7 @@
 +    }
 +    const result = await manager.callTool(serverName, toolName, toolArgs, true);
      console.log(result);
- 
+
      await manager.disconnectAll();
 --- a/src/mcp/client-manager.ts
 +++ b/src/mcp/client-manager.ts
@@ -198,7 +198,7 @@
 +  const { StreamableHTTPClientTransport } = await import(
 +    "@modelcontextprotocol/sdk/client/streamableHttp.js"
 +  );
- 
+
    defaultDeps = {
      createClient: () =>
 @@ -42,8 +45,15 @@
@@ -230,11 +230,11 @@
 +      if (throwOnError) throw new Error(`MCP server "${serverName}" not connected`);
        return `Error: MCP server "${serverName}" not connected`;
      }
- 
+
 @@ -131,6 +143,9 @@
          arguments: args,
        });
- 
+
 +      if (result?.isError) {
 +        throw new Error(`MCP tool "${toolName}" reported isError: ${JSON.stringify(result.content)}`);
 +      }
@@ -281,7 +281,7 @@
  import type { OpenAiToolCall } from "./tool-loop.js";
 @@ -42,7 +43,7 @@
  }
- 
+
  function buildToolSchemaBlock(tools: Array<any>): string {
 -  const fingerprint = buildToolFingerprint(tools);
 +  const fingerprint = `${Boolean(process.env.AGENT_TEAMS_CURSOR_PROXY_PORT)}:${buildToolFingerprint(tools)}`;
@@ -290,19 +290,19 @@
    }
 @@ -59,7 +60,9 @@
      .join("\n");
- 
+
    const block =
 -    `SYSTEM: You have access to the following tools. When you need to use one, respond with a tool_call in the standard OpenAI format.\n` +
 +    (process.env.AGENT_TEAMS_CURSOR_PROXY_PORT
 +      ? `SYSTEM: The following are OpenCode tool schemas. Use native tools for local operations and the managed MCP dispatch instructions for app calls.\n`
 +      : `SYSTEM: You have access to the following tools. When you need to use one, respond with a tool_call in the standard OpenAI format.\n`) +
      `Tool guidance: prefer write/edit for file changes; use bash mainly to run commands/tests.\n\nAvailable tools:\n${toolDescs}`;
- 
+
    if (fingerprint) {
 @@ -160,7 +163,8 @@
      });
    }
- 
+
 -  const lines: string[] = [];
 +  const dispatch = managedMcpDispatchInstructions();
 +  const lines: string[] = dispatch ? [dispatch] : [];
@@ -331,7 +331,7 @@
        "Do NOT call a tool named 'mcp' with parameters. Always use the complete tool name below.",
        "",
      ];
- 
+
 @@ -371,7 +372,7 @@
          fullPromptChars: getFullPrompt().length,
        });
@@ -339,5 +339,235 @@
 -    return { prompt: incremental, resumeChatId, sessionKey, usedIncremental: true, contentPrefix, recordContentPrefix, toolFingerprint, subagentFingerprint };
 +    return { prompt: [managedMcpDispatchInstructions(), incremental].filter(Boolean).join("\n\n"), resumeChatId, sessionKey, usedIncremental: true, contentPrefix, recordContentPrefix, toolFingerprint, subagentFingerprint };
    }
- 
+
    log.info("Session resume active but incremental prompt unavailable; using full prompt", {
+--- a/src/plugin.ts
++++ b/src/plugin.ts
+@@ -2736,7 +2736,9 @@
+               fallbackBaseDir,
+               sessionWorkspaceBySession,
+             );
+-            return await handler(normalizedArgs);
++            // OpenCode owns this invocation, including its abort signal. Model arguments
++            // and the proxy HTTP request cannot supply this ownership.
++            return await handler(normalizedArgs, { abort: context?.abort });
+           } catch (error: any) {
+             log.debug("Tool hook execution failed", { tool: toolName, error: String(error?.message || error) });
+             throw error;
+--- a/src/tools/core/types.ts
++++ b/src/tools/core/types.ts
+@@ -11,7 +11,7 @@
+ }
+
+ export interface ToolHandler {
+-  (args: Record<string, unknown>): Promise<string>;
++  (args: Record<string, unknown>, context?: { abort?: AbortSignal }): Promise<string>;
+ }
+
+ export interface Tool {
+--- a/src/tools/defaults.ts
++++ b/src/tools/defaults.ts
+@@ -1,3 +1,4 @@
++import { executeShell } from "./executors/shell.js";
+ import type { ToolRegistry } from "./core/registry.js";
+ import { createLogger } from "../utils/logger.js";
+
+@@ -22,7 +23,7 @@
+         },
+         timeout: {
+           type: "number",
+-          description: "Timeout in seconds (default: 30)"
++          description: "Timeout in milliseconds (default: 30000)"
+         },
+         cwd: {
+           type: "string",
+@@ -32,49 +33,16 @@
+       required: ["command"]
+     },
+     source: "local" as const
+-  }, async (args) => {
+-    const { spawn } = await import("child_process");
+-
++  }, async (args, context) => {
+     const command = resolveBashCommand(args);
+     if (!command) {
+       throw new Error("bash: missing required argument 'command'");
+     }
+-    const timeoutMs = resolveTimeoutMs(args.timeout);
+-    const cwd = resolveWorkingDirectory(args);
+-
+-    return new Promise<string>((resolve, reject) => {
+-      const proc = spawn(command, {
+-        shell: resolveShellOption(),
+-        cwd,
+-      });
+-
+-      const stdoutChunks: Buffer[] = [];
+-      const stderrChunks: Buffer[] = [];
+-      let timedOut = false;
+-
+-      const timer = setTimeout(() => {
+-        timedOut = true;
+-        proc.kill("SIGTERM");
+-      }, timeoutMs);
+-
+-      proc.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+-      proc.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+-
+-      proc.on("close", (code) => {
+-        clearTimeout(timer);
+-        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+-        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+-        const output = stdout || stderr || "Command executed successfully";
+-        if (timedOut) {
+-          resolve(`Command timed out after ${timeoutMs / 1000}s\n${output}`);
+-        } else if (code !== 0) {
+-          resolve(`${output}\n[Exit code: ${code}]`);
+-        } else {
+-          resolve(output);
+-        }
+-      });
+-
+-      proc.on("error", reject);
++    return executeShell(command, {
++      shell: resolveShellOption(),
++      cwd: resolveWorkingDirectory(args),
++      timeout: args.timeout,
++      abort: context?.abort,
+     });
+   });
+
+@@ -690,27 +658,6 @@
+     return ".";
+   }
+   return null;
+-}
+-
+-function resolveTimeout(value: unknown): number | undefined {
+-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+-    return value;
+-  }
+-  if (typeof value === "string") {
+-    const parsed = Number(value.trim());
+-    if (Number.isFinite(parsed) && parsed > 0) {
+-      return parsed;
+-    }
+-  }
+-  return undefined;
+-}
+-
+-// Convert model-supplied timeout (seconds) to milliseconds. Falls back to 30s.
+-function resolveTimeoutMs(value: unknown): number {
+-  const raw = resolveTimeout(value);
+-  if (raw === undefined) return 30_000;
+-  // Values ≤ 600 are treated as seconds (no real use case for a <600ms shell timeout).
+-  return raw <= 600 ? raw * 1000 : raw;
+ }
+
+ export function resolveShellOption(deps: {
+--- /dev/null
++++ b/src/tools/executors/shell.ts
+@@ -0,0 +1,103 @@
++import { spawn } from "node:child_process";
++
++/** Foreground shell ownership belongs to one OpenCode tool invocation. */
++export async function executeShell(command: string, options: {
++  shell: string | boolean;
++  cwd?: string;
++  timeout?: unknown;
++  abort?: AbortSignal;
++}): Promise<string> {
++  const abortError = () => Object.assign(new Error("Tool execution aborted"), { name: "AbortError" });
++  if (options.abort?.aborted) throw abortError();
++  // OpenCode's bash timeout is milliseconds. Never infer units from magnitude
++  // or silently replace an invalid/overflowing timer with a default.
++  const timeoutMs = options.timeout ?? 30_000;
++  if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647) {
++    throw new Error("bash: timeout must be an integer number of milliseconds between 0 and 2147483647");
++  }
++
++  return new Promise<string>((resolve, reject) => {
++    const grouped = process.platform !== "win32";
++    const proc = spawn(command, {
++      shell: options.shell,
++      cwd: options.cwd,
++      // POSIX setsid gives only this foreground invocation its own group.
++      // Keep it referenced and await close; there is no detached supervisor.
++      detached: grouped,
++      stdio: ["ignore", "pipe", "pipe"],
++    });
++    const stdout: Buffer[] = [];
++    const stderr: Buffer[] = [];
++    let failure: Error | undefined;
++    let closed = false;
++    let exitCode: number | null = null;
++    let exitSignal: NodeJS.Signals | null = null;
++    let escalated = false;
++    let settled = false;
++    let escalation: ReturnType<typeof setTimeout> | undefined;
++    let observation: ReturnType<typeof setTimeout> | undefined;
++
++    const finish = (error?: Error) => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(timer);
++      clearTimeout(escalation);
++      clearTimeout(observation);
++      options.abort?.removeEventListener("abort", onAbort);
++      const output = Buffer.concat(stdout).toString("utf8") || Buffer.concat(stderr).toString("utf8");
++      if (error) {
++        if (output) error.message += `\n${output}`;
++        reject(error);
++      } else {
++        const text = output || (exitCode === 0 ? "Command executed successfully" : "Command failed");
++        resolve(exitCode === 0 ? text : `${text}\n[Exit code: ${exitSignal ?? exitCode}]`);
++      }
++    };
++    const maybeFinish = () => {
++      if (closed && (!failure || escalated)) finish(failure);
++    };
++    const signal = (value: NodeJS.Signals) => {
++      if (!proc.pid) return;
++      try {
++        if (grouped) process.kill(-proc.pid, value);
++        else if (!closed) proc.kill(value);
++      } catch (error: any) {
++        if (error?.code !== "ESRCH") throw error;
++      }
++    };
++    const stop = (error: Error) => {
++      if (settled || failure) return;
++      failure = error;
++      clearTimeout(timer);
++      try { signal("SIGTERM"); } catch (signalError: any) { finish(signalError); return; }
++      // Parent exit/closed pipes do not prove descendant exit. Escalation must
++      // survive close so a TERM-resistant ordinary child cannot outlive Stop.
++      escalation = setTimeout(() => {
++        try { signal("SIGKILL"); } catch (signalError: any) { finish(signalError); return; }
++        escalated = true;
++        maybeFinish();
++        if (!settled) observation = setTimeout(() => {
++          proc.stdout.destroy();
++          proc.stderr.destroy();
++          finish(new Error(`${failure!.message}; shell close observation timed out`));
++        }, 1500);
++      }, 500);
++    };
++    const onAbort = () => stop(abortError());
++    const timer = setTimeout(() => stop(Object.assign(
++      new Error(`Command timed out after ${timeoutMs}ms`), { name: "TimeoutError" },
++    )), timeoutMs);
++    proc.stdout.on("data", chunk => stdout.push(Buffer.from(chunk)));
++    proc.stderr.on("data", chunk => stderr.push(Buffer.from(chunk)));
++    proc.on("error", finish);
++    proc.on("close", (code, signal) => {
++      closed = true;
++      exitCode = code;
++      exitSignal = signal;
++      maybeFinish();
++    });
++    options.abort?.addEventListener("abort", onAbort, { once: true });
++    // Cover cancellation between the pre-spawn check and listener attachment.
++    if (options.abort?.aborted) onAbort();
++  });
++}
