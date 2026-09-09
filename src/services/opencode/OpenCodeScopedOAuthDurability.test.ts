@@ -11,6 +11,7 @@ import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehavio
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { readOpenCodeAuthCredential, readOpenCodeSavedAuthStore, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import type { OpenCodeHostHandle, OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
 
@@ -45,10 +46,18 @@ describe('scoped OAuth native durability integration', () => {
     await mkdir(project)
     env = { HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
       XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
+      XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'),
+      APPDATA: path.join(root, 'roaming'), LOCALAPPDATA: path.join(root, 'local'),
+      TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'),
       CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache'),
       CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:1/mcp' }
+    await mkdir(env.TMPDIR!)
     saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]))
     Object.assign(process.env, env)
+    // Every managed path participates in scope identity, including config/log/
+    // temp. Default session resolution and fresh children read process.env;
+    // their inputs must match the explicitly captured fixture on every OS.
+    expect(resolveClaudeMultimodelPaths(process.env)).toEqual(resolveClaudeMultimodelPaths(env))
     now = 2000
     await save(manager.getGlobalAuthPath(), c0)
   })
@@ -117,7 +126,12 @@ describe('scoped OAuth native durability integration', () => {
       const p = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope });
       const c = await readOpenCodeAuthCredential({ authPath: p.managedAuthPath, providerId: 'xai' });
       process.stdout.write(c?.refresh === 'single-use-1' ? 'saved-C1' : 'wrong');`
-    const child = Bun.spawn([process.execPath, '-e', script, project], { env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe' })
+    // Windows environment names are case-insensitive. Remove inherited aliases
+    // before adding canonical fixture keys so the child gets one value per key.
+    const fixtureKeys = new Set(Object.keys(env).map(key => key.toUpperCase()))
+    const childEnv = { ...Object.fromEntries(Object.entries(process.env)
+      .filter(([key]) => !fixtureKeys.has(key.toUpperCase()))), ...env }
+    const child = Bun.spawn([process.execPath, '-e', script, project], { env: childEnv, stdout: 'pipe', stderr: 'pipe' })
     const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect(stderr).toBe('')
     expect(exit).toBe(0)

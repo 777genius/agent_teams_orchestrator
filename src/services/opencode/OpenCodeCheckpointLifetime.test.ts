@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite'
 import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { readProcessStartTimeMs } from '../../utils/processKill.js'
+import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
@@ -133,8 +133,20 @@ describe('pending native OAuth session authority', () => {
         const stopped = await lifecycleManager.reconcilePersistentHosts({ mode: 'force', reason: 'shutdown' })
         expect(stopped.hosts[0].action).toBe('kept_pending_oauth')
         expect(stopped.hosts[0].reason).toContain('owned process stopped')
-        await exited
-        expect(child.signalCode).toBe('SIGTERM')
+        const exitCode = await exited
+        // Windows kills the tree with taskkill /T /F, which reports an exit
+        // code rather than a POSIX signal. Stdin is still open here: only the
+        // owned force-stop may end this child, and its death must be observed.
+        expect(child.stdin.writableEnded).toBe(false)
+        expect(isProcessAlive(child.pid!)).toBe(false)
+        if (process.platform === 'win32') {
+          expect(child.signalCode).toBeNull()
+          expect(exitCode).toBeNumber()
+          expect(exitCode).not.toBe(0)
+        } else {
+          expect(child.signalCode).toBe('SIGTERM')
+          expect(exitCode).toBeNull()
+        }
         expect(lifecycleManager.getHost(owner.record.hostKey)).toBeNull()
       } else {
         child.stdin.end()
