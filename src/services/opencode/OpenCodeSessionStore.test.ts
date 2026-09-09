@@ -393,6 +393,27 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.deleteIfSession(record, token('old-attempt', 1, record.opencodeSessionId))).toBe(false)
   })
 
+  test('terminal Stop CAS rejects dead-runtime retirement even with matching retained authority', async () => {
+    const file = path.join(tempDir, 'sessions.json')
+    const store = new OpenCodeSessionStore(file)
+    const record = { ...baseRecord, runId: 'old-run',
+      profileScope: { purpose: 'launch_runtime' as const, providerId: 'openai', scopeToken: 'scope',
+        configFingerprint: 'config', selectedAuthIdentity: 'absent' as const },
+      stopAuthority: { runtime: { providerId: 'opencode' as const, binaryPath: 'opencode',
+        binaryFingerprint: null, version: null, capabilitySnapshotId: `opencode:${'a'.repeat(32)}` },
+        expectedBehaviorFingerprint: 'b'.repeat(64) },
+    }
+    await store.upsert(record)
+    const retired = await new OpenCodeSessionStore(file).retireAbsentRuntimeIfSession(record, 'next-run')
+    expect(retired?.staleReason).toBe('runtime_process_gone')
+    expect(retired?.stopAuthority).toEqual(record.stopAuthority)
+    const before = await readFile(file, 'utf8')
+    expect(await store.markStoppedIfSession(record, record.stopAuthority)).toBeNull()
+    expect(await store.markStoppedIfSession(record)).toBeNull()
+    expect(await readFile(file, 'utf8')).toBe(before)
+    expect(await store.get(record.teamId, record.laneId, record.memberName)).toEqual(retired)
+  })
+
   test('atomically replaces an ownerless stale legacy session when a strict run is introduced', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'stale-legacy-sessions.json'))
     const legacy = { ...baseRecord, staleReason: 'managed_auth_changed' }
