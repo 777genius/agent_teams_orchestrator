@@ -21,13 +21,14 @@ async function fixture(input: {
   method: 'oauth' | 'api'
   providerId?: string
   admission?: 'accepted' | 'rejected' | 'unavailable'
-  refresh?: 'throws' | 'timeout' | 'missing'
+  refresh?: 'throws' | 'timeout' | 'missing' | 'hang'
   managed?: boolean
   metadata?: boolean
   execution?: 'available' | 'not_authenticated' | 'unavailable'
   previous?: boolean
   freshModel?: boolean
   hostUnavailable?: boolean
+  observerFailure?: boolean
 }) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-connect-admission-'))
   const providerId = input.providerId ?? 'xai'
@@ -94,10 +95,22 @@ async function fixture(input: {
     killProcess: pid => { livePids.delete(pid) },
   })
   const adapter = new OpenCodeProviderManagementAdapter({
+    ...(input.refresh === 'hang' ? { inventoryTimeoutMs: 10 } : {}),
     inventoryService: {
       probe: async (_projectPath, options) => {
+        expect(_projectPath).toBe(root)
+        expect(options?.includeAppMcp).toBe(false)
+        expect(options?.profileScope).toBeUndefined()
         if (written && options?.bypassCache) {
           events.push('refresh')
+          if (input.refresh === 'hang') {
+            return new Promise((_resolve, reject) => {
+              options.abortSignal!.addEventListener('abort', () => {
+                events.push('inventory-aborted')
+                reject(new Error('synthetic inventory aborted'))
+              }, { once: true })
+            })
+          }
           if (input.refresh === 'throws') throw new Error('synthetic inventory unavailable')
           if (input.refresh === 'missing') return { ...inventory(), detected: false, profile: null }
           if (input.refresh === 'timeout') return { ...inventory(), profile: null,
@@ -211,7 +224,10 @@ async function fixture(input: {
     const result = await adapter.connectProvider({
       runtimeId: 'opencode', providerId, projectPath: root, method: input.method,
       apiKey: 'synthetic-key', authMethodIndex: 0, oauthOperationId: 'synthetic-operation',
-    }, { authorizationReady: async () => {}, authorizationCompleted: async () => { events.push('completed') } })
+    }, { authorizationReady: async () => {}, authorizationCompleted: async () => {
+      events.push('completed')
+      if (input.observerFailure) throw new Error('synthetic progress transport closed')
+    } })
     // The admission process is gone before returning (also on every rejection).
     // API's original persistent catalog retains its existing lifetime contract.
     if (snapshots[1]) {
@@ -227,7 +243,31 @@ async function fixture(input: {
 }
 
 describe('post-auth provider admission', () => {
+  for (const previous of [false, true]) {
+    test(`OAuth progress interruption rolls back mirrored auth (previous=${previous})`, async () => {
+      const run = await fixture({ method: 'oauth', observerFailure: true, previous })
+      expect(run.result).toMatchObject({ ok: false, error: { code: 'auth-failed' } })
+      expect(run.stores.get(run.globalAuthPath)).toEqual(previous ? run.previous : undefined)
+      expect(run.stores.get(run.managedAuthPath)).toEqual(previous ? run.previous : undefined)
+      expect(run.events.filter(event => event === 'callback')).toHaveLength(1)
+      expect(run.events.filter(event => event === 'completed')).toHaveLength(1)
+      expect(run.events).not.toContain('refresh')
+      expect(run.events).not.toContain('execution')
+      expect(run.events.filter(event => event.startsWith('release:'))).toHaveLength(1)
+    })
+  }
   for (const method of ['oauth', 'api'] as const) {
+    test(`${method}: actual inventory deadline aborts the probe and uses a fresh process`, async () => {
+      const run = await fixture({ method, refresh: 'hang' })
+      expect(run.result.ok).toBe(true)
+      expect(run.events.filter(event => event === 'inventory-aborted')).toHaveLength(1)
+      expect(run.snapshots).toHaveLength(2)
+      expect(run.snapshots[1]!.host.profile.managedAuthFingerprint).toBe('before-auth')
+      expect(run.snapshots[1]!.connected).toEqual(['xai'])
+      expect(run.events.filter(event => event === 'execution')).toHaveLength(1)
+      expect(run.events.filter(event => event === 'mirror')).toHaveLength(2)
+      expect(run.events.filter(event => event === (method === 'oauth' ? 'callback' : 'put'))).toHaveLength(1)
+    })
     test(`${method}: first login reads a fresh provider instance before execution`, async () => {
       const run = await fixture({ method })
       expect(run.snapshots[0]!.connected).toEqual([])

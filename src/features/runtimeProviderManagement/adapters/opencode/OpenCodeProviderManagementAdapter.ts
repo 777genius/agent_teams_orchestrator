@@ -4903,14 +4903,30 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        await observer.authorizationCompleted?.({
-          operationId,
-          providerId,
-          displayName,
-          authOptionId: authOption.id,
-          methodIndex,
-          completionMethod: authorization.method,
-        })
+        try {
+          await observer.authorizationCompleted?.({
+            operationId,
+            providerId,
+            displayName,
+            authOptionId: authOption.id,
+            methodIndex,
+            completionMethod: authorization.method,
+          })
+        } catch (error) {
+          // Progress transport can close after mirroring but before admission.
+          // This is still an unverified transaction and must restore its baseline.
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error ? error.message : 'OAuth verification was interrupted',
+          )
+        }
 
         const admission = await this.refreshConnectedProviderAdmission({
           inventory, inventoryService, providerId, providerAuth, capabilities,
