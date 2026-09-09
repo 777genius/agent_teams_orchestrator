@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -134,6 +135,63 @@ test('cleanup errors override successful assertions and preserve the remaining r
   });
   assert.equal(teardownFailure.passed, false);
   assert.match(teardownFailure.cleanupError, /identity unavailable/);
+});
+
+test('teardown retains the last phase on timeout or failure and keeps stdout separate', t => {
+  const error = Object.assign(new Error('spawnSync powershell.exe ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const stderr = 'teardown: started\nteardown: before import Microsoft.PowerShell.Management\n';
+  let result;
+  const env = { HOME: '/isolated/home' };
+  t.mock.method(childProcess, 'spawnSync', (executable, argv, options) => {
+    assert.equal(executable, 'powershell.exe');
+    assert.deepEqual(argv.slice(0, -1), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']);
+    assert.equal(options.env, env);
+    assert.equal(options.timeout, 30000);
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+    // Check emitted diagnostic boundaries; native execution remains Windows-only.
+    const command = argv.at(-1);
+    for (const [phase, operation] of [
+      ...['Microsoft.PowerShell.Management', 'CimCmdlets', 'Microsoft.PowerShell.Utility']
+        .map(name => [`import ${name}`, `Import-Module ${name} -ErrorAction Stop`]),
+      ['script enumeration', '$scripts = @(Get-ChildItem -LiteralPath'],
+      ['process enumeration', '$entries = @(Get-CimInstance Win32_Process)'],
+      ['Get-Process', '$target = Get-Process -Id'],
+      ['hold handle', '$heldHandle = $target.Handle'],
+      ['identity query', '$current = Get-CimInstance Win32_Process -Filter'],
+      ['identity validation', "throw 'Owned process identity changed during cleanup'"],
+      ['kill', '$target.Kill()'],
+      ['wait for exit', '$target.WaitForExit(5000)'],
+      ['dispose', '$target.Dispose()'],
+      ['JSON output', 'ConvertTo-Json -InputObject $stopped'],
+    ]) {
+      const before = command.indexOf(`[Console]::Error.WriteLine('teardown: before ${phase}`);
+      const after = command.indexOf(`[Console]::Error.WriteLine('teardown: after ${phase}`);
+      assert.ok(before >= 0 && before < command.indexOf(operation) && command.indexOf(operation) < after, phase);
+    }
+    return result;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (result of [
+      { status: null, signal: 'SIGTERM', stdout: '', stderr, error },
+      { status: 1, signal: null, stdout: '', stderr },
+      { status: 0, signal: null, stdout: '[]\n', stderr: 'teardown: after JSON output\n' },
+    ]) {
+      const report = {};
+      if (result.error) assert.throws(() => teardownOwnedProcesses('/isolated', report, env), caught => caught === error);
+      else if (result.status) assert.throws(() => teardownOwnedProcesses('/isolated', report, env), /Owned-process teardown failed/);
+      else teardownOwnedProcesses('/isolated', report, env);
+      assert.equal(report.teardown.stderr, result.stderr);
+      assert.equal(report.teardown.stdout, result.stdout);
+      assert.equal(report.teardown.errorCode, result.error?.code);
+      assert.equal(report.teardown.signal, result.signal);
+      assert.equal(report.teardown.timeoutMs, 30000);
+      assert.ok(Number.isFinite(report.teardown.elapsedMs));
+    }
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
 });
 
 test('readiness rejects a degraded host even with a successful envelope', () => {
@@ -371,6 +429,9 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
     // Attach the rejection handler before synchronous teardown blocks the loop.
     exited.catch(() => {});
     teardownOwnedProcesses(root, evidence, env);
+    assert.match(evidence.teardown.stderr, /teardown: after identity validation pid=/);
+    assert.match(evidence.teardown.stderr, /teardown: after wait for exit pid=/);
+    assert.match(evidence.teardown.stderr, /teardown: after JSON output/);
     await exited;
     const stopped = JSON.parse(evidence.teardown.stdout);
     assert.ok(stopped.some(entry => entry.pid === child.pid));

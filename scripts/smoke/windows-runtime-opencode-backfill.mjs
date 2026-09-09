@@ -175,15 +175,24 @@ export const windowsNodeScriptPattern = String.raw`^(?:"(?<quotedExe>[^"]+)"|(?<
 export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
   const literal = value => "'" + value.replaceAll("'", "''") + "'";
   const command = `
+[Console]::Error.WriteLine('teardown: started')
 $ErrorActionPreference = 'Stop'
-# Avoid automatic module discovery under the isolated fixture home.
+# Direct stderr markers need no modules and survive a later import/CIM timeout.
+[Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Management')
 Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+[Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Management')
+[Console]::Error.WriteLine('teardown: before import CimCmdlets')
 Import-Module CimCmdlets -ErrorAction Stop
+[Console]::Error.WriteLine('teardown: after import CimCmdlets')
+[Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Utility')
 Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+[Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Utility')
 $rootPath = ${literal(path.resolve(root) + path.sep)}
 $nodePath = ${literal(process.execPath)}
 $nodeScriptPattern = ${literal(windowsNodeScriptPattern)}
+[Console]::Error.WriteLine('teardown: before script enumeration')
 $scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse | ForEach-Object { $_.FullName })
+[Console]::Error.WriteLine('teardown: after script enumeration count=' + $scripts.Count)
 function Is-Owned($entry) {
   if ($entry.ExecutablePath -and $entry.ExecutablePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
   if ($entry.ExecutablePath -ieq $nodePath) {
@@ -198,28 +207,51 @@ function Is-Owned($entry) {
   return $false
 }
 $stopped = @()
-foreach ($entry in @(Get-CimInstance Win32_Process)) {
+[Console]::Error.WriteLine('teardown: before process enumeration')
+$entries = @(Get-CimInstance Win32_Process)
+[Console]::Error.WriteLine('teardown: after process enumeration count=' + $entries.Count)
+foreach ($entry in $entries) {
   if (-not (Is-Owned $entry)) { continue }
+  [Console]::Error.WriteLine('teardown: before Get-Process pid=' + $entry.ProcessId)
   $target = Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
+  [Console]::Error.WriteLine('teardown: after Get-Process pid=' + $entry.ProcessId + ' found=' + [bool]$target)
   if (-not $target) { continue }
   try {
     # Hold the process handle before the second identity check, avoiding PID reuse.
+    [Console]::Error.WriteLine('teardown: before hold handle pid=' + $entry.ProcessId)
     $heldHandle = $target.Handle
+    [Console]::Error.WriteLine('teardown: after hold handle pid=' + $entry.ProcessId)
+    [Console]::Error.WriteLine('teardown: before identity query pid=' + $entry.ProcessId)
     $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.ProcessId)
+    [Console]::Error.WriteLine('teardown: after identity query pid=' + $entry.ProcessId + ' found=' + [bool]$current)
     if (-not $current) { continue }
+    [Console]::Error.WriteLine('teardown: before identity validation pid=' + $entry.ProcessId)
     if ($current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
+    [Console]::Error.WriteLine('teardown: after identity validation pid=' + $entry.ProcessId)
     $stopped += @{ pid = $entry.ProcessId; executable = $entry.ExecutablePath; commandLine = $entry.CommandLine; startedAt = $entry.CreationDate.ToUniversalTime().ToString('o') }
+    [Console]::Error.WriteLine('teardown: before kill pid=' + $entry.ProcessId)
     $target.Kill()
+    [Console]::Error.WriteLine('teardown: after kill pid=' + $entry.ProcessId)
+    [Console]::Error.WriteLine('teardown: before wait for exit pid=' + $entry.ProcessId)
     if (-not $target.WaitForExit(5000)) { throw 'Owned process did not exit during cleanup' }
-  } finally { $target.Dispose() }
+    [Console]::Error.WriteLine('teardown: after wait for exit pid=' + $entry.ProcessId)
+  } finally {
+    [Console]::Error.WriteLine('teardown: before dispose pid=' + $entry.ProcessId)
+    $target.Dispose()
+    [Console]::Error.WriteLine('teardown: after dispose pid=' + $entry.ProcessId)
+  }
 }
+[Console]::Error.WriteLine('teardown: before JSON output')
 ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
+[Console]::Error.WriteLine('teardown: after JSON output')
 `;
   const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
+  const started = performance.now();
   const result = spawnSync('powershell.exe', argv, { env, cwd: root, encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
   report.teardown = { executable: 'powershell.exe', argv, pid: result.pid, status: result.status,
-    stdout: result.stdout, stderr: result.stderr, error: result.error?.message };
+    elapsedMs: Math.round(performance.now() - started), timeoutMs: 30000, signal: result.signal,
+    stdout: result.stdout, stderr: result.stderr, error: result.error?.message, errorCode: result.error?.code };
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `Owned-process teardown failed: ${result.stderr}`);
 }
