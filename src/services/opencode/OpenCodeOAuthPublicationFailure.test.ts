@@ -155,6 +155,15 @@ for (const mutation of ['duplicate', 'new-successor', 'account-swap', 'api', 'lo
         }
         const otherProject = path.join(root, 'other-project')
         await mkdir(otherProject)
+        if (mutation !== 'source-paths') {
+          // A foreign project's changed configuration cannot revoke this owner.
+          await expect(resolveOpenCodeProfileScope({ projectPath: otherProject,
+            selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env })).rejects.toThrow('another project')
+          expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+        }
+        // The original caller still proves configuration/source revocation and
+        // retires the operation with its consumed-token fence intact.
+        await resolve()
         const freshScope = await resolveOpenCodeProfileScope({ projectPath: otherProject,
           selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env })
         expect(freshScope.scopeToken).not.toBe(profile.scopeToken)
