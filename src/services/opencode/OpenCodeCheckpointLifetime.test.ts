@@ -86,11 +86,14 @@ describe('pending native OAuth session authority', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
-  test.each(['retained-control', 'exit-listener', 'force-stop'])('owned child exit preserves recovery lease evidence: %s', async mode => {
+  test.each(['retained-control', 'exit-listener', 'force-stop', 'force-stop-exit-after-reconcile'])('owned child exit preserves recovery lease evidence: %s', async mode => {
     const cleanup = mode !== 'retained-control'
     const { spawn } = await import('node:child_process')
     const child = spawn(process.execPath, ['-e', 'await Bun.stdin.text()'], { stdio: ['pipe', 'ignore', 'ignore'] })
     const exited = new Promise<number | null>(resolve => child.once('exit', resolve))
+    let removed: Promise<void> | undefined
+    let releaseRemoval!: () => void
+    const removalGate = new Promise<void>(resolve => { releaseRemoval = resolve })
     try {
       const birth = await readProcessStartTimeMs(child.pid!)
       expect(birth).toBeGreaterThan(0)
@@ -112,24 +115,44 @@ describe('pending native OAuth session authority', () => {
           db.query('insert into message values (?, ?, ?, ?, ?)').run(message.info.id, owner.record.opencodeSessionId, index + 1, null, JSON.stringify(message.info))
         }
       } finally { db.close() }
-      let removed: Promise<void> | undefined
+      let deliverExit: (() => void) | undefined
+      let removalFinished = false
+      const removalCalls: unknown[][] = []
       let lifecycleManager: any
       if (cleanup) {
         const hostManager: any = lifecycleManager = new OpenCodeHostManager({ persistentRegistryPath: registryPath,
           fetchJson: async () => ({ status: 200, data: {} }) })
         const original = hostManager.removePersistentHost.bind(hostManager)
-        hostManager.removePersistentHost = (...args: unknown[]) => { removed = original(...args); return removed }
+        hostManager.removePersistentHost = (...args: unknown[]) => {
+          removalCalls.push(args)
+          removed = (async () => {
+            // Child exit is not completion of the fire-and-forget registry work.
+            if (mode === 'exit-listener') await removalGate
+            await original(...args)
+            removalFinished = true
+          })()
+          return removed
+        }
         hostManager.cleanupOpenTuiTempArtifactsIfUnused = async () => {}
         const entry = { child, handle: { hostKey: owner.record.hostKey, state: 'healthy', diagnostics: [],
           pid: child.pid, processStartedAtMs: birth, profile, baseUrl: owner.baseUrl }, lifetime: 'persistent', ownedByProcess: true, refCount: 1 }
         hostManager.hosts.set(owner.record.hostKey, entry)
         hostManager.bindHostLifecycle(owner.record.hostKey, entry)
+        if (mode === 'force-stop-exit-after-reconcile') {
+          // Deliver the real lifecycle callback after reconciliation has deleted
+          // the entry, reproducing Windows event ordering without delaying death.
+          const lifecycleExit = child.listeners('exit').at(-1)!
+          child.removeListener('exit', lifecycleExit)
+          child.once('exit', (code, signal) => {
+            deliverExit = () => lifecycleExit.call(child, code, signal)
+          })
+        }
         await expect(hostManager.upsertPersistentHost({ ...entry.handle,
           processStartedAtMs: birth! + 1 })).rejects.toThrow('pending OAuth publication')
         expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey]).toEqual(
           registry.hosts[owner.record.hostKey])
       }
-      if (mode === 'force-stop') {
+      if (mode.startsWith('force-stop')) {
         const stopped = await lifecycleManager.reconcilePersistentHosts({ mode: 'force', reason: 'shutdown' })
         expect(stopped.hosts[0].action).toBe('kept_pending_oauth')
         expect(stopped.hosts[0].reason).toContain('owned process stopped')
@@ -148,11 +171,31 @@ describe('pending native OAuth session authority', () => {
           expect(exitCode).toBeNull()
         }
         expect(lifecycleManager.getHost(owner.record.hostKey)).toBeNull()
+        if (mode === 'force-stop-exit-after-reconcile') {
+          expect(deliverExit).toBeDefined()
+          expect(removed).toBeUndefined()
+          deliverExit!()
+          // The real listener must return early for an entry already reconciled.
+          expect(removed).toBeUndefined()
+          expect(removalCalls).toEqual([])
+        }
       } else {
         child.stdin.end()
         expect(await exited).toBe(0)
       }
-      if (cleanup) { expect(removed).toBeDefined(); await removed }
+      if (mode === 'exit-listener') {
+        expect(removed).toBeDefined()
+        expect(removalFinished).toBe(false)
+        releaseRemoval()
+      }
+      // Force reconciliation owns cleanup and can remove the in-memory entry
+      // before the exit listener runs. Drain registry work only if it was begun.
+      if (removed) {
+        expect(removalCalls).toEqual([[owner.record.hostKey, { pid: child.pid, startedAtMs: birth }]])
+        await removed
+        expect(removalFinished).toBe(true)
+      }
+      if (cleanup) expect(lifecycleManager.getHost(owner.record.hostKey)).toBeNull()
       const fresh = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env })
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases).toEqual(
         registry.hosts[owner.record.hostKey].leases)
@@ -174,6 +217,6 @@ describe('pending native OAuth session authority', () => {
         await lifecycleManager.reconcilePersistentHosts({ mode: 'stale' })
         expect(await Bun.file(registryPath).exists()).toBe(false)
       }
-    } finally { child.stdin.end(); await exited }
+    } finally { releaseRemoval(); child.stdin.end(); await exited; await removed }
   })
 })
