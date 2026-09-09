@@ -1142,7 +1142,13 @@ export class OpenCodeSessionBridge {
     if (unsubmitted) return false // A live host may still admit an in-flight request.
     const client = this.clientFactory.create(owner.baseUrl)
     const idle = async () => {
-      const status = (await client.getSessionStatus())[record.opencodeSessionId]
+      const statuses = await client.getSessionStatus()
+      if (!asRecord(statuses)) return false
+      // Native /session/status is sparse: v1.18.4 removes idle entries. Omission
+      // proves only idle; exact prompt completion and scoped host ownership
+      // below remain necessary. Never substitute an empty map on read failure.
+      if (!Object.prototype.hasOwnProperty.call(statuses, record.opencodeSessionId)) return true
+      const status = statuses[record.opencodeSessionId]
       return status === 'idle' || asRecord(status)?.type === 'idle'
     }
     if (!await idle()) return false

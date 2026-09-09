@@ -1104,7 +1104,13 @@ export class OpenCodeExecutionProbe {
     if (unsubmitted) return false // Idle does not exclude an in-flight submission.
     const client = this.clientFactory.create(owner.baseUrl)
     const idle = async () => {
-      const status = (await client.getSessionStatus())[owner.sessionId]
+      const statuses = await client.getSessionStatus()
+      if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses)) return false
+      // Native /session/status is sparse: v1.18.4 removes idle entries. Omission
+      // proves only idle; exact terminal history and process ownership below
+      // are still required. A failed read or malformed entry is not idle.
+      if (!Object.prototype.hasOwnProperty.call(statuses, owner.sessionId)) return true
+      const status = statuses[owner.sessionId]
       return status === 'idle' || (typeof status === 'object' && status?.type === 'idle')
     }
     if (!await idle()) return false
