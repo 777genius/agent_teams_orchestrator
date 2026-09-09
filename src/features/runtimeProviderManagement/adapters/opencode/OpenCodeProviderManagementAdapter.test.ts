@@ -2424,8 +2424,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
       verifiedModelId: 'xai/grok-4',
     })
     expect(authorizations).toEqual([{ method: 0 }])
-    expect(ensureHostCalls).toEqual([expect.objectContaining({ hostLifetime: 'process' })])
-    expect(releaseHostCalls).toEqual([{ keepPersistentAlive: false }])
+    expect(ensureHostCalls).toEqual([
+      expect.objectContaining({ hostLifetime: 'process' }),
+      expect.objectContaining({ hostLifetime: 'process', preparedProfile: expect.any(Object) }),
+    ])
+    expect(releaseHostCalls).toEqual([
+      { keepPersistentAlive: false },
+      { keepPersistentAlive: false },
+    ])
     expect(modelProbes).toEqual([{ selectedModel: 'xai/grok-4', bypassCache: true }])
     expect(verificationEvents).toEqual([
       {
