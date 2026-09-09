@@ -168,6 +168,53 @@ test('dead-host retirement never becomes a true Stop receipt', async () => {
   expect(abort).not.toHaveBeenCalled()
 })
 
+test('retirement after lease release and before terminal CAS retains false across receipt, replay and reconciliation', async () => {
+  const abort = track(spyOn(openCodeSessionBridge, 'abort').mockResolvedValue(true))
+  let leaseReleased = false
+  const release = track(spyOn(openCodeSessionBridge, 'releaseSession').mockImplementation(async () => {
+    leaseReleased = true
+  }))
+  const restore = track(spyOn(openCodeSessionBridge, 'restoreSessionLease').mockResolvedValue(undefined))
+  let retired: OpenCodeSessionRecord | null = null
+  const terminalCas = track(spyOn(openCodeSessionStore, 'markStoppedIfSession').mockImplementation(async (input, authority, signal) => {
+    expect(leaseReleased).toBe(true)
+    expect(authority).toEqual(record.stopAuthority)
+    // Pause Stop at its terminal CAS entry, after strict release has returned.
+    // A separate store instance commits the successor launch's retirement first.
+    const successorStore = new OpenCodeSessionStore(path.join(dir, 'sessions.json'))
+    retired = await successorStore.retireAbsentRuntimeIfSession(record, 'next-run')
+    expect(retired?.staleReason).toBe('runtime_process_gone')
+    expect(retired?.stopAuthority).toEqual(record.stopAuthority)
+    return store.markStoppedIfSession(input, authority, signal)
+  }))
+  const first = await executeOpenCodeBridgeCommandEnvelope(envelope('opencode.stopTeam', stopBody()))
+  expect(first.ok).toBe(true)
+  if (!first.ok) throw new Error(first.error.message)
+  expect(first.data.stopped).toBe(false)
+  expect(first.data.members.alice.stopped).toBe(false)
+  expect(first.data.members.alice.diagnostics).toContain('runtime disappeared without confirmed Stop')
+  expect(first.data.diagnostics).toContainEqual(expect.objectContaining({
+    code: 'opencode_stop_status_unconfirmed', severity: 'warning',
+  }))
+  store = new OpenCodeSessionStore(path.join(dir, 'sessions.json'))
+  const lookup = await executeOpenCodeBridgeCommandEnvelope(envelope('opencode.stopOutcome', { stopRecovery: request }))
+  expect(lookup.ok).toBe(true)
+  if (!lookup.ok) throw new Error(lookup.error.message)
+  expect(lookup.data.status).toBe('completed')
+  expect(lookup.data.receipt.data).toEqual(first.data)
+  const replay = await executeOpenCodeBridgeCommandEnvelope(envelope('opencode.stopTeam', stopBody()))
+  expect(replay.ok).toBe(true)
+  if (replay.ok) expect(replay.data).toEqual(first.data)
+  const current = await executeOpenCodeBridgeCommandEnvelope(envelope('opencode.reconcileStop', { stopRecovery: request }))
+  expect(current.ok && current.data.status).toBe('unknown')
+  expect(await store.get(record.teamId, record.laneId!, record.memberName)).toEqual(retired)
+  expect(abort).toHaveBeenCalledTimes(1)
+  expect(release).toHaveBeenCalledTimes(1)
+  expect(release).toHaveBeenCalledWith(record, { strictLeaseRelease: true })
+  expect(terminalCas).toHaveBeenCalledTimes(1)
+  expect(restore).not.toHaveBeenCalled()
+})
+
 test('cancellation after terminal CAS persists the original result before rejecting transport', async () => {
   const controller = new AbortController()
   const abort = track(spyOn(openCodeSessionBridge, 'abort').mockResolvedValue(true))

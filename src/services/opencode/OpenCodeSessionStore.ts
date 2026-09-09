@@ -846,6 +846,8 @@ export class OpenCodeSessionStore {
         || (record.createdAt !== undefined && previous.createdAt !== record.createdAt)
         || (record.projectPath !== undefined && previous.projectPath !== record.projectPath)) return null
       if (isOpenCodeSessionStopped(previous)) {
+        // Retirement authorizes replacement, not a confirmed Stop receipt.
+        if (previous.staleReason === 'runtime_process_gone') return null
         if (stopAuthority && jsonStringify(previous.stopAuthority) !== jsonStringify(stopAuthority)) return null
         return previous
       }

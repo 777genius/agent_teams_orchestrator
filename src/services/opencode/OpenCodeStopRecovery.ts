@@ -113,7 +113,8 @@ export function validateStopData(value: unknown, request: OpenCodeStopRequest): 
     || !Array.isArray(data.warnings) || !data.warnings.every(item => typeof item === 'string')
     || !Array.isArray(data.diagnostics) || !data.diagnostics.every(value => {
       const d = object(value)
-      return typeof d.code === 'string' && typeof d.message === 'string' && ['info', 'warning', 'error'].includes(String(d.severity))
+      return typeof d.code === 'string' && typeof d.message === 'string'
+        && typeof d.severity === 'string' && ['info', 'warning', 'error'].includes(d.severity)
     }) || (data.idempotencyKey !== undefined && data.idempotencyKey !== request.idempotencyKey)
     || ![data.manifestHighWatermark, data.runtimeStoreManifestHighWatermark].every(value => value === null || (Number.isSafeInteger(value) && Number(value) >= 0))
     || Object.keys(members).length !== request.target.members.length

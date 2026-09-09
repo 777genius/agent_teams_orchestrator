@@ -4738,6 +4738,16 @@ async function runStop(
           throw casError
         }
         if (!terminal) {
+          const current = await openCodeSessionStore.get(teamId, laneId, record.memberName)
+          if (isExactStopSession(current, record) && current.staleReason === 'runtime_process_gone') {
+            memberDiagnostics.push('runtime disappeared without confirmed Stop')
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_status_unconfirmed',
+              `${record.memberName}: runtime retirement is not confirmed Stop evidence`,
+              'warning',
+            ))
+            return { record, stopped: false, diagnostics: memberDiagnostics }
+          }
           diagnostics.push(teamDiagnostic(
             'opencode_stop_identity_changed',
             `${record.memberName}: session identity changed before confirmation`,

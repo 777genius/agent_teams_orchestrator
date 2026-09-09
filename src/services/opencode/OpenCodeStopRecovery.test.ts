@@ -93,6 +93,27 @@ describe('owned durable Stop outcomes', () => {
     expect((await store.lookupStop(request)).status).toBe('inflight')
   })
 
+  test('diagnostic severity accepts string enums and rejects arrays on write and retained receipt lookup', async () => {
+    await store.beginStop(request, runtime)
+    const data = { ...result(false), diagnostics: [
+      { code: 'test', message: 'retained diagnostic', severity: ['error'] },
+    ] }
+    await expect(store.completeStop(request, data as unknown as OpenCodeStopData)).rejects.toThrow('Invalid durable Stop result')
+    expect((await store.lookupStop(request)).status).toBe('inflight')
+    const valid = { ...result(false), diagnostics: (['info', 'warning', 'error'] as const).map(severity => ({
+      code: 'test', message: 'retained diagnostic', severity,
+    })) }
+    await store.completeStop(request, valid)
+    const completed = await store.lookupStop(request)
+    expect(completed.status).toBe('completed')
+    if (completed.status === 'completed') expect(completed.receipt.data).toEqual(valid)
+    const disk = JSON.parse(await readFile(file, 'utf8'))
+    const receipt = Object.values(disk.stopReceipts)[0] as { data: unknown }
+    receipt.data = data
+    await writeFile(file, JSON.stringify(disk))
+    await expect(new OpenCodeSessionStore(file).lookupStop(request)).rejects.toThrow('Invalid durable Stop result')
+  })
+
   test('crash after effect remains inflight, but exact terminal state reconciles separately', async () => {
     await store.beginStop(request, runtime)
     await store.markStoppedIfSession(record, { runtime, expectedBehaviorFingerprint: behavior })
