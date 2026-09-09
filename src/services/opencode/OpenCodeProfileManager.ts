@@ -2737,7 +2737,7 @@ export class OpenCodeProfileManager {
           purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
         }, predecessor)
         if (originalScope.scopeToken !== authority.scope.scopeToken) {
-          throw new Error('OpenCode OAuth publication source configuration changed')
+          throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth publication source configuration changed')
         }
       }
     }
@@ -2754,7 +2754,7 @@ export class OpenCodeProfileManager {
       // Include the complete effective snapshot token, not just its narrower
       // selected config/auth tuple. Publication never reseals this old profile.
       if (!isDeepStrictEqual(current, authority.scope)) {
-        throw new Error('OpenCode OAuth source scope changed')
+        throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth source scope changed')
       }
     }
     if (!isValidOpenCodeOAuthCredential(predecessor)) {
