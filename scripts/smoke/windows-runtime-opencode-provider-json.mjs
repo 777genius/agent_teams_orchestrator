@@ -34,8 +34,9 @@ export function runRecordedCheck(group, label, invocation, validate, { spawn = s
 export function assertReadinessHost(payload) {
   assert.equal(payload.command, 'opencode.readiness');
   assert.equal(typeof payload.ok, 'boolean');
-  // Fake MCP may be unavailable, but a healthy host requires production startup
-  // to have captured a non-null process identity in OpenCodeHostManager.
+  // The simulated HTTP MCP attach must succeed: an absent /mcp entry makes
+  // readiness fail with hostHealthy:false. Host startup must also capture a
+  // non-null process identity in the unchanged production OpenCodeHostManager.
   assert.equal(payload.data?.hostHealthy, true, JSON.stringify(payload));
 }
 
@@ -68,6 +69,7 @@ function assertExitZero(result, label) {
 
 
 export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSync, cleanup = finishSmokeCleanup } = {}) {
+  report.mcpEvidence = { mode: 'simulated-opencode-http-attach', bundledAppMcp: false, executableTools: false };
   const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-'));
   try {
     const fakeOpenCodeScript = path.join(tempRoot, 'fake-opencode.cjs');
@@ -89,9 +91,10 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
 
     const smokeEnv = sandboxEnvironment(tempRoot, fakeOpenCodeCmd);
     // Standalone CI has no sibling app MCP bundle. The fake OpenCode server
-    // returns an empty /mcp and never executes MCP commands, so only an explicit
-    // launch entry is needed for production profile resolution to reach host
-    // startup. This is not bundled app MCP coverage; keep host readiness real.
+    // accepts a local attach and retains its simulated status/config over HTTP;
+    // it never executes MCP commands or tools. This entry resolves the profile
+    // but deliberately fails direct MCP tools/list. This is host/identity smoke,
+    // not bundled app MCP or launch readiness evidence.
     const fixtureMcpEntry = path.join(tempRoot, 'fixture-agent-teams-mcp.cjs');
     writeFileSync(fixtureMcpEntry,
       'throw new Error("Windows provider smoke fixture only: not an MCP server");\n', 'utf8');
