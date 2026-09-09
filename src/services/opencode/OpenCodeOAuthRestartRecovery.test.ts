@@ -539,7 +539,7 @@ test('candidate normalization rejects an ineligible default-port URL with fragme
   expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
 })
 
-test('F2 characterization source replacement during nonterminal session verification releases active fence', async () => {
+test('F2 safety source replacement during nonterminal session verification retains active fence', async () => {
   const f = await fixture({ session: true, terminal: 'incomplete' })
   const { OpenCodeSessionBridge } = await import('./OpenCodeSessionBridge')
   const { OpenCodeHostManager } = await import('./OpenCodeHostManager')
@@ -552,15 +552,16 @@ test('F2 characterization source replacement during nonterminal session verifica
   const replacement = { ...c0, refresh: 'independent-new-login', accountId: 'new-account' }
   let calls = 0
   // This is the production pre-release entry, not a fabricated assertOwner bypass.
-  await manager.finishOwnedOAuthBeforeSessionRelease(f.receipt.nativeSession.record, async owner => {
+  await expect(manager.finishOwnedOAuthBeforeSessionRelease(f.receipt.nativeSession.record, async owner => {
     expect(await bridge.isOwnedOAuthNativeSessionSettled(owner)).toBe(false)
     await writeFile(f.global, JSON.stringify({ xai: replacement }))
     calls++
     return false
-  })
+  })).rejects.toThrow()
   expect(calls).toBe(1)
-  expect(await exists(f.receiptPath)).toBe(false)
-  expect((await Bun.file(f.archivePath).json()).successor).toBeNull()
+  expect(await exists(f.receiptPath)).toBe(true)
+  expect(await exists(f.archivePath)).toBe(false)
+  expect((await Bun.file(f.receiptPath).json()).publicationRevoked).toBe(true)
   expect(await read(f.global)).toEqual(replacement)
 })
 
