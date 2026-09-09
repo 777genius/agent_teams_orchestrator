@@ -7,10 +7,11 @@ import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { readOpenCodeAuthCredential, upsertOpenCodeAuthCredential, type OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
-import type { OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
+import type { OpenCodeHostHandle, OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
 
 const c0 = { type: 'oauth', access: 'TEST-C0', refresh: 'single-use-C0', expires: 1000, accountId: 'TEST' }
 const c1 = { ...c0, access: 'TEST-C1', refresh: 'single-use-C1', expires: 500 }
@@ -23,6 +24,7 @@ describe('pending native OAuth session authority', () => {
   let root: string, project: string, global: string, registryPath: string, sessionPath: string
   let env: NodeJS.ProcessEnv, profile: OpenCodePreparedProfile, owner: OpenCodeOAuthNativeSessionOwner
   let registry: any, status: unknown, messages: any[], onRead: (() => Promise<void>) | undefined
+  let readStatusMap: () => Promise<any>
   let abortAcknowledged: boolean, abortCalls: number, onAbort: (() => Promise<void>) | undefined
   let sessionStore: OpenCodeSessionStore, bridge: OpenCodeSessionBridge
   const manager = new OpenCodeProfileManager()
@@ -31,7 +33,7 @@ describe('pending native OAuth session authority', () => {
   const resolve = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3',
     purpose: 'launch_runtime', env, isOAuthNativeSessionSettled: value => bridge.isOwnedOAuthNativeSessionSettled(value),
     isOAuthNativeProbeSettled: value => new OpenCodeExecutionProbe({ clientFactory: { create: () => ({
-      getSessionStatus: async () => ({ 'native-session': status }), getSessionMessages: async () => messages,
+      getSessionStatus: () => readStatusMap(), getSessionMessages: async () => { await onRead?.(); return messages },
     }) as never } }).isOwnedOAuthNativeProbeSettled(value) })
   const arm = (throwAfter = false) => manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
     operation: async armNative => {
@@ -77,10 +79,11 @@ describe('pending native OAuth session authority', () => {
     sessionStore = new OpenCodeSessionStore(sessionPath)
     await sessionStore.upsert(record)
     status = 'idle'; messages = []; onRead = undefined
+    readStatusMap = async () => ({ 'native-session': status })
     abortAcknowledged = true; abortCalls = 0; onAbort = undefined
     bridge = new OpenCodeSessionBridge({
       hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
-      clientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': status }),
+      clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
         getSessionMessages: async () => { await onRead?.(); return messages }, abortSession: async () => { abortCalls += 1; await onAbort?.(); return abortAcknowledged } }) as never },
     })
   })
@@ -213,6 +216,132 @@ describe('pending native OAuth session authority', () => {
     status = 'idle'
     await resolve()
     expect(await readSaved()).toEqual(c1)
+  })
+
+  test.each(['success', 'provider-error', 'uncertain-submit'])('scoped readiness preserves native sparse-map outcome: %s', async outcome => {
+    let submissions = 0
+    const clientFactory = new OpenCodeClientFactory({ fetchImpl: (async (input, init) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/session' && init?.method === 'POST') return Response.json({ id: 'native-session' })
+      if (url.pathname === '/session/native-session/prompt_async') {
+        submissions += 1
+        const prompt = JSON.parse(String(init?.body))
+        messages = terminalMessages(prompt.messageID)
+        await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+        if (outcome === 'uncertain-submit') {
+          messages.pop()
+          throw new Error('TEST connection reset after submission')
+        }
+        if (outcome === 'provider-error') {
+          messages[1].info.error = { name: 'APIError', data: { message: 'TEST provider denied model access', statusCode: 403 } }
+        } else messages[1].parts = [{ type: 'text', text: 'PONG' }]
+        return new Response(null, { status: 204 })
+      }
+      if (url.pathname === '/session/status') return Response.json({})
+      if (url.pathname === '/session/native-session/message') return Response.json(messages)
+      if (url.pathname.startsWith('/session/native-session/message/')) return Response.json(messages[0])
+      if (url.pathname === '/session/native-session/abort') return Response.json(true)
+      throw new Error(`Unexpected TEST request: ${init?.method ?? 'GET'} ${url.pathname}`)
+    }) as typeof fetch })
+    const host: OpenCodeHostHandle = { hostKey: owner.record.hostKey, profileRootKey: profile.profileRootKey,
+      projectPath: project, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      baseUrl: owner.baseUrl, port: 43210, pid: owner.pid, processStartedAtMs: owner.processStartedAtMs,
+      version: '1.18.4-fixture', state: 'healthy', profile,
+      resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [] }
+    const probe = new OpenCodeExecutionProbe({ clientFactory, pollIntervalMs: 1, probeTimeoutMs: 1000 })
+    const run = () => probe.probeModelOnHost({ host, projectPath: project, selectedModel: 'xai/grok-4.3' })
+    if (outcome === 'uncertain-submit') {
+      await expect(run()).rejects.toThrow('settlement is unconfirmed')
+      const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
+      const receipt = await readFile(receiptPath, 'utf8')
+      await expect(run()).rejects.toThrow('pending')
+      expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+      expect(await readSaved()).toEqual(c0)
+    } else {
+      const result = await run()
+      // Preserve the existing classifier's HTTP 403 result and provider reason.
+      expect(result.outcome).toBe(outcome === 'success' ? 'available' : 'not_authenticated')
+      if (outcome === 'success') expect(result.reason).toBeNull()
+      else expect(result.reason).toContain('TEST provider denied model access')
+      expect(await readSaved()).toEqual(c1)
+      expect(await Bun.file(`${global}.agent-teams-xai-oauth-save.json`).exists()).toBe(false)
+    }
+    expect(submissions).toBe(1)
+  })
+
+  describe.each(['probe', 'session'] as const)('native sparse status map: %s', kind => {
+    const armPending = () => manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
+      operation: async (armSession, armProbe) => {
+        if (kind === 'session') await armSession(owner)
+        else await armProbe({ projectPath: project, scopeToken: profile.scopeToken!, profileRootKey: profile.profileRootKey,
+          hostKey: owner.record.hostKey, baseUrl: owner.baseUrl, pid: owner.pid, processStartedAtMs: owner.processStartedAtMs,
+          selectedModel: owner.record.selectedModel, sessionId: owner.record.opencodeSessionId, messageId: owner.messageId })
+      }, isNativeSettled: () => false, allowNativeContinuation: true })
+
+    test.each(['empty', 'other-busy', 'provider-error'])('publishes exact terminal prompt with omitted idle entry: %s', async variant => {
+      await armPending()
+      await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+      messages = terminalMessages(owner.messageId)
+      // OpenCode v1.18.4 SessionStatus.set(idle) deletes the entry; the HTTP
+      // handler returns Object.fromEntries(list()), including only active sessions.
+      readStatusMap = async () => variant === 'other-busy' ? { other: { type: 'busy' } } : {}
+      if (variant === 'provider-error') {
+        delete messages[1].info.time.completed
+        messages[1].info.error = { name: 'APIError', data: { message: 'TEST provider rejected request', statusCode: 403 } }
+      }
+      await resolve()
+      expect(await readSaved()).toEqual(c1)
+      expect(await Bun.file(`${global}.agent-teams-xai-oauth-save.json`).exists()).toBe(false)
+    })
+
+    test.each(['user-only', 'wrong-parent', 'wrong-model', 'wrong-provider', 'no-user', 'step-only',
+      'busy', 'retry', 'null-entry', 'undefined-entry', 'unknown-entry', 'null-map', 'array-map', 'string-map',
+      'undefined-map', 'status-failed', 'busy-after-history', 'status-failed-after-history', 'owner-changed',
+    ])('retains receipt and fences resubmission without settlement proof: %s', async mutation => {
+      await armPending()
+      const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
+      const receipt = await readFile(receiptPath, 'utf8')
+      await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+      messages = terminalMessages(owner.messageId)
+      readStatusMap = async () => ({})
+      if (mutation === 'user-only') messages.pop()
+      if (mutation === 'wrong-parent') messages[1].info.parentID = 'foreign'
+      if (mutation === 'wrong-model') messages[1].info.modelID = 'foreign'
+      if (mutation === 'wrong-provider') messages[1].info.providerID = 'foreign'
+      if (mutation === 'no-user') messages.shift()
+      if (mutation === 'step-only') { delete messages[1].info.time.completed; messages[1].parts = [{ type: 'step-finish' }] }
+      if (mutation === 'busy' || mutation === 'retry') readStatusMap = async () => ({ 'native-session': { type: mutation } })
+      if (mutation === 'null-entry') readStatusMap = async () => ({ 'native-session': null })
+      if (mutation === 'undefined-entry') readStatusMap = async () => ({ 'native-session': undefined })
+      if (mutation === 'unknown-entry') readStatusMap = async () => ({ 'native-session': { type: 'unknown' } })
+      if (mutation === 'null-map') readStatusMap = async () => null
+      if (mutation === 'array-map') readStatusMap = async () => []
+      if (mutation === 'string-map') readStatusMap = async () => 'idle'
+      if (mutation === 'undefined-map') readStatusMap = async () => undefined
+      if (mutation === 'status-failed') readStatusMap = async () => { throw new Error('TEST status unavailable') }
+      if (mutation === 'busy-after-history') onRead = async () => { readStatusMap = async () => ({ 'native-session': { type: 'busy' } }) }
+      if (mutation === 'status-failed-after-history') onRead = async () => { readStatusMap = async () => { throw new Error('TEST status unavailable') } }
+      if (mutation === 'owner-changed') onRead = async () => {
+        if (kind === 'session') await sessionStore.upsert({ ...owner.record, runId: 'replacement' })
+        else owner.processStartedAtMs += 1
+      }
+      // Probe ownership comes from the persisted receipt, not this mutable test
+      // object. Change its observed OS birth only through an exact process read.
+      const birthSpy = mutation === 'owner-changed' && kind === 'probe'
+        ? spyOn(await import('../../utils/processKill.js'), 'readProcessStartTimeMs')
+          .mockImplementation(async () => owner.processStartedAtMs)
+        : undefined
+      try {
+        await expect(resolve()).rejects.toThrow()
+        let submissions = 0
+        await expect(manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
+          operation: async () => { submissions += 1 },
+        })).rejects.toThrow()
+        expect(submissions).toBe(0)
+        expect(await readSaved()).toEqual(c0)
+        expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+      } finally { birthSpy?.mockRestore() }
+    })
   })
 
   test.each([
