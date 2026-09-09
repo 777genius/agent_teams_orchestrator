@@ -351,7 +351,7 @@ export async function runtimeStatus(opts: {
       }
     } else {
       await withRuntimeJsonStdoutGuardedResponse(loadPayload, async (payload, stdoutWrite) => {
-        await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite)
+        await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite, 'strict')
         return 0
       })
       return
@@ -977,6 +977,7 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
 function writeStdoutAndDrain(
   payload: string,
   stdoutWrite: RuntimeStdoutWrite = process.stdout.write,
+  timeoutPolicy: 'best-effort' | 'strict' = 'best-effort',
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -1001,12 +1002,15 @@ function writeStdoutAndDrain(
       resolve()
     }
     const onDrain = () => finish()
-    // A drain deadline is a failed write, not evidence that the response was
-    // delivered. Keep it referenced even if the writer has no active handles.
+    // Status catches a strict deadline failure and explicitly exits nonzero.
+    // Other callers retain their existing best-effort deadline and exit path.
     timer = setTimeout(
-      () => finish(new Error('Timed out writing runtime command stdout')),
+      () => finish(timeoutPolicy === 'strict'
+        ? new Error('Timed out writing runtime command stdout')
+        : undefined),
       STDOUT_DRAIN_FALLBACK_TIMEOUT_MS,
     )
+    if (timeoutPolicy === 'best-effort') timer.unref?.()
     const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, error => {
       finish(error)
     })

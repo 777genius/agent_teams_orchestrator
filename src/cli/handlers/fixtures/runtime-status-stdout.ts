@@ -5,6 +5,7 @@ import { resolve, dirname } from 'node:path'
 // reading user configuration. The handler path also permits testing a base copy.
 const handlerPath = process.argv[2]!
 const scenario = process.argv[3]!
+const command = process.argv.find(arg => arg.startsWith('--command='))?.split('=')[1] ?? 'status'
 const dependency = (path: string) => resolve(dirname(handlerPath), path)
 const unused = () => { throw new Error('Unexpected provider call in offline fixture') }
 
@@ -19,15 +20,41 @@ for (const [file, name] of [
 ]) {
   mock.module(dependency(`../../services/opencode/${file}.js`), () => ({ [name!]: unused }))
 }
-mock.module(dependency('../../features/runtimeProviderManagement/index.js'), () =>
-  Object.fromEntries([
+const providerManagementMocks = Object.fromEntries([
     'clearProviderProjectDefaultModel', 'connectProviderWithApiKey', 'connectProvider',
     'configureProviderModelLimits', 'forgetManagedProvider', 'loadProviderDirectory',
     'loadProviderModels', 'loadProviderManagementView', 'loadProviderSetupForm',
     'openCodeProviderManagementAdapter', 'setProviderDefaultModel', 'testProviderModel',
-  ].map(name => [name, unused])),
-)
+  ].map(name => [name, unused]))
+mock.module(dependency('../../features/runtimeProviderManagement/index.js'), () => providerManagementMocks)
 mock.module(dependency('../../utils/slowOperations.js'), () => ({ jsonStringify: JSON.stringify }))
+
+// Adjacent commands use only synthetic results. Retaining an interval exposes
+// any drain rejection that bypasses their explicit process.exit boundary.
+if (command === 'verify') {
+  mock.module(dependency('../../services/opencode/OpenCodeProvisioningProbe.js'), () => ({
+    openCodeProvisioningProbe: { probe: async () => ({ models: [], diagnostics: [] }) },
+  }))
+}
+if (command === 'verify-model') {
+  mock.module(dependency('../../services/opencode/OpenCodeExecutionProbe.js'), () => ({
+    openCodeExecutionProbe: { probeModel: async () => ({ outcome: 'success', diagnostics: [] }) },
+  }))
+}
+if (command === 'providers-view' || command === 'providers-reject') {
+  mock.module(dependency('../../features/runtimeProviderManagement/index.js'), () => ({
+    ...providerManagementMocks,
+    loadProviderManagementView: async () => {
+      if (command === 'providers-reject') throw new Error('offline management failure')
+      return { ok: true, value: { providers: [], diagnostics: [] } }
+    },
+  }))
+}
+if (command === 'opencode-command') {
+  mock.module(dependency('../../services/opencode/OpenCodeBridgeCommandHandler.js'), () => ({
+    executeOpenCodeBridgeCommandEnvelope: async () => ({ ok: true }),
+  }))
+}
 
 mock.module(dependency('../../services/runtimeBackends/registry.js'), () => ({
   getUnifiedRuntimeStatusPayload: (provider: string, _deps: unknown, options: { detailLevel: string }) => {
@@ -79,10 +106,36 @@ if (scenario === 'stderr-no-callback') {
 // Production setupGracefulShutdown observes rejections for telemetry without
 // making them fatal; entrypoints/cli.tsx starts with `void main()`.
 process.on('unhandledRejection', () => {})
-const { runtimeStatus } = await import(handlerPath)
-void runtimeStatus({
-  provider: 'opencode',
-  json: true,
-  text: process.argv.includes('--text'),
-  summary: process.argv.includes('--summary'),
-})
+if (process.argv.includes('--retain-handle')) setInterval(() => {}, 1_000)
+const runtime = await import(handlerPath)
+switch (command) {
+  case 'status':
+    void runtime.runtimeStatus({
+      provider: 'opencode',
+      json: true,
+      text: process.argv.includes('--text'),
+      summary: process.argv.includes('--summary'),
+    })
+    break
+  case 'verify':
+    void runtime.runtimeVerify({ provider: 'opencode', json: true })
+    break
+  case 'verify-model':
+    void runtime.runtimeVerifyModel({ provider: 'opencode', model: 'offline/model', json: true })
+    break
+  case 'providers-view':
+  case 'providers-reject':
+    void runtime.runtimeProvidersView({ runtime: 'opencode', json: true })
+    break
+  case 'providers-validation':
+    void runtime.runtimeProvidersConnect({ runtime: 'opencode', provider: 'offline', json: true })
+    break
+  case 'opencode-command': {
+    const { writeFile } = await import('node:fs/promises')
+    await writeFile('envelope.json', '{}')
+    void runtime.runtimeOpenCodeCommand({ input: 'envelope.json' })
+    break
+  }
+  default:
+    throw new Error(`Unknown offline command: ${command}`)
+}
