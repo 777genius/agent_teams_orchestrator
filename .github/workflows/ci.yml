@@ -152,6 +152,11 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Test selected authority and sandbox lifecycle
         run: bun run test:opencode-authority
+      - name: Require Python for Linux OS pipe regression
+        if: runner.os == 'Linux'
+        run: python3 --version
+      - name: Test runtime status and adjacent output boundaries
+        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts
 
   opencode-conformance:
     name: OpenCode ${{ matrix.version }} conformance (${{ matrix.os }})

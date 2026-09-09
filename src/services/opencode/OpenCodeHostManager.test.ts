@@ -1599,6 +1599,7 @@ describe('OpenCodeHostManager', () => {
       spawnHostProcess: () => spawned.child,
       fetchJson: fetchJson(true),
       isProcessAlive: pid => pid === spawned.child.pid,
+      readProcessStartTimeMs: async () => 123_456,
       sleepMs: async () => {},
       persistentRegistryPath: registryPath,
     })
@@ -1610,6 +1611,7 @@ describe('OpenCodeHostManager', () => {
       },
       fetchJson: fetchJson(false),
       isProcessAlive: pid => pid === spawned.child.pid,
+      readProcessStartTimeMs: async () => 123_456,
       sleepMs: async () => {},
       persistentRegistryPath: registryPath,
     })
@@ -1644,6 +1646,7 @@ describe('OpenCodeHostManager', () => {
         },
         fetchJson: fetchJson(false),
         isProcessAlive: pid => pid === spawned.child.pid,
+        readProcessStartTimeMs: async () => 123_456,
         sleepMs: async () => {},
         persistentRegistryPath: registryPath,
       })
