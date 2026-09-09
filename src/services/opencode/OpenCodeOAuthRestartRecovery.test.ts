@@ -5,6 +5,7 @@ import { Database } from 'bun:sqlite'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import os from 'node:os'
 import {
   OpenCodeProfileManager, resolveOpenCodeProfileScope, isOpenCodeOAuthPublicationScopeCurrent,
 } from './OpenCodeProfileManager.js'
@@ -26,17 +27,19 @@ const exists = (file: string) => Bun.file(file).exists()
 
 async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' | 'execution_probe', remote?: boolean,
   terminal?: string, successor?: typeof c0, controlUrl?: string } = {}) {
-  const root = await realpath(await mkdtemp('/tmp/oauth-restart-audit-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'oauth-restart-audit-')))
   roots.push(root)
   const project = path.join(root, 'project')
   await mkdir(project)
   await mkdir(path.join(root, 'tmp'))
   const env: NodeJS.ProcessEnv = {
-    PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, NODE_ENV: 'test',
+    PATH: [path.dirname(process.execPath), process.env.PATH ?? process.env.Path ?? ''].join(path.delimiter),
+    SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
+    COMSPEC: process.env.COMSPEC, PATHEXT: process.env.PATHEXT, NODE_ENV: 'test',
     HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
     XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'),
-    TMPDIR: path.join(root, 'tmp'),
+    TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'),
     CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache'),
     CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: process.execPath,
     CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify([path.join(root, 'never-executed-mcp.js')]),

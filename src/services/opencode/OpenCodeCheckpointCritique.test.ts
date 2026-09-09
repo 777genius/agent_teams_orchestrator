@@ -45,13 +45,15 @@ async function fixture() {
 async function clean(f: Awaited<ReturnType<typeof fixture>>) {
   failurePath = undefined; beforeWrite = undefined; afterWrite = undefined; await rm(f.root, { recursive: true, force: true })
 }
-test('originating project config change retires terminal receipt without blocking unrelated project', async () => {
+test('only the originating project retires its changed-config terminal receipt', async () => {
   const f = await fixture()
   try {
     await f.pending()
     const receipt = await readFile(f.receipt, 'utf8')
     await writeFile(path.join(f.project, 'opencode.json'), JSON.stringify({ provider: { xai: { options: { baseURL: 'http://test.invalid/changed' } } } }))
-    for (let i = 0; i < 2; i++) await f.resolve(f.other)
+    for (let i = 0; i < 2; i++) await expect(f.resolve(f.other)).rejects.toThrow()
+    expect(await readFile(f.receipt, 'utf8')).toBe(receipt)
+    await f.resolve()
     expect(await Bun.file(f.receipt).exists()).toBe(false)
     expect(await f.read()).toEqual(c0)
   } finally { await clean(f) }
@@ -62,6 +64,9 @@ test('changed source paths retire obsolete receipt and allow explicit replacemen
     await f.pending()
     await upsertOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai', credential: replacement })
     const env = { ...f.env, XDG_DATA_HOME: path.join(f.root, 'new-data') }
+    for (let i = 0; i < 2; i++) await expect(f.resolve(f.other, env)).rejects.toThrow()
+    expect(await Bun.file(f.receipt).exists()).toBe(true)
+    await f.resolve(f.project, env)
     for (let i = 0; i < 2; i++) await f.resolve(f.other, env)
     expect(await Bun.file(f.receipt).exists()).toBe(false)
     expect(await f.read()).toEqual(replacement)
@@ -202,6 +207,9 @@ test(`configuration revoked at successor rename is never fresh authority (recove
     await expect(resolveOpenCodeProfileScope({ projectPath: f.other, selectedModel: 'xai/grok-4.3',
       purpose: 'launch_runtime', env: f.env, cacheSnapshot: false })).rejects.toThrow()
     await expect(f.resolve(f.other)).rejects.toThrow()
+    expect(await Bun.file(f.receipt).exists()).toBe(true)
+    // A foreign caller cannot retire the receipt; its original owner must do so.
+    await expect(f.resolve()).rejects.toThrow()
     expect(await Bun.file(f.receipt).exists()).toBe(false)
     // Removal of the active receipt cannot make revoked C1 selectable in a new coordinator.
     const script = `import { resolveOpenCodeProfileScope } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))};
