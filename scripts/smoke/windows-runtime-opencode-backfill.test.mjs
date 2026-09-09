@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -222,6 +222,78 @@ test('ownership diagnostics are bounded to explicit fixture candidates and canno
   assert.ok(command.includes('[Math]::Min(512, $value.Length)'));
   assert.ok(command.includes('if (-not $owned) { continue }'));
   assert.equal(command.match(/\$target\.Kill\(\)/g).length, 1);
+});
+
+// CLI envelopes are injected here; the launch resolver runs unchanged in Bun.
+// This covers standalone fixture wiring, not native Windows or bundled app MCP.
+test('provider fixture supplies an isolated MCP entry to the production resolver', { timeout: 15000 }, () => {
+  const report = { cases: [] };
+  const environments = [];
+  let fixtureRoot;
+  const bun = existingBun();
+  assert.ok(bun, 'Existing Bun required; never install dependencies for this test');
+  runProviderSmoke('/fixture/runtime.exe', report, () => {}, {
+    spawn: (_executable, argv, { env, cwd }) => {
+      environments.push(env);
+      const input = argv.includes('--input')
+        ? JSON.parse(readFileSync(argv[argv.indexOf('--input') + 1], 'utf8')) : null;
+      if (input?.command === 'opencode.readiness') {
+        assert.equal(input.body.requireExecutionProbe, false);
+        assert.equal(input.body.projectPath, cwd);
+      }
+      const payload = !input
+        ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
+        : { command: input.command, requestId: input.requestId,
+          ok: input.command === 'opencode.handshake', data: { hostHealthy: true } };
+      const stdout = JSON.stringify(payload);
+      if (argv.includes('--output')) writeFileSync(argv[argv.indexOf('--output') + 1], stdout);
+      return { status: 0, stdout, stderr: '' };
+    },
+    cleanup: (_group, root) => {
+      fixtureRoot = root;
+      try {
+        assert.equal(environments.length, 4);
+        const env = environments[0];
+        const entry = env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY;
+        assert.equal(typeof entry, 'string', 'Standalone provider smoke needs an explicit fixture MCP entry');
+        assert.equal(path.isAbsolute(entry), true);
+        assert.equal(path.dirname(entry), root);
+        assert.equal(statSync(entry).isFile(), true);
+        assert.ok(environments.every(item => item === env));
+        for (const key of ['CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+          'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL']) {
+          assert.equal(env[key], undefined, 'Fixture must not use an inherited MCP override');
+        }
+        const resolver = fileURLToPath(new URL('../../src/services/opencode/OpenCodeMcpManager.ts', import.meta.url));
+        const program = `
+          import assert from 'node:assert/strict';
+          const { resolveOpenCodeAppMcpLaunchConfig } = await import(${JSON.stringify(resolver)});
+          const resolved = await resolveOpenCodeAppMcpLaunchConfig({
+            pathExists: async () => { throw new Error('Fixture must not discover a sibling app'); },
+          });
+          assert.equal(resolved.source, 'env-override');
+          assert.equal(resolved.config.type, 'local');
+          assert.deepEqual(resolved.config.command, [Bun.which('node'), process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY]);
+          assert.equal(resolved.config.enabled, true);
+          const withoutEntry = { ...process.env };
+          delete withoutEntry.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY;
+          await assert.rejects(resolveOpenCodeAppMcpLaunchConfig({ env: withoutEntry, pathExists: async () => false }),
+            /Unable to resolve the agent-teams MCP entrypoint/);
+        `;
+        const result = spawnSync(bun, ['--eval', program], { cwd: root, env, encoding: 'utf8', timeout: 10000 });
+        assert.ifError(result.error);
+        assert.equal(result.status, 0, result.stderr + result.stdout);
+        // A mistaken attempt to execute this placeholder must fail visibly.
+        const executed = spawnSync(process.execPath, [entry], { cwd: root, env, encoding: 'utf8', timeout: 1000 });
+        assert.ifError(executed.error);
+        assert.equal(executed.status, 1);
+        assert.match(executed.stderr, /fixture only/);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  });
+  assert.equal(report.error, undefined);
+  assert.ok(report.cases.every(item => item.passed), JSON.stringify(report));
+  assert.equal(existsSync(fixtureRoot), false);
 });
 
 test('readiness rejects a degraded host even with a successful envelope', () => {

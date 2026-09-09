@@ -88,6 +88,14 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
     );
 
     const smokeEnv = sandboxEnvironment(tempRoot, fakeOpenCodeCmd);
+    // Standalone CI has no sibling app MCP bundle. The fake OpenCode server
+    // returns an empty /mcp and never executes MCP commands, so only an explicit
+    // launch entry is needed for production profile resolution to reach host
+    // startup. This is not bundled app MCP coverage; keep host readiness real.
+    const fixtureMcpEntry = path.join(tempRoot, 'fixture-agent-teams-mcp.cjs');
+    writeFileSync(fixtureMcpEntry,
+      'throw new Error("Windows provider smoke fixture only: not an MCP server");\n', 'utf8');
+    smokeEnv.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = fixtureMcpEntry;
 
     const check = (label, argv, validate, outputPath) => runRecordedCheck(report, label,
       { executable: runtimeBinary, argv, cwd: projectPath, env: smokeEnv, outputPath },
