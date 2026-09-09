@@ -325,6 +325,79 @@ function recordWindowsProbe(evidence, flush, label, executable, argv, options) {
   return item;
 }
 
+// Every invocation imports the actual helper in a fresh Bun process. Repeats are
+// ordered diagnostics, never substitutes for the first acceptance result.
+function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) {
+  assert.ok(bun, 'Existing Bun required; this test never installs it');
+  assert.ok(Number.isSafeInteger(pid) && pid > 0, 'Fixture PID required');
+  const processKill = path.join(repository, 'src/utils/processKill.ts');
+  const program = `
+    console.error(JSON.stringify({ phase: 'before-production-import', attempt: ${attempt}, bunVersion: Bun.version }));
+    const { readProcessStartTimeMs } = await import(${JSON.stringify(processKill)});
+    console.error(JSON.stringify({ phase: 'before-production-query', attempt: ${attempt}, bunVersion: Bun.version }));
+    const started = performance.now();
+    const startedAtMs = await readProcessStartTimeMs(${pid});
+    console.error(JSON.stringify({ phase: 'after-production-query', attempt: ${attempt}, elapsedMs: performance.now() - started, startedAtMs }));
+    console.log(JSON.stringify({ startedAtMs }));
+  `;
+  return recordWindowsProbe(evidence, flush, attempt === 1 ? 'production-identity' : `production-identity-repeat-${attempt - 1}`,
+    bun, ['--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+}
+
+// Run every evidence/assertion phase, then rethrow the original failure object.
+// In particular, diagnostics, teardown, and cleanup cannot replace identity failure.
+async function runNativePhases(evidence, flush, phases) {
+  let firstError;
+  evidence.phases = [];
+  for (const [label, run] of phases) {
+    const phase = { label, state: 'running' };
+    evidence.phases.push(phase);
+    flush();
+    try { await run(); phase.state = 'passed'; }
+    catch (error) {
+      firstError ??= error;
+      phase.state = 'failed';
+      phase.error = error.stack || String(error);
+      evidence.error ??= phase.error;
+    }
+    flush();
+  }
+  if (firstError) throw firstError;
+}
+
+function nativeTeardownPhases(evidence, children, getExited) {
+  let stopped;
+  return [
+    ['teardown-identity-marker', () => assert.match(evidence.teardown?.stderr ?? '', /teardown: after identity validation pid=/)],
+    ['teardown-exit-marker', () => assert.match(evidence.teardown?.stderr ?? '', /teardown: after wait for exit pid=/)],
+    ['teardown-json-marker', () => assert.match(evidence.teardown?.stderr ?? '', /teardown: after JSON output/)],
+    ['owned-child-exited', async () => {
+      // A failed teardown is a failed condition, not a reason to wait another
+      // 35s or silently skip the assertion. Other checks still run independently.
+      assert.equal(evidence.teardown?.status, 0, 'Teardown must finish successfully');
+      assert.ok(getExited(), 'Owned fixture must have started');
+      await getExited();
+    }],
+    ['teardown-json', () => { stopped = JSON.parse(evidence.teardown?.stdout); assert.ok(Array.isArray(stopped)); }],
+    ['owned-child-stopped', () => assert.ok(stopped?.some(entry => entry.pid === children[0]?.pid))],
+    ['first-identity-matches-teardown', () => {
+      assert.ok(Number.isFinite(evidence.startedAtMs), 'First production identity must succeed; repeats cannot satisfy this gate');
+      assert.equal(Date.parse(stopped?.find(entry => entry.pid === children[0]?.pid)?.startedAt), evidence.startedAtMs,
+        'teardown must identify the same process creation time as the first production query');
+    }],
+    ['only-owned-child-stopped', () => assert.ok(stopped?.every(entry =>
+      entry.pid !== process.pid && entry.pid !== children[1]?.pid && entry.pid !== children[2]?.pid))],
+    // These survival checks run independently even after teardown throws,
+    // invalid JSON, missing phase markers, or a previous survival failure.
+    ['parent-survived', () => assert.equal(process.kill(process.pid, 0), true, 'parent Node remains alive')],
+    ...[1, 2].map(index => [index === 1 ? 'unrelated-survived' : 'shared-prefix-survived', () => {
+      assert.ok(children[index]?.pid, 'Negative fixture must have started');
+      assert.equal(process.kill(children[index].pid, 0), true, 'Unowned Node fixture remains alive');
+      (evidence.survivingUnrelatedPids ??= []).push(children[index].pid);
+    }]),
+  ];
+}
+
 function diagnoseWindowsStartup(evidence, flush, env, root, pid) {
   const absolute = path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows',
     'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
@@ -332,8 +405,9 @@ function diagnoseWindowsStartup(evidence, flush, env, root, pid) {
   const identity = `${startup}; $ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
   const directIdentity = `${startup}; $ErrorActionPreference = 'Stop'; [System.Diagnostics.Process]::GetProcessById(${pid}).StartTime.ToUniversalTime().ToString('o')`;
   const moduleIdentity = `${startup}; $ErrorActionPreference = 'Stop'; Import-Module Microsoft.PowerShell.Management; [Console]::Out.WriteLine('management-loaded'); (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
-  // Each probe changes one factor from the absolute-startup control. The piped
-  // input reproduces the original harness mode; it can never make the test pass.
+  // These approximate query/startup controls are diagnostic only, not copies
+  // of the production acceptance helper. Piped input reproduces the old harness
+  // mode. None of these results can make the test pass.
   for (const [label, executable, command, stdin] of [
     ['bare-startup-ignore-stdin', 'powershell.exe', startup, 'ignore'],
     ['absolute-startup-ignore-stdin', absolute, startup, 'ignore'],
@@ -371,6 +445,90 @@ test('native probe evidence retains an empty-output timeout and its invocation',
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// Linux wiring only: do not warm PowerShell before the native Windows first query.
+test('production probe runs the actual helper twice through fresh Bun with timing markers', { skip: process.platform !== 'linux' }, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-production-probe-'));
+  try {
+    const evidence = { probes: [] };
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const bun = existingBun();
+    for (const attempt of [1, 2]) {
+      const query = productionIdentityProbe(evidence, () => {}, bun, env, root, process.pid, attempt);
+      assert.equal(query.status, 0, query.stderr);
+      assert.equal(query.error, null);
+      const value = JSON.parse(query.stdout).startedAtMs;
+      assert.ok(Number.isFinite(value)); // Linux start ticks, not Windows milliseconds
+      const markers = query.stderr.trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(markers.map(item => item.phase), ['before-production-import', 'before-production-query', 'after-production-query']);
+      assert.ok(markers.every(item => item.attempt === attempt));
+      assert.equal(markers.at(-1).startedAtMs, value);
+      assert.ok(markers.at(-1).elapsedMs >= 0);
+      assert.equal(query.timeoutMs, 10000);
+    }
+    assert.deepEqual(evidence.probes.map(item => item.label), ['production-identity', 'production-identity-repeat-1']);
+    assert.equal(evidence.probes[0].stdout, evidence.probes[1].stdout);
+    assert.equal(evidence.startedAtMs, undefined, 'Recording diagnostics does not set acceptance identity');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('native failure collection keeps first failure and enforces every teardown and survival gate', async t => {
+  const children = [{ pid: 101 }, { pid: 102 }, { pid: 103 }];
+  const timestamp = '2026-09-09T03:26:43.616Z';
+  const firstFailure = new Error('original first identity failure');
+  const teardownFailure = Object.assign(new Error('teardown timeout'), { code: 'ETIMEDOUT' });
+  let result;
+  let deadPid;
+  let checked;
+  t.mock.method(childProcess, 'spawnSync', () => result);
+  t.mock.method(process, 'kill', (pid, signal) => {
+    assert.equal(signal, 0);
+    checked.push(pid);
+    if (pid === deadPid) throw new Error('negative fixture killed');
+    return true;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const scenario of ['pass', 'first-failed-repeat-succeeded', 'first-and-teardown-failed',
+      'teardown-failed', 'bad-json', 'wrong-identity', 'unrelated-stopped', 'parent-dead', 'unrelated-dead', 'shared-prefix-dead']) {
+      const evidence = {};
+      const snapshots = [];
+      checked = [];
+      deadPid = { 'parent-dead': process.pid, 'unrelated-dead': 102, 'shared-prefix-dead': 103 }[scenario];
+      const firstFailed = scenario.startsWith('first-');
+      result = { status: 0, stdout: JSON.stringify([{ pid: 101, startedAt: timestamp }]),
+        stderr: 'teardown: after identity validation pid=101\nteardown: after wait for exit pid=101\nteardown: after JSON output\n' };
+      if (scenario.includes('teardown-failed')) result = { status: null, stdout: '', stderr: 'teardown: started\n', error: teardownFailure };
+      if (scenario === 'bad-json') result.stdout = 'invalid';
+      if (scenario === 'wrong-identity') result.stdout = JSON.stringify([{ pid: 101, startedAt: '2020-01-01T00:00:00Z' }]);
+      if (scenario === 'unrelated-stopped') result.stdout = JSON.stringify([{ pid: 101, startedAt: timestamp }, { pid: 102 }]);
+      const run = runNativePhases(evidence, () => snapshots.push(structuredClone(evidence)), [
+        ['first-production-identity', () => {
+          if (firstFailed) throw firstFailure;
+          evidence.startedAtMs = Date.parse(timestamp);
+        }],
+        ['diagnostic-production-repeat-1', () => { evidence.probes = [{ stdout: JSON.stringify({ startedAtMs: Date.parse(timestamp) }) }]; }],
+        ['owned-teardown', () => teardownOwnedProcesses('/isolated', evidence, {})],
+        ...nativeTeardownPhases(evidence, children, () => Promise.resolve()),
+      ]);
+      if (scenario === 'pass') await run;
+      else await assert.rejects(run, error => firstFailed ? error === firstFailure
+        : scenario === 'teardown-failed' ? error === teardownFailure : error instanceof Error);
+      assert.equal(evidence.teardown.stderr, result.stderr, scenario);
+      assert.deepEqual(checked, [process.pid, 102, 103], scenario);
+      assert.ok(evidence.phases.every(phase => phase.state !== 'running'), scenario);
+      assert.deepEqual(evidence.phases.slice(-3).map(phase => phase.state),
+        [process.pid, 102, 103].map(pid => pid === deadPid ? 'failed' : 'passed'), scenario);
+      assert.equal(evidence.phases.find(phase => phase.label === 'first-identity-matches-teardown').state,
+        firstFailed || ['teardown-failed', 'bad-json', 'wrong-identity'].includes(scenario) ? 'failed' : 'passed', scenario);
+      if (firstFailed) assert.equal(evidence.startedAtMs, undefined, 'Repeat success cannot replace first identity');
+      assert.equal(snapshots.at(-1).phases.at(-1).state, evidence.phases.at(-1).state);
+    }
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
 // Retain the coordinator's 90s outer watchdog to include diagnostics and teardown;
 // no 30s identity retry. Production itself has a 2.5s PowerShell query deadline.
 test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 90000 }, async t => {
@@ -387,69 +545,66 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
     if (evidencePath) writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + '\n');
   };
   const children = [];
+  let originalError;
+  let startedAtMs;
+  let exited;
+  let bun;
   try {
-    flush();
-    const ready = [];
-    for (const name of ['fake-opencode.cjs', 'unrelated-helper.cjs', 'fake-opencode.cjs unrelated-helper.cjs']) {
-      const script = path.join(root, name);
-      writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
-      const child = spawn(process.execPath, [script], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
-      children.push(child);
-      evidence.children.push({ pid: child.pid, executable: process.execPath, argv: [script] });
-      ready.push(Promise.all([
-        once(child, 'spawn'),
-        once(child.stdout, 'data', { signal: AbortSignal.timeout(5000) }),
-      ]));
-    }
-    await Promise.all(ready);
-    flush();
-    const [child, unrelated, sharedPrefix] = children;
-    const bun = existingBun();
-    assert.ok(bun, 'Existing Bun required; this test never installs it');
-    // Execute the unchanged production helper inside an isolated Bun process:
-    // same bare powershell.exe, arguments, async spawn, ignored stdin/stderr,
-    // hidden window and 2500ms deadline used by OpenCodeHostManager. The outer
-    // 10s bound includes Bun startup; it does not extend the identity deadline.
-    const processKill = path.join(repository, 'src/utils/processKill.ts');
-    const program = `
-      const { readProcessStartTimeMs } = await import(${JSON.stringify(processKill)});
-      console.error(JSON.stringify({ phase: 'before-production-query', bunVersion: Bun.version }));
-      console.log(JSON.stringify({ startedAtMs: await readProcessStartTimeMs(${child.pid}) }));
-    `;
-    const query = recordWindowsProbe(evidence, flush, 'production-identity', bun, ['--eval', program],
-      { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
-    let startedAtMs;
-    try { startedAtMs = JSON.parse(query.stdout).startedAtMs; } catch { /* retained raw evidence below */ }
-    if (query.error || query.status !== 0 || !Number.isFinite(startedAtMs)) {
-      diagnoseWindowsStartup(evidence, flush, env, root, child.pid);
-      assert.fail(`Production Windows process identity failed: ${JSON.stringify(query)}`);
-    }
-    evidence.startedAtMs = startedAtMs;
-    const exited = once(child, 'exit', { signal: AbortSignal.timeout(35000) });
-    // Attach the rejection handler before synchronous teardown blocks the loop.
-    exited.catch(() => {});
-    teardownOwnedProcesses(root, evidence, env);
-    assert.match(evidence.teardown.stderr, /teardown: after identity validation pid=/);
-    assert.match(evidence.teardown.stderr, /teardown: after wait for exit pid=/);
-    assert.match(evidence.teardown.stderr, /teardown: after JSON output/);
-    await exited;
-    const stopped = JSON.parse(evidence.teardown.stdout);
-    assert.ok(stopped.some(entry => entry.pid === child.pid));
-    assert.equal(Date.parse(stopped.find(entry => entry.pid === child.pid).startedAt), startedAtMs,
-      'teardown must identify the same process creation time as production');
-    assert.ok(stopped.every(entry => entry.pid !== process.pid && entry.pid !== unrelated.pid && entry.pid !== sharedPrefix.pid));
-    assert.equal(process.kill(process.pid, 0), true, 'parent Node remains alive');
-    assert.equal(process.kill(unrelated.pid, 0), true, 'Node running another script remains alive');
-    assert.equal(process.kill(sharedPrefix.pid, 0), true, 'Node running the quoted shared-prefix script remains alive');
-    evidence.survivingUnrelatedPids = [unrelated.pid, sharedPrefix.pid];
+    await runNativePhases(evidence, flush, [
+      ['fixture-startup', async () => {
+        const ready = [];
+        for (const name of ['fake-opencode.cjs', 'unrelated-helper.cjs', 'fake-opencode.cjs unrelated-helper.cjs']) {
+          const script = path.join(root, name);
+          writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+          const child = spawn(process.execPath, [script], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+          children.push(child);
+          evidence.children.push({ pid: child.pid, executable: process.execPath, argv: [script] });
+          ready.push(Promise.all([
+            once(child, 'spawn'),
+            once(child.stdout, 'data', { signal: AbortSignal.timeout(5000) }),
+          ]));
+        }
+        await Promise.all(ready);
+        bun = existingBun();
+      }],
+      ['first-production-identity', () => {
+        const query = productionIdentityProbe(evidence, flush, bun, env, root, children[0]?.pid, 1);
+        try { startedAtMs = JSON.parse(query.stdout).startedAtMs; } catch { /* retained raw evidence */ }
+        assert.ok(!query.error && query.status === 0 && Number.isFinite(startedAtMs),
+          `Production Windows process identity failed: ${JSON.stringify(query)}`);
+        evidence.startedAtMs = startedAtMs;
+      }],
+      // Collect repeats before PowerShell controls warm the runner further. Each
+      // keeps the production 2.5s query deadline and existing 10s Bun outer bound.
+      ['diagnostic-production-repeat-1', () => {
+        productionIdentityProbe(evidence, flush, bun, env, root, children[0]?.pid, 2);
+      }],
+      ['diagnostic-startup-controls', () => {
+        if (!Number.isFinite(evidence.startedAtMs) && children[0]?.pid) {
+          diagnoseWindowsStartup(evidence, flush, env, root, children[0].pid);
+        }
+      }],
+      ['owned-teardown', () => {
+        const child = children[0];
+        if (child?.pid) {
+          exited = once(child, 'exit', { signal: AbortSignal.timeout(35000) });
+          exited.catch(() => {});
+        }
+        // Always use the existing exact-ownership/held-handle implementation,
+        // even when first identity or diagnostics failed. Never use a repeat PID identity.
+        teardownOwnedProcesses(root, evidence, env);
+      }],
+      ...nativeTeardownPhases(evidence, children, () => exited),
+    ]);
     evidence.passed = true;
   } catch (error) {
+    originalError = error;
     evidence.error = error.stack || String(error);
-    throw error;
   } finally {
     const cleanup = await Promise.allSettled(children.map(async child => {
       if (child.pid && child.exitCode === null && child.signalCode === null) {
         const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+        exited.catch(() => {});
         child.kill(); // only the ChildProcess handle created in this test
         await exited;
       }
@@ -460,6 +615,7 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
     if (evidence.cleanupErrors.length) evidence.passed = false;
     flush();
     if (!evidence.passed) t.diagnostic(JSON.stringify(evidence));
-    assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
   }
+  if (originalError) throw originalError;
+  assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
 });
