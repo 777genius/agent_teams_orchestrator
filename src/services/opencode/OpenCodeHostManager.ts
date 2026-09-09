@@ -184,6 +184,7 @@ export type OpenCodePersistentHostReconcileResult = {
       | 'disposed'
       | 'removed_dead'
       | 'kept_active'
+      | 'kept_pending_oauth'
       | 'kept_leased'
       | 'kept_recent'
       | 'kept_filtered'
@@ -994,9 +995,39 @@ export class OpenCodeHostManager {
     await this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const previous = registry.hosts[handle.hostKey]
+      if (previous && await this.hasPendingOAuthHost(handle.hostKey)
+        && (previous.pid !== handle.pid || previous.processStartedAtMs !== handle.processStartedAtMs)) {
+        throw new Error('OpenCode host owns a pending OAuth publication')
+      }
       registry.hosts[handle.hostKey] = this.buildPersistentHostRecord(handle, previous)
       await this.writePersistentRegistryUnlocked(registry)
     })
+  }
+
+  // Registry lifetime follows the admitted OAuth operation, including ordinary
+  // child exit and stale cleanup. This preserves evidence; it never grants
+  // recovery authority when birth/run/session/lease comparisons fail.
+  private async hasPendingOAuthHost(hostKey: string, lease?: OpenCodeHostLeaseInput): Promise<boolean> {
+    if (!this.persistentRegistryPath) return false
+    try {
+      const receipt = JSON.parse(await readFile(path.join(path.dirname(this.persistentRegistryPath),
+        'auth.json.agent-teams-xai-oauth-save.json'), 'utf8'))
+      if (receipt?.version !== 1 || typeof receipt.operationId !== 'string'
+        || !receipt.owner || !('successor' in receipt)) {
+        throw new Error('OpenCode pending OAuth cleanup owner is invalid')
+      }
+      if (lease) {
+        const owner = receipt.nativeSession?.record
+        return owner?.hostKey === hostKey && owner.teamId === lease.teamId
+          && owner.laneId === (lease.laneId?.trim() || 'primary') && owner.memberName === lease.memberName
+          && owner.runId === lease.runId && owner.opencodeSessionId === lease.sessionId
+      }
+      return receipt.nativeSession?.record?.hostKey === hostKey
+        || receipt.nativeProbe?.hostKey === hostKey
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return false
+      throw error // Corrupt/unreadable ownership must not authorize cleanup.
+    }
   }
 
   private async removePersistentHost(
@@ -1015,6 +1046,7 @@ export class OpenCodeHostManager {
           || record.processStartedAtMs !== expectedIdentity.startedAtMs))) {
         return
       }
+      if (await this.hasPendingOAuthHost(hostKey)) return
       delete registry.hosts[hostKey]
       if (Object.keys(registry.hosts).length === 0) {
         await unlink(registryPath).catch(() => undefined)
@@ -1160,6 +1192,7 @@ export class OpenCodeHostManager {
       // caller supplying only one identity cannot release a lease qualified by both.
       if ((lease.runId && (!expectedRunId || lease.runId !== expectedRunId))
         || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return false
+      if (await this.hasPendingOAuthHost(hostKey, input)) return false
       delete leases[leaseKey]
       registry.hosts[hostKey] = {
         ...record,
@@ -1607,7 +1640,7 @@ export class OpenCodeHostManager {
         const result = await operation()
         // The callback returns terminal CAS evidence. A rejected CAS leaves the
         // exact dead registry record and its leases intact for the winner.
-        if (registered && result != null && result !== false) {
+        if (registered && result != null && result !== false && !await this.hasPendingOAuthHost(record.hostKey)) {
           delete registry.hosts[record.hostKey]
           await writeJsonFileAtomic(registryPath, registry, { indent: 2 })
         }
@@ -1952,7 +1985,7 @@ export class OpenCodeHostManager {
         // Delete only the exact record we terminated; a concurrent startup or
         // registry writer must not have its replacement removed.
         const current = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
-        if (current && current.pid === record.pid
+        if (current && !await this.hasPendingOAuthHost(hostKey) && current.pid === record.pid
           && current.processStartedAtMs === record.processStartedAtMs) {
           const latest = await this.readPersistentRegistryUnlocked()
           delete latest.hosts[hostKey]
@@ -2027,13 +2060,14 @@ export class OpenCodeHostManager {
         : null
 
       for (const [hostKey, record] of Object.entries(registry.hosts)) {
+        const pendingOAuth = await this.hasPendingOAuthHost(hostKey)
         const leases = normalizePersistentHostLeases(record.leases)
         let droppedStaleLeaseCount = 0
         const dropStaleLeases = (
           staleAgeMs: number | null | undefined,
           predicate: (lease: PersistentHostLeaseRecord) => boolean,
         ): number => {
-          if (force || typeof staleAgeMs !== 'number' || staleAgeMs <= 0) {
+          if (pendingOAuth || force || typeof staleAgeMs !== 'number' || staleAgeMs <= 0) {
             return 0
           }
           let dropped = 0
@@ -2108,6 +2142,28 @@ export class OpenCodeHostManager {
         }
 
         try {
+          if (pendingOAuth) {
+            // Retention is evidence lifetime, never a liveness assertion or a
+            // veto of an explicit Stop. The normal identity-checked terminator
+            // still refuses a reused/unverified PID; keep the original record
+            // and leases even after a successful force stop.
+            let reason = 'pending OAuth publication retains exact owner evidence; liveness not asserted'
+            if (force) {
+              try {
+                await this.terminatePersistentHostRecord(record, { force: true })
+                reason = 'owned process stopped; pending OAuth publication retains exact owner evidence'
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                diagnostics.push(`Failed to stop pending OpenCode host ${hostKey}: ${message}`)
+                hosts.push({ hostKey, projectPath: record.projectPath, pid: record.pid, port: record.port,
+                  action: 'failed', reason: message, leaseCount })
+                continue
+              }
+            }
+            hosts.push({ hostKey, projectPath: record.projectPath, pid: record.pid, port: record.port,
+              action: 'kept_pending_oauth', reason, leaseCount })
+            continue
+          }
           if (!this.isProcessAlive(record.pid)) {
             delete registry.hosts[hostKey]
             cleaned += 1

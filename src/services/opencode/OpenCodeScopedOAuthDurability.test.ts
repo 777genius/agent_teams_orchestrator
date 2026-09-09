@@ -9,7 +9,7 @@ import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehavio
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
-import { readOpenCodeAuthCredential, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
+import { readOpenCodeAuthCredential, readOpenCodeSavedAuthStore, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import type { OpenCodeHostHandle, OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
 
 const c0 = { type: 'oauth', access: 'synthetic-access-0', refresh: 'single-use-0', expires: 1000, accountId: 'test-account' }
@@ -21,6 +21,9 @@ describe('scoped OAuth native durability integration', () => {
   let now: number
   const manager = new OpenCodeProfileManager()
   const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, providerId: 'xai' })
+  const readSaved = async (global = path.join(env.CLAUDE_MULTIMODEL_DATA_HOME!, 'opencode', 'auth.json')) =>
+    (await readOpenCodeSavedAuthStore({ globalAuthPath: global, sourceAuthPaths: [global,
+      path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'), path.join(env.HOME!, '.local', 'share', 'opencode', 'auth.json')] })).xai ?? null
   const save = (authPath: string, credential: typeof c0) => upsertOpenCodeAuthCredential({ authPath, providerId: 'xai', credential })
   const prepare = async () => manager.prepareProfile(project, {
     profileScope: await resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env }),
@@ -94,7 +97,7 @@ describe('scoped OAuth native durability integration', () => {
       .toEqual({ checked: true, refreshed: true })
     expect(seen[0]).not.toBe(launch.managedAuthPath)
     expect(await read(launch.managedAuthPath)).toEqual(c0)
-    expect(await read(manager.getGlobalAuthPath())).toEqual(c1)
+    expect(await readSaved()).toEqual(c1)
     const script = `import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))};
       import { readOpenCodeAuthCredential } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeAuthStore.ts'))};
       const projectPath = process.argv[1];
@@ -113,7 +116,7 @@ describe('scoped OAuth native durability integration', () => {
     now = c1.expires + 1
     expect(await coordinator.ensureFreshForPrompt({ selectedModel: 'xai/grok-4.3', projectPath: project, profile: nextLaunch }))
       .toEqual({ checked: true, refreshed: true })
-    expect(await read(manager.getGlobalAuthPath())).toEqual(c2)
+    expect(await readSaved()).toEqual(c2)
     expect(consumed.size).toBe(2)
   })
 
@@ -123,7 +126,7 @@ describe('scoped OAuth native durability integration', () => {
     await expect(coordinator.ensureFreshForPrompt({ selectedModel: 'xai/grok-4.3', projectPath: project, profile: launch }))
       .rejects.toThrow()
     expect(consumed.size).toBe(1)
-    expect(await read(manager.getGlobalAuthPath())).toEqual(c1)
+    expect(await readSaved()).toEqual(c1)
     const reopened = await prepare()
     expect(await read(reopened.managedAuthPath)).toEqual(c1)
   })
@@ -176,7 +179,7 @@ describe('scoped OAuth native durability integration', () => {
         }, releaseHost: async () => {},
       },
       clientFactory: { create: () => ({ createSession: async () => {
-        expect(await read(manager.getGlobalAuthPath())).toEqual(c1)
+        expect(await readSaved()).toEqual(c1)
         return { id: 'fresh-session' }
       } }) as never },
     })
@@ -258,7 +261,7 @@ describe('scoped OAuth native durability integration', () => {
         : bridge.promptAsync(record, { text: 'TEST failing native rotation' })
       await expect(action).rejects.toThrow(nativeTerminal ? 'TEST response lost after consumption' : 'settlement is unconfirmed')
       if (!nativeTerminal) {
-        expect(await read(manager.getGlobalAuthPath())).toEqual(c0)
+        expect(await readSaved()).toEqual(c0)
         expect(await Bun.file(`${manager.getGlobalAuthPath()}.agent-teams-xai-oauth-save.json`).exists()).toBe(true)
         nativeTerminal = true
         await expect(bridge.sendMessage(record, { text: 'recover then reject old seal' })).rejects.toThrow('relaunch')
@@ -277,7 +280,7 @@ describe('scoped OAuth native durability integration', () => {
       await completeAcceptedNative!()
       await expect(bridge.sendMessage(record, { text: 'old seal after completion' })).rejects.toThrow('relaunch')
     }
-    expect(await read(manager.getGlobalAuthPath())).toEqual(c1)
+    expect(await readSaved()).toEqual(c1)
     expect(record).toEqual(sealed)
     expect(stored).toEqual(sealed)
     await expect(bridge.sendMessage(record, { text: 'old run must not send' })).rejects.toThrow('relaunch')
@@ -303,7 +306,7 @@ describe('scoped OAuth native durability integration', () => {
     // bytes in the old scope. Keep this rejection until owned recovery exists.
     const reopened = await prepare()
     expect(await read(reopened.managedAuthPath)).toEqual(c1)
-    expect(await read(manager.getGlobalAuthPath())).toEqual(c1)
+    expect(await readSaved()).toEqual(c1)
   })
 
   test('saved destination and probe environment use captured data root after ambient source switch', async () => {
@@ -315,7 +318,7 @@ describe('scoped OAuth native durability integration', () => {
     const before = await readFile(foreignGlobal, 'utf8')
     const { coordinator } = engine()
     await coordinator.ensureFreshForPrompt({ selectedModel: 'xai/grok-4.3', projectPath: project, profile: launch })
-    expect(await read(global)).toEqual(c1)
+    expect(await readSaved(global)).toEqual(c1)
     expect(await readFile(foreignGlobal, 'utf8')).toBe(before)
   })
 })

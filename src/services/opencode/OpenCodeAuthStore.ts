@@ -59,10 +59,75 @@ type OpenCodeOAuthSaveReceipt = {
   successor: OpenCodeAuthCredential | null
   nativeSession?: OpenCodeOAuthNativeSessionOwner
   nativeProbe?: OpenCodeOAuthNativeProbeOwner
+  authorityBefore?: OpenCodeOAuthSuccessorAuthority | null
 }
 
 function oauthSaveReceiptPath(globalAuthPath: string): string {
   return `${globalAuthPath}.agent-teams-xai-oauth-save.json`
+}
+
+// This file is exclusively app-written under the existing auth coordination
+// lock. Native auth.json files are inputs, never publication destinations.
+// Its condition is checked on every fresh read, so an independent native
+// replacement cannot be overwritten or silently shadowed by our publication.
+type OpenCodeOAuthSuccessorAuthority = {
+  version: 1
+  operationId: string
+  sourceAuthPaths: string[]
+  before: Array<OpenCodeAuthCredential | null>
+  predecessor: OpenCodeAuthCredential
+  successor: OpenCodeAuthCredential
+}
+
+export function openCodeOAuthSuccessorPath(globalAuthPath: string): string {
+  return `${globalAuthPath}.agent-teams-xai-oauth-successor.json`
+}
+
+function validSuccessorAuthority(value: OpenCodeOAuthSuccessorAuthority): boolean {
+  return !!value && value.version === 1 && typeof value.operationId === 'string'
+    && Array.isArray(value.sourceAuthPaths) && value.sourceAuthPaths.every(p => typeof p === 'string' && path.isAbsolute(p))
+    && new Set(value.sourceAuthPaths).size === value.sourceAuthPaths.length
+    && Array.isArray(value.before) && value.before.length === value.sourceAuthPaths.length
+    && value.before.some(isValidOpenCodeOAuthCredential)
+    && value.before.every(c => c === null || (isValidOpenCodeOAuthCredential(c)
+      && c.accountId === value.predecessor?.accountId
+      && isDeepStrictEqual(c, value.before.find(entry => entry !== null))))
+    && isValidOpenCodeOAuthCredential(value.predecessor) && isValidOpenCodeOAuthCredential(value.successor)
+    && value.predecessor.accountId === value.successor.accountId
+}
+
+async function readSuccessorAuthority(globalAuthPath: string): Promise<OpenCodeOAuthSuccessorAuthority | null> {
+  const value = await readOptionalJson(openCodeOAuthSuccessorPath(globalAuthPath)) as OpenCodeOAuthSuccessorAuthority | null
+  if (value !== null && (!validSuccessorAuthority(value)
+    || !value.sourceAuthPaths.includes(globalAuthPath)
+    || value.sourceAuthPaths.some(p => resolveOpenCodeAuthCoordinationPath(p) !== path.resolve(p)))) throw new Error('OpenCode OAuth saved successor authority is invalid')
+  return value
+}
+
+function matchesSuccessorSources(authority: OpenCodeOAuthSuccessorAuthority,
+  paths: readonly string[], stores: readonly OpenCodeAuthStore[]): boolean {
+  return isDeepStrictEqual(authority.sourceAuthPaths, paths)
+    && stores.every((store, index) => isDeepStrictEqual(store.xai ?? null, authority.before[index]))
+}
+
+export async function readOpenCodeSavedAuthStore(input: {
+  sourceAuthPaths: readonly string[]
+  globalAuthPath: string
+  sourceStores?: readonly OpenCodeAuthStore[]
+}): Promise<OpenCodeAuthStore> {
+  const stores = input.sourceStores ?? await Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore))
+  const merged = mergeOpenCodeManagedAuthSources({ ...input, sourceStores: stores })
+  const authority = await readSuccessorAuthority(input.globalAuthPath)
+  if (authority) {
+    if (matchesSuccessorSources(authority, input.sourceAuthPaths, stores)) merged.xai = authority.successor
+    else if (merged.xai && (authority.before.some(c => isDeepStrictEqual(c, merged.xai))
+      || isDeepStrictEqual(authority.predecessor, merged.xai))) {
+      // A conflicting source can make the legacy expiry merge pick consumed
+      // C0. Revocation is not permission to reuse that predecessor.
+      throw new Error('OpenCode OAuth saved successor source was revoked; use fresh authentication')
+    }
+  }
+  return merged
 }
 
 function revokedOAuthAdmissionPath(globalAuthPath: string, predecessor: OpenCodeOAuthCredential): string {
@@ -112,8 +177,13 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
       || !isValidOpenCodeOAuthCredential(receipt.predecessor)
       || (receipt.successor === null ? (!!receipt.nativeSession === !!receipt.nativeProbe) : !isValidOpenCodeOAuthCredential(receipt.successor))
       || (receipt.successor !== null && receipt.predecessor.accountId !== receipt.successor.accountId)
-      || !receipt.before.some(c => isDeepStrictEqual(c, receipt.predecessor))
-      || receipt.before.some(c => c !== null && !isDeepStrictEqual(c, receipt.predecessor))) {
+      || (receipt.authorityBefore != null && !validSuccessorAuthority(receipt.authorityBefore))
+      || (!(receipt.before.some(c => isDeepStrictEqual(c, receipt.predecessor))
+        && receipt.before.every(c => c === null || isDeepStrictEqual(c, receipt.predecessor)))
+        && !(receipt.authorityBefore
+          && isDeepStrictEqual(receipt.authorityBefore.successor, receipt.predecessor)
+          && isDeepStrictEqual(receipt.authorityBefore.before, receipt.before)
+          && isDeepStrictEqual(receipt.authorityBefore.sourceAuthPaths, receipt.sourceAuthPaths)))) {
       throw new Error('OpenCode OAuth pending saved publication owner is invalid')
     }
     if (input.sessionToRelease) {
@@ -127,7 +197,6 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
           || native.hostKey !== requested.hostKey || native.opencodeSessionId !== requested.opencodeSessionId) return false
       }
     }
-    const localPaths = receipt.sourceAuthPaths.filter(p => p !== input.globalAuthPath).sort()
     if (receipt.sourceAuthPaths.some(p => resolveOpenCodeAuthCoordinationPath(p) !== path.resolve(p))) {
       throw new Error('OpenCode OAuth pending saved publication has a scoped destination')
     }
@@ -158,8 +227,16 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
     const publish = async (): Promise<boolean> => {
       const current = await Promise.all(receipt.sourceAuthPaths.map(readOpenCodeAuthStore))
       const matches = (credential: OpenCodeAuthCredential | undefined, index: number) =>
-        receipt.before[index] === null ? credential === undefined
-          : isDeepStrictEqual(credential, receipt.predecessor) || isDeepStrictEqual(credential, receipt.successor)
+        isDeepStrictEqual(credential ?? null, receipt.before[index])
+      const authority = await readSuccessorAuthority(input.globalAuthPath)
+      const alreadyPublished = authority?.operationId === receipt.operationId
+        && isDeepStrictEqual(authority.predecessor, receipt.predecessor)
+        && isDeepStrictEqual(authority.successor, receipt.successor)
+        && isDeepStrictEqual(authority.before, receipt.before)
+        && isDeepStrictEqual(authority.sourceAuthPaths, receipt.sourceAuthPaths)
+      if (!alreadyPublished && !isDeepStrictEqual(authority, receipt.authorityBefore ?? null)) {
+        return retireRevokedPublication()
+      }
       if (current.some((store, index) => !matches(store.xai, index))) {
         // A new login, logout or account/source replacement supersedes this
         // completion. Discard only the old receipt, never the current authority.
@@ -231,31 +308,23 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
       if (!isDeepStrictEqual(native, receipt.successor)) {
         throw new Error('OpenCode OAuth pending native result changed')
       }
-      for (let index = 0; index < receipt.sourceAuthPaths.length; index += 1) {
-        if (receipt.before[index] === null) continue
-        await input.assertOwner(receipt.owner, receipt.predecessor, receipt.managedAuthPath)
-        const store = await readOpenCodeAuthStore(receipt.sourceAuthPaths[index])
-        if (!matches(store.xai, index)) {
-          throw new Error('OpenCode OAuth pending saved publication was superseded')
-        }
-        if (!isDeepStrictEqual(store.xai, receipt.successor)) {
-          await writeOpenCodeAuthStore(receipt.sourceAuthPaths[index], { ...store, xai: receipt.successor })
-        }
+      await input.assertOwner(receipt.owner, receipt.predecessor, receipt.managedAuthPath)
+      const saved = await Promise.all(receipt.sourceAuthPaths.map(readOpenCodeAuthStore))
+      if (saved.some((store, index) => !matches(store.xai, index))) {
+        throw new Error('OpenCode OAuth pending saved publication was superseded')
       }
-      const stores = await Promise.all(receipt.sourceAuthPaths.map(readOpenCodeAuthStore))
-      if (stores.some((store, index) => receipt.before[index] === null ? store.xai !== undefined
-        : !isDeepStrictEqual(store.xai, receipt.successor))
-        || !isDeepStrictEqual(mergeOpenCodeManagedAuthSources({ sourceAuthPaths: receipt.sourceAuthPaths,
-        sourceStores: stores, globalAuthPath: input.globalAuthPath }).xai, receipt.successor)) {
+      await writeJsonFileAtomic(openCodeOAuthSuccessorPath(input.globalAuthPath), {
+        version: 1, operationId: receipt.operationId, sourceAuthPaths: receipt.sourceAuthPaths,
+        before: receipt.before, predecessor: receipt.predecessor, successor: receipt.successor,
+      }, { mode: 0o600 })
+      if (!isDeepStrictEqual((await readOpenCodeSavedAuthStore(input)).xai, receipt.successor)) {
         throw new Error('OpenCode OAuth recovered successor was not selected')
       }
       await input.assertOwner(receipt.owner, receipt.predecessor, receipt.managedAuthPath)
       await rm(receiptPath)
       return true
     }
-    const lock = (index: number): Promise<boolean> => index < localPaths.length
-      ? withAuthStoreWriteLock(localPaths[index], () => lock(index + 1)) : publish()
-    return lock(0)
+    return publish()
   })
 }
 
@@ -337,7 +406,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
     recoveryOwner: input.recoveryOwner ? structuredClone(input.recoveryOwner) : undefined,
   }
   const providerId = normalizeProviderId(input.providerId)
-  if (!providerId || !isValidOpenCodeOAuthCredential(input.predecessor)) {
+  if (providerId !== 'xai' || !isValidOpenCodeOAuthCredential(input.predecessor)) {
     throw new Error('OpenCode owned refresh requires a valid OAuth predecessor')
   }
   // Copy before awaiting: callers cannot replace an expectation during a read.
@@ -354,13 +423,8 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
     await input.assertOwnership()
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   }
-  // The app lock is always outermost, matching profile preparation/login. Local
-  // saved sources use the existing writer locks too; no peer roots are read.
-  const lockPaths = [input.globalAuthPath,
-    ...sourceAuthPaths.filter(p => p !== input.globalAuthPath).sort()]
-  const lock = (index: number): Promise<T> => index < lockPaths.length
-    ? withAuthStoreWriteLock(lockPaths[index], () => lock(index + 1), input.abortSignal)
-    : run()
+  // Only the app-owned successor is published. Native source writers need not
+  // cooperate with this lock, because their files are never overwritten.
   const run = async (): Promise<T> => {
     await check()
     if (input.recoveryOwner && await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) {
@@ -371,25 +435,23 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
       throw new Error('OpenCode OAuth predecessor has a revoked pending native admission; use fresh authentication')
     }
     const before = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
-    const selected = mergeOpenCodeManagedAuthSources({
+    const authorityBefore = await readSuccessorAuthority(input.globalAuthPath)
+    const selected = (await readOpenCodeSavedAuthStore({
       sourceAuthPaths, sourceStores: before, globalAuthPath: input.globalAuthPath,
-    })[providerId]
+    }))[providerId]
     const managed = await readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId })
     if (!isDeepStrictEqual(selected, predecessor) || !isDeepStrictEqual(managed, predecessor)) {
       throw new Error('OpenCode OAuth predecessor changed before native execution')
     }
-    // Saved copies of precisely C0 form this authority. A different credential
-    // is a source/account conflict even when its expiry would lose the merge.
-    // Updating exact copies is necessary for equal/lower-expiry C1 to win fresh
-    // resolution, and does not authorize replacing any other saved credential.
-    const ownerIndices = before.flatMap((store, index) => {
-      const credential = store[providerId]
-      if (credential && !isDeepStrictEqual(credential, predecessor)) {
-        throw new Error('OpenCode OAuth saved sources disagree')
-      }
-      return credential ? [index] : []
-    })
-    if (!ownerIndices.length) throw new Error('OpenCode OAuth saved owner is missing')
+    // An existing app successor proves the selected predecessor even though
+    // native sources still contain the original C0. Otherwise every saved
+    // selected-provider entry must be an exact copy of the predecessor.
+    const inherited = authorityBefore && matchesSuccessorSources(authorityBefore, sourceAuthPaths, before)
+      && isDeepStrictEqual(authorityBefore.successor, predecessor)
+    if (!inherited && (before.every(store => !store[providerId])
+      || before.some(store => store[providerId] && !isDeepStrictEqual(store[providerId], predecessor)))) {
+      throw new Error('OpenCode OAuth saved sources disagree or owner is missing')
+    }
     await check()
     let nativeReceipt: OpenCodeOAuthSaveReceipt | null = null
     const armNativeOwner = async (native: Pick<OpenCodeOAuthSaveReceipt, 'nativeSession' | 'nativeProbe'>) => {
@@ -411,7 +473,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
         version: 1, operationId: randomUUID(), owner: input.recoveryOwner,
         globalAuthPath: input.globalAuthPath, managedAuthPath: input.managedAuthPath,
         sourceAuthPaths, before: before.map(store => store[providerId] ?? null), predecessor,
-        successor: null, ...structuredClone(native),
+        successor: null, authorityBefore, ...structuredClone(native),
       }
       await writeJsonFileAtomic(oauthSaveReceiptPath(input.globalAuthPath), nativeReceipt, { mode: 0o600 })
       try {
@@ -471,43 +533,32 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
       if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
       return value
     }
-    const next = current.map((store, index) => ownerIndices.includes(index)
-      ? { ...store, [providerId]: successor } : store)
-    const nextSelected = mergeOpenCodeManagedAuthSources({
-      sourceAuthPaths, sourceStores: next, globalAuthPath: input.globalAuthPath,
-    })[providerId]
-    if (!isDeepStrictEqual(nextSelected, successor)) {
-      throw new Error('OpenCode OAuth successor would not be selected on reopen')
-    }
+    const operationId = nativeReceipt?.operationId ?? randomUUID()
     if (input.recoveryOwner) {
       if (providerId !== 'xai') throw new Error('OpenCode owned save recovery supports xAI only')
       const receipt: OpenCodeOAuthSaveReceipt = {
-        version: 1, operationId: nativeReceipt?.operationId ?? randomUUID(), owner: structuredClone(input.recoveryOwner),
+        version: 1, operationId, owner: structuredClone(input.recoveryOwner),
         globalAuthPath: input.globalAuthPath, managedAuthPath: input.managedAuthPath,
         sourceAuthPaths, before: before.map(store => store[providerId] ?? null),
-        predecessor, successor,
+        predecessor, successor, authorityBefore,
+        ...(nativeReceipt?.nativeSession ? { nativeSession: nativeReceipt.nativeSession } : {}),
+        ...(nativeReceipt?.nativeProbe ? { nativeProbe: nativeReceipt.nativeProbe } : {}),
       }
       await writeJsonFileAtomic(oauthSaveReceiptPath(input.globalAuthPath), receipt, { mode: 0o600 })
     }
     await input.assertOwnership()
-    for (const index of ownerIndices) {
-      // Scope/auth identity necessarily changes at the first publication. Do
-      // not reinterpret the old token as a successor token during this loop.
-      await input.assertPublicationOwnership?.()
-      // Re-read immediately before each atomic write. Unrelated provider edits
-      // are retained; a changed selected-provider entry is never overwritten.
-      const store = await readOpenCodeAuthStore(sourceAuthPaths[index])
-      if (!isDeepStrictEqual(store[providerId], predecessor)) {
-        throw new Error('OpenCode OAuth saved predecessor changed before publication')
-      }
-      await writeOpenCodeAuthStore(sourceAuthPaths[index], { ...store, [providerId]: successor })
+    await input.assertPublicationOwnership?.()
+    const saved = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
+    if (saved.some((store, index) => !isDeepStrictEqual(store[providerId], before[index][providerId]))
+      || !isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), authorityBefore)) {
+      throw new Error('OpenCode OAuth saved predecessor changed before publication')
     }
-    const persisted = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
-    if (persisted.some((store, index) => !isDeepStrictEqual(store[providerId],
-      ownerIndices.includes(index) ? successor : before[index][providerId]))
-      || !isDeepStrictEqual(mergeOpenCodeManagedAuthSources({
-      sourceAuthPaths, sourceStores: persisted, globalAuthPath: input.globalAuthPath,
-    })[providerId], successor)) {
+    await writeJsonFileAtomic(openCodeOAuthSuccessorPath(input.globalAuthPath), {
+      version: 1, operationId, sourceAuthPaths, before: before.map(store => store[providerId] ?? null),
+      predecessor, successor,
+    }, { mode: 0o600 })
+    if (!isDeepStrictEqual((await readOpenCodeSavedAuthStore({ sourceAuthPaths,
+      globalAuthPath: input.globalAuthPath }))[providerId], successor)) {
       throw new Error('OpenCode OAuth successor publication was superseded')
     }
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
@@ -515,7 +566,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
     if (input.recoveryOwner) await rm(oauthSaveReceiptPath(input.globalAuthPath))
     return value
   }
-  return lock(0)
+  return withAuthStoreWriteLock(input.globalAuthPath, run, input.abortSignal)
 }
 
 async function readOptionalJson(filePath: string): Promise<unknown | null> {
@@ -524,7 +575,10 @@ async function readOptionalJson(filePath: string): Promise<unknown | null> {
     if (!raw.trim()) {
       return {}
     }
-    return JSON.parse(raw) as unknown
+    const value: unknown = JSON.parse(raw)
+    // JSON null is present corrupt evidence, not a missing receipt/fence.
+    if (value === null) throw new Error('OpenCode auth JSON is invalid: null')
+    return value
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
       return null

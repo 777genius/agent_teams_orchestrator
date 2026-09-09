@@ -42,6 +42,7 @@ import {
   fanOutOpenCodeOAuthCredential,
   materializeOpenCodeSelectedAuthCredential,
   mergeOpenCodeManagedAuthSources,
+  readOpenCodeSavedAuthStore,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
@@ -2507,11 +2508,14 @@ async function readSelectedAuthFromSources(input: {
   let selected: Awaited<ReturnType<typeof readOpenCodeAuthCredential>> = null
   try {
     const sourceStores = await Promise.all(input.sourcePaths.map(readOpenCodeAuthStore))
-    const merged = mergeOpenCodeManagedAuthSources({
+    const sources = {
       sourceAuthPaths: input.sourcePaths,
       sourceStores,
       globalAuthPath: input.globalAuthPath,
-    })
+    }
+    const merged = input.providerId === 'xai'
+      ? await readOpenCodeSavedAuthStore(sources)
+      : mergeOpenCodeManagedAuthSources(sources)
     selected = merged[input.providerId] ?? null
     return { credential: selected, identity: authCredentialIdentity(input.providerId, selected) }
   } catch {

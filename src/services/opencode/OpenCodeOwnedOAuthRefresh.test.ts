@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import {
-  readOpenCodeAuthCredential, upsertOpenCodeAuthCredential,
+  readOpenCodeAuthCredential, readOpenCodeSavedAuthStore, upsertOpenCodeAuthCredential,
   withOpenCodeOwnedOAuthRefresh,
 } from './OpenCodeAuthStore.js'
 
@@ -22,6 +22,7 @@ describe('owned OAuth saved authority', () => {
   let managed: string
   let foreign: string
   const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, providerId: 'xai' })
+  const saved = async () => (await readOpenCodeSavedAuthStore({ sourceAuthPaths: [global, local], globalAuthPath: global })).xai ?? null
   const write = (authPath: string, credential: Record<string, unknown>) =>
     upsertOpenCodeAuthCredential({ authPath, providerId: 'xai', credential })
   const native = (credential: unknown, authPath = managed) =>
@@ -42,13 +43,14 @@ describe('owned OAuth saved authority', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
-  test('publishes lower-expiry successor into exact saved copies and preserves unrelated providers and foreign scopes', async () => {
+  test('publishes lower-expiry app successor conditioned on exact saved copies and preserves unrelated providers and foreign scopes', async () => {
     await write(local, c0)
     await upsertOpenCodeAuthCredential({ authPath: global, providerId: 'other', credential: { type: 'api', key: 'test-only' } })
     const foreignBefore = await readFile(foreign, 'utf8')
     await owned(async () => { await native(c1); return 'settled' })
-    expect(await read(global)).toEqual(c1)
-    expect(await read(local)).toEqual(c1)
+    expect(await saved()).toEqual(c1)
+    expect(await read(local)).toEqual(c0)
+    expect(await read(global)).toEqual(c0)
     expect(await readFile(foreign, 'utf8')).toBe(foreignBefore)
     expect(JSON.parse(await readFile(global, 'utf8')).other).toEqual({ type: 'api', key: 'test-only' })
   })
@@ -61,19 +63,19 @@ describe('owned OAuth saved authority', () => {
       await native(next)
     }
     await owned(() => rotate(c0, c1))
-    const script = `import { readOpenCodeAuthStore, mergeOpenCodeManagedAuthSources } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeAuthStore.ts'))};
+    const script = `import { readOpenCodeAuthStore, readOpenCodeSavedAuthStore } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeAuthStore.ts'))};
       const paths = JSON.parse(process.argv[1]);
-      const result = mergeOpenCodeManagedAuthSources({ sourceAuthPaths: paths, sourceStores: await Promise.all(paths.map(readOpenCodeAuthStore)), globalAuthPath: paths[0] });
+      const result = await readOpenCodeSavedAuthStore({ sourceAuthPaths: paths, sourceStores: await Promise.all(paths.map(readOpenCodeAuthStore)), globalAuthPath: paths[0] });
       process.stdout.write(result.xai.refresh);`
     const child = Bun.spawn([process.execPath, '-e', script, JSON.stringify([global, local])], { stdout: 'pipe', stderr: 'pipe' })
     expect(await new Response(child.stdout).text()).toBe(c1.refresh)
     expect(await child.exited).toBe(0)
     const c2 = { ...c1, access: 'synthetic-access-2', refresh: 'single-use-2' }
     await owned(() => rotate(c1, c2), { predecessor: c1 })
-    expect(await read(global)).toEqual(c2)
+    expect(await saved()).toEqual(c2)
     expect(consumed.size).toBe(2)
     await expect(owned(() => native(c1))).rejects.toThrow('predecessor changed')
-    expect(await read(global)).toEqual(c2)
+    expect(await saved()).toEqual(c2)
   })
 
   test.each([false, true])('queued preprepared operation rejects consumed C0 (shared root: %s)', async shared => {
@@ -89,7 +91,7 @@ describe('owned OAuth saved authority', () => {
     await first
     expect(await second).toBeInstanceOf(Error)
     expect(consumedAgain).toBe(false)
-    expect(await read(global)).toEqual(c1)
+    expect(await saved()).toEqual(c1)
     expect(await read(other)).toEqual(shared ? c1 : c0)
   })
 
@@ -131,7 +133,7 @@ describe('owned OAuth saved authority', () => {
     const controller = new AbortController()
     await expect(owned(async () => { await native(c1); controller.abort(new Error('test cancellation')) }, { abortSignal: controller.signal }))
       .rejects.toThrow('test cancellation')
-    expect(await read(global)).toEqual(c1)
+    expect(await saved()).toEqual(c1)
     expect(await read(managed)).toEqual(c1)
   })
 

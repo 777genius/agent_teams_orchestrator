@@ -26,7 +26,7 @@ describe('pending native OAuth session authority', () => {
   let abortAcknowledged: boolean, abortCalls: number, onAbort: (() => Promise<void>) | undefined
   let sessionStore: OpenCodeSessionStore, bridge: OpenCodeSessionBridge
   const manager = new OpenCodeProfileManager()
-  const readSaved = () => readOpenCodeAuthCredential({ authPath: global, providerId: 'xai' })
+  const readSaved = () => manager.readSavedOAuthCredential(profile)
   const saveRegistry = () => writeFile(registryPath, JSON.stringify(registry))
   const resolve = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3',
     purpose: 'launch_runtime', env, isOAuthNativeSessionSettled: value => bridge.isOwnedOAuthNativeSessionSettled(value),
@@ -109,7 +109,7 @@ describe('pending native OAuth session authority', () => {
     await manager.withOwnedOAuthRefresh({ profile: fresh, assertHostOwnership: async () => {},
       operation: () => writeFile(fresh.managedAuthPath, JSON.stringify({ xai: cnext })),
     })
-    expect(await readSaved()).toEqual(cnext)
+    expect(await manager.readSavedOAuthCredential(fresh)).toEqual(cnext)
     // A late old writer and reintroduction of its C0 cannot escape the original
     // admission fence by changing source/config or logging into another account.
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
@@ -143,19 +143,23 @@ describe('pending native OAuth session authority', () => {
           getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId))} }) } }));
       const { resolveOpenCodeProfileScope, OpenCodeProfileManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))});
       const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime' });
-      const profile = await new OpenCodeProfileManager().prepareProfile(process.argv[1], { profileScope: scope });
+      const manager = new OpenCodeProfileManager();
+      const profile = await manager.prepareProfile(process.argv[1], { profileScope: scope });
       const auth = await Bun.file(profile.managedAuthPath).json();
-      process.stdout.write(auth.xai.refresh);`
+      if (auth.xai.refresh !== 'single-use-C1') throw new Error('fresh process did not select C1');
+      await manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
+        operation: async () => {
+          await Bun.write(profile.managedAuthPath, JSON.stringify({ xai: { ...auth.xai, access: 'TEST-C2', refresh: 'single-use-C2' } }));
+        } });
+      process.stdout.write('C1->C2');`
     const child = Bun.spawn([process.execPath, '-e', script, project], { env, stdout: 'pipe', stderr: 'pipe' })
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
-    expect(stderr).toBe(''); expect(code).toBe(0); expect(stdout).toBe(c1.refresh)
-    expect(await readSaved()).toEqual(c1)
+    expect(stderr).toBe(''); expect(code).toBe(0); expect(stdout).toBe('C1->C2')
+    const c2 = { ...c1, access: 'TEST-C2', refresh: 'single-use-C2' }
+    expect(await readSaved()).toEqual(c2)
     expect(await sessionStore.get('TEST', 'primary', 'owner')).toEqual(owner.record)
     const next = await manager.prepareProfile(project, { profileScope: await resolve() })
-    const c2 = { ...c1, access: 'TEST-C2', refresh: 'single-use-C2' }
-    await manager.withOwnedOAuthRefresh({ profile: next, assertHostOwnership: async () => {},
-      operation: () => writeFile(next.managedAuthPath, JSON.stringify({ xai: c2 })) })
-    expect(await readSaved()).toEqual(c2)
+    expect(await readOpenCodeAuthCredential({ authPath: next.managedAuthPath, providerId: 'xai' })).toEqual(c2)
   })
 
   test.each(['busy', 'null-status', 'wrong-parent', 'wrong-model', 'no-user', 'step-only'])('requires exact settled native prompt: %s', async mutation => {
