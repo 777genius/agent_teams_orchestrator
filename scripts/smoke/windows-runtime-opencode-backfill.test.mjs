@@ -7,12 +7,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { once } from 'node:events';
-import { fileURLToPath } from 'node:url';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
+import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
+const identityProbeModule = new URL('./windows-process-identity-probe.mjs', import.meta.url).href;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const existingBun = () => (process.env.PATH || '').split(path.delimiter)
   .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
@@ -433,14 +437,19 @@ function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) 
   assert.ok(bun, 'Existing Bun required; this test never installs it');
   assert.ok(Number.isSafeInteger(pid) && pid > 0, 'Fixture PID required');
   const processKill = path.join(repository, 'src/utils/processKill.ts');
-  const program = `
-    console.error(JSON.stringify({ phase: 'before-production-import', attempt: ${attempt}, bunVersion: Bun.version }));
-    const { readProcessStartTimeMs } = await import(${JSON.stringify(processKill)});
-    console.error(JSON.stringify({ phase: 'before-production-query', attempt: ${attempt}, bunVersion: Bun.version }));
+  // Acceptance must remain uninstrumented: stream listeners and native exit
+  // callback wrappers can perturb the very transport race under investigation.
+  const program = attempt === 1 ? `
+    console.error(JSON.stringify({ phase: 'before-production-import', attempt: 1, bunVersion: Bun.version }));
+    const { readProcessStartTimeMs } = await import(${JSON.stringify(pathToFileURL(processKill).href)});
+    console.error(JSON.stringify({ phase: 'before-production-query', attempt: 1, bunVersion: Bun.version }));
     const started = performance.now();
     const startedAtMs = await readProcessStartTimeMs(${pid});
-    console.error(JSON.stringify({ phase: 'after-production-query', attempt: ${attempt}, elapsedMs: performance.now() - started, startedAtMs }));
+    console.error(JSON.stringify({ phase: 'after-production-query', attempt: 1, elapsedMs: performance.now() - started, startedAtMs }));
     console.log(JSON.stringify({ startedAtMs }));
+  ` : `
+    const { traceProductionIdentity } = await import(${JSON.stringify(identityProbeModule)});
+    await traceProductionIdentity(${JSON.stringify({ processKill: pathToFileURL(processKill).href, pid, attempt })});
   `;
   return recordWindowsProbe(evidence, flush, attempt === 1 ? 'production-identity' : `production-identity-repeat-${attempt - 1}`,
     bun, ['--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
@@ -552,26 +561,30 @@ function nativeTeardownPhases(evidence, children, getExited) {
   ];
 }
 
-function diagnoseWindowsStartup(evidence, flush, env, root, pid) {
-  const absolute = path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows',
-    'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const startup = "[Console]::Out.WriteLine('powershell-started')";
-  const identity = `${startup}; $ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
-  const directIdentity = `${startup}; $ErrorActionPreference = 'Stop'; [System.Diagnostics.Process]::GetProcessById(${pid}).StartTime.ToUniversalTime().ToString('o')`;
-  const moduleIdentity = `${startup}; $ErrorActionPreference = 'Stop'; Import-Module Microsoft.PowerShell.Management; [Console]::Out.WriteLine('management-loaded'); (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
-  // These approximate query/startup controls are diagnostic only, not copies
-  // of the production acceptance helper. Piped input reproduces the old harness
-  // mode. None of these results can make the test pass.
-  for (const [label, executable, command, stdin] of [
-    ['bare-startup-ignore-stdin', 'powershell.exe', startup, 'ignore'],
-    ['absolute-startup-ignore-stdin', absolute, startup, 'ignore'],
-    ['absolute-identity-ignore-stdin', absolute, identity, 'ignore'],
-    ['absolute-dotnet-identity', absolute, directIdentity, 'ignore'],
-    ['absolute-module-identity', absolute, moduleIdentity, 'ignore'],
-    ['absolute-startup-pipe-stdin', absolute, startup, 'pipe'],
-  ]) recordWindowsProbe(evidence, flush, label, executable,
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-    { env, cwd: root, stdio: [stdin, 'pipe', 'pipe'], timeout: 2500 });
+function diagnoseWindowsStartup(evidence, flush, env, root, bun) {
+  const traced = evidence.probes.find(item => item.label === 'production-identity-repeat-1');
+  const markers = traced?.stderr?.trim().split('\n').flatMap(line => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  }) ?? [];
+  const invocations = markers.filter(item => item.phase === 'query-child' && item.event === 'invocation');
+  assert.equal(invocations.length, 1, 'Must capture the actual traced production invocation');
+  const invocation = invocations[0];
+  // Change one transport variable at a time. The first two production attempts
+  // already cover Bun with ignored stdin/stderr, with and without observers.
+  // Node now gets IDENTICAL argv
+  // and async stdio instead of a different script through spawnSync.
+  for (const [label, executable, mode] of [
+    ['node-exact-production-query', process.execPath, 'exact'],
+    ['bun-production-query-stderr-pipe', bun, 'stderr-pipe'],
+    ['bun-production-query-stdin-eof', bun, 'stdin-eof'],
+  ]) {
+    const program = `
+      const { replayIdentityQuery } = await import(${JSON.stringify(identityProbeModule)});
+      await replayIdentityQuery(${JSON.stringify({ invocation, mode })});
+    `;
+    recordWindowsProbe(evidence, flush, label, executable, ['--input-type=module', '--eval', program],
+      { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 7000 });
+  }
 }
 
 test('native probe evidence retains an empty-output timeout and its invocation', () => {
@@ -599,7 +612,176 @@ test('native probe evidence retains an empty-output timeout and its invocation',
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('identity tracing preserves transport and kill, bounds data, and distinguishes exit from close', () => {
+  const events = [];
+  const kills = [];
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new PassThrough(), stderr: new PassThrough(), stdin: null,
+    pid: 123, exitCode: null, signalCode: null,
+    kill: signal => { kills.push(signal); return false; },
+  });
+  const args = ['-Command', 'exact production command'];
+  const options = { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+    env: { ONLY_SANDBOX: 'do not emit environment values' } };
+  const spawn = traceSpawn((command, receivedArgs, receivedOptions) => {
+    assert.equal(command, 'powershell.exe');
+    assert.equal(receivedArgs, args);
+    assert.equal(receivedOptions, options);
+    return child;
+  }, item => events.push(item));
+  assert.equal(spawn('powershell.exe', args, options), child);
+  child.stdout.write('x'.repeat(3000));
+  child.stdout.write('discarded');
+  child.emit('exit', 0, null);
+  assert.equal(events.some(item => item.event === 'close'), false);
+  assert.equal(child.kill('SIGKILL'), false);
+  child.emit('close', 0, null);
+  assert.deepEqual(kills, ['SIGKILL']);
+  assert.deepEqual(events.filter(item => ['exit', 'kill-request', 'close'].includes(item.event))
+    .map(item => item.event), ['exit', 'kill-request', 'close']);
+  assert.equal(events.filter(item => item.event === 'stdout-data').map(item => item.text).join('').length, 2048);
+  assert.equal(events[0].envExplicit, true);
+  assert.deepEqual(events[0].environmentKeys, ['ONLY_SANDBOX']);
+  assert.equal(JSON.stringify(events).includes(options.env.ONLY_SANDBOX), false);
+  assert.deepEqual(environmentSummary({ b: '2', a: '1' }), environmentSummary({ a: '1', b: '2' }));
+  assert.notEqual(environmentSummary({ a: '1' }).environmentHash, environmentSummary({ a: '2' }).environmentHash);
+});
+
+test('exact transport replays keep nonzero exit, expose ignored versus piped stderr, and send stdin EOF', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'identity-transport-'));
+  try {
+    const env = sandboxEnvironment(root, path.join(root, 'unused.cmd'));
+    for (const runtime of [process.execPath, existingBun()]) {
+      assert.ok(runtime);
+      for (const mode of ['exact', 'stderr-pipe', 'stdin-eof']) {
+        const childProgram = `
+          process.stdin.resume();
+          process.stdin.on('end', () => {
+            process.stderr.write('query stderr');
+            process.stdout.write('2026-09-09T03:26:43.6163024Z');
+            process.exitCode = 7;
+          });
+        `;
+        const invocation = { command: process.execPath, args: ['--eval', childProgram],
+          options: { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }, envExplicit: false };
+        const program = `
+          const { replayIdentityQuery } = await import(${JSON.stringify(identityProbeModule)});
+          await replayIdentityQuery(${JSON.stringify({ invocation, mode, timeoutMs: 1500 })});
+        `;
+        const probe = recordWindowsProbe({ probes: [] }, () => {}, mode, runtime,
+          ['--input-type=module', '--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 3000 });
+        assert.equal(probe.status, 0, probe.stderr);
+        const result = JSON.parse(probe.stdout);
+        assert.equal(result.code, 7, probe.stderr);
+        assert.equal(result.timedOut, false);
+        const events = probe.stderr.trim().split('\n').map(line => JSON.parse(line));
+        assert.equal(events.some(item => item.event === 'stderr-data'), mode === 'stderr-pipe');
+        assert.equal(events.some(item => item.event === 'stdin-finish'), mode === 'stdin-eof');
+        assert.ok(events.some(item => item.event === 'stdout-end'));
+        assert.ok(events.some(item => item.event === 'exit' && item.code === 7));
+        assert.ok(events.some(item => item.event === 'close' && item.code === 7));
+        assert.deepEqual(events[0].args, invocation.args);
+        assert.equal(events[0].environmentHash, environmentSummary(env).environmentHash);
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('transport timeout cannot turn partial identity output into success', () => {
+  const invocation = { command: process.execPath,
+    args: ['--eval', "process.stdout.write('2026-09-09T03:26:43.6163024Z'); setInterval(() => {}, 1000)"],
+    options: { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }, envExplicit: false };
+  const program = `
+    const { replayIdentityQuery } = await import(${JSON.stringify(identityProbeModule)});
+    await replayIdentityQuery(${JSON.stringify({ invocation, mode: 'exact', timeoutMs: 500 })});
+  `;
+  const probe = recordWindowsProbe({ probes: [] }, () => {}, 'hung', process.execPath,
+    ['--input-type=module', '--eval', program], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 2000 });
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  assert.equal(result.timedOut, true);
+  assert.ok(result.output.includes('2026-09-09'));
+  assert.equal(result.code, undefined);
+  assert.match(probe.stderr, /kill-request/);
+});
+
+test('Bun production tracing observes the actual helper spawn, close, and deadline', { skip: process.platform !== 'linux' }, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'identity-production-trace-'));
+  try {
+    const env = sandboxEnvironment(root, path.join(root, 'unused.cmd'));
+    for (const hung of [false, true]) {
+      // Exercise the real Windows branch and its real timer through Bun. Only
+      // the OS child is substituted on Linux; this is not native PowerShell proof.
+      const childProgram = `process.stdout.write('2026-09-09T03:26:43.6163024Z'); ${hung ? 'setInterval(() => {}, 1000)' : ''}`;
+      const program = `
+        import cp from 'node:child_process';
+        const spawn = cp.ChildProcess.prototype.spawn;
+        cp.ChildProcess.prototype.spawn = function(options) {
+          return spawn.call(this, { ...options, file: ${JSON.stringify(process.execPath)},
+            args: [${JSON.stringify(process.execPath)}, '--eval', ${JSON.stringify(childProgram)}] });
+        };
+        const { traceProductionIdentity } = await import(${JSON.stringify(identityProbeModule)});
+        await traceProductionIdentity(${JSON.stringify({ processKill: pathToFileURL(path.join(repository, 'src/utils/processKill.ts')).href,
+          pid: 2104, attempt: 1, platform: 'win32' })});
+      `;
+      const probe = recordWindowsProbe({ probes: [] }, () => {}, 'synthetic-production-child', existingBun(),
+        ['--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000 });
+      assert.equal(probe.status, 0, probe.stderr);
+      const value = JSON.parse(probe.stdout).startedAtMs;
+      assert.equal(value, hung ? null : Date.parse('2026-09-09T03:26:43.6163024Z'), probe.stderr);
+      const events = probe.stderr.trim().split('\n').map(line => JSON.parse(line));
+      const invocation = events.find(item => item.event === 'invocation');
+      assert.equal(invocation.command, 'powershell.exe');
+      assert.deepEqual(invocation.options, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      assert.equal(invocation.envExplicit, false);
+      assert.match(invocation.args[5], /GetProcessById\(2104\)/);
+      assert.equal(invocation.environmentHash, environmentSummary(env).environmentHash);
+      const native = events.find(item => item.phase === 'query-native' && item.event === 'invocation');
+      assert.deepEqual(native.command, [process.execPath, '--eval', childProgram]);
+      // Bun's node adapter maps "ignore" to null before Bun.spawn.
+      assert.deepEqual(native.stdio, [null, 'pipe', null]);
+      assert.equal(native.environmentHash, invocation.environmentHash);
+      assert.ok(events.some(item => item.event === 'stdout-data'));
+      const after = events.find(item => item.phase === 'after-production-query');
+      if (hung) {
+        assert.ok(after.elapsedMs >= 4900, JSON.stringify(after));
+        assert.ok(events.some(item => item.event === 'kill-request' && item.args[0] === 'SIGKILL'));
+      } else {
+        assert.ok(events.some(item => item.phase === 'query-native' && item.event === 'exit' && item.code === 0));
+        assert.ok(events.some(item => item.event === 'close' && item.code === 0));
+        assert.equal(events.some(item => item.event === 'kill-request'), false);
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // Linux wiring only: do not warm PowerShell before the native Windows first query.
+test('first production acceptance has no child observers; only the diagnostic repeat is traced', t => {
+  const calls = [];
+  t.mock.method(childProcess, 'spawnSync', (executable, args, options) => {
+    calls.push({ executable, args, options });
+    return { status: 0, signal: null, stdout: '{"startedAtMs":null}\n', stderr: '' };
+  });
+  syncBuiltinESMExports();
+  try {
+    const evidence = { probes: [] };
+    const env = { HOME: '/isolated', PATH: '/trusted' };
+    for (const attempt of [1, 2]) productionIdentityProbe(evidence, () => {}, '/existing/bun', env, '/isolated', 2104, attempt);
+    assert.match(calls[0].args[1], /await readProcessStartTimeMs\(2104\)/);
+    assert.doesNotMatch(calls[0].args[1], /identity-probe|traceProductionIdentity|ChildProcess|Bun\.spawn/);
+    assert.match(calls[1].args[1], /traceProductionIdentity/);
+    for (const call of calls) {
+      assert.equal(call.options.env, env);
+      assert.equal(call.options.timeout, 10000);
+      assert.deepEqual(call.options.stdio, ['ignore', 'pipe', 'pipe']);
+    }
+    assert.equal(evidence.startedAtMs, undefined);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
 test('production probe runs the actual helper twice through fresh Bun with timing markers', { skip: process.platform !== 'linux' }, () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-production-probe-'));
   try {
@@ -696,7 +878,7 @@ test('native failure collection keeps first failure and enforces every teardown 
 });
 
 // Retain the coordinator's 90s outer watchdog to include diagnostics and teardown;
-// no 30s identity retry. Production itself has a 2.5s PowerShell query deadline.
+// no 30s identity retry. Production itself has a 5s PowerShell query deadline.
 test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 90000 }, async t => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill owned process-'));
   const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
@@ -741,13 +923,13 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
         evidence.startedAtMs = startedAtMs;
       }],
       // Collect repeats before PowerShell controls warm the runner further. Each
-      // keeps the production 2.5s query deadline and existing 10s Bun outer bound.
+      // keeps the production 5s query deadline and existing 10s Bun outer bound.
       ['diagnostic-production-repeat-1', () => {
         productionIdentityProbe(evidence, flush, bun, env, root, children[0]?.pid, 2);
       }],
       ['diagnostic-startup-controls', () => {
         if (!Number.isFinite(evidence.startedAtMs) && children[0]?.pid) {
-          diagnoseWindowsStartup(evidence, flush, env, root, children[0].pid);
+          diagnoseWindowsStartup(evidence, flush, env, root, bun);
         }
       }],
       ['fixture-ownership-contract', () => nativeOwnershipProbe(evidence, flush, env, root, children[0]?.pid)],
