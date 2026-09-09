@@ -23,6 +23,62 @@ permissions:
   contents: read
 
 jobs:
+  windows-packaged-backfill:
+    name: Windows packaged backfill (candidate)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: runtime
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Validate fixture and rejecting assertions
+        timeout-minutes: 2
+        working-directory: harness
+        shell: pwsh
+        env:
+          BACKFILL_WINDOWS_TEST_EVIDENCE: ${{ github.workspace }}/backfill-windows-process-test.json
+        run: |
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = git rev-parse HEAD
+          node --test scripts/smoke/windows-runtime-opencode-backfill.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture/process test failed; see process-test evidence' }
+      - name: Install frozen runtime dependencies
+        working-directory: runtime
+        run: bun install --frozen-lockfile
+      # Same compile command and native Windows target as release-runtime.yml.
+      - name: Compile Windows runtime
+        working-directory: runtime
+        run: bun run compile
+      - name: Run packaged backfill and provider JSON smoke
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git -C runtime rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = git -C harness rev-parse HEAD
+          if ($env:BACKFILL_RUNTIME_SOURCE_COMMIT -ne $env:BACKFILL_RUNTIME_HARNESS_COMMIT) { throw 'Harness/runtime commit mismatch' }
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node harness/scripts/smoke/windows-runtime-opencode-provider-json.mjs runtime/dist/cli.exe backfill-candidate.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+      - name: Upload executable regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-candidate
+          path: |
+            backfill-candidate.json
+            backfill-windows-process-test.json
+          if-no-files-found: warn
+
   cursor-managed-plugin:
     name: Cursor managed plugin
     runs-on: ubuntu-latest

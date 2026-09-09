@@ -216,7 +216,15 @@ jobs:
           fi
           ./dist/cli --version
 
+      # The shared executable smoke uses Node's built-in SQLite fixture writer.
+      - name: Setup Node for Windows executable smoke
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Verify compiled runtime (Windows)
+        timeout-minutes: 12
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh
         run: |
@@ -228,7 +236,19 @@ jobs:
             throw "Compiled Claude Code version mismatch: expected $env:EXPECTED_CLAUDE_CODE_VERSION, got $actualVersion"
           }
           .\dist\cli.exe --version
-          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = $env:BACKFILL_RUNTIME_SOURCE_COMMIT
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+
+      - name: Upload Windows executable regression evidence
+        if: always() && runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-release-${{ matrix.platform }}
+          path: backfill-runtime-evidence.json
+          if-no-files-found: warn
 
       - name: Verify compiled Windows architecture
         if: matrix.platform == 'win32-x64'
