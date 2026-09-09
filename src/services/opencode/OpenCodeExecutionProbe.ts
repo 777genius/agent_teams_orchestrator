@@ -1,8 +1,11 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import { withTimeout } from '../../utils/sleep.js'
+import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
+import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   openCodeCursorNativeFailureProbe,
@@ -16,7 +19,7 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
-import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
+import { readOpenCodeAuthCredential, withOpenCodeOAuthRefreshLock, type OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import {
   ensureOpenCodeNativeCliCredentialBridge,
@@ -90,6 +93,7 @@ type OpenCodeExecutionProbeDeps = {
 type ProbeModelParams = {
   selectedModel: string
   projectPath?: string | null
+  scopeEnvironment?: NodeJS.ProcessEnv
   prompt?: string
   expectedOutput?: string
   contextTokens?: number
@@ -570,6 +574,7 @@ export class OpenCodeExecutionProbe {
         projectPath: params.projectPath,
         purpose: 'execution_probe',
         selectedModel: params.selectedModel,
+        env: params.scopeEnvironment,
       }),
     }
     return this.deps.prepareProfile
@@ -925,6 +930,7 @@ export class OpenCodeExecutionProbe {
                 projectPath: params.projectPath,
                 purpose: 'execution_probe',
                 selectedModel: params.selectedModel,
+                env: params.scopeEnvironment,
               }),
             },
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
@@ -1004,8 +1010,106 @@ export class OpenCodeExecutionProbe {
       authPath: input.host.profile.managedAuthPath,
       providerId,
       abortSignal: input.params.runtimeDeadline?.signal,
-      operation: () => this.runProbeModelWithHostUnlocked(input),
+      operation: async () => {
+        if (!input.host.profile.profileScope
+          || (await readOpenCodeAuthCredential({ authPath: input.host.profile.managedAuthPath, providerId }))?.type !== 'oauth') {
+          return this.runProbeModelWithHostUnlocked(input)
+        }
+        const hostIdentity = () => ({
+          hostKey: input.host.hostKey, baseUrl: input.host.baseUrl,
+          pid: input.host.pid, processStartedAtMs: input.host.processStartedAtMs,
+          profileRootKey: input.host.profileRootKey,
+        })
+        const expectedHost = hostIdentity()
+        let nativeOwner: OpenCodeOAuthNativeProbeOwner | undefined
+        let settled = false
+        const completion = await openCodeProfileManager.withOwnedOAuthRefresh({
+          profile: input.host.profile,
+          abortSignal: input.params.runtimeDeadline?.signal,
+          assertHostOwnership: async () => {
+            if (!isDeepStrictEqual(hostIdentity(), expectedHost)
+              || !expectedHost.processStartedAtMs
+              || await readProcessStartTimeMs(expectedHost.pid) !== expectedHost.processStartedAtMs) {
+              throw new Error('OpenCode OAuth execution host changed or process ownership is unavailable')
+            }
+          },
+          operation: async (_armSession, armProbe) => {
+            let result: OpenCodeExecutionProbeResult | undefined
+            let error: unknown
+            try {
+              result = await this.runProbeModelWithHostUnlocked({ ...input,
+                armOAuthNativeProbe: async (sessionId, messageId) => {
+                  nativeOwner = { ...expectedHost, processStartedAtMs: expectedHost.processStartedAtMs!,
+                    projectPath: input.host.profile.projectPath, scopeToken: input.host.profile.scopeToken!,
+                    profileRootKey: input.host.profile.profileRootKey, sessionId, messageId,
+                    selectedModel: input.params.selectedModel }
+                  await armProbe(nativeOwner)
+                },
+              })
+            } catch (caught) { error = caught }
+            if (!nativeOwner && error !== undefined) throw error
+            settled = !!nativeOwner && await this.isOwnedOAuthNativeProbeSettled(nativeOwner)
+            return { result, error }
+          },
+          isNativeSettled: () => settled,
+        })
+        if (completion.error !== undefined) throw completion.error
+        if (!completion.result) throw new Error('OpenCode OAuth execution probe produced no result')
+        return completion.result
+      },
     })
+  }
+
+  /** Exact live terminal prompt, or exact accepted prompt after confirmed process exit. */
+  async isOwnedOAuthNativeProbeSettled(owner: OpenCodeOAuthNativeProbeOwner, recoveryDataRoot?: string, unsubmitted = false): Promise<boolean> {
+    if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0
+      || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0
+      || !/^[a-f0-9]{64}$/.test(owner.scopeToken) || !owner.hostKey.includes(owner.scopeToken)
+      || !owner.sessionId || !owner.messageId || !owner.profileRootKey.startsWith('scope-')) return false
+    const url = new URL(owner.baseUrl)
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port
+      || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return false
+    const sameProcess = async () => await readProcessStartTimeMs(owner.pid) === owner.processStartedAtMs
+    const absent = () => {
+      try { process.kill(owner.pid, 0); return false }
+      catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH' }
+    }
+    const completedPrompt = (messages: OpenCodeMessage[]) => {
+      const model = parseProviderScopedModel(owner.selectedModel)
+      if (model.providerID !== 'xai') return false
+      const userPresent = messages.some(message => message.info?.id === owner.messageId && message.info?.role === 'user')
+      return userPresent && messages.some(message => {
+        const info = message.info
+        const completed = info.time && typeof info.time === 'object' && 'completed' in info.time
+          ? info.time.completed : undefined
+        return info.role === 'assistant' && info.parentID === owner.messageId
+          && info.providerID === model.providerID && info.modelID === model.modelID
+          && (typeof completed === 'number' && Number.isFinite(completed)
+            || !!info.error && typeof info.error === 'object')
+      })
+    }
+    if (!await sameProcess()) {
+      if (!recoveryDataRoot || !absent()) return false
+      const offline = await new OpenCodeOfflineSessionReader(recoveryDataRoot).readSession({
+        profileRootKey: owner.profileRootKey, projectPath: owner.projectPath, opencodeSessionId: owner.sessionId,
+      })
+      return offline?.historyShape === 'supported'
+        && offline.sessionIdentity?.sessionId === owner.sessionId
+        && offline.sessionIdentity.directory === owner.projectPath
+        && (unsubmitted
+          ? offline.historyComplete === true && !offline.messages.some(message => message.info?.id === owner.messageId || message.info?.parentID === owner.messageId)
+          : offline.messages.some(message => message.info?.id === owner.messageId && message.info?.role === 'user'))
+        && absent()
+    }
+    if (unsubmitted) return false // Idle does not exclude an in-flight submission.
+    const client = this.clientFactory.create(owner.baseUrl)
+    const idle = async () => {
+      const status = (await client.getSessionStatus())[owner.sessionId]
+      return status === 'idle' || (typeof status === 'object' && status?.type === 'idle')
+    }
+    if (!await idle()) return false
+    const messages = await client.getSessionMessages(owner.sessionId)
+    return completedPrompt(messages) && await idle() && await sameProcess()
   }
 
   private async runProbeModelWithHostUnlocked(input: {
@@ -1017,6 +1121,7 @@ export class OpenCodeExecutionProbe {
     probeTimeoutMs: number
     pollIntervalMs: number
     diagnostics: Set<string>
+    armOAuthNativeProbe?: (sessionId: string, messageId: string) => Promise<void>
   }): Promise<OpenCodeExecutionProbeResult> {
     const {
       params,
@@ -1031,7 +1136,10 @@ export class OpenCodeExecutionProbe {
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
-      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
+      // Scoped operations publish only their own native successor through the
+      // predecessor-bound owner surrounding the entire settled operation.
+      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai'
+        && !host.profile.profileScope) {
         await this.fanOutOAuthCredential({
           providerId: 'xai',
           sourceAuthPath: host.profile.managedAuthPath,
@@ -1123,6 +1231,7 @@ export class OpenCodeExecutionProbe {
             parts: [{ type: 'text', text: prompt }],
           }
 
+          await input.armOAuthNativeProbe?.(session.id, messageID)
           try {
             await client.promptSessionAsync(session.id, probeMessage)
           } catch (error) {

@@ -1,8 +1,11 @@
 import {
+  isValidOpenCodeOAuthCredential,
   readOpenCodeAuthCredential,
   withOpenCodeOAuthRefreshLock,
 } from './OpenCodeAuthStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { isDeepStrictEqual } from 'node:util'
 
 import type { OpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import type { OpenCodePreparedProfile } from './types.js'
@@ -95,6 +98,9 @@ export class OpenCodeOAuthRefreshCoordinator {
     if (credential?.type !== 'oauth') {
       return { checked: false, refreshed: false }
     }
+    if (!isValidOpenCodeOAuthCredential(credential)) {
+      throw new Error('SuperGrok OAuth predecessor is malformed')
+    }
     if (!isOpenCodeOAuthCredentialExpiring({ credential, nowMs: nowMs(), skewMs: refreshSkewMs })) {
       return { checked: true, refreshed: false }
     }
@@ -104,10 +110,19 @@ export class OpenCodeOAuthRefreshCoordinator {
       authPath: input.profile.managedAuthPath,
       providerId: XAI_PROVIDER_ID,
       operation: async () => {
-        const latestCredential = await readCredential({
+        const readCurrent = () => input.profile.profileScope
+          ? openCodeProfileManager.readSavedOAuthCredential(input.profile)
+          : readCredential({
           authPath: input.profile.managedAuthPath,
           providerId: XAI_PROVIDER_ID,
         })
+        const latestCredential = await readCurrent()
+        if (!isValidOpenCodeOAuthCredential(latestCredential)) {
+          throw new Error('SuperGrok OAuth saved credential disappeared or changed type')
+        }
+        if (input.profile.profileScope && !isDeepStrictEqual(latestCredential, credential)) {
+          throw new Error('SuperGrok OAuth saved authority changed; resolve a new launch profile')
+        }
         if (!isOpenCodeOAuthCredentialExpiring({
           credential: latestCredential,
           nowMs: nowMs(),
@@ -122,6 +137,9 @@ export class OpenCodeOAuthRefreshCoordinator {
           selectedModel: input.selectedModel,
           projectPath: input.projectPath,
           bypassCache: true,
+          ...(input.profile.profileScope ? {
+            scopeEnvironment: await openCodeProfileManager.getOAuthRefreshEnvironment(input.profile),
+          } : {}),
         })
         if (probe.outcome !== 'available') {
           throw new Error(
@@ -129,17 +147,18 @@ export class OpenCodeOAuthRefreshCoordinator {
           )
         }
 
-        const refreshedCredential = await readCredential({
-          authPath: input.profile.managedAuthPath,
-          providerId: XAI_PROVIDER_ID,
-        })
-        if (isOpenCodeOAuthCredentialExpiring({
+        // A generic probe owns a separate execution scope. Its durable result
+        // must be selected from saved authority; copying it into the caller's
+        // old scope would invalidate that scope's sealed credential identity.
+        const refreshedCredential = await readCurrent()
+        if (!isValidOpenCodeOAuthCredential(refreshedCredential)
+          || isOpenCodeOAuthCredentialExpiring({
           credential: refreshedCredential,
           nowMs: nowMs(),
           skewMs: refreshSkewMs,
         })) {
           throw new Error(
-            'SuperGrok OAuth refreshed, but the rotated credential was not persisted. Reconnect SuperGrok before continuing.',
+            'SuperGrok OAuth probe completed, but the rotated credential was not persisted as valid saved OAuth.',
           )
         }
 

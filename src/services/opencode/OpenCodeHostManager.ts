@@ -1028,7 +1028,7 @@ export class OpenCodeHostManager {
    * asset verification, host spawn, or arbitrary caller-supplied endpoint. */
   async resolveOwnedSessionEndpoint(
     hostKey: string,
-    input: OpenCodeHostLeaseInput & { projectPath: string },
+    input: OpenCodeHostLeaseInput & { projectPath: string; expectedProcessStartedAtMs?: number },
     abortSignal?: AbortSignal,
   ): Promise<{ baseUrl: string; pid: number }> {
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
@@ -1037,6 +1037,9 @@ export class OpenCodeHostManager {
       const record = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
       const lease = record && normalizePersistentHostLeases(record.leases)[buildLeaseKey(input)]
       if (!record || record.hostKey !== hostKey || record.projectPath !== input.projectPath
+        || (input.expectedProcessStartedAtMs !== undefined
+          && (!Number.isFinite(input.expectedProcessStartedAtMs) || input.expectedProcessStartedAtMs <= 0
+            || record.processStartedAtMs !== input.expectedProcessStartedAtMs))
         || !lease || lease.teamId !== input.teamId
         || lease.laneId !== (input.laneId?.trim() || 'primary')
         || lease.memberName !== input.memberName
@@ -1533,7 +1536,8 @@ export class OpenCodeHostManager {
   // exact host is excluded. A matching dead registry entry is removed only after
   // terminal CAS evidence; absence is never inferred from health or registry errors.
   async withConfirmedAbsentHostAuthority<T>(
-    record: { hostKey: string; runtimePid?: number | null },
+    record: { hostKey: string; runtimePid?: number | null; expectedProcessStartedAtMs?: number
+      expectedSession?: OpenCodeHostLeaseInput & { projectPath: string } },
     operation: () => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
@@ -1558,6 +1562,20 @@ export class OpenCodeHostManager {
           if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
         }
         const registered = hosts[record.hostKey]
+        if (record.expectedProcessStartedAtMs !== undefined && (!registered || typeof registered !== 'object'
+          || !('processStartedAtMs' in registered) || registered.processStartedAtMs !== record.expectedProcessStartedAtMs)) {
+          throw new Error('OpenCode dead runtime recovery original process birth differs')
+        }
+        if (record.expectedSession) {
+          const expected = record.expectedSession
+          const host = registry.hosts[record.hostKey]
+          const lease = host && normalizePersistentHostLeases(host.leases)[buildLeaseKey(expected)]
+          if (!expected.runId || !expected.sessionId || host?.projectPath !== expected.projectPath
+            || !lease || lease.teamId !== expected.teamId || lease.laneId !== (expected.laneId?.trim() || 'primary')
+            || lease.memberName !== expected.memberName || lease.runId !== expected.runId || lease.sessionId !== expected.sessionId) {
+            throw new Error('OpenCode dead runtime recovery session lease changed')
+          }
+        }
         if (Object.hasOwn(hosts, record.hostKey) && (!registered || typeof registered !== 'object'
           || !('pid' in registered) || registered.pid !== record.runtimePid
           || !('hostKey' in registered) || registered.hostKey !== record.hostKey

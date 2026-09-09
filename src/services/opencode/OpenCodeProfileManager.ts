@@ -19,6 +19,7 @@ import {
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
@@ -46,6 +47,12 @@ import {
   readOpenCodeAuthStore,
   removeOpenCodeAuthCredential,
   upsertOpenCodeAuthCredential,
+  isValidOpenCodeOAuthCredential,
+  withOpenCodeOwnedOAuthRefresh,
+  recoverOpenCodeOwnedOAuthSave,
+  OpenCodeOAuthPublicationRevokedError,
+  type OpenCodeOAuthNativeSessionOwner,
+  type OpenCodeOAuthNativeProbeOwner,
 } from './OpenCodeAuthStore.js'
 import {
   readOpenCodeGlobalManagedRuntimePreferences,
@@ -94,6 +101,7 @@ import type {
   OpenCodePreparedProfile,
   OpenCodeProfilePurpose,
   OpenCodeProfileScope,
+  OpenCodeSessionRecord,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
@@ -1676,6 +1684,13 @@ function buildScopeIdentity(scope: OpenCodeProfileScope): {
   }
 }
 
+function buildScopedProfileRootKey(projectPath: string, scope: OpenCodeProfileScope): string {
+  // The token binds the complete effective snapshot. The narrower config/auth
+  // tuple can be identical for distinct tokens. Keep scoped stores out of legacy
+  // OAuth peer reconciliation, including in a later bridge process.
+  return `scope-${hashString(JSON.stringify({ projectPath, scopeToken: scope.scopeToken }))}`
+}
+
 function isolateScopedRuntimeConfig(
   config: Record<string, unknown>,
   providerId: string,
@@ -2044,15 +2059,20 @@ async function bindSelectedProviderAuthoritySources(input: {
   }
 }
 
-export async function resolveOpenCodeProfileScope(input: {
+type OpenCodeScopeResolutionInput = {
   projectPath?: string | null
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
   // Authority refresh reads scope without publishing a preparation snapshot.
   cacheSnapshot?: boolean
-}): Promise<OpenCodeProfileScope> {
-  const inputEnv = input.env ?? process.env
+  isOAuthNativeSessionSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
+  isOAuthNativeSessionUnsubmitted?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
+  isOAuthNativeProbeSettled?: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<boolean>
+  oauthSessionToRelease?: OpenCodeSessionRecord
+}
+
+function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const retainedScopeEnvironment = asRecord(safeParseJSONC(
     inputEnv[OPEN_CODE_SCOPE_ENVIRONMENT_ENV],
   ))
@@ -2061,6 +2081,80 @@ export async function resolveOpenCodeProfileScope(input: {
     if (value === null) delete envSnapshot[key]
     else if (typeof value === 'string') envSnapshot[key] = value
   }
+  return envSnapshot
+}
+
+export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
+  await recoverOpenCodeScopedOAuth(input)
+  return resolveOpenCodeProfileScopeInternal(input)
+}
+
+async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
+  // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
+  // Fresh launch resolution can finish an already proven native publication;
+  // it cannot create provenance from an old managed auth file.
+  if (input.cacheSnapshot !== false && input.selectedModel.split('/')[0]?.trim().toLowerCase() === 'xai') {
+    const env = scopeSourceEnvironment(input.env ?? process.env)
+    const managedPaths = resolveClaudeMultimodelPaths(env)
+    const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+    const globalAuthPath = path.join(managedPaths.data, 'opencode', 'auth.json')
+    await recoverOpenCodeOwnedOAuthSave({
+      globalAuthPath,
+      sessionToRelease: input.oauthSessionToRelease,
+      sourceAuthPaths: Array.from(new Set([globalAuthPath,
+        path.join(env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share'), 'opencode', 'auth.json'),
+        path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+      ])),
+      isNativeProbeSettled: input.isOAuthNativeProbeSettled ?? (async owner => {
+        const { OpenCodeExecutionProbe } = await import('./OpenCodeExecutionProbe.js')
+        return new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, managedPaths.data)
+      }),
+      isNativeSessionSettled: input.isOAuthNativeSessionSettled ?? (async owner => {
+        const [{ OpenCodeSessionBridge }, { OpenCodeHostManager }, { OpenCodeSessionStore }] = await Promise.all([
+          import('./OpenCodeSessionBridge.js'), import('./OpenCodeHostManager.js'), import('./OpenCodeSessionStore.js'),
+        ])
+        return new OpenCodeSessionBridge({
+          oauthRecoveryDataRoot: managedPaths.data,
+          hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(managedPaths.data, 'opencode', 'host-registry.json') }),
+          sessionStore: new OpenCodeSessionStore(path.join(managedPaths.data, 'opencode', 'session-store.json')),
+        }).isOwnedOAuthNativeSessionSettled(owner)
+      }),
+      isNativeSessionUnsubmitted: input.isOAuthNativeSessionUnsubmitted ?? (async owner => {
+        const [{ OpenCodeSessionBridge }, { OpenCodeHostManager }, { OpenCodeSessionStore }] = await Promise.all([
+          import('./OpenCodeSessionBridge.js'), import('./OpenCodeHostManager.js'), import('./OpenCodeSessionStore.js'),
+        ])
+        return new OpenCodeSessionBridge({
+          oauthRecoveryDataRoot: managedPaths.data,
+          hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(managedPaths.data, 'opencode', 'host-registry.json') }),
+          sessionStore: new OpenCodeSessionStore(path.join(managedPaths.data, 'opencode', 'session-store.json')),
+        }).isOwnedOAuthNativeSessionSettled(owner, true)
+      }),
+      isNativeProbeUnsubmitted: async owner => {
+        const { OpenCodeExecutionProbe } = await import('./OpenCodeExecutionProbe.js')
+        return new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, managedPaths.data, true)
+      },
+      assertOwner: async (owner, predecessor, managedAuthPath) => {
+        const scope = await resolveOpenCodeProfileScopeInternal({
+          projectPath: owner.projectPath, purpose: owner.purpose,
+          selectedModel: 'xai/oauth-authority', env, cacheSnapshot: false,
+        }, authCredentialIdentity('xai', predecessor))
+        const expectedPath = path.join(managedPaths.data, 'opencode', 'profiles',
+          buildScopedProfileRootKey(owner.projectPath, scope), 'data', 'opencode', 'auth.json')
+        if (scope.scopeToken !== owner.scopeToken || managedAuthPath !== expectedPath) {
+          throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth pending saved publication source scope changed')
+        }
+      },
+    })
+  }
+}
+
+async function resolveOpenCodeProfileScopeInternal(
+  input: OpenCodeScopeResolutionInput,
+  // Private comparison-only substitution for a proven partial C0→C1 save. It
+  // never supplies credentials or a snapshot to a prepared launch or comparator.
+  recoveryPredecessorIdentity?: OpenCodeIdentityComponent,
+): Promise<OpenCodeProfileScope> {
+  const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   if (isStrictAuthorityPurpose(input.purpose)
     && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
@@ -2162,7 +2256,7 @@ export async function resolveOpenCodeProfileScope(input: {
   if (cursorCandidate && !cursorNativeAuthorized) {
     throw new Error('OpenCode strict Cursor profile requires current native authentication')
   }
-  const selectedAuthIdentity = cursorNative?.identity ?? selectedAuth.identity
+  const selectedAuthIdentity = recoveryPredecessorIdentity ?? cursorNative?.identity ?? selectedAuth.identity
   if (
     isStrictAuthorityPurpose(input.purpose)
     && !selectedAuthIsCredential
@@ -2239,7 +2333,7 @@ export async function resolveOpenCodeProfileScope(input: {
     selectedAuthIdentity,
     scopeToken,
   }
-  if (input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
+  if (!recoveryPredecessorIdentity && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
     openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
       projectPath,
       importedRuntimeConfig,
@@ -2476,7 +2570,7 @@ export class OpenCodeProfileManager {
     }
 
     return entries
-      .filter(entry => entry.isDirectory())
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith('scope-'))
       .map(entry => path.join(profilesRootPath, entry.name, 'data', 'opencode', 'auth.json'))
       .sort((left, right) => left.localeCompare(right))
   }
@@ -2486,6 +2580,122 @@ export class OpenCodeProfileManager {
       providerId,
       sourceAuthPath,
       targetAuthPaths: [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
+    })
+  }
+
+  private async scopedOAuthAuthority(profile: OpenCodePreparedProfile) {
+    await assertOpenCodePreparedProfileScope(profile)
+    const snapshot = openCodeEffectiveConfigSnapshots.get(profile.scopeToken ?? '')
+    const scope = profile.profileScope
+    if (!snapshot || !scope || scope.providerId !== 'xai') {
+      throw new Error('OpenCode OAuth refresh requires an exact scoped snapshot')
+    }
+    const rootKey = buildScopedProfileRootKey(snapshot.projectPath, scope)
+    const managedAuthPath = path.join(snapshot.managedPaths.data, 'opencode', 'profiles',
+      rootKey, 'data', 'opencode', 'auth.json')
+    if (profile.profileRootKey !== rootKey || profile.managedAuthPath !== managedAuthPath) {
+      throw new Error('OpenCode OAuth refresh managed scope path changed')
+    }
+    const globalAuthPath = this.getGlobalAuthPath(snapshot.managedPaths.data)
+    const sourceAuthPaths = Array.from(new Set([
+      globalAuthPath, ...this.getSourceAuthPaths(snapshot.runtimeEnv),
+    ]))
+    return { snapshot, scope, managedAuthPath, globalAuthPath, sourceAuthPaths }
+  }
+
+  async finishOwnedOAuthBeforeSessionRelease(
+    record: OpenCodeSessionRecord,
+    isSettled: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>,
+  ): Promise<void> {
+    if (record.profileScope?.providerId !== 'xai') return
+    const snapshot = openCodeEffectiveConfigSnapshots.get(record.profileScope.scopeToken)
+    await recoverOpenCodeScopedOAuth({
+      projectPath: record.projectPath, purpose: record.profileScope.purpose,
+      selectedModel: record.selectedModel, env: snapshot?.runtimeEnv ?? process.env,
+      oauthSessionToRelease: record, isOAuthNativeSessionSettled: isSettled,
+    })
+  }
+
+  async readSavedOAuthCredential(profile: OpenCodePreparedProfile) {
+    const authority = await this.scopedOAuthAuthority(profile)
+    const selected = await readSelectedAuthFromSources({
+      providerId: authority.scope.providerId,
+      sourcePaths: authority.sourceAuthPaths,
+      globalAuthPath: authority.globalAuthPath,
+    })
+    if (selected.identity === 'error') throw new Error('OpenCode OAuth saved authority is unavailable')
+    return selected.credential
+  }
+
+  async getOAuthRefreshEnvironment(profile: OpenCodePreparedProfile): Promise<NodeJS.ProcessEnv> {
+    return { ...(await this.scopedOAuthAuthority(profile)).snapshot.runtimeEnv }
+  }
+
+  // This wraps controlled, settled native work; it never blesses a credential
+  // discovered by scanning profiles. Source paths come from the resolver's
+  // retained environment, including when this manager's ambient data root differs.
+  async withOwnedOAuthRefresh<T>(input: {
+    profile: OpenCodePreparedProfile
+    assertHostOwnership: () => Promise<void>
+    operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
+      armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
+    isNativeSettled?: (value: T) => boolean
+    allowNativeContinuation?: boolean
+    abortSignal?: AbortSignal
+  }): Promise<T> {
+    const captured = structuredClone(input.profile)
+    const authority = await this.scopedOAuthAuthority(input.profile)
+    const predecessor = authority.snapshot.selectedAuthCredential
+    const assertPublicationOwnership = async () => {
+      if (!isDeepStrictEqual(input.profile, captured)) {
+        throw new Error('OpenCode OAuth prepared host profile changed')
+      }
+      await input.assertHostOwnership()
+      if (isValidOpenCodeOAuthCredential(predecessor)) {
+        const originalScope = await resolveOpenCodeProfileScopeInternal({
+          projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
+          purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
+        }, authority.scope.selectedAuthIdentity)
+        if (originalScope.scopeToken !== authority.scope.scopeToken) {
+          throw new Error('OpenCode OAuth publication source configuration changed')
+        }
+      }
+    }
+    const assertOwnership = async () => {
+      await assertPublicationOwnership()
+      const current = await resolveOpenCodeProfileScope({
+        projectPath: authority.snapshot.projectPath,
+        selectedModel: `${authority.scope.providerId}/oauth-authority`,
+        purpose: authority.scope.purpose,
+        env: authority.snapshot.runtimeEnv,
+        cacheSnapshot: false,
+      })
+      // This runs before publication, while saved authority must still be C0.
+      // Include the complete effective snapshot token, not just its narrower
+      // selected config/auth tuple. Publication never reseals this old profile.
+      if (!isDeepStrictEqual(current, authority.scope)) {
+        throw new Error('OpenCode OAuth source scope changed')
+      }
+    }
+    if (!isValidOpenCodeOAuthCredential(predecessor)) {
+      if (predecessor?.type === 'oauth') throw new Error('OpenCode OAuth predecessor is malformed')
+      await assertOwnership()
+      return input.operation(async () => {}, async () => {})
+    }
+    return withOpenCodeOwnedOAuthRefresh({
+      ...authority,
+      providerId: authority.scope.providerId,
+      predecessor,
+      assertOwnership,
+      assertPublicationOwnership,
+      operation: input.operation,
+      isNativeSettled: input.isNativeSettled,
+      allowNativeContinuation: input.allowNativeContinuation,
+      recoveryOwner: authority.scope.purpose === 'catalog' ? undefined : {
+        projectPath: authority.snapshot.projectPath, purpose: authority.scope.purpose,
+        scopeToken: authority.scope.scopeToken,
+      },
+      abortSignal: input.abortSignal,
     })
   }
 
@@ -2503,10 +2713,7 @@ export class OpenCodeProfileManager {
     const managedPaths = snapshot?.managedPaths ?? this.paths
     const runtimeEnv = snapshot?.runtimeEnv ?? process.env
     const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
-    const profileRootKey = hashString(JSON.stringify({
-      projectPath,
-      ...buildScopeIdentity(policy.scope),
-    })).slice(0, 16)
+    const profileRootKey = buildScopedProfileRootKey(projectPath, policy.scope)
     const managedAuthPath = path.join(
       managedPaths.data,
       'opencode',
@@ -2651,10 +2858,7 @@ export class OpenCodeProfileManager {
         })
       : null
     const profileRootKey = policy
-      ? hashString(JSON.stringify({
-          projectPath: resolvedProjectPath,
-          ...buildScopeIdentity(policy.scope),
-        })).slice(0, 16)
+      ? buildScopedProfileRootKey(resolvedProjectPath, policy.scope)
       : this.getProfileRootKey(resolvedProjectPath)
     enterStep('wait for profile preparation lock')
     return await this.withProfilePreparationLock(profileRootKey, async () => {
