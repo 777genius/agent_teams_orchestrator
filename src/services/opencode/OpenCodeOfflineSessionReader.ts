@@ -83,6 +83,8 @@ export type OpenCodeOfflineSessionReadResult = {
   dbPath: string
   dbFingerprint: OpenCodeSqliteFingerprint
   historyShape?: 'supported' | 'unsupported'
+  // Absence of a message is evidence only when no rows were omitted by caps.
+  historyComplete?: boolean
   sessionIdentity: OpenCodeSqliteSessionIdentity | null
   snapshotStepParts: OpenCodeSnapshotStepPart[]
   patchParts: OpenCodePatchPart[]
@@ -164,11 +166,13 @@ async function readSqliteFingerprint(dbPath: string): Promise<OpenCodeSqliteFing
 }
 
 export class OpenCodeOfflineSessionReader {
+  constructor(private readonly dataRoot?: string) {}
+
   resolveDbPath(profileRootKey: string): string | null {
     if (!isSafeProfileRootKey(profileRootKey)) {
       return null
     }
-    const profileRoot = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'profiles')
+    const profileRoot = path.join(this.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode', 'profiles')
     const dbPath = path.resolve(
       profileRoot,
       profileRootKey,
@@ -183,7 +187,7 @@ export class OpenCodeOfflineSessionReader {
     return dbPath
   }
 
-  async readSession(record: OpenCodeSessionRecord): Promise<OpenCodeOfflineSessionReadResult | null> {
+  async readSession(record: Pick<OpenCodeSessionRecord, 'profileRootKey' | 'projectPath' | 'opencodeSessionId'>): Promise<OpenCodeOfflineSessionReadResult | null> {
     const diagnostics: string[] = []
     const dbPath = this.resolveDbPath(record.profileRootKey)
     if (!dbPath) {
@@ -307,6 +311,7 @@ export class OpenCodeOfflineSessionReader {
         historyShape: 'supported',
         sessionIdentity,
         snapshotStepParts: snapshotParts.snapshotStepParts,
+        historyComplete: messages.length === rawMessages.length && parts.length === rawParts.length,
         patchParts: snapshotParts.patchParts,
         snapshotWindows: this.buildSnapshotWindows(snapshotParts.snapshotStepParts, diagnostics),
         rawMessages: messages,
@@ -387,7 +392,7 @@ export class OpenCodeOfflineSessionReader {
 
   private readSessionIdentity(
     db: Database,
-    record: OpenCodeSessionRecord,
+    record: Pick<OpenCodeSessionRecord, 'projectPath' | 'opencodeSessionId'>,
     diagnostics: string[],
   ): OpenCodeSqliteSessionIdentity | null {
     const sessionColumns = this.tableColumns(db, 'session')

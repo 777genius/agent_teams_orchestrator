@@ -151,7 +151,10 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Test selected authority and sandbox lifecycle
-        run: bun run test:opencode-authority
+        # Native Windows fixtures perform several process-identity queries and
+        # child startups per test; the default 5s can expire during valid work.
+        # Production operation deadlines remain enforced inside the tests.
+        run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
       - name: Require Python for Linux OS pipe regression
         if: runner.os == 'Linux'
         run: python3 --version
