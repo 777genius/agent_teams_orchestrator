@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import os from 'node:os'
 import * as atomic from '../../utils/atomicWrite.js'
 const realWrite = atomic.writeJsonFileAtomic
 let failurePath: string | undefined
@@ -21,7 +22,7 @@ const c1 = { ...c0, access: 'TEST-C1', refresh: 'TEST-R1', expires: 500 }
 const c2 = { ...c0, access: 'TEST-C2', refresh: 'TEST-R2', expires: 400 }
 const replacement = { ...c0, access: 'TEST-B', refresh: 'TEST-RB', accountId: 'TEST-B' }
 async function fixture() {
-  const root = await mkdtemp('/tmp/ariel-oauth-owned-source-TEST-')
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'ariel-oauth-owned-source-TEST-')))
   const project = path.join(root, 'project'), other = path.join(root, 'other')
   await mkdir(project); await mkdir(other)
   const env = { HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
@@ -174,5 +175,89 @@ test('corrupt xAI successor does not change an unrelated provider selection', as
     const profile = await f.manager.prepareProfile(f.project, { profileScope: scope })
     expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'deepinfra' })).toEqual(api)
     await expect(f.resolve()).rejects.toThrow()
+  } finally { await clean(f) }
+})
+
+for (const recovery of [false, true]) for (const crashAfterRename of [false, true])
+test(`configuration revoked at successor rename is never fresh authority (recovery=${recovery}, crash=${crashAfterRename})`, async () => {
+  const f = await fixture()
+  try {
+    if (recovery) await f.pending()
+    let changed = false
+    beforeWrite = async file => {
+      if (file !== openCodeOAuthSuccessorPath(f.global) || changed) return
+      changed = true
+      await writeFile(path.join(f.project, 'opencode.json'), JSON.stringify({ provider: { xai: {
+        options: { baseURL: 'http://test.invalid/revoked-at-rename' },
+      } } }))
+    }
+    afterWrite = async file => {
+      if (file === openCodeOAuthSuccessorPath(f.global) && crashAfterRename) throw new Error('TEST crash after rename')
+    }
+    await expect(recovery ? f.resolve() : f.rotate()).rejects.toThrow()
+    expect(changed).toBe(true)
+    expect(await Bun.file(openCodeOAuthSuccessorPath(f.global)).exists()).toBe(true)
+    beforeWrite = undefined; afterWrite = undefined
+    // Read-only authority comparison must reject even before receipt recovery.
+    await expect(resolveOpenCodeProfileScope({ projectPath: f.other, selectedModel: 'xai/grok-4.3',
+      purpose: 'launch_runtime', env: f.env, cacheSnapshot: false })).rejects.toThrow()
+    await expect(f.resolve(f.other)).rejects.toThrow()
+    expect(await Bun.file(f.receipt).exists()).toBe(false)
+    // Removal of the active receipt cannot make revoked C1 selectable in a new coordinator.
+    const script = `import { resolveOpenCodeProfileScope } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))};
+      let rejected = false;
+      try { await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime' }); }
+      catch { rejected = true; }
+      if (!rejected) throw new Error('TEST revoked successor was selected in fresh child');`
+    const child = Bun.spawn([process.execPath, '-e', script, f.other], { env: { ...process.env, ...f.env }, stdout: 'pipe', stderr: 'pipe' })
+    expect(await new Response(child.stderr).text()).toBe('')
+    expect(await child.exited).toBe(0)
+    // Once explicitly retired, restoring old configuration cannot resurrect C1.
+    await rm(path.join(f.project, 'opencode.json'))
+    await expect(f.resolve(f.other)).rejects.toThrow()
+    await upsertOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai', credential: replacement })
+    const fresh = await f.manager.prepareProfile(f.other, { profileScope: await f.resolve(f.other) })
+    expect(await readOpenCodeAuthCredential({ authPath: fresh.managedAuthPath, providerId: 'xai' })).toEqual(replacement)
+    const next = { ...replacement, access: 'TEST-B-next', refresh: 'TEST-B-next-refresh' }
+    await f.manager.withOwnedOAuthRefresh({ profile: fresh, assertHostOwnership: async () => {},
+      operation: () => writeFile(fresh.managedAuthPath, JSON.stringify({ xai: next })) })
+    expect(await f.manager.readSavedOAuthCredential(fresh)).toEqual(next)
+    expect(await readOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai' })).toEqual(replacement)
+  } finally { await clean(f) }
+})
+
+for (const pending of [false, true])
+test(`pre-scope successor requires fresh credentials without stranding new login (pending=${pending})`, async () => {
+  const f = await fixture()
+  try {
+    if (pending) {
+      afterWrite = async file => { if (file === openCodeOAuthSuccessorPath(f.global)) throw new Error('TEST crash after rename') }
+      await expect(f.rotate()).rejects.toThrow()
+      afterWrite = undefined
+    } else await f.rotate()
+    const file = openCodeOAuthSuccessorPath(f.global)
+    const legacy = JSON.parse(await readFile(file, 'utf8'))
+    delete legacy.owner // Exact a043 sidecar format has no durable publication scope.
+    await writeFile(file, JSON.stringify(legacy))
+    await expect(f.resolve()).rejects.toThrow()
+    await upsertOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai', credential: { ...c0, access: 'TEST-altered-before-replacement' } })
+    const reused = await f.manager.prepareProfile(f.other, { profileScope: await f.resolve(f.other) })
+    let reusedCalls = 0
+    await expect(f.manager.withOwnedOAuthRefresh({ profile: reused, assertHostOwnership: async () => {},
+      operation: async () => { reusedCalls += 1 } })).rejects.toThrow('pending')
+    expect(reusedCalls).toBe(0)
+    await upsertOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai', credential: replacement })
+    const fresh = await f.manager.prepareProfile(f.other, { profileScope: await f.resolve(f.other) })
+    expect(await readOpenCodeAuthCredential({ authPath: fresh.managedAuthPath, providerId: 'xai' })).toEqual(replacement)
+    const next = { ...replacement, access: 'TEST-B-next', refresh: 'TEST-B-next-refresh' }
+    await f.manager.withOwnedOAuthRefresh({ profile: fresh, assertHostOwnership: async () => {},
+      operation: () => writeFile(fresh.managedAuthPath, JSON.stringify({ xai: next })) })
+    expect(await f.manager.readSavedOAuthCredential(fresh)).toEqual(next)
+    await upsertOpenCodeAuthCredential({ authPath: f.global, providerId: 'xai', credential: { ...c0, access: 'TEST-altered-access' } })
+    const spent = await f.manager.prepareProfile(f.other, { profileScope: await f.resolve(f.other) })
+    let calls = 0
+    await expect(f.manager.withOwnedOAuthRefresh({ profile: spent, assertHostOwnership: async () => {},
+      operation: async () => { calls += 1 } })).rejects.toThrow('pending')
+    expect(calls).toBe(0)
   } finally { await clean(f) }
 })

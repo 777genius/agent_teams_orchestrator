@@ -1060,7 +1060,7 @@ export class OpenCodeExecutionProbe {
     })
   }
 
-  /** Exact live terminal prompt, or exact accepted prompt after confirmed process exit. */
+  /** Exact canonical terminal prompt under live or confirmed absent ownership. */
   async isOwnedOAuthNativeProbeSettled(owner: OpenCodeOAuthNativeProbeOwner, recoveryDataRoot?: string, unsubmitted = false): Promise<boolean> {
     if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0
       || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0
@@ -1098,7 +1098,7 @@ export class OpenCodeExecutionProbe {
         && offline.sessionIdentity.directory === owner.projectPath
         && (unsubmitted
           ? offline.historyComplete === true && !offline.messages.some(message => message.info?.id === owner.messageId || message.info?.parentID === owner.messageId)
-          : offline.messages.some(message => message.info?.id === owner.messageId && message.info?.role === 'user'))
+          : completedPrompt(offline.messages))
         && absent()
     }
     if (unsubmitted) return false // Idle does not exclude an in-flight submission.

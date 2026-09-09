@@ -49,7 +49,7 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
-import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath } from './OpenCodeProfileManager.js'
+import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -3420,6 +3420,12 @@ async function runLaunch(
       if (await canonicalizeOpenCodeProjectPath(record.projectPath) !== launchProjectPath) {
         throw new Error('OpenCode dead runtime recovery project authority mismatch')
       }
+      // Recovery needs the old active session and its exact birth/run/lease proof.
+      // Finish outside the host fence: offline recovery acquires that same fence.
+      await raceOpenCodeAbortSignal(
+        openCodeProfileManager.finishOwnedOAuthBeforeSessionRelease(record), provisioningSignal,
+      )
+      phaseContext.throwIfExpired()
       await openCodeHostManager.withConfirmedAbsentHostAuthority(record, async () => {
         const retired = await openCodeSessionStore.retireAbsentRuntimeIfSession(record, runId, provisioningSignal)
         if (!retired) throw new Error('OpenCode dead runtime recovery session authority changed or is owned')

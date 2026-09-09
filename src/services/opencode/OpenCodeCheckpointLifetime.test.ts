@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
@@ -39,7 +39,7 @@ describe('pending native OAuth session authority', () => {
       if (throwAfter) throw new Error('TEST uncertain HTTP outcome')
     }, isNativeSettled: () => false, allowNativeContinuation: true })
   beforeEach(async () => {
-    root = await mkdtemp(path.join(os.tmpdir(), 'opencode-pending-native-TEST-'))
+    root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-pending-native-TEST-')))
     project = path.join(root, 'project')
     await mkdir(project)
     env = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),

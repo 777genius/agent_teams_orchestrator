@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, realpath, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
+import * as processIdentity from '../../utils/processKill.js'
+const realReadProcessBirth = processIdentity.readProcessStartTimeMs
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { readOpenCodeAuthCredential, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
@@ -29,10 +31,19 @@ describe('profile scope preparation and execution ownership', () => {
   let project: string
   let env: NodeJS.ProcessEnv
   let saved: NodeJS.ProcessEnv
+  let processBirthMock: { mockRestore(): void } | undefined
   const manager = new OpenCodeProfileManager()
   beforeEach(async () => {
+    // These synthetic hosts run in this same test process, whose birth cannot
+    // change mid-test. Keep repeated OS shell startup out of coordinator timing;
+    // PendingOAuthSession/CheckpointLifetime exercise real process replacement.
+    const birth = await realReadProcessBirth(process.pid)
+    expect(birth).toBeGreaterThan(0)
+    processBirthMock = spyOn(processIdentity, 'readProcessStartTimeMs').mockImplementation(
+      (pid, platform) => pid === process.pid && (platform === undefined || platform === process.platform)
+        ? Promise.resolve(birth) : realReadProcessBirth(pid, platform))
     processBirth = (await readProcessStartTimeMs(process.pid))!
-    root = await mkdtemp(path.join(os.tmpdir(), 'opencode-scope-race-TEST-'))
+    root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-scope-race-TEST-')))
     project = path.join(root, 'project')
     await mkdir(project)
     env = {
@@ -50,6 +61,7 @@ describe('profile scope preparation and execution ownership', () => {
       credential: { type: 'api', key: 'sandbox-zai' } })
   })
   afterEach(async () => {
+    processBirthMock?.mockRestore()
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value

@@ -1,7 +1,7 @@
 // Run in its own Bun process: the atomic writer is fault-injected at the module
 // boundary, while resolver, native ownership and recovery remain real.
 import { expect, mock, test } from 'bun:test'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as atomic from '../../utils/atomicWrite.js'
@@ -19,7 +19,7 @@ mock.module('../../utils/atomicWrite.js', () => ({ ...atomic,
 const { OpenCodeProfileManager, resolveOpenCodeProfileScope } = await import('./OpenCodeProfileManager.js')
 const { readOpenCodeAuthCredential, readOpenCodeSavedAuthStore, openCodeOAuthSuccessorPath, upsertOpenCodeAuthCredential } = await import('./OpenCodeAuthStore.js')
 const saved = async (global: string, env: NodeJS.ProcessEnv) => (await readOpenCodeSavedAuthStore({
-  globalAuthPath: global, sourceAuthPaths: [global, path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+  globalAuthPath: global, env, sourceAuthPaths: [global, path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
     path.join(env.HOME!, '.local', 'share', 'opencode', 'auth.json')],
 })).xai ?? null
 const c0 = { type: 'oauth', access: 'synthetic-C0', refresh: 'single-use-C0', expires: 1000, accountId: 'TEST' }
@@ -27,7 +27,7 @@ const c1 = { ...c0, access: 'synthetic-C1', refresh: 'single-use-C1', expires: 5
 const c2 = { ...c0, access: 'synthetic-C2', refresh: 'single-use-C2', expires: 250 }
 
 for (const [failAfterRename, purpose] of [[false, 'launch_runtime'], [true, 'launch_runtime'], [false, 'execution_probe'], [true, 'execution_probe']] as const) test(`saved write failure recovers exact native C1 and consumes it for C2 in a fresh process (${purpose}, after successor rename: ${failAfterRename})`, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-publication-TEST-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-publication-TEST-')))
   const project = path.join(root, 'project')
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
@@ -96,7 +96,7 @@ for (const [failAfterRename, purpose] of [[false, 'launch_runtime'], [true, 'lau
 
 for (const mutation of ['duplicate', 'new-successor', 'account-swap', 'api', 'logout', 'config', 'project-config', 'source-paths', 'corrupt-source', 'corrupt-owner', 'native-result']) {
   test(`pending owned completion handles ${mutation} without overwriting changed authority`, async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-receipt-TEST-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-receipt-TEST-')))
     const project = path.join(root, 'project')
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
       XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
@@ -161,11 +161,22 @@ for (const mutation of ['duplicate', 'new-successor', 'account-swap', 'api', 'lo
         expect(await read()).toEqual(c0)
         expect(await Bun.file(receiptPath).exists()).toBe(false)
         expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'xai' })).toEqual(c1)
+        const spent = await manager.prepareProfile(otherProject, { profileScope: freshScope })
+        let spentCalls = 0
+        await expect(manager.withOwnedOAuthRefresh({ profile: spent, assertHostOwnership: async () => {},
+          operation: async () => { spentCalls += 1 },
+        })).rejects.toThrow('pending')
+        expect(spentCalls).toBe(0)
         const cnew = { ...c0, access: 'TEST-new-login', refresh: 'TEST-new-login-refresh' }
         await upsertOpenCodeAuthCredential({ authPath: global, providerId: 'xai', credential: cnew })
         const reopened = await manager.prepareProfile(otherProject, { profileScope: await resolveOpenCodeProfileScope({
           projectPath: otherProject, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env }) })
         expect(await readOpenCodeAuthCredential({ authPath: reopened.managedAuthPath, providerId: 'xai' })).toEqual(cnew)
+        const cnext = { ...cnew, access: 'TEST-new-next', refresh: 'TEST-new-next-refresh' }
+        await manager.withOwnedOAuthRefresh({ profile: reopened, assertHostOwnership: async () => {},
+          operation: () => writeFile(reopened.managedAuthPath, JSON.stringify({ xai: cnext })),
+        })
+        expect(await read()).toEqual(cnext)
       } else if (mutation.startsWith('corrupt-')) {
         const corrupted = JSON.parse(receipt)
         if (mutation === 'corrupt-source') corrupted.sourceAuthPaths[1] = 42
@@ -188,7 +199,7 @@ for (const mutation of ['duplicate', 'new-successor', 'account-swap', 'api', 'lo
 }
 
 test.each(['admission', 'terminal-upgrade'])('native session receipt write failure preserves reuse: %s', async stage => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-arm-failure-TEST-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-arm-failure-TEST-')))
   const project = path.join(root, 'project')
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
@@ -238,7 +249,7 @@ test.each(['admission', 'terminal-upgrade'])('native session receipt write failu
 
 test('Stop publication failure retains the original lease until exact saved C1 is durable', async () => {
   const { OpenCodeSessionBridge } = await import('./OpenCodeSessionBridge.js')
-  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-stop-write-TEST-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-stop-write-TEST-')))
   const project = path.join(root, 'project')
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
@@ -285,7 +296,7 @@ test('Stop publication failure retains the original lease until exact saved C1 i
 
 for (const failAfterRename of [false, true]) test(`revoked admission archive failure keeps the active fence (after rename: ${failAfterRename})`, async () => {
   const { createHash } = await import('node:crypto')
-  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-archive-TEST-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-oauth-archive-TEST-')))
   const project = path.join(root, 'project')
   const env = { HOME: path.join(root, 'home'), XDG_CONFIG_HOME: path.join(root, 'config'),
     XDG_DATA_HOME: path.join(root, 'data'), CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app'),

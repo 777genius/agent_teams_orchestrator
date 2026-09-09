@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
+import * as processIdentity from '../../utils/processKill.js'
+const realReadProcessBirth = processIdentity.readProcessStartTimeMs
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
@@ -19,17 +21,26 @@ const c2 = { ...c0, access: 'synthetic-access-2', refresh: 'single-use-2', expir
 describe('scoped OAuth native durability integration', () => {
   let root: string, project: string, env: NodeJS.ProcessEnv, saved: NodeJS.ProcessEnv
   let now: number
+  let processBirthMock: { mockRestore(): void } | undefined
   const manager = new OpenCodeProfileManager()
   const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, providerId: 'xai' })
   const readSaved = async (global = path.join(env.CLAUDE_MULTIMODEL_DATA_HOME!, 'opencode', 'auth.json')) =>
-    (await readOpenCodeSavedAuthStore({ globalAuthPath: global, sourceAuthPaths: [global,
+    (await readOpenCodeSavedAuthStore({ globalAuthPath: global, env, sourceAuthPaths: [global,
       path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'), path.join(env.HOME!, '.local', 'share', 'opencode', 'auth.json')] })).xai ?? null
   const save = (authPath: string, credential: typeof c0) => upsertOpenCodeAuthCredential({ authPath, providerId: 'xai', credential })
   const prepare = async () => manager.prepareProfile(project, {
     profileScope: await resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env }),
   })
   beforeEach(async () => {
-    root = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-durability-TEST-'))
+    // These synthetic hosts run in this same test process, whose birth cannot
+    // change mid-test. Keep repeated OS shell startup out of coordinator timing;
+    // PendingOAuthSession/CheckpointLifetime exercise real process replacement.
+    const birth = await realReadProcessBirth(process.pid)
+    expect(birth).toBeGreaterThan(0)
+    processBirthMock = spyOn(processIdentity, 'readProcessStartTimeMs').mockImplementation(
+      (pid, platform) => pid === process.pid && (platform === undefined || platform === process.platform)
+        ? Promise.resolve(birth) : realReadProcessBirth(pid, platform))
+    root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-durability-TEST-')))
     project = path.join(root, 'project')
     await mkdir(project)
     env = { HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
@@ -42,6 +53,7 @@ describe('scoped OAuth native durability integration', () => {
     await save(manager.getGlobalAuthPath(), c0)
   })
   afterEach(async () => {
+    processBirthMock?.mockRestore()
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value

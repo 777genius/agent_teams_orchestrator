@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
@@ -39,7 +39,7 @@ describe('pending native OAuth session authority', () => {
       if (throwAfter) throw new Error('TEST uncertain HTTP outcome')
     }, isNativeSettled: () => false, allowNativeContinuation: true })
   beforeEach(async () => {
-    root = await mkdtemp(path.join(os.tmpdir(), 'opencode-pending-native-TEST-'))
+    root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-pending-native-TEST-')))
     project = path.join(root, 'project')
     await mkdir(project)
     env = { ...process.env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
@@ -215,7 +215,25 @@ describe('pending native OAuth session authority', () => {
     expect(await readSaved()).toEqual(c1)
   })
 
-  test.each([['probe', false], ['probe', true], ['session', false], ['session', true], ['revoked-session', false], ['replaced-birth-session', false], ['cancelled-probe', false], ['cancelled-session', false], ['unsubmitted-probe', false], ['unsubmitted-session', false], ['unsubmitted-probe-missing-history', false], ['unsubmitted-session-missing-history', false], ['unsubmitted-probe-unsupported-history', false], ['unsubmitted-session-unsupported-history', false], ['unsubmitted-probe-changed-auth', false], ['unsubmitted-session-changed-auth', false], ['unsubmitted-probe-wrong-directory', false], ['unsubmitted-session-wrong-directory', false], ['unsubmitted-probe-oversized', false], ['unsubmitted-session-oversized', false], ['unsubmitted-probe-message-cap', false], ['unsubmitted-session-message-cap', false]] as const)('exited %s requires exact committed terminal history (wrong parent: %s)', async (kind, wrongParent) => {
+  test.each([
+    ['probe', false], ['probe', true],
+    ['session', false], ['session', true],
+    ['revoked-session', false], ['replaced-birth-session', false],
+    ['cancelled-probe', false], ['cancelled-session', false],
+    ['wrong-parent-probe', false], ['wrong-parent-session', false],
+    ['wrong-model-probe', false], ['wrong-model-session', false],
+    ['wrong-provider-probe', false], ['wrong-provider-session', false],
+    ['incomplete-probe', false], ['incomplete-session', false],
+    ['relaunch-session', false], ['relaunch-session', true],
+    ['relaunch-cancelled-session', false], ['unsubmitted-probe', false],
+    ['unsubmitted-session', false], ['unsubmitted-probe-missing-history', false],
+    ['unsubmitted-session-missing-history', false], ['unsubmitted-probe-unsupported-history', false],
+    ['unsubmitted-session-unsupported-history', false], ['unsubmitted-probe-changed-auth', false],
+    ['unsubmitted-session-changed-auth', false], ['unsubmitted-probe-wrong-directory', false],
+    ['unsubmitted-session-wrong-directory', false], ['unsubmitted-probe-oversized', false],
+    ['unsubmitted-session-oversized', false], ['unsubmitted-probe-message-cap', false],
+    ['unsubmitted-session-message-cap', false],
+  ] as const)('exited %s requires exact committed terminal history (wrong parent: %s)', async (kind, wrongParent) => {
     const isProbe = kind.includes('probe')
     const unsubmitted = kind.startsWith('unsubmitted-')
     const child = Bun.spawn([process.execPath, '-e', 'await Bun.stdin.text()'], { stdin: 'pipe', stdout: 'ignore', stderr: 'pipe' })
@@ -245,7 +263,11 @@ describe('pending native OAuth session authority', () => {
         db.query('insert into session values (?, ?, ?)').run(owner.record.opencodeSessionId, 'project-TEST', project)
         db.query('insert into project values (?, ?, ?)').run('project-TEST', project, 'git')
         const history = terminalMessages(wrongParent ? 'foreign-message' : owner.messageId)
-        if (kind.startsWith('cancelled-')) history.splice(1)
+        if (kind.includes('cancelled-')) history.splice(1)
+        if (kind.startsWith('wrong-parent-')) history[1]!.info.parentID = 'foreign-message'
+        if (kind.startsWith('wrong-model-')) history[1]!.info.modelID = 'foreign-model'
+        if (kind.startsWith('wrong-provider-')) history[1]!.info.providerID = 'foreign-provider'
+        if (kind.startsWith('incomplete-')) delete (history[1]!.info as any).time
         if (unsubmitted) history.splice(0)
         for (const [index, message] of history.entries()) {
           db.query('insert into message values (?, ?, ?, ?, ?)').run(message.info.id, owner.record.opencodeSessionId, index + 1, null, JSON.stringify(message.info))
@@ -264,7 +286,53 @@ describe('pending native OAuth session authority', () => {
       if (kind === 'revoked-session') { registry.hosts[owner.record.hostKey].leases = {}; await saveRegistry() }
       if (kind === 'replaced-birth-session') { registry.hosts[owner.record.hostKey].processStartedAtMs += 1; await saveRegistry() }
       const fresh = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env })
-      if (wrongParent || kind === 'revoked-session' || kind === 'replaced-birth-session' || /missing-history|unsupported-history|changed-auth|wrong-directory|oversized|message-cap/.test(kind)) {
+      if (kind.startsWith('relaunch-')) {
+        // Direct public launch: no standalone resolver or receipt recovery first.
+        const { executeOpenCodeBridgeCommandEnvelope } = await import('./OpenCodeBridgeCommandHandler.js')
+        const { openCodeSessionStore } = await import('./OpenCodeSessionStore.js')
+        const { openCodeHostManager } = await import('./OpenCodeHostManager.js')
+        const { openCodeProvisioningProbe } = await import('./OpenCodeProvisioningProbe.js')
+        const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+        const restores: Array<{ mockRestore(): void }> = []
+        let provisioned = false
+        try {
+          restores.push(spyOn(openCodeSessionStore, 'list').mockImplementation(() => sessionStore.list()))
+          restores.push(spyOn(openCodeSessionStore, 'retireAbsentRuntimeIfSession').mockImplementation(
+            (...args) => sessionStore.retireAbsentRuntimeIfSession(...args)))
+          restores.push(spyOn(openCodeHostManager, 'withConfirmedAbsentHostAuthority').mockImplementation(
+            (...args) => hosts.withConfirmedAbsentHostAuthority(...args)))
+          restores.push(spyOn(openCodeProvisioningProbe, 'probeRetainingHost').mockImplementation(async () => {
+            provisioned = true
+            const reopened = await manager.prepareProfile(project, { profileScope: await fresh() })
+            expect(await readOpenCodeAuthCredential({ authPath: reopened.managedAuthPath, providerId: 'xai' })).toEqual(c1)
+            expect((await sessionStore.get('TEST', 'primary', 'owner'))?.stoppedAt).toBeDefined()
+            expect(await Bun.file(`${global}.agent-teams-xai-oauth-save.json`).exists()).toBe(false)
+            // Provisioning is the next process boundary; this fixture launches no provider.
+            throw new Error('TEST reached fresh C1 provisioning')
+          }))
+          const result = await executeOpenCodeBridgeCommandEnvelope({ schemaVersion: 1, requestId: 'TEST-relaunch',
+            command: 'opencode.launchTeam', cwd: project, startedAt: new Date().toISOString(), timeoutMs: 20_000,
+            body: { teamId: 'TEST', laneId: 'primary', runId: 'run-2', selectedModel: 'xai/grok-4.3',
+              members: [{ name: 'owner' }], preconditions: { handshakeIdentityHash: 'TEST-handshake',
+                laneId: 'primary', expectedRunId: 'run-2', expectedCapabilitySnapshotId: null,
+                expectedBehaviorFingerprint: 'b'.repeat(64), expectedManifestHighWatermark: 0,
+                commandLeaseId: 'TEST-lease', idempotencyKey: 'TEST-relaunch' } } })
+          expect(result.ok).toBe(false)
+          if (wrongParent || kind.includes('cancelled')) {
+            expect(provisioned).toBe(false)
+            expect((await sessionStore.get('TEST', 'primary', 'owner'))?.stoppedAt).toBeUndefined()
+            expect(await Bun.file(`${global}.agent-teams-xai-oauth-save.json`).exists()).toBe(true)
+            expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey]).toBeDefined()
+          } else {
+            expect(provisioned).toBe(true)
+            if (!result.ok) expect(result.error.message).toBe('TEST reached fresh C1 provisioning')
+            expect(await readSaved()).toEqual(c1)
+            expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey]).toBeUndefined()
+          }
+        } finally { for (const mock of restores.reverse()) mock.mockRestore() }
+        return
+      }
+      if (wrongParent || /^(cancelled|wrong-parent|wrong-provider|wrong-model|incomplete)-/.test(kind) || kind === 'revoked-session' || kind === 'replaced-birth-session' || /missing-history|unsupported-history|changed-auth|wrong-directory|oversized|message-cap/.test(kind)) {
         await expect(fresh()).rejects.toThrow()
         expect(await readSaved()).toEqual(c0)
       } else {

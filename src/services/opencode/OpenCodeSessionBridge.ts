@@ -1133,7 +1133,7 @@ export class OpenCodeSessionBridge {
           && offline.sessionIdentity.directory === record.projectPath
           && (unsubmitted
             ? offline.historyComplete === true && !offline.messages.some(message => message.info?.id === owner.messageId || message.info?.parentID === owner.messageId)
-            : offline.messages.some(message => message.info?.id === owner.messageId && message.info?.role === 'user'))
+            : completedPrompt(offline.messages))
         await this.assertOwnedOAuthSessionAuthority(record)
         return null // Verification only; leave registry retirement to the run owner.
       })
