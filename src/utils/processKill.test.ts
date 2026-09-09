@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
+import * as childProcess from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { join } from 'node:path'
 
 import {
@@ -14,6 +17,7 @@ import {
 const originalSystemRoot = process.env.SystemRoot
 
 afterEach(() => {
+  mock.restore()
   if (originalSystemRoot === undefined) {
     delete process.env.SystemRoot
   } else {
@@ -60,8 +64,91 @@ describe('processKill', () => {
   })
 
   it('does not spawn an identity query for an invalid pid', async () => {
-    await expect(readProcessStartTimeMs(0, 'win32')).resolves.toBeNull()
+    const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => {
+      throw new Error('Invalid PID must not spawn')
+    })
+    for (const pid of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1,
+      0x80000000, '123', '123; exit 0', null, undefined]) {
+      await expect(readProcessStartTimeMs(pid as number, 'win32')).resolves.toBeNull()
+    }
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  function mockWindowsQuery() {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      kill: mock(() => true),
+    })
+    const spawn = spyOn(childProcess, 'spawn').mockReturnValue(child as unknown as childProcess.ChildProcess)
+    return { child, spawn }
+  }
+
+  it('queries the same Windows creation time through .NET without cmdlet autoimport', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    expect(spawn).toHaveBeenCalledTimes(1)
+    const [command, args, options] = spawn.mock.calls[0]!
+    expect(command).toBe('powershell.exe')
+    expect(args!.slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command'])
+    const query = args![5]!
+    expect(query).toContain('$ErrorActionPreference = "Stop"')
+    expect(query).toContain('$process = $null; try { $process = [System.Diagnostics.Process]::GetProcessById(2104)')
+    expect(query).toContain('$process.StartTime.ToUniversalTime().ToString("o")')
+    expect(query).toContain('catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }')
+    expect(query).toEndWith('[Console]::Out.WriteLine($startedAt)')
+    expect(query).not.toMatch(/Get-Process|Get-CimInstance|Import-Module|Write-Output/)
+    expect(options).toEqual({ stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    child.stdout.write('2026-09-09T03:26:43.')
+    child.stdout.write('6163024Z\r\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toBe(Date.parse('2026-09-09T03:26:43.6163024Z'))
+  })
+
+  it('fails closed on missing, denied, malformed, or failed Windows queries', async () => {
+    for (const [output, code] of [['', 0], ['not a timestamp', 0],
+      ['2026-09-09T03:26:43.6163024Z\n', 1], ['2026-09-09T03:26:43.6163024Z\n', null]] as const) {
+      const { child, spawn } = mockWindowsQuery()
+      const result = readProcessStartTimeMs(2104, 'win32')
+      child.stdout.write(output)
+      child.emit('close', code)
+      await expect(result).resolves.toBeNull()
+      expect(spawn).toHaveBeenCalledTimes(1)
+      spawn.mockRestore()
+    }
+  })
+
+  it('fails closed on Windows query spawn errors without a fallback', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    child.emit('error', new Error('ENOENT'))
+    await expect(result).resolves.toBeNull()
+    expect(spawn).toHaveBeenCalledTimes(1)
+    spawn.mockImplementation(() => { throw new Error('EACCES') })
+    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBeNull()
+    expect(spawn).toHaveBeenCalledTimes(2)
+  })
+
+  it('retains the 64 KiB Windows identity output bound', async () => {
+    const { child } = mockWindowsQuery()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    child.stdout.write(' '.repeat(64 * 1024))
+    child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('kills a hung Windows query at the existing 2.5 second deadline and fails closed', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const timer = spyOn(globalThis, 'setTimeout')
+    const result = readProcessStartTimeMs(2104, 'win32')
+    expect(timer.mock.calls[0]![1]).toBe(2500)
+    await expect(result).resolves.toBeNull()
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(spawn).toHaveBeenCalledTimes(1)
+    child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toBeNull()
   })
 
   it('parses precise Linux start ticks when command names contain delimiters', () => {

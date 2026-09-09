@@ -176,6 +176,10 @@ export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(ro
   const literal = value => "'" + value.replaceAll("'", "''") + "'";
   const command = `
 $ErrorActionPreference = 'Stop'
+# Avoid automatic module discovery under the isolated fixture home.
+Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+Import-Module CimCmdlets -ErrorAction Stop
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 $rootPath = ${literal(path.resolve(root) + path.sep)}
 $nodePath = ${literal(process.execPath)}
 $nodeScriptPattern = ${literal(windowsNodeScriptPattern)}
@@ -198,14 +202,16 @@ foreach ($entry in @(Get-CimInstance Win32_Process)) {
   if (-not (Is-Owned $entry)) { continue }
   $target = Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
   if (-not $target) { continue }
-  # Hold the process handle before the second identity check, avoiding PID reuse.
-  $heldHandle = $target.Handle
-  $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.ProcessId)
-  if (-not $current) { continue }
-  if ($current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
-  $stopped += @{ pid = $entry.ProcessId; executable = $entry.ExecutablePath; commandLine = $entry.CommandLine; startedAt = $entry.CreationDate.ToUniversalTime().ToString('o') }
-  $target.Kill()
-  if (-not $target.WaitForExit(5000)) { throw 'Owned process did not exit during cleanup' }
+  try {
+    # Hold the process handle before the second identity check, avoiding PID reuse.
+    $heldHandle = $target.Handle
+    $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.ProcessId)
+    if (-not $current) { continue }
+    if ($current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
+    $stopped += @{ pid = $entry.ProcessId; executable = $entry.ExecutablePath; commandLine = $entry.CommandLine; startedAt = $entry.CreationDate.ToUniversalTime().ToString('o') }
+    $target.Kill()
+    if (-not $target.WaitForExit(5000)) { throw 'Owned process did not exit during cleanup' }
+  } finally { $target.Dispose() }
 }
 ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
 `;

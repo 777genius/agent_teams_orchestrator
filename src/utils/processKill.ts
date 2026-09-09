@@ -96,7 +96,7 @@ function readProcessQueryOutput(
 }
 
 /**
- * Read the operating-system process creation time without invoking a shell.
+ * Read the operating-system process creation time using a bounded query.
  * A PID alone is not an ownership token: after a process exits the OS may reuse
  * it for an unrelated process, so persistent registries must compare both.
  */
@@ -104,10 +104,10 @@ export async function readProcessStartTimeMs(
   pid: number,
   platform: NodeJS.Platform = process.platform,
 ): Promise<number | null> {
-  const normalizedPid = Math.trunc(pid)
-  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || (platform === 'win32' && pid > 0x7fffffff)) {
     return null
   }
+  const normalizedPid = pid
 
   if (platform === 'linux') {
     // Linux exposes starttime in clock ticks, avoiding the one-second
@@ -128,18 +128,22 @@ export async function readProcessStartTimeMs(
   if (platform !== 'win32') return null
 
   const command = 'powershell.exe'
+  // Get-Process can hang during module autoimport in an isolated Windows home.
+  // Read the same .NET StartTime directly and release the process handle even
+  // when the process exits or access is denied. Emit only after cleanup succeeds.
   const args = [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        [
-          '$ErrorActionPreference = "Stop"',
-          `$process = Get-Process -Id ${normalizedPid} -ErrorAction Stop`,
-          '$process.StartTime.ToUniversalTime().ToString("o")',
-        ].join('; '),
-      ]
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    [
+      '$ErrorActionPreference = "Stop"',
+      '$process = $null',
+      `try { $process = [System.Diagnostics.Process]::GetProcessById(${normalizedPid}); $startedAt = $process.StartTime.ToUniversalTime().ToString("o") } catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }`,
+      '[Console]::Out.WriteLine($startedAt)',
+    ].join('; '),
+  ]
 
   const output = await readProcessQueryOutput(
     command,
