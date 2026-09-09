@@ -25,7 +25,7 @@ const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, provid
 const exists = (file: string) => Bun.file(file).exists()
 
 async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' | 'execution_probe', remote?: boolean,
-  terminal?: string, successor?: typeof c0 } = {}) {
+  terminal?: string, successor?: typeof c0, controlUrl?: string } = {}) {
   const root = await realpath(await mkdtemp('/tmp/oauth-restart-audit-'))
   roots.push(root)
   const project = path.join(root, 'project')
@@ -40,7 +40,7 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
     CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache'),
     CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: process.execPath,
     CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify([path.join(root, 'never-executed-mcp.js')]),
-    CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43101', AGENT_TEAMS_MCP_CLAUDE_DIR: path.join(root, 'claude'),
+    CLAUDE_TEAM_CONTROL_URL: options.controlUrl ?? 'http://127.0.0.1:43101', AGENT_TEAMS_MCP_CLAUDE_DIR: path.join(root, 'claude'),
     ...(options.remote ? { CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:43101/mcp' } : {}),
   }
   const purpose = options.purpose ?? 'launch_runtime'
@@ -461,3 +461,282 @@ for (const mutation of ['command', 'authority-root', 'provider-config']) {
     expect((await saved(f)).xai).toEqual(c1)
   })
 }
+
+// Permanent independent-review regressions; desired behavior replaces bug characterization.
+for (const session of [false, true]) for (const terminal of [undefined, 'incomplete']) for (const drift of ['command', 'authority-root', 'source-paths']) {
+  test(`F1 foreign caller retains original receipt session=${session}: ${terminal ?? 'complete'}/${drift}`, async () => {
+    const f = await fixture({ terminal, session })
+    const foreign = path.join(f.root, 'foreign'); await mkdir(foreign)
+    const env = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' }
+    if (drift === 'command') env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = '/foreign-command'
+    if (drift === 'authority-root') env.AGENT_TEAMS_MCP_CLAUDE_DIR = path.join(f.root, 'foreign-app')
+    if (drift === 'source-paths') env.XDG_DATA_HOME = path.join(f.root, 'foreign-source')
+    const result = await fresh(f, env, 'execution_probe', foreign)
+    expect(result.ok).toBe(false)
+    expect(await exists(f.receiptPath)).toBe(true)
+    expect(await exists(f.archivePath)).toBe(false)
+    const retained = await Bun.file(f.receiptPath).json()
+    expect(retained.owner).toEqual(f.receipt.owner)
+    expect(retained.successor).toEqual(terminal ? null : c1)
+    expect(await read(f.global)).toEqual(c0)
+    let calls = 0
+    await expect(manager.withOwnedOAuthRefresh({ profile: f.profile, assertHostOwnership: async () => {},
+      operation: async () => { calls++ } })).rejects.toThrow()
+    expect(calls).toBe(0)
+    if (terminal) {
+      expect((await fresh(f)).ok).toBe(false)
+      expect(await exists(f.receiptPath)).toBe(true)
+      const db = new Database(path.join(path.dirname(f.profile.managedAuthPath), 'opencode.db'))
+      try {
+        const row = db.query('select data from message where id = ?').get('audit-assistant') as { data: string }
+        const assistant = JSON.parse(row.data)
+        assistant.time = { completed: 1 }
+        db.query('update message set data = ? where id = ?').run(JSON.stringify(assistant), 'audit-assistant')
+      } finally { db.close() }
+    }
+    expect((await fresh(f)).ok).toBe(true)
+    expect((await saved(f)).xai).toEqual(c1)
+    expect(await exists(f.receiptPath)).toBe(false)
+    expect(await exists(f.archivePath)).toBe(false)
+    expect(await read(f.global)).toEqual(c0)
+  })
+}
+
+for (const state of ['pending', 'published']) for (const [label, url] of [
+  ['nonloopback', 'http://192.0.2.1:43102'], ['other-loopback', 'http://127.0.0.2:43102'],
+  ['ipv6-host-change', 'http://[::1]:43102'], ['username', 'http://alice@127.0.0.1:43102'],
+  ['password', 'http://alice:secret@127.0.0.1:43102'], ['https', 'https://127.0.0.1:43102'],
+  ['port-zero', 'http://127.0.0.1:0'], ['invalid-port', 'http://127.0.0.1:65536'], ['malformed', 'not a URL'],
+  ['fragment', 'http://127.0.0.1:43102/#fragment'], ['path', 'http://127.0.0.1:43102/foreign'],
+  ['query', 'http://127.0.0.1:43102/?secret=other'],
+]) {
+  test(`endpoint admission ${state}/${label}`, async () => {
+    const f = await fixture()
+    if (state === 'published') expect((await fresh(f)).ok).toBe(true)
+    const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: url }
+    // Ineligible endpoints cannot acquire port-drift authority.
+    expect(await current(f, changed)).toBe(false)
+    if (state === 'published') {
+      const file = openCodeOAuthSuccessorPath(f.global), before = await readFile(file, 'utf8')
+      await expect(saved(f, changed)).rejects.toThrow()
+      expect(await readFile(file, 'utf8')).toBe(before)
+    } else {
+      await fresh(f, changed)
+      expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+      expect((await Bun.file(f.archivePath).json()).successor).toEqual(c1)
+    }
+  })
+}
+
+test('candidate normalization rejects an ineligible default-port URL with fragment', async () => {
+  const f = await fixture()
+  const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:80/#foreign-fragment' }
+  expect(await current(f, changed)).toBe(false)
+  const rawScope = await resolveOpenCodeProfileScope({ projectPath: f.project, purpose: f.purpose,
+    selectedModel: 'xai/grok-4.3', env: changed, cacheSnapshot: false })
+  expect(rawScope.scopeToken).not.toBe(f.receipt.owner.scopeToken)
+  expect((await fresh(f, changed)).ok).toBe(true)
+  expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+})
+
+test('F2 characterization source replacement during nonterminal session verification releases active fence', async () => {
+  const f = await fixture({ session: true, terminal: 'incomplete' })
+  const { OpenCodeSessionBridge } = await import('./OpenCodeSessionBridge')
+  const { OpenCodeHostManager } = await import('./OpenCodeHostManager')
+  const { OpenCodeSessionStore } = await import('./OpenCodeSessionStore')
+  const dataRoot = path.join(f.root, 'app-data')
+  const bridge = new OpenCodeSessionBridge({ oauthRecoveryDataRoot: dataRoot,
+    hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(dataRoot, 'opencode', 'host-registry.json') }),
+    sessionStore: new OpenCodeSessionStore(path.join(dataRoot, 'opencode', 'session-store.json')) })
+  expect(await bridge.isOwnedOAuthNativeSessionSettled(f.receipt.nativeSession)).toBe(false)
+  const replacement = { ...c0, refresh: 'independent-new-login', accountId: 'new-account' }
+  let calls = 0
+  // This is the production pre-release entry, not a fabricated assertOwner bypass.
+  await manager.finishOwnedOAuthBeforeSessionRelease(f.receipt.nativeSession.record, async owner => {
+    expect(await bridge.isOwnedOAuthNativeSessionSettled(owner)).toBe(false)
+    await writeFile(f.global, JSON.stringify({ xai: replacement }))
+    calls++
+    return false
+  })
+  expect(calls).toBe(1)
+  expect(await exists(f.receiptPath)).toBe(false)
+  expect((await Bun.file(f.archivePath).json()).successor).toBeNull()
+  expect(await read(f.global)).toEqual(replacement)
+})
+
+for (const state of ['pending', 'published']) for (const mutation of ['version', 'version-string', 'scope-link', 'fingerprint', 'primitive', 'empty-object']) {
+  test(`invalid binding denies selection ${state}/${mutation}`, async () => {
+    const f = await fixture()
+    if (state === 'published') expect((await fresh(f)).ok).toBe(true)
+    const file = state === 'pending' ? f.receiptPath : openCodeOAuthSuccessorPath(f.global)
+    const value = await Bun.file(file).json()
+    if (mutation === 'version') value.owner.credentialBinding.version = 2
+    if (mutation === 'version-string') value.owner.credentialBinding.version = '1'
+    if (mutation === 'scope-link') value.owner.credentialBinding.scopeToken = 'b'.repeat(64)
+    if (mutation === 'fingerprint') value.owner.credentialBinding.fingerprint = 'not-a-fingerprint'
+    if (mutation === 'primitive') value.owner.credentialBinding = 'forged'
+    if (mutation === 'empty-object') value.owner.credentialBinding = {}
+    await writeFile(file, JSON.stringify(value))
+    const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' }
+    expect((await fresh(f, changed)).ok).toBe(false)
+    if (state === 'pending') {
+      expect((await Bun.file(file).json()).successor).toEqual(c1)
+      expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+      expect(await exists(f.archivePath)).toBe(false)
+    } else {
+      await expect(saved(f, changed)).rejects.toThrow('binding')
+      expect(await Bun.file(file).json()).toEqual(value)
+    }
+  })
+}
+
+for (const state of ['pending', 'published']) for (const mutation of ['managed-data', 'managed-cache', 'home', 'config', 'provider-secret', 'account', 'source-value']) {
+  test(`independent authority isolation ${state}/${mutation}`, async () => {
+    const f = await fixture()
+    if (state === 'published') expect((await fresh(f)).ok).toBe(true)
+    const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' }
+    const replacement = { ...c0, refresh: 'replacement', ...(mutation === 'account' ? { accountId: 'different' } : {}) }
+    if (mutation === 'managed-data') changed.CLAUDE_MULTIMODEL_DATA_HOME = path.join(f.root, 'new-app-data')
+    if (mutation === 'managed-cache') changed.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(f.root, 'new-app-cache')
+    if (mutation === 'home') changed.HOME = changed.USERPROFILE = path.join(f.root, 'new-home')
+    if (mutation === 'config') changed.OPENCODE_CONFIG_CONTENT = JSON.stringify({ provider: { xai: { options: { baseURL: 'http://different.invalid/v1' } } } })
+    if (mutation === 'provider-secret') changed.XAI_API_KEY = 'independent-different-static-key'
+    if (mutation === 'account' || mutation === 'source-value') await writeFile(f.global, JSON.stringify({ xai: replacement }))
+    if (mutation !== 'account' && mutation !== 'source-value') expect(await current(f, changed)).toBe(false)
+    const result = await fresh(f, changed)
+    if (state === 'pending') expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+    else {
+      if (mutation === 'account' || mutation === 'source-value') expect((await saved(f, changed)).xai).toEqual(replacement)
+      else await expect(saved(f, changed)).rejects.toThrow()
+    }
+    expect(await read(f.global)).toEqual(mutation === 'account' || mutation === 'source-value' ? replacement : c0)
+  })
+}
+
+for (const mutation of ['lease-run', 'lease-session', 'birth', 'endpoint', 'session-record']) {
+  test(`independent new-port persistent session ownership ${mutation}`, async () => {
+    const f = await fixture({ session: true })
+    const registryPath = path.join(f.root, 'app-data/opencode/host-registry.json')
+    const registry = await Bun.file(registryPath).json()
+    const host: any = Object.values(registry.hosts)[0]
+    const lease: any = Object.values(host.leases)[0]
+    if (mutation === 'lease-run') lease.runId = 'foreign-run'
+    if (mutation === 'lease-session') lease.sessionId = 'foreign-session'
+    if (mutation === 'birth') host.processStartedAtMs += 1234
+    if (mutation === 'endpoint') host.baseUrl = 'http://127.0.0.1:43211'
+    if (mutation === 'session-record') {
+      // The public upsert rejects a foreign run before it reaches recovery.
+      // Mutate durable bytes to exercise recovery's independent ownership check.
+      const storePath = path.join(f.root, 'app-data/opencode/session-store.json')
+      const store = await Bun.file(storePath).json()
+      for (const record of Object.values(store.records) as any[]) record.runId = 'foreign-run'
+      await writeFile(storePath, JSON.stringify(store))
+    }
+    await writeFile(registryPath, JSON.stringify(registry))
+    const result = await fresh(f, { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' })
+    if (mutation === 'endpoint') {
+      // An exited writer is verified via exact birth/lease and canonical SQLite
+      // history; its obsolete registry URL is not contacted or used as proof.
+      expect(result.ok).toBe(true)
+      expect((await saved(f)).xai).toEqual(c1)
+      return
+    }
+    expect(result.ok).toBe(false)
+    expect(await readFile(f.receiptPath, 'utf8')).toBe(f.receiptText)
+    expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+  })
+}
+
+for (const session of [false, true]) test(`independent multiport sidecar chain C0 through C3 session=${session}`, async () => {
+  const f = await fixture({ session })
+  let predecessor = c1
+  let previousScope = f.profile.scopeToken
+  for (let stage = 1; stage <= 3; stage++) {
+    const env = { ...f.env, CLAUDE_TEAM_CONTROL_URL: `http://127.0.0.1:${44000 + stage}` }
+    expect((await fresh(f, env)).ok).toBe(true)
+    expect((await saved(f, env)).xai).toEqual(predecessor)
+    const scope = await resolveOpenCodeProfileScope({ projectPath: f.project, purpose: f.purpose, selectedModel: 'xai/grok-4.3', env })
+    expect(scope.scopeToken).not.toBe(previousScope)
+    const next = await manager.prepareProfile(f.project, { profileScope: scope })
+    expect(await read(next.managedAuthPath)).toEqual(predecessor)
+    const file = openCodeOAuthSuccessorPath(f.global)
+    const prior = await readFile(file, 'utf8')
+    expect((await fresh(f, env)).ok).toBe(true)
+    expect(await readFile(file, 'utf8')).toBe(prior)
+    if (stage < 3) {
+      const successor = { ...c0, access: `independent-C${stage+1}`, refresh: `independent-single-use-C${stage+1}`, expires: 500-stage }
+      await manager.withOwnedOAuthRefresh({ profile: next, assertHostOwnership: async () => {},
+        operation: async () => { await writeFile(next.managedAuthPath, JSON.stringify({ xai: successor })) } })
+      const authority = await Bun.file(file).json()
+      expect(authority.predecessor).toEqual(predecessor)
+      expect(authority.successor).toEqual(successor)
+      expect(authority.before).toEqual(f.receipt.before)
+      expect(authority.owner.scopeToken).toBe(scope.scopeToken)
+      expect(authority.owner.credentialBinding.scopeToken).toBe(scope.scopeToken)
+      predecessor = successor
+    }
+    previousScope = scope.scopeToken
+    expect(await read(f.global)).toEqual(c0)
+  }
+})
+
+for (const controlUrl of ['not a URL', 'http://127.0.0.1:0', 'http://127.0.0.1:80/#fragment', 'http://127.0.0.1:80/#']) {
+  test(`ineligible original endpoint retains exact-scope compatibility: ${controlUrl}`, async () => {
+    const f = await fixture({ controlUrl })
+    expect(await current(f)).toBe(true)
+    expect(await current(f, { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' })).toBe(false)
+    expect((await fresh(f)).ok).toBe(true)
+    expect((await saved(f)).xai).toEqual(c1)
+  })
+}
+
+for (const session of [false, true]) for (const nativeState of ['throwing', 'unsubmitted']) {
+  test(`foreign source paths retain ${nativeState} native receipt session=${session}`, async () => {
+    const f = await fixture({ session })
+    const foreign = path.join(f.root, 'foreign'); await mkdir(foreign)
+    const dbPath = path.join(path.dirname(f.profile.managedAuthPath), 'opencode.db')
+    const original = await readFile(dbPath)
+    if (nativeState === 'throwing') await writeFile(dbPath, 'invalid SQLite history')
+    else {
+      await writeFile(f.profile.managedAuthPath, JSON.stringify({ xai: c0 }))
+      const db = new Database(dbPath)
+      try { db.exec('delete from message') } finally { db.close() }
+    }
+    const changed = { ...f.env, XDG_DATA_HOME: path.join(f.root, 'foreign-source') }
+    expect((await fresh(f, changed, f.purpose, foreign)).ok).toBe(false)
+    expect(await readFile(f.receiptPath, 'utf8')).toBe(f.receiptText)
+    expect(await exists(f.archivePath)).toBe(false)
+    await writeFile(dbPath, original)
+    await writeFile(f.profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+    expect((await fresh(f)).ok).toBe(true)
+    expect((await saved(f)).xai).toEqual(c1)
+    expect(await exists(f.archivePath)).toBe(false)
+  })
+}
+
+for (const session of [false, true]) test(`foreign exact configuration retains unsubmitted receipt session=${session}`, async () => {
+  const f = await fixture({ session })
+  const foreign = path.join(f.root, 'foreign'); await mkdir(foreign)
+  await writeFile(f.profile.managedAuthPath, JSON.stringify({ xai: c0 }))
+  const dbPath = path.join(path.dirname(f.profile.managedAuthPath), 'opencode.db')
+  const original = await readFile(dbPath)
+  const db = new Database(dbPath)
+  try { db.exec('delete from message') } finally { db.close() }
+  expect((await fresh(f, f.env, f.purpose, foreign)).ok).toBe(false)
+  expect(await readFile(f.receiptPath, 'utf8')).toBe(f.receiptText)
+  expect(await exists(f.archivePath)).toBe(false)
+  await writeFile(dbPath, original)
+  await writeFile(f.profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+  expect((await fresh(f)).ok).toBe(true)
+  expect((await saved(f)).xai).toEqual(c1)
+})
+
+test('foreign exact configuration can still publish a proven original completion', async () => {
+  const f = await fixture()
+  const foreign = path.join(f.root, 'foreign'); await mkdir(foreign)
+  expect((await fresh(f, f.env, f.purpose, foreign)).ok).toBe(true)
+  expect((await saved(f)).xai).toEqual(c1)
+  const authority = await Bun.file(openCodeOAuthSuccessorPath(f.global)).json()
+  expect(authority.owner).toEqual(f.receipt.owner)
+  expect(authority.completion.managedAuthPath).toBe(f.profile.managedAuthPath)
+})

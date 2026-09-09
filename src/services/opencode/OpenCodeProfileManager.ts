@@ -2103,6 +2103,11 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
     const globalAuthPath = path.join(managedPaths.data, 'opencode', 'auth.json')
     await recoverOpenCodeOwnedOAuthSave({
       globalAuthPath, env,
+      assertRetirementAuthority: async owner => {
+        if (await canonicalizeOpenCodeProjectPath(input.projectPath) !== owner.projectPath) {
+          throw new Error('OpenCode OAuth retirement belongs to another project; original admission retained')
+        }
+      },
       sessionToRelease: input.oauthSessionToRelease,
       sourceAuthPaths: Array.from(new Set([globalAuthPath,
         path.join(env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share'), 'opencode', 'auth.json'),
@@ -2137,6 +2142,11 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
         return new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, managedPaths.data, true)
       },
       assertOwner: async (owner, predecessor, managedAuthPath) => {
+        const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+        if (projectPath !== owner.projectPath
+          && !await isOpenCodeOAuthPublicationScopeCurrent(owner, predecessor, env, projectPath)) {
+          throw new Error('OpenCode OAuth restart admission belongs to another project; original completion retained')
+        }
         const expectedPath = path.join(managedPaths.data, 'opencode', 'profiles',
           buildScopedProfileRootKey(owner.projectPath, owner), 'data', 'opencode', 'auth.json')
         if (managedAuthPath !== expectedPath) {
@@ -2147,11 +2157,6 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
             throw new Error('OpenCode OAuth recovery binding unavailable for changed launch scope; original admission retained')
           }
           throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth pending saved publication source scope changed')
-        }
-        const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
-        if (projectPath !== owner.projectPath
-          && !await isOpenCodeOAuthPublicationScopeCurrent(owner, predecessor, env, projectPath)) {
-          throw new Error('OpenCode OAuth restart admission belongs to another project; original completion retained')
         }
       },
     })
@@ -2363,6 +2368,7 @@ async function resolveOpenCodeProfileScopeInternal(
     // This is credential admission, not host reuse. Bind every scope input,
     // changing only the port of an otherwise identical local app control URL.
     const credentialMcp = structuredClone(appMcpLaunchConfig)
+    let restartEligible = false
     if (credentialMcp?.config.type === 'local') {
       const localEnv = credentialMcp.config.environment
       const control = localEnv?.CLAUDE_TEAM_CONTROL_URL
@@ -2371,7 +2377,8 @@ async function resolveOpenCodeProfileScopeInternal(
         try {
           const url = new URL(control)
           if (url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname)
-            && !url.username && !url.password && !url.hash) {
+            && !url.username && !url.password && !control.includes('#') && url.port !== '0') {
+            restartEligible = true
             url.port = ''
             localEnv.CLAUDE_TEAM_CONTROL_URL = url.toString()
           }
@@ -2387,6 +2394,9 @@ async function resolveOpenCodeProfileScopeInternal(
         managedPaths: snapshotManagedPaths,
         sourceRoots: { home: snapshotHomePath, xdgDataHome },
         appMcpLaunchIdentity: redactConfigIdentity(credentialMcp, env),
+        // Shared redaction may erase invalid URL details (notably fragments).
+        // Only eligible local endpoints may compare across distinct full scopes.
+        ...(!restartEligible ? { exactScopeToken: scopeToken } : {}),
       }),
     })
   }

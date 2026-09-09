@@ -180,6 +180,9 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
   sourceAuthPaths: readonly string[]
   assertOwner: (owner: OpenCodeOAuthSaveOwner, predecessor: OpenCodeAuthCredential,
     managedAuthPath: string) => Promise<void>
+  // Caller admission is separate from owner/source revocation. A foreign
+  // launch cannot retire a receipt using its own differing configuration.
+  assertRetirementAuthority?: (owner: OpenCodeOAuthSaveOwner) => Promise<void>
   isNativeSessionSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
   isNativeProbeSettled?: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<boolean>
   isNativeSessionUnsubmitted?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
@@ -240,6 +243,7 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
       throw new Error('OpenCode OAuth pending saved publication managed owner is invalid')
     }
     const retireRevokedPublication = async () => {
+      await input.assertRetirementAuthority?.(receipt.owner)
       // Revocation removes publication authority, never the denial of a
       // potentially consumed single-use predecessor. Archive terminal receipts
       // too, before freeing the active slot for an unrelated fresh credential.
@@ -324,6 +328,7 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
             || !isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), entryAuthority)) {
             throw new Error('OpenCode OAuth unsubmitted saved authority changed')
           }
+          await input.assertRetirementAuthority?.(receipt.owner)
           await rm(receiptPath)
           return false
         }
