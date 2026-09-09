@@ -84,6 +84,33 @@ describe('processKill', () => {
     return { child, spawn }
   }
 
+  // Drive the query's deadline without sleeping or depending on runner load.
+  function mockQueryClock() {
+    let now = 0
+    const pending = new Map<object, { at: number; fire: () => void }>()
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms: number) => {
+      const handle = { unref() {} }
+      pending.set(handle, { at: now + ms, fire: callback })
+      return handle
+    }) as typeof setTimeout)
+    spyOn(globalThis, 'clearTimeout').mockImplementation(((handle: object) => {
+      pending.delete(handle)
+    }) as typeof clearTimeout)
+    return {
+      timer,
+      advanceTo(ms: number) {
+        now = ms
+        for (const [handle, task] of pending) {
+          if (task.at <= now) {
+            pending.delete(handle)
+            task.fire()
+          }
+        }
+      },
+      pendingCount: () => pending.size,
+    }
+  }
+
   it('queries the same Windows creation time through .NET without cmdlet autoimport', async () => {
     const { child, spawn } = mockWindowsQuery()
     const result = readProcessStartTimeMs(2104, 'win32')
@@ -138,17 +165,77 @@ describe('processKill', () => {
     await expect(result).resolves.toBeNull()
   })
 
-  it('kills a hung Windows query at the existing 2.5 second deadline and fails closed', async () => {
+  it('accepts the first cold Windows identity after the old budget without a retry', async () => {
     const { child, spawn } = mockWindowsQuery()
-    const timer = spyOn(globalThis, 'setTimeout')
+    const clock = mockQueryClock()
     const result = readProcessStartTimeMs(2104, 'win32')
-    expect(timer.mock.calls[0]![1]).toBe(2500)
+    let settled = false
+    void result.then(() => { settled = true })
+    clock.advanceTo(3_000)
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    expect(child.kill).not.toHaveBeenCalled()
+    child.stdout.write('2026-09-09T03:26:43.6163024Z\r\n')
+    clock.advanceTo(4_999)
+    child.emit('close', 0)
+    await expect(result).resolves.toBe(Date.parse('2026-09-09T03:26:43.6163024Z'))
+    expect(spawn).toHaveBeenCalledTimes(1)
+    expect(clock.pendingCount()).toBe(0)
+    clock.advanceTo(5_000)
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('kills a hung Windows query at 5 seconds and ignores partial or late success', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const clock = mockQueryClock()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    expect(clock.timer.mock.calls[0]![1]).toBe(5_000)
+    child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
+    clock.advanceTo(4_999)
+    expect(child.kill).not.toHaveBeenCalled()
+    clock.advanceTo(5_000)
     await expect(result).resolves.toBeNull()
     expect(child.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(child.kill).toHaveBeenCalledTimes(1)
     expect(spawn).toHaveBeenCalledTimes(1)
+    expect(clock.pendingCount()).toBe(0)
     child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
     child.emit('close', 0)
     await expect(result).resolves.toBeNull()
+  })
+
+  it('still rejects invalid output after a cold Windows startup', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const clock = mockQueryClock()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    clock.advanceTo(3_000)
+    child.stdout.write('not a timestamp\r\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toBeNull()
+    expect(spawn).toHaveBeenCalledTimes(1)
+    expect(child.kill).not.toHaveBeenCalled()
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  it('retains the 2.5 second budget for Darwin identity and command-line queries', async () => {
+    for (const query of [
+      () => readProcessStartTimeMs(2104, 'darwin'),
+      () => readProcessCommandLine(2104, 'darwin'),
+      () => readProcessCommandLine(2104, 'win32'),
+    ]) {
+      const { child, spawn } = mockWindowsQuery()
+      const clock = mockQueryClock()
+      const result = query()
+      expect(clock.timer.mock.calls[0]![1]).toBe(2_500)
+      clock.advanceTo(2_499)
+      expect(child.kill).not.toHaveBeenCalled()
+      clock.advanceTo(2_500)
+      await expect(result).resolves.toBeNull()
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL')
+      expect(spawn).toHaveBeenCalledTimes(1)
+      expect(clock.pendingCount()).toBe(0)
+      mock.restore()
+    }
   })
 
   it('parses precise Linux start ticks when command names contain delimiters', () => {

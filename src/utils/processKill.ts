@@ -3,6 +3,10 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
+// Cold PowerShell identity queries have reached the 2.5s cutoff while a repeat
+// completes in ~0.8s. Give the first .NET query startup headroom without retrying.
+// This budget is separate from command-line queries and process termination.
+const WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS = 5_000
 const PROCESS_START_TIME_OUTPUT_LIMIT_BYTES = 64 * 1024
 const PROCESS_COMMAND_OUTPUT_LIMIT_BYTES = 256 * 1024
 
@@ -53,6 +57,7 @@ function readProcessQueryOutput(
   command: string,
   args: string[],
   outputLimitBytes: number,
+  timeoutMs = PROCESS_START_TIME_QUERY_TIMEOUT_MS,
 ): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
@@ -73,7 +78,7 @@ function readProcessQueryOutput(
         // Best-effort query cleanup.
       }
       finish(null)
-    }, PROCESS_START_TIME_QUERY_TIMEOUT_MS)
+    }, timeoutMs)
     timeout.unref?.()
 
     try {
@@ -149,6 +154,7 @@ export async function readProcessStartTimeMs(
     command,
     args,
     PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+    WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS,
   )
   return output === null ? null : parseProcessStartTime(output)
 }
