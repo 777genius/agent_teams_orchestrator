@@ -7,12 +7,16 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillEnvelope, assertImportedLedger, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
+const existingBun = () => (process.env.PATH || '').split(path.delimiter)
+  .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
+  .find(candidate => existsSync(candidate));
+
 
 // Real SQLite reader + attribution/reconstruction, without loading the full CLI,
 // installing dependencies, compiling, starting a provider, or modifying a project.
@@ -55,9 +59,7 @@ test('fixture is readable and reconstructs one strictly attributed write through
         requestedTask: { taskId: 'another-task', teamName: input.teamName } });
       assert.equal(wrongTask.changes.length, 0);
     `;
-    const bun = (process.env.PATH || '').split(path.delimiter)
-      .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
-      .find(candidate => existsSync(candidate));
+    const bun = existingBun();
     assert.ok(bun, 'Existing Bun required; this test never installs it');
     const result = spawnSync(bun, ['--eval', program], { cwd: root, env, encoding: 'utf8', timeout: 10000 });
     if (result.error) throw result.error;
@@ -220,42 +222,179 @@ test('spawn timeout records argv and stderr and fails the provider check', () =>
   assert.match(item.error, /ETIMEDOUT/);
 });
 
-test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 90000 }, async () => {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-owned-process-'));
-  const script = path.join(root, 'fake-opencode.cjs');
-  writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
-  const unrelatedScript = path.join(root, 'unrelated-helper.cjs');
-  writeFileSync(unrelatedScript, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
-  const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
-  const child = spawn(process.execPath, [script], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
-  const unrelated = spawn(process.execPath, [unrelatedScript], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+test('Windows script argument parsing requires a complete exact path', () => {
+  const node = String.raw`C:\trusted node\node.exe`;
+  for (const script of [String.raw`C:\isolated\fake-opencode.cjs`, String.raw`C:\isolated space 世界\fake-opencode.cjs`]) {
+    const pattern = new RegExp(windowsNodeScriptPattern, 'i');
+    const scriptArgument = command => {
+      const groups = pattern.exec(command)?.groups;
+      return groups?.quotedScript || groups?.bareScript;
+    };
+    assert.equal(scriptArgument(`"${node}" "${script}"`), script);
+    assert.equal(scriptArgument(`"${node}" "${script}" --port 1234`), script);
+    assert.equal(scriptArgument(`node.exe "${script}"`), script);
+    for (const command of [
+      `"${node}" "${script} unrelated-helper.cjs"`,
+      `"${node}" "${script} unrelated-helper.cjs" --port 1234`,
+      `"${node}" "${script}.other"`,
+      `"${node}" "${script}"suffix`,
+      `"${node}" "${script}`, // missing closing quote
+      `"${node}" ${script}\u00a0unrelated.cjs`, // NBSP is not a Windows argument separator
+      `"${node}" "${script}"\u00a0unrelated.cjs`,
+    ]) assert.notEqual(scriptArgument(command), script, command);
+    if (/\s/.test(script)) assert.notEqual(scriptArgument(`"${node}" ${script}`), script);
+    else assert.equal(scriptArgument(`"${node}" ${script} --port 1234`), script);
+  }
+});
+
+// Native failure evidence is flushed before and after every bounded invocation,
+// including an empty-output timeout. Only the sandbox allowlist is passed; never
+// retry against the runner's real home, PATH, credentials or provider config.
+function recordWindowsProbe(evidence, flush, label, executable, argv, options) {
+  const item = { label, executable, argv, cwd: options.cwd, stdio: options.stdio,
+    timeoutMs: options.timeout, startedAt: new Date().toISOString(), state: 'running' };
+  evidence.probes.push(item);
+  flush();
+  const started = performance.now();
+  const result = spawnSync(executable, argv, { encoding: 'utf8', maxBuffer: 64 * 1024,
+    windowsHide: true, ...options });
+  Object.assign(item, { state: 'finished', elapsedMs: Math.round(performance.now() - started),
+    pid: result.pid, status: result.status, signal: result.signal,
+    stdout: result.stdout, stderr: result.stderr,
+    error: result.error ? { message: result.error.message, code: result.error.code,
+      errno: result.error.errno, syscall: result.error.syscall } : null });
+  flush();
+  return item;
+}
+
+function diagnoseWindowsStartup(evidence, flush, env, root, pid) {
+  const absolute = path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows',
+    'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const startup = "[Console]::Out.WriteLine('powershell-started')";
+  const identity = `${startup}; $ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
+  // Each probe changes one factor from the absolute-startup control. The piped
+  // input reproduces the original harness mode; it can never make the test pass.
+  for (const [label, executable, command, stdin] of [
+    ['bare-startup-ignore-stdin', 'powershell.exe', startup, 'ignore'],
+    ['absolute-startup-ignore-stdin', absolute, startup, 'ignore'],
+    ['absolute-identity-ignore-stdin', absolute, identity, 'ignore'],
+    ['absolute-startup-pipe-stdin', absolute, startup, 'pipe'],
+  ]) recordWindowsProbe(evidence, flush, label, executable,
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+    { env, cwd: root, stdio: [stdin, 'pipe', 'pipe'], timeout: 2500 });
+}
+
+test('native probe evidence retains an empty-output timeout and its invocation', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-probe-evidence-'));
   try {
-    await Promise.all([once(child.stdout, 'data'), once(unrelated.stdout, 'data')]);
-    const query = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `$ErrorActionPreference = 'Stop'; (Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().ToString('o')`],
-    { env, cwd: root, encoding: 'utf8', timeout: 30000 });
-    assert.equal(query.status, 0, JSON.stringify({
-      status: query.status, signal: query.signal, error: query.error?.message,
-      stdout: query.stdout, stderr: query.stderr,
-    }));
-    assert.ok(Number.isFinite(Date.parse(query.stdout.trim())));
-    const report = {};
-    const exited = once(child, 'exit');
-    teardownOwnedProcesses(root, report, env);
+    const evidence = { probes: [] };
+    const snapshots = [];
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const argv = ['--eval', 'setInterval(() => {}, 1000)'];
+    const item = recordWindowsProbe(evidence, () => snapshots.push(structuredClone(evidence)),
+      'empty-output-timeout', process.execPath, argv,
+      { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 250 });
+    assert.equal(item.error.code, 'ETIMEDOUT');
+    assert.equal(item.stdout, '');
+    assert.equal(item.stderr, '');
+    assert.equal(item.status, null);
+    assert.equal(item.executable, process.execPath);
+    assert.deepEqual(item.argv, argv);
+    assert.equal(item.timeoutMs, 250);
+    assert.ok(item.elapsedMs >= 200);
+    assert.equal('env' in item, false);
+    assert.equal(snapshots[0].probes[0].state, 'running');
+    assert.equal(snapshots[1].probes[0].state, 'finished');
+    assert.equal(snapshots[1].probes[0].error.code, 'ETIMEDOUT');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Retain the coordinator's 90s outer watchdog to include diagnostics and teardown;
+// no 30s identity retry. Production itself has a 2.5s PowerShell query deadline.
+test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 90000 }, async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill owned process-'));
+  const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+  const evidence = { schemaVersion: 1, passed: false, platform: process.platform,
+    arch: process.arch, osRelease: os.release(), node: process.version,
+    harnessCommit: process.env.BACKFILL_RUNTIME_HARNESS_COMMIT || null,
+    root, environmentKeys: Object.keys(env).sort(), searchPath: env.PATH,
+    isolatedDirectories: { HOME: env.HOME, USERPROFILE: env.USERPROFILE, TEMP: env.TEMP,
+      APPDATA: env.APPDATA, LOCALAPPDATA: env.LOCALAPPDATA }, probes: [], children: [] };
+  const evidencePath = process.env.BACKFILL_WINDOWS_TEST_EVIDENCE;
+  const flush = () => {
+    if (evidencePath) writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + '\n');
+  };
+  const children = [];
+  try {
+    flush();
+    const ready = [];
+    for (const name of ['fake-opencode.cjs', 'unrelated-helper.cjs', 'fake-opencode.cjs unrelated-helper.cjs']) {
+      const script = path.join(root, name);
+      writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+      const child = spawn(process.execPath, [script], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+      children.push(child);
+      evidence.children.push({ pid: child.pid, executable: process.execPath, argv: [script] });
+      ready.push(Promise.all([
+        once(child, 'spawn'),
+        once(child.stdout, 'data', { signal: AbortSignal.timeout(5000) }),
+      ]));
+    }
+    await Promise.all(ready);
+    flush();
+    const [child, unrelated, sharedPrefix] = children;
+    const bun = existingBun();
+    assert.ok(bun, 'Existing Bun required; this test never installs it');
+    // Execute the unchanged production helper inside an isolated Bun process:
+    // same bare powershell.exe, arguments, async spawn, ignored stdin/stderr,
+    // hidden window and 2500ms deadline used by OpenCodeHostManager. The outer
+    // 10s bound includes Bun startup; it does not extend the identity deadline.
+    const processKill = path.join(repository, 'src/utils/processKill.ts');
+    const program = `
+      const { readProcessStartTimeMs } = await import(${JSON.stringify(processKill)});
+      console.error(JSON.stringify({ phase: 'before-production-query', bunVersion: Bun.version }));
+      console.log(JSON.stringify({ startedAtMs: await readProcessStartTimeMs(${child.pid}) }));
+    `;
+    const query = recordWindowsProbe(evidence, flush, 'production-identity', bun, ['--eval', program],
+      { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+    let startedAtMs;
+    try { startedAtMs = JSON.parse(query.stdout).startedAtMs; } catch { /* retained raw evidence below */ }
+    if (query.error || query.status !== 0 || !Number.isFinite(startedAtMs)) {
+      diagnoseWindowsStartup(evidence, flush, env, root, child.pid);
+      assert.fail(`Production Windows process identity failed: ${JSON.stringify(query)}`);
+    }
+    evidence.startedAtMs = startedAtMs;
+    const exited = once(child, 'exit', { signal: AbortSignal.timeout(35000) });
+    // Attach the rejection handler before synchronous teardown blocks the loop.
+    exited.catch(() => {});
+    teardownOwnedProcesses(root, evidence, env);
     await exited;
-    const stopped = JSON.parse(report.teardown.stdout);
+    const stopped = JSON.parse(evidence.teardown.stdout);
     assert.ok(stopped.some(entry => entry.pid === child.pid));
-    assert.ok(stopped.every(entry => entry.pid !== process.pid && entry.pid !== unrelated.pid));
+    assert.equal(Date.parse(stopped.find(entry => entry.pid === child.pid).startedAt), startedAtMs,
+      'teardown must identify the same process creation time as production');
+    assert.ok(stopped.every(entry => entry.pid !== process.pid && entry.pid !== unrelated.pid && entry.pid !== sharedPrefix.pid));
     assert.equal(process.kill(process.pid, 0), true, 'parent Node remains alive');
     assert.equal(process.kill(unrelated.pid, 0), true, 'Node running another script remains alive');
+    assert.equal(process.kill(sharedPrefix.pid, 0), true, 'Node running the quoted shared-prefix script remains alive');
+    evidence.survivingUnrelatedPids = [unrelated.pid, sharedPrefix.pid];
+    evidence.passed = true;
+  } catch (error) {
+    evidence.error = error.stack || String(error);
+    throw error;
   } finally {
-    for (const processHandle of [child, unrelated]) {
-      if (processHandle.exitCode === null && processHandle.signalCode === null) {
-        const exited = once(processHandle, 'exit');
-        processHandle.kill();
+    const cleanup = await Promise.allSettled(children.map(async child => {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+        child.kill(); // only the ChildProcess handle created in this test
         await exited;
       }
-    }
-    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+    }));
+    evidence.cleanupErrors = cleanup.filter(item => item.status === 'rejected').map(item => String(item.reason));
+    try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 }); }
+    catch (error) { evidence.cleanupErrors.push(String(error)); evidence.remainingRoot = root; }
+    if (evidence.cleanupErrors.length) evidence.passed = false;
+    flush();
+    if (!evidence.passed) t.diagnostic(JSON.stringify(evidence));
+    assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
   }
 });

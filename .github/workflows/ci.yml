@@ -43,8 +43,15 @@ jobs:
         with:
           node-version: '24'
       - name: Validate fixture and rejecting assertions
+        timeout-minutes: 2
         working-directory: harness
-        run: node --test scripts/smoke/windows-runtime-opencode-backfill.test.mjs
+        shell: pwsh
+        env:
+          BACKFILL_WINDOWS_TEST_EVIDENCE: ${{ github.workspace }}/backfill-windows-process-test.json
+        run: |
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = git rev-parse HEAD
+          node --test scripts/smoke/windows-runtime-opencode-backfill.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture/process test failed; see process-test evidence' }
       - name: Install frozen runtime dependencies
         working-directory: runtime
         run: bun install --frozen-lockfile
@@ -67,7 +74,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-packaged-backfill-candidate
-          path: backfill-candidate.json
+          path: |
+            backfill-candidate.json
+            backfill-windows-process-test.json
           if-no-files-found: warn
 
   cursor-managed-plugin:

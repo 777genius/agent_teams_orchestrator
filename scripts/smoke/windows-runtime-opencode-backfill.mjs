@@ -165,6 +165,11 @@ export function appExeFallback(binary, args, env) {
     args: ['/d', '/s', '/v:off', '/c', rawCommand], windowsVerbatimArguments: true };
 }
 
+// Parse just the first two Windows arguments. Quoted arguments must close before
+// the boundary; unquoted arguments cannot contain whitespace or quotes. Compare
+// the entire captured script path, never a prefix. Shared with the regression.
+export const windowsNodeScriptPattern = String.raw`^(?:"(?<quotedExe>[^"]+)"|(?<bareExe>[^\s"]+))[ \t]+(?:"(?<quotedScript>[^"]+)"|(?<bareScript>[^\s"]+))(?:[ \t]|$)`;
+
 // Only stop executables copied into this unique sandbox, or Node running an
 // exact fixture script within it. Never kill by PID alone or by image name.
 export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
@@ -173,13 +178,17 @@ export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(ro
 $ErrorActionPreference = 'Stop'
 $rootPath = ${literal(path.resolve(root) + path.sep)}
 $nodePath = ${literal(process.execPath)}
+$nodeScriptPattern = ${literal(windowsNodeScriptPattern)}
 $scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse | ForEach-Object { $_.FullName })
 function Is-Owned($entry) {
   if ($entry.ExecutablePath -and $entry.ExecutablePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
   if ($entry.ExecutablePath -ieq $nodePath) {
-    foreach ($scriptPath in $scripts) {
-      $pattern = '^"?' + '(?:' + [regex]::Escape($nodePath) + '|node(?:\\.exe)?)' + '"?\\s+"?' + [regex]::Escape($scriptPath) + '"?(?:\\s|$)'
-      if ($entry.CommandLine -match $pattern) { return $true }
+    if ($entry.CommandLine -match $nodeScriptPattern) {
+      $commandExe = if ($Matches['quotedExe']) { $Matches['quotedExe'] } else { $Matches['bareExe'] }
+      $commandScript = if ($Matches['quotedScript']) { $Matches['quotedScript'] } else { $Matches['bareScript'] }
+      if (@($nodePath, 'node', 'node.exe') -icontains $commandExe) {
+        return ($scripts -icontains $commandScript)
+      }
     }
   }
   return $false
@@ -202,7 +211,7 @@ ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
 `;
   const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
   const result = spawnSync('powershell.exe', argv, { env, cwd: root, encoding: 'utf8',
-    timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
   report.teardown = { executable: 'powershell.exe', argv, pid: result.pid, status: result.status,
     stdout: result.stdout, stderr: result.stderr, error: result.error?.message };
   if (result.error) throw result.error;
