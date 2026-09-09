@@ -121,21 +121,28 @@ describe('scoped OAuth native durability integration', () => {
     expect(await readSaved()).toEqual(c1)
     const script = `import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))};
       import { readOpenCodeAuthCredential } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeAuthStore.ts'))};
+      import { resolveClaudeMultimodelPaths } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeManagedPaths.ts'))};
       const projectPath = process.argv[1];
       const profileScope = await resolveOpenCodeProfileScope({ projectPath, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime' });
       const p = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope });
       const c = await readOpenCodeAuthCredential({ authPath: p.managedAuthPath, providerId: 'xai' });
-      process.stdout.write(c?.refresh === 'single-use-1' ? 'saved-C1' : 'wrong');`
+      process.stdout.write(JSON.stringify({ credential: c, paths: resolveClaudeMultimodelPaths() }));`
     // Windows environment names are case-insensitive. Remove inherited aliases
     // before adding canonical fixture keys so the child gets one value per key.
     const fixtureKeys = new Set(Object.keys(env).map(key => key.toUpperCase()))
-    const childEnv = { ...Object.fromEntries(Object.entries(process.env)
+    const inheritedEnv = { ...process.env, home: path.join(root, 'foreign-home'),
+      AppData: path.join(root, 'foreign-roaming'), LocalAppData: path.join(root, 'foreign-local'),
+      Temp: path.join(root, 'foreign-temp') }
+    const childEnv = { ...Object.fromEntries(Object.entries(inheritedEnv)
       .filter(([key]) => !fixtureKeys.has(key.toUpperCase()))), ...env }
+    for (const key of fixtureKeys) {
+      expect(Object.keys(childEnv).filter(candidate => candidate.toUpperCase() === key)).toEqual([key])
+    }
     const child = Bun.spawn([process.execPath, '-e', script, project], { env: childEnv, stdout: 'pipe', stderr: 'pipe' })
     const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect(stderr).toBe('')
     expect(exit).toBe(0)
-    expect(stdout).toBe('saved-C1')
+    expect(JSON.parse(stdout)).toEqual({ credential: c1, paths: resolveClaudeMultimodelPaths(env) })
     const nextLaunch = await prepare()
     expect(nextLaunch.scopeToken).not.toBe(launch.scopeToken)
     expect(await read(nextLaunch.managedAuthPath)).toEqual(c1)
@@ -155,6 +162,24 @@ describe('scoped OAuth native durability integration', () => {
     expect(await readSaved()).toEqual(c1)
     const reopened = await prepare()
     expect(await read(reopened.managedAuthPath)).toEqual(c1)
+  })
+
+  test('saved successor rejects a different current managed temp root without retiring valid authority', async () => {
+    const launch = await prepare()
+    const { coordinator } = engine()
+    await coordinator.ensureFreshForPrompt({ selectedModel: 'xai/grok-4.3', projectPath: project, profile: launch })
+    const global = manager.getGlobalAuthPath()
+    const sourceAuthPaths = [global, path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+      path.join(env.HOME!, '.local', 'share', 'opencode', 'auth.json')]
+    const changedEnv = { ...env, TMPDIR: path.join(root, 'other-temp') }
+    expect(resolveClaudeMultimodelPaths(changedEnv).temp).not.toBe(resolveClaudeMultimodelPaths(env).temp)
+    await expect(readOpenCodeSavedAuthStore({ globalAuthPath: global, sourceAuthPaths, env: changedEnv }))
+      .rejects.toThrow('saved successor scope was revoked')
+    await expect(resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3',
+      purpose: 'launch_runtime', env: changedEnv, cacheSnapshot: false }))
+      .rejects.toThrow('selected authentication is unavailable')
+    expect(await readSaved()).toEqual(c1)
+    expect(await read((await prepare()).managedAuthPath)).toEqual(c1)
   })
 
   test.each([false, true])('actual queued coordinators reject stale C0 and fresh resolution reuses C1 (distinct roots: %s)', async distinct => {
