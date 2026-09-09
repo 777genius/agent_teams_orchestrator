@@ -216,6 +216,13 @@ jobs:
           fi
           ./dist/cli --version
 
+      # The shared executable smoke uses Node's built-in SQLite fixture writer.
+      - name: Setup Node for Windows executable smoke
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Verify compiled runtime (Windows)
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh

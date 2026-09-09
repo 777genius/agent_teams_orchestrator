@@ -23,6 +23,56 @@ permissions:
   contents: read
 
 jobs:
+  windows-packaged-backfill:
+    name: Windows packaged backfill (${{ matrix.revision }})
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [baseline, candidate]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: harness
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.revision == 'baseline' && 'c4f757c5e0328d8a10d1d9426a6778025071193b' || github.sha }}
+          path: runtime
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Validate fixture and rejecting assertions
+        working-directory: harness
+        run: node --test scripts/smoke/windows-runtime-opencode-backfill.test.mjs
+      - name: Install frozen runtime dependencies
+        working-directory: runtime
+        run: bun install --frozen-lockfile
+      # Same compile command and native Windows target as release-runtime.yml.
+      - name: Compile Windows runtime
+        working-directory: runtime
+        run: bun run compile
+      - name: Run packaged backfill and provider JSON smoke
+        # Baseline failure is an observation; candidate failure is a required gate.
+        continue-on-error: ${{ matrix.revision == 'baseline' }}
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git -C runtime rev-parse HEAD
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node harness/scripts/smoke/windows-runtime-opencode-provider-json.mjs runtime/dist/cli.exe backfill-${{ matrix.revision }}.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+      - name: Upload executable regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-${{ matrix.revision }}
+          path: backfill-${{ matrix.revision }}.json
+          if-no-files-found: warn
+
   cursor-managed-plugin:
     name: Cursor managed plugin
     runs-on: ubuntu-latest
