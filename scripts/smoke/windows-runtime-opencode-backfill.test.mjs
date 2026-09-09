@@ -665,7 +665,9 @@ test('exact transport replays keep nonzero exit, expose ignored versus piped std
         const invocation = { command: process.execPath, args: ['--eval', childProgram],
           options: { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }, envExplicit: false };
         const program = `
-          const { replayIdentityQuery } = await import(${JSON.stringify(identityProbeModule)});
+          const { replayIdentityQuery, environmentSummary } = await import(${JSON.stringify(identityProbeModule)});
+          // Windows may add identity variables while creating this process.
+          console.error(JSON.stringify({ phase: 'environment-before-replay', ...environmentSummary(process.env) }));
           await replayIdentityQuery(${JSON.stringify({ invocation, mode, timeoutMs: 1500 })});
         `;
         const probe = recordWindowsProbe({ probes: [] }, () => {}, mode, runtime,
@@ -680,8 +682,11 @@ test('exact transport replays keep nonzero exit, expose ignored versus piped std
         assert.ok(events.some(item => item.event === 'stdout-end'));
         assert.ok(events.some(item => item.event === 'exit' && item.code === 7));
         assert.ok(events.some(item => item.event === 'close' && item.code === 7));
-        assert.deepEqual(events[0].args, invocation.args);
-        assert.equal(events[0].environmentHash, environmentSummary(env).environmentHash);
+        const before = events.find(item => item.phase === 'environment-before-replay');
+        const spawned = events.find(item => item.event === 'invocation');
+        assert.deepEqual(spawned.args, invocation.args);
+        assert.deepEqual(spawned.environmentKeys, before.environmentKeys);
+        assert.equal(spawned.environmentHash, before.environmentHash);
       }
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
