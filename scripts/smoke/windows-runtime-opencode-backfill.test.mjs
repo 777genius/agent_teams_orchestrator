@@ -151,13 +151,14 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
     // Check emitted diagnostic boundaries; native execution remains Windows-only.
     const command = argv.at(-1);
     for (const [phase, operation] of [
-      ...['Microsoft.PowerShell.Management', 'CimCmdlets', 'Microsoft.PowerShell.Utility']
+      ...['Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility']
         .map(name => [`import ${name}`, `Import-Module ${name} -ErrorAction Stop`]),
+      ['load System.Management', "[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')"],
       ['script enumeration', '$scripts = @(Get-ChildItem -LiteralPath'],
-      ['process enumeration', '$entries = @(Get-CimInstance Win32_Process)'],
+      ['process enumeration', '$entries = @(Read-ProcessEntries)'],
       ['Get-Process', '$target = Get-Process -Id'],
       ['hold handle', '$heldHandle = $target.Handle'],
-      ['identity query', '$current = Get-CimInstance Win32_Process -Filter'],
+      ['identity query', '$current = Read-ProcessEntries (" WHERE ProcessId = " + $entry.ProcessId)'],
       ['identity validation', "throw 'Owned process identity changed during cleanup'"],
       ['kill', '$target.Kill()'],
       ['wait for exit', '$target.WaitForExit(5000)'],
@@ -168,6 +169,17 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
       const after = command.indexOf(`[Console]::Error.WriteLine('teardown: after ${phase}`);
       assert.ok(before >= 0 && before < command.indexOf(operation) && command.indexOf(operation) < after, phase);
     }
+    assert.doesNotMatch(command, /Import-Module CimCmdlets|Get-CimInstance|Get-WmiObject|Add-Type/);
+    assert.ok(command.includes("[System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ExecutablePath, CommandLine, CreationDate FROM Win32_Process' + $filter)"));
+    assert.ok(command.includes('[System.Management.ManagementDateTimeConverter]::ToDateTime($row.CreationDate)'));
+    assert.ok(command.includes("$entry.CreationDate.ToUniversalTime().ToString('o')"));
+    for (const dispose of ['$row.Dispose()', '$results.Dispose()', '$searcher.Dispose()']) assert.ok(command.includes(dispose));
+    // Missing creation time must fail closed; the held handle and ownership
+    // re-read must precede the only kill. This checks construction, not native WMI.
+    const guard = command.indexOf("if ($null -eq $entry.CreationDate -or $current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }");
+    assert.ok(guard > command.indexOf('$current = Read-ProcessEntries'));
+    assert.ok(command.indexOf('$heldHandle = $target.Handle') < command.indexOf('$current = Read-ProcessEntries'));
+    assert.ok(guard < command.indexOf('$target.Kill()'));
     return result;
   });
   syncBuiltinESMExports();
@@ -349,10 +361,18 @@ function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) 
 async function runNativePhases(evidence, flush, phases) {
   let firstError;
   evidence.phases = [];
+  const save = () => {
+    try { flush(); }
+    catch (error) {
+      firstError ??= error;
+      evidence.error ??= error.stack || String(error);
+      (evidence.writeErrors ??= []).push(error.stack || String(error));
+    }
+  };
   for (const [label, run] of phases) {
     const phase = { label, state: 'running' };
     evidence.phases.push(phase);
-    flush();
+    save(); // Evidence I/O must not bypass teardown or the remaining assertions.
     try { await run(); phase.state = 'passed'; }
     catch (error) {
       firstError ??= error;
@@ -360,7 +380,7 @@ async function runNativePhases(evidence, flush, phases) {
       phase.error = error.stack || String(error);
       evidence.error ??= phase.error;
     }
-    flush();
+    save();
   }
   if (firstError) throw firstError;
 }
@@ -475,6 +495,7 @@ test('native failure collection keeps first failure and enforces every teardown 
   const children = [{ pid: 101 }, { pid: 102 }, { pid: 103 }];
   const timestamp = '2026-09-09T03:26:43.616Z';
   const firstFailure = new Error('original first identity failure');
+  const writeFailure = new Error('evidence disk write failed');
   const teardownFailure = Object.assign(new Error('teardown timeout'), { code: 'ETIMEDOUT' });
   let result;
   let deadPid;
@@ -489,7 +510,8 @@ test('native failure collection keeps first failure and enforces every teardown 
   syncBuiltinESMExports();
   try {
     for (const scenario of ['pass', 'first-failed-repeat-succeeded', 'first-and-teardown-failed',
-      'teardown-failed', 'bad-json', 'wrong-identity', 'unrelated-stopped', 'parent-dead', 'unrelated-dead', 'shared-prefix-dead']) {
+      'evidence-write-failed', 'first-and-evidence-write-failed',
+      'teardown-failed', 'bad-json', 'wrong-identity', 'missing-identity', 'unrelated-stopped', 'parent-dead', 'unrelated-dead', 'shared-prefix-dead']) {
       const evidence = {};
       const snapshots = [];
       checked = [];
@@ -500,8 +522,14 @@ test('native failure collection keeps first failure and enforces every teardown 
       if (scenario.includes('teardown-failed')) result = { status: null, stdout: '', stderr: 'teardown: started\n', error: teardownFailure };
       if (scenario === 'bad-json') result.stdout = 'invalid';
       if (scenario === 'wrong-identity') result.stdout = JSON.stringify([{ pid: 101, startedAt: '2020-01-01T00:00:00Z' }]);
+      if (scenario === 'missing-identity') result.stdout = JSON.stringify([{ pid: 101 }]);
       if (scenario === 'unrelated-stopped') result.stdout = JSON.stringify([{ pid: 101, startedAt: timestamp }, { pid: 102 }]);
-      const run = runNativePhases(evidence, () => snapshots.push(structuredClone(evidence)), [
+      const run = runNativePhases(evidence, () => {
+        snapshots.push(structuredClone(evidence));
+        // Fail after the first phase has produced its result, then recover so
+        // later evidence can still be written. Teardown and all gates must run.
+        if (scenario.includes('evidence-write-failed') && snapshots.length === 2) throw writeFailure;
+      }, [
         ['first-production-identity', () => {
           if (firstFailed) throw firstFailure;
           evidence.startedAtMs = Date.parse(timestamp);
@@ -512,14 +540,16 @@ test('native failure collection keeps first failure and enforces every teardown 
       ]);
       if (scenario === 'pass') await run;
       else await assert.rejects(run, error => firstFailed ? error === firstFailure
-        : scenario === 'teardown-failed' ? error === teardownFailure : error instanceof Error);
+        : scenario === 'teardown-failed' ? error === teardownFailure
+          : scenario === 'evidence-write-failed' ? error === writeFailure : error instanceof Error);
       assert.equal(evidence.teardown.stderr, result.stderr, scenario);
+      assert.equal(evidence.writeErrors?.length ?? 0, scenario.includes('evidence-write-failed') ? 1 : 0);
       assert.deepEqual(checked, [process.pid, 102, 103], scenario);
       assert.ok(evidence.phases.every(phase => phase.state !== 'running'), scenario);
       assert.deepEqual(evidence.phases.slice(-3).map(phase => phase.state),
         [process.pid, 102, 103].map(pid => pid === deadPid ? 'failed' : 'passed'), scenario);
       assert.equal(evidence.phases.find(phase => phase.label === 'first-identity-matches-teardown').state,
-        firstFailed || ['teardown-failed', 'bad-json', 'wrong-identity'].includes(scenario) ? 'failed' : 'passed', scenario);
+        firstFailed || ['teardown-failed', 'bad-json', 'wrong-identity', 'missing-identity'].includes(scenario) ? 'failed' : 'passed', scenario);
       if (firstFailed) assert.equal(evidence.startedAtMs, undefined, 'Repeat success cannot replace first identity');
       assert.equal(snapshots.at(-1).phases.at(-1).state, evidence.phases.at(-1).state);
     }
@@ -613,7 +643,13 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
     try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 }); }
     catch (error) { evidence.cleanupErrors.push(String(error)); evidence.remainingRoot = root; }
     if (evidence.cleanupErrors.length) evidence.passed = false;
-    flush();
+    try { flush(); }
+    catch (error) {
+      originalError ??= error;
+      evidence.passed = false;
+      evidence.error ??= error.stack || String(error);
+      (evidence.writeErrors ??= []).push(error.stack || String(error));
+    }
     if (!evidence.passed) t.diagnostic(JSON.stringify(evidence));
   }
   if (originalError) throw originalError;

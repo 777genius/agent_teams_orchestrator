@@ -177,13 +177,13 @@ export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(ro
   const command = `
 [Console]::Error.WriteLine('teardown: started')
 $ErrorActionPreference = 'Stop'
-# Direct stderr markers need no modules and survive a later import/CIM timeout.
+# Direct stderr markers need no modules and survive a later import/query timeout.
 [Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Management')
 Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
 [Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Management')
-[Console]::Error.WriteLine('teardown: before import CimCmdlets')
-Import-Module CimCmdlets -ErrorAction Stop
-[Console]::Error.WriteLine('teardown: after import CimCmdlets')
+[Console]::Error.WriteLine('teardown: before load System.Management')
+[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
+[Console]::Error.WriteLine('teardown: after load System.Management')
 [Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Utility')
 Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 [Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Utility')
@@ -206,9 +206,31 @@ function Is-Owned($entry) {
   }
   return $false
 }
+# Query local WMI under this same identity, without loading CimCmdlets.
+# Copy the four identity/ownership fields before releasing the WMI resources.
+function Read-ProcessEntries([string]$filter = '') {
+  $searcher = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ExecutablePath, CommandLine, CreationDate FROM Win32_Process' + $filter)
+  $results = $null
+  try {
+    $results = $searcher.Get()
+    foreach ($row in $results) {
+      try {
+        [pscustomobject]@{
+          ProcessId = $row.ProcessId
+          ExecutablePath = $row.ExecutablePath
+          CommandLine = $row.CommandLine
+          CreationDate = if ($row.CreationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($row.CreationDate) } else { $null }
+        }
+      } finally { $row.Dispose() }
+    }
+  } finally {
+    if ($null -ne $results) { $results.Dispose() }
+    $searcher.Dispose()
+  }
+}
 $stopped = @()
 [Console]::Error.WriteLine('teardown: before process enumeration')
-$entries = @(Get-CimInstance Win32_Process)
+$entries = @(Read-ProcessEntries)
 [Console]::Error.WriteLine('teardown: after process enumeration count=' + $entries.Count)
 foreach ($entry in $entries) {
   if (-not (Is-Owned $entry)) { continue }
@@ -222,11 +244,11 @@ foreach ($entry in $entries) {
     $heldHandle = $target.Handle
     [Console]::Error.WriteLine('teardown: after hold handle pid=' + $entry.ProcessId)
     [Console]::Error.WriteLine('teardown: before identity query pid=' + $entry.ProcessId)
-    $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.ProcessId)
+    $current = Read-ProcessEntries (" WHERE ProcessId = " + $entry.ProcessId)
     [Console]::Error.WriteLine('teardown: after identity query pid=' + $entry.ProcessId + ' found=' + [bool]$current)
     if (-not $current) { continue }
     [Console]::Error.WriteLine('teardown: before identity validation pid=' + $entry.ProcessId)
-    if ($current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
+    if ($null -eq $entry.CreationDate -or $current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
     [Console]::Error.WriteLine('teardown: after identity validation pid=' + $entry.ProcessId)
     $stopped += @{ pid = $entry.ProcessId; executable = $entry.ExecutablePath; commandLine = $entry.CommandLine; startedAt = $entry.CreationDate.ToUniversalTime().ToString('o') }
     [Console]::Error.WriteLine('teardown: before kill pid=' + $entry.ProcessId)
