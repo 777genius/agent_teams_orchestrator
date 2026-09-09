@@ -8,11 +8,19 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 
+import {
+  matchesStopTarget, parseOpenCodeStopRequest, sameStopRequest, stopBinding,
+  stopRequestKey, stopSessionSetToken, validateStopData, validateStopReceipt,
+  type OpenCodeStopRequest, type OpenCodeStopReceipt, type OpenCodeStopOutcome,
+  type OpenCodeStopReconciliation, type OpenCodeStopData,
+} from './OpenCodeStopRecovery.js'
+
 import type { OpenCodeSessionRecord, OpenCodeSessionStopAuthority } from './types.js'
 
 type SessionStoreShape = {
   schemaVersion: 1
   records: Record<string, OpenCodeSessionRecord>
+  stopReceipts?: Record<string, OpenCodeStopReceipt>
   materializationClaims?: Record<string, string>
   materializationClaimRuns?: Record<string, string>
   materializationOwners?: Record<string, MaterializationOwnerToken>
@@ -384,7 +392,13 @@ export class OpenCodeSessionStore {
   }
 
   private async readStore(preserveMaterializationFences = false): Promise<SessionStoreShape> {
-    if (!(await fileExists(this.filePath))) {
+    const exists = preserveMaterializationFences
+      ? await stat(this.filePath).then(() => true, error => {
+        if (error.code === 'ENOENT') return false
+        throw error
+      })
+      : await fileExists(this.filePath)
+    if (!exists) {
       return {
         schemaVersion: 1,
         records: {},
@@ -393,7 +407,8 @@ export class OpenCodeSessionStore {
 
     const content = await readFile(this.filePath, 'utf8')
     const parsed = JSON.parse(content) as SessionStoreShape
-    if (parsed.schemaVersion !== 1 || typeof parsed.records !== 'object' || parsed.records === null) {
+    if (!parsed || parsed.schemaVersion !== 1 || typeof parsed.records !== 'object' || parsed.records === null || Array.isArray(parsed.records)) {
+      if (preserveMaterializationFences) throw new Error('Invalid OpenCode session store authority')
       return {
         schemaVersion: 1,
         records: {},
@@ -405,6 +420,130 @@ export class OpenCodeSessionStore {
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
     await writeJsonFileAtomic(this.filePath, store, { indent: 2 })
+  }
+
+  private stopLane(store: SessionStoreShape, request: OpenCodeStopRequest): OpenCodeSessionRecord[] {
+    return Object.values(store.records).filter(record => record.teamId === request.target.teamId
+      && (record.laneId ?? 'primary') === request.target.laneId
+      && (record.runId === request.target.runId || !isOpenCodeSessionStopped(record)
+        || request.target.members.some(member => member.memberName === record.memberName)))
+  }
+
+  private stopOutcome(store: SessionStoreShape, request: OpenCodeStopRequest): OpenCodeStopOutcome {
+    if (store.stopReceipts !== undefined) {
+      if (!store.stopReceipts || typeof store.stopReceipts !== 'object' || Array.isArray(store.stopReceipts)) {
+        throw new Error('Corrupt Stop receipt map')
+      }
+      for (const [key, value] of Object.entries(store.stopReceipts)) {
+        const item = validateStopReceipt(value)
+        if (stopRequestKey(item.request) !== key) throw new Error('Corrupt Stop receipt index')
+      }
+    }
+    const receipt = store.stopReceipts?.[stopRequestKey(request)]
+    if (!receipt) {
+      // Reusing the deterministic key with a different request is also a mismatch.
+      return { status: Object.values(store.stopReceipts ?? {}).some(item =>
+        item.request.idempotencyKey === request.idempotencyKey) ? 'target_mismatch' : 'unknown' }
+    }
+    if (!sameStopRequest(receipt.request, request)) return { status: 'target_mismatch' }
+    if (receipt.status === 'completed') {
+      return { status: 'completed', receipt: { ...receipt, data: validateStopData(receipt.data, request) } }
+    }
+    if (receipt.status !== 'inflight') throw new Error('Corrupt Stop receipt status')
+    return { status: 'inflight' }
+  }
+
+  async lookupStop(input: OpenCodeStopRequest, signal?: AbortSignal): Promise<OpenCodeStopOutcome> {
+    const request = parseOpenCodeStopRequest(input)
+    return this.withStoreLock(async () => this.stopOutcome(await this.readStore(true), request), signal)
+  }
+
+  async beginStop(input: OpenCodeStopRequest, runtime: OpenCodeSessionStopAuthority['runtime'],
+    signal?: AbortSignal): Promise<OpenCodeStopOutcome | { status: 'started'; records: OpenCodeSessionRecord[] }> {
+    const request = parseOpenCodeStopRequest(input)
+    const authority = structuredClone(runtime)
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const outcome = this.stopOutcome(store, request)
+      if (outcome.status !== 'unknown') return outcome
+      const records = this.stopLane(store, request)
+      if (authority.capabilitySnapshotId !== request.target.capabilitySnapshotId
+        || !matchesStopTarget(records, request.target)) return { status: 'target_mismatch' }
+      if (this.stopHasMaterializationFence(store, request)) return { status: 'inflight' }
+      const binding = stopBinding(records)
+      if (Object.values(store.stopReceipts ?? {}).some(receipt => receipt.status === 'inflight'
+        && receipt.request.target.teamId === request.target.teamId
+        && receipt.request.target.laneId === request.target.laneId
+        // A crash fence belongs to the original generation. It must neither be
+        // bypassed with a new key nor poison an independently launched successor.
+        && receipt.binding.some(old => binding.some(current =>
+          current.memberName === old.memberName && current.sessionId === old.sessionId
+          && current.hostKey === old.hostKey && current.createdAt === old.createdAt)))) return { status: 'inflight' }
+      store.stopReceipts ??= {}
+      store.stopReceipts[stopRequestKey(request)] = validateStopReceipt({
+        request, binding, runtime: authority, status: 'inflight',
+      })
+      // Persist before abort. A failed or interrupted write never authorizes effects.
+      await this.writeStore(store)
+      return { status: 'started', records }
+    }, signal)
+  }
+
+  async completeStop(input: OpenCodeStopRequest, value: OpenCodeStopData): Promise<void> {
+    const request = parseOpenCodeStopRequest(input)
+    const data = validateStopData(value, request)
+    // Do not race this atomic write with cancellation after effects.
+    await this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const receipt = store.stopReceipts?.[stopRequestKey(request)]
+      if (!receipt || !sameStopRequest(validateStopReceipt(receipt).request, request)) throw new Error('Stop receipt identity changed')
+      if (receipt.status === 'completed') {
+        if (JSON.stringify(validateStopData(receipt.data, request)) !== JSON.stringify(data)) {
+          throw new Error('Stop result already completed differently')
+        }
+        return
+      }
+      if (receipt.status !== 'inflight') throw new Error('Corrupt Stop receipt status')
+      store.stopReceipts![stopRequestKey(request)] = { ...receipt, status: 'completed', data }
+      await this.writeStore(store)
+    })
+  }
+
+  private stopHasMaterializationFence(store: SessionStoreShape, request: OpenCodeStopRequest): boolean {
+    const prefix = `${request.target.teamId}::${request.target.laneId}::`
+    // A claim can introduce another member not yet present in records.
+    return [store.materializationClaims, store.materializationOwners].some(map => map !== undefined
+      && (!map || typeof map !== 'object' || Array.isArray(map)
+        || Object.keys(map).some(key => key.startsWith(prefix))))
+  }
+
+  async reconcileStop(input: OpenCodeStopRequest,
+    legacyCapability: () => Promise<string>, signal?: AbortSignal): Promise<OpenCodeStopReconciliation> {
+    const request = parseOpenCodeStopRequest(input)
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const target = request.target
+      const result = (status: OpenCodeStopReconciliation['status']): OpenCodeStopReconciliation => ({ status, target })
+      const outcome = this.stopOutcome(store, request)
+      if (outcome.status === 'target_mismatch') return result('target_mismatch')
+      const records = this.stopLane(store, request)
+      if (!records.length) return result('unknown')
+      if (!matchesStopTarget(records, target)) return result('target_mismatch')
+      if (this.stopHasMaterializationFence(store, request)) return result('unknown')
+      const binding = stopBinding(records)
+      const receipt = store.stopReceipts?.[stopRequestKey(request)]
+      if (receipt && JSON.stringify(receipt.binding) !== JSON.stringify(binding)) return result('target_mismatch')
+      if (records.some(record => !record.stopAuthority) && !receipt) {
+        // Legacy capability comes from retained launch evidence, never the caller alone.
+        let capability: string
+        try { capability = await legacyCapability() } catch { return result('unknown') }
+        if (capability !== target.capabilitySnapshotId) return result('target_mismatch')
+      }
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
+      if (records.some(record => record.staleReason === 'runtime_process_gone')) return result('unknown')
+      if (records.some(record => !isOpenCodeSessionStopped(record))) return result('active')
+      return { status: 'reconciled_stopped', target, binding, sessionSetToken: stopSessionSetToken(target, binding) }
+    }, signal)
   }
 
   async list(): Promise<OpenCodeSessionRecord[]> {
@@ -693,7 +832,8 @@ export class OpenCodeSessionStore {
 
   async markStoppedIfSession(
     record: Pick<OpenCodeSessionRecord,
-      'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId' | 'hostKey'>,
+      'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId' | 'hostKey'>
+      & Partial<Pick<OpenCodeSessionRecord, 'createdAt' | 'projectPath'>>,
     stopAuthority?: OpenCodeSessionStopAuthority,
     signal?: AbortSignal,
   ): Promise<OpenCodeSessionRecord | null> {
@@ -702,7 +842,9 @@ export class OpenCodeSessionStore {
       const key = buildRecordKey(record)
       const previous = store.records[key]
       if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
-        || previous.runId !== record.runId || previous.hostKey !== record.hostKey) return null
+        || previous.runId !== record.runId || previous.hostKey !== record.hostKey
+        || (record.createdAt !== undefined && previous.createdAt !== record.createdAt)
+        || (record.projectPath !== undefined && previous.projectPath !== record.projectPath)) return null
       if (isOpenCodeSessionStopped(previous)) {
         if (stopAuthority && jsonStringify(previous.stopAuthority) !== jsonStringify(stopAuthority)) return null
         return previous

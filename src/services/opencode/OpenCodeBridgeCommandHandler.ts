@@ -1,4 +1,3 @@
-import { readOpenCodeLegacyStopCapability } from './OpenCodeLegacyStopAuthority.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
@@ -8,6 +7,11 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
+import {
+  OPENCODE_STOP_RECOVERY_CONTRACT_VERSION, parseOpenCodeStopRequest,
+  type OpenCodeStopRequest, type OpenCodeStopData,
+} from './OpenCodeStopRecovery.js'
+import { readOpenCodeLegacyStopCapability } from './OpenCodeLegacyStopAuthority.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import {
   buildOpenCodeExecutionProof,
@@ -150,6 +154,8 @@ function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeT
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
+  'opencode.stopOutcome',
+  'opencode.reconcileStop',
   'opencode.readiness',
   'opencode.cleanupHosts',
   'opencode.launchTeam',
@@ -4438,6 +4444,10 @@ function isExactStopSession(
     && current.runId === expected.runId
     && current.opencodeSessionId === expected.opencodeSessionId
     && current.hostKey === expected.hostKey
+    && current.teamId === expected.teamId
+    && current.laneId === expected.laneId
+    && current.projectPath === expected.projectPath
+    && current.createdAt === expected.createdAt
 }
 
 function isExactActiveStopSession(
@@ -4451,6 +4461,7 @@ async function runStop(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
   externalSignal?: AbortSignal,
+  stopRequest?: OpenCodeStopRequest,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -4498,6 +4509,7 @@ async function runStop(
     record => record.runId !== runId && !isOpenCodeSessionStopped(record),
   )
   if (conflictingActiveRecords.length > 0) {
+    if (stopRequest) throw new Error('OpenCode Stop target_mismatch')
     const diagnostics = [teamDiagnostic(
       'opencode_stop_identity_changed',
       `OpenCode lane ${teamId}/${laneId} belongs to another active run`,
@@ -4517,12 +4529,23 @@ async function runStop(
       },
     }
   }
-  const records = laneRecords.filter(record => record.runId === runId)
+  let records = laneRecords.filter(record => record.runId === runId)
   const snapshot = retained?.snapshot ?? null
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot, { confirmedStopRuntime: retained?.confirmedStopRuntime }),
   })
+  if (stopRequest) {
+    const runtime = retained?.confirmedStopRuntime ?? createRuntimeSnapshot(snapshot)
+    if (!runtime.capabilitySnapshotId) throw new Error('OpenCode Stop requires retained capability authority')
+    const begun = await openCodeSessionStore.beginStop(stopRequest,
+      { ...runtime, capabilitySnapshotId: runtime.capabilitySnapshotId }, stopSignal)
+    if (begun.status === 'completed') {
+      return { snapshot: null, confirmedStopRuntime: begun.receipt.runtime, data: begun.receipt.data }
+    }
+    if (begun.status !== 'started') throw new Error(`OpenCode Stop ${begun.status}; query stopOutcome/reconcileStop`)
+    records = begun.records
+  }
   const diagnostics: TeamDiagnostic[] = []
   const requestOptions = {
     signal: stopSignal,
@@ -4536,7 +4559,18 @@ async function runStop(
     const memberDiagnostics: string[] = []
     try {
       if (isOpenCodeSessionStopped(record)) {
-        stopped = true
+        // Dead-host retirement permits a new launch; it does not attest that
+        // this request stopped the original session. Do not mint a true receipt
+        // from process-absence evidence that reconciliation treats as unknown.
+        stopped = record.staleReason !== 'runtime_process_gone'
+        if (!stopped) {
+          memberDiagnostics.push('runtime disappeared without confirmed Stop')
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_status_unconfirmed',
+            `${record.memberName}: runtime retirement is not confirmed Stop evidence`,
+            'warning',
+          ))
+        }
       } else {
         runtimeDeadline.throwIfExpired('stop_abort')
         const beforeAbort = await raceOpenCodeAbortSignal(
@@ -4741,9 +4775,6 @@ async function runStop(
     }
     return { record, stopped, diagnostics: memberDiagnostics }
   })
-  if (externalSignal?.aborted) {
-    throwOpenCodeAbortReason(externalSignal)
-  }
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   for (const result of memberResults) {
     members[result.record.memberName] = {
@@ -4805,20 +4836,19 @@ async function runStop(
     }
   }
 
-  return {
-    snapshot,
-    confirmedStopRuntime: retained?.confirmedStopRuntime,
-    data: {
-      runId,
-      stopped: Object.values(members).every(member => member.stopped),
-      members,
-      warnings: [],
-      diagnostics,
-      ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
-      manifestHighWatermark: commandEvidence.manifestHighWatermark,
-      runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
-    },
+  const data: OpenCodeStopData = {
+    runId,
+    stopped: Object.values(members).every(member => member.stopped),
+    members,
+    warnings: [],
+    diagnostics,
+    ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+    manifestHighWatermark: commandEvidence.manifestHighWatermark,
+    runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
   }
+  if (stopRequest) await openCodeSessionStore.completeStop(stopRequest, data)
+  if (externalSignal?.aborted) throwOpenCodeAbortReason(externalSignal)
+  return { snapshot, confirmedStopRuntime: retained?.confirmedStopRuntime, data }
   } finally {
     await releaseAuthority()
   }
@@ -5905,6 +5935,25 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
   }
 }
 
+function stopRecoveryRequest(envelope: BridgeEnvelope): OpenCodeStopRequest {
+  const request = parseOpenCodeStopRequest(envelope.body.stopRecovery)
+  const target = request.target
+  if (envelope.cwd !== target.projectPath) throw new Error('OpenCode Stop target project mismatch')
+  if (envelope.command === 'opencode.stopTeam') {
+    const preconditions = parseOpenCodeBridgePreconditions(envelope.body.preconditions)
+    if (request.originalRequestId !== envelope.requestId
+      || target.teamId !== (asString(envelope.body.teamId) ?? asString(envelope.body.teamName))
+      || target.laneId !== envelope.body.laneId || target.runId !== envelope.body.runId
+      || (envelope.body.projectPath !== undefined && target.projectPath !== envelope.body.projectPath)
+      || target.capabilitySnapshotId !== expectedCapabilitySnapshotId(envelope.body)
+      || target.expectedBehaviorFingerprint !== preconditions?.expectedBehaviorFingerprint
+      || request.idempotencyKey !== preconditions?.idempotencyKey) {
+      throw new Error('OpenCode Stop original request/target mismatch')
+    }
+  }
+  return request
+}
+
 async function handleEnvelope(
   envelope: BridgeEnvelope,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
@@ -5915,7 +5964,11 @@ async function handleEnvelope(
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       let snapshot: OpenCodeProvisioningSnapshot | null = null
       let confirmedStopRuntime: ConfirmedStopRuntime | undefined
-      if (!lightweightLaunchHandshake && envelope.body.requiredCommand === 'opencode.launchTeam') {
+      if (envelope.body.requiredCommand === 'opencode.stopOutcome'
+        || envelope.body.requiredCommand === 'opencode.reconcileStop') {
+        // Recovery negotiation must remain available after the original host exits.
+        // No host acquisition/probe, and no claim of current launch authority.
+      } else if (!lightweightLaunchHandshake && envelope.body.requiredCommand === 'opencode.launchTeam') {
         const selected = parseOpenCodeProviderScopedModelRef(asString(envelope.body.selectedModel))
         if (!selected) {
           throw new Error('OpenCode launch handshake requires a provider-qualified selectedModel')
@@ -5974,6 +6027,7 @@ async function handleEnvelope(
         server: identity,
         agreedProtocolVersion: 1,
         acceptedCommands: SUPPORTED_COMMANDS,
+        stopRecoveryContractVersion: OPENCODE_STOP_RECOVERY_CONTRACT_VERSION,
         serverTime: nowIso(),
         identityHash: '',
       }
@@ -5997,9 +6051,30 @@ async function handleEnvelope(
       return runLaunch(envelope, runtimeDeadline, externalSignal)
     case 'opencode.reconcileTeam':
       return runReconcile(envelope)
+    case 'opencode.stopOutcome': {
+      const request = stopRecoveryRequest(envelope)
+      return { snapshot: null, data: await openCodeSessionStore.lookupStop(request, runtimeDeadline
+        ? (externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal) : externalSignal) }
+    }
+    case 'opencode.reconcileStop': {
+      const request = stopRecoveryRequest(envelope)
+      return { snapshot: null, data: await openCodeSessionStore.reconcileStop(request,
+        () => readOpenCodeLegacyStopCapability({ teamsPath: getTeamsDir(), ...request.target }), runtimeDeadline
+          ? (externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal) : externalSignal) }
+    }
     case 'opencode.stopTeam':
       if (!runtimeDeadline) {
         throw new Error('OpenCode stop deadline was not initialized')
+      }
+      if (envelope.body.stopRecovery !== undefined) {
+        const request = stopRecoveryRequest(envelope)
+        const previous = await openCodeSessionStore.lookupStop(request, runtimeDeadline
+        ? (externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal) : externalSignal)
+        if (previous.status === 'completed') {
+          return { snapshot: null, confirmedStopRuntime: previous.receipt.runtime, data: previous.receipt.data }
+        }
+        if (previous.status !== 'unknown') throw new Error(`OpenCode Stop ${previous.status}; query stopOutcome/reconcileStop`)
+        return runStop(envelope, runtimeDeadline, externalSignal, request)
       }
       return runStop(envelope, runtimeDeadline, externalSignal)
     case 'opencode.sendMessage':
@@ -6089,6 +6164,8 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     envelope.command === 'opencode.readiness'
     || envelope.command === 'opencode.launchTeam'
     || envelope.command === 'opencode.stopTeam'
+    || envelope.command === 'opencode.stopOutcome'
+    || envelope.command === 'opencode.reconcileStop'
     || envelope.command === 'opencode.observeMessageDelivery'
     || (envelope.command === 'opencode.sendMessage' && !!expectedCapabilitySnapshotId(envelope.body))
     || (envelope.command === 'opencode.handshake'
