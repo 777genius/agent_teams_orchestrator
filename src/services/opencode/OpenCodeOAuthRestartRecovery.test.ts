@@ -37,6 +37,11 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
     SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
     COMSPEC: process.env.COMSPEC, PATHEXT: process.env.PATHEXT, NODE_ENV: 'test',
     HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
+    // Windows child startup fills missing home aliases from the real OS account.
+    ...(process.platform === 'win32' ? {
+      HOMEDRIVE: path.parse(root).root.replace(/[\\/]$/, ''),
+      HOMEPATH: path.join(root, 'home').slice(path.parse(root).root.length - 1),
+    } : {}),
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
     XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'),
     TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'),
@@ -134,6 +139,10 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
       if (p === ${JSON.stringify(fault.path)}) throw new Error('AUDIT crash boundary');
     } }));` : ''
   const script = `${inject}globalThis.fetch = async () => { throw new Error('AUDIT forbids network') };
+    if (process.platform === 'win32') {
+      const { deepStrictEqual } = await import('node:assert/strict');
+      deepStrictEqual([process.env.HOMEDRIVE, process.env.HOMEPATH], ${JSON.stringify([env.HOMEDRIVE, env.HOMEPATH])});
+    }
     const { resolveOpenCodeProfileScope } = await import(${JSON.stringify(modulePath)});
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));
