@@ -3648,6 +3648,80 @@ export class OpenCodeProviderManagementAdapter
     )
   }
 
+  private async refreshConnectedProviderAdmission(input: {
+    inventory: OpenCodeInventorySnapshot
+    inventoryService: OpenCodeInventoryServiceLike
+    providerId: string
+    providerAuth: Record<string, OpenCodeProviderAuthMethod[]> | null
+    capabilities: OpenCodeProviderManagementCapabilities
+  }): Promise<ProviderManagementResult<{
+    inventory: OpenCodeInventorySnapshot
+    configProviders: OpenCodeConfigProvidersResponse | null
+    providers: OpenCodeProviderResponse
+    provider: ProviderConnection | null
+  }>> {
+    const hostManager = this.deps.hostManager ?? openCodeHostManager
+    const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
+    let host: OpenCodeHostHandle | null = null
+    try {
+      this.invalidateDirectoryCache()
+      const refreshedInventory = await this.probeInventory(
+        input.inventoryService,
+        input.inventory.projectPath,
+        { bypassCache: true },
+      )
+      const refresh = useActionRefreshInventory(
+        input.inventory,
+        refreshedInventory,
+        inventory => addManagedProviderToInventory(inventory, input.providerId),
+      )
+      if (!refresh.inventory.detected || !refresh.inventory.profile) {
+        throw new Error('OpenCode refreshed managed profile is unavailable')
+      }
+      // Auth callback/PUT can leave the instance's provider snapshot stale.
+      // Process lifetime without an explicit hostKey allocates a unique host,
+      // even when refresh falls back to the previous profile after a timeout.
+      // Read admission and model selection there, before execution verification.
+      host = await hostManager.ensureHost({
+        projectPath: refresh.inventory.projectPath,
+        preparedProfile: refresh.inventory.profile,
+        hostLifetime: 'process',
+        resolveConfigFingerprint: false,
+        // Inventory (or the initial host on timeout) already prewarmed this profile.
+        prewarmManagedSubscriptionPlugins: false,
+      })
+      const client = clientFactory.create(host.baseUrl)
+      const [configProvidersResult, providersResult] = await Promise.all([
+        safeRead(() => client.getConfigProviders()),
+        safeRead(() => client.getProviders()),
+      ])
+      // An unavailable endpoint is not negative provider admission, and cannot
+      // fall back to credential metadata as positive admission either.
+      if (!providersResult.ok) {
+        throw new Error('OpenCode refreshed provider admission is unavailable')
+      }
+      const providers = providersResult.value
+      const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+      const provider = buildProviderConnections({
+        inventory: refresh.inventory,
+        configProviders,
+        providers,
+        providerAuth: input.providerAuth,
+        capabilities: input.capabilities,
+      }).find(candidate => candidate.providerId === input.providerId) ?? null
+      return { ok: true, value: { inventory: refresh.inventory, configProviders, providers, provider } }
+    } catch {
+      return providerManagementError(
+        'runtime-unhealthy',
+        'OpenCode could not refresh provider admission after saving credentials. Connection could not be verified.',
+      )
+    } finally {
+      if (host) {
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: false }).catch(() => undefined)
+      }
+    }
+  }
+
   private async withManagedOpenCodeClient<T>(
     runtimeId: ProviderManagementRuntimeId,
     projectPath: string | null | undefined,
@@ -4507,7 +4581,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, host, client }) => {
+      async ({ inventory, inventoryService, client }) => {
         if (!client.authorizeProviderOAuth || !client.completeProviderOAuth) {
           return providerManagementError(
             'unsupported-auth-method',
@@ -4829,38 +4903,45 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        await observer.authorizationCompleted?.({
-          operationId,
-          providerId,
-          displayName,
-          authOptionId: authOption.id,
-          methodIndex,
-          completionMethod: authorization.method,
-        })
-
-        this.invalidateDirectoryCache()
-        const refreshedInventory = await this.probeInventory(
-          inventoryService,
-          inventory.projectPath,
-          {
-            bypassCache: true,
-          },
-        )
-        const refresh = useActionRefreshInventory(
-          inventory,
-          refreshedInventory,
-          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
-        )
-        const view = appendViewDiagnostics(
-          await readLiveView({
-            inventory: refresh.inventory,
-            host,
+        try {
+          await observer.authorizationCompleted?.({
+            operationId,
+            providerId,
+            displayName,
+            authOptionId: authOption.id,
+            methodIndex,
+            completionMethod: authorization.method,
+          })
+        } catch (error) {
+          // Progress transport can close after mirroring but before admission.
+          // This is still an unverified transaction and must restore its baseline.
+          await this.rollbackProviderAuth({
             client,
-            diagnostics: refresh.inventory.diagnostics,
-          }),
-          refresh.postViewDiagnostics,
-        )
-        const provider = findProviderConnection(view, providerId)
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error ? error.message : 'OAuth verification was interrupted',
+          )
+        }
+
+        const admission = await this.refreshConnectedProviderAdmission({
+          inventory, inventoryService, providerId, providerAuth, capabilities,
+        })
+        if (!admission.ok) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return admission
+        }
+        const { provider } = admission.value
         if (
           !provider ||
           provider.state !== 'connected' ||
@@ -4880,9 +4961,9 @@ export class OpenCodeProviderManagementAdapter
         }
         const executionProof = await this.verifyConnectedProviderExecution({
           providerId,
-          inventory: refresh.inventory,
-          configProviders,
-          providers,
+          inventory: admission.value.inventory,
+          configProviders: admission.value.configProviders,
+          providers: admission.value.providers,
         })
         if (!executionProof.ok) {
           await this.rollbackProviderAuth({
@@ -4945,7 +5026,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, host, client }) => {
+      async ({ inventory, inventoryService, client }) => {
         if (!client.setProviderAuth) {
           return providerManagementError(
             'unsupported-action',
@@ -5083,13 +5164,6 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        // OpenCode snapshots connected providers when an instance starts. The auth
-        // endpoint persists the credential but does not refresh that in-memory
-        // snapshot, so this host can legitimately remain stale after a successful
-        // write. Confirm against the bypass-cache inventory below, which starts
-        // from the updated managed auth store, and then prove providers that need
-        // credential validation with a real model request.
-
         const authStore = this.getAuthStore()
         try {
           await authStore.upsertApiAuth({
@@ -5115,27 +5189,20 @@ export class OpenCodeProviderManagementAdapter
             error instanceof Error ? error.message : 'OpenCode auth mirror failed',
           )
         }
-        this.invalidateDirectoryCache()
-        const refreshedInventory = await this.probeInventory(
-          inventoryService,
-          inventory.projectPath,
-          {
-            bypassCache: true,
-          },
-        )
-        const refresh = useActionRefreshInventory(
-          inventory,
-          refreshedInventory,
-          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
-        )
-        const view = await readLiveView({
-          inventory: refresh.inventory,
-          host,
-          client,
-          diagnostics: refresh.inventory.diagnostics,
+        const admission = await this.refreshConnectedProviderAdmission({
+          inventory, inventoryService, providerId, providerAuth, capabilities,
         })
-        const viewWithRefreshDiagnostics = appendViewDiagnostics(view, refresh.postViewDiagnostics)
-        const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
+        if (!admission.ok) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
+          })
+          return admission
+        }
+        const { provider } = admission.value
         if (!provider) {
           await this.rollbackProviderAuth({
             client,
@@ -5149,7 +5216,10 @@ export class OpenCodeProviderManagementAdapter
             `OpenCode did not return provider ${providerId} after connecting`,
           )
         }
-        if (provider.state !== 'connected' || !provider.ownership.includes('managed')) {
+        if (
+          provider.state !== 'connected' ||
+          !provider.ownership.includes('managed')
+        ) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -5164,9 +5234,9 @@ export class OpenCodeProviderManagementAdapter
         }
         const executionProof = await this.verifyConnectedProviderExecution({
           providerId,
-          inventory: refresh.inventory,
-          configProviders,
-          providers,
+          inventory: admission.value.inventory,
+          configProviders: admission.value.configProviders,
+          providers: admission.value.providers,
           secretToRedact: apiKey,
           required: true,
         })
