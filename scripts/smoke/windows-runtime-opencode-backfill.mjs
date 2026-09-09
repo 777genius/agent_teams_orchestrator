@@ -172,9 +172,11 @@ export const windowsNodeScriptPattern = String.raw`^(?:"(?<quotedExe>[^"]+)"|(?<
 
 // Only stop executables copied into this unique sandbox, or Node running an
 // exact fixture script within it. Never kill by PID alone or by image name.
-export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
+export function buildWindowsTeardownCommand(root, diagnosticPids = []) {
   const literal = value => "'" + value.replaceAll("'", "''") + "'";
-  const command = `
+  // PIDs select bounded diagnostics only; they never confer ownership.
+  const candidates = diagnosticPids.filter(pid => Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff).slice(0, 8);
+  return String.raw`
 [Console]::Error.WriteLine('teardown: started')
 $ErrorActionPreference = 'Stop'
 # Direct stderr markers need no modules and survive a later import/query timeout.
@@ -190,24 +192,38 @@ Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 $rootPath = ${literal(path.resolve(root) + path.sep)}
 $nodePath = ${literal(process.execPath)}
 $nodeScriptPattern = ${literal(windowsNodeScriptPattern)}
+$diagnosticPids = @(${candidates.join(', ')})
+function Get-OwnershipPath([string]$value) {
+  # Windows PowerShell/.NET Framework GetFullPath expands existing 8.3 names.
+  # Reject relative paths: the inspecting shell is not the target process cwd.
+  if ($value -notmatch '^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])') { return $null }
+  try { return [IO.Path]::GetFullPath($value) } catch { return $null }
+}
+$rootPath = Get-OwnershipPath $rootPath
+$nodePath = Get-OwnershipPath $nodePath
+if (-not $rootPath -or -not $nodePath) { throw 'Fixture ownership paths must be absolute' }
 [Console]::Error.WriteLine('teardown: before script enumeration')
-$scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse | ForEach-Object { $_.FullName })
+$scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse -File | ForEach-Object { Get-OwnershipPath $_.FullName })
 [Console]::Error.WriteLine('teardown: after script enumeration count=' + $scripts.Count)
 function Is-Owned($entry) {
-  if ($entry.ExecutablePath -and $entry.ExecutablePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-  if ($entry.ExecutablePath -ieq $nodePath) {
+  $executablePath = Get-OwnershipPath $entry.ExecutablePath
+  if (-not $executablePath) { return $false }
+  if ($executablePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  if ($executablePath -ieq $nodePath) {
     if ($entry.CommandLine -match $nodeScriptPattern) {
       $commandExe = if ($Matches['quotedExe']) { $Matches['quotedExe'] } else { $Matches['bareExe'] }
       $commandScript = if ($Matches['quotedScript']) { $Matches['quotedScript'] } else { $Matches['bareScript'] }
-      if (@($nodePath, 'node', 'node.exe') -icontains $commandExe) {
-        return ($scripts -icontains $commandScript)
+      if (@('node', 'node.exe') -icontains $commandExe -or (Get-OwnershipPath $commandExe) -ieq $nodePath) {
+        $scriptPath = Get-OwnershipPath $commandScript
+        return ($scriptPath -and $scripts -icontains $scriptPath)
       }
     }
   }
   return $false
 }
 # Query local WMI under this same identity, without loading CimCmdlets.
-# Copy the four identity/ownership fields before releasing the WMI resources.
+# Read the actual ManagementBaseObject properties, independent of PowerShell's
+# WMI adapter, and copy all four fields before releasing the WMI resources.
 function Read-ProcessEntries([string]$filter = '') {
   $searcher = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ExecutablePath, CommandLine, CreationDate FROM Win32_Process' + $filter)
   $results = $null
@@ -215,11 +231,20 @@ function Read-ProcessEntries([string]$filter = '') {
     $results = $searcher.Get()
     foreach ($row in $results) {
       try {
+        $creationDate = $row.GetPropertyValue('CreationDate')
+        if ($diagnosticPids -contains $row.GetPropertyValue('ProcessId')) {
+          $projection = [ordered]@{ pid = $row.GetPropertyValue('ProcessId') }
+          foreach ($name in @('ProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')) {
+            $projection[$name + 'Present'] = $null -ne $row.GetPropertyValue($name)
+            $projection[$name + 'AdapterEqual'] = $row.$name -ceq $row.GetPropertyValue($name)
+          }
+          [Console]::Error.WriteLine('teardown: fixture projection ' + (ConvertTo-Json -InputObject $projection -Compress))
+        }
         [pscustomobject]@{
-          ProcessId = $row.ProcessId
-          ExecutablePath = $row.ExecutablePath
-          CommandLine = $row.CommandLine
-          CreationDate = if ($row.CreationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($row.CreationDate) } else { $null }
+          ProcessId = $row.GetPropertyValue('ProcessId')
+          ExecutablePath = $row.GetPropertyValue('ExecutablePath')
+          CommandLine = $row.GetPropertyValue('CommandLine')
+          CreationDate = if ($creationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($creationDate) } else { $null }
         }
       } finally { $row.Dispose() }
     }
@@ -233,7 +258,22 @@ $stopped = @()
 $entries = @(Read-ProcessEntries)
 [Console]::Error.WriteLine('teardown: after process enumeration count=' + $entries.Count)
 foreach ($entry in $entries) {
-  if (-not (Is-Owned $entry)) { continue }
+  $owned = Is-Owned $entry
+  if ($diagnosticPids -contains $entry.ProcessId) {
+    # No host command lines, even for candidates. Only bounded parsed paths and
+    # match results for the explicit fixture PIDs are emitted on stderr.
+    $scriptArg = $null
+    $argvMatched = $entry.CommandLine -match $nodeScriptPattern
+    if ($argvMatched) { $scriptArg = if ($Matches['quotedScript']) { $Matches['quotedScript'] } else { $Matches['bareScript'] } }
+    $diagnostic = [ordered]@{ pid = $entry.ProcessId; owned = $owned; argvMatched = $argvMatched }
+    foreach ($pair in @(@('script', $scriptArg), @('scriptFullPath', (Get-OwnershipPath $scriptArg)), @('rootFullPath', $rootPath))) {
+      $value = [string]$pair[1]
+      $diagnostic[$pair[0]] = $value.Substring(0, [Math]::Min(512, $value.Length))
+    }
+    $diagnostic['nodePathMatches'] = (Get-OwnershipPath $entry.ExecutablePath) -ieq $nodePath
+    [Console]::Error.WriteLine('teardown: fixture ownership ' + (ConvertTo-Json -InputObject $diagnostic -Compress))
+  }
+  if (-not $owned) { continue }
   [Console]::Error.WriteLine('teardown: before Get-Process pid=' + $entry.ProcessId)
   $target = Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
   [Console]::Error.WriteLine('teardown: after Get-Process pid=' + $entry.ProcessId + ' found=' + [bool]$target)
@@ -267,6 +307,10 @@ foreach ($entry in $entries) {
 ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
 [Console]::Error.WriteLine('teardown: after JSON output')
 `;
+}
+
+export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
+  const command = buildWindowsTeardownCommand(root, (report.children || []).map(child => child.pid));
   const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
   const started = performance.now();
   const result = spawnSync('powershell.exe', argv, { env, cwd: root, encoding: 'utf8',

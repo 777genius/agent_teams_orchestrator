@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 
@@ -171,7 +171,11 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
     }
     assert.doesNotMatch(command, /Import-Module CimCmdlets|Get-CimInstance|Get-WmiObject|Add-Type/);
     assert.ok(command.includes("[System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ExecutablePath, CommandLine, CreationDate FROM Win32_Process' + $filter)"));
-    assert.ok(command.includes('[System.Management.ManagementDateTimeConverter]::ToDateTime($row.CreationDate)'));
+    for (const name of ['ProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate']) {
+      assert.ok(command.includes(`$row.GetPropertyValue('${name}')`));
+      assert.ok(!command.includes(`$row.${name}`), 'Projection must not depend on the WMI adapter');
+    }
+    assert.ok(command.includes('[System.Management.ManagementDateTimeConverter]::ToDateTime($creationDate)'));
     assert.ok(command.includes("$entry.CreationDate.ToUniversalTime().ToString('o')"));
     for (const dispose of ['$row.Dispose()', '$results.Dispose()', '$searcher.Dispose()']) assert.ok(command.includes(dispose));
     // Missing creation time must fail closed; the held handle and ownership
@@ -204,6 +208,20 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
     t.mock.restoreAll();
     syncBuiltinESMExports();
   }
+});
+
+test('ownership diagnostics are bounded to explicit fixture candidates and cannot authorize a kill', () => {
+  const command = buildWindowsTeardownCommand('/isolated', [null, -1, 1.5, 0x80000000, '2; exit', ...Array.from({ length: 12 }, (_, i) => i + 101)]);
+  assert.ok(command.includes('$diagnosticPids = @(101, 102, 103, 104, 105, 106, 107, 108)'));
+  const predicate = command.slice(command.indexOf('function Is-Owned'), command.indexOf('function Read-ProcessEntries'));
+  assert.doesNotMatch(predicate, /diagnosticPids/);
+  assert.ok(predicate.includes('Get-OwnershipPath $entry.ExecutablePath'));
+  assert.ok(predicate.includes('Get-OwnershipPath $commandScript'));
+  assert.ok(predicate.includes('$scripts -icontains $scriptPath'));
+  assert.ok(command.includes('if ($diagnosticPids -contains $entry.ProcessId)'));
+  assert.ok(command.includes('[Math]::Min(512, $value.Length)'));
+  assert.ok(command.includes('if (-not $owned) { continue }'));
+  assert.equal(command.match(/\$target\.Kill\(\)/g).length, 1);
 });
 
 test('readiness rejects a degraded host even with a successful envelope', () => {
@@ -354,6 +372,50 @@ function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) 
   `;
   return recordWindowsProbe(evidence, flush, attempt === 1 ? 'production-identity' : `production-identity-repeat-${attempt - 1}`,
     bun, ['--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+}
+
+// Execute the real emitted projection and predicate without its kill loop.
+// Run after the first production identity so this cannot warm its cold query.
+function nativeOwnershipProbe(evidence, flush, env, root, pid) {
+  assert.ok(Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff, 'Fixture PID required');
+  const literal = value => "'" + value.replaceAll("'", "''") + "'";
+  const prefix = buildWindowsTeardownCommand(root, [pid]).split('$stopped = @()')[0];
+  assert.doesNotMatch(prefix, /\.Kill\(/);
+  const script = path.join(root, 'fake-opencode.cjs');
+  const longScript = realpathSync.native(script);
+  const entry = commandLine => ({ ExecutablePath: process.execPath, CommandLine: commandLine });
+  const quoted = value => `"${value}"`;
+  const cases = [
+    [true, entry(`${quoted(process.execPath)} ${quoted(script)}`)],
+    [true, entry(`${quoted(realpathSync.native(process.execPath))} ${quoted(longScript)} --port 1234`)],
+    [true, entry(`node.exe ${quoted(script)}`)],
+    [false, entry(`${quoted(process.execPath)} ${quoted(script + ' unrelated-helper.cjs')}`)],
+    [false, entry(`${quoted(process.execPath)} ${quoted(script)}suffix`)],
+    [false, entry(`${quoted(process.execPath)} ${quoted(script)}\u00a0unrelated.cjs`)],
+    [false, entry(`${quoted(process.execPath)} --require ${quoted(script)}`)],
+    [false, entry(`${quoted(process.execPath)} fake-opencode.cjs`)],
+    [false, entry(`${quoted(process.execPath)} ${quoted(path.join(root + '-sibling', 'fake-opencode.cjs'))}`)],
+    [false, { ...entry(`node.exe ${quoted(script)}`), ExecutablePath: null }],
+    [false, { ...entry(`node.exe ${quoted(script)}`), ExecutablePath: path.join(root + '-sibling', 'node.exe') }],
+  ];
+  const command = prefix + `
+$expectedScript = ${literal(longScript)}
+if ((Get-OwnershipPath ${literal(script)}) -ine $expectedScript) { throw 'Short/long fixture paths disagree' }
+$cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
+foreach ($case in $cases) {
+  if ([bool](Is-Owned $case[1]) -ne $case[0]) { throw 'Exact argv ownership regression' }
+}
+$rows = @(Read-ProcessEntries ' WHERE ProcessId = ${pid}')
+if ($rows.Count -ne 1 -or $rows[0].ProcessId -ne ${pid} -or -not $rows[0].CreationDate -or -not (Is-Owned $rows[0])) { throw 'Actual fixture WMI projection/ownership failed' }
+ConvertTo-Json -InputObject @{ cases = $cases.Count; startedAt = $rows[0].CreationDate.ToUniversalTime().ToString('o'); inputScript = ${literal(script)}; longScript = $expectedScript } -Compress
+`;
+  const probe = recordWindowsProbe(evidence, flush, 'fixture-ownership-contract', 'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+    { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+  assert.ok(!probe.error && probe.status === 0, `Fixture ownership contract failed: ${JSON.stringify(probe)}`);
+  const result = JSON.parse(probe.stdout);
+  assert.equal(result.cases, cases.length);
+  assert.equal(Date.parse(result.startedAt), evidence.startedAtMs);
 }
 
 // Run every evidence/assertion phase, then rethrow the original failure object.
@@ -511,7 +573,7 @@ test('native failure collection keeps first failure and enforces every teardown 
   try {
     for (const scenario of ['pass', 'first-failed-repeat-succeeded', 'first-and-teardown-failed',
       'evidence-write-failed', 'first-and-evidence-write-failed',
-      'teardown-failed', 'bad-json', 'wrong-identity', 'missing-identity', 'unrelated-stopped', 'parent-dead', 'unrelated-dead', 'shared-prefix-dead']) {
+      'teardown-failed', 'bad-json', 'empty-stopped', 'wrong-identity', 'missing-identity', 'unrelated-stopped', 'parent-dead', 'unrelated-dead', 'shared-prefix-dead']) {
       const evidence = {};
       const snapshots = [];
       checked = [];
@@ -521,6 +583,7 @@ test('native failure collection keeps first failure and enforces every teardown 
         stderr: 'teardown: after identity validation pid=101\nteardown: after wait for exit pid=101\nteardown: after JSON output\n' };
       if (scenario.includes('teardown-failed')) result = { status: null, stdout: '', stderr: 'teardown: started\n', error: teardownFailure };
       if (scenario === 'bad-json') result.stdout = 'invalid';
+      if (scenario === 'empty-stopped') result.stdout = '[]';
       if (scenario === 'wrong-identity') result.stdout = JSON.stringify([{ pid: 101, startedAt: '2020-01-01T00:00:00Z' }]);
       if (scenario === 'missing-identity') result.stdout = JSON.stringify([{ pid: 101 }]);
       if (scenario === 'unrelated-stopped') result.stdout = JSON.stringify([{ pid: 101, startedAt: timestamp }, { pid: 102 }]);
@@ -549,7 +612,8 @@ test('native failure collection keeps first failure and enforces every teardown 
       assert.deepEqual(evidence.phases.slice(-3).map(phase => phase.state),
         [process.pid, 102, 103].map(pid => pid === deadPid ? 'failed' : 'passed'), scenario);
       assert.equal(evidence.phases.find(phase => phase.label === 'first-identity-matches-teardown').state,
-        firstFailed || ['teardown-failed', 'bad-json', 'wrong-identity', 'missing-identity'].includes(scenario) ? 'failed' : 'passed', scenario);
+        firstFailed || ['teardown-failed', 'bad-json', 'empty-stopped', 'wrong-identity', 'missing-identity'].includes(scenario) ? 'failed' : 'passed', scenario);
+      if (scenario === 'empty-stopped') assert.equal(evidence.phases.find(phase => phase.label === 'owned-child-stopped').state, 'failed');
       if (firstFailed) assert.equal(evidence.startedAtMs, undefined, 'Repeat success cannot replace first identity');
       assert.equal(snapshots.at(-1).phases.at(-1).state, evidence.phases.at(-1).state);
     }
@@ -614,6 +678,7 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
           diagnoseWindowsStartup(evidence, flush, env, root, children[0].pid);
         }
       }],
+      ['fixture-ownership-contract', () => nativeOwnershipProbe(evidence, flush, env, root, children[0]?.pid)],
       ['owned-teardown', () => {
         const child = children[0];
         if (child?.pid) {
