@@ -1,47 +1,42 @@
 #!/usr/bin/env node
 
+import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runBackfillSmoke, sandboxEnvironment } from './windows-runtime-opencode-backfill.mjs';
+import { pathToFileURL } from 'node:url';
+import { finishSmokeCleanup, runBackfillSmoke, runSmokeGroups, sandboxEnvironment } from './windows-runtime-opencode-backfill.mjs';
 
-const runtimeBinary = path.resolve(process.argv[2] || path.join('dist', 'cli.exe'));
-runBackfillSmoke(runtimeBinary, process.argv[3]);
-const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-'));
-const fakeOpenCodeScript = path.join(tempRoot, 'fake-opencode.cjs');
-const fakeOpenCodeCmd = path.join(tempRoot, 'opencode.cmd');
-const projectPath = path.join(tempRoot, 'project with spaces');
-mkdirSync(projectPath, { recursive: true });
+// Record before launch and before assertions: failures retain exact transport evidence.
+export function runRecordedCheck(group, label, invocation, validate, { spawn = spawnSync, flush = () => {} } = {}) {
+  const { env, ...transport } = invocation;
+  const item = { label, ...transport, passed: false };
+  group.cases.push(item);
+  flush();
+  try {
+    const result = spawn(item.executable, item.argv, { cwd: item.cwd, env,
+      encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 45000, windowsHide: true, shell: false });
+    Object.assign(item, { pid: result.pid, status: result.status, signal: result.signal,
+      stdout: result.stdout, stderr: result.stderr, error: result.error?.message });
+    if (item.outputPath && existsSync(item.outputPath)) item.output = readFileSync(item.outputPath, 'utf8');
+    flush();
+    if (result.error) throw result.error;
+    assertExitZero(result, label);
+    validate(item.outputPath ? item.output : item.stdout, result);
+    item.passed = true;
+  } catch (error) { item.error = error.stack || String(error); }
+  finally { flush(); }
+  return item;
+}
 
-writeFileSync(
-  fakeOpenCodeScript,
-  readFileSync(new URL('./windows-runtime-opencode-fixture.cjs', import.meta.url), 'utf8'),
-  'utf8',
-);
-
-writeFileSync(
-  fakeOpenCodeCmd,
-  '@echo off\r\nnode "%~dp0fake-opencode.cjs" %*\r\n',
-  'utf8',
-);
-
-const smokeEnv = sandboxEnvironment(tempRoot, fakeOpenCodeCmd);
-
-function runRuntime(args, options = {}) {
-  const result = spawnSync(runtimeBinary, args, {
-    cwd: projectPath,
-    env: smokeEnv,
-    encoding: 'utf8',
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: 45_000,
-    windowsHide: true,
-    ...options,
-  });
-  if (result.error) {
-    throw result.error;
-  }
-  return result;
+export function assertReadinessHost(payload) {
+  assert.equal(payload.command, 'opencode.readiness');
+  assert.equal(typeof payload.ok, 'boolean');
+  // Fake MCP may be unavailable, but a healthy host requires production startup
+  // to have captured a non-null process identity in OpenCodeHostManager.
+  assert.equal(payload.data?.hostHealthy, true, JSON.stringify(payload));
 }
 
 function describeRuntimeResult(result) {
@@ -71,157 +66,157 @@ function assertExitZero(result, label) {
   }
 }
 
-try {
-  const providersResult = runRuntime([
-    'runtime',
-    'providers',
-    'view',
-    '--runtime',
-    'opencode',
-    '--json',
-    '--compact',
-    '--project-path',
-    projectPath,
-  ]);
-  assertExitZero(providersResult, 'runtime providers view');
-  const providersPayload = assertJsonObject(providersResult.stdout, 'runtime providers view', providersResult);
-  if (providersPayload.runtimeId !== 'opencode') {
-    throw new Error('runtime providers view returned the wrong runtimeId');
-  }
-  const providers = providersPayload.view?.providers;
-  if (!Array.isArray(providers) || !providers.some(provider => provider?.providerId === 'opencode')) {
-    throw new Error('runtime providers view did not include the fake OpenCode provider');
-  }
 
-  const bridgeInputPath = path.join(tempRoot, 'opencode-handshake.json');
-  const bridgeOutputPath = path.join(tempRoot, 'opencode-handshake.output.json');
-  writeFileSync(
-    bridgeInputPath,
-    JSON.stringify({
-      schemaVersion: 1,
-      requestId: 'runtime-opencode-smoke',
-      command: 'opencode.handshake',
-      cwd: projectPath,
-      startedAt: new Date().toISOString(),
-      timeoutMs: 45_000,
-      body: {
-        client: {
-          schemaVersion: 1,
-          peer: 'claude_team',
-          appVersion: 'smoke',
-          gitSha: null,
-          buildId: null,
-          bridgeProtocol: {
-            minVersion: 1,
-            currentVersion: 1,
-            supportedCommands: [
-              'opencode.handshake',
-              'opencode.commandStatus',
-              'opencode.readiness',
-            ],
-            opencodeTaskLedgerEvidenceContractVersion: 1,
-            opencodeAppManagedBootstrapContractVersion: 1,
-            opencodeDeliveryAcceptanceContractVersion: 2,
-          },
-          runtime: {
-            providerId: 'opencode',
-            binaryPath: null,
-            binaryFingerprint: null,
-            version: null,
-            capabilitySnapshotId: null,
-            runtimeStoreManifestHighWatermark: null,
-            activeRunId: null,
-          },
-          featureFlags: {
-            opencodeTeamLaunch: true,
-            opencodeStateChangingCommands: true,
-          },
-        },
-        requiredCommand: 'opencode.readiness',
-        expectedRunId: null,
-        expectedCapabilitySnapshotId: null,
-        expectedManifestHighWatermark: 0,
-      },
-    }, null, 2),
-    'utf8',
-  );
-
-  const bridgeResult = runRuntime([
-    'runtime',
-    'opencode-command',
-    '--json',
-    '--input',
-    bridgeInputPath,
-    '--output',
-    bridgeOutputPath,
-  ]);
-  assertExitZero(bridgeResult, 'runtime opencode-command');
-  const bridgePayload = assertJsonObject(readFileSync(bridgeOutputPath, 'utf8'), 'runtime opencode-command');
-  if (bridgePayload.ok !== true || bridgePayload.command !== 'opencode.handshake') {
-    throw new Error('runtime opencode-command did not return a successful handshake envelope');
-  }
-
-  const bridgeStdoutResult = runRuntime([
-    'runtime',
-    'opencode-command',
-    '--json',
-    '--input',
-    bridgeInputPath,
-  ]);
-  assertExitZero(bridgeStdoutResult, 'runtime opencode-command stdout');
-  const bridgeStdoutPayload = assertJsonObject(
-    bridgeStdoutResult.stdout,
-    'runtime opencode-command stdout',
-    bridgeStdoutResult,
-  );
-  if (bridgeStdoutPayload.ok !== true || bridgeStdoutPayload.command !== 'opencode.handshake') {
-    throw new Error('runtime opencode-command stdout did not return a successful handshake envelope');
-  }
-
-  const readinessInputPath = path.join(tempRoot, 'opencode-readiness.json');
-  writeFileSync(
-    readinessInputPath,
-    JSON.stringify({
-      schemaVersion: 1,
-      requestId: 'runtime-opencode-readiness-smoke',
-      command: 'opencode.readiness',
-      cwd: projectPath,
-      startedAt: new Date().toISOString(),
-      timeoutMs: 45_000,
-      body: {
-        projectPath,
-        selectedModel: 'opencode/big-pickle',
-        requireExecutionProbe: false,
-      },
-    }, null, 2),
-    'utf8',
-  );
-
-  const readinessStdoutResult = runRuntime([
-    'runtime',
-    'opencode-command',
-    '--json',
-    '--input',
-    readinessInputPath,
-  ]);
-  assertExitZero(readinessStdoutResult, 'runtime opencode-command readiness stdout');
-  const readinessStdoutPayload = assertJsonObject(
-    readinessStdoutResult.stdout,
-    'runtime opencode-command readiness stdout',
-    readinessStdoutResult,
-  );
-  if (
-    readinessStdoutPayload.command !== 'opencode.readiness' ||
-    typeof readinessStdoutPayload.ok !== 'boolean'
-  ) {
-    throw new Error('runtime opencode-command readiness stdout did not return a bridge envelope');
-  }
-
-  process.stdout.write('Windows runtime OpenCode provider JSON smoke passed\n');
-} finally {
+export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSync, cleanup = finishSmokeCleanup } = {}) {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-'));
   try {
-    rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
-  } catch {
-    // Best effort only. Windows can keep the fake host process alive briefly.
+    const fakeOpenCodeScript = path.join(tempRoot, 'fake-opencode.cjs');
+    const fakeOpenCodeCmd = path.join(tempRoot, 'opencode.cmd');
+    const projectPath = path.join(tempRoot, 'project with spaces');
+    mkdirSync(projectPath, { recursive: true });
+
+    writeFileSync(
+      fakeOpenCodeScript,
+      readFileSync(new URL('./windows-runtime-opencode-fixture.cjs', import.meta.url), 'utf8'),
+      'utf8',
+    );
+
+    writeFileSync(
+      fakeOpenCodeCmd,
+      '@echo off\r\nnode "%~dp0fake-opencode.cjs" %*\r\n',
+      'utf8',
+    );
+
+    const smokeEnv = sandboxEnvironment(tempRoot, fakeOpenCodeCmd);
+
+    const check = (label, argv, validate, outputPath) => runRecordedCheck(report, label,
+      { executable: runtimeBinary, argv, cwd: projectPath, env: smokeEnv, outputPath },
+      (raw, result) => validate(assertJsonObject(raw || '', label, result)), { spawn, flush });
+
+    check('providers-view', [
+      'runtime', 'providers', 'view', '--runtime', 'opencode', '--json', '--compact', '--project-path', projectPath,
+    ], payload => {
+      assert.equal(payload.runtimeId, 'opencode');
+      assert.ok(payload.view?.providers?.some(provider => provider?.providerId === 'opencode'),
+        'runtime providers view did not include the fake OpenCode provider');
+    });
+
+    const bridgeInputPath = path.join(tempRoot, 'opencode-handshake.json');
+    const bridgeOutputPath = path.join(tempRoot, 'opencode-handshake.output.json');
+    writeFileSync(
+      bridgeInputPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        requestId: 'runtime-opencode-smoke',
+        command: 'opencode.handshake',
+        cwd: projectPath,
+        startedAt: new Date().toISOString(),
+        timeoutMs: 45_000,
+        body: {
+          client: {
+            schemaVersion: 1,
+            peer: 'claude_team',
+            appVersion: 'smoke',
+            gitSha: null,
+            buildId: null,
+            bridgeProtocol: {
+              minVersion: 1,
+              currentVersion: 1,
+              supportedCommands: [
+                'opencode.handshake',
+                'opencode.commandStatus',
+                'opencode.readiness',
+              ],
+              opencodeTaskLedgerEvidenceContractVersion: 1,
+              opencodeAppManagedBootstrapContractVersion: 1,
+              opencodeDeliveryAcceptanceContractVersion: 2,
+            },
+            runtime: {
+              providerId: 'opencode',
+              binaryPath: null,
+              binaryFingerprint: null,
+              version: null,
+              capabilitySnapshotId: null,
+              runtimeStoreManifestHighWatermark: null,
+              activeRunId: null,
+            },
+            featureFlags: {
+              opencodeTeamLaunch: true,
+              opencodeStateChangingCommands: true,
+            },
+          },
+          requiredCommand: 'opencode.readiness',
+          expectedRunId: null,
+          expectedCapabilitySnapshotId: null,
+          expectedManifestHighWatermark: 0,
+        },
+      }, null, 2),
+      'utf8',
+    );
+
+    const assertHandshake = payload => {
+      assert.equal(payload.ok, true);
+      assert.equal(payload.command, 'opencode.handshake');
+      assert.equal(payload.requestId, 'runtime-opencode-smoke');
+    };
+    check('handshake-file', ['runtime', 'opencode-command', '--json', '--input', bridgeInputPath, '--output', bridgeOutputPath],
+      assertHandshake, bridgeOutputPath);
+    check('handshake-stdout', ['runtime', 'opencode-command', '--json', '--input', bridgeInputPath], assertHandshake);
+
+    const readinessInputPath = path.join(tempRoot, 'opencode-readiness.json');
+    writeFileSync(
+      readinessInputPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        requestId: 'runtime-opencode-readiness-smoke',
+        command: 'opencode.readiness',
+        cwd: projectPath,
+        startedAt: new Date().toISOString(),
+        timeoutMs: 45_000,
+        body: {
+          projectPath,
+          selectedModel: 'opencode/big-pickle',
+          requireExecutionProbe: false,
+        },
+      }, null, 2),
+      'utf8',
+    );
+
+    check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath], assertReadinessHost);
+  } catch (error) { report.error = error.stack || String(error); }
+  finally {
+    try {
+      const log = path.join(tempRoot, 'fake-opencode-invocations.jsonl');
+      if (existsSync(log)) report.probeInvocations = readFileSync(log, 'utf8');
+    } catch (error) { report.error = error.stack || String(error); }
+    cleanup(report, tempRoot);
+    flush();
   }
+  return report;
+}
+
+export function runCombinedSmoke(binaryInput, evidenceInput) {
+  const runtimeBinary = path.resolve(binaryInput);
+  const evidencePath = path.resolve(evidenceInput || 'backfill-runtime-evidence.json');
+  mkdirSync(path.dirname(evidencePath), { recursive: true });
+  const report = { schemaVersion: 2, platform: process.platform, arch: process.arch,
+    nodeVersion: process.version, parentPid: process.pid, runtimeBinary,
+    sourceCommit: process.env.BACKFILL_RUNTIME_SOURCE_COMMIT,
+    harnessCommit: process.env.BACKFILL_RUNTIME_HARNESS_COMMIT,
+    buildBunVersion: process.env.BACKFILL_RUNTIME_BUN_VERSION, passed: false };
+  const flush = () => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n');
+  flush();
+  assert.equal(process.platform, 'win32', 'Packaged Windows coverage requires actual Windows execution');
+  report.executableSha256 = createHash('sha256').update(readFileSync(runtimeBinary)).digest('hex');
+  runSmokeGroups(report, {
+    backfill: (group, save) => runBackfillSmoke(runtimeBinary, evidencePath, { report: group, flush: save }),
+    provider: (group, save) => runProviderSmoke(runtimeBinary, group, save),
+  }, flush);
+  assert.equal(report.passed, true, `Packaged Windows smoke failed; combined evidence: ${evidencePath}`);
+  process.stdout.write('Windows runtime OpenCode backfill and provider JSON smoke passed\n');
+  return report;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  runCombinedSmoke(process.argv[2] || path.join('dist', 'cli.exe'), process.argv[3]);
 }

@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, createBackfillFixture, sandboxEnvironment } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillEnvelope, assertImportedLedger, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath } from './windows-runtime-opencode-backfill.mjs';
+
+import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -103,4 +106,153 @@ test('ledger assertion rejects wrong content, wrong task, and duplicate imports'
     writeFileSync(journal, (JSON.stringify(event) + '\n').repeat(2));
     assert.throws(() => assertImportedLedger(root));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Windows PATH contains only trusted Node, System32 and Windows PowerShell directories', () => {
+  assert.deepEqual(trustedSearchPath('win32', 'C:\\trusted node\\node.exe', 'C:\\Windows').split(';'), [
+    'C:\\trusted node', 'C:\\Windows\\System32', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0',
+  ]);
+});
+
+test('cleanup errors override successful assertions and preserve the remaining root', () => {
+  const root = '/isolated/fixture';
+  const report = { passed: true, cases: [{ passed: true }] };
+  const order = [];
+  finishSmokeCleanup(report, root, {
+    teardown: () => order.push('teardown'),
+    remove: () => { order.push('remove'); throw new Error('forced EBUSY after retries'); },
+  });
+  assert.deepEqual(order, ['teardown', 'remove']);
+  assert.equal(report.passed, false);
+  assert.equal(report.remainingRoot, root);
+  assert.match(report.cleanupError, /EBUSY/);
+  const teardownFailure = { passed: true, cases: [{ passed: true }] };
+  finishSmokeCleanup(teardownFailure, root, {
+    teardown: () => { throw new Error('identity unavailable'); }, remove: () => {},
+  });
+  assert.equal(teardownFailure.passed, false);
+  assert.match(teardownFailure.cleanupError, /identity unavailable/);
+});
+
+test('readiness rejects a degraded host even with a successful envelope', () => {
+  const payload = { ok: true, command: 'opencode.readiness', data: { hostHealthy: true } };
+  assertReadinessHost(payload);
+  assert.throws(() => assertReadinessHost({ ...payload, data: { hostHealthy: false } }));
+  assert.throws(() => assertReadinessHost({ ...payload, data: {} }));
+});
+
+test('combined evidence runs all provider checks after backfill or provider failure', () => {
+  // Exercise the real provider harness with injected process results, including
+  // file output. No packaged binary, provider process or Windows simulation claim.
+  for (const failedGroup of ['none', 'backfill', 'providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout', 'provider-cleanup']) {
+    const snapshots = [];
+    const report = {};
+    const labels = ['providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout'];
+    let calls = 0;
+    runSmokeGroups(report, {
+      backfill: group => {
+        if (failedGroup === 'backfill') throw new Error('forced backfill failure');
+        group.passed = true;
+      },
+      provider: (group, flush) => runProviderSmoke('/fixture/runtime.exe', group, flush, {
+        spawn: (executable, argv) => {
+          const label = labels[calls++];
+          const payload = label === 'providers-view'
+            ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
+            : label === 'readiness-stdout'
+              ? { ok: false, command: 'opencode.readiness', data: { hostHealthy: true } }
+              : { ok: true, command: 'opencode.handshake', requestId: 'runtime-opencode-smoke' };
+          const stdout = JSON.stringify(payload);
+          const outputIndex = argv.indexOf('--output');
+          if (outputIndex >= 0) writeFileSync(argv[outputIndex + 1], stdout);
+          return { pid: 123, status: label === failedGroup ? 1 : 0, signal: null,
+            stdout, stderr: label === failedGroup ? 'forced provider failure: exact stderr' : '' };
+        },
+        cleanup: (group, root) => {
+          try {
+            finishSmokeCleanup(group, root, {
+              teardown: () => {},
+              remove: (...args) => {
+                if (failedGroup === 'provider-cleanup') throw new Error('forced cleanup EBUSY');
+                rmSync(...args);
+              },
+            });
+          } finally { rmSync(root, { recursive: true, force: true }); }
+        },
+      }),
+    }, () => snapshots.push(structuredClone(report)));
+    assert.equal(calls, 4);
+    assert.equal(report.passed, failedGroup === 'none');
+    assert.equal(snapshots.at(-1).passed, report.passed);
+    assert.equal(report.groups.provider.cases.length, 4);
+    if (failedGroup === 'provider-cleanup') {
+      assert.equal(report.groups.backfill.passed, true);
+      assert.equal(report.groups.provider.passed, false);
+      assert.match(report.groups.provider.cleanupError, /EBUSY/);
+      assert.ok(report.groups.provider.remainingRoot);
+    }
+    for (const item of report.groups.provider.cases) {
+      assert.equal(item.executable, '/fixture/runtime.exe');
+      assert.equal(item.argv[0], 'runtime');
+      assert.equal(typeof item.stdout, 'string');
+      assert.equal('env' in item, false);
+      assert.equal(item.passed, item.label !== failedGroup);
+      if (item.label === failedGroup) {
+        assert.equal(item.status, 1);
+        assert.equal(item.stderr, 'forced provider failure: exact stderr');
+      }
+    }
+    assert.ok(report.groups.provider.cases[1].output.includes('opencode.handshake'));
+    assert.ok(snapshots.some(snapshot => snapshot.groups?.provider?.cases.some(item => item.passed === false)));
+  }
+});
+
+test('spawn timeout records argv and stderr and fails the provider check', () => {
+  const group = { cases: [] };
+  const error = Object.assign(new Error('spawn ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  let validated = false;
+  const item = runRecordedCheck(group, 'timeout', { executable: '/fixture/runtime.exe', argv: ['runtime'], cwd: '/fixture' },
+    () => { validated = true; }, { spawn: () => ({ pid: 321, status: null, signal: 'SIGTERM', stdout: '', stderr: 'before timeout', error }) });
+  assert.equal(validated, false);
+  assert.equal(item.passed, false);
+  assert.equal(item.stderr, 'before timeout');
+  assert.deepEqual(item.argv, ['runtime']);
+  assert.match(item.error, /ETIMEDOUT/);
+});
+
+test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 20000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-owned-process-'));
+  const script = path.join(root, 'fake-opencode.cjs');
+  writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+  const unrelatedScript = path.join(root, 'unrelated-helper.cjs');
+  writeFileSync(unrelatedScript, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+  const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+  const child = spawn(process.execPath, [script], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  const unrelated = spawn(process.execPath, [unrelatedScript], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await Promise.all([once(child.stdout, 'data'), once(unrelated.stdout, 'data')]);
+    const query = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference = 'Stop'; (Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().ToString('o')`],
+    { env, cwd: root, encoding: 'utf8', timeout: 10000 });
+    assert.equal(query.status, 0, query.stderr);
+    assert.ok(Number.isFinite(Date.parse(query.stdout.trim())));
+    const report = {};
+    const exited = once(child, 'exit');
+    teardownOwnedProcesses(root, report, env);
+    await exited;
+    const stopped = JSON.parse(report.teardown.stdout);
+    assert.ok(stopped.some(entry => entry.pid === child.pid));
+    assert.ok(stopped.every(entry => entry.pid !== process.pid && entry.pid !== unrelated.pid));
+    assert.equal(process.kill(process.pid, 0), true, 'parent Node remains alive');
+    assert.equal(process.kill(unrelated.pid, 0), true, 'Node running another script remains alive');
+  } finally {
+    for (const processHandle of [child, unrelated]) {
+      if (processHandle.exitCode === null && processHandle.signalCode === null) {
+        const exited = once(processHandle, 'exit');
+        processHandle.kill();
+        await exited;
+      }
+    }
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  }
 });

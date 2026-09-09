@@ -24,20 +24,17 @@ permissions:
 
 jobs:
   windows-packaged-backfill:
-    name: Windows packaged backfill (${{ matrix.revision }})
+    name: Windows packaged backfill (candidate)
     runs-on: windows-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        revision: [baseline, candidate]
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: harness
       - uses: actions/checkout@v6
         with:
-          ref: ${{ matrix.revision == 'baseline' && 'c4f757c5e0328d8a10d1d9426a6778025071193b' || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: runtime
       - uses: oven-sh/setup-bun@v2
         with:
@@ -56,21 +53,21 @@ jobs:
         working-directory: runtime
         run: bun run compile
       - name: Run packaged backfill and provider JSON smoke
-        # Baseline failure is an observation; candidate failure is a required gate.
-        continue-on-error: ${{ matrix.revision == 'baseline' }}
         timeout-minutes: 12
         shell: pwsh
         run: |
           $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git -C runtime rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = git -C harness rev-parse HEAD
+          if ($env:BACKFILL_RUNTIME_SOURCE_COMMIT -ne $env:BACKFILL_RUNTIME_HARNESS_COMMIT) { throw 'Harness/runtime commit mismatch' }
           $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
-          node harness/scripts/smoke/windows-runtime-opencode-provider-json.mjs runtime/dist/cli.exe backfill-${{ matrix.revision }}.json
+          node harness/scripts/smoke/windows-runtime-opencode-provider-json.mjs runtime/dist/cli.exe backfill-candidate.json
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
       - name: Upload executable regression evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-packaged-backfill-${{ matrix.revision }}
-          path: backfill-${{ matrix.revision }}.json
+          name: windows-packaged-backfill-candidate
+          path: backfill-candidate.json
           if-no-files-found: warn
 
   cursor-managed-plugin:

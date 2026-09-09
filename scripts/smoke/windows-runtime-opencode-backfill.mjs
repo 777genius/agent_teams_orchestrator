@@ -18,6 +18,13 @@ const laneId = 'secondary:opencode:bob';
 const sessionId = 'session-bob';
 const content = 'Fixture only: spaces, "quotes", C:\\fake\\path, Привет 世界\n';
 
+export function trustedSearchPath(platform = process.platform, nodePath = process.execPath, systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows') {
+  const paths = platform === 'win32' ? path.win32 : path;
+  return [paths.dirname(nodePath), ...(platform === 'win32'
+    ? [paths.join(systemRoot, 'System32'), paths.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0')]
+    : ['/usr/bin', '/bin'])].join(platform === 'win32' ? ';' : ':');
+}
+
 export function sandboxEnvironment(root, fakeBinary) {
   // Allowlist platform plumbing. Do not inherit credentials, runtime selection,
   // shell startup hooks, provider config paths, or actual project/home pointers.
@@ -26,9 +33,7 @@ export function sandboxEnvironment(root, fakeBinary) {
     if (/^(systemroot|windir|comspec|pathext|systemdrive)$/i.test(key)) env[key] = value;
   }
   // The fake provider uses this Node; Windows process inspection needs system tools.
-  env.PATH = [path.dirname(process.execPath), ...(process.platform === 'win32'
-    ? [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32')]
-    : ['/usr/bin', '/bin'])].join(path.delimiter);
+  env.PATH = trustedSearchPath();
   const dirs = {
     HOME: 'home', USERPROFILE: 'home', APPDATA: 'AppData/Roaming', LOCALAPPDATA: 'AppData/Local',
     TMP: 'temp', TEMP: 'temp', TMPDIR: 'temp',
@@ -160,18 +165,90 @@ export function appExeFallback(binary, args, env) {
     args: ['/d', '/s', '/v:off', '/c', rawCommand], windowsVerbatimArguments: true };
 }
 
-export function runBackfillSmoke(binaryInput, evidenceInput) {
+// Only stop executables copied into this unique sandbox, or Node running an
+// exact fixture script within it. Never kill by PID alone or by image name.
+export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
+  const literal = value => "'" + value.replaceAll("'", "''") + "'";
+  const command = `
+$ErrorActionPreference = 'Stop'
+$rootPath = ${literal(path.resolve(root) + path.sep)}
+$nodePath = ${literal(process.execPath)}
+$scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse | ForEach-Object { $_.FullName })
+function Is-Owned($entry) {
+  if ($entry.ExecutablePath -and $entry.ExecutablePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  if ($entry.ExecutablePath -ieq $nodePath) {
+    foreach ($scriptPath in $scripts) {
+      $pattern = '^"?' + '(?:' + [regex]::Escape($nodePath) + '|node(?:\\.exe)?)' + '"?\\s+"?' + [regex]::Escape($scriptPath) + '"?(?:\\s|$)'
+      if ($entry.CommandLine -match $pattern) { return $true }
+    }
+  }
+  return $false
+}
+$stopped = @()
+foreach ($entry in @(Get-CimInstance Win32_Process)) {
+  if (-not (Is-Owned $entry)) { continue }
+  $target = Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
+  if (-not $target) { continue }
+  # Hold the process handle before the second identity check, avoiding PID reuse.
+  $heldHandle = $target.Handle
+  $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.ProcessId)
+  if (-not $current) { continue }
+  if ($current.CreationDate -ne $entry.CreationDate -or -not (Is-Owned $current)) { throw 'Owned process identity changed during cleanup' }
+  $stopped += @{ pid = $entry.ProcessId; executable = $entry.ExecutablePath; commandLine = $entry.CommandLine; startedAt = $entry.CreationDate.ToUniversalTime().ToString('o') }
+  $target.Kill()
+  if (-not $target.WaitForExit(5000)) { throw 'Owned process did not exit during cleanup' }
+}
+ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
+`;
+  const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
+  const result = spawnSync('powershell.exe', argv, { env, cwd: root, encoding: 'utf8',
+    timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
+  report.teardown = { executable: 'powershell.exe', argv, pid: result.pid, status: result.status,
+    stdout: result.stdout, stderr: result.stderr, error: result.error?.message };
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, `Owned-process teardown failed: ${result.stderr}`);
+}
+
+export function finishSmokeCleanup(report, root, { teardown = teardownOwnedProcesses, remove = rmSync } = {}) {
+  report.passed = false;
+  try { teardown(root, report); }
+  catch (error) { report.cleanupError = error.stack || String(error); }
+  try { remove(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 }); }
+  catch (error) {
+    report.cleanupError = [report.cleanupError, error.stack || String(error)].filter(Boolean).join('\n');
+    report.remainingRoot = root;
+  }
+  report.passed = !report.cleanupError && !report.error && report.cases.length > 0 && report.cases.every(item => item.passed);
+}
+
+export function runSmokeGroups(report, groups, flush) {
+  report.passed = false;
+  report.groups = {};
+  flush();
+  for (const [name, run] of Object.entries(groups)) {
+    const group = report.groups[name] = { passed: false, cases: [] };
+    flush();
+    try { run(group, flush); }
+    catch (error) { group.passed = false; group.error = error.stack || String(error); }
+    flush();
+  }
+  report.passed = Object.values(report.groups).length > 0 && Object.values(report.groups).every(group => group.passed);
+  flush();
+  return report;
+}
+
+export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedReport, flush: suppliedFlush } = {}) {
   assert.equal(process.platform, 'win32', 'Packaged Windows coverage requires actual Windows execution');
   const runtimeBinary = path.resolve(binaryInput);
   assert.equal(path.extname(runtimeBinary).toLowerCase(), '.exe');
   const evidencePath = path.resolve(evidenceInput || 'backfill-runtime-evidence.json');
   mkdirSync(path.dirname(evidencePath), { recursive: true });
   // Failures are evidence too. All shapes run even when an earlier shape fails.
-  const report = { schemaVersion: 1, parentPid: process.pid, platform: process.platform, arch: process.arch,
+  const report = Object.assign(suppliedReport || {}, { schemaVersion: 1, parentPid: process.pid, platform: process.platform, arch: process.arch,
     nodeVersion: process.version, sourceCommit: process.env.BACKFILL_RUNTIME_SOURCE_COMMIT,
     buildBunVersion: process.env.BACKFILL_RUNTIME_BUN_VERSION, runtimeBinary, executableSha256: sha256(readFileSync(runtimeBinary)),
-    cases: [], passed: false };
-  const flush = () => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n');
+    cases: [], passed: false });
+  const flush = suppliedFlush || (() => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n'));
   flush();
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-'));
   try {
@@ -261,16 +338,14 @@ export function runBackfillSmoke(binaryInput, evidenceInput) {
         flush();
       }
     }
-    report.passed = report.cases.every(item => item.passed);
   } finally {
-    try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 }); }
-    catch (error) { report.cleanupError = error.message; }
+    finishSmokeCleanup(report, root);
     flush();
   }
-  assert.equal(report.passed, true, `Packaged Windows backfill failed; exact argv/stderr and fixture evidence: ${evidencePath}`);
   return report;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  runBackfillSmoke(process.argv[2] || path.join('dist', 'cli.exe'), process.argv[3]);
+  const report = runBackfillSmoke(process.argv[2] || path.join('dist', 'cli.exe'), process.argv[3]);
+  assert.equal(report.passed, true, 'Packaged Windows backfill failed; see evidence JSON');
 }
