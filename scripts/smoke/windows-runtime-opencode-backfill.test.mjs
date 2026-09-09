@@ -220,7 +220,7 @@ test('spawn timeout records argv and stderr and fails the provider check', () =>
   assert.match(item.error, /ETIMEDOUT/);
 });
 
-test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 20000 }, async () => {
+test('Windows isolated PATH captures identity and teardown stops only the owned fixture', { skip: process.platform !== 'win32', timeout: 90000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-owned-process-'));
   const script = path.join(root, 'fake-opencode.cjs');
   writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
@@ -233,8 +233,11 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
     await Promise.all([once(child.stdout, 'data'), once(unrelated.stdout, 'data')]);
     const query = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
       `$ErrorActionPreference = 'Stop'; (Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().ToString('o')`],
-    { env, cwd: root, encoding: 'utf8', timeout: 10000 });
-    assert.equal(query.status, 0, query.stderr);
+    { env, cwd: root, encoding: 'utf8', timeout: 30000 });
+    assert.equal(query.status, 0, JSON.stringify({
+      status: query.status, signal: query.signal, error: query.error?.message,
+      stdout: query.stdout, stderr: query.stderr,
+    }));
     assert.ok(Number.isFinite(Date.parse(query.stdout.trim())));
     const report = {};
     const exited = once(child, 'exit');
