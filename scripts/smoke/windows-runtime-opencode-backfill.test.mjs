@@ -272,12 +272,16 @@ function diagnoseWindowsStartup(evidence, flush, env, root, pid) {
     'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const startup = "[Console]::Out.WriteLine('powershell-started')";
   const identity = `${startup}; $ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
+  const directIdentity = `${startup}; $ErrorActionPreference = 'Stop'; [System.Diagnostics.Process]::GetProcessById(${pid}).StartTime.ToUniversalTime().ToString('o')`;
+  const moduleIdentity = `${startup}; $ErrorActionPreference = 'Stop'; Import-Module Microsoft.PowerShell.Management; [Console]::Out.WriteLine('management-loaded'); (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`;
   // Each probe changes one factor from the absolute-startup control. The piped
   // input reproduces the original harness mode; it can never make the test pass.
   for (const [label, executable, command, stdin] of [
     ['bare-startup-ignore-stdin', 'powershell.exe', startup, 'ignore'],
     ['absolute-startup-ignore-stdin', absolute, startup, 'ignore'],
     ['absolute-identity-ignore-stdin', absolute, identity, 'ignore'],
+    ['absolute-dotnet-identity', absolute, directIdentity, 'ignore'],
+    ['absolute-module-identity', absolute, moduleIdentity, 'ignore'],
     ['absolute-startup-pipe-stdin', absolute, startup, 'pipe'],
   ]) recordWindowsProbe(evidence, flush, label, executable,
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
