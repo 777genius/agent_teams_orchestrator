@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
+import { readProcessStartTimeMs } from '../../utils/processKill.js'
+
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
@@ -1113,7 +1115,9 @@ export class OpenCodeSessionBridge {
         const info = asRecord(message.info)
         return info?.role === 'assistant' && info.parentID === owner.messageId
           && info.providerID === model.providerID && info.modelID === model.modelID
-          && (Number.isFinite(asRecord(info.time)?.completed) || !!asRecord(info.error))
+          && (Object.keys(asRecord(info.error) ?? {}).length > 0 || (info.finish !== 'tool-calls' && info.finish !== 'unknown'
+            && !message.parts?.some(part => part.type === 'tool')
+            && Number.isFinite(asRecord(info.time)?.completed)))
       })
       return userPresent && (completed || cancelledByOwnedStop)
     }
@@ -2198,11 +2202,22 @@ export class OpenCodeSessionBridge {
     options: {
       limit?: number
       sessionId?: string | null
+      signal?: AbortSignal
     } = {},
   ): Promise<{
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
+    if (record.profileScope?.purpose === 'launch_runtime' && record.profileScope.providerId === 'xai') {
+      // Observation must remain available while an admitted native turn owns
+      // the publication fence. Preparing a profile here both gates the read on
+      // settlement and may reconcile auth.json while that writer is still busy.
+      return this.withOwnedOAuthSessionObservation(record, async ({ baseUrl, runtimePid }, assertOwner) =>
+        this.reconcileSessionAtEndpoint(record, record, options, {
+          baseUrl, runtimePid, resolvedConfigFingerprint: record.resolvedBehaviorFingerprint,
+          profileAuthState: null, preflightDiagnostics: [], assertOwner,
+        }), options.signal)
+    }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
     const profile = sessionProfile.profile
     const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
@@ -2236,7 +2251,63 @@ export class OpenCodeSessionBridge {
         })
       }
 
-      const client = this.clientFactory.create(baseUrl)
+      return this.reconcileSessionAtEndpoint(record, activeRecord, options, {
+        baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState: profile.authState, preflightDiagnostics,
+      })
+    }, profile)
+  }
+
+  async withOwnedOAuthSessionObservation<T>(
+    record: OpenCodeSessionRecord,
+    operation: (endpoint: { baseUrl: string; runtimePid: number }, assertOwner: () => Promise<void>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    signal?.throwIfAborted()
+    const captured = structuredClone(record)
+    await this.assertOwnedOAuthSessionAuthority(captured)
+    const resolveEndpoint = async (birth?: number) => {
+      if (!this.hostManager.resolveOwnedSessionEndpoint) throw new Error('OpenCode observation requires persistent ownership')
+      return this.hostManager.resolveOwnedSessionEndpoint(captured.hostKey, {
+        teamId: captured.teamId, laneId: captured.laneId, memberName: captured.memberName,
+        runId: captured.runId, sessionId: captured.opencodeSessionId, projectPath: captured.projectPath,
+        expectedProcessStartedAtMs: birth,
+      }, signal)
+    }
+    const endpoint = await resolveEndpoint()
+    if (endpoint.pid !== captured.runtimePid) throw new Error('OpenCode observation process changed')
+    const birth = await readProcessStartTimeMs(endpoint.pid)
+    if (!birth) throw new Error('OpenCode observation requires exact process birth')
+    const assertOwner = async () => {
+      signal?.throwIfAborted()
+      await this.assertOwnedOAuthSessionAuthority(captured)
+      if (!isDeepStrictEqual(record, captured) || !isDeepStrictEqual(await resolveEndpoint(birth), endpoint)) {
+        throw new Error('OpenCode observation ownership changed')
+      }
+    }
+    await assertOwner()
+    const value = await operation({ baseUrl: endpoint.baseUrl, runtimePid: endpoint.pid }, assertOwner)
+    await assertOwner()
+    return value
+  }
+
+  private async reconcileSessionAtEndpoint(
+    record: OpenCodeSessionRecord,
+    activeRecord: OpenCodeSessionRecord,
+    options: { limit?: number; sessionId?: string | null; signal?: AbortSignal },
+    context: {
+      baseUrl: string
+      resolvedConfigFingerprint: string | null
+      runtimePid: number | null
+      profileAuthState: OpenCodeAuthState | null
+      preflightDiagnostics: string[]
+      assertOwner?: () => Promise<void>
+    },
+  ): Promise<{ record: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }> {
+    const { baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState, preflightDiagnostics, assertOwner } = context
+    if (assertOwner && options.sessionId?.trim() && options.sessionId.trim() !== record.opencodeSessionId) {
+      throw new Error('OpenCode observation requires the exact owned session')
+    }
+      const client = this.clientFactory.create(baseUrl, options.signal ? { signal: options.signal } : undefined)
       let permissionDiagnostic: string | null = null
       const [statusMap, pendingPermissions] = await Promise.all([
         client.getSessionStatus(),
@@ -2264,7 +2335,7 @@ export class OpenCodeSessionBridge {
         rawStatus,
         messages,
       })
-      summary.profileAuthState = profile.authState
+      summary.profileAuthState = profileAuthState
       const normalizedPendingPermissions = normalizeOpenCodePermissions(pendingPermissions)
         .filter(permission => permission.sessionId === targetSessionId)
       const pendingPermissionRequestIds = normalizedPendingPermissions
@@ -2287,6 +2358,7 @@ export class OpenCodeSessionBridge {
         summary.diagnostics.push(...preflightDiagnostics)
       }
 
+      await assertOwner?.()
       const nextRecord = this.buildUpdatedRecord(activeRecord, {
         lastCanonicalCursor: summary.lastCanonicalCursor,
         lastKnownRawStatus: summary.rawStatus,
@@ -2314,7 +2386,6 @@ export class OpenCodeSessionBridge {
         record: runtimePid ? { ...reconciledRecord, runtimePid } : reconciledRecord,
         summary,
       }
-    }, profile)
   }
 
   async observePreview(
