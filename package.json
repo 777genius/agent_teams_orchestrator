@@ -1,6 +1,6 @@
 {
   "name": "claude-multimodel",
-  "version": "0.0.93",
+  "version": "0.0.94",
   "private": true,
   "description": "Reconstructed Bun CLI workspace for the Claude Code source snapshot.",
   "type": "module",
