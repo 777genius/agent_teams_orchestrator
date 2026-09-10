@@ -1,10 +1,15 @@
+import * as processIdentity from '../../utils/processKill.js'
+import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { buildOpenCodeExecutionProof, validateOpenCodeExecutionProof } from './OpenCodeExecutionProof.js'
+import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import { openCodeOAuthSuccessorPath, readOpenCodeAuthCredential, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
-import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { assertOpenCodePreparedProfileScope, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
-import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
+import { OpenCodeProfileManager, assertOpenCodePreparedProfileScope, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import { refreshSelectedProfileAuthority, type OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
 import type { OpenCodeHostHandle } from './types.js'
 
@@ -295,4 +300,259 @@ describe('selected launch authority contract', () => {
       expect(JSON.stringify(f.diagnostics)).not.toContain('secret')
     }
   })
+})
+
+const selectedModel = 'xai/grok-4.3'
+const c0 = { type: 'oauth', access: 'synthetic-access-0', refresh: 'synthetic-single-use-0', expires: 1000, accountId: 'TEST' }
+const c1 = { ...c0, access: 'synthetic-access-1', refresh: 'synthetic-single-use-1', expires: 900000 }
+const readBirth = processIdentity.readProcessStartTimeMs
+
+describe('selected readiness owned OAuth rotation', () => {
+  let root: string, project: string, env: NodeJS.ProcessEnv, saved: NodeJS.ProcessEnv
+  let host: OpenCodeHostHandle, live: Record<string, unknown>, expected: string
+  let manager: OpenCodeProfileManager, global: string, successorPath: string
+  let birthMock: { mockRestore(): void } | undefined
+  let submitted: string | undefined
+  let diagnostics: OpenCodeAuthorityRejection[]
+  let afterNative: (() => Promise<void>) | undefined
+  let nativeCredential: unknown
+  let probe: OpenCodeExecutionProbe
+  let evidenceHook: (() => Promise<void>) | undefined
+
+  beforeEach(async () => {
+    root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'readiness-oauth-TEST-')))
+    project = path.join(root, 'project')
+    await mkdir(project)
+    env = { HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
+      XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
+      XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'state'),
+      APPDATA: path.join(root, 'roaming'), LOCALAPPDATA: path.join(root, 'local'),
+      TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'),
+      CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache'),
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:1/mcp' }
+    await mkdir(env.TMPDIR!)
+    saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]))
+    Object.assign(process.env, env)
+    manager = new OpenCodeProfileManager()
+    global = manager.getGlobalAuthPath()
+    successorPath = openCodeOAuthSuccessorPath(global)
+    await upsertOpenCodeAuthCredential({ authPath: global, providerId: 'xai', credential: c0 })
+    const scope = await resolveOpenCodeProfileScope({ projectPath: project, selectedModel, purpose: 'launch_runtime', env })
+    const profile = await manager.prepareProfile(project, { profileScope: scope })
+    const birth = await readBirth(process.pid)
+    expect(birth).toBeGreaterThan(0)
+    birthMock = spyOn(processIdentity, 'readProcessStartTimeMs').mockImplementation(
+      (pid, platform) => pid === process.pid && (platform === undefined || platform === process.platform)
+        ? Promise.resolve(birth) : readBirth(pid, platform))
+    host = { profile, hostKey: `TEST-${scope.scopeToken}`, baseUrl: 'http://127.0.0.1:1',
+      profileRootKey: profile.profileRootKey, projectPath: project, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      version: '1.18.4', pid: process.pid, processStartedAtMs: birth, port: 1, state: 'healthy',
+      resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [] }
+    live = JSON.parse(JSON.stringify(profile.managedConfig)
+      .replace(/\{env:([^}]+)\}/g, (_match, name: string) => profile.env[name] || ''))
+    expected = (await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
+      effectiveConfigFingerprint: profile.managedConfigFingerprint })).expectedBehaviorFingerprint
+    submitted = undefined
+    afterNative = undefined
+    evidenceHook = undefined
+    nativeCredential = c1
+    diagnostics = []
+    probe = new OpenCodeExecutionProbe({ clientFactory: { create: () => ({
+      createSession: async () => ({ id: 'TEST-probe' }), getSession: async () => ({ id: 'TEST-probe' }),
+      getSessionStatus: async () => ({ 'TEST-probe': 'idle' }), getPermissions: async () => [],
+      getSessionMessages: async () => submitted ? [
+        { info: { id: submitted, role: 'user', sessionID: 'TEST-probe' }, parts: [] },
+        { info: { id: 'TEST-assistant', parentID: submitted, role: 'assistant', providerID: 'xai',
+          modelID: 'grok-4.3', sessionID: 'TEST-probe', time: { created: 101, completed: 110 } },
+          parts: [{ type: 'text', text: 'PONG' }] }] : [],
+      promptSessionAsync: async (_id: string, body: { messageID: string }) => {
+        submitted = body.messageID
+        expect(await readOpenCodeAuthCredential({ authPath: host.profile.managedAuthPath, providerId: 'xai' })).toEqual(c0)
+        await writeFile(host.profile.managedAuthPath, JSON.stringify({ xai: nativeCredential }))
+        await afterNative?.()
+      },
+      abortSession: async () => true, deleteSession: async () => true,
+    }) as never } })
+  })
+  afterEach(async () => {
+    birthMock?.mockRestore()
+    for (const [key, value] of Object.entries(saved ?? {})) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(root, { recursive: true, force: true })
+  })
+  const refresh = (allowOwnedOAuthRotation = false, phaseContext?: import('./OpenCodeRuntimeDeadline.js').OpenCodePhaseContext) => refreshSelectedProfileAuthority({
+    host, selectedModel, expectedBehaviorFingerprint: expected, allowOwnedOAuthRotation, phaseContext,
+    onRejection: value => diagnostics.push(value),
+  }, {
+    clientFactory: { create: () => ({ getConfig: async () => live,
+      listAgents: async () => effectiveAgentsFixture(host.profile.managedConfig, host.profile.env.XDG_DATA_HOME!),
+    }) as never },
+    mcpManager: { ensureAppMcp: async () => ({ summary: { matchedServerName: 'agent-teams', connected: true } }) as never },
+    buildEvidence: async input => {
+      const evidence = await buildOpenCodeExpectedBehaviorEvidence(input)
+      await evidenceHook?.()
+      return evidence
+    },
+  })
+  const execute = () => probe.probeModelOnHost({ host, selectedModel, cleanupSuccessfulSession: true })
+
+  test('C0 precheck, real owned native C1 commit, postcheck accepts only the completed rotation', async () => {
+    const original = structuredClone(host)
+    expect(await refresh()).not.toBeNull()
+    expect((await execute()).outcome).toBe('available')
+    const committed = JSON.parse(await readFile(successorPath, 'utf8'))
+    expect(committed.predecessor).toEqual(c0)
+    expect(committed.successor).toEqual(c1)
+    expect(committed.completion.nativeProbe.messageId).toBe(submitted)
+    const current = await resolveOpenCodeProfileScope({ projectPath: project, selectedModel, purpose: 'launch_runtime', env, cacheSnapshot: false })
+    expect(current.scopeToken).not.toBe(original.profile.scopeToken)
+    expect(current.configFingerprint).toBe(original.profile.profileScope!.configFingerprint)
+    expect(current.selectedAuthIdentity).not.toBe(original.profile.profileScope!.selectedAuthIdentity)
+    expect(await refresh()).toBeNull()
+    expect(diagnostics.at(-1)).toEqual({ check: 'scope_token_match' })
+    diagnostics = []
+    const refreshed = await refresh(true)
+    expect({ refreshed, diagnostics }).toMatchObject({ diagnostics: [] })
+    expect(refreshed).not.toBeNull()
+    expect(host).toEqual(original)
+    const snapshot = { detected: true, hostHealthy: true, projectPath: project, profile: refreshed,
+      host, config: null, configProviders: null, providers: null, providerAuth: null,
+      agents: [], mcp: null, appMcp: null, probeError: null, diagnostics: [] }
+    const proof = await buildOpenCodeExecutionProof({ selectedModel, snapshot, capabilitySnapshotId: null }, {
+      resolveBinaryPath: () => path.join(root, 'synthetic-opencode'), resolveBinaryIdentity: async () => 'TEST-binary',
+    })
+    expect(proof.credentialMode).toBe('oauth')
+    expect(proof.reusable).toBe(false)
+    expect(proof.expectedBehaviorEvidence.expectedBehaviorFingerprint).not.toBe(expected)
+    expect(proof.expectedBehaviorEvidence).toEqual(await buildOpenCodeExpectedBehaviorEvidence({
+      profile: host.profile, fullModelId: selectedModel, effectiveConfigFingerprint: host.profile.managedConfigFingerprint,
+      readCredential: async () => c1,
+    }))
+    expect(await validateOpenCodeExecutionProof({ proof, selectedModel, projectPath: project,
+      snapshot, capabilitySnapshotId: null })).toEqual({ valid: false, reason: 'execution proof is not reusable for oauth credentials' })
+    // Continuity authorizes evidence only, never a second submission from C0.
+    await expect(execute()).rejects.toThrow()
+    const fresh = await manager.prepareProfile(project, { profileScope: await resolveOpenCodeProfileScope({
+      projectPath: project, selectedModel, purpose: 'launch_runtime', env,
+    }) })
+    expect(fresh.scopeToken).not.toBe(original.profile.scopeToken)
+    expect(await readOpenCodeAuthCredential({ authPath: fresh.managedAuthPath, providerId: 'xai' })).toEqual(c1)
+  })
+
+  test('no rotation follows the unchanged authority path', async () => {
+    nativeCredential = c0
+    expect(await refresh()).not.toBeNull()
+    expect((await execute()).outcome).toBe('available')
+    expect(await refresh(true)).not.toBeNull()
+    expect(await readFile(successorPath, 'utf8').catch(() => null)).toBeNull()
+  })
+
+  test.each([
+    ['owner', null], ['owner.scopeToken', 'f'.repeat(64)], ['owner.projectPath', '/foreign-project'],
+    ['owner.purpose', 'execution_probe'], ['completion', null], ['completion.nativeProbe', null],
+    ['completion.managedAuthPath', '/foreign-managed'],
+    ['completion.nativeProbe.hostKey', 'foreign-host'], ['completion.nativeProbe.baseUrl', 'http://127.0.0.1:2'],
+    ['completion.nativeProbe.pid', 1], ['completion.nativeProbe.processStartedAtMs', 1],
+    ['completion.nativeProbe.profileRootKey', 'foreign-root'], ['completion.nativeProbe.scopeToken', 'f'.repeat(64)],
+    ['completion.nativeProbe.projectPath', '/foreign-project'], ['completion.nativeProbe.selectedModel', 'xai/foreign-model'],
+    ['completion.nativeProbe.messageId', ''], ['completion.nativeProbe.sessionId', ''],
+    ['predecessor.access', 'unrelated-same-account'], ['successor.access', 'unrelated-same-account'],
+    ['sourceAuthPaths', []],
+  ])('rejects foreign/missing committed provenance: %s', async (field, value) => {
+    expect((await execute()).outcome).toBe('available')
+    const authority = JSON.parse(await readFile(successorPath, 'utf8'))
+    const fields = field.split('.')
+    let parent = authority
+    for (const name of fields.slice(0, -1)) parent = parent[name]
+    parent[fields.at(-1)!] = value
+    await writeFile(successorPath, JSON.stringify(authority))
+    expect(await refresh(true)).toBeNull()
+  })
+
+  test.each(['missing publication', 'pending admission', 'partial publication', 'retired publication'])('rejects %s', async kind => {
+    await execute()
+    const committed = await readFile(successorPath, 'utf8')
+    if (kind === 'missing publication') await rm(successorPath)
+    else {
+      const receipt = JSON.parse(committed)
+      receipt.successor = kind === 'pending admission' ? null : c1
+      if (kind === 'retired publication') receipt.publicationRevoked = true
+      await writeFile(`${global}.agent-teams-xai-oauth-save.json`, JSON.stringify(receipt))
+    }
+    const before = await readFile(successorPath, 'utf8').catch(() => null)
+    expect(await refresh(true)).toBeNull()
+    expect(await readFile(successorPath, 'utf8').catch(() => null)).toBe(before)
+  })
+
+  test.each([
+    ['same-account unrelated OAuth', { ...c1, access: 'foreign-access', refresh: 'foreign-refresh' }],
+    ['account change', { ...c1, accountId: 'foreign' }], ['API replacement', { type: 'api', key: 'synthetic-foreign' }],
+    ['logout', null],
+  ])('rejects saved and native %s after a legitimate commit', async (_name, replacement) => {
+    await execute()
+    const committed = await readFile(successorPath, 'utf8')
+    await writeFile(host.profile.managedAuthPath, JSON.stringify({ xai: replacement }))
+    expect(await refresh(true)).toBeNull()
+    await writeFile(host.profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+    await writeFile(global, JSON.stringify({ xai: replacement }))
+    expect(await refresh(true)).toBeNull()
+    expect(await readFile(successorPath, 'utf8')).toBe(committed)
+  })
+
+  test.each(['project config', 'project behavior', 'MCP', 'live config', 'host owner', 'project identity'])('rejects non-auth %s drift', async kind => {
+    await execute()
+    if (kind === 'project config') await writeFile(path.join(project, 'opencode.json'), JSON.stringify({ command: { foreign: { template: 'foreign' } } }))
+    if (kind === 'project behavior') await writeFile(path.join(project, 'AGENTS.md'), 'Synthetic changed project instructions')
+    if (kind === 'MCP') live.mcp = { 'agent-teams': { type: 'remote', url: 'http://127.0.0.1:2/mcp' } }
+    if (kind === 'live config') live.default_agent = 'foreign'
+    if (kind === 'host owner') host.hostKey = 'foreign'
+    if (kind === 'project identity') host.projectPath = path.join(root, 'other-project')
+    expect(await refresh(true)).toBeNull()
+  })
+
+  test.each(['saved auth', 'native auth', 'publication', 'host'])('rejects %s changes during final behavior evidence', async kind => {
+    await execute()
+    evidenceHook = async () => {
+      if (kind === 'saved auth') await writeFile(global, JSON.stringify({ xai: { ...c0, access: 'foreign' } }))
+      if (kind === 'native auth') await writeFile(host.profile.managedAuthPath, JSON.stringify({ xai: { ...c1, access: 'foreign' } }))
+      if (kind === 'publication') await rm(successorPath)
+      if (kind === 'host') host.pid += 1
+    }
+    expect(await refresh(true)).toBeNull()
+  })
+
+  test('rotation cannot replace a different initial behavior expectation', async () => {
+    await execute()
+    expected = 'f'.repeat(64)
+    expect(await refresh(true)).toBeNull()
+    expect(diagnostics.at(-1)).toEqual({ check: 'behavior_match' })
+  })
+
+  test('cancellation of the postcheck preserves committed saved authority and rejects', async () => {
+    await execute()
+    const committed = await readFile(successorPath, 'utf8')
+    const controller = new AbortController()
+    evidenceHook = async () => { controller.abort(new Error('synthetic cancellation')) }
+    expect(await refresh(true, { phase: 'post_probe_refresh', signal: controller.signal,
+      remainingMs: () => 10000, throwIfExpired: () => { if (controller.signal.aborted) throw controller.signal.reason },
+    })).toBeNull()
+    expect(await readFile(successorPath, 'utf8')).toBe(committed)
+  })
+
+  test.each([null, { ...c1, refresh: '' }, { ...c1, accountId: 'foreign' }])('failed/invalid native refresh cannot establish continuity %#', async credential => {
+    nativeCredential = credential
+    await expect(execute()).rejects.toThrow()
+    expect(await refresh(true)).toBeNull()
+    expect(await readFile(successorPath, 'utf8').catch(() => null)).toBeNull()
+  })
+
+  test('foreign saved authority during native work prevents commit and postcheck acceptance', async () => {
+    afterNative = () => writeFile(global, JSON.stringify({ xai: { ...c0, access: 'independent-login' } }))
+    await expect(execute()).rejects.toThrow()
+    expect(await refresh(true)).toBeNull()
+    expect(await readFile(successorPath, 'utf8').catch(() => null)).toBeNull()
+  })
+
 })

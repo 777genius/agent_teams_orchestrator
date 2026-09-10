@@ -43,6 +43,7 @@ import {
   materializeOpenCodeSelectedAuthCredential,
   mergeOpenCodeManagedAuthSources,
   readOpenCodeSavedAuthStore,
+  readOpenCodeCommittedOAuthProbeRotation,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
@@ -99,6 +100,7 @@ import {
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
 } from './OpenCodeCursorResourceExhaustedPatch.js'
 import type {
+  OpenCodeHostHandle,
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
@@ -2186,7 +2188,7 @@ export async function isOpenCodeOAuthPublicationScopeCurrent(
 
 async function resolveOpenCodeProfileScopeInternal(
   input: OpenCodeScopeResolutionInput,
-  // Private comparison-only substitution for a proven partial C0→C1 save. It
+  // Private comparison-only substitution for a proven C0→C1 save. It
   // never prepares a launch, caches a snapshot, or reads successor authority.
   recoveryPredecessor?: OpenCodeAuthCredential,
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
@@ -2709,6 +2711,36 @@ export class OpenCodeProfileManager {
 
   async getOAuthRefreshEnvironment(profile: OpenCodePreparedProfile): Promise<NodeJS.ProcessEnv> {
     return { ...(await this.scopedOAuthAuthority(profile)).snapshot.runtimeEnv }
+  }
+
+  async readCompletedReadinessOAuthRotation(
+    host: OpenCodeHostHandle,
+    selectedModel: string,
+    currentScope: OpenCodeProfileScope,
+  ) {
+    if (host.profile.profileScope?.purpose !== 'launch_runtime'
+      || host.profile.profileScope.providerId !== 'xai'
+      || !selectedModel.startsWith('xai/') || !host.processStartedAtMs
+      || host.profileRootKey !== host.profile.profileRootKey
+      || host.projectPath !== host.profile.canonicalProjectPath) return null
+    const authority = await this.scopedOAuthAuthority(host.profile)
+    const predecessor = authority.snapshot.selectedAuthCredential
+    if (!isValidOpenCodeOAuthCredential(predecessor)) return null
+    const rotation = await readOpenCodeCommittedOAuthProbeRotation({
+      ...authority, env: authority.snapshot.runtimeEnv, predecessor,
+      nativeProbe: { projectPath: authority.snapshot.projectPath, scopeToken: authority.scope.scopeToken,
+        profileRootKey: host.profileRootKey, hostKey: host.hostKey, baseUrl: host.baseUrl,
+        pid: host.pid, processStartedAtMs: host.processStartedAtMs, selectedModel },
+    })
+    if (!rotation) return null
+    const input = { projectPath: authority.snapshot.projectPath, selectedModel,
+      purpose: authority.scope.purpose, env: host.profile.env, cacheSnapshot: false }
+    // Unlike restart credential admission, readiness requires the exact full
+    // scope (including MCP port), substituting only proven credential bytes.
+    const before = await resolveOpenCodeProfileScopeInternal(input, rotation.predecessor)
+    const after = await resolveOpenCodeProfileScopeInternal(input, rotation.successor)
+    return isDeepStrictEqual(before, authority.scope) && isDeepStrictEqual(after, currentScope)
+      ? rotation : null
   }
 
   // This wraps controlled, settled native work; it never blesses a credential

@@ -2832,6 +2832,9 @@ async function runReadiness(
       const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
+        allowOwnedOAuthRotation: executionOutcome.outcome === 'available'
+          && executionOutcome.observedProviderId === qualifiedSelectedModel.providerId
+          && executionOutcome.observedModelId === qualifiedSelectedModel.modelId,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,

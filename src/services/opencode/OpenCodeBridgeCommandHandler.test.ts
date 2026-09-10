@@ -2616,6 +2616,29 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
+  test('owned OAuth continuity is requested only after successful matching execution', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    const execute = openCodeExecutionProbe.probeModelOnHost
+    for (const resultKind of ['available', 'unavailable', 'wrong_provider', 'wrong_model']) {
+      const continuity: boolean[] = []
+      openCodeProvisioningProbe.refreshSelectedProfileAuthority = async input => {
+        continuity.push(input.allowOwnedOAuthRotation === true)
+        return input.host.profile
+      }
+      openCodeExecutionProbe.probeModelOnHost = async input => {
+        const result = await execute(input)
+        if (resultKind === 'unavailable') result.outcome = 'unavailable'
+        if (resultKind === 'wrong_provider') result.observedProviderId = 'foreign'
+        if (resultKind === 'wrong_model') result.observedModelId = 'foreign'
+        return result
+      }
+      await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project', selectedModel: 'openrouter/minimax-m2.5-free', requireExecutionProbe: true,
+      }))
+      expect(continuity).toEqual([false, resultKind === 'available'])
+    }
+  })
+
   test('selected readiness bounds real authority auth reads before and after execution and ignores late results', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     const successfulExecution = openCodeExecutionProbe.probeModelOnHost

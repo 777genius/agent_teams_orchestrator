@@ -165,6 +165,40 @@ export async function readOpenCodeSavedAuthStore(input: {
   return merged
 }
 
+// Read-only evidence for the just-completed selected readiness probe. A pending
+// save, legacy publication or another host's successor cannot prove continuity.
+export async function readOpenCodeCommittedOAuthProbeRotation(input: {
+  globalAuthPath: string
+  sourceAuthPaths: readonly string[]
+  managedAuthPath: string
+  env: NodeJS.ProcessEnv
+  predecessor: OpenCodeAuthCredential
+  nativeProbe: Omit<OpenCodeOAuthNativeProbeOwner, 'sessionId' | 'messageId'>
+}): Promise<{ operationId: string; predecessor: OpenCodeAuthCredential; successor: OpenCodeAuthCredential } | null> {
+  const authority = await readSuccessorAuthority(input.globalAuthPath)
+  const native = authority?.completion?.nativeProbe
+  if (!authority || !native || !native.sessionId || !native.messageId
+    || authority.owner?.purpose !== 'launch_runtime'
+    || authority.owner.projectPath !== input.nativeProbe.projectPath
+    || authority.owner.scopeToken !== input.nativeProbe.scopeToken
+    || authority.completion?.managedAuthPath !== input.managedAuthPath
+    || authority.completion.nativeSession
+    || !isDeepStrictEqual(authority.predecessor, input.predecessor)
+    || isDeepStrictEqual(authority.predecessor, authority.successor)
+    || !isDeepStrictEqual(authority.sourceAuthPaths, input.sourceAuthPaths)
+    || !isDeepStrictEqual(native, { ...input.nativeProbe, sessionId: native.sessionId, messageId: native.messageId })
+    || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
+  const sources = await Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore))
+  if (!matchesSuccessorSources(authority, input.sourceAuthPaths, sources)) return null
+  const saved = await readOpenCodeSavedAuthStore({ ...input, sourceStores: sources,
+    admissionProjectPath: input.nativeProbe.projectPath })
+  if (!isDeepStrictEqual(saved.xai, authority.successor)
+    || !isDeepStrictEqual(await readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'xai' }), authority.successor)
+    || !isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), authority)
+    || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
+  return { operationId: authority.operationId, predecessor: authority.predecessor, successor: authority.successor }
+}
+
 function revokedOAuthAdmissionPath(globalAuthPath: string, predecessor: OpenCodeOAuthCredential): string {
   // The single-use refresh token remains fenced even if other fields change.
   // No peer enumeration: admission consults only its own predecessor's fence.
