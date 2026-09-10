@@ -58,6 +58,10 @@ import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './Op
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import {
+  PROCESS_ATTRIBUTION_SCHEMA_VERSION,
+  resolveProcessAttributionDirectory,
+} from './OpenCodeProcessAttributionStore.js'
+import {
   isOpenCodeRuntimeDeadlineError,
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
@@ -971,6 +975,12 @@ function createRuntimePreconditionSnapshot(
     ...(overrides.confirmedStopRuntime ?? overrides.deliveryRuntime ?? createRuntimeSnapshot(snapshot)),
     runtimeStoreManifestHighWatermark:
       overrides.runtimeStoreManifestHighWatermark ?? RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+    // A capable runtime is detected by this block, never by parsing a version
+    // string: an older runtime simply does not advertise one.
+    processAttribution: {
+      schemaVersion: PROCESS_ATTRIBUTION_SCHEMA_VERSION,
+      directory: resolveProcessAttributionDirectory(),
+    },
     activeRunId: null,
   }
 }

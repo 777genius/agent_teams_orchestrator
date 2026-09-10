@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 
 import { OpenCodeCursorNativeFailureProbe } from './OpenCodeCursorNativeFailureProbe.js'
+import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttributionStore.js'
 
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
 
@@ -93,7 +94,13 @@ describe('OpenCodeCursorNativeFailureProbe', () => {
       'auto',
     ])
     expect(spawnedOptions?.cwd).toBe('/sandbox/project')
-    expect(spawnedOptions?.env).toBe(env)
+    expect(spawnedOptions?.env).toMatchObject(env)
+    // The probe is the one cursor-agent the runtime spawns itself, so its tree
+    // records itself as a readiness probe and never as a team's agent.
+    expect(spawnedOptions?.env?.AGENT_TEAMS_PROCESS_ATTRIBUTION_KIND).toBe('readiness-probe')
+    expect(spawnedOptions?.env?.AGENT_TEAMS_PROCESS_ATTRIBUTION_ID).toMatch(/^[0-9a-f]{32}$/)
+    expect(spawnedOptions?.env?.AGENT_TEAMS_PROCESS_ATTRIBUTION_DIR)
+      .toBe(resolveProcessAttributionDirectory(env))
     expect(spawnedOptions?.windowsHide).toBe(true)
     expect(spawnedOptions?.stdio).toEqual(['pipe', 'pipe', 'pipe'])
     expect(prompt).toBe('Output only the single word PONG.')

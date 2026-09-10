@@ -98,10 +98,8 @@ import {
   canonicalizeOpenCodeProviderId,
   isLiteralLoopbackOpenCodeUrl,
 } from './OpenCodeProviderIdentity.js'
-import {
-  buildCursorAgentResourceExhaustedPreloadScript,
-  CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
-} from './OpenCodeCursorResourceExhaustedPatch.js'
+import { buildCursorAgentResourceExhaustedPreloadScript } from './OpenCodeCursorResourceExhaustedPatch.js'
+import { buildCursorAgentAttributionPreloadScript } from './OpenCodeProcessAttributionStore.js'
 import type {
   OpenCodeHostHandle,
   OpenCodeMcpServerConfig,
@@ -1348,6 +1346,87 @@ export function applyCursorManagedExecutionEnvironment(env: NodeJS.ProcessEnv): 
   })
 }
 
+/**
+ * Node parses NODE_OPTIONS itself and treats a backslash inside a quoted value
+ * as an escape, so a quoted Windows path arrives with its separators removed and
+ * the preload cannot be resolved. Quotes still have to stay for paths with
+ * spaces, so the separators become the form Windows node also accepts.
+ */
+export function buildCursorAgentPreloadRequireOption(
+  preloadPath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const requirePath = platform === 'win32' ? preloadPath.replaceAll('\\', '/') : preloadPath
+  return `--require="${requirePath}"`
+}
+
+/**
+ * Operator kill switch for the preload as a whole. It is deliberately separate
+ * from AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED, which turns off the
+ * classification patch inside a preload that still runs: this one stops the shim
+ * from injecting anything, which is the only escape hatch left once the
+ * injection is no longer gated on the classification flag.
+ */
+export const CURSOR_PRELOAD_DISABLED_ENV = 'AGENT_TEAMS_CURSOR_PRELOAD_DISABLED'
+
+const CURSOR_PRELOAD_FILE_NAME = 'cursor-agent-preload.cjs'
+/** The cmd variable the Windows shim resolves the preload into. */
+const WINDOWS_CURSOR_PRELOAD_VARIABLE = 'AGENT_TEAMS_CURSOR_PRELOAD'
+
+/**
+ * One preload file, two responsibilities. A second --require would make the
+ * NODE_OPTIONS restore order load-bearing, and the attribution block has to run
+ * first because the classification block owns that restore. The strict-mode
+ * directive is emitted once here: only the first statement of a file is a
+ * directive, so a second copy further down would be a plain string expression.
+ */
+export function buildCursorAgentPreloadScript(): string {
+  return [
+    "'use strict'",
+    buildCursorAgentAttributionPreloadScript(),
+    buildCursorAgentResourceExhaustedPreloadScript(),
+  ].join('\n')
+}
+
+/**
+ * The Windows shim resolves the preload from its own directory rather than from
+ * a path written into the file. cmd.exe renders the file through the console OEM
+ * code page, so a profile path with non-ASCII characters arrives mojibake'd and
+ * would never resolve; %~dp0 is expanded from the real invocation path instead.
+ * A preload that is missing or unreadable degrades to no preload, because node
+ * aborts a process whose --require cannot be resolved.
+ */
+function buildWindowsCursorPreloadLines(): string[] {
+  const variable = WINDOWS_CURSOR_PRELOAD_VARIABLE
+  return [
+    `set "${variable}=%~dp0${CURSOR_PRELOAD_FILE_NAME}"`,
+    `set "${variable}=%${variable}:\\=/%"`,
+    `if "%${CURSOR_PRELOAD_DISABLED_ENV}%"=="1" set "${variable}="`,
+    `if not exist "%${variable}%" set "${variable}="`,
+    `if defined ${variable} set "AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS=%NODE_OPTIONS%"`,
+    `if defined ${variable} set "NODE_OPTIONS=${
+      buildCursorAgentPreloadRequireOption(`%${variable}%`, 'win32')
+    } %NODE_OPTIONS%"`,
+    `set "${variable}="`,
+  ]
+}
+
+function buildPosixCursorPreloadLines(
+  preloadPath: string,
+  platform: NodeJS.Platform,
+): string[] {
+  return [
+    `if [ "\${${CURSOR_PRELOAD_DISABLED_ENV}:-}" != "1" ] && [ -r ${
+      quotePosixShellValue(preloadPath)
+    } ]; then`,
+    '  export AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS="${NODE_OPTIONS:-}"',
+    `  export NODE_OPTIONS=${
+      quotePosixShellValue(buildCursorAgentPreloadRequireOption(preloadPath, platform))
+    }" \${NODE_OPTIONS:-}"`,
+    'fi',
+  ]
+}
+
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
@@ -1371,12 +1450,8 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   }
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
   await mkdir(binPath, { recursive: true })
-  const cursorResourceExhaustedPreloadPath = path.join(
-    binPath,
-    'cursor-resource-exhausted-preload.cjs',
-  )
-  await publishNativeCliFile(cursorResourceExhaustedPreloadPath,
-    buildCursorAgentResourceExhaustedPreloadScript(), 0o600)
+  const cursorAgentPreloadPath = path.join(binPath, CURSOR_PRELOAD_FILE_NAME)
+  await publishNativeCliFile(cursorAgentPreloadPath, buildCursorAgentPreloadScript(), 0o600)
 
   // The plugin registers OpenCode MCP servers as tools, but an agent can only
   // reach them through the plugin's own mcptool CLI. A global npm install would
@@ -1403,12 +1478,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'set "XDG_DATA_HOME="',
         'set "XDG_CACHE_HOME="',
         `set "PATH=${escapeWindowsBatchValue(hostPath)}"`,
-        ...(command === 'cursor-agent'
-          ? [
-              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS=%NODE_OPTIONS%"`,
-              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "NODE_OPTIONS=--require="${escapeWindowsBatchValue(cursorResourceExhaustedPreloadPath)}" %NODE_OPTIONS%"`,
-            ]
-          : []),
+        ...(command === 'cursor-agent' ? buildWindowsCursorPreloadLines() : []),
         `call "${escapeWindowsBatchValue(hostCommand)}" %*`,
         'exit /b %ERRORLEVEL%',
         '',
@@ -1436,12 +1506,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         ? [`export OPENCODE_CONFIG=${quotePosixShellValue(managedConfigPath)}`]
         : []),
       ...(command === 'cursor-agent'
-          ? [
-            `if [ "\${${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}:-}" != "1" ]; then`,
-            '  export AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS="${NODE_OPTIONS:-}"',
-            `  export NODE_OPTIONS=${quotePosixShellValue(`--require="${cursorResourceExhaustedPreloadPath}"`)}" \${NODE_OPTIONS:-}"`,
-            'fi',
-          ]
+        ? buildPosixCursorPreloadLines(cursorAgentPreloadPath, platform)
         : []),
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',

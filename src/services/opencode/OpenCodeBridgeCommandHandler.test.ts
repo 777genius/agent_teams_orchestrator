@@ -21,6 +21,7 @@ import {
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttributionStore.js'
 import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -960,6 +961,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)
     expect(result.data.server.bridgeProtocol.expectedBehaviorFingerprintSchemaVersion).toBe(2)
+    // The desktop app detects a runtime that records process attribution by
+    // this block, never by parsing a version string.
+    expect(result.data.server.runtime.processAttribution).toEqual({
+      schemaVersion: 1,
+      directory: resolveProcessAttributionDirectory(),
+    })
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {

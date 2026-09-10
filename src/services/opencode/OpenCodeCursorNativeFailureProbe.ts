@@ -2,6 +2,11 @@ import type { ChildProcess } from 'node:child_process'
 
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { killProcessTree } from '../../utils/processKill.js'
+import {
+  buildProcessAttributionSpawnEnv,
+  mintProcessAttributionId,
+  resolveProcessAttributionDirectory,
+} from './OpenCodeProcessAttributionStore.js'
 import { waitForOpenCodeAbortableDelay } from './OpenCodeRuntimeDeadline.js'
 
 const DEFAULT_CURSOR_NATIVE_FAILURE_PROBE_DELAY_MS = 2_000
@@ -204,7 +209,17 @@ export class OpenCodeCursorNativeFailureProbe {
         ],
         {
           cwd: input.projectPath,
-          env,
+          // The readiness proof is the one cursor-agent this runtime spawns
+          // itself. Marking its tree turns a "never reap this" comment on the
+          // desktop side into evidence it can check.
+          env: {
+            ...env,
+            ...buildProcessAttributionSpawnEnv({
+              directory: resolveProcessAttributionDirectory(env),
+              attributionId: mintProcessAttributionId(),
+              kind: 'readiness-probe',
+            }),
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
         },

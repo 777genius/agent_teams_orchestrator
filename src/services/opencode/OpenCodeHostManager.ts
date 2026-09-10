@@ -30,6 +30,15 @@ import {
 } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import {
+  buildProcessAttributionSpawnEnv,
+  deleteHostAttributionRecords,
+  mintProcessAttributionId,
+  pruneStaleAttributionRecords,
+  resolveProcessAttributionDirectory,
+  writeHostAttributionRecord,
+  type OpenCodeHostAttributionOwner,
+} from './OpenCodeProcessAttributionStore.js'
+import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
@@ -120,6 +129,7 @@ type OpenCodeHostManagerDeps = {
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
   now?: () => Date
   persistentRegistryPath?: string | null
+  processAttributionDirectory?: string | null
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -151,6 +161,7 @@ type PersistentHostRegistryRecord = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  attributionId?: string | null
   version: string | null
   resolvedConfigFingerprint: string | null
   updatedAt: string
@@ -423,12 +434,26 @@ export function shouldUnrefOpenCodeHostProcess(
 export function buildOpenCodeHostSpawnOptions(
   profile: OpenCodePreparedProfile,
   platform: NodeJS.Platform = process.platform,
-  options: { lifetime?: OpenCodeHostLifetime } = {},
+  options: {
+    lifetime?: OpenCodeHostLifetime
+    attributionId?: string | null
+    attributionDirectory?: string | null
+  } = {},
 ): SpawnOptions {
   const lifetime = options.lifetime ?? 'persistent'
+  // Attribution belongs to this spawn, not to the profile: the host key is
+  // derived from profile.env, so a per-spawn value there would fork the key.
+  const attributionEnv = options.attributionId
+    ? buildProcessAttributionSpawnEnv({
+      directory: options.attributionDirectory ?? null,
+      attributionId: options.attributionId,
+    })
+    : {}
   return {
     cwd: profile.workingDirectoryPath ?? profile.projectPath,
-    env: profile.env,
+    env: Object.keys(attributionEnv).length > 0
+      ? { ...profile.env, ...attributionEnv }
+      : profile.env,
     detached: lifetime === 'persistent' || platform !== 'win32',
     stdio: 'ignore',
     windowsHide: true,
@@ -573,6 +598,72 @@ export class OpenCodeHostManager {
     return this.deps.persistentRegistryPath === undefined
       ? defaultPersistentRegistryPath()
       : this.deps.persistentRegistryPath
+  }
+
+  /**
+   * The runtime advertises resolveProcessAttributionDirectory() to the app as
+   * the place it writes its records, so the process entry point resolves that
+   * once and injects it rather than repeating the resolution here. A caller
+   * that pins its own registry and no directory keeps its records beside that
+   * registry, where only that caller prunes them.
+   */
+  private get processAttributionDirectory(): string | null {
+    if (this.deps.processAttributionDirectory !== undefined) {
+      return this.deps.processAttributionDirectory
+    }
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return null
+    }
+    return path.join(path.dirname(registryPath), 'process-attribution')
+  }
+
+  private buildHostAttributionOwners(
+    leases: Record<string, PersistentHostLeaseRecord>,
+  ): OpenCodeHostAttributionOwner[] {
+    return Object.values(leases).map(lease => ({
+      teamId: lease.teamId,
+      laneId: lease.laneId,
+      memberName: lease.memberName,
+      runId: lease.runId,
+      sessionId: lease.sessionId,
+      createdAt: lease.createdAt,
+      updatedAt: lease.updatedAt,
+    }))
+  }
+
+  /**
+   * Attribution is evidence about a process tree, never authority over it: a
+   * failed write leaves the app exactly as blind as it is today, so it must not
+   * fail the operation that produced it.
+   */
+  private async syncHostAttributionRecord(
+    record: PersistentHostRegistryRecord,
+    leases: Record<string, PersistentHostLeaseRecord>,
+  ): Promise<void> {
+    const directory = this.processAttributionDirectory
+    if (!directory || !record.attributionId) {
+      return
+    }
+    await writeHostAttributionRecord({
+      directory,
+      attributionId: record.attributionId,
+      hostPid: record.pid,
+      hostStartedAtNative: record.processStartedAtMs ?? null,
+      projectPath: record.projectPath,
+      owners: this.buildHostAttributionOwners(leases),
+      now: () => this.now(),
+    }).catch(() => undefined)
+  }
+
+  private async removeHostAttributionRecords(
+    attributionId: string | null | undefined,
+  ): Promise<void> {
+    const directory = this.processAttributionDirectory
+    if (!directory || !attributionId) {
+      return
+    }
+    await deleteHostAttributionRecords(directory, attributionId).catch(() => undefined)
   }
 
   private getPersistentProfileTmpPath(profileRootKey: string): string {
@@ -899,6 +990,7 @@ export class OpenCodeHostManager {
       port: handle.port,
       pid: handle.pid,
       processStartedAtMs: handle.processStartedAtMs,
+      attributionId: handle.attributionId ?? previous?.attributionId ?? null,
       version: handle.version,
       resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
       updatedAt: this.nowIso(),
@@ -1018,8 +1110,10 @@ export class OpenCodeHostManager {
         && (previous.pid !== handle.pid || previous.processStartedAtMs !== handle.processStartedAtMs)) {
         throw new Error('OpenCode host owns a pending OAuth publication')
       }
-      registry.hosts[handle.hostKey] = this.buildPersistentHostRecord(handle, previous)
+      const record = this.buildPersistentHostRecord(handle, previous)
+      registry.hosts[handle.hostKey] = record
       await this.writePersistentRegistryUnlocked(registry)
+      await this.syncHostAttributionRecord(record, normalizePersistentHostLeases(record.leases))
     })
   }
 
@@ -1067,6 +1161,7 @@ export class OpenCodeHostManager {
       }
       if (await this.hasPendingOAuthHost(hostKey)) return
       delete registry.hosts[hostKey]
+      await this.removeHostAttributionRecords(record.attributionId)
       if (Object.keys(registry.hosts).length === 0) {
         await unlink(registryPath).catch(() => undefined)
         return
@@ -1166,12 +1261,10 @@ export class OpenCodeHostManager {
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       }
-      registry.hosts[hostKey] = {
-        ...record,
-        leases,
-        updatedAt: now,
-      }
+      const updated = { ...record, leases, updatedAt: now }
+      registry.hosts[hostKey] = updated
       await this.writePersistentRegistryUnlocked(registry)
+      await this.syncHostAttributionRecord(updated, leases)
     })
   }
 
@@ -1213,12 +1306,15 @@ export class OpenCodeHostManager {
         || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return false
       if (await this.hasPendingOAuthHost(hostKey, input)) return false
       delete leases[leaseKey]
-      registry.hosts[hostKey] = {
-        ...record,
-        leases,
-        updatedAt: this.nowIso(),
-      }
+      const updated = { ...record, leases, updatedAt: this.nowIso() }
+      registry.hosts[hostKey] = updated
       await this.writePersistentRegistryUnlocked(registry)
+      // Releasing the last lease leaves the host process running and registered
+      // - preflight probes retain and release a lease around every run - so the
+      // record is rewritten with no owners rather than deleted. Deleting it
+      // would strip the proof from live cursor-agent trees the moment a lane
+      // stops. Only a host leaving the registry takes its records with it.
+      await this.syncHostAttributionRecord(updated, leases)
       return true
     })
   }
@@ -1306,6 +1402,7 @@ export class OpenCodeHostManager {
       port: record.port,
       pid: record.pid,
       processStartedAtMs,
+      attributionId: record.attributionId ?? null,
       version: health.version ?? record.version,
       state: 'healthy',
       profile,
@@ -1415,6 +1512,7 @@ export class OpenCodeHostManager {
     profile: OpenCodePreparedProfile,
     port: number,
     lifetime: OpenCodeHostLifetime,
+    attributionId: string | null,
   ): ChildProcess {
     if (this.deps.spawnHostProcess) {
       return this.deps.spawnHostProcess(profile, port)
@@ -1423,7 +1521,11 @@ export class OpenCodeHostManager {
     return spawnPortableCli(
       resolveOpenCodeBinaryPath() ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
-      buildOpenCodeHostSpawnOptions(profile, process.platform, { lifetime }),
+      buildOpenCodeHostSpawnOptions(profile, process.platform, {
+        lifetime,
+        attributionId,
+        attributionDirectory: this.processAttributionDirectory,
+      }),
     )
   }
 
@@ -1502,7 +1604,10 @@ export class OpenCodeHostManager {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
     await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
-    const child = this.spawnHost(profile, port, lifetime)
+    // Minted before the spawn so every process below this host inherits it,
+    // including the cursor-agent trees the runtime never sees.
+    const attributionId = mintProcessAttributionId()
+    const child = this.spawnHost(profile, port, lifetime, attributionId)
 
     const diagnostics: string[] = []
     const captureOutput = (source: 'stdout' | 'stderr') => (chunk: Buffer | string) => {
@@ -1527,6 +1632,7 @@ export class OpenCodeHostManager {
       baseUrl,
       port,
       pid: child.pid ?? -1,
+      attributionId,
       version: null,
       state: 'starting',
       profile,
@@ -2221,6 +2327,7 @@ export class OpenCodeHostManager {
           }
           if (!this.isProcessAlive(record.pid)) {
             delete registry.hosts[hostKey]
+            await this.removeHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
@@ -2243,6 +2350,7 @@ export class OpenCodeHostManager {
           if (skipStartupRecord(record)) continue
           if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
             delete registry.hosts[hostKey]
+            await this.removeHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
@@ -2360,6 +2468,7 @@ export class OpenCodeHostManager {
           try {
             await this.terminatePersistentHostRecord(record, { force, startupBudget: budget })
             delete registry.hosts[hostKey]
+            await this.removeHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             hosts.push({
@@ -2427,6 +2536,30 @@ export class OpenCodeHostManager {
             `Removed ${tempCleanup.removed} stale OpenCode profile temp dylib(s) (${tempCleanup.bytes} bytes)`,
           )
         }
+
+        const attributionDirectory = this.processAttributionDirectory
+        if (attributionDirectory) {
+          // A crashed or SIGKILLed process leaves its record behind. It is
+          // identity, never liveness, so the runtime reaps what it wrote.
+          const pruned = await pruneStaleAttributionRecords(attributionDirectory, {
+            now: () => this.nowMs(),
+            isProcessAlive: pid => this.isProcessAlive(pid),
+            readProcessStartTimeMs: pid => this.readProcessStartTimeMs(pid),
+          }).catch(error => {
+            diagnostics.push(
+              `Failed to prune OpenCode process attribution records: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            )
+            return null
+          })
+          if (pruned && (pruned.prunedHosts > 0 || pruned.prunedAgents > 0 || pruned.prunedCorrupt > 0)) {
+            diagnostics.push(
+              `Pruned OpenCode process attribution records (hosts=${pruned.prunedHosts}, `
+              + `agents=${pruned.prunedAgents}, corrupt=${pruned.prunedCorrupt})`,
+            )
+          }
+        }
       }
 
       return {
@@ -2468,4 +2601,9 @@ export class OpenCodeHostManager {
   }
 }
 
-export const openCodeHostManager = new OpenCodeHostManager()
+export const openCodeHostManager = new OpenCodeHostManager({
+  // The bridge advertises this same resolution to the app in its runtime
+  // precondition snapshot; resolving it once here keeps the directory the
+  // runtime writes to and the directory the app reads identical.
+  processAttributionDirectory: resolveProcessAttributionDirectory(),
+})

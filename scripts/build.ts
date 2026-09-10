@@ -206,6 +206,9 @@ const defines = {
   'process.env.CLAUDE_CODE_VERIFY_PLAN': JSON.stringify('false'),
   'process.env.CCR_FORCE_BUNDLE': JSON.stringify('true'),
   'MACRO.VERSION': JSON.stringify(version),
+  // The runtime's own package version. MACRO.VERSION above is the Claude Code
+  // compatibility version and says nothing about which runtime build is running.
+  'MACRO.RUNTIME_VERSION': JSON.stringify(pkg.version),
   'MACRO.BUILD_TIME': JSON.stringify(buildTime),
   'MACRO.PACKAGE_URL': JSON.stringify(pkg.name),
   'MACRO.NATIVE_PACKAGE_URL': 'undefined',
