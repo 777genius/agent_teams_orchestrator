@@ -239,7 +239,9 @@ describe('pending native OAuth session authority', () => {
         schemaVersion: 1, command, requestId: `TEST-${command}-${member}`, cwd: project,
         startedAt: new Date().toISOString(), timeoutMs: 10_000,
         body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: member,
-          expectedCapabilitySnapshotId: capability, messageId: 'inbox-TEST',
+          // Keep each member's delivery identity stable from blocked send through retry.
+          deliveryAttemptId: `attempt-${member}`,
+          expectedCapabilitySnapshotId: capability, messageId: member === 'owner' ? 'inbox-TEST' : 'inbox-other',
           runtimePromptMessageId: owner.messageId, sessionId: member === 'owner' ? 'native-session' : 'other-session',
           text: 'synthetic followup', settlementMode: 'acceptance', ...(scenario === 'no-reply' ? { noReply: true } : {}), ...extra },
       }, { signal })
@@ -470,6 +472,7 @@ describe('pending native OAuth session authority', () => {
           const call = requestId => execute({ schemaVersion: 1, command: 'opencode.sendMessage', requestId, cwd: record.projectPath,
             startedAt: new Date().toISOString(), timeoutMs: 10000,
             body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: 'owner', expectedCapabilitySnapshotId: ${JSON.stringify(capability)},
+              deliveryAttemptId: requestId === 'TEST-third' ? 'attempt-third' : 'attempt-owner',
               messageId: requestId === 'TEST-third' ? 'inbox-third' : 'inbox-TEST', text: 'synthetic followup', settlementMode: 'acceptance' } });
           const retry = await call('TEST-opencode.sendMessage-owner');
           if (retry.ok || posts !== 0) throw new Error('duplicate delivery admitted after restart');
