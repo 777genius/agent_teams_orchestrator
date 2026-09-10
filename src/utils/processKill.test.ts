@@ -6,6 +6,9 @@ import { join } from 'node:path'
 
 import {
   buildWindowsTaskkillInvocation,
+  hasPendingStartupTaskkill,
+  drainStartupTaskkills,
+  killProcessTreeForStartup,
   isProcessAlive,
   killProcessTreeAndWait,
   parseDarwinProcessStartTime,
@@ -234,6 +237,192 @@ describe('processKill', () => {
       expect(child.kill).toHaveBeenCalledWith('SIGKILL')
       expect(spawn).toHaveBeenCalledTimes(1)
       expect(clock.pendingCount()).toBe(0)
+      mock.restore()
+    }
+  })
+
+  it('startup accepts four-second Windows identity and legacy reads with a six-second override', async () => {
+    for (const query of [
+      () => readProcessStartTimeMs(2104, 'win32', 6_000),
+      () => readProcessCommandLine(2104, 'win32', 6_000),
+    ]) {
+      const { child } = mockWindowsQuery()
+      const clock = mockQueryClock()
+      const result = query()
+      expect(clock.timer.mock.calls[0]![1]).toBe(6_000)
+      clock.advanceTo(4_000)
+      child.stdout.write('2026-09-09T03:26:43.6163024Z')
+      child.emit('close', 0)
+      expect(await result).not.toBeNull()
+      expect(child.kill).not.toHaveBeenCalled()
+      mock.restore()
+    }
+  })
+
+  const startupBudget = { cap: (ms: number) => ms, assertAvailable: () => {} }
+  const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve() }
+
+  it('startup timeout requests stop but waits for actual delayed close', async () => {
+    const { child } = mockWindowsQuery()
+    const clock = mockQueryClock()
+    let done = false
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: async () => 1000, alive: () => false,
+    })
+    void result.then(() => { done = true })
+    await flush()
+    clock.advanceTo(2_500)
+    await flush()
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(done).toBe(false)
+    expect(hasPendingStartupTaskkill(2104)).toBe(true)
+    child.emit('close', 0)
+    expect(await result).toEqual({ helperTerminated: true, rootGone: true, treeKillSucceeded: false })
+    expect(hasPendingStartupTaskkill(2104)).toBe(false)
+  })
+
+  it('startup live helper yields explicit unknown facts and retry never dispatches another helper', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    const clock = mockQueryClock()
+    const deps = { readIdentity: async () => 1000, alive: () => false }
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, deps)
+    await flush()
+    clock.advanceTo(3_500)
+    let drained = false
+    const drain = drainStartupTaskkills().then(() => { drained = true })
+    await flush()
+    expect(drained).toBe(false)
+    expect(await result).toEqual({ helperTerminated: false, rootGone: true, treeKillSucceeded: false })
+    expect((await killProcessTreeForStartup(2104, 1000, startupBudget, deps)).helperTerminated).toBe(false)
+    expect(spawn).toHaveBeenCalledTimes(1)
+    child.emit('close', 1)
+    await drain
+    expect(drained).toBe(true)
+    expect(hasPendingStartupTaskkill(2104)).toBe(false)
+  })
+
+  it('startup root disappearance does not erase tree failure', async () => {
+    const { child } = mockWindowsQuery()
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: async () => 1000, alive: () => false,
+    })
+    await flush()
+    child.emit('close', 1)
+    expect(await result).toEqual({ helperTerminated: true, rootGone: true, treeKillSucceeded: false })
+  })
+
+  it('startup rechecks PID identity before force fallback', async () => {
+    const { child } = mockWindowsQuery()
+    const signal = mock(() => {})
+    let queries = 0
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: async () => ++queries === 1 ? 1000 : 2000, alive: () => true, signal,
+    })
+    await flush()
+    child.emit('close', 1)
+    expect((await result).treeKillSucceeded).toBe(false)
+    expect(queries).toBe(2)
+    expect(signal).not.toHaveBeenCalled()
+  })
+
+  it('startup tracks awaited fallback after helper close until every destructive continuation drains', async () => {
+    const { child, spawn } = mockWindowsQuery()
+    let resolveIdentity!: (value: number) => void
+    let queries = 0
+    const signal = mock(() => {})
+    const deps = {
+      readIdentity: async () => ++queries === 1 ? 1000 : new Promise<number>(resolve => { resolveIdentity = resolve }),
+      alive: () => true, signal,
+    }
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, deps)
+    await flush()
+    child.emit('close', 1)
+    await flush()
+    expect(queries).toBe(2)
+    expect(hasPendingStartupTaskkill(2104)).toBe(true)
+    let drained = false
+    const drain = drainStartupTaskkills().then(() => { drained = true })
+    expect((await killProcessTreeForStartup(2104, 1000, startupBudget, deps)).helperTerminated).toBe(false)
+    expect(spawn).toHaveBeenCalledTimes(1)
+    expect(drained).toBe(false)
+    resolveIdentity(1000)
+    await result
+    await drain
+    expect(signal).toHaveBeenCalledTimes(1)
+    expect(hasPendingStartupTaskkill(2104)).toBe(false)
+  })
+
+  it('startup drain also observes operations started while its original snapshot is pending', async () => {
+    const { spawn } = mockWindowsQuery()
+    let resolveFirst!: (value: number) => void
+    let resolveSecond!: (value: number) => void
+    const first = killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: () => new Promise<number>(resolve => { resolveFirst = resolve }), alive: () => true,
+    })
+    let drained = false
+    const drain = drainStartupTaskkills().then(() => { drained = true })
+    const second = killProcessTreeForStartup(2105, 1000, startupBudget, {
+      readIdentity: () => new Promise<number>(resolve => { resolveSecond = resolve }), alive: () => true,
+    })
+    resolveFirst(2000)
+    await first
+    await flush()
+    expect(drained).toBe(false)
+    expect(hasPendingStartupTaskkill(2105)).toBe(true)
+    resolveSecond(2000)
+    await second
+    await drain
+    expect(drained).toBe(true)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('startup reserves a PID before its first awaited identity so concurrent retry cannot double-dispatch', async () => {
+    const { spawn } = mockWindowsQuery()
+    let resolveIdentity!: (value: number) => void
+    const result = killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: () => new Promise<number>(resolve => { resolveIdentity = resolve }), alive: () => true,
+    })
+    const retry = await killProcessTreeForStartup(2104, 1000, startupBudget, {
+      readIdentity: async () => 1000, alive: () => true,
+    })
+    expect(retry.helperTerminated).toBe(false)
+    expect(spawn).not.toHaveBeenCalled()
+    resolveIdentity(2000)
+    expect((await result).helperTerminated).toBe(true)
+    expect(hasPendingStartupTaskkill(2104)).toBe(false)
+  })
+
+  it('startup never dispatches when the termination reserve is exhausted between clock reads', async () => {
+    const { spawn } = mockWindowsQuery()
+    await expect(killProcessTreeForStartup(2104, 1000, {
+      assertAvailable: () => {}, cap: ms => ms === 3500 ? 999 : ms,
+    }, { readIdentity: async () => 1000, alive: () => true })).rejects.toThrow('reserve exhausted')
+    expect(spawn).not.toHaveBeenCalled()
+    expect(hasPendingStartupTaskkill(2104)).toBe(false)
+  })
+
+  it('startup exhausted after awaited probes cannot taskkill or force fallback', async () => {
+    for (const exhaustAt of [1, 2]) {
+      const { child, spawn } = mockWindowsQuery()
+      let exhausted = false
+      let queries = 0
+      const signal = mock(() => {})
+      const budget = { cap: (ms: number) => ms, assertAvailable: () => {
+        if (exhausted) throw new Error('exhausted')
+      } }
+      const result = killProcessTreeForStartup(2104, 1000, budget, {
+        readIdentity: async () => { exhausted = ++queries === exhaustAt; return 1000 },
+        alive: () => true, signal,
+      })
+      if (exhaustAt === 1) {
+        await expect(result).rejects.toThrow('exhausted')
+        expect(spawn).not.toHaveBeenCalled()
+      } else {
+        await flush()
+        child.emit('close', 1)
+        expect((await result).helperTerminated).toBe(true)
+      }
+      expect(signal).not.toHaveBeenCalled()
       mock.restore()
     }
   })
