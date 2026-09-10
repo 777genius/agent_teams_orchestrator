@@ -2929,7 +2929,9 @@ export class OpenCodeProfileManager {
           if (rotation) throw new Error('OpenCode OAuth native admission session authority changed')
           // Legacy/injected owners retain their existing single-session receipt;
           // absence of persisted cohort evidence never authorizes peer reuse.
-          await armSession({ ...native, sessionAuthorities: undefined })
+          const singleSession = { ...native }
+          delete singleSession.sessionAuthorities
+          await armSession(singleSession)
           return
         }
         await armSession({ ...native, sessionAuthorities })
