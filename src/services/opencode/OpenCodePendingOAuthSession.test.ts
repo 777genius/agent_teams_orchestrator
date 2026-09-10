@@ -10,6 +10,7 @@ import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { readOpenCodeAuthCredential, upsertOpenCodeAuthCredential, type OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
 import type { OpenCodeHostHandle, OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
 
@@ -232,7 +233,7 @@ describe('pending native OAuth session authority', () => {
       // Added entrypoint remains real; only bind its synthetic persistent roots.
       restores.push(spyOn(openCodeSessionBridge, 'withOwnedOAuthSessionObservation')
         .mockImplementation(productionBridge.withOwnedOAuthSessionObservation.bind(productionBridge)))
-      const capability = `opencode:${hashStable({ version: 'TEST', projectPath: project,
+      const capability = `opencode:${hashStable({ version: 'TEST', projectPath: normalizeOpenCodeProjectIdentity(project),
         projectBehaviorFingerprint: profile.projectBehaviorFingerprint, managedConfigFingerprint: profile.managedConfigFingerprint,
         mcpServers: ['agent-teams'], providers: [] }).slice(0, 32)}`
       const call = (command: string, member = 'owner', extra: Record<string, unknown> = {}, signal?: AbortSignal) => execute({
