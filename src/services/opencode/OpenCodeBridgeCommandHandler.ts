@@ -1,3 +1,4 @@
+import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
@@ -2823,7 +2824,9 @@ async function runReadiness(
       if (!refreshedBefore) {
         throw new Error(`OpenCode selected readiness host/config/auth/project/MCP authority is unavailable${authorityDiagnostic}`)
       }
+      let completedOAuthProbe: OpenCodeOAuthNativeProbeOwner | undefined
       const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
+        onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
         runtimeDeadline,
@@ -2832,9 +2835,10 @@ async function runReadiness(
       const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
-        allowOwnedOAuthRotation: executionOutcome.outcome === 'available'
+        completedOAuthProbe: executionOutcome.outcome === 'available'
           && executionOutcome.observedProviderId === qualifiedSelectedModel.providerId
-          && executionOutcome.observedModelId === qualifiedSelectedModel.modelId,
+          && executionOutcome.observedModelId === qualifiedSelectedModel.modelId
+          ? completedOAuthProbe : undefined,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
@@ -2879,7 +2883,7 @@ async function runReadiness(
           toolProof,
           true,
           executionProof,
-          initialEvidence,
+          executionProof?.expectedBehaviorEvidence ?? initialEvidence,
         ),
       }
     } finally {

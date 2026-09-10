@@ -2619,14 +2619,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('owned OAuth continuity is requested only after successful matching execution', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     const execute = openCodeExecutionProbe.probeModelOnHost
-    for (const resultKind of ['available', 'unavailable', 'wrong_provider', 'wrong_model']) {
+    for (const resultKind of ['available', 'unavailable', 'wrong_provider', 'wrong_model', 'missing_identity']) {
       const continuity: boolean[] = []
       openCodeProvisioningProbe.refreshSelectedProfileAuthority = async input => {
-        continuity.push(input.allowOwnedOAuthRotation === true)
+        continuity.push(input.completedOAuthProbe !== undefined)
         return input.host.profile
       }
       openCodeExecutionProbe.probeModelOnHost = async input => {
         const result = await execute(input)
+        if (resultKind !== 'missing_identity') input.onOwnedOAuthProbeSuccess?.({
+          hostKey: input.host.hostKey, baseUrl: input.host.baseUrl, pid: input.host.pid,
+          processStartedAtMs: input.host.processStartedAtMs!, profileRootKey: input.host.profileRootKey,
+          projectPath: input.host.projectPath, scopeToken: input.host.profile.scopeToken!,
+          selectedModel: input.selectedModel, sessionId: 'TEST-session', messageId: 'TEST-message',
+        })
         if (resultKind === 'unavailable') result.outcome = 'unavailable'
         if (resultKind === 'wrong_provider') result.observedProviderId = 'foreign'
         if (resultKind === 'wrong_model') result.observedModelId = 'foreign'

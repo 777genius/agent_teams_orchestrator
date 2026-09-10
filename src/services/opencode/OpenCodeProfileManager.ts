@@ -1,3 +1,4 @@
+import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
@@ -2717,20 +2718,25 @@ export class OpenCodeProfileManager {
     host: OpenCodeHostHandle,
     selectedModel: string,
     currentScope: OpenCodeProfileScope,
+    completedProbe: OpenCodeOAuthNativeProbeOwner,
   ) {
     if (host.profile.profileScope?.purpose !== 'launch_runtime'
       || host.profile.profileScope.providerId !== 'xai'
       || !selectedModel.startsWith('xai/') || !host.processStartedAtMs
       || host.profileRootKey !== host.profile.profileRootKey
       || host.projectPath !== host.profile.canonicalProjectPath) return null
+    const nativeProbe = { projectPath: host.profile.canonicalProjectPath, scopeToken: host.profile.scopeToken!,
+      profileRootKey: host.profileRootKey, hostKey: host.hostKey, baseUrl: host.baseUrl,
+      pid: host.pid, processStartedAtMs: host.processStartedAtMs, selectedModel,
+      sessionId: completedProbe.sessionId, messageId: completedProbe.messageId }
+    if (!nativeProbe.sessionId || !nativeProbe.messageId
+      || !isDeepStrictEqual(completedProbe, nativeProbe)) return null
     const authority = await this.scopedOAuthAuthority(host.profile)
     const predecessor = authority.snapshot.selectedAuthCredential
     if (!isValidOpenCodeOAuthCredential(predecessor)) return null
     const rotation = await readOpenCodeCommittedOAuthProbeRotation({
       ...authority, env: authority.snapshot.runtimeEnv, predecessor,
-      nativeProbe: { projectPath: authority.snapshot.projectPath, scopeToken: authority.scope.scopeToken,
-        profileRootKey: host.profileRootKey, hostKey: host.hostKey, baseUrl: host.baseUrl,
-        pid: host.pid, processStartedAtMs: host.processStartedAtMs, selectedModel },
+      nativeProbe,
     })
     if (!rotation) return null
     const input = { projectPath: authority.snapshot.projectPath, selectedModel,
@@ -2740,6 +2746,7 @@ export class OpenCodeProfileManager {
     const before = await resolveOpenCodeProfileScopeInternal(input, rotation.predecessor)
     const after = await resolveOpenCodeProfileScopeInternal(input, rotation.successor)
     return isDeepStrictEqual(before, authority.scope) && isDeepStrictEqual(after, currentScope)
+      && await readProcessStartTimeMs(nativeProbe.pid) === nativeProbe.processStartedAtMs
       ? rotation : null
   }
 

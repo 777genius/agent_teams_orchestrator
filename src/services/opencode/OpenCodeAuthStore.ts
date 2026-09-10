@@ -173,7 +173,7 @@ export async function readOpenCodeCommittedOAuthProbeRotation(input: {
   managedAuthPath: string
   env: NodeJS.ProcessEnv
   predecessor: OpenCodeAuthCredential
-  nativeProbe: Omit<OpenCodeOAuthNativeProbeOwner, 'sessionId' | 'messageId'>
+  nativeProbe: OpenCodeOAuthNativeProbeOwner
 }): Promise<{ operationId: string; predecessor: OpenCodeAuthCredential; successor: OpenCodeAuthCredential } | null> {
   const authority = await readSuccessorAuthority(input.globalAuthPath)
   const native = authority?.completion?.nativeProbe
@@ -186,7 +186,7 @@ export async function readOpenCodeCommittedOAuthProbeRotation(input: {
     || !isDeepStrictEqual(authority.predecessor, input.predecessor)
     || isDeepStrictEqual(authority.predecessor, authority.successor)
     || !isDeepStrictEqual(authority.sourceAuthPaths, input.sourceAuthPaths)
-    || !isDeepStrictEqual(native, { ...input.nativeProbe, sessionId: native.sessionId, messageId: native.messageId })
+    || !isDeepStrictEqual(native, input.nativeProbe)
     || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
   const sources = await Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore))
   if (!matchesSuccessorSources(authority, input.sourceAuthPaths, sources)) return null

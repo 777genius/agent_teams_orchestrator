@@ -1,3 +1,4 @@
+import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
@@ -70,7 +71,7 @@ export async function refreshSelectedProfileAuthority(input: {
     contractConfigIdentity?: string | null
     // Only the successful post-execution readiness check may compare an owned
     // committed rotation. The retained profile is never resealed or reusable.
-    allowOwnedOAuthRotation?: boolean
+    completedOAuthProbe?: OpenCodeOAuthNativeProbeOwner
     phaseContext?: OpenCodePhaseContext
     onRejection?: (diagnostic: OpenCodeAuthorityRejection) => void
   }, deps: OpenCodeSelectedProfileAuthorityDeps = {}): Promise<OpenCodeHostHandle['profile'] | null> {
@@ -119,6 +120,7 @@ export async function refreshSelectedProfileAuthority(input: {
       const original = rawEntries(profile)
       const expectedFingerprint = input.expectedBehaviorFingerprint
       const contractIdentity = input.contractConfigIdentity
+      const completedProbe = input.completedOAuthProbe ? { ...input.completedOAuthProbe } : undefined
       const selectedModel = input.selectedModel
       const baseUrl = input.host.baseUrl
       const hostIdentity = () => [input.host.hostKey, input.host.profileRootKey,
@@ -182,9 +184,11 @@ export async function refreshSelectedProfileAuthority(input: {
       try { assertOpenCodeEffectiveAgentPolicies(expectedPolicies, liveAgents) }
       catch { if (!changed.includes('agent')) changed.push('agent') }
       if (changed.length) return reject({ check: 'selected_config_match', fields: changed })
-      const readRotation = () => read('profile_scope', () => openCodeProfileManager.readCompletedReadinessOAuthRotation(
-        { ...input.host, profile }, selected.raw, scope))
-      const rotation = scope.scopeToken !== profile.profileScope.scopeToken && input.allowOwnedOAuthRotation === true
+      const readRotation = () => completedProbe
+        ? read('profile_scope', () => openCodeProfileManager.readCompletedReadinessOAuthRotation(
+          { ...input.host, profile }, selected.raw, scope, completedProbe))
+        : Promise.resolve(null)
+      const rotation = scope.scopeToken !== profile.profileScope.scopeToken && completedProbe
         && selected.providerId === 'xai' ? await readRotation() : null
       if (scope.scopeToken !== profile.profileScope.scopeToken && !rotation) return reject({ check: 'scope_token_match' })
       if (scope.configFingerprint !== profile.profileScope.configFingerprint) return reject({ check: 'scope_config_match' })

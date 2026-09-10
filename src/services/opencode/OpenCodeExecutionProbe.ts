@@ -91,6 +91,8 @@ type OpenCodeExecutionProbeDeps = {
 }
 
 type ProbeModelParams = {
+  // Private readiness handoff after settled, successful owned native execution.
+  onOwnedOAuthProbeSuccess?: (owner: OpenCodeOAuthNativeProbeOwner) => void
   selectedModel: string
   projectPath?: string | null
   scopeEnvironment?: NodeJS.ProcessEnv
@@ -1055,6 +1057,12 @@ export class OpenCodeExecutionProbe {
         })
         if (completion.error !== undefined) throw completion.error
         if (!completion.result) throw new Error('OpenCode OAuth execution probe produced no result')
+        const selected = parseProviderScopedModel(input.params.selectedModel)
+        if (settled && nativeOwner && completion.result.outcome === 'available'
+          && completion.result.observedProviderId === selected.providerID
+          && completion.result.observedModelId === selected.modelID) {
+          input.params.onOwnedOAuthProbeSuccess?.({ ...nativeOwner })
+        }
         return completion.result
       },
     })
