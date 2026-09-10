@@ -27,8 +27,8 @@ describe('OpenCodeBridgePreconditions', () => {
 
     expect(result).toEqual({
       idempotencyKey: 'idem-1',
-      manifestHighWatermark: 4,
-      runtimeStoreManifestHighWatermark: 4,
+      manifestHighWatermark: 3,
+      runtimeStoreManifestHighWatermark: 3,
     })
   })
 
@@ -106,21 +106,107 @@ describe('OpenCodeBridgePreconditions', () => {
     ).toThrow('expected laneId precondition does not match command laneId')
   })
 
-  test('rejects stale runtime manifest high watermarks', () => {
-    expect(() =>
+  test('echoes the app-owned manifest high watermark instead of comparing it', () => {
+    const result = validateOpenCodeBridgeStateChangingPreconditions({
+      body: {
+        runId: 'run-1',
+        preconditions: preconditions({
+          expectedManifestHighWatermark: 10,
+          idempotencyKey: 'idem-echo',
+        }),
+      },
+      runtime: {
+        capabilitySnapshotId: 'cap-1',
+        runtimeStoreManifestHighWatermark: 0,
+      },
+    })
+
+    expect(result).toEqual({
+      idempotencyKey: 'idem-echo',
+      manifestHighWatermark: 10,
+      runtimeStoreManifestHighWatermark: 10,
+    })
+  })
+
+  test('echoes a supplied watermark verbatim and falls back to the runtime value', () => {
+    // A lower watermark than the one the app holds must survive the round trip
+    // unchanged, so the app can still reject a stale replay of its own command.
+    expect(
       validateOpenCodeBridgeStateChangingPreconditions({
         body: {
           runId: 'run-1',
-          preconditions: preconditions({
-            expectedManifestHighWatermark: 10,
-          }),
+          preconditions: preconditions({ expectedManifestHighWatermark: 1 }),
         },
         runtime: {
           capabilitySnapshotId: 'cap-1',
           runtimeStoreManifestHighWatermark: 9,
         },
       }),
-    ).toThrow('runtime manifest high watermark precondition is stale')
+    ).toMatchObject({ manifestHighWatermark: 1, runtimeStoreManifestHighWatermark: 1 })
+
+    expect(
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: {
+          runId: 'run-1',
+          manifestHighWatermark: 7,
+        },
+        runtime: {
+          capabilitySnapshotId: 'cap-1',
+          runtimeStoreManifestHighWatermark: 0,
+        },
+      }),
+    ).toEqual({ manifestHighWatermark: 7, runtimeStoreManifestHighWatermark: 7 })
+
+    expect(
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: {
+          runId: 'run-1',
+          preconditions: preconditions({ expectedManifestHighWatermark: null }),
+        },
+        runtime: {
+          capabilitySnapshotId: 'cap-1',
+          runtimeStoreManifestHighWatermark: 4,
+        },
+      }),
+    ).toMatchObject({ manifestHighWatermark: 4, runtimeStoreManifestHighWatermark: 4 })
+  })
+
+  test('rejects a manifest high watermark outside the safe integer range', () => {
+    // The supplied value is echoed into durable Stop data, whose own validator
+    // requires a safe integer, so the bridge must reject it before the stop runs.
+    expect(() =>
+      parseOpenCodeBridgePreconditions(preconditions({ expectedManifestHighWatermark: 2 ** 53 })),
+    ).toThrow('expectedManifestHighWatermark must be a non-negative safe integer or null')
+
+    expect(
+      parseOpenCodeBridgePreconditions(
+        preconditions({ expectedManifestHighWatermark: 2 ** 53 - 1 }),
+      )?.expectedManifestHighWatermark,
+    ).toBe(2 ** 53 - 1)
+
+    expect(() =>
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: { runId: 'run-1', manifestHighWatermark: 2 ** 53 },
+        runtime: { capabilitySnapshotId: 'cap-1', runtimeStoreManifestHighWatermark: 0 },
+      }),
+    ).toThrow('manifestHighWatermark must be a non-negative safe integer or null')
+
+    expect(
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: { runId: 'run-1', manifestHighWatermark: 2 ** 53 - 1 },
+        runtime: { capabilitySnapshotId: 'cap-1', runtimeStoreManifestHighWatermark: 0 },
+      }),
+    ).toEqual({
+      manifestHighWatermark: 2 ** 53 - 1,
+      runtimeStoreManifestHighWatermark: 2 ** 53 - 1,
+    })
+
+    // Negative controls: the existing non-negative and integer rules still hold.
+    for (const value of [-1, 1.5, Number.MAX_VALUE, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(() =>
+        parseOpenCodeBridgePreconditions(preconditions({ expectedManifestHighWatermark: value })),
+      ).toThrow('expectedManifestHighWatermark must be a non-negative safe integer or null')
+    }
   })
 
   test('rejects malformed precondition payloads', () => {

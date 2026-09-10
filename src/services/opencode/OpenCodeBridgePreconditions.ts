@@ -99,20 +99,20 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
     input.body.manifestHighWatermark,
     'manifestHighWatermark',
   )
+  // The expected manifest high watermark counts committed batches in the app's
+  // own runtime store. The bridge keeps no such store, so it has nothing to
+  // compare the value against: it is opaque app-owned evidence that the command
+  // carries and the reply echoes unchanged, letting the app fence its own stale
+  // replays. When no watermark is supplied the runtime value is echoed instead.
   const expectedManifestHighWatermark =
     preconditions?.expectedManifestHighWatermark ?? bodyManifestHighWatermark ?? null
-  if (
-    expectedManifestHighWatermark !== null &&
-    input.runtime.runtimeStoreManifestHighWatermark !== null &&
-    input.runtime.runtimeStoreManifestHighWatermark < expectedManifestHighWatermark
-  ) {
-    throw new Error('OpenCode bridge runtime manifest high watermark precondition is stale')
-  }
+  const echoedManifestHighWatermark =
+    expectedManifestHighWatermark ?? input.runtime.runtimeStoreManifestHighWatermark
 
   return {
     ...(preconditions ? { idempotencyKey: preconditions.idempotencyKey } : {}),
-    manifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
-    runtimeStoreManifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
+    manifestHighWatermark: echoedManifestHighWatermark,
+    runtimeStoreManifestHighWatermark: echoedManifestHighWatermark,
     ...(capabilitySnapshotRecovery ? { capabilitySnapshotRecovery } : {}),
   }
 }
@@ -202,8 +202,13 @@ function requireNullableNumber(value: unknown, field: string): number | null {
   if (value === null) {
     return null
   }
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`OpenCode bridge precondition ${field} must be a non-negative integer or null`)
+  // A supplied watermark is echoed back into durable Stop data, whose own
+  // validator requires a safe integer, so anything larger would be accepted here
+  // and then rejected by the store after the stop effects had already run.
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `OpenCode bridge precondition ${field} must be a non-negative safe integer or null`,
+    )
   }
   return value
 }

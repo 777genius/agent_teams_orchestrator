@@ -127,7 +127,13 @@ import type {
 } from './types.js'
 
 const BRIDGE_SCHEMA_VERSION = 1
-const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
+// Manifest high watermarks are owned by the desktop app's runtime store. The
+// bridge has none of its own, so this is the value reported when there is no
+// supplied watermark to echo: a command or handshake that carries none, and the
+// runStop() 'lane belongs to another active run' early return, which answers
+// before the command preconditions are parsed and therefore reports this even
+// when the command did supply a watermark.
+const UNSPECIFIED_MANIFEST_HIGH_WATERMARK = 0
 // App-managed bootstrap deliberately bypasses the launch-time model tool-call
 // requirement for OpenCode only. Bump this when changing the injected context
 // or the candidate proof shape so the desktop app can reject stale evidence.
@@ -975,7 +981,7 @@ function createRuntimePreconditionSnapshot(
   return {
     ...(overrides.confirmedStopRuntime ?? overrides.deliveryRuntime ?? createRuntimeSnapshot(snapshot)),
     runtimeStoreManifestHighWatermark:
-      overrides.runtimeStoreManifestHighWatermark ?? RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+      overrides.runtimeStoreManifestHighWatermark ?? UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
     // A capable runtime is detected by this block, never by parsing a version
     // string: an older runtime simply does not advertise one.
     processAttribution: {
@@ -3444,9 +3450,6 @@ async function runLaunch(
   if (preconditions?.expectedRunId && preconditions.expectedRunId !== runId) {
     throw new Error('OpenCode bridge expectedRunId precondition does not match command runId')
   }
-  if ((preconditions?.expectedManifestHighWatermark ?? 0) > RUNTIME_STORE_MANIFEST_HIGH_WATERMARK) {
-    throw new Error('OpenCode bridge runtime manifest high watermark precondition is stale')
-  }
   if (!preconditions?.commandLeaseId) {
     throw new Error('OpenCode strict launch requires full preconditions and commandLeaseId')
   }
@@ -4612,8 +4615,8 @@ async function runStop(
         members: {},
         warnings: [],
         diagnostics,
-        manifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
-        runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+        manifestHighWatermark: UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
+        runtimeStoreManifestHighWatermark: UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
       },
     }
   }
@@ -6152,9 +6155,11 @@ async function handleEnvelope(
       }
       const identity = createBridgeServerIdentity(snapshot, {
         confirmedStopRuntime, deliveryRuntime,
-        runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
-          ? asNullableNumber(envelope.body.expectedManifestHighWatermark)
-          : undefined,
+        // Every handshake that carries the app's manifest high watermark gets it
+        // back unchanged, whatever command it negotiates.
+        runtimeStoreManifestHighWatermark: asNullableNumber(
+          envelope.body.expectedManifestHighWatermark,
+        ),
       })
       const handshake = {
         schemaVersion: BRIDGE_SCHEMA_VERSION,
