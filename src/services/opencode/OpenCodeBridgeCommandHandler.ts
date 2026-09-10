@@ -5261,6 +5261,7 @@ async function runSendMessage(
         memberName,
         ...(runtimePid ? { runtimePid } : {}),
         prePromptCursor,
+        ...(runtimePromptMessageId ? { runtimePromptMessageId } : {}),
         diagnostics: [
           ...mcpDiagnostics,
           teamDiagnostic(
@@ -5278,6 +5279,8 @@ async function runSendMessage(
         sessionId: deliveryRecord.opencodeSessionId,
         runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
         prePromptCursor,
+        // Acceptance must name the exact prompt admitted by onPromptSubmitting.
+        runtimePromptMessageId,
         acceptedAt: nowIso(),
         completedAt: nowIso(),
         sendMessageData: finalData,
