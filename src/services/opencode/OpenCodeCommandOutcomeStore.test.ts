@@ -39,7 +39,7 @@ describe('OpenCodeCommandOutcomeStore', () => {
   test('atomically admits one prompt and retains its owner across terminal retry and restart', async () => {
     const store = await createStore()
     const file = path.join(tempDir!, 'command-outcomes.json')
-    const first = basePatch({ status: 'prompt_submitting', runtimePromptMessageId: 'prompt-a', deliveryAttemptId: 'attempt-a' })
+    const first = basePatch({ status: 'prompt_submitting', runtimePromptMessageId: 'prompt-a', deliveryAttemptId: 'attempt-a', sessionId: 'session-a', runtimePid: 123 })
     const results = await Promise.allSettled([
       store.upsert(first, { requireRetryable: true }),
       new OpenCodeCommandOutcomeStore(file).upsert({ ...first, runtimePromptMessageId: 'prompt-b' }, { requireRetryable: true }),
@@ -52,6 +52,8 @@ describe('OpenCodeCommandOutcomeStore', () => {
     await expect(restarted.upsert({ ...first, requestId: 'alias' }, { requireRetryable: true })).rejects.toThrow('another request')
     await expect(restarted.upsert({ ...first, runtimePromptMessageId: 'replacement' })).rejects.toThrow('existing prompt')
     await expect(restarted.upsert({ ...first, memberName: 'foreign' })).rejects.toThrow('identity changed')
+    await expect(restarted.upsert({ ...first, sessionId: 'replacement-session' })).rejects.toThrow('identity changed')
+    await expect(restarted.upsert({ ...first, runtimePid: 456 })).rejects.toThrow('identity changed')
     expect((await restarted.query({ requestId: first.requestId })).record?.runtimePromptMessageId).toBe(winner.runtimePromptMessageId)
   })
 

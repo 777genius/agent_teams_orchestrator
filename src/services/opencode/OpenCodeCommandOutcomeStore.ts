@@ -362,7 +362,7 @@ export class OpenCodeCommandOutcomeStore {
         throw new Error('OpenCode delivery attempt already belongs to another request; query its outcome')
       }
       if (previous && !safeToRetryForStatus(previous.status) && (['teamId', 'teamName', 'laneId', 'memberName', 'projectPath',
-        'runId', 'messageId', 'payloadHash', 'deliveryAttemptId'] as const).some(field =>
+        'runId', 'messageId', 'payloadHash', 'deliveryAttemptId', 'sessionId', 'runtimePid'] as const).some(field =>
         patch[field] != null && previous[field] != null && patch[field] !== previous[field])) {
         throw new Error('OpenCode delivery request identity changed')
       }
