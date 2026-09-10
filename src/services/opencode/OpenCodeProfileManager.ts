@@ -2739,7 +2739,13 @@ export class OpenCodeProfileManager {
     if (!rotation) return null
     const scopeInput = { projectPath: record.projectPath, purpose: 'launch_runtime' as const,
       selectedModel: record.selectedModel, env: runtimeEnv, cacheSnapshot: false }
-    if (!isDeepStrictEqual(await resolveOpenCodeProfileScopeInternal(scopeInput, rotation.predecessor), record.profileScope)) return null
+    // Exact scope alone must not bypass a missing or forged retained binding.
+    // Recompute it from the proven original launch credential and current inputs.
+    let binding: OpenCodeOAuthSaveOwner['credentialBinding']
+    const launchScope = await resolveOpenCodeProfileScopeInternal(scopeInput, rotation.predecessor,
+      value => { binding = value })
+    if (!isDeepStrictEqual(launchScope, record.profileScope)
+      || !isDeepStrictEqual(binding, rotation.credentialBinding)) return null
     await this.assertSessionRefreshOwner(record, rotation.nativeSession, data)
     return isDeepStrictEqual(await readOpenCodeCommittedOAuthSessionRotation(input), rotation) ? rotation : null
   }
@@ -2914,7 +2920,7 @@ export class OpenCodeProfileManager {
         const records = await new OpenCodeSessionStore(path.join(authority.snapshot.managedPaths.data,
           'opencode', 'session-store.json')).list()
         const candidates = rotation
-          ? rotation.nativeSession.sessionAuthorities ?? [rotation.nativeSession.record] : records
+          ? rotation.nativeSession.sessionAuthorities! : records
         const sessionAuthorities: OpenCodeSessionRecord[] = []
         for (const record of records) {
           if (record.hostKey !== native.record.hostKey || record.runtimePid !== native.pid
