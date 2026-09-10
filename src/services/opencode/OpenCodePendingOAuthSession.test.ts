@@ -497,7 +497,10 @@ describe('pending native OAuth session authority', () => {
       for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key]
       Object.assign(process.env, savedEnv)
     }
-  })
+    // This multi-command integration scenario performs real process-birth queries.
+    // Windows starts PowerShell for each query; keep the test harness deadline
+    // separate from the unchanged per-command and process-query deadlines.
+  }, process.platform === 'win32' ? 180_000 : 30_000)
 
   test.each(['tool-calls', 'unknown', 'empty-error'])('relay recovery retains a completed %s step until the terminal assistant', async finish => {
     await arm()
