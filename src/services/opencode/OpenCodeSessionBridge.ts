@@ -168,6 +168,7 @@ export function sessionManagedAuthMatches(record: OpenCodeSessionRecord, profile
       && profile.profileScope?.selectedAuthIdentity === record.profileScope.selectedAuthIdentity
   }
   return record.managedAuthFingerprint === profile.managedAuthFingerprint
+    || openCodeProfileManager.hasOwnedOAuthSessionProfile(record, profile)
 }
 
 function getMessageId(message: OpenCodeMessage): string | null {
@@ -498,6 +499,10 @@ export class OpenCodeSessionBridge {
         isOAuthNativeSessionSettled: owner => this.isOwnedOAuthNativeSessionSettled(owner),
         isOAuthNativeSessionUnsubmitted: owner => this.isOwnedOAuthNativeSessionSettled(owner, true),
       }), options.signal)
+    if (record.profileScope?.providerId === 'xai') {
+      const continued = await openCodeProfileManager.prepareOwnedOAuthSessionProfile(record, options.signal)
+      if (continued) return { profile: continued, toolApprovalMode: record.toolApprovalMode ?? 'auto' }
+    }
     if (record.toolApprovalMode) {
       return {
         profile: await this.prepareProfile(projectPath, {
@@ -763,6 +768,7 @@ export class OpenCodeSessionBridge {
         host,
         selectedModel: record.selectedModel,
         expectedBehaviorFingerprint: record.expectedBehaviorFingerprint!,
+        ownedOAuthSession: record,
         ...(options.signal ? {
           phaseContext: {
             phase: 'stop_abort',
@@ -1022,6 +1028,7 @@ export class OpenCodeSessionBridge {
     return this.withSessionHost(record, async context => {
       const completion = await openCodeProfileManager.withOwnedOAuthRefresh({
         profile: context.profile,
+        sessionRecord: capturedRecord,
         assertHostOwnership: async () => {
           if (!isDeepStrictEqual(record, capturedRecord)) {
             throw new Error('OpenCode OAuth session operation identity changed')
@@ -1939,14 +1946,17 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
-    },
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting'>,
   ): Promise<void> {
     await this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
       const client = this.clientFactory.create(baseUrl)
-      const messageID = armOAuthNativeSession
+      const messageID = armOAuthNativeSession || params.onPromptSubmitting
         ? (await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)).runtimePromptMessageId : undefined
       try {
-        if (messageID) await armOAuthNativeSession!(messageID, params.noReply ?? false)
+        if (messageID) {
+          await params.onPromptSubmitting?.({ sessionId: record.opencodeSessionId, runtimePromptMessageId: messageID, baseUrl })
+          await armOAuthNativeSession?.(messageID, params.noReply ?? false)
+        }
         await client.promptSessionAsync(record.opencodeSessionId, {
           ...(messageID ? { messageID } : {}),
           agent: params.agent,
@@ -2378,7 +2388,7 @@ export class OpenCodeSessionBridge {
           || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
-        await this.sessionStore.upsert(nextRecord)
+        await this.sessionStore.upsert(nextRecord, undefined, assertOwner ? record : undefined)
       }
 
       const reconciledRecord = isCurrentSession ? nextRecord : activeRecord

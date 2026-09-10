@@ -355,7 +355,9 @@ async function markSendMessageOutcome(
     diagnostics: input.diagnostics,
     sendMessageData: input.sendMessageData ? toOutcomeSendMessageData(input.sendMessageData) : undefined,
   }
-  await openCodeCommandOutcomeStore.upsert(patch)
+  await openCodeCommandOutcomeStore.upsert(patch, {
+    requireRetryable: input.status === 'received' || input.status === 'prompt_submitting',
+  })
 }
 
 function commandStatusFromOutcomeStatus(
@@ -1109,11 +1111,11 @@ async function probeStoredLaneAuthority(
   ))
   if (runtimePids.size > 1) throw new Error('OpenCode lifecycle lane process authority is ambiguous')
   const expectedRuntimePid = runtimePids.values().next().value
-  if (selectedModel.providerId === 'xai' && (command === 'opencode.observeMessageDelivery'
-    || (envelope.command === 'opencode.handshake' && command === 'opencode.sendMessage'))) {
-    // Negotiation and canonical reads cannot prepare credentials: a previously
-    // admitted async turn may still own their publication. Bind the read to the
-    // persisted launch and exact live process. Actual send retains fresh admission.
+  if (selectedModel.providerId === 'xai' && (command === 'opencode.sendMessage' || command === 'opencode.observeMessageDelivery')) {
+    // Discover the existing host without preparing a different credential scope.
+    // Reads stay available while native work owns publication. Actual sends
+    // recover that receipt and verify live selected authority in SessionBridge
+    // before arming the next prompt under the OAuth publication lock.
     const ownerChecks: Array<() => Promise<void>> = []
     let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, authorityRecords[0])
     for (const record of authorityRecords) {
@@ -4921,6 +4923,7 @@ async function runSendMessage(
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
+  deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
   data: SendMessageCommandData
 }> {
   const authoritySnapshot = authority?.snapshot
@@ -4952,7 +4955,7 @@ async function runSendMessage(
 
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
-    runtime: createRuntimePreconditionSnapshot(authoritySnapshot),
+    runtime: createRuntimePreconditionSnapshot(authoritySnapshot, { deliveryRuntime: authority?.deliveryRuntime }),
   })
   await markSendMessageOutcome(outcomeBase, {
     status: 'preconditions_checked',
@@ -5136,7 +5139,7 @@ async function runSendMessage(
         diagnostics: diagnostics.map(teamDiagnosticToOutcomeString),
       })
       return {
-        snapshot,
+        snapshot, deliveryRuntime: authority?.deliveryRuntime,
         data: {
           accepted: false,
           sessionId: deliveryRecord.opencodeSessionId,
@@ -5203,6 +5206,13 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: true,
+        onPromptSubmitting: async event => {
+          runtimePromptMessageId = event.runtimePromptMessageId
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_submitting', sessionId: event.sessionId, runtimePromptMessageId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null, prePromptCursor,
+          })
+        },
       })
       promptEndpointAccepted = true
       const runtimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
@@ -5236,7 +5246,7 @@ async function runSendMessage(
         diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
       }).catch(() => undefined)
       return {
-        snapshot,
+        snapshot, deliveryRuntime: authority?.deliveryRuntime,
         data: finalData,
       }
     } else if (settlementMode === 'acceptance') {
@@ -5383,7 +5393,7 @@ async function runSendMessage(
       reconcileSummary: null,
     })
     return {
-      snapshot,
+      snapshot, deliveryRuntime: authority?.deliveryRuntime,
       data: finalData,
     }
   }
@@ -5518,7 +5528,7 @@ async function runSendMessage(
   }
 
   return {
-    snapshot,
+    snapshot, deliveryRuntime: authority?.deliveryRuntime,
     data: finalData,
   }
 }

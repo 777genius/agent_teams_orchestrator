@@ -1,5 +1,6 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -572,11 +573,28 @@ export class OpenCodeSessionStore {
     }, signal)
   }
 
-  async upsert(record: OpenCodeSessionRecord, ownerToken?: MaterializationOwnerToken): Promise<UpsertResult> {
+  async upsert(record: OpenCodeSessionRecord, ownerToken?: MaterializationOwnerToken, expectedRecord?: OpenCodeSessionRecord): Promise<UpsertResult> {
+    if (expectedRecord) {
+      expectedRecord = structuredClone(expectedRecord)
+      record = structuredClone(record)
+    }
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
+      if (expectedRecord) {
+        const authority = (value: OpenCodeSessionRecord) => {
+          const { updatedAt, lastCanonicalCursor, lastKnownRawStatus, lastKnownDurableState, ...identity } = value
+          return identity
+        }
+        if (!previous || !isDeepStrictEqual(authority(previous), authority(expectedRecord))
+          || !isDeepStrictEqual(authority(record), authority(expectedRecord))) {
+          throw new Error('OpenCode session authority changed before persistence')
+        }
+        record = { ...previous, lastCanonicalCursor: record.lastCanonicalCursor,
+          lastKnownRawStatus: record.lastKnownRawStatus, lastKnownDurableState: record.lastKnownDurableState,
+          updatedAt: record.updatedAt }
+      }
       if (store.materializationClaims?.[key]) {
         throw new Error('OpenCode session write is fenced by a materialization claim')
       }

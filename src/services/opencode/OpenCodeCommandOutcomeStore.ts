@@ -347,10 +347,32 @@ export class OpenCodeCommandOutcomeStore {
     await writeJsonFileAtomic(this.filePath, store, { indent: 2 })
   }
 
-  async upsert(patch: OpenCodeCommandOutcomePatch): Promise<OpenCodeCommandOutcomeRecord> {
+  async upsert(patch: OpenCodeCommandOutcomePatch, options: { requireRetryable?: boolean } = {}): Promise<OpenCodeCommandOutcomeRecord> {
+    patch = structuredClone(patch)
+    options = { ...options }
     return this.withStoreLock(async () => {
-      const { store } = await this.readStore()
+      const { store, diagnostics } = await this.readStore()
+      if (options.requireRetryable && diagnostics.length) {
+        throw new Error('OpenCode delivery admission requires readable outcome history')
+      }
       const previous = store.records[patch.requestId] ?? null
+      if (options.requireRetryable && patch.deliveryAttemptId && Object.values(store.records).some(record =>
+        record.deliveryAttemptId === patch.deliveryAttemptId && record.requestId !== patch.requestId
+          && !safeToRetryForStatus(record.status))) {
+        throw new Error('OpenCode delivery attempt already belongs to another request; query its outcome')
+      }
+      if (previous && !safeToRetryForStatus(previous.status) && (['teamId', 'teamName', 'laneId', 'memberName', 'projectPath',
+        'runId', 'messageId', 'payloadHash', 'deliveryAttemptId'] as const).some(field =>
+        patch[field] != null && previous[field] != null && patch[field] !== previous[field])) {
+        throw new Error('OpenCode delivery request identity changed')
+      }
+      if (options.requireRetryable && previous && !safeToRetryForStatus(previous.status)) {
+        throw new Error('OpenCode delivery request already submitted; observe its existing outcome')
+      }
+      if (previous?.runtimePromptMessageId && !safeToRetryForStatus(previous.status)
+        && patch.runtimePromptMessageId && previous.runtimePromptMessageId !== patch.runtimePromptMessageId) {
+        throw new Error('OpenCode delivery outcome belongs to an existing prompt')
+      }
       const updatedAt = nowIso()
       const status = chooseStatus(previous, patch.status)
       const next: OpenCodeCommandOutcomeRecord = {

@@ -36,6 +36,25 @@ function basePatch(overrides: Partial<Parameters<OpenCodeCommandOutcomeStore['up
 }
 
 describe('OpenCodeCommandOutcomeStore', () => {
+  test('atomically admits one prompt and retains its owner across terminal retry and restart', async () => {
+    const store = await createStore()
+    const file = path.join(tempDir!, 'command-outcomes.json')
+    const first = basePatch({ status: 'prompt_submitting', runtimePromptMessageId: 'prompt-a', deliveryAttemptId: 'attempt-a' })
+    const results = await Promise.allSettled([
+      store.upsert(first, { requireRetryable: true }),
+      new OpenCodeCommandOutcomeStore(file).upsert({ ...first, runtimePromptMessageId: 'prompt-b' }, { requireRetryable: true }),
+    ])
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    const winner = (await store.query({ requestId: first.requestId })).record!
+    await store.upsert({ ...first, runtimePromptMessageId: winner.runtimePromptMessageId, status: 'reconciled', completedAt: new Date().toISOString() })
+    const restarted = new OpenCodeCommandOutcomeStore(file)
+    await expect(restarted.upsert(basePatch({ status: 'received' }), { requireRetryable: true })).rejects.toThrow('already submitted')
+    await expect(restarted.upsert({ ...first, requestId: 'alias' }, { requireRetryable: true })).rejects.toThrow('another request')
+    await expect(restarted.upsert({ ...first, runtimePromptMessageId: 'replacement' })).rejects.toThrow('existing prompt')
+    await expect(restarted.upsert({ ...first, memberName: 'foreign' })).rejects.toThrow('identity changed')
+    expect((await restarted.query({ requestId: first.requestId })).record?.runtimePromptMessageId).toBe(winner.runtimePromptMessageId)
+  })
+
   test('writes and queries a send-message outcome by request id and delivery attempt id', async () => {
     const store = await createStore()
 
