@@ -27,17 +27,20 @@ const successor = { ...credential, access: 'sandbox-successor', refresh: 'sandbo
 // only the HTTP/OpenCode process boundary is replaced. All files are disposable.
 describe('profile scope preparation and execution ownership', () => {
   let processBirth: number
-  let root: string
+  let root: string | undefined
   let project: string
   let env: NodeJS.ProcessEnv
-  let saved: NodeJS.ProcessEnv
+  let saved: NodeJS.ProcessEnv = {}
   let processBirthMock: { mockRestore(): void } | undefined
   const manager = new OpenCodeProfileManager()
   beforeEach(async () => {
+    root = undefined
+    saved = {}
+    processBirthMock = undefined
     // These synthetic hosts run in this same test process, whose birth cannot
     // change mid-test. Keep repeated OS shell startup out of coordinator timing;
     // PendingOAuthSession/CheckpointLifetime exercise real process replacement.
-    const birth = await realReadProcessBirth(process.pid)
+    const birth = await realReadProcessBirth(process.pid, process.platform, 20_000)
     expect(birth).toBeGreaterThan(0)
     processBirthMock = spyOn(processIdentity, 'readProcessStartTimeMs').mockImplementation(
       (pid, platform) => pid === process.pid && (platform === undefined || platform === process.platform)
@@ -59,14 +62,14 @@ describe('profile scope preparation and execution ownership', () => {
     await upsertOpenCodeAuthCredential({ authPath: manager.getGlobalAuthPath(), providerId: 'xai', credential })
     await upsertOpenCodeAuthCredential({ authPath: manager.getGlobalAuthPath(), providerId: 'zai',
       credential: { type: 'api', key: 'sandbox-zai' } })
-  })
+  }, 30_000)
   afterEach(async () => {
     processBirthMock?.mockRestore()
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value
     }
-    await rm(root, { recursive: true, force: true })
+    if (root) await rm(root, { recursive: true, force: true })
   })
   const scope = (selectedModel = 'xai/grok-4.3', purpose: OpenCodeProfilePurpose = 'launch_runtime', extra = {}) =>
     resolveOpenCodeProfileScope({ projectPath: project, selectedModel, purpose, env: { ...env, ...extra } })

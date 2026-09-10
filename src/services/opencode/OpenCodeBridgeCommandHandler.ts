@@ -1,3 +1,5 @@
+import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
+import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
 import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
@@ -159,6 +161,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.reconcileStop',
   'opencode.readiness',
   'opencode.cleanupHosts',
+  'opencode.cleanupStartupHosts',
   'opencode.launchTeam',
   'opencode.reconcileTeam',
   'opencode.stopTeam',
@@ -3152,6 +3155,9 @@ async function runReadiness(
 }
 
 async function runCleanupHosts(envelope: BridgeEnvelope) {
+  const startup = envelope.command === 'opencode.cleanupStartupHosts'
+  if (startup && process.platform !== 'win32') throw new Error('Startup host cleanup is Windows-only')
+  const startupBudget = startup ? new OpenCodeStartupCleanupBudget(envelope.body.deadlineUnixMs) : undefined
   const mode = asString(envelope.body.mode) === 'force' ? 'force' : 'stale'
   const staleAgeMs = typeof envelope.body.staleAgeMs === 'number'
     ? envelope.body.staleAgeMs
@@ -3169,7 +3175,16 @@ async function runCleanupHosts(envelope: BridgeEnvelope) {
     staleAgeMs,
     leaseStaleAgeMs,
     preflightLeaseStaleAgeMs,
+    ...(startupBudget ? { startupBudget } : {}),
   })
+  if (startup) {
+    // Observe the original operation only. Reconciliation must not be rerun:
+    // its source identity, lease checks and failed-tree coverage still apply.
+    await drainStartupTaskkills()
+    if (result.startupCleanup) {
+      result.startupCleanup.completion = pendingStartupTaskkillPids().length > 0 ? 'unknown' : 'drained'
+    }
+  }
   return {
     snapshot: null,
     data: result,
@@ -6065,6 +6080,7 @@ async function handleEnvelope(
         throw new Error('OpenCode readiness deadline was not initialized')
       }
       return runReadiness(envelope, runtimeDeadline)
+    case 'opencode.cleanupStartupHosts':
     case 'opencode.cleanupHosts':
       return runCleanupHosts(envelope)
     case 'opencode.launchTeam':

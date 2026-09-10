@@ -157,6 +157,11 @@ jobs:
         # child startups per test; the default 5s can expire during valid work.
         # Production operation deadlines remain enforced inside the tests.
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
+      - name: Test Windows startup cleanup completion contracts
+        run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
+      - name: Test native Windows startup termination
+        if: runner.os == 'Windows'
+        run: bun test src/services/opencode/OpenCodeStartupCleanup.native.test.ts
       - name: Require Python for Linux OS pipe regression
         if: runner.os == 'Linux'
         run: python3 --version
