@@ -323,6 +323,7 @@ async function markSendMessageOutcome(
   base: SendMessageOutcomeBase,
   input: {
     status: OpenCodeCommandOutcomeStatus
+    definitelyUnsubmitted?: { runtimePromptMessageId: string }
     sessionId?: string | null
     runtimePid?: number | null
     prePromptCursor?: string | null
@@ -358,9 +359,13 @@ async function markSendMessageOutcome(
     diagnostics: input.diagnostics,
     sendMessageData: input.sendMessageData ? toOutcomeSendMessageData(input.sendMessageData) : undefined,
   }
-  await openCodeCommandOutcomeStore.upsert(patch, {
+  // OutcomeStore owns the locked identity check and durable transition. Older
+  // stores ignore this option and conservatively retain prompt_submitting.
+  const options = {
     requireRetryable: input.status === 'received' || input.status === 'prompt_submitting',
-  })
+    ...(input.definitelyUnsubmitted ? { definitelyUnsubmitted: input.definitelyUnsubmitted } : {}),
+  }
+  await openCodeCommandOutcomeStore.upsert(patch, options)
 }
 
 function commandStatusFromOutcomeStatus(
@@ -5213,6 +5218,23 @@ async function runSendMessage(
   let runtimePromptMessageId: string | null = null
   let turnSettled: OpenCodeTurnSettledSummary | null = null
   let promptEndpointAccepted = false
+  const onPromptDefinitelyUnsubmitted = async (event: {
+    sessionId: string; runtimePromptMessageId: string; error: unknown
+  }) => {
+    // Use the exact admitting prompt and immutable command identity. Do not
+    // infer non-submission from the generic failure path or native history.
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'failed_before_accept',
+      sessionId: event.sessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor,
+      runtimePromptMessageId: event.runtimePromptMessageId,
+      definitelyUnsubmitted: { runtimePromptMessageId: event.runtimePromptMessageId },
+      completedAt: nowIso(),
+      error: event.error instanceof Error ? event.error.message : String(event.error),
+      diagnostics: ['opencode_prompt_definitely_unsubmitted'],
+    })
+  }
   try {
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
     if (noReply) {
@@ -5221,6 +5243,7 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: true,
+        onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async event => {
           runtimePromptMessageId = event.runtimePromptMessageId
           await markSendMessageOutcome(outcomeBase, {
@@ -5270,6 +5293,7 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: false,
+        onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',
@@ -5312,6 +5336,7 @@ async function runSendMessage(
         noReply: false,
         timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
         idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
+        onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',

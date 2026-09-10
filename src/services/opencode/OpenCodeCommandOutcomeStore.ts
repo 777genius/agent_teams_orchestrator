@@ -356,12 +356,15 @@ export class OpenCodeCommandOutcomeStore {
     await writeJsonFileAtomic(this.filePath, store, { indent: 2 })
   }
 
-  async upsert(patch: OpenCodeCommandOutcomePatch, options: { requireRetryable?: boolean } = {}): Promise<OpenCodeCommandOutcomeRecord> {
+  async upsert(patch: OpenCodeCommandOutcomePatch, options: {
+    requireRetryable?: boolean
+    definitelyUnsubmitted?: { runtimePromptMessageId: string }
+  } = {}): Promise<OpenCodeCommandOutcomeRecord> {
     patch = structuredClone(patch)
-    options = { ...options }
+    options = structuredClone(options)
     return this.withStoreLock(async () => {
       const { store, diagnostics } = await this.readStore()
-      if (options.requireRetryable && diagnostics.length) {
+      if ((options.requireRetryable || options.definitelyUnsubmitted !== undefined) && diagnostics.length) {
         throw new Error('OpenCode delivery admission requires readable outcome history')
       }
       const previous = store.records[patch.requestId] ?? null
@@ -379,6 +382,37 @@ export class OpenCodeCommandOutcomeStore {
       }
       if (aliases.some(record => !safeToRetryForStatus(record.status))) {
         throw new Error('OpenCode delivery attempt already belongs to another request; query its outcome')
+      }
+      if (options.definitelyUnsubmitted !== undefined) {
+        const messageId = options.definitelyUnsubmitted?.runtimePromptMessageId
+        // This evidence is captured before native transport. Compare the complete
+        // captured owner under the admission lock; omitted fields are not wildcards.
+        if (patch.status !== 'failed_before_accept' || previous?.status !== 'prompt_submitting'
+          || typeof messageId !== 'string' || !messageId.trim()
+          || messageId !== previous.runtimePromptMessageId
+          || messageId !== patch.runtimePromptMessageId
+          || previous.acceptedAt !== null || previous.turnObservedAt !== null || previous.sendMessageData
+          || (['requestId', 'teamId', 'teamName', 'laneId', 'memberName', 'projectPath',
+            'runId', 'deliveryAttemptId', 'messageId', 'payloadHash', 'sessionId', 'runtimePid'] as const)
+            .some(field => !Object.prototype.hasOwnProperty.call(patch, field)
+              || patch[field] !== previous[field])) {
+          throw new Error('OpenCode definitely-unsubmitted transition requires the exact submitting owner')
+        }
+        // Retain all native/ledger evidence rather than merging unrelated patch
+        // metadata into this narrowly authorized transition. Failed writes reject
+        // without releasing the persisted submission fence.
+        const next: OpenCodeCommandOutcomeRecord = {
+          ...previous,
+          status: 'failed_before_accept',
+          safeToRetry: true,
+          error: patch.error ?? previous.error,
+          completedAt: patch.completedAt ?? previous.completedAt,
+          diagnostics: mergeDiagnostics(previous.diagnostics, patch.diagnostics),
+          updatedAt: nowIso(),
+        }
+        store.records[patch.requestId] = next
+        await this.writeStore(store)
+        return next
       }
       if (options.requireRetryable && previous && !safeToRetryForStatus(previous.status)) {
         throw new Error('OpenCode delivery request already submitted; observe its existing outcome')
@@ -432,12 +466,12 @@ export class OpenCodeCommandOutcomeStore {
         prePromptCursor: patch.prePromptCursor ?? previous?.prePromptCursor ?? null,
         runtimePromptMessageId:
           patch.runtimePromptMessageId ?? previous?.runtimePromptMessageId ?? null,
-        acceptedAt: previous?.acceptedAt ?? patch.acceptedAt ?? null,
-        turnObservedAt: patch.turnObservedAt ?? previous?.turnObservedAt ?? null,
+        acceptedAt: retryAdmission ? null : previous?.acceptedAt ?? patch.acceptedAt ?? null,
+        turnObservedAt: retryAdmission ? null : patch.turnObservedAt ?? previous?.turnObservedAt ?? null,
         completedAt: retryAdmission ? null : patch.completedAt ?? previous?.completedAt ?? null,
         error: retryAdmission ? null : patch.error ?? previous?.error ?? null,
         diagnostics: mergeDiagnostics(previous?.diagnostics ?? [], patch.diagnostics),
-        ...(patch.sendMessageData ?? previous?.sendMessageData
+        ...(!retryAdmission && (patch.sendMessageData ?? previous?.sendMessageData)
           ? { sendMessageData: patch.sendMessageData ?? previous?.sendMessageData }
           : {}),
         createdAt: previous?.createdAt ?? updatedAt,
@@ -450,7 +484,7 @@ export class OpenCodeCommandOutcomeStore {
           && sendMessageData[field] !== next[field])) {
         throw new Error('OpenCode accepted result identity changed')
       }
-      if (previous?.sendMessageData && patch.sendMessageData) {
+      if (!retryAdmission && previous?.sendMessageData && patch.sendMessageData) {
         const retained = previous.sendMessageData
         const incoming = patch.sendMessageData
         if ((['memberName', 'sessionId', 'runtimePid', 'runtimePromptMessageId',

@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -36,6 +36,189 @@ function basePatch(overrides: Partial<Parameters<OpenCodeCommandOutcomeStore['up
 }
 
 describe('OpenCodeCommandOutcomeStore', () => {
+  function submittingPatch() {
+    return basePatch({ status: 'prompt_submitting', deliveryAttemptId: 'attempt',
+      sessionId: 'session', runtimePid: 123, runtimePromptMessageId: 'native-1',
+      prePromptCursor: 'cursor', diagnostics: ['admitted'] })
+  }
+
+  const unsubmitted = { definitelyUnsubmitted: { runtimePromptMessageId: 'native-1' } }
+
+  test('definitely-unsubmitted owner durably becomes retryable while retaining ledger evidence', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert(submittingPatch(), { requireRetryable: true })
+    const failed = await store.upsert({ ...submitted, status: 'failed_before_accept',
+      error: 'arm rejected', completedAt: '2026-09-10T00:00:00.000Z',
+      prePromptCursor: 'must-not-replace-evidence', diagnostics: ['unsubmitted'],
+      acceptedAt: 'must-not-introduce-acceptance' }, unsubmitted)
+    expect(failed).toEqual({ ...submitted, status: 'failed_before_accept', safeToRetry: true,
+      error: 'arm rejected', completedAt: '2026-09-10T00:00:00.000Z',
+      diagnostics: ['admitted', 'unsubmitted'], updatedAt: failed.updatedAt })
+    const reopened = new OpenCodeCommandOutcomeStore(path.join(tempDir!, 'command-outcomes.json'))
+    expect((await reopened.query({ deliveryAttemptId: 'attempt' })).record).toEqual(failed)
+    const retry = await reopened.upsert({ ...failed, status: 'prompt_submitting',
+      runtimePromptMessageId: 'native-2' }, { requireRetryable: true })
+    expect(retry).toMatchObject({ status: 'prompt_submitting', safeToRetry: false,
+      runtimePromptMessageId: 'native-2', error: null, completedAt: null })
+  })
+
+  test('definitely-unsubmitted rejects each mismatched or omitted captured identity without a write', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert(submittingPatch(), { requireRetryable: true })
+    const file = path.join(tempDir!, 'command-outcomes.json')
+    const before = await readFile(file, 'utf8')
+    const failure = { ...submitted, status: 'failed_before_accept' as const }
+    for (const field of ['requestId', 'teamId', 'teamName', 'laneId', 'memberName',
+      'projectPath', 'runId', 'deliveryAttemptId', 'messageId', 'payloadHash',
+      'sessionId', 'runtimePid', 'runtimePromptMessageId'] as const) {
+      for (const value of [undefined, null, field === 'runtimePid' ? 456 : 'foreign']) {
+        await expect(store.upsert({ ...failure, [field]: value }, unsubmitted)).rejects.toThrow()
+      }
+      const omitted: Partial<typeof failure> = { ...failure }
+      delete omitted[field]
+      await expect(store.upsert(omitted as typeof failure, unsubmitted)).rejects.toThrow()
+    }
+    for (const runtimePromptMessageId of ['', '   ', 'foreign']) {
+      await expect(store.upsert(failure, { definitelyUnsubmitted: { runtimePromptMessageId } })).rejects.toThrow()
+    }
+    expect(await readFile(file, 'utf8')).toBe(before)
+  })
+
+  test('explicit null identity matches but omission cannot stand in for null or an absent attempt', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert({ ...submittingPatch(), deliveryAttemptId: undefined,
+      runId: null, messageId: null, payloadHash: null, sessionId: null, runtimePid: null })
+    const failure = { ...submitted, status: 'failed_before_accept' as const }
+    await expect(store.upsert(failure, unsubmitted)).rejects.toThrow('exact submitting owner')
+    await expect(store.upsert({ ...failure, deliveryAttemptId: undefined, runId: undefined },
+      unsubmitted)).rejects.toThrow('exact submitting owner')
+    expect(await store.upsert({ ...failure, deliveryAttemptId: undefined }, unsubmitted))
+      .toMatchObject({ status: 'failed_before_accept', safeToRetry: true })
+  })
+
+  test('definitely-unsubmitted requires readable existing submitting history and the failure status', async () => {
+    const store = await createStore()
+    const file = path.join(tempDir!, 'command-outcomes.json')
+    const failure = { ...submittingPatch(), status: 'failed_before_accept' as const }
+    await expect(store.upsert(failure, unsubmitted)).rejects.toThrow('exact submitting owner')
+    for (const content of ['{bad json', JSON.stringify({ schemaVersion: 2, records: {} }),
+      JSON.stringify({ schemaVersion: 1, records: { [failure.requestId]: { invalid: true } } })]) {
+      await writeFile(file, content)
+      await expect(store.upsert(failure, unsubmitted)).rejects.toThrow()
+      expect(await readFile(file, 'utf8')).toBe(content)
+    }
+    await rm(file)
+    const submitted = await store.upsert(submittingPatch())
+    const before = await readFile(file, 'utf8')
+    for (const status of ['received', 'preconditions_checked', 'session_resolved', 'mcp_ready',
+      'prompt_submitting', 'prompt_accepted', 'turn_observed', 'reconciled', 'failed_after_accept'] as const) {
+      await expect(store.upsert({ ...submitted, status }, unsubmitted)).rejects.toThrow()
+    }
+    expect(await readFile(file, 'utf8')).toBe(before)
+    for (const status of ['received', 'preconditions_checked', 'session_resolved', 'mcp_ready',
+      'failed_before_accept', 'prompt_accepted', 'failed_after_accept', 'turn_observed', 'reconciled'] as const) {
+      await writeFile(file, JSON.stringify({ schemaVersion: 1,
+        records: { [submitted.requestId]: { ...submitted, status } } }))
+      const bytes = await readFile(file, 'utf8')
+      await expect(store.upsert(failure, unsubmitted)).rejects.toThrow('exact submitting owner')
+      expect(await readFile(file, 'utf8')).toBe(bytes)
+    }
+  })
+
+  test('definitely-unsubmitted persistence failure leaves the reopened owner fenced', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert(submittingPatch())
+    const writer = spyOn(store as unknown as { writeStore: () => Promise<void> }, 'writeStore')
+      .mockRejectedValue(new Error('synthetic persistence failure'))
+    try {
+      await expect(store.upsert({ ...submitted, status: 'failed_before_accept' }, unsubmitted))
+        .rejects.toThrow('synthetic persistence failure')
+      expect(writer).toHaveBeenCalledTimes(1)
+    } finally {
+      writer.mockRestore()
+    }
+    const reopened = new OpenCodeCommandOutcomeStore(path.join(tempDir!, 'command-outcomes.json'))
+    expect((await reopened.query({ requestId: submitted.requestId })).record).toEqual(submitted)
+    await expect(reopened.upsert({ ...submitted, runtimePromptMessageId: 'native-2' },
+      { requireRetryable: true })).rejects.toThrow('already submitted')
+  })
+
+  test('late old-generation evidence cannot reopen a replacement or accepted owner', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert(submittingPatch())
+    const failure = { ...submitted, status: 'failed_before_accept' as const }
+    await store.upsert(failure, unsubmitted)
+    const competitor = new OpenCodeCommandOutcomeStore(path.join(tempDir!, 'command-outcomes.json'))
+    const replacement = await competitor.upsert({ ...submitted, runtimePromptMessageId: 'native-2' },
+      { requireRetryable: true })
+    for (const status of ['failed_before_accept', 'prompt_accepted', 'reconciled'] as const) {
+      await expect(store.upsert({ ...submitted, status },
+        status === 'failed_before_accept' ? unsubmitted : {})).rejects.toThrow()
+    }
+    await expect(store.upsert(failure)).rejects.toThrow('existing prompt')
+    expect((await competitor.query({ requestId: submitted.requestId })).record).toEqual(replacement)
+    const accepted = await competitor.upsert({ ...replacement, status: 'prompt_accepted' })
+    await expect(store.upsert({ ...accepted, status: 'failed_before_accept' },
+      { definitelyUnsubmitted: { runtimePromptMessageId: 'native-2' } })).rejects.toThrow()
+    expect((await competitor.query({ requestId: submitted.requestId })).record).toEqual(accepted)
+  })
+
+  test('retry admission discards retained or incoming acceptance metadata from failed history', async () => {
+    const store = await createStore()
+    const failed = await store.upsert({ ...submittingPatch(), status: 'failed_before_accept',
+      acceptedAt: '2026-09-09T00:00:00.000Z', turnObservedAt: '2026-09-09T00:00:01.000Z',
+      sendMessageData: { accepted: true, memberName: 'bob', runtimePromptMessageId: 'native-1', diagnostics: [] } })
+    const retry = await store.upsert({ ...failed, status: 'prompt_submitting',
+      runtimePromptMessageId: 'native-2' }, { requireRetryable: true })
+    expect(retry).toMatchObject({ status: 'prompt_submitting', safeToRetry: false,
+      acceptedAt: null, turnObservedAt: null })
+    expect(retry.sendMessageData).toBeUndefined()
+  })
+
+  test('queued old evidence is checked after the competing generation commits under the lock', async () => {
+    const store = await createStore()
+    const submitted = await store.upsert(submittingPatch())
+    await store.upsert({ ...submitted, status: 'failed_before_accept' }, unsubmitted)
+    const competitor = new OpenCodeCommandOutcomeStore(path.join(tempDir!, 'command-outcomes.json'))
+    type Writer = { writeStore: (value: unknown) => Promise<void> }
+    const target = competitor as unknown as Writer
+    const originalWrite = target.writeStore.bind(competitor)
+    let entered!: () => void
+    let release!: () => void
+    const atWrite = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const writer = spyOn(target, 'writeStore').mockImplementation(async value => {
+      entered()
+      await gate
+      await originalWrite(value)
+    })
+    try {
+      const replacementWrite = competitor.upsert({ ...submitted, runtimePromptMessageId: 'native-2' },
+        { requireRetryable: true })
+      await atWrite
+      const failure = { ...submitted, status: 'failed_before_accept' as const }
+      const evidence = { definitelyUnsubmitted: { runtimePromptMessageId: 'native-1' } }
+      const lateWrite = store.upsert(failure, evidence).then(
+        value => ({ value, error: null }),
+        (error: Error) => ({ value: null, error }),
+      )
+      // Neither caller mutation nor a pre-lock snapshot of history may authorize
+      // the queued transition against the replacement that is about to commit.
+      failure.runtimePromptMessageId = 'native-2'
+      evidence.definitelyUnsubmitted.runtimePromptMessageId = 'native-2'
+      release()
+      const replacement = await replacementWrite
+      const late = await lateWrite
+      expect(late.value).toBeNull()
+      expect(late.error?.message).toContain('exact submitting owner')
+      const reopened = new OpenCodeCommandOutcomeStore(path.join(tempDir!, 'command-outcomes.json'))
+      expect((await reopened.query({ requestId: submitted.requestId })).record).toEqual(replacement)
+    } finally {
+      release()
+      writer.mockRestore()
+    }
+  })
+
   test('atomically admits one prompt and retains its owner across terminal retry and restart', async () => {
     const store = await createStore()
     const file = path.join(tempDir!, 'command-outcomes.json')

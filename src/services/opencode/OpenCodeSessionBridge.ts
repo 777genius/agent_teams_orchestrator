@@ -110,6 +110,12 @@ export type OpenCodePromptAsyncWithTurnSettledHooks = {
     runtimePromptMessageId: string
     baseUrl: string
   }) => Promise<void>
+  // Emitted only when OAuth arm rejects before the native client is invoked.
+  onPromptDefinitelyUnsubmitted?: (event: {
+    sessionId: string
+    runtimePromptMessageId: string
+    error: unknown
+  }) => Promise<void>
   onPromptAccepted?: (event: {
     sessionId: string
     runtimePromptMessageId: string
@@ -1058,9 +1064,12 @@ export class OpenCodeSessionBridge {
           try {
             value = await callback({ ...context, armOAuthNativeSession: async (messageId, noReply = false) => {
               if (!context.runtimePid) throw new Error('OpenCode OAuth session has no owned process')
-              nativeOwner = { record: capturedRecord, baseUrl: context.baseUrl,
+              const candidate = { record: capturedRecord, baseUrl: context.baseUrl,
                 pid: context.runtimePid, processStartedAtMs: context.processStartedAtMs!, messageId, noReply }
-              await arm(nativeOwner)
+              await arm(candidate)
+              // An attempted arm is not an admitted native operation. In
+              // particular, a publication CAS rejection cannot have sent HTTP.
+              nativeOwner = candidate
             } })
           } catch (caught) { failed = true; error = caught }
           if (!nativeOwner && failed) throw error
@@ -1938,6 +1947,25 @@ export class OpenCodeSessionBridge {
     }, () => true)
   }
 
+  private async armPromptBeforeTransport(
+    record: OpenCodeSessionRecord,
+    runtimePromptMessageId: string,
+    noReply: boolean,
+    arm: ((messageId: string, noReply?: boolean) => Promise<void>) | undefined,
+    hooks: Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptDefinitelyUnsubmitted'>,
+  ): Promise<void> {
+    // Keep this catch strictly around arm. A client invocation, including a
+    // synchronous throw or a lost response, must never produce this evidence.
+    try {
+      await arm?.(runtimePromptMessageId, noReply)
+    } catch (error) {
+      await hooks.onPromptDefinitelyUnsubmitted?.({
+        sessionId: record.opencodeSessionId, runtimePromptMessageId, error,
+      })
+      throw error
+    }
+  }
+
   async promptAsync(
     record: OpenCodeSessionRecord,
     params: {
@@ -1946,7 +1974,7 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
-    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting'>,
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<void> {
     await this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
       const client = this.clientFactory.create(baseUrl)
@@ -1955,7 +1983,7 @@ export class OpenCodeSessionBridge {
       try {
         if (messageID) {
           await params.onPromptSubmitting?.({ sessionId: record.opencodeSessionId, runtimePromptMessageId: messageID, baseUrl })
-          await armOAuthNativeSession?.(messageID, params.noReply ?? false)
+          await this.armPromptBeforeTransport(record, messageID, params.noReply ?? false, armOAuthNativeSession, params)
         }
         await client.promptSessionAsync(record.opencodeSessionId, {
           ...(messageID ? { messageID } : {}),
@@ -2014,7 +2042,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId: observation.runtimePromptMessageId,
           baseUrl,
         })
-        await armOAuthNativeSession?.(observation.runtimePromptMessageId, false)
+        await this.armPromptBeforeTransport(record, observation.runtimePromptMessageId, false, armOAuthNativeSession, params)
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: observation.runtimePromptMessageId,
           agent: params.agent,
@@ -2155,7 +2183,7 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
-    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted'>,
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<{
     runtimePromptMessageId: string
     hookDiagnostics: string[]
@@ -2174,7 +2202,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId,
           baseUrl,
         })
-        await armOAuthNativeSession?.(runtimePromptMessageId, false)
+        await this.armPromptBeforeTransport(record, runtimePromptMessageId, false, armOAuthNativeSession, params)
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: runtimePromptMessageId,
           agent: params.agent,
