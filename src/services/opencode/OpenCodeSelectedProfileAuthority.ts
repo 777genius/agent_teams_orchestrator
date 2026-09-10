@@ -1,3 +1,4 @@
+import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
@@ -6,7 +7,7 @@ import { raceOpenCodeAbortSignal } from './OpenCodeRuntimeDeadline.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
-import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
+import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
 import type { OpenCodeHostHandle } from './types.js'
@@ -68,6 +69,9 @@ export async function refreshSelectedProfileAuthority(input: {
     selectedModel: string
     expectedBehaviorFingerprint: string
     contractConfigIdentity?: string | null
+    // Only the successful post-execution readiness check may compare an owned
+    // committed rotation. The retained profile is never resealed or reusable.
+    completedOAuthProbe?: OpenCodeOAuthNativeProbeOwner
     phaseContext?: OpenCodePhaseContext
     onRejection?: (diagnostic: OpenCodeAuthorityRejection) => void
   }, deps: OpenCodeSelectedProfileAuthorityDeps = {}): Promise<OpenCodeHostHandle['profile'] | null> {
@@ -116,8 +120,12 @@ export async function refreshSelectedProfileAuthority(input: {
       const original = rawEntries(profile)
       const expectedFingerprint = input.expectedBehaviorFingerprint
       const contractIdentity = input.contractConfigIdentity
+      const completedProbe = input.completedOAuthProbe ? { ...input.completedOAuthProbe } : undefined
       const selectedModel = input.selectedModel
       const baseUrl = input.host.baseUrl
+      const hostIdentity = () => [input.host.hostKey, input.host.profileRootKey,
+        input.host.projectPath, input.host.pid, input.host.processStartedAtMs]
+      const originalHostIdentity = hostIdentity()
       if (buildManagedConfigFingerprint(profile.managedConfig, profile.env) !== profile.managedConfigFingerprint) {
         return reject({ check: 'selected_config_match', fields: [] })
       }
@@ -176,18 +184,30 @@ export async function refreshSelectedProfileAuthority(input: {
       try { assertOpenCodeEffectiveAgentPolicies(expectedPolicies, liveAgents) }
       catch { if (!changed.includes('agent')) changed.push('agent') }
       if (changed.length) return reject({ check: 'selected_config_match', fields: changed })
-      if (scope.scopeToken !== profile.profileScope.scopeToken) return reject({ check: 'scope_token_match' })
+      const readRotation = () => completedProbe
+        ? read('profile_scope', () => openCodeProfileManager.readCompletedReadinessOAuthRotation(
+          { ...input.host, profile }, selected.raw, scope, completedProbe))
+        : Promise.resolve(null)
+      const rotation = scope.scopeToken !== profile.profileScope.scopeToken && completedProbe
+        && selected.providerId === 'xai' ? await readRotation() : null
+      if (scope.scopeToken !== profile.profileScope.scopeToken && !rotation) return reject({ check: 'scope_token_match' })
       if (scope.configFingerprint !== profile.profileScope.configFingerprint) return reject({ check: 'scope_config_match' })
-      if (scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity) return reject({ check: 'selected_auth_identity_match' })
+      if (scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity && !rotation) return reject({ check: 'selected_auth_identity_match' })
       const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }
       phase = 'behavior_evidence'
       const evidence = await raceOpenCodeAbortSignal((deps.buildEvidence ?? buildOpenCodeExpectedBehaviorEvidence)({
         profile: refreshed, fullModelId: selected.raw,
         effectiveConfigFingerprint: profile.managedConfigFingerprint,
+        // Verify the original full behavior expectation using only the proven
+        // predecessor. Execution proof construction still reads native C1 and
+        // keeps OAuth proofs non-reusable; no host/scope identity is replaced.
+        ...(rotation ? { readCredential: async () => rotation.predecessor } : {}),
       }), input.phaseContext?.signal)
+      if (rotation && !isDeepStrictEqual(await readRotation(), rotation)) return reject({ check: 'selected_auth_identity_match' })
       input.phaseContext?.throwIfExpired()
       if (input.selectedModel !== selectedModel || input.host.baseUrl !== baseUrl
         || input.host.profile !== sourceProfile || !isDeepStrictEqual(rawEntries(sourceProfile), original)
+        || !isDeepStrictEqual(hostIdentity(), originalHostIdentity)
         || input.expectedBehaviorFingerprint !== expectedFingerprint || input.contractConfigIdentity !== contractIdentity) {
         return reject({ check: 'selected_config_match', fields: [] })
       }
