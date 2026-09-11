@@ -1,3 +1,4 @@
+import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { describe, expect, test } from 'bun:test'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -209,6 +210,8 @@ describe('OpenCodeProvisioningProbe', () => {
     })
   }
 
+  // This integration matrix performs many filesystem authority refreshes. On Windows,
+  // the default 5 s can expire before finally restores the process-wide fixture env.
   test('refreshes selected config/project/auth/MCP authority and fails closed on each mutation', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-selected-refresh-'))
     const keys = [
@@ -239,7 +242,13 @@ describe('OpenCodeProvisioningProbe', () => {
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-one'
       process.env.DEEPINFRA_API_KEY = 'focused-test-static-authority'
       process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-        provider: { deepinfra: { options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' } } },
+        provider: { deepinfra: {
+          options: { route: '{env:SELECTED_ROUTE_AUTHORITY}' },
+          models: { chosen: {
+            name: 'Chosen', structured_output: true,
+            limit: { context: 200_000, output: 65_536 },
+          } },
+        } },
       })
       const scope = await resolveOpenCodeProfileScope({
         projectPath, purpose: 'launch_runtime', selectedModel: 'deepinfra/chosen',
@@ -251,7 +260,9 @@ describe('OpenCodeProvisioningProbe', () => {
         ...host, projectPath, profileRootKey: prepared.profileRootKey, profile: prepared,
         resolvedConfigFingerprint: prepared.managedConfigFingerprint,
       }
-      let liveConfig = structuredClone(prepared.managedConfig)
+      const livePrepared = () => JSON.parse(JSON.stringify(prepared.managedConfig)
+        .replace(/\{env:([^}]+)\}/g, (_match, name: string) => prepared.env[name] || ''))
+      let liveConfig = livePrepared()
       let connected = true
       let matchedServerName = 'agent-teams'
       let configError: unknown = null
@@ -259,7 +270,7 @@ describe('OpenCodeProvisioningProbe', () => {
         clientFactory: { create: () => ({ getConfig: async () => {
           if (configError) throw configError
           return liveConfig
-        } }) as never },
+        }, listAgents: async () => effectiveAgentsFixture(prepared.managedConfig, prepared.env.XDG_DATA_HOME) }) as never },
         mcpManager: { ensureAppMcp: async () => ({
           mcp: { 'agent-teams': { connected } },
           summary: {
@@ -295,7 +306,7 @@ describe('OpenCodeProvisioningProbe', () => {
         prepared.managedConfig.agent as Record<string, Record<string, unknown>>,
       ).map(([name, agent]) => [name, { ...agent, options: {} }]))
       const normalizedLiveConfig = {
-        ...structuredClone(prepared.managedConfig), agent: normalizedAgents, command: {},
+        ...livePrepared(), agent: normalizedAgents, command: {},
       }
       const preparedBeforeNormalization = structuredClone(prepared)
       liveConfig = normalizedLiveConfig
@@ -307,6 +318,21 @@ describe('OpenCodeProvisioningProbe', () => {
         effectiveConfigFingerprint: prepared.managedConfigFingerprint,
       })).toEqual(evidence)
       expect(diagnostics).toEqual([])
+      // OpenCode drops model fields its config schema does not know (for example
+      // structured_output) when serving GET /config; that alone must not reject.
+      const liveProviders = structuredClone(
+        (normalizedLiveConfig as Record<string, unknown>).provider,
+      ) as Record<string, { models: Record<string, Record<string, unknown>> }>
+      expect(liveProviders.deepinfra.models.chosen.structured_output).toBe(true)
+      delete liveProviders.deepinfra.models.chosen.structured_output
+      liveConfig = { ...normalizedLiveConfig, provider: liveProviders }
+      expect(await refresh()).not.toBeNull()
+      expect(diagnostics).toEqual([])
+      const mutatedProviders = structuredClone(liveProviders)
+      mutatedProviders.deepinfra.models.chosen.limit = { context: 1, output: 1 }
+      liveConfig = { ...normalizedLiveConfig, provider: mutatedProviders }
+      expect(await refresh()).toBeNull()
+      expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: ['provider'] })
       for (const [field, value] of [
         ['command', { injected: { template: 'unexpected-command' } }],
         ['command', null],
@@ -323,7 +349,7 @@ describe('OpenCodeProvisioningProbe', () => {
         expect(await refresh()).toBeNull()
         expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: [field] })
       }
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       matchedServerName = 'secret-server-name'
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'mcp_name' })
@@ -367,7 +393,7 @@ describe('OpenCodeProvisioningProbe', () => {
       }
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'mcp_config_match' })
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       process.env.SELECTED_ROUTE_AUTHORITY = 'route-two'
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'mutated-command'
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify({ ROUTE: 'mutated' })
@@ -377,7 +403,7 @@ describe('OpenCodeProvisioningProbe', () => {
       liveConfig = { ...liveConfig, permission: { poisoned: 'allow' } }
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'selected_config_match', fields: ['permission'] })
-      liveConfig = structuredClone(prepared.managedConfig)
+      liveConfig = livePrepared()
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
       expect(await refresh()).toBeNull()
       expect(diagnostics.pop()).toEqual({ check: 'behavior_match' })
@@ -400,7 +426,7 @@ describe('OpenCodeProvisioningProbe', () => {
       }
       await rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({

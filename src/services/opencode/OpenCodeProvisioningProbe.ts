@@ -113,6 +113,9 @@ export class OpenCodeProvisioningProbe {
     options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> & {
       selectedModel?: string
       leaseId?: string
+      existingHostKey?: string
+      expectedRuntimePid?: number
+      attachAppMcp?: boolean
     } = {},
   ): Promise<RetainedOpenCodeProvisioningProbe> {
     return this.probeWithHost(projectPath, {
@@ -122,6 +125,9 @@ export class OpenCodeProvisioningProbe {
       phaseContext: options.phaseContext,
       selectedModel: options.selectedModel,
       leaseId: options.leaseId,
+      existingHostKey: options.existingHostKey,
+      expectedRuntimePid: options.expectedRuntimePid,
+      attachAppMcp: options.attachAppMcp,
     })
   }
 
@@ -136,6 +142,9 @@ export class OpenCodeProvisioningProbe {
       phaseContext?: OpenCodePhaseContext
       selectedModel?: string
       leaseId?: string
+      existingHostKey?: string
+      expectedRuntimePid?: number
+      attachAppMcp?: boolean
     },
   ): Promise<RetainedOpenCodeProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
@@ -164,30 +173,39 @@ export class OpenCodeProvisioningProbe {
       const prepared = inventory.profile
       const preparedScope = prepared?.profileScope
       const authIdentity = prepared?.selectedSourceAuthIdentity
-      if (
-        !prepared
-        || !preparedScope
-        || inventory.projectPath !== prepared.canonicalProjectPath
-        || prepared.projectPath !== prepared.canonicalProjectPath
-        || prepared.scopeToken !== profileScope.scopeToken
-        || preparedScope.scopeToken !== profileScope.scopeToken
-        || preparedScope.purpose !== 'launch_runtime'
-        || preparedScope.providerId !== selectedModel!.providerId
-        || preparedScope.configFingerprint !== profileScope.configFingerprint
-        || preparedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
-        || !prepared.managedConfig
-        || Array.isArray(prepared.managedConfig)
-        || buildManagedConfigFingerprint(prepared.managedConfig, prepared.env)
-          !== prepared.managedConfigFingerprint
-        || authIdentity === undefined
-        || authIdentity === 'error'
-        || prepared.selectedManagedAuthIdentity === undefined
-        || prepared.selectedManagedAuthIdentity === 'error'
-        || authIdentity !== prepared.selectedManagedAuthIdentity
-        || authIdentity !== profileScope.selectedAuthIdentity
-        || prepared.authState !== 'ok'
-      ) {
-        throw new Error('OpenCode strict launch profile scope evidence is invalid')
+      // Naming the failing check turns an opaque launch refusal into something
+      // a user or a bug report can act on. No identity value is disclosed.
+      const evidenceFailures = !prepared || !preparedScope
+        ? ['prepared_profile_missing']
+        : Object.entries({
+          project_path_mismatch: inventory.projectPath !== prepared.canonicalProjectPath,
+          project_path_not_canonical: prepared.projectPath !== prepared.canonicalProjectPath,
+          scope_token_mismatch: prepared.scopeToken !== profileScope.scopeToken
+            || preparedScope.scopeToken !== profileScope.scopeToken,
+          scope_purpose_mismatch: preparedScope.purpose !== 'launch_runtime',
+          scope_provider_mismatch: preparedScope.providerId !== selectedModel!.providerId,
+          config_fingerprint_mismatch:
+            preparedScope.configFingerprint !== profileScope.configFingerprint,
+          scope_auth_identity_mismatch:
+            preparedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity,
+          managed_config_missing: !prepared.managedConfig || Array.isArray(prepared.managedConfig),
+          managed_config_fingerprint_mismatch: Boolean(prepared.managedConfig)
+            && !Array.isArray(prepared.managedConfig)
+            && buildManagedConfigFingerprint(prepared.managedConfig, prepared.env)
+              !== prepared.managedConfigFingerprint,
+          source_auth_identity_unavailable:
+            authIdentity === undefined || authIdentity === 'error',
+          managed_auth_identity_unavailable:
+            prepared.selectedManagedAuthIdentity === undefined
+            || prepared.selectedManagedAuthIdentity === 'error',
+          auth_identity_mismatch: authIdentity !== prepared.selectedManagedAuthIdentity
+            || authIdentity !== profileScope.selectedAuthIdentity,
+          auth_state_not_ok: prepared.authState !== 'ok',
+        }).filter(([, failed]) => failed).map(([name]) => name)
+      if (evidenceFailures.length > 0) {
+        throw new Error(
+          `OpenCode strict launch profile scope evidence is invalid: ${evidenceFailures.join(', ')}`,
+        )
       }
     }
     const cacheKey = [
@@ -253,12 +271,13 @@ export class OpenCodeProvisioningProbe {
       released = true
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       if (options.disposeHostOnRelease !== false) {
-        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive })
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: keepAlive || Boolean(options.existingHostKey) })
       }
     }
     try {
       const ensurePromise = hostManager.ensureHost({
         projectPath: inventory.projectPath,
+        ...(options.existingHostKey ? { hostKey: options.existingHostKey, existingOnly: true } : {}),
         preparedProfile: inventory.profile ?? undefined,
         ...(options.phaseContext
           ? { healthTimeoutMs: options.phaseContext.remainingMs() }
@@ -273,8 +292,14 @@ export class OpenCodeProvisioningProbe {
         } : {}),
       })
       host = await ensurePromise
+      if (options.expectedRuntimePid !== undefined && host.pid !== options.expectedRuntimePid) {
+        const acquired = host
+        host = undefined
+        await hostManager.releaseHost(acquired.hostKey, { keepPersistentAlive: true })
+        throw new Error(`OpenCode selected session runtime process changed (expected pid=${options.expectedRuntimePid}, actual pid=${acquired.pid}); relaunch the lane`)
+      }
       if (options.phaseContext?.signal.aborted) {
-        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: Boolean(options.existingHostKey) }).catch(() => undefined)
         host = undefined
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
@@ -283,6 +308,7 @@ export class OpenCodeProvisioningProbe {
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
+      if (options.existingHostKey) throw error
       const probeFailure = error instanceof Error ? error.message : String(error)
       const diagnostics = [
         ...inventory.diagnostics,
@@ -346,7 +372,7 @@ export class OpenCodeProvisioningProbe {
         }
         const appMcp = await mcpManager.ensureAppMcp({
           baseUrl: host.baseUrl,
-          attachIfMissing: true,
+          attachIfMissing: options.attachAppMcp !== false,
           requestContext,
         })
         const appMcpReady = appMcp.summary.status === 'attached'

@@ -1,8 +1,11 @@
+import { readProcessStartTimeMs } from '../../utils/processKill.js'
+import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
+import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
-  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -17,6 +20,7 @@ import {
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
@@ -39,11 +43,23 @@ import {
   fanOutOpenCodeOAuthCredential,
   materializeOpenCodeSelectedAuthCredential,
   mergeOpenCodeManagedAuthSources,
+  readOpenCodeSavedAuthStore,
+  readOpenCodeCommittedOAuthProbeRotation,
+  readOpenCodeCommittedOAuthSessionRotation,
+  sameOpenCodeOAuthSessionAuthority,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
   removeOpenCodeAuthCredential,
   upsertOpenCodeAuthCredential,
+  isValidOpenCodeOAuthCredential,
+  withOpenCodeOwnedOAuthRefresh,
+  recoverOpenCodeOwnedOAuthSave,
+  OpenCodeOAuthPublicationRevokedError,
+  type OpenCodeOAuthNativeSessionOwner,
+  type OpenCodeOAuthSaveOwner,
+  type OpenCodeAuthCredential,
+  type OpenCodeOAuthNativeProbeOwner,
 } from './OpenCodeAuthStore.js'
 import {
   readOpenCodeGlobalManagedRuntimePreferences,
@@ -59,6 +75,24 @@ import {
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  type OpenCodeCursorManagedAssets,
+  resolveOpenCodeCursorManagedAssets,
+} from './OpenCodeCursorManagedAssets.js'
+import {
+  applyCursorManagedProxyEndpoint,
+  CURSOR_MANAGED_PROXY_PORT_ENV,
+  reserveCursorManagedProxyPort,
+} from './OpenCodeCursorManagedPort.js'
+import {
+  buildCursorReadinessFingerprint,
+  CURSOR_NATIVE_ENV_KEYS,
+  resolveCursorAgentExecutable,
+  resolveCurrentCursorNativeAuthority,
+  resolveCursorExecutableIdentity,
+  cursorNativeSelectedIdentity,
+  reconcileCursorNativeAuthority,
+} from './OpenCodeCursorNativeAuthority.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
@@ -69,17 +103,18 @@ import {
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
 } from './OpenCodeCursorResourceExhaustedPatch.js'
 import type {
+  OpenCodeHostHandle,
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeProfilePurpose,
   OpenCodeProfileScope,
+  OpenCodeSessionRecord,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
-export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
-export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
-export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
+import { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME, OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeAgentNames.js'
+export { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME, OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeAgentNames.js'
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
 const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
@@ -94,31 +129,31 @@ const OPEN_CODE_PROFILE_RUNTIME_OVERRIDE_KEYS = [
   'XDG_CACHE_HOME', 'NPM_CONFIG_CACHE', 'PLAYWRIGHT_BROWSERS_PATH',
   'PUPPETEER_CACHE_DIR', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_devdir',
   'OPENCODE_DISABLE_CLAUDE_CODE',
-  'PATH', 'CURSOR_ACP_HOME_DIR', 'CURSOR_AGENT_EXECUTABLE',
+  'PATH', 'CURSOR_ACP_HOME_DIR', 'CURSOR_AGENT_EXECUTABLE', 'CURSOR_CONFIG_DIR', 'NODE_OPTIONS',
 ] as const
 
 // Copilot Free and Student can expose only GitHub's Auto picker, which OpenCode
-// cannot currently execute through an explicit model id. Seed one conservative
+// cannot currently execute through an explicit model id. Seed a current lightweight
 // explicit model so provider discovery and verification can return an actionable
-// limitation instead of hiding the authenticated provider. Paid accounts still
-// receive their account-specific models from OpenCode live discovery.
+// limitation instead of hiding the authenticated provider. The seed does not grant
+// model access; availability still depends on the account and live discovery.
 const GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG = {
   name: 'GitHub Copilot',
   npm: '@ai-sdk/github-copilot',
   api: 'https://api.githubcopilot.com',
   models: {
-    'gpt-5-mini': {
-      name: 'GPT-5 Mini',
-      family: 'gpt-mini',
+    'gpt-5.6-luna': {
+      name: 'GPT-5.6 Luna',
+      family: 'gpt-5.6-luna',
       attachment: true,
       reasoning: true,
       tool_call: true,
       structured_output: true,
       temperature: false,
       limit: {
-        context: 264_000,
-        input: 128_000,
-        output: 64_000,
+        context: 1_050_000,
+        input: 922_000,
+        output: 128_000,
       },
       modalities: {
         input: ['text', 'image'],
@@ -878,6 +913,8 @@ export async function areOpenCodeManagedPluginCachesReady(
 interface OpenCodeNativeCliCredentialBridge {
   binPath: string
   cursorAgentExecutablePath: string
+  /** The unwrapped native command, stable across profile preparations. */
+  cursorAgentHostCommand: string
   kiroCliExecutablePath: string
   hostHomePath: string
 }
@@ -898,8 +935,10 @@ type CursorAgentAuthProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
   abortSignal?: AbortSignal,
+  env?: NodeJS.ProcessEnv,
 ) => Promise<boolean>
 
+const CURSOR_SIGNED_OUT_PATTERN = /\bnot logged in\b|"authenticated"\s*:\s*false/i
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
 const CURSOR_AGENT_AUTH_MARKER_TTL_MS = 30 * 60 * 1000
 const CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS = 60 * 1000
@@ -962,19 +1001,22 @@ export function isKiroCliWhoamiAuthenticated(result: KiroCliWhoamiResult): boole
     || hasAuthenticatedKiroAccount(result.stderr)
 }
 
-const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform, abortSignal) =>
+const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform, abortSignal, env) =>
   await new Promise<boolean>(resolve => {
     execFile(
       executablePath,
       ['status'],
       {
+        env,
         signal: abortSignal,
         timeout: 15_000,
         windowsHide: true,
         shell: platform === 'win32',
       },
       (error, stdout, stderr) => {
-        resolve(!error && /\blogged in\b/i.test(`${stdout}\n${stderr}`))
+        // "Not logged in" also contains "logged in": a signed-out CLI must not pass.
+        const output = `${stdout}\n${stderr}`
+        resolve(!error && /\blogged in\b/i.test(output) && !CURSOR_SIGNED_OUT_PATTERN.test(output))
       },
     )
   })
@@ -1015,6 +1057,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   globalAuthPath: string
   managedAuthPath: string
   cursorAgentExecutablePath: string
+  env?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
   probe?: CursorAgentAuthProbe
   now?: () => number
@@ -1081,6 +1124,7 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
     input.cursorAgentExecutablePath,
     input.platform ?? process.platform,
     input.abortSignal,
+    input.env,
   ).catch(() => false)
   if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (!authenticated) {
@@ -1250,10 +1294,66 @@ function escapeWindowsBatchValue(value: string): string {
   return value.replaceAll('%', '%%')
 }
 
+/** Keeps the unscoped plugin list in step with the scoped policy override. */
+function substituteCursorManagedPlugin(
+  plugins: readonly string[],
+  assets: OpenCodeCursorManagedAssets | null,
+): string[] {
+  if (!assets) return [...plugins]
+  return plugins.map(plugin =>
+    plugin.startsWith('@rama_nigg/open-cursor') ? assets.pluginEntryPath : plugin)
+}
+
+// Reverify each preparation: negative results, restaging and interpreter changes
+// must agree with the uncached strict launch gates.
+export async function resolveManagedCursorAssets(
+  runtimeEnv: NodeJS.ProcessEnv,
+): Promise<OpenCodeCursorManagedAssets | null> {
+  const result = await resolveOpenCodeCursorManagedAssets({ env: runtimeEnv })
+  return result.available ? result.assets : null
+}
+
+async function managedCursorAssetsIdentity(assets: OpenCodeCursorManagedAssets): Promise<string> {
+  return hashString(JSON.stringify([assets.fingerprint, assets.pluginEntryPath, assets.mcpToolPath,
+    await resolveCursorExecutableIdentity(assets.interpreterPath)]))
+}
+
+export function buildCursorHostGeneration(input: {
+  assetsIdentity: string; nativeIdentity: string; scopeToken: string; configFingerprint: string
+  projectPath: string; profileRootKey: string; projectBehaviorFingerprint: string
+  binaryHostIdentity: string; transportIdentity: string
+}): string {
+  return hashString(JSON.stringify([input.assetsIdentity, input.nativeIdentity,
+    input.scopeToken, input.configFingerprint, input.projectPath, input.profileRootKey,
+    input.projectBehaviorFingerprint, input.binaryHostIdentity, input.transportIdentity,
+    OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION]))
+}
+
+// CURSOR_CONFIG_DIR isolates native model persistence, not native MCP discovery.
+// Derive it before account probing so strict scope and execution share one env.
+export function managedCursorNativeEnvironment(
+  env: NodeJS.ProcessEnv, dataPath: string, projectPath: string,
+): NodeJS.ProcessEnv {
+  return { ...env, CURSOR_CONFIG_DIR: path.join(dataPath, 'opencode',
+    'cursor-native-config', hashString(projectPath)), }
+}
+
+/** Pin the cancellation route reviewed in the staged transport fixture. */
+export function applyCursorManagedExecutionEnvironment(env: NodeJS.ProcessEnv): void {
+  Object.assign(env, {
+    CURSOR_ACP_BACKEND: 'cursor-agent', CURSOR_ACP_AGENT_POOL: 'false',
+    CURSOR_ACP_SESSION_RESUME: 'false', CURSOR_ACP_REUSE_EXISTING_PROXY: 'false',
+    CURSOR_ACP_TOOL_LOOP_MODE: 'opencode', CURSOR_ACP_PROVIDER_BOUNDARY: 'v1',
+    CURSOR_ACP_MODEL_AUTO_REFRESH: 'false',
+  })
+}
+
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  cursorManagedAssets: OpenCodeCursorManagedAssets | null = null,
+  managedConfigPath: string | null = null,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
   const hostHomePath = (
     platform === 'win32'
@@ -1261,18 +1361,35 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       : hostEnv.HOME?.trim() || hostEnv.USERPROFILE?.trim()
   ) || os.homedir()
   const hostPath = hostEnv.PATH ?? ''
-  const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+  const resolvedCursorCommand = platform === 'win32' && !cursorManagedAssets
+    ? hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() ?? 'cursor-agent'
+    : await resolveCursorAgentExecutable(hostEnv)
+  const cursorAgentCommand = resolvedCursorCommand
+    ?? path.join(profileRootPath, 'missing-native-cursor-agent')
+  if (cursorManagedAssets && !resolvedCursorCommand) {
+    throw new Error('Managed Cursor requires an absolute native executable')
+  }
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
   await mkdir(binPath, { recursive: true })
   const cursorResourceExhaustedPreloadPath = path.join(
     binPath,
     'cursor-resource-exhausted-preload.cjs',
   )
-  await writeFile(
-    cursorResourceExhaustedPreloadPath,
-    buildCursorAgentResourceExhaustedPreloadScript(),
-    { encoding: 'utf8', mode: 0o600 },
-  )
+  await publishNativeCliFile(cursorResourceExhaustedPreloadPath,
+    buildCursorAgentResourceExhaustedPreloadScript(), 0o600)
+
+  // The plugin registers OpenCode MCP servers as tools, but an agent can only
+  // reach them through the plugin's own mcptool CLI. A global npm install would
+  // provide it; a bundled artifact does not, so the profile ships its own shim.
+  if (cursorManagedAssets && platform !== 'win32') {
+    const shimPath = path.join(binPath, 'mcptool')
+    await publishNativeCliFile(shimPath, [
+      '#!/bin/sh',
+      `exec ${quotePosixShellValue(cursorManagedAssets.interpreterPath)}`
+        + ` ${quotePosixShellValue(cursorManagedAssets.mcpToolPath)} "$@"`,
+      '',
+    ].join('\n'), 0o700)
+  }
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
     const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
@@ -1296,7 +1413,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
-      await writeFile(bridgePath, content, 'utf8')
+      await publishNativeCliFile(bridgePath, content, 0o700)
       return bridgePath
     }
 
@@ -1305,8 +1422,19 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       '#!/bin/sh',
       `export HOME=${quotePosixShellValue(hostHomePath)}`,
       `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
-      'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
-      `export PATH=${quotePosixShellValue(hostPath)}`,
+      ...(command === 'cursor-agent'
+        ? CURSOR_NATIVE_ENV_KEYS.filter(key => key !== 'PATH').map(key => hostEnv[key] === undefined
+          ? `unset ${key}` : `export ${key}=${quotePosixShellValue(hostEnv[key]!)}`)
+        : ['unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME']),
+      command === 'cursor-agent' && cursorManagedAssets
+        // Native execution is absolute, so our mcptool can safely win PATH.
+        ? `export PATH=${quotePosixShellValue(`${binPath}${path.delimiter}${hostPath}`)}`
+        : `export PATH=${quotePosixShellValue(hostPath)}`,
+      ...(command === 'cursor-agent' && managedConfigPath
+        // The bridge clears XDG_*, so mcptool needs the config named outright or
+        // it would resolve the user's own OpenCode config instead of this profile.
+        ? [`export OPENCODE_CONFIG=${quotePosixShellValue(managedConfigPath)}`]
+        : []),
       ...(command === 'cursor-agent'
           ? [
             `if [ "\${${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}:-}" != "1" ]; then`,
@@ -1318,8 +1446,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
-    await writeFile(bridgePath, content, 'utf8')
-    await chmod(bridgePath, 0o700)
+    await publishNativeCliFile(bridgePath, content, 0o700)
     return bridgePath
   }
 
@@ -1327,7 +1454,10 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     writeBridge('cursor-agent'),
     writeBridge('kiro-cli'),
   ])
-  return { binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath }
+  return {
+    binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath,
+    cursorAgentHostCommand: cursorAgentCommand,
+  }
 }
 
 function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> {
@@ -1512,6 +1642,7 @@ function redactConfigIdentity(
 type OpenCodeEffectiveConfigSnapshot = Readonly<{
   projectPath: string
   importedRuntimeConfig: Readonly<Record<string, unknown>>
+  cursorAssetsIdentity?: string | null
   runtimeEnv: Readonly<NodeJS.ProcessEnv>
   managedPaths: Readonly<ReturnType<typeof resolveClaudeMultimodelPaths>>
   scopeIdentity: Readonly<{
@@ -1526,6 +1657,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
 }>
 
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
+const ownedOAuthSessionProfiles = new WeakMap<OpenCodePreparedProfile, { record: OpenCodeSessionRecord; profile: OpenCodePreparedProfile }>()
 const OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN =
   'agent-teams.opencode.semantic-secret-identity/v2'
 
@@ -1559,6 +1691,13 @@ function buildScopeIdentity(scope: OpenCodeProfileScope): {
     configFingerprint: scope.configFingerprint,
     selectedAuthIdentity: scope.selectedAuthIdentity,
   }
+}
+
+function buildScopedProfileRootKey(projectPath: string, scope: Pick<OpenCodeProfileScope, 'scopeToken'>): string {
+  // The token binds the complete effective snapshot. The narrower config/auth
+  // tuple can be identical for distinct tokens. Keep scoped stores out of legacy
+  // OAuth peer reconciliation, including in a later bridge process.
+  return `scope-${hashString(JSON.stringify({ projectPath, scopeToken: scope.scopeToken }))}`
 }
 
 function isolateScopedRuntimeConfig(
@@ -1929,13 +2068,20 @@ async function bindSelectedProviderAuthoritySources(input: {
   }
 }
 
-export async function resolveOpenCodeProfileScope(input: {
+type OpenCodeScopeResolutionInput = {
   projectPath?: string | null
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
-}): Promise<OpenCodeProfileScope> {
-  const inputEnv = input.env ?? process.env
+  // Authority refresh reads scope without publishing a preparation snapshot.
+  cacheSnapshot?: boolean
+  isOAuthNativeSessionSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
+  isOAuthNativeSessionUnsubmitted?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
+  isOAuthNativeProbeSettled?: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<boolean>
+  oauthSessionToRelease?: OpenCodeSessionRecord
+}
+
+function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const retainedScopeEnvironment = asRecord(safeParseJSONC(
     inputEnv[OPEN_CODE_SCOPE_ENVIRONMENT_ENV],
   ))
@@ -1943,6 +2089,128 @@ export async function resolveOpenCodeProfileScope(input: {
   for (const [key, value] of Object.entries(retainedScopeEnvironment)) {
     if (value === null) delete envSnapshot[key]
     else if (typeof value === 'string') envSnapshot[key] = value
+  }
+  return envSnapshot
+}
+
+export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
+  await recoverOpenCodeScopedOAuth(input)
+  return resolveOpenCodeProfileScopeInternal(input)
+}
+
+async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
+  // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
+  // Fresh launch resolution can finish an already proven native publication;
+  // it cannot create provenance from an old managed auth file.
+  if (input.cacheSnapshot !== false && input.selectedModel.split('/')[0]?.trim().toLowerCase() === 'xai') {
+    const env = scopeSourceEnvironment(input.env ?? process.env)
+    const managedPaths = resolveClaudeMultimodelPaths(env)
+    const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+    const globalAuthPath = path.join(managedPaths.data, 'opencode', 'auth.json')
+    await recoverOpenCodeOwnedOAuthSave({
+      globalAuthPath, env,
+      assertRetirementAuthority: async owner => {
+        if (await canonicalizeOpenCodeProjectPath(input.projectPath) !== owner.projectPath) {
+          throw new Error('OpenCode OAuth retirement belongs to another project; original admission retained')
+        }
+      },
+      sessionToRelease: input.oauthSessionToRelease,
+      sourceAuthPaths: Array.from(new Set([globalAuthPath,
+        path.join(env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share'), 'opencode', 'auth.json'),
+        path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+      ])),
+      isNativeProbeSettled: input.isOAuthNativeProbeSettled ?? (async owner => {
+        const { OpenCodeExecutionProbe } = await import('./OpenCodeExecutionProbe.js')
+        return new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, managedPaths.data)
+      }),
+      isNativeSessionSettled: input.isOAuthNativeSessionSettled ?? (async owner => {
+        const [{ OpenCodeSessionBridge }, { OpenCodeHostManager }, { OpenCodeSessionStore }] = await Promise.all([
+          import('./OpenCodeSessionBridge.js'), import('./OpenCodeHostManager.js'), import('./OpenCodeSessionStore.js'),
+        ])
+        return new OpenCodeSessionBridge({
+          oauthRecoveryDataRoot: managedPaths.data,
+          hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(managedPaths.data, 'opencode', 'host-registry.json') }),
+          sessionStore: new OpenCodeSessionStore(path.join(managedPaths.data, 'opencode', 'session-store.json')),
+        }).isOwnedOAuthNativeSessionSettled(owner)
+      }),
+      isNativeSessionUnsubmitted: input.isOAuthNativeSessionUnsubmitted ?? (async owner => {
+        const [{ OpenCodeSessionBridge }, { OpenCodeHostManager }, { OpenCodeSessionStore }] = await Promise.all([
+          import('./OpenCodeSessionBridge.js'), import('./OpenCodeHostManager.js'), import('./OpenCodeSessionStore.js'),
+        ])
+        return new OpenCodeSessionBridge({
+          oauthRecoveryDataRoot: managedPaths.data,
+          hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(managedPaths.data, 'opencode', 'host-registry.json') }),
+          sessionStore: new OpenCodeSessionStore(path.join(managedPaths.data, 'opencode', 'session-store.json')),
+        }).isOwnedOAuthNativeSessionSettled(owner, true)
+      }),
+      isNativeProbeUnsubmitted: async owner => {
+        const { OpenCodeExecutionProbe } = await import('./OpenCodeExecutionProbe.js')
+        return new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, managedPaths.data, true)
+      },
+      assertOwner: async (owner, predecessor, managedAuthPath) => {
+        const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+        if (projectPath !== owner.projectPath
+          && !await isOpenCodeOAuthPublicationScopeCurrent(owner, predecessor, env, projectPath)) {
+          throw new Error('OpenCode OAuth restart admission belongs to another project; original completion retained')
+        }
+        const expectedPath = path.join(managedPaths.data, 'opencode', 'profiles',
+          buildScopedProfileRootKey(owner.projectPath, owner), 'data', 'opencode', 'auth.json')
+        if (managedAuthPath !== expectedPath) {
+          throw new Error('OpenCode OAuth pending saved publication managed owner changed')
+        }
+        if (!await isOpenCodeOAuthPublicationScopeCurrent(owner, predecessor, env)) {
+          if (!owner.credentialBinding) {
+            throw new Error('OpenCode OAuth recovery binding unavailable for changed launch scope; original admission retained')
+          }
+          throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth pending saved publication source scope changed')
+        }
+      },
+    })
+  }
+}
+
+// Read-only publication comparison. Substitution is limited to the proven
+// predecessor; it cannot prepare a profile or select the successor recursively.
+export async function isOpenCodeOAuthPublicationScopeCurrent(
+  owner: OpenCodeOAuthSaveOwner, predecessor: OpenCodeAuthCredential, env: NodeJS.ProcessEnv,
+  admissionProjectPath?: string,
+): Promise<boolean> {
+  if (owner.launchCredential) {
+    if (!isValidOpenCodeOAuthCredential(owner.launchCredential)
+      || owner.launchCredential.accountId !== predecessor.accountId) return false
+    predecessor = owner.launchCredential
+  }
+  const binding = owner.credentialBinding
+  if (binding && (binding.version !== 1 || binding.scopeToken !== owner.scopeToken
+    || !/^[a-f0-9]{64}$/.test(binding.fingerprint))) {
+    throw new Error('OpenCode OAuth recovery binding is invalid')
+  }
+  let currentBinding: OpenCodeOAuthSaveOwner['credentialBinding']
+  const scope = await resolveOpenCodeProfileScopeInternal({
+    projectPath: owner.projectPath, purpose: owner.purpose,
+    selectedModel: 'xai/oauth-authority', env, cacheSnapshot: false,
+  }, predecessor, value => { currentBinding = value })
+  return scope.scopeToken === owner.scopeToken
+    || !!binding && currentBinding?.fingerprint === binding.fingerprint
+      && (admissionProjectPath === undefined || admissionProjectPath === owner.projectPath)
+}
+
+async function resolveOpenCodeProfileScopeInternal(
+  input: OpenCodeScopeResolutionInput,
+  // Private substitution for proven OAuth lineage. Ordinary comparison never
+  // caches; only exact owned-session reconstruction captures a config snapshot.
+  recoveryPredecessor?: OpenCodeAuthCredential,
+  captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
+  captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
+): Promise<OpenCodeProfileScope> {
+  const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
+  const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+  if (isStrictAuthorityPurpose(input.purpose)
+    && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
+    Object.assign(envSnapshot, managedCursorNativeEnvironment(
+      envSnapshot, resolveClaudeMultimodelPaths(envSnapshot).data, projectPath,
+    ))
+    await mkdir(envSnapshot.CURSOR_CONFIG_DIR!, { recursive: true, mode: 0o700 })
   }
   const env = Object.freeze(envSnapshot)
   const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
@@ -1953,11 +2221,22 @@ export async function resolveOpenCodeProfileScope(input: {
   }
   if (isStrictAuthorityPurpose(input.purpose)
     && (providerId === 'kiro' || providerId === 'cursor-acp')) {
-    throw new Error(
-      `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`,
-    )
+    // Cursor is admitted only once the staged managed assets verify: they carry
+    // the ownership barrier and the Stop control that make a terminal Stop
+    // provable. Unstaged Cursor, and Kiro, stay blocked.
+    const managedCursor = providerId === 'cursor-acp'
+      ? await resolveOpenCodeCursorManagedAssets({ env })
+        .catch(error => ({ available: false as const, reason: `probe_failed:${String(error).slice(0, 60)}` }))
+      : { available: false as const, reason: 'provider_has_no_managed_path' }
+    if (!managedCursor.available) {
+      // The reason is the whole difference between "this build ships no assets"
+      // and "the environment hid the interpreter", and both used to read alike.
+      throw new Error(
+        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`
+        + ` (managed path unavailable: ${managedCursor.reason})`,
+      )
+    }
   }
-  const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
     ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
     : await readSafeOpenCodeRuntimeConfigImport(env)
@@ -1985,8 +2264,9 @@ export async function resolveOpenCodeProfileScope(input: {
     plugin: effective.plugin ?? null,
   }, env)
   const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(snapshotHomePath, '.local', 'share')
-  const selectedAuth = await readSelectedAuthFromSources({
-    providerId,
+  const selectedAuth = recoveryPredecessor ? { credential: recoveryPredecessor,
+    identity: authCredentialIdentity('xai', recoveryPredecessor) } : await readSelectedAuthFromSources({
+    providerId, env, admissionProjectPath: projectPath,
     globalAuthPath: path.join(snapshotManagedPaths.data, 'opencode', 'auth.json'),
     sourcePaths: Array.from(new Set([
       path.join(snapshotManagedPaths.data, 'opencode', 'auth.json'),
@@ -2002,6 +2282,10 @@ export async function resolveOpenCodeProfileScope(input: {
     throw new Error('OpenCode strict profile selected authentication is unavailable')
   }
   const authlessAuthorityMode = isStrictAuthorityPurpose(input.purpose)
+    // Cursor's loopback adapter is native-authenticated, not authless. Otherwise
+    // its first marker write changes configured_authless to null and rotates
+    // config/scope identity even while the native account remains unchanged.
+    && providerId !== 'cursor-acp'
     && selectedAuth.credential === null
     && !authoritySources.hasStaticCredential
     ? resolveOpenCodeAuthlessAuthorityMode({
@@ -2010,13 +2294,34 @@ export async function resolveOpenCodeProfileScope(input: {
         providerConfig: selectedProviderConfig,
       })
     : null
+  // The Cursor marker credential is deliberately not proof. A live native account
+  // probe is, and it is only consulted when the managed assets verify.
+  const cursorCandidate = isStrictAuthorityPurpose(input.purpose)
+    && providerId === 'cursor-acp'
+  const cursorAssets = cursorCandidate ? await resolveManagedCursorAssets(env) : null
+  const cursorAssetsReady = cursorAssets !== null
+  const cursorAssetsIdentity = cursorAssets ? await managedCursorAssetsIdentity(cursorAssets) : null
+  const cursorNative = cursorAssetsReady ? await resolveCurrentCursorNativeAuthority(env) : null
+  const cursorNativeAuthorized = cursorNative !== null
+  if (cursorCandidate && !cursorNativeAuthorized) {
+    throw new Error('OpenCode strict Cursor profile requires current native authentication')
+  }
+  const selectedAuthIdentity = cursorNative?.identity ?? selectedAuth.identity
   if (
     isStrictAuthorityPurpose(input.purpose)
     && !selectedAuthIsCredential
     && !authoritySources.hasStaticCredential
     && authlessAuthorityMode === null
+    && !cursorNativeAuthorized
   ) {
-    throw new Error('OpenCode strict profile requires explicit selected authentication')
+    // Which of the three conditions failed is the difference between "stage the
+    // assets", "sign in to Cursor" and "this provider needs a credential".
+    const cursorDetail = !cursorCandidate
+      ? 'not_cursor_native_candidate'
+      : !cursorAssetsReady ? 'managed_assets_unavailable' : 'cursor_account_not_authorized'
+    throw new Error(
+      `OpenCode strict profile requires explicit selected authentication (${cursorDetail})`,
+    )
   }
   const authlessAuthorityFingerprint = authlessAuthorityMode === null
     ? null
@@ -2028,6 +2333,7 @@ export async function resolveOpenCodeProfileScope(input: {
   const authoritySourceFingerprint = semanticSecretIdentity('selected-provider-authority', {
     sourceFingerprint: authoritySources.fingerprint,
     authlessAuthorityFingerprint,
+    ...(cursorAssetsIdentity ? { cursorAssetsIdentity } : {}),
   })
   const retainedAppMcpLaunchConfig = safeParseJSONC(
     env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
@@ -2063,31 +2369,70 @@ export async function resolveOpenCodeProfileScope(input: {
     purpose: input.purpose,
     providerId,
     configFingerprint,
-    selectedAuthIdentity: selectedAuth.identity,
+    selectedAuthIdentity,
     effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
     selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
     authoritySourceFingerprint,
     managedPaths: snapshotManagedPaths,
     appMcpLaunchIdentity,
   })
+  if (captureCredentialBinding) {
+    // This is credential admission, not host reuse. Bind every scope input,
+    // changing only the port of an otherwise identical local app control URL.
+    const credentialMcp = structuredClone(appMcpLaunchConfig)
+    let restartEligible = false
+    if (credentialMcp?.config.type === 'local') {
+      const localEnv = credentialMcp.config.environment
+      const control = localEnv?.CLAUDE_TEAM_CONTROL_URL
+      const authorityRoot = localEnv?.AGENT_TEAMS_MCP_CLAUDE_DIR
+      if (localEnv && control && authorityRoot && path.isAbsolute(authorityRoot)) {
+        try {
+          const url = new URL(control)
+          if (url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname)
+            && !url.username && !url.password && !control.includes('#') && url.port !== '0') {
+            restartEligible = true
+            url.port = ''
+            localEnv.CLAUDE_TEAM_CONTROL_URL = url.toString()
+          }
+        } catch { /* No restart relaxation for an invalid endpoint. */ }
+      }
+    }
+    captureCredentialBinding({ version: 1, scopeToken,
+      fingerprint: semanticSecretIdentity('oauth-credential-authority-v1', {
+        projectPath, purpose: input.purpose, providerId, identity,
+        selectedAuthIdentity, authoritySourceFingerprint,
+        effectiveConfigSnapshot: redactConfigIdentity(importedRuntimeConfig, env),
+        selectedProviderApiKeyIdentity: selectedProviderApiKeyIdentity(providerId, env),
+        managedPaths: snapshotManagedPaths,
+        sourceRoots: { home: snapshotHomePath, xdgDataHome },
+        appMcpLaunchIdentity: redactConfigIdentity(credentialMcp, env),
+        // Shared redaction may erase invalid URL details (notably fragments).
+        // Only eligible local endpoints may compare across distinct full scopes.
+        ...(!restartEligible ? { exactScopeToken: scopeToken } : {}),
+      }),
+    })
+  }
   const scope: OpenCodeProfileScope = {
     purpose: input.purpose,
     providerId,
     configFingerprint,
-    selectedAuthIdentity: selectedAuth.identity,
+    selectedAuthIdentity,
     scopeToken,
   }
-  if (!openCodeEffectiveConfigSnapshots.has(scopeToken)) {
-    openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
+  if (captureSnapshot || !recoveryPredecessor && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
+    const snapshot = freezeConfigSnapshot({
       projectPath,
       importedRuntimeConfig,
       runtimeEnv: env,
+      cursorAssetsIdentity,
       managedPaths: snapshotManagedPaths,
       scopeIdentity: buildScopeIdentity(scope),
       selectedAuthCredential: selectedAuth.credential,
       authoritySourceFingerprint,
       appMcpLaunchConfig,
-    }))
+    })
+    if (captureSnapshot) captureSnapshot(snapshot)
+    else openCodeEffectiveConfigSnapshots.set(scopeToken, snapshot)
   }
   return scope
 }
@@ -2168,6 +2513,19 @@ export function buildManagedConfigFingerprint(
   )))
 }
 
+/**
+ * Per-section fingerprints of the same config the whole fingerprint covers.
+ * A stale session otherwise reports only "some hash changed", which is exactly
+ * the question a launch failure leaves you asking.
+ */
+export function buildManagedConfigSectionFingerprints(
+  managedConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  return Object.fromEntries(Object.keys(managedConfig).sort().map(section =>
+    [section, buildManagedConfigFingerprint({ [section]: managedConfig[section] }, env)]))
+}
+
 export function orderOpenCodeAuthSyncSources(input: {
   globalAuthPath: string
   globalAuthFingerprint: string | null
@@ -2227,6 +2585,8 @@ function isValidatedStrictAuthCredential(providerId: string, credential: unknown
 }
 
 async function readSelectedAuthFromSources(input: {
+  admissionProjectPath?: string
+  env?: NodeJS.ProcessEnv
   providerId: string
   sourcePaths: readonly string[]
   globalAuthPath: string
@@ -2237,11 +2597,14 @@ async function readSelectedAuthFromSources(input: {
   let selected: Awaited<ReturnType<typeof readOpenCodeAuthCredential>> = null
   try {
     const sourceStores = await Promise.all(input.sourcePaths.map(readOpenCodeAuthStore))
-    const merged = mergeOpenCodeManagedAuthSources({
+    const sources = {
       sourceAuthPaths: input.sourcePaths,
-      sourceStores,
+      sourceStores, env: input.env, admissionProjectPath: input.admissionProjectPath,
       globalAuthPath: input.globalAuthPath,
-    })
+    }
+    const merged = input.providerId === 'xai'
+      ? await readOpenCodeSavedAuthStore(sources)
+      : mergeOpenCodeManagedAuthSources(sources)
     selected = merged[input.providerId] ?? null
     return { credential: selected, identity: authCredentialIdentity(input.providerId, selected) }
   } catch {
@@ -2300,7 +2663,7 @@ export class OpenCodeProfileManager {
     }
 
     return entries
-      .filter(entry => entry.isDirectory())
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith('scope-'))
       .map(entry => path.join(profilesRootPath, entry.name, 'data', 'opencode', 'auth.json'))
       .sort((left, right) => left.localeCompare(right))
   }
@@ -2310,6 +2673,283 @@ export class OpenCodeProfileManager {
       providerId,
       sourceAuthPath,
       targetAuthPaths: [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
+    })
+  }
+
+  private async scopedOAuthAuthority(profile: OpenCodePreparedProfile) {
+    await assertOpenCodePreparedProfileScope(profile)
+    const snapshot = openCodeEffectiveConfigSnapshots.get(profile.scopeToken ?? '')
+    const scope = profile.profileScope
+    if (!snapshot || !scope || scope.providerId !== 'xai') {
+      throw new Error('OpenCode OAuth refresh requires an exact scoped snapshot')
+    }
+    const rootKey = buildScopedProfileRootKey(snapshot.projectPath, scope)
+    const managedAuthPath = path.join(snapshot.managedPaths.data, 'opencode', 'profiles',
+      rootKey, 'data', 'opencode', 'auth.json')
+    if (profile.profileRootKey !== rootKey || profile.managedAuthPath !== managedAuthPath) {
+      throw new Error('OpenCode OAuth refresh managed scope path changed')
+    }
+    const globalAuthPath = this.getGlobalAuthPath(snapshot.managedPaths.data)
+    const sourceAuthPaths = Array.from(new Set([
+      globalAuthPath, ...this.getSourceAuthPaths(snapshot.runtimeEnv),
+    ]))
+    return { snapshot, scope, managedAuthPath, globalAuthPath, sourceAuthPaths }
+  }
+
+  async finishOwnedOAuthBeforeSessionRelease(
+    record: OpenCodeSessionRecord,
+    isSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>,
+  ): Promise<void> {
+    if (record.profileScope?.providerId !== 'xai') return
+    const snapshot = openCodeEffectiveConfigSnapshots.get(record.profileScope.scopeToken)
+    await recoverOpenCodeScopedOAuth({
+      projectPath: record.projectPath, purpose: record.profileScope.purpose,
+      selectedModel: record.selectedModel, env: snapshot?.runtimeEnv ?? process.env,
+      oauthSessionToRelease: record, isOAuthNativeSessionSettled: isSettled,
+    })
+  }
+
+  async readSavedOAuthCredential(profile: OpenCodePreparedProfile) {
+    const authority = await this.scopedOAuthAuthority(profile)
+    const selected = await readSelectedAuthFromSources({
+      providerId: authority.scope.providerId, env: authority.snapshot.runtimeEnv,
+      admissionProjectPath: authority.snapshot.projectPath,
+      sourcePaths: authority.sourceAuthPaths,
+      globalAuthPath: authority.globalAuthPath,
+    })
+    if (selected.identity === 'error') throw new Error('OpenCode OAuth saved authority is unavailable')
+    return selected.credential
+  }
+
+  async getOAuthRefreshEnvironment(profile: OpenCodePreparedProfile): Promise<NodeJS.ProcessEnv> {
+    return { ...(await this.scopedOAuthAuthority(profile)).snapshot.runtimeEnv }
+  }
+
+  async readCompletedSessionOAuthRotation(record: OpenCodeSessionRecord, env: NodeJS.ProcessEnv = process.env) {
+    record = structuredClone(record)
+    if (record.profileScope?.purpose !== 'launch_runtime' || record.profileScope.providerId !== 'xai'
+      || record.stoppedAt || record.staleReason || !record.runId) return null
+    const runtimeEnv = scopeSourceEnvironment(env)
+    const data = resolveClaudeMultimodelPaths(runtimeEnv).data
+    const globalAuthPath = this.getGlobalAuthPath(data)
+    const managedAuthPath = path.join(data, 'opencode', 'profiles', record.profileRootKey, 'data', 'opencode', 'auth.json')
+    const input = { globalAuthPath, managedAuthPath, env: runtimeEnv, record,
+      sourceAuthPaths: Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths(runtimeEnv)])) }
+    const rotation = await readOpenCodeCommittedOAuthSessionRotation(input)
+    if (!rotation) return null
+    const scopeInput = { projectPath: record.projectPath, purpose: 'launch_runtime' as const,
+      selectedModel: record.selectedModel, env: runtimeEnv, cacheSnapshot: false }
+    // Exact scope alone must not bypass a missing or forged retained binding.
+    // Recompute it from the proven original launch credential and current inputs.
+    let binding: OpenCodeOAuthSaveOwner['credentialBinding']
+    const launchScope = await resolveOpenCodeProfileScopeInternal(scopeInput, rotation.predecessor,
+      value => { binding = value })
+    if (!isDeepStrictEqual(launchScope, record.profileScope)
+      || !isDeepStrictEqual(binding, rotation.credentialBinding)) return null
+    await this.assertSessionRefreshOwner(record, rotation.nativeSession, data)
+    return isDeepStrictEqual(await readOpenCodeCommittedOAuthSessionRotation(input), rotation) ? rotation : null
+  }
+
+  private async assertSessionRefreshOwner(record: OpenCodeSessionRecord, native: OpenCodeOAuthNativeSessionOwner, data: string) {
+    const [{ OpenCodeSessionStore }, { OpenCodeHostManager }] = await Promise.all([
+      import('./OpenCodeSessionStore.js'), import('./OpenCodeHostManager.js'),
+    ])
+    const current = await new OpenCodeSessionStore(path.join(data, 'opencode', 'session-store.json'))
+      .get(record.teamId, record.laneId ?? 'primary', record.memberName)
+    if (!current || !sameOpenCodeOAuthSessionAuthority(current, record) || current.stoppedAt || current.staleReason) {
+      throw new Error('OpenCode OAuth session refresh authority changed; relaunch the lane')
+    }
+    const endpoint = await new OpenCodeHostManager({ persistentRegistryPath: path.join(data, 'opencode', 'host-registry.json') })
+      .resolveOwnedSessionEndpoint(record.hostKey, { teamId: record.teamId, laneId: record.laneId,
+        memberName: record.memberName, runId: record.runId, sessionId: record.opencodeSessionId,
+        projectPath: record.projectPath, expectedProcessStartedAtMs: native.processStartedAtMs })
+    if (endpoint.pid !== native.pid || endpoint.baseUrl !== native.baseUrl) {
+      throw new Error('OpenCode OAuth session refresh process changed')
+    }
+  }
+
+  async prepareOwnedOAuthSessionProfile(record: OpenCodeSessionRecord, signal?: AbortSignal) {
+    const rotation = await this.readCompletedSessionOAuthRotation(record)
+    if (!rotation) return null
+    let snapshot: OpenCodeEffectiveConfigSnapshot | undefined
+    const scope = await resolveOpenCodeProfileScopeInternal({ projectPath: record.projectPath,
+      selectedModel: record.selectedModel, purpose: 'launch_runtime', cacheSnapshot: false },
+      rotation.predecessor, undefined, value => { snapshot = value })
+    if (!snapshot || !isDeepStrictEqual(scope, record.profileScope)) return null
+    // Reconstruct the original config only. This snapshot never materializes C0
+    // into native auth; preparation below checks the committed successor instead.
+    openCodeEffectiveConfigSnapshots.set(scope.scopeToken, snapshot)
+    const profile = await this.prepareProfileInternal(record.projectPath, {
+      profileScope: scope, toolApprovalMode: record.toolApprovalMode ?? 'auto', abortSignal: signal,
+    }, record)
+    if (!isDeepStrictEqual(await this.readCompletedSessionOAuthRotation(record), rotation)) {
+      throw new Error('OpenCode OAuth session refresh changed during preparation')
+    }
+    ownedOAuthSessionProfiles.set(profile, { record: structuredClone(record), profile: structuredClone(profile) })
+    return profile
+  }
+
+  hasOwnedOAuthSessionProfile(record: OpenCodeSessionRecord, profile: OpenCodePreparedProfile): boolean {
+    const proof = ownedOAuthSessionProfiles.get(profile)
+    return !!proof && sameOpenCodeOAuthSessionAuthority(proof.record, record) && isDeepStrictEqual(proof.profile, profile)
+  }
+
+  async readCompletedReadinessOAuthRotation(
+    host: OpenCodeHostHandle,
+    selectedModel: string,
+    currentScope: OpenCodeProfileScope,
+    completedProbe: OpenCodeOAuthNativeProbeOwner,
+  ) {
+    if (host.profile.profileScope?.purpose !== 'launch_runtime'
+      || host.profile.profileScope.providerId !== 'xai'
+      || !selectedModel.startsWith('xai/') || !host.processStartedAtMs
+      || host.profileRootKey !== host.profile.profileRootKey
+      || host.projectPath !== host.profile.canonicalProjectPath) return null
+    const nativeProbe = { projectPath: host.profile.canonicalProjectPath, scopeToken: host.profile.scopeToken!,
+      profileRootKey: host.profileRootKey, hostKey: host.hostKey, baseUrl: host.baseUrl,
+      pid: host.pid, processStartedAtMs: host.processStartedAtMs, selectedModel,
+      sessionId: completedProbe.sessionId, messageId: completedProbe.messageId }
+    if (!nativeProbe.sessionId || !nativeProbe.messageId
+      || !isDeepStrictEqual(completedProbe, nativeProbe)) return null
+    const authority = await this.scopedOAuthAuthority(host.profile)
+    const predecessor = authority.snapshot.selectedAuthCredential
+    if (!isValidOpenCodeOAuthCredential(predecessor)) return null
+    const rotation = await readOpenCodeCommittedOAuthProbeRotation({
+      ...authority, env: authority.snapshot.runtimeEnv, predecessor,
+      nativeProbe,
+    })
+    if (!rotation) return null
+    const input = { projectPath: authority.snapshot.projectPath, selectedModel,
+      purpose: authority.scope.purpose, env: host.profile.env, cacheSnapshot: false }
+    // Unlike restart credential admission, readiness requires the exact full
+    // scope (including MCP port), substituting only proven credential bytes.
+    const before = await resolveOpenCodeProfileScopeInternal(input, rotation.predecessor)
+    const after = await resolveOpenCodeProfileScopeInternal(input, rotation.successor)
+    return isDeepStrictEqual(before, authority.scope) && isDeepStrictEqual(after, currentScope)
+      && await readProcessStartTimeMs(nativeProbe.pid) === nativeProbe.processStartedAtMs
+      ? rotation : null
+  }
+
+  // This wraps controlled, settled native work; it never blesses a credential
+  // discovered by scanning profiles. Source paths come from the resolver's
+  // retained environment, including when this manager's ambient data root differs.
+  async withOwnedOAuthRefresh<T>(input: {
+    profile: OpenCodePreparedProfile
+    sessionRecord?: OpenCodeSessionRecord
+    assertHostOwnership: () => Promise<void>
+    operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
+      armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
+    isNativeSettled?: (value: T) => boolean
+    allowNativeContinuation?: boolean
+    abortSignal?: AbortSignal
+  }): Promise<T> {
+    const sessionRecord = input.sessionRecord ? structuredClone(input.sessionRecord) : undefined
+    const captured = structuredClone(input.profile)
+    const authority = await this.scopedOAuthAuthority(input.profile)
+    const launchCredential = authority.snapshot.selectedAuthCredential
+    const rotation = sessionRecord
+      ? await this.readCompletedSessionOAuthRotation(sessionRecord, authority.snapshot.runtimeEnv) : null
+    const predecessor = rotation?.successor ?? launchCredential
+    if (rotation && (!isDeepStrictEqual(sessionRecord?.profileScope, authority.scope)
+      || sessionRecord?.profileRootKey !== captured.profileRootKey
+      || !isDeepStrictEqual(launchCredential, rotation.predecessor))) {
+      throw new Error('OpenCode OAuth continuation does not match the prepared session')
+    }
+    const assertPublicationOwnership = async () => {
+      if (!isDeepStrictEqual(input.profile, captured)) {
+        throw new Error('OpenCode OAuth prepared host profile changed')
+      }
+      await input.assertHostOwnership()
+      if (isValidOpenCodeOAuthCredential(predecessor)) {
+        const originalScope = await resolveOpenCodeProfileScopeInternal({
+          projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
+          purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
+        }, launchCredential!)
+        if (originalScope.scopeToken !== authority.scope.scopeToken) {
+          throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth publication source configuration changed')
+        }
+      }
+    }
+    const assertOwnership = async () => {
+      await assertPublicationOwnership()
+      const current = await resolveOpenCodeProfileScope({
+        projectPath: authority.snapshot.projectPath,
+        selectedModel: `${authority.scope.providerId}/oauth-authority`,
+        purpose: authority.scope.purpose,
+        env: authority.snapshot.runtimeEnv,
+        cacheSnapshot: false,
+      })
+      // This runs before publication, while saved authority must still be C0.
+      // Include the complete effective snapshot token, not just its narrower
+      // selected config/auth tuple. Publication never reseals this old profile.
+      const expectedScope = rotation ? await resolveOpenCodeProfileScopeInternal({
+        projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
+        purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
+      }, predecessor!) : authority.scope
+      if (!isDeepStrictEqual(current, expectedScope)) {
+        throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth source scope changed')
+      }
+    }
+    if (!isValidOpenCodeOAuthCredential(predecessor)) {
+      if (predecessor?.type === 'oauth') throw new Error('OpenCode OAuth predecessor is malformed')
+      await assertOwnership()
+      return input.operation(async () => {}, async () => {})
+    }
+    let credentialBinding: OpenCodeOAuthSaveOwner['credentialBinding']
+    await resolveOpenCodeProfileScopeInternal({
+      projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
+      purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
+    }, launchCredential!, binding => { credentialBinding = binding })
+    if (credentialBinding?.scopeToken !== authority.scope.scopeToken) {
+      throw new Error('OpenCode OAuth admission source configuration changed')
+    }
+    return withOpenCodeOwnedOAuthRefresh({
+      ...authority, env: authority.snapshot.runtimeEnv,
+      providerId: authority.scope.providerId,
+      predecessor,
+      assertOwnership,
+      assertPublicationOwnership,
+      expectedOperationId: rotation?.operationId,
+      operation: (armSession, armProbe) => input.operation(async native => {
+        if (rotation && (!sessionRecord || !sameOpenCodeOAuthSessionAuthority(native.record, sessionRecord)
+          || native.baseUrl !== rotation.nativeSession.baseUrl || native.pid !== rotation.nativeSession.pid
+          || native.processStartedAtMs !== rotation.nativeSession.processStartedAtMs)) {
+          throw new Error('OpenCode OAuth continuation native owner changed')
+        }
+        const { OpenCodeSessionStore } = await import('./OpenCodeSessionStore.js')
+        const records = await new OpenCodeSessionStore(path.join(authority.snapshot.managedPaths.data,
+          'opencode', 'session-store.json')).list()
+        const candidates = rotation
+          ? rotation.nativeSession.sessionAuthorities! : records
+        const sessionAuthorities: OpenCodeSessionRecord[] = []
+        for (const record of records) {
+          if (record.hostKey !== native.record.hostKey || record.runtimePid !== native.pid
+            || record.profileRootKey !== native.record.profileRootKey
+            || !isDeepStrictEqual(record.profileScope, native.record.profileScope)
+            || record.stoppedAt || record.staleReason
+            || !candidates.some(candidate => sameOpenCodeOAuthSessionAuthority(candidate, record))) continue
+          await this.assertSessionRefreshOwner(record, native, authority.snapshot.managedPaths.data)
+          sessionAuthorities.push(record)
+        }
+        if (!sessionAuthorities.some(record => sameOpenCodeOAuthSessionAuthority(record, native.record))) {
+          if (rotation) throw new Error('OpenCode OAuth native admission session authority changed')
+          // Legacy/injected owners retain their existing single-session receipt;
+          // absence of persisted cohort evidence never authorizes peer reuse.
+          const singleSession = { ...native }
+          delete singleSession.sessionAuthorities
+          await armSession(singleSession)
+          return
+        }
+        await armSession({ ...native, sessionAuthorities })
+      }, armProbe),
+      isNativeSettled: input.isNativeSettled,
+      allowNativeContinuation: input.allowNativeContinuation,
+      recoveryOwner: authority.scope.purpose === 'catalog' ? undefined : {
+        projectPath: authority.snapshot.projectPath, purpose: authority.scope.purpose,
+        scopeToken: authority.scope.scopeToken, credentialBinding,
+        ...(rotation ? { launchCredential: rotation.predecessor } : {}),
+      },
+      abortSignal: input.abortSignal,
     })
   }
 
@@ -2327,10 +2967,7 @@ export class OpenCodeProfileManager {
     const managedPaths = snapshot?.managedPaths ?? this.paths
     const runtimeEnv = snapshot?.runtimeEnv ?? process.env
     const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
-    const profileRootKey = hashString(JSON.stringify({
-      projectPath,
-      ...buildScopeIdentity(policy.scope),
-    })).slice(0, 16)
+    const profileRootKey = buildScopedProfileRootKey(projectPath, policy.scope)
     const managedAuthPath = path.join(
       managedPaths.data,
       'opencode',
@@ -2346,7 +2983,7 @@ export class OpenCodeProfileManager {
     ]))
     const [source, managed, preferences] = await Promise.all([
       readSelectedAuthFromSources({
-        providerId: policy.scope.providerId,
+        providerId: policy.scope.providerId, env: runtimeEnv, admissionProjectPath: projectPath,
         sourcePaths,
         globalAuthPath: this.getGlobalAuthPath(managedPaths.data),
       }),
@@ -2413,9 +3050,14 @@ export class OpenCodeProfileManager {
     }
   }
 
-  async prepareProfile(
+  async prepareProfile(projectPath?: string | null, options: OpenCodePrepareProfileOptions = {}): Promise<OpenCodePreparedProfile> {
+    return this.prepareProfileInternal(projectPath, options)
+  }
+
+  private async prepareProfileInternal(
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
+    ownedSession?: OpenCodeSessionRecord,
   ): Promise<OpenCodePreparedProfile> {
     let leaveStep: (() => void) | undefined
     const enterStep = (label: string): void => {
@@ -2424,6 +3066,18 @@ export class OpenCodeProfileManager {
     }
     enterStep('resolve project and scope')
     try {
+    // Cursor executes its own shell tool, so OpenCode's permission rules never
+    // see the call and manual approval cannot be honoured. Measured: with
+    // approval set to manual the command still ran and no request was raised.
+    // Refusing is the honest answer; silently running everything is not.
+    if (options.toolApprovalMode === 'manual'
+      && options.profileScope
+      && canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp') {
+      throw new Error(
+        'Cursor runs its own tools, so manual tool approval cannot be enforced for it. '
+        + 'Choose automatic approval for this team, or a different provider.',
+      )
+    }
     const configSnapshot = options.profileScope
       ? openCodeEffectiveConfigSnapshots.get(options.profileScope.scopeToken)
       : undefined
@@ -2443,16 +3097,27 @@ export class OpenCodeProfileManager {
     }
     const resolvedProjectPath = configSnapshot?.projectPath ?? currentProjectPath
     const managedPaths = configSnapshot?.managedPaths ?? this.paths
-    const runtimeEnv = configSnapshot?.runtimeEnv ?? process.env
+    let runtimeEnv = configSnapshot?.runtimeEnv ?? process.env
     const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
+    // Verified staging is the only switch that turns on the managed Cursor path.
+    // Anything unavailable keeps the upstream plugin and today's launch behaviour.
+    const wantsCursorManagedAssets = options.profileScope
+      ? canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp'
+      : options.includeManagedSubscriptionPlugins !== false
+    const cursorManagedAssets = wantsCursorManagedAssets
+      ? await resolveManagedCursorAssets(runtimeEnv)
+      : null
+    if (cursorManagedAssets) {
+      runtimeEnv = managedCursorNativeEnvironment(runtimeEnv, managedPaths.data, resolvedProjectPath)
+      await mkdir(runtimeEnv.CURSOR_CONFIG_DIR!, { recursive: true, mode: 0o700 })
+    }
     const policy = options.profileScope
-      ? planOpenCodeProfilePolicy(options.profileScope)
+      ? planOpenCodeProfilePolicy(options.profileScope, {
+          cursorManagedPlugin: cursorManagedAssets?.pluginEntryPath ?? null,
+        })
       : null
     const profileRootKey = policy
-      ? hashString(JSON.stringify({
-          projectPath: resolvedProjectPath,
-          ...buildScopeIdentity(policy.scope),
-        })).slice(0, 16)
+      ? buildScopedProfileRootKey(resolvedProjectPath, policy.scope)
       : this.getProfileRootKey(resolvedProjectPath)
     enterStep('wait for profile preparation lock')
     return await this.withProfilePreparationLock(profileRootKey, async () => {
@@ -2530,7 +3195,10 @@ export class OpenCodeProfileManager {
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
       ?? (options.includeManagedSubscriptionPlugins === false
         ? []
-        : getOpenCodeManagedSubscriptionPluginPackages())
+        : substituteCursorManagedPlugin(
+          getOpenCodeManagedSubscriptionPluginPackages(),
+          cursorManagedAssets,
+        ))
     if (policy || managedSubscriptionPlugins.length > 0) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig, [...managedSubscriptionPlugins])
     }
@@ -2541,10 +3209,44 @@ export class OpenCodeProfileManager {
         managedSubscriptionPlugins,
       )
     }
+    // Retained per profile so the managed config fingerprint stays stable across
+    // preparations and an existing host keeps serving the same endpoint.
+    const cursorNative = cursorManagedAssets
+      ? await resolveCurrentCursorNativeAuthority(runtimeEnv, options.abortSignal) : null
+    const strictCursor = policy && isStrictAuthorityPurpose(policy.scope.purpose)
+      && canonicalizeOpenCodeProviderId(policy.scope.providerId) === 'cursor-acp'
+    if (strictCursor && (!cursorManagedAssets || !cursorNative
+      || await managedCursorAssetsIdentity(cursorManagedAssets) !== configSnapshot?.cursorAssetsIdentity
+      || cursorNative.identity !== policy.scope.selectedAuthIdentity)) {
+      throw new Error('OpenCode strict Cursor native authority changed before preparation')
+    }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: managedPaths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: managedPaths.cache,
     })
+    // A retained endpoint belongs to the stable host generation, excluding port.
+    // Old live hosts keep their own state when account/config/assets change.
+    const cursorHostBinaryPath = cursorManagedAssets ? resolveOpenCodeBinaryPath() : null
+    const cursorHostBinaryIdentity = cursorManagedAssets
+      ? cursorHostBinaryPath ? await resolveOpenCodeBinaryHostIdentity(cursorHostBinaryPath) : 'missing-binary'
+      : null
+    const cursorGeneration = cursorManagedAssets ? buildCursorHostGeneration({
+      assetsIdentity: await managedCursorAssetsIdentity(cursorManagedAssets),
+      nativeIdentity: cursorNative?.identity ?? 'absent',
+      scopeToken: policy?.scope.scopeToken ?? profileRootKey,
+      configFingerprint: buildManagedConfigFingerprint(managedConfig, runtimeEnv),
+      projectPath: resolvedProjectPath, profileRootKey, projectBehaviorFingerprint,
+      binaryHostIdentity: cursorHostBinaryIdentity!,
+      transportIdentity: buildOpenCodeHostTransportIdentity(managedConfig),
+    }) : null
+    const cursorManagedStatePath = cursorGeneration
+      ? path.join(profileRootPath, 'cursor-managed', cursorGeneration) : null
+    const cursorManagedProxyPort = cursorManagedStatePath
+      ? await reserveCursorManagedProxyPort(path.join(cursorManagedStatePath, 'proxy-port.json'))
+      : null
+    if (cursorManagedProxyPort) {
+      applyCursorManagedProxyEndpoint(managedConfig, cursorManagedProxyPort)
+    }
     const managedConfigFingerprint = buildManagedConfigFingerprint(
       managedConfig,
       configSnapshot?.runtimeEnv ?? process.env,
@@ -2590,9 +3292,36 @@ export class OpenCodeProfileManager {
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
       enterStep('repair plugin caches and native bridge')
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
+      // The plugin's MCP bridge reads servers from a config file, not from
+      // OPENCODE_CONFIG_CONTENT. Without this file it discovers nothing and the
+      // agent has no Agent Teams tools at all.
+      const managedConfigPath = cursorManagedAssets
+        ? path.join(xdgConfigHome, 'opencode', 'opencode.json')
+        : null
+      if (managedConfigPath) {
+        // Only the sections the bridge actually reads. OpenCode merges this file
+        // with OPENCODE_CONFIG_CONTENT, and `plugin` is an array, so writing the
+        // whole config appended the plugin a second time and the launch readiness
+        // authority rejected the host on selected_config_match:plugin. Objects
+        // merge by key and stay identical; arrays do not.
+        const bridgeConfig = Object.fromEntries(
+          (['mcp', 'agent'] as const)
+            .filter(section => managedConfig[section] && !Array.isArray(managedConfig[section]))
+            .map(section => [section, managedConfig[section]]),
+        )
+        await mkdir(path.dirname(managedConfigPath), { recursive: true })
+        await writeFile(
+          managedConfigPath,
+          `${JSON.stringify(bridgeConfig, null, 2)}\n`,
+          { encoding: 'utf8', mode: 0o600 },
+        )
+      }
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
-        profileRootPath,
-        runtimeEnv,
+        cursorManagedStatePath ?? profileRootPath,
+        { ...runtimeEnv, ...(cursorNative ? { CURSOR_AGENT_EXECUTABLE: cursorNative.executablePath } : {}) },
+        process.platform,
+        cursorManagedAssets,
+        managedConfigPath,
       )
     }
     enterStep('coordinate shared node_modules')
@@ -2621,7 +3350,13 @@ export class OpenCodeProfileManager {
     let selectedSourceAuthIdentity: OpenCodeIdentityComponent | undefined
     if (policy) {
       selectedSourceAuthIdentity = configSnapshot!.scopeIdentity.selectedAuthIdentity
-      await materializeOpenCodeSelectedAuthCredential({
+      const continuation = ownedSession ? await this.readCompletedSessionOAuthRotation(ownedSession, runtimeEnv) : null
+      if (ownedSession && (!continuation || ownedSession.profileRootKey !== profileRootKey
+        || !isDeepStrictEqual(ownedSession.profileScope, policy.scope)
+        || !isDeepStrictEqual(configSnapshot!.selectedAuthCredential, continuation.predecessor))) {
+        throw new Error('OpenCode OAuth continuation publication changed')
+      }
+      if (!continuation) await materializeOpenCodeSelectedAuthCredential({
         abortSignal: options.abortSignal,
         authPath: managedAuthPath,
         providerId: policy.scope.providerId,
@@ -2636,6 +3371,32 @@ export class OpenCodeProfileManager {
         abortSignal: options.abortSignal,
       })
     }
+    // A stale readiness answer must not survive a Cursor account switch or a
+    // replaced binary, which the auth marker's TTL alone cannot notice.
+    let cursorReadinessFingerprint: string | null = null
+    if (nativeCliCredentialBridge && cursorManagedStatePath && cursorManagedProxyPort) {
+      enterStep('bind native Cursor authority')
+      const authority = await reconcileCursorNativeAuthority({
+        statePath: path.join(cursorManagedStatePath, 'native-authority.json'),
+        executablePath: nativeCliCredentialBridge.cursorAgentHostCommand,
+        env: runtimeEnv,
+        dedupeMs: 0,
+        abortSignal: options.abortSignal,
+      }).catch(() => ({ authority: null, state: 'signed-out' as const }))
+      if (strictCursor && (!authority.authority
+        || cursorNativeSelectedIdentity(authority.authority) !== policy!.scope.selectedAuthIdentity)) {
+        throw new Error('OpenCode strict Cursor native authority changed during preparation')
+      }
+      if (authority.authority && cursorManagedAssets) {
+        cursorReadinessFingerprint = buildCursorReadinessFingerprint({
+          authority: authority.authority,
+          assetsFingerprint: cursorManagedAssets.fingerprint,
+          profileScopeToken: policy?.scope.scopeToken ?? profileRootKey,
+          managedConfigFingerprint,
+          proxyPort: cursorManagedProxyPort,
+        })
+      }
+    }
     if (nativeCliCredentialBridge) {
       enterStep('probe native provider credentials')
       await ensureOpenCodeNativePluginAuthCredentials({
@@ -2645,6 +3406,7 @@ export class OpenCodeProfileManager {
           globalAuthPath,
           managedAuthPath,
           cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
+          env: runtimeEnv,
         }),
         prepareKiro: () => ensureOpenCodeKiroPluginAuthCredential({
           abortSignal: options.abortSignal,
@@ -2658,8 +3420,14 @@ export class OpenCodeProfileManager {
 
     enterStep('verify auth and finalize environment')
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
+    const finalCursorNative = strictCursor
+      ? await resolveCurrentCursorNativeAuthority(runtimeEnv, options.abortSignal) : null
+    if (strictCursor && (!finalCursorNative || finalCursorNative.identity !== selectedSourceAuthIdentity)) {
+      throw new Error('OpenCode strict Cursor native authority changed at finalization')
+    }
     const selectedManagedAuthIdentity = policy
-      ? await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
+      ? strictCursor ? finalCursorNative!.identity
+        : await readSelectedManagedAuthIdentity(managedAuthPath, policy.scope.providerId)
       : undefined
     const authState = await (async () => {
       if (policy) {
@@ -2688,7 +3456,7 @@ export class OpenCodeProfileManager {
     })()
 
     const env: NodeJS.ProcessEnv = {
-      ...(configSnapshot?.runtimeEnv ?? process.env),
+      ...runtimeEnv,
       HOME: homePath,
       USERPROFILE: homePath,
       TMPDIR: tmpPath,
@@ -2717,6 +3485,11 @@ export class OpenCodeProfileManager {
         )),
       } : {}),
     }
+    delete env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
+    if (cursorHostBinaryIdentity) env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY = cursorHostBinaryIdentity
+    delete env.AGENT_TEAMS_CURSOR_READINESS
+    delete env[CURSOR_MANAGED_PROXY_PORT_ENV]
+    if (cursorManagedAssets) applyCursorManagedExecutionEnvironment(env)
     if (nativeCliCredentialBridge) {
       env.PATH = [nativeCliCredentialBridge.binPath, runtimeEnv.PATH]
         .filter((value): value is string => Boolean(value))
@@ -2725,6 +3498,12 @@ export class OpenCodeProfileManager {
         runtimeEnv.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
         nativeCliCredentialBridge.cursorAgentExecutablePath
+    }
+    if (cursorManagedProxyPort) {
+      env[CURSOR_MANAGED_PROXY_PORT_ENV] = String(cursorManagedProxyPort)
+      if (cursorReadinessFingerprint) {
+        env.AGENT_TEAMS_CURSOR_READINESS = cursorReadinessFingerprint
+      }
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)

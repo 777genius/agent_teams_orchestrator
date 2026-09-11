@@ -1,0 +1,19 @@
+{
+  "nestedEscape": {"before":4,"after":31,"writerPid":40956,"writerPgid":40956,"writerPpidAfterStop":1,"reportedCleanupCompleted":true},
+  "libproc": {
+    "flavor":17,"abiBytes":56,
+    "rootPid":47308,"rootUnique":22260738,
+    "middlePid":47407,"middleUnique":22260837,"middleParentUnique":22260738,
+    "leafPid":47408,"leafUniqueBefore":22260838,"leafUniqueAfter":22260838,
+    "leafParentUniqueBefore":22260837,"leafParentUniqueAfter":22260837,
+    "reapedMiddleBytes":0,"reapedMiddleError":3,
+    "originalParentIdentitySurvivesReparent":true,
+    "unobservedReapedIntermediateBreaksChain":true
+  },
+  "kqueue": {"returned":1,"errorFlag":true,"receiptError":45,"ENOTSUP":45,"NOTE_TRACK_supported":false},
+  "xnuSourceCommit":"f6217f891ac0bb64f3d375211650a4c1ff8ca1ea",
+  "finalFixturePidsRemaining":[],
+  "productionCodeChanged":false,
+  "productionReadmeUpdated":true,
+  "wholeSessionCapability":"blocked"
+}

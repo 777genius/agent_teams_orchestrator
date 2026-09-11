@@ -298,6 +298,7 @@ function buildSyntheticToolResultMessage(params: {
 function buildSystemErrorMessage(params: {
   sessionId: string
   assistantUuid: string
+  assistantProjected: boolean
   message: OpenCodeCanonicalMessage
   timestampFallback: () => number
 }): OpenCodeProjectedLogMessage | null {
@@ -309,7 +310,7 @@ function buildSystemErrorMessage(params: {
   const errorMessage = params.message.errorMessage ?? 'Unknown OpenCode runtime error'
   return {
     uuid: `${params.assistantUuid}::error`,
-    parentUuid: params.assistantUuid,
+    parentUuid: params.assistantProjected ? params.assistantUuid : params.message.parentId,
     type: 'system',
     timestamp: toIsoTimestamp(
       params.message.completedAt ?? params.message.createdAt,
@@ -457,6 +458,7 @@ export class OpenCodeLogProjector {
           const systemErrorMessage = buildSystemErrorMessage({
             sessionId: summary.sessionId,
             assistantUuid,
+            assistantProjected: assistantMessage !== null,
             message,
             timestampFallback: nextFallbackTimestamp,
           })

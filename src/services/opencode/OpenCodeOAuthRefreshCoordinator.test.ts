@@ -272,6 +272,38 @@ describe('OpenCodeOAuthRefreshCoordinator', () => {
     })).rejects.toThrow('rotated credential was not persisted')
   })
 
+  test.each([null, { type: 'api', key: 'synthetic' }, { type: 'oauth', access: 'synthetic', refresh: '', expires: 900_000 }])(
+    'rejects missing, replaced, or malformed OAuth after a successful probe %#', async replacement => {
+      let reads = 0
+      const coordinator = new OpenCodeOAuthRefreshCoordinator({
+        nowMs: () => 1_000,
+        readCredential: async () => ++reads < 3
+          ? { type: 'oauth', access: 'synthetic', refresh: 'single-use', expires: 1 } : replacement,
+        withRefreshLock: async input => input.operation(),
+        probeModel: async () => probeResult('available'),
+      })
+      await expect(coordinator.ensureFreshForPrompt({
+        selectedModel: 'xai/grok-4.3', projectPath: '/tmp/project', profile: profile(authPath),
+      })).rejects.toThrow('rotated credential was not persisted')
+    },
+  )
+
+  test('rejects OAuth disappearance while waiting for the refresh lock', async () => {
+    let reads = 0
+    let probes = 0
+    const coordinator = new OpenCodeOAuthRefreshCoordinator({
+      nowMs: () => 1_000,
+      readCredential: async () => ++reads === 1
+        ? { type: 'oauth', access: 'synthetic', refresh: 'single-use', expires: 1 } : null,
+      withRefreshLock: async input => input.operation(),
+      probeModel: async () => { probes += 1; return probeResult('available') },
+    })
+    await expect(coordinator.ensureFreshForPrompt({
+      selectedModel: 'xai/grok-4.3', projectPath: '/tmp/project', profile: profile(authPath),
+    })).rejects.toThrow('disappeared or changed type')
+    expect(probes).toBe(0)
+  })
+
   test('uses the earlier JWT expiry when the stored deadline is stale', () => {
     const now = 1_000_000
     const jwtPayload = Buffer.from(JSON.stringify({ exp: (now + 30_000) / 1_000 }))

@@ -15,6 +15,11 @@ on:
         description: Runtime version label, for example 2.1.87
         required: false
         type: string
+      publish_release:
+        description: Publish the verified draft after explicit owner approval for this version
+        required: false
+        default: false
+        type: boolean
       target_release_repo:
         description: Public repository that should receive the runtime assets
         required: false
@@ -211,7 +216,15 @@ jobs:
           fi
           ./dist/cli --version
 
+      # The shared executable smoke uses Node's built-in SQLite fixture writer.
+      - name: Setup Node for Windows executable smoke
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Verify compiled runtime (Windows)
+        timeout-minutes: 12
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh
         run: |
@@ -223,7 +236,19 @@ jobs:
             throw "Compiled Claude Code version mismatch: expected $env:EXPECTED_CLAUDE_CODE_VERSION, got $actualVersion"
           }
           .\dist\cli.exe --version
-          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = $env:BACKFILL_RUNTIME_SOURCE_COMMIT
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+
+      - name: Upload Windows executable regression evidence
+        if: always() && runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-release-${{ matrix.platform }}
+          path: backfill-runtime-evidence.json
+          if-no-files-found: warn
 
       - name: Verify compiled Windows architecture
         if: matrix.platform == 'win32-x64'
@@ -278,6 +303,11 @@ jobs:
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package cross-compiled Windows ARM64 runtime archive
@@ -295,6 +325,11 @@ jobs:
           cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
           (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
@@ -319,6 +354,9 @@ jobs:
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
+          # Resolved beside the installed binary; see the bash packaging step.
+          if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
+          Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name
@@ -396,6 +434,7 @@ jobs:
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -466,6 +505,11 @@ jobs:
             sleep 2
           done
 
+          if [[ "$PUBLISH_RELEASE" != "true" ]]; then
+            echo "Runtime draft ${TARGET_RELEASE_TAG} is complete; publication requires explicit approval."
+            exit 0
+          fi
+
           gh api \
             --method PATCH \
             "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
@@ -481,7 +525,8 @@ jobs:
     if: >-
       always() &&
       needs.prepare-release.result == 'success' &&
-      (needs.prepare-release.outputs.already_published == 'true' || needs.publish.result == 'success')
+      (needs.prepare-release.outputs.already_published == 'true' ||
+       (inputs.publish_release == true && needs.publish.result == 'success'))
 
     steps:
       - name: Verify exact public release assets

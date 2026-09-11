@@ -10,7 +10,7 @@ import {
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
-import { isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { sessionManagedAuthMatches, isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import {
@@ -58,7 +58,7 @@ const profile: OpenCodePreparedProfile = {
 const host: OpenCodeHostHandle = {
   hostKey: 'host-key',
   profileRootKey: 'profile-root',
-  projectPath: '/tmp/project',
+  projectPath: profile.projectPath,
   projectBehaviorFingerprint: 'behavior-v1',
   baseUrl: 'http://127.0.0.1:4096',
   port: 4096,
@@ -77,7 +77,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openai/gpt-5.4-mini',
-    projectPath: '/tmp/project',
+    projectPath: profile.projectPath,
     profileRootKey: 'profile-root',
     hostKey: 'host-key',
     profileScope: profile.profileScope ?? null,
@@ -120,18 +120,33 @@ function buildPreviewSummary(
 
 describe('OpenCodeSessionBridge', () => {
   let isolatedRoot: string
-  const originalAppMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
-  const originalDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
-  const originalCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
-  const originalHome = process.env.HOME
-  const originalXdgDataHome = process.env.XDG_DATA_HOME
+  // Scope resolution still reads real fixture config/auth even with prepareProfile injected.
+  const environmentKeys = [
+    CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+    'HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
+    'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
+    'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT',
+    'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_ENVIRONMENT',
+    'CLAUDE_MULTIMODEL_OPENCODE_SCOPE_APP_MCP_LAUNCH_CONFIG',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON',
+    'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
+  ] as const
+  let originalEnvironment: Record<string, string | undefined>
 
   beforeEach(async () => {
+    originalEnvironment = Object.fromEntries(environmentKeys.map(key => [key, process.env[key]]))
     resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
     isolatedRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-bridge-'))
+    for (const key of environmentKeys) delete process.env[key]
     process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(isolatedRoot, 'data')
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(isolatedRoot, 'cache')
     process.env.HOME = path.join(isolatedRoot, 'home')
+    process.env.USERPROFILE = process.env.HOME
+    process.env.XDG_CONFIG_HOME = path.join(isolatedRoot, 'xdg-config')
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
     process.env.XDG_DATA_HOME = path.join(isolatedRoot, 'xdg-data')
     process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = path.join(
       isolatedRoot,
@@ -153,7 +168,19 @@ describe('OpenCodeSessionBridge', () => {
         'kimi-for-coding': { type: 'api', key: 'test-kimi-key' },
       }),
     )
+    profile.projectPath = path.join(isolatedRoot, 'project')
+    await mkdir(profile.projectPath)
     profile.canonicalProjectPath = await canonicalizeOpenCodeProjectPath(profile.projectPath)
+    profile.workingDirectoryPath = profile.projectPath
+    host.projectPath = profile.projectPath
+    profile.profileRootPath = path.join(isolatedRoot, 'profile-root')
+    profile.homePath = path.join(profile.profileRootPath, 'home')
+    profile.tmpPath = path.join(profile.profileRootPath, 'tmp')
+    profile.xdgConfigHome = path.join(profile.profileRootPath, 'config')
+    profile.xdgDataHome = path.join(profile.profileRootPath, 'data')
+    profile.xdgCacheHome = path.join(profile.profileRootPath, 'cache')
+    profile.managedAuthPath = path.join(profile.xdgDataHome, 'opencode', 'auth.json')
+    profile.sourceAuthPath = path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
     // These general session tests exercise the legacy unscoped contract.
     // Scoped sessions need real sealed behavior evidence (covered separately).
     profile.profileScope = null
@@ -161,18 +188,16 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   afterEach(async () => {
-    await rm(isolatedRoot, { recursive: true, force: true })
-    if (originalDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
-    else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = originalDataHome
-    if (originalCacheHome === undefined) delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
-    else process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = originalCacheHome
-    if (originalHome === undefined) delete process.env.HOME
-    else process.env.HOME = originalHome
-    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
-    else process.env.XDG_DATA_HOME = originalXdgDataHome
-    if (originalAppMcpEntry === undefined) {
-      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
-    } else process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = originalAppMcpEntry
+    try {
+      // Windows can briefly retain directory handles after fixture I/O settles.
+      // Exhausted retries still fail teardown; environment restoration must always run.
+      await rm(isolatedRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+    } finally {
+      for (const key of environmentKeys) {
+        if (originalEnvironment[key] === undefined) delete process.env[key]
+        else process.env[key] = originalEnvironment[key]
+      }
+    }
   })
 
   test('strict compatibility rejects stale, different-effort, behavior, bootstrap, and member identities', () => {
@@ -289,7 +314,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: 'team-a',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       runId: 'run-1',
     })
 
@@ -311,7 +336,7 @@ describe('OpenCodeSessionBridge', () => {
     let prepareProfileCalls = 0
     let createSessionCalls = 0
     const profileScope = await resolveOpenCodeProfileScope({
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       purpose: 'launch_runtime',
       selectedModel: 'openai/gpt-5.4-mini',
     })
@@ -388,7 +413,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: 'team-a',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       preparedProfile,
     })).rejects.toThrow('relaunch the lane')
     expect(updated).toBeNull()
@@ -408,7 +433,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: 'team-a',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       preparedProfile: {
         ...profile,
         profileScope: {
@@ -480,7 +505,7 @@ describe('OpenCodeSessionBridge', () => {
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       fresh: true,
       toolApprovalMode: 'manual',
     })
@@ -494,7 +519,7 @@ describe('OpenCodeSessionBridge', () => {
   test('infers manual tool approval mode from caller-provided prepared profile', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const profileScope = await resolveOpenCodeProfileScope({
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       purpose: 'launch_runtime',
       selectedModel: 'openai/gpt-5.4-mini',
     })
@@ -515,7 +540,7 @@ describe('OpenCodeSessionBridge', () => {
     }
     const manualHost: OpenCodeHostHandle = {
       ...host,
-      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      hostKey: `${profile.projectPath}::profile-root::behavior-v1::manual-config-v1`,
       profile: manualProfile,
     }
     const bridge = new OpenCodeSessionBridge({
@@ -575,7 +600,7 @@ describe('OpenCodeSessionBridge', () => {
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       preparedProfile: manualProfile,
       fresh: true,
     })
@@ -602,7 +627,7 @@ describe('OpenCodeSessionBridge', () => {
     }
     const manualHost: OpenCodeHostHandle = {
       ...host,
-      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      hostKey: `${profile.projectPath}::profile-root::behavior-v1::manual-config-v1`,
       profile: manualProfile,
     }
     const legacyRecord = buildRecord({
@@ -675,7 +700,7 @@ describe('OpenCodeSessionBridge', () => {
       laneId: 'primary',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       runId: 'run-1',
     })
 
@@ -761,7 +786,7 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'tom',
       selectedModel: 'opencode/big-pickle',
       selectedVariant: 'max',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       runId: 'run-1',
       fresh: true,
     })
@@ -1164,69 +1189,68 @@ describe('OpenCodeSessionBridge', () => {
     }])
   })
 
-  test('keeps the stop observer host retained until observer disposal', async () => {
+  test('Stop, status and observer use exact stored ownership after authority loss and bridge restart', async () => {
+    const record = buildRecord({ runId: 'run-1', selectedModel: 'cursor-acp/auto',
+      profileScope: { purpose: 'launch_runtime', providerId: 'cursor-acp', scopeToken: 'scope',
+        configFingerprint: 'config', selectedAuthIdentity: `known:${'a'.repeat(64)}` } })
+    const store = new OpenCodeSessionStore(path.join(isolatedRoot, 'stop-sessions.json'))
+    await store.upsert(record)
     const events: string[] = []
-    const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async () => profile,
-      hostManager: {
-        ensureHost: async () => host,
-        retainHostLease: async () => { events.push('lease retained') },
-        releaseHost: async (_hostKey, options) => {
-          events.push(`host released:${options.keepPersistentAlive === true}`)
-        },
-      },
-      stopObserverFactory: async () => ({
-        arm: () => {},
-        currentStatus: () => null,
-        waitForIdle: async () => false,
-        dispose: async () => { events.push('observer disposed') },
-      }),
-    })
-    const observer = await bridge.observeStopIdle(buildRecord({
-      profileScope: null,
-      managedConfigFingerprint: profile.managedConfigFingerprint,
-    }))
-
-    expect(events).toEqual(['lease retained'])
-    await observer.dispose()
-    expect(events).toEqual([
-      'lease retained',
-      'observer disposed',
-      'host released:true',
-    ])
-  })
-
-  test('threads stop cancellation and remaining budget through profile, host, and client', async () => {
     const controller = new AbortController()
     const remainingMs = () => 321
-    let profileSignal: AbortSignal | undefined
-    let hostSignal: AbortSignal | undefined
-    let clientContext: { signal?: AbortSignal; remainingMs?: () => number } | undefined
-    const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async (_projectPath, options) => {
-        profileSignal = options?.abortSignal
-        return profile
-      },
+    const makeBridge = () => new OpenCodeSessionBridge({
+      sessionStore: store,
+      prepareProfile: async () => { throw new Error('signed out/assets missing/config changed') },
       hostManager: {
-        ensureHost: async input => {
-          hostSignal = input.abortSignal
-          return host
+        ensureHost: async () => { throw new Error('must not authorize or spawn cleanup') },
+        releaseHost: async () => { throw new Error('cleanup must not acquire a host reference') },
+        retainHostLease: async () => { throw new Error('must not reacquire cleanup lease') },
+        resolveOwnedSessionEndpoint: async (key, lease, signal) => {
+          expect(key).toBe(record.hostKey)
+          expect(lease).toEqual({ teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+            runId: record.runId, sessionId: record.opencodeSessionId, projectPath: record.projectPath })
+          expect(signal).toBe(controller.signal)
+          return { baseUrl: host.baseUrl, pid: host.pid }
         },
-        releaseHost: async () => {},
       },
-      clientFactory: {
-        create: (_baseUrl, context) => {
-          clientContext = context
-          return { abortSession: async () => true } as never
-        },
-      },
+      clientFactory: { create: (url, options) => {
+        expect(url).toBe(host.baseUrl)
+        expect(options?.signal).toBe(controller.signal)
+        expect(options?.remainingMs?.()).toBe(321)
+        return { abortSession: async (sessionId: string) => { events.push(sessionId); return true },
+          getSessionStatus: async () => ({ [record.opencodeSessionId]: { type: 'idle' } }) } as never
+      } },
+      stopObserverFactory: async () => ({ arm: () => {}, currentStatus: () => 'idle',
+        waitForIdle: async () => true, dispose: async () => { events.push('disposed') } }),
     })
+    const options = { signal: controller.signal, remainingMs }
+    const bridge = makeBridge()
+    const observer = await bridge.observeStopIdle(record, options)
+    expect(await bridge.abort(record, options)).toBe(true)
+    expect(await bridge.getRawStatus(record, options)).toEqual({ type: 'idle' })
+    await observer.dispose()
+    expect(await makeBridge().abort(record, options)).toBe(true)
+    await store.markStoppedIfSession(record)
+    expect(await makeBridge().abort(record, options)).toBe(true)
+    expect(events).toEqual(['session-1', 'disposed', 'session-1'])
+    for (const patch of [{ runId: 'foreign' }, { hostKey: 'foreign' }, { opencodeSessionId: 'foreign' }]) {
+      await expect(makeBridge().abort({ ...record, ...patch }, options)).rejects.toThrow('ownership changed')
+    }
+    await expect(bridge.promptAsync(record, { text: 'new work' })).rejects.toThrow()
+  })
 
-    expect(await bridge.abort(buildRecord(), { signal: controller.signal, remainingMs })).toBe(true)
-    expect(profileSignal).toBe(controller.signal)
-    expect(hostSignal).toBe(controller.signal)
-    expect(clientContext?.signal).toBe(controller.signal)
-    expect(clientContext?.remainingMs?.()).toBe(321)
+  test('Cursor session compatibility survives marker TTL but refuses missing readiness/account change', () => {
+    const selectedAuthIdentity = `known:${'a'.repeat(64)}` as const
+    const scope = { purpose: 'launch_runtime', providerId: 'cursor-acp', scopeToken: 'scope',
+      configFingerprint: 'config', selectedAuthIdentity } as const
+    const record = buildRecord({ selectedModel: 'cursor-acp/auto', profileScope: scope,
+      managedAuthFingerprint: 'marker-before-ttl' })
+    const current = { ...profile, profileScope: scope, selectedManagedAuthIdentity: selectedAuthIdentity,
+      managedAuthFingerprint: 'marker-after-31-minutes', env: { AGENT_TEAMS_CURSOR_READINESS: 'ready' } }
+    expect(sessionManagedAuthMatches(record, current)).toBe(true)
+    expect(sessionManagedAuthMatches(record, { ...current, env: {} })).toBe(false)
+    expect(sessionManagedAuthMatches(record, { ...current, selectedManagedAuthIdentity: `known:${'b'.repeat(64)}` })).toBe(false)
+    expect(sessionManagedAuthMatches(buildRecord(), current)).toBe(false)
   })
 
   test('confirmed stop fails on a real registry lock filesystem error', async () => {
@@ -1854,7 +1878,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: 'team-a',
       memberName: 'tom',
       selectedModel: 'opencode/big-pickle',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
       fresh: true,
     })).rejects.toThrow('invalid session title')
 
@@ -1899,7 +1923,7 @@ describe('OpenCodeSessionBridge', () => {
       prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async input => {
-          expect(input).toEqual({ projectPath: '/tmp/project', hostKey: 'host-key', preparedProfile: profile })
+          expect(input).toEqual({ projectPath: profile.projectPath, hostKey: 'host-key', preparedProfile: profile })
           return host
         },
         releaseHost: async () => {
@@ -2152,7 +2176,7 @@ describe('OpenCodeSessionBridge', () => {
       teamId: 'team-a',
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4',
-      projectPath: '/tmp/project',
+      projectPath: profile.projectPath,
     })
 
     expect(staleReasons).toEqual(['model_changed:openai/gpt-5.4-mini->openai/gpt-5.4'])
@@ -2260,7 +2284,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         memberName: 'alice',
         selectedModel: 'openai/gpt-5.4-mini',
-        projectPath: '/tmp/project',
+        projectPath: profile.projectPath,
         runId: 'run-1',
       }),
     ).rejects.toThrow('disk write failed')
@@ -2289,6 +2313,7 @@ describe('OpenCodeSessionBridge', () => {
   test('sends provider-scoped model data when posting a message', async () => {
     const sentBodies: unknown[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2357,6 +2382,9 @@ describe('OpenCodeSessionBridge', () => {
     const fanOutInputs: Array<{ providerId: string; sourceAuthPath: string }> = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
+      oauthRefreshCoordinator: {
+        ensureFreshForPrompt: async () => ({ checked: true, refreshed: false }),
+      },
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2408,7 +2436,7 @@ describe('OpenCodeSessionBridge', () => {
           order.push('refresh')
           expect(input).toEqual({
             selectedModel: 'xai/grok-4.3',
-            projectPath: '/tmp/project',
+            projectPath: profile.projectPath,
             profile,
           })
           return { checked: true, refreshed: true }
@@ -2502,7 +2530,7 @@ describe('OpenCodeSessionBridge', () => {
           expect(input).toMatchObject({
             baseUrl: 'http://127.0.0.1:4096',
             sessionId: 'session-1',
-            projectPath: '/tmp/project',
+            projectPath: profile.projectPath,
             runtimePromptMessageId,
             timeoutMs: 500,
             idleTimeoutMs: 100,
@@ -2622,6 +2650,7 @@ describe('OpenCodeSessionBridge', () => {
     const observationMarks: string[] = []
     let promptCalls = 0
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2714,6 +2743,7 @@ describe('OpenCodeSessionBridge', () => {
     const promptBodies: unknown[] = []
     const hookEvents: string[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2797,6 +2827,7 @@ describe('OpenCodeSessionBridge', () => {
     })
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2857,6 +2888,7 @@ describe('OpenCodeSessionBridge', () => {
   test('continues prompt_async delivery when prompt id lower-bound fetch fails', async () => {
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -2915,10 +2947,12 @@ describe('OpenCodeSessionBridge', () => {
       randomSuffix: 'GGGGGGGGGGGGGG',
     })
     let promptCalls = 0
+    const releasedHosts: string[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
-        releaseHost: async () => {},
+        releaseHost: async hostKey => { releasedHosts.push(hostKey) },
       },
       clientFactory: {
         create: () => ({
@@ -2963,14 +2997,17 @@ describe('OpenCodeSessionBridge', () => {
       text: 'Should not send with unsafe id',
     })).rejects.toThrow('OpenCode prompt id allocation failed')
     expect(promptCalls).toBe(0)
+    expect(releasedHosts).toEqual([host.hostKey])
   })
 
   test('fails before prompt_async when a high legacy msg id would poison OpenCode ordering', async () => {
     let promptCalls = 0
+    const releasedHosts: string[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
-        releaseHost: async () => {},
+        releaseHost: async hostKey => { releasedHosts.push(hostKey) },
       },
       clientFactory: {
         create: () => ({
@@ -3015,6 +3052,7 @@ describe('OpenCodeSessionBridge', () => {
       text: 'Should not send into poisoned ordering',
     })).rejects.toThrow('OpenCode prompt id allocation failed')
     expect(promptCalls).toBe(0)
+    expect(releasedHosts).toEqual([host.hostKey])
   })
 
   test('rejects noReply prompt_async before attaching turn-settled observation', async () => {
@@ -3138,7 +3176,7 @@ describe('OpenCodeSessionBridge', () => {
     }
     const manualHost: OpenCodeHostHandle = {
       ...host,
-      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      hostKey: `${profile.projectPath}::profile-root::behavior-v1::manual-config-v1`,
       profile: manualProfile,
       resolvedConfigFingerprint: null,
     }
@@ -4066,12 +4104,15 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'bob',
     }))
 
+    // The reason names what moved: here only the managed copy's bytes did,
+    // with the same profile, the same selected identity and the same source.
     expect(staleMarks).toEqual([{
       laneId: 'secondary:opencode:bob',
-      staleReason: 'managed_auth_changed',
+      staleReason: 'managed_auth_changed:managed_store_bytes',
     }])
     expect(result.summary.previewOutcome).toBe('stale')
-    expect(result.summary.staleReason).toBe('managed_auth_changed')
+    expect(result.summary.staleReason).toBe('managed_auth_changed:managed_store_bytes')
     expect(result.summary.streamConnected).toBe(false)
   })
+
 })

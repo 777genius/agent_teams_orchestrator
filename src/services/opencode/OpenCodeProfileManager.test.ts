@@ -14,6 +14,8 @@ import {
   ensureOpenCodeCursorPluginAuthCredential,
   ensureOpenCodeKiroPluginAuthCredential,
   ensureOpenCodeNativeCliCredentialBridge,
+  applyCursorManagedExecutionEnvironment,
+  buildCursorHostGeneration,
   ensureOpenCodeNativePluginAuthCredentials,
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
@@ -786,14 +788,14 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         purpose: 'execution_probe',
         selectedModel: `${providerId}/model`,
         env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({
-          provider: { [providerId]: { options: { apiKey: 'exact-options-key' } } },
+          provider: { [providerId]: { options: { apiKey: 'test-fixture-literal' } } },
         }) },
       })
       expect(exactOptions.scopeToken).toMatch(/^[a-f0-9]{64}$/)
     }
     for (const providerId of ['google-vertex', 'vertex']) {
       await expect(resolveBedrock(providerId, {
-        options: { apiKey: 'not-a-vertex-runtime-contract' },
+        options: { apiKey: 'fixture-fixture-literal' },
       })).rejects.toThrow('requires explicit selected authentication')
     }
   })
@@ -1363,21 +1365,31 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         npm: '@ai-sdk/github-copilot',
         api: 'https://api.githubcopilot.com',
         models: {
-          'gpt-5-mini': {
-            name: 'GPT-5 Mini',
-            family: 'gpt-mini',
+          'gpt-5.6-luna': {
+            name: 'GPT-5.6 Luna',
+            family: 'gpt-5.6-luna',
+            attachment: true,
+            modalities: { input: ['text', 'image'], output: ['text'] },
             reasoning: true,
             tool_call: true,
             structured_output: true,
             limit: {
-              context: 264_000,
-              input: 128_000,
-              output: 64_000,
+              context: 1_050_000,
+              input: 922_000,
+              output: 128_000,
             },
           },
         },
       },
     })
+  })
+
+  test('preserves an explicit Copilot model selection when seeding Luna', () => {
+    const managedConfig = buildManagedConfig(undefined, {
+      defaultModelId: 'github-copilot/gpt-5-mini',
+    })
+
+    expect(managedConfig.model).toBe('github-copilot/gpt-5-mini')
   })
 
   test('seeds Xiaomi MiMo Token Plan OpenCode providers for regional Token Plan endpoints', () => {
@@ -2181,8 +2193,8 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     process.env.OPENCODE_CONFIG = customConfigPath
     process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       provider: {
-        deepinfra: { options: { apiKey: 'deepinfra-config-secret' }, models: { chosen: {} } },
-        unrelated: { options: { apiKey: 'unrelated-provider-secret-must-not-cross-scope' } },
+        deepinfra: { options: { apiKey: 'example-fixture-literal' }, models: { chosen: {} } },
+        unrelated: { options: { apiKey: 'placeholder-fixture-literal' } },
         kiro: { options: { poisoned: true }, models: { poison: {} } },
         'cursor-acp': { options: { poisoned: true }, models: { poison: {} } },
         lmstudio: {
@@ -2233,7 +2245,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(scopedProfile.managedConfig.plugin).toEqual([])
       expect(scopedProfile.managedConfig.provider).toEqual({
         deepinfra: {
-          options: { apiKey: 'deepinfra-config-secret' },
+          options: { apiKey: 'example-fixture-literal' },
           models: { chosen: {} },
         },
       })
@@ -2277,10 +2289,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         expect(retainedScopeEnvironment).not.toHaveProperty('OPENCODE_CONFIG')
         const serializedProfileEnvironment = Object.values(launchProfile.env).join('\n')
         expect(serializedProfileEnvironment).not.toContain(
-          'unrelated-provider-secret-must-not-cross-scope',
+          'placeholder-fixture-literal',
         )
         expect(JSON.stringify(launchProfile.managedConfig)).not.toContain(
-          'unrelated-provider-secret-must-not-cross-scope',
+          'placeholder-fixture-literal',
         )
         expect(await resolveOpenCodeProfileScope({
           projectPath, purpose: 'launch_runtime', selectedModel: selected,
@@ -3299,4 +3311,51 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
       },
     })
   })
+})
+
+
+test('managed execution pins the reviewed native cancellation route despite ambient SDK/pool overrides', () => {
+  const env = { CURSOR_ACP_BACKEND: 'sdk', CURSOR_ACP_AGENT_POOL: 'true',
+    CURSOR_ACP_SESSION_RESUME: 'true', CURSOR_ACP_REUSE_EXISTING_PROXY: 'true',
+    CURSOR_ACP_TOOL_LOOP_MODE: 'cursor' }
+  applyCursorManagedExecutionEnvironment(env)
+  expect(env).toMatchObject({ CURSOR_ACP_BACKEND: 'cursor-agent', CURSOR_ACP_AGENT_POOL: 'false',
+    CURSOR_ACP_SESSION_RESUME: 'false', CURSOR_ACP_REUSE_EXISTING_PROXY: 'false',
+    CURSOR_ACP_TOOL_LOOP_MODE: 'opencode' })
+})
+
+test('Cursor retained port state separates host generations and is stable for unchanged identity', () => {
+  const inputs = { assetsIdentity: 'assets', nativeIdentity: 'account-a', scopeToken: 'scope', configFingerprint: 'config',
+    projectPath: '/project', profileRootKey: 'profile', projectBehaviorFingerprint: 'agents-a',
+    binaryHostIdentity: 'binary-a', transportIdentity: 'raw-mcp-a' }
+  const generation = buildCursorHostGeneration(inputs)
+  expect(buildCursorHostGeneration({ ...inputs })).toBe(generation)
+  for (const field of Object.keys(inputs) as Array<keyof typeof inputs>) {
+    expect(buildCursorHostGeneration({ ...inputs, [field]: 'changed' })).not.toBe(generation)
+  }
+})
+
+test('complete Cursor wrapper uses discovered absolute CLI and owned mcptool with spaces and short PATH', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(path.join(os.tmpdir(), "cursor wrapper user's "))
+  try {
+    const bin = path.join(root, '.local/bin')
+    const obsolete = path.join(root, 'obsolete bin')
+    await mkdir(bin, { recursive: true })
+    await mkdir(obsolete)
+    const native = path.join(bin, 'cursor-agent')
+    await writeFile(native, '#!/bin/sh\nprintf "native:%s:%s:%s:%s\\n" "$HOME" "$XDG_CONFIG_HOME" "$CURSOR_CONFIG_DIR" "$1"\nmcptool "$2"\n', { mode: 0o700 })
+    await writeFile(path.join(obsolete, 'mcptool'), '#!/bin/sh\necho obsolete\n', { mode: 0o700 })
+    const cli = path.join(root, 'managed mcp cli')
+    await writeFile(cli, '#!/bin/sh\nprintf "managed:%s" "$1"\n', { mode: 0o700 })
+    const env = { HOME: root, PATH: `${obsolete}:/usr/bin:/bin`, XDG_CONFIG_HOME: path.join(root, 'native config'), CURSOR_CONFIG_DIR: path.join(root, 'isolated cursor config') }
+    const bridge = await ensureOpenCodeNativeCliCredentialBridge(path.join(root, 'profile'), env, 'darwin', {
+      pluginEntryPath: path.join(root, 'plugin.js'), mcpToolPath: cli, interpreterPath: '/bin/sh', fingerprint: 'fixture',
+    }, path.join(root, 'profile config.json'))
+    expect(bridge.cursorAgentHostCommand).toBe(await realpath(native))
+    const output = await runCommandCapture(bridge.cursorAgentExecutablePath, ['a b', 'c d'], {
+      HOME: '/wrong', XDG_CONFIG_HOME: '/wrong', PATH: bridge.binPath,
+    })
+    expect(output).toBe(`native:${root}:${env.XDG_CONFIG_HOME}:${env.CURSOR_CONFIG_DIR}:a b\nmanaged:c d`)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

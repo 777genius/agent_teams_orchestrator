@@ -477,7 +477,7 @@ describe('OpenCodeLogProjector', () => {
     ])
   })
 
-  test('projects assistant runtime errors into synthetic system log messages', () => {
+  test.each([false, true])('preserves runtime error lineage when assistant content exists: %s', (hasContent) => {
     const projection = projector.projectSummary(
       buildSummary({
         messageCount: 1,
@@ -493,13 +493,13 @@ describe('OpenCodeLogProjector', () => {
             modelId: 'gpt-5.4-mini',
             createdAt: 200,
             completedAt: 201,
-            text: '',
+            text: hasContent ? 'Partial answer' : '',
             reasoningText: '',
             previewText: null,
             partTypes: [],
             reasoningPartCount: 0,
             toolCalls: [],
-            contentBlocks: [],
+            contentBlocks: hasContent ? [{ type: 'text', text: 'Partial answer' }] : [],
             finishReason: null,
             errorName: 'UnknownError',
             errorMessage: 'Token refresh failed: 401',
@@ -509,12 +509,18 @@ describe('OpenCodeLogProjector', () => {
       }),
     )
 
-    expect(projection.projectedMessageCount).toBe(1)
+    expect(projection.projectedMessageCount).toBe(hasContent ? 2 : 1)
+    if (hasContent) {
+      expect(projection.messages[0]).toMatchObject({
+        uuid: 'msg-assistant-error',
+        parentUuid: 'msg-user-err',
+      })
+    }
     expect(projection.syntheticMessageCount).toBe(1)
-    expect(projection.messages[0]).toEqual(
+    expect(projection.messages.at(-1)).toEqual(
       expect.objectContaining({
         uuid: 'msg-assistant-error::error',
-        parentUuid: 'msg-assistant-error',
+        parentUuid: hasContent ? 'msg-assistant-error' : 'msg-user-err',
         type: 'system',
         level: 'error',
         content: 'OpenCode runtime error - UnknownError: Token refresh failed: 401',

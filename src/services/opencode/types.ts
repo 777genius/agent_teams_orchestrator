@@ -673,6 +673,8 @@ export type OpenCodeSessionRecord = {
   managedAuthFingerprint: string | null
   projectBehaviorFingerprint: string
   managedConfigFingerprint?: string
+  /** Per-section fingerprints, so a stale session can name what changed. */
+  managedConfigSectionFingerprints?: Record<string, string>
   expectedBehaviorFingerprint?: string
   opencodeVersion?: string
   bootstrapMode?: OpenCodeBootstrapMode

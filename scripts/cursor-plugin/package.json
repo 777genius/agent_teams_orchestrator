@@ -1,0 +1,8 @@
+{
+  "name": "agent-teams-cursor-plugin-build",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@rama_nigg/open-cursor": "2.5.2"
+  }
+}

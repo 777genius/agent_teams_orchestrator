@@ -97,9 +97,16 @@ export async function buildOpenCodeExpectedBehaviorEvidence(input: {
   }
   const canonicalProjectPath = input.profile.canonicalProjectPath
     ?? normalizeOpenCodeProjectIdentity(input.profile.projectPath, input.platform)
+  const nativeCursor = modelProviderId === 'cursor-acp'
+    && (input.profile.profileScope?.purpose === 'launch_runtime'
+      || input.profile.profileScope?.purpose === 'execution_probe')
+  if (nativeCursor && (!input.profile.env.AGENT_TEAMS_CURSOR_READINESS
+    || input.profile.selectedManagedAuthIdentity !== input.profile.profileScope!.selectedAuthIdentity)) {
+    throw new Error('OpenCode current native Cursor authentication is unavailable')
+  }
   let credential: Record<string, unknown> | null
   try {
-    credential = await (input.readCredential ?? readOpenCodeAuthCredential)({
+    credential = nativeCursor ? null : await (input.readCredential ?? readOpenCodeAuthCredential)({
       authPath: input.profile.managedAuthPath,
       providerId: modelProviderId,
     })
@@ -120,7 +127,11 @@ export async function buildOpenCodeExpectedBehaviorEvidence(input: {
       input.effectiveConfigFingerprint,
       'effective config fingerprint',
     ),
-    effectiveSelectedAuthFingerprint: input.profile.profileScope
+    effectiveSelectedAuthFingerprint: nativeCursor
+      ? sha256(JSON.stringify([SELECTED_AUTH_DOMAIN, 'cursor-native-v1',
+          requireFingerprint(input.profile.profileScope!.selectedAuthIdentity.replace(/^known:/, ''), 'native Cursor identity'),
+          requireFingerprint(input.profile.authoritySourceFingerprint ?? '', 'authority source fingerprint')]))
+      : input.profile.profileScope
       && input.profile.authoritySourceFingerprint
       ? sha256(JSON.stringify([
           SELECTED_AUTH_DOMAIN,

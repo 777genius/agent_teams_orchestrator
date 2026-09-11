@@ -1,6 +1,7 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import { readFile } from 'node:fs/promises'
+import { drainStartupTaskkills } from '../../utils/processKill.js'
 
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
@@ -133,9 +134,13 @@ export async function runtimeOpenCodeCommand(opts: {
   }
   let signalCleanupPromise: Promise<void> | null = null
   let signalReceivedAt: number | null = null
+  let startupCleanupOnly = false
   let cleanupPromise: Promise<void> | null = null
   const drainCleanupOnce = (timeoutMs?: number): Promise<void> => {
-    cleanupPromise ??= drainCleanup(timeoutMs)
+    cleanupPromise ??= startupCleanupOnly
+      ? Promise.all([drainStartupTaskkills(), openCodeHostManager.drainStartupCleanupLockReleases(),
+        openCodeSessionStore.drainPendingLateLockReleases()]).then(() => undefined)
+      : drainCleanup(timeoutMs)
     return cleanupPromise
   }
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
@@ -165,6 +170,8 @@ export async function runtimeOpenCodeCommand(opts: {
   try {
     const raw = await readInput(opts.input)
     const envelope = JSON.parse(raw) as unknown
+    startupCleanupOnly = !!envelope && typeof envelope === 'object'
+      && 'command' in envelope && envelope.command === 'opencode.cleanupStartupHosts'
     let result: Awaited<ReturnType<typeof executeEnvelope>>
     try {
       result = await executeEnvelope(envelope, {
@@ -175,6 +182,9 @@ export async function runtimeOpenCodeCommand(opts: {
       // unwinds. Do not snapshot cleanup tracking until that registration is done.
       settleCommandExecution()
     }
+    // Startup terminal evidence is published only after helpers, fallback
+    // continuations and their retained locks have drained.
+    if (startupCleanupOnly) await drainCleanupOnce()
     if (signalCleanupPromise) {
       await signalCleanupPromise
       return
