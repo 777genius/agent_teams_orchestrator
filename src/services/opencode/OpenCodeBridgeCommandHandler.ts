@@ -3272,19 +3272,10 @@ async function assertOpenCodeLaunchMcpReady(
 }
 
 /**
- * Stands down a session whose launch bootstrap failed, WITHOUT erasing the fact
- * that it existed.
- *
- * The record used to be deleted here. That made the failure permanent: the
- * session store is the only thing `sendMessage` consults, and its recovery path
- * is keyed on finding a record that is stale - it recreates the session before
- * delivery precisely then. With no record at all there is nothing to recognise,
- * so every later message to that member is refused with "No stored OpenCode
- * session record", forever, and the app has no way back short of relaunching
- * the whole team.
- *
- * Keeping the record stale costs one row and restores the recovery that already
- * exists. The host-side session is still released, so nothing is left running.
+ * Release a failed bootstrap while retaining its strict session identity.
+ * The same run can safely resume bootstrap from that known remote session. Once
+ * its materialization owner is released, a different strict run may atomically
+ * replace the stale record instead. Delivery must never bypass strict bootstrap.
  */
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
@@ -3313,8 +3304,8 @@ async function cleanupFailedLaunchSession(
     ))
   }
 
-  // Deliberately no delete: the stale record above is what lets the next
-  // delivery recreate the session instead of refusing forever.
+  // Deliberately no delete: strict launch retry owns recovery. sendMessage does
+  // not have the proof or bootstrap input required to recreate this session.
   return diagnostics
 }
 
@@ -5004,6 +4995,9 @@ async function runSendMessage(
   const mcpDiagnostics: TeamDiagnostic[] = []
   const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
   const staleReason = record.staleReason ?? compatibilityStaleReason
+  if (staleReason === 'launch_failed') {
+    throw new Error('OpenCode member launch did not complete; retry launch for the same run or relaunch the lane')
+  }
   if (authority && (staleReason || forceSessionRefreshReason)) {
     throw new Error('OpenCode selected session cannot be recreated without strict launch proof; relaunch the lane')
   }

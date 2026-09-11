@@ -439,6 +439,46 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.get(legacy.teamId, legacy.laneId, legacy.memberName)).toEqual(successor)
   })
 
+  test('atomically replaces a failed strict launch after its owner exits', async () => {
+    let ownerAlive = true
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'failed-strict-sessions.json'), {
+      ownerPid: 111,
+      isProcessAlive: pid => pid !== 111 || ownerAlive,
+      readProcessStartTimeMs: async () => 1_111,
+    })
+    const failed = {
+      ...baseRecord,
+      runId: 'failed-run',
+      profileScope: {
+        purpose: 'launch_runtime' as const,
+        providerId: 'openai',
+        scopeToken: 'failed-scope',
+        configFingerprint: 'failed-config',
+        selectedAuthIdentity: 'absent' as const,
+      },
+    }
+    const oldClaim = await store.claimMaterialization(failed, 'failed-attempt', failed.runId)
+    expect(oldClaim).toEqual(expect.objectContaining({ kind: 'claimed' }))
+    if (oldClaim.kind !== 'claimed') throw new Error('missing failed launch claim')
+    const oldOwner = await store.commitMaterialization(failed, oldClaim.ownerToken)
+    expect(oldOwner).not.toBeNull()
+    expect(await store.markStaleIfSession(failed, 'launch_failed', oldOwner!)).not.toBeNull()
+
+    expect(await store.claimMaterialization(failed, 'next-attempt', 'next-run')).toEqual({
+      kind: 'existing',
+      record: { ...failed, staleReason: 'launch_failed', updatedAt: expect.any(String) },
+      ownerToken: oldOwner,
+    })
+
+    ownerAlive = false
+    const nextClaim = await store.claimMaterialization(failed, 'next-attempt', 'next-run')
+    expect(nextClaim).toEqual(expect.objectContaining({ kind: 'claimed' }))
+    if (nextClaim.kind !== 'claimed') throw new Error('missing replacement claim')
+    const successor = { ...failed, runId: 'next-run', opencodeSessionId: 'next-session' }
+    expect(await store.commitMaterialization(successor, nextClaim.ownerToken)).not.toBeNull()
+    expect(await store.get(failed.teamId, failed.laneId, failed.memberName)).toEqual(successor)
+  })
+
   test('keeps clean and unknown-outcome legacy sessions fenced from strict replacement', async () => {
     for (const [name, staleReason] of [
       ['clean', null],
