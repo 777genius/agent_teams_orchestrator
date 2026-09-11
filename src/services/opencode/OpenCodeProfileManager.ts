@@ -45,6 +45,8 @@ import {
   mergeOpenCodeManagedAuthSources,
   readOpenCodeSavedAuthStore,
   readOpenCodeCommittedOAuthProbeRotation,
+  readOpenCodeCommittedOAuthSessionRotation,
+  sameOpenCodeOAuthSessionAuthority,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
@@ -1655,6 +1657,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
 }>
 
 const openCodeEffectiveConfigSnapshots = new Map<string, OpenCodeEffectiveConfigSnapshot>()
+const ownedOAuthSessionProfiles = new WeakMap<OpenCodePreparedProfile, { record: OpenCodeSessionRecord; profile: OpenCodePreparedProfile }>()
 const OPEN_CODE_SEMANTIC_SECRET_IDENTITY_DOMAIN =
   'agent-teams.opencode.semantic-secret-identity/v2'
 
@@ -2172,6 +2175,11 @@ export async function isOpenCodeOAuthPublicationScopeCurrent(
   owner: OpenCodeOAuthSaveOwner, predecessor: OpenCodeAuthCredential, env: NodeJS.ProcessEnv,
   admissionProjectPath?: string,
 ): Promise<boolean> {
+  if (owner.launchCredential) {
+    if (!isValidOpenCodeOAuthCredential(owner.launchCredential)
+      || owner.launchCredential.accountId !== predecessor.accountId) return false
+    predecessor = owner.launchCredential
+  }
   const binding = owner.credentialBinding
   if (binding && (binding.version !== 1 || binding.scopeToken !== owner.scopeToken
     || !/^[a-f0-9]{64}$/.test(binding.fingerprint))) {
@@ -2189,10 +2197,11 @@ export async function isOpenCodeOAuthPublicationScopeCurrent(
 
 async function resolveOpenCodeProfileScopeInternal(
   input: OpenCodeScopeResolutionInput,
-  // Private comparison-only substitution for a proven C0→C1 save. It
-  // never prepares a launch, caches a snapshot, or reads successor authority.
+  // Private substitution for proven OAuth lineage. Ordinary comparison never
+  // caches; only exact owned-session reconstruction captures a config snapshot.
   recoveryPredecessor?: OpenCodeAuthCredential,
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
+  captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
 ): Promise<OpenCodeProfileScope> {
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
@@ -2410,8 +2419,8 @@ async function resolveOpenCodeProfileScopeInternal(
     selectedAuthIdentity,
     scopeToken,
   }
-  if (!recoveryPredecessor && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
-    openCodeEffectiveConfigSnapshots.set(scopeToken, freezeConfigSnapshot({
+  if (captureSnapshot || !recoveryPredecessor && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
+    const snapshot = freezeConfigSnapshot({
       projectPath,
       importedRuntimeConfig,
       runtimeEnv: env,
@@ -2421,7 +2430,9 @@ async function resolveOpenCodeProfileScopeInternal(
       selectedAuthCredential: selectedAuth.credential,
       authoritySourceFingerprint,
       appMcpLaunchConfig,
-    }))
+    })
+    if (captureSnapshot) captureSnapshot(snapshot)
+    else openCodeEffectiveConfigSnapshots.set(scopeToken, snapshot)
   }
   return scope
 }
@@ -2714,6 +2725,75 @@ export class OpenCodeProfileManager {
     return { ...(await this.scopedOAuthAuthority(profile)).snapshot.runtimeEnv }
   }
 
+  async readCompletedSessionOAuthRotation(record: OpenCodeSessionRecord, env: NodeJS.ProcessEnv = process.env) {
+    record = structuredClone(record)
+    if (record.profileScope?.purpose !== 'launch_runtime' || record.profileScope.providerId !== 'xai'
+      || record.stoppedAt || record.staleReason || !record.runId) return null
+    const runtimeEnv = scopeSourceEnvironment(env)
+    const data = resolveClaudeMultimodelPaths(runtimeEnv).data
+    const globalAuthPath = this.getGlobalAuthPath(data)
+    const managedAuthPath = path.join(data, 'opencode', 'profiles', record.profileRootKey, 'data', 'opencode', 'auth.json')
+    const input = { globalAuthPath, managedAuthPath, env: runtimeEnv, record,
+      sourceAuthPaths: Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths(runtimeEnv)])) }
+    const rotation = await readOpenCodeCommittedOAuthSessionRotation(input)
+    if (!rotation) return null
+    const scopeInput = { projectPath: record.projectPath, purpose: 'launch_runtime' as const,
+      selectedModel: record.selectedModel, env: runtimeEnv, cacheSnapshot: false }
+    // Exact scope alone must not bypass a missing or forged retained binding.
+    // Recompute it from the proven original launch credential and current inputs.
+    let binding: OpenCodeOAuthSaveOwner['credentialBinding']
+    const launchScope = await resolveOpenCodeProfileScopeInternal(scopeInput, rotation.predecessor,
+      value => { binding = value })
+    if (!isDeepStrictEqual(launchScope, record.profileScope)
+      || !isDeepStrictEqual(binding, rotation.credentialBinding)) return null
+    await this.assertSessionRefreshOwner(record, rotation.nativeSession, data)
+    return isDeepStrictEqual(await readOpenCodeCommittedOAuthSessionRotation(input), rotation) ? rotation : null
+  }
+
+  private async assertSessionRefreshOwner(record: OpenCodeSessionRecord, native: OpenCodeOAuthNativeSessionOwner, data: string) {
+    const [{ OpenCodeSessionStore }, { OpenCodeHostManager }] = await Promise.all([
+      import('./OpenCodeSessionStore.js'), import('./OpenCodeHostManager.js'),
+    ])
+    const current = await new OpenCodeSessionStore(path.join(data, 'opencode', 'session-store.json'))
+      .get(record.teamId, record.laneId ?? 'primary', record.memberName)
+    if (!current || !sameOpenCodeOAuthSessionAuthority(current, record) || current.stoppedAt || current.staleReason) {
+      throw new Error('OpenCode OAuth session refresh authority changed; relaunch the lane')
+    }
+    const endpoint = await new OpenCodeHostManager({ persistentRegistryPath: path.join(data, 'opencode', 'host-registry.json') })
+      .resolveOwnedSessionEndpoint(record.hostKey, { teamId: record.teamId, laneId: record.laneId,
+        memberName: record.memberName, runId: record.runId, sessionId: record.opencodeSessionId,
+        projectPath: record.projectPath, expectedProcessStartedAtMs: native.processStartedAtMs })
+    if (endpoint.pid !== native.pid || endpoint.baseUrl !== native.baseUrl) {
+      throw new Error('OpenCode OAuth session refresh process changed')
+    }
+  }
+
+  async prepareOwnedOAuthSessionProfile(record: OpenCodeSessionRecord, signal?: AbortSignal) {
+    const rotation = await this.readCompletedSessionOAuthRotation(record)
+    if (!rotation) return null
+    let snapshot: OpenCodeEffectiveConfigSnapshot | undefined
+    const scope = await resolveOpenCodeProfileScopeInternal({ projectPath: record.projectPath,
+      selectedModel: record.selectedModel, purpose: 'launch_runtime', cacheSnapshot: false },
+      rotation.predecessor, undefined, value => { snapshot = value })
+    if (!snapshot || !isDeepStrictEqual(scope, record.profileScope)) return null
+    // Reconstruct the original config only. This snapshot never materializes C0
+    // into native auth; preparation below checks the committed successor instead.
+    openCodeEffectiveConfigSnapshots.set(scope.scopeToken, snapshot)
+    const profile = await this.prepareProfileInternal(record.projectPath, {
+      profileScope: scope, toolApprovalMode: record.toolApprovalMode ?? 'auto', abortSignal: signal,
+    }, record)
+    if (!isDeepStrictEqual(await this.readCompletedSessionOAuthRotation(record), rotation)) {
+      throw new Error('OpenCode OAuth session refresh changed during preparation')
+    }
+    ownedOAuthSessionProfiles.set(profile, { record: structuredClone(record), profile: structuredClone(profile) })
+    return profile
+  }
+
+  hasOwnedOAuthSessionProfile(record: OpenCodeSessionRecord, profile: OpenCodePreparedProfile): boolean {
+    const proof = ownedOAuthSessionProfiles.get(profile)
+    return !!proof && sameOpenCodeOAuthSessionAuthority(proof.record, record) && isDeepStrictEqual(proof.profile, profile)
+  }
+
   async readCompletedReadinessOAuthRotation(
     host: OpenCodeHostHandle,
     selectedModel: string,
@@ -2755,6 +2835,7 @@ export class OpenCodeProfileManager {
   // retained environment, including when this manager's ambient data root differs.
   async withOwnedOAuthRefresh<T>(input: {
     profile: OpenCodePreparedProfile
+    sessionRecord?: OpenCodeSessionRecord
     assertHostOwnership: () => Promise<void>
     operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
       armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
@@ -2762,9 +2843,18 @@ export class OpenCodeProfileManager {
     allowNativeContinuation?: boolean
     abortSignal?: AbortSignal
   }): Promise<T> {
+    const sessionRecord = input.sessionRecord ? structuredClone(input.sessionRecord) : undefined
     const captured = structuredClone(input.profile)
     const authority = await this.scopedOAuthAuthority(input.profile)
-    const predecessor = authority.snapshot.selectedAuthCredential
+    const launchCredential = authority.snapshot.selectedAuthCredential
+    const rotation = sessionRecord
+      ? await this.readCompletedSessionOAuthRotation(sessionRecord, authority.snapshot.runtimeEnv) : null
+    const predecessor = rotation?.successor ?? launchCredential
+    if (rotation && (!isDeepStrictEqual(sessionRecord?.profileScope, authority.scope)
+      || sessionRecord?.profileRootKey !== captured.profileRootKey
+      || !isDeepStrictEqual(launchCredential, rotation.predecessor))) {
+      throw new Error('OpenCode OAuth continuation does not match the prepared session')
+    }
     const assertPublicationOwnership = async () => {
       if (!isDeepStrictEqual(input.profile, captured)) {
         throw new Error('OpenCode OAuth prepared host profile changed')
@@ -2774,7 +2864,7 @@ export class OpenCodeProfileManager {
         const originalScope = await resolveOpenCodeProfileScopeInternal({
           projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
           purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
-        }, predecessor)
+        }, launchCredential!)
         if (originalScope.scopeToken !== authority.scope.scopeToken) {
           throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth publication source configuration changed')
         }
@@ -2792,7 +2882,11 @@ export class OpenCodeProfileManager {
       // This runs before publication, while saved authority must still be C0.
       // Include the complete effective snapshot token, not just its narrower
       // selected config/auth tuple. Publication never reseals this old profile.
-      if (!isDeepStrictEqual(current, authority.scope)) {
+      const expectedScope = rotation ? await resolveOpenCodeProfileScopeInternal({
+        projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
+        purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
+      }, predecessor!) : authority.scope
+      if (!isDeepStrictEqual(current, expectedScope)) {
         throw new OpenCodeOAuthPublicationRevokedError('OpenCode OAuth source scope changed')
       }
     }
@@ -2805,7 +2899,7 @@ export class OpenCodeProfileManager {
     await resolveOpenCodeProfileScopeInternal({
       projectPath: authority.snapshot.projectPath, selectedModel: 'xai/oauth-authority',
       purpose: authority.scope.purpose, env: authority.snapshot.runtimeEnv, cacheSnapshot: false,
-    }, predecessor, binding => { credentialBinding = binding })
+    }, launchCredential!, binding => { credentialBinding = binding })
     if (credentialBinding?.scopeToken !== authority.scope.scopeToken) {
       throw new Error('OpenCode OAuth admission source configuration changed')
     }
@@ -2815,12 +2909,45 @@ export class OpenCodeProfileManager {
       predecessor,
       assertOwnership,
       assertPublicationOwnership,
-      operation: input.operation,
+      expectedOperationId: rotation?.operationId,
+      operation: (armSession, armProbe) => input.operation(async native => {
+        if (rotation && (!sessionRecord || !sameOpenCodeOAuthSessionAuthority(native.record, sessionRecord)
+          || native.baseUrl !== rotation.nativeSession.baseUrl || native.pid !== rotation.nativeSession.pid
+          || native.processStartedAtMs !== rotation.nativeSession.processStartedAtMs)) {
+          throw new Error('OpenCode OAuth continuation native owner changed')
+        }
+        const { OpenCodeSessionStore } = await import('./OpenCodeSessionStore.js')
+        const records = await new OpenCodeSessionStore(path.join(authority.snapshot.managedPaths.data,
+          'opencode', 'session-store.json')).list()
+        const candidates = rotation
+          ? rotation.nativeSession.sessionAuthorities! : records
+        const sessionAuthorities: OpenCodeSessionRecord[] = []
+        for (const record of records) {
+          if (record.hostKey !== native.record.hostKey || record.runtimePid !== native.pid
+            || record.profileRootKey !== native.record.profileRootKey
+            || !isDeepStrictEqual(record.profileScope, native.record.profileScope)
+            || record.stoppedAt || record.staleReason
+            || !candidates.some(candidate => sameOpenCodeOAuthSessionAuthority(candidate, record))) continue
+          await this.assertSessionRefreshOwner(record, native, authority.snapshot.managedPaths.data)
+          sessionAuthorities.push(record)
+        }
+        if (!sessionAuthorities.some(record => sameOpenCodeOAuthSessionAuthority(record, native.record))) {
+          if (rotation) throw new Error('OpenCode OAuth native admission session authority changed')
+          // Legacy/injected owners retain their existing single-session receipt;
+          // absence of persisted cohort evidence never authorizes peer reuse.
+          const singleSession = { ...native }
+          delete singleSession.sessionAuthorities
+          await armSession(singleSession)
+          return
+        }
+        await armSession({ ...native, sessionAuthorities })
+      }, armProbe),
       isNativeSettled: input.isNativeSettled,
       allowNativeContinuation: input.allowNativeContinuation,
       recoveryOwner: authority.scope.purpose === 'catalog' ? undefined : {
         projectPath: authority.snapshot.projectPath, purpose: authority.scope.purpose,
         scopeToken: authority.scope.scopeToken, credentialBinding,
+        ...(rotation ? { launchCredential: rotation.predecessor } : {}),
       },
       abortSignal: input.abortSignal,
     })
@@ -2923,9 +3050,14 @@ export class OpenCodeProfileManager {
     }
   }
 
-  async prepareProfile(
+  async prepareProfile(projectPath?: string | null, options: OpenCodePrepareProfileOptions = {}): Promise<OpenCodePreparedProfile> {
+    return this.prepareProfileInternal(projectPath, options)
+  }
+
+  private async prepareProfileInternal(
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
+    ownedSession?: OpenCodeSessionRecord,
   ): Promise<OpenCodePreparedProfile> {
     let leaveStep: (() => void) | undefined
     const enterStep = (label: string): void => {
@@ -3218,7 +3350,13 @@ export class OpenCodeProfileManager {
     let selectedSourceAuthIdentity: OpenCodeIdentityComponent | undefined
     if (policy) {
       selectedSourceAuthIdentity = configSnapshot!.scopeIdentity.selectedAuthIdentity
-      await materializeOpenCodeSelectedAuthCredential({
+      const continuation = ownedSession ? await this.readCompletedSessionOAuthRotation(ownedSession, runtimeEnv) : null
+      if (ownedSession && (!continuation || ownedSession.profileRootKey !== profileRootKey
+        || !isDeepStrictEqual(ownedSession.profileScope, policy.scope)
+        || !isDeepStrictEqual(configSnapshot!.selectedAuthCredential, continuation.predecessor))) {
+        throw new Error('OpenCode OAuth continuation publication changed')
+      }
+      if (!continuation) await materializeOpenCodeSelectedAuthCredential({
         abortSignal: options.abortSignal,
         authPath: managedAuthPath,
         providerId: policy.scope.providerId,

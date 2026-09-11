@@ -62,7 +62,11 @@ describe('pending native OAuth session authority', () => {
       managedAuthFingerprint: profile.managedAuthFingerprint, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
       managedConfigFingerprint: profile.managedConfigFingerprint, expectedBehaviorFingerprint: 'TEST-proof',
       staleReason: null, createdAt: now, updatedAt: now }
-    const birth = await readProcessStartTimeMs(process.pid)
+    // Capture fixture identity before the lifetime behavior begins. A cold
+    // Windows runner can exceed the production query budget during this setup;
+    // subsequent ownership checks still use the unchanged production deadline.
+    const birth = await readProcessStartTimeMs(process.pid, process.platform,
+      process.platform === 'win32' ? 15_000 : undefined)
     expect(birth).toBeGreaterThan(0)
     owner = { record, baseUrl: 'http://127.0.0.1:43210', pid: process.pid, processStartedAtMs: birth!,
       messageId: 'msg-TEST', noReply: false }

@@ -323,6 +323,7 @@ async function markSendMessageOutcome(
   base: SendMessageOutcomeBase,
   input: {
     status: OpenCodeCommandOutcomeStatus
+    definitelyUnsubmitted?: { runtimePromptMessageId: string }
     sessionId?: string | null
     runtimePid?: number | null
     prePromptCursor?: string | null
@@ -358,7 +359,13 @@ async function markSendMessageOutcome(
     diagnostics: input.diagnostics,
     sendMessageData: input.sendMessageData ? toOutcomeSendMessageData(input.sendMessageData) : undefined,
   }
-  await openCodeCommandOutcomeStore.upsert(patch)
+  // OutcomeStore owns the locked identity check and durable transition. Older
+  // stores ignore this option and conservatively retain prompt_submitting.
+  const options = {
+    requireRetryable: input.status === 'received' || input.status === 'prompt_submitting',
+    ...(input.definitelyUnsubmitted ? { definitelyUnsubmitted: input.definitelyUnsubmitted } : {}),
+  }
+  await openCodeCommandOutcomeStore.upsert(patch, options)
 }
 
 function commandStatusFromOutcomeStatus(
@@ -931,16 +938,16 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
 
 type ConfirmedStopRuntime = NonNullable<OpenCodeSessionRecord['stopAuthority']>['runtime']
 
-function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
+function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null, storedSession?: OpenCodeSessionRecord) {
   const capabilitySnapshotId = snapshot
     ? `opencode:${hashStable({
-      version: snapshot.host?.version ?? null,
+      version: storedSession?.opencodeVersion ?? snapshot.host?.version ?? null,
       projectPath: normalizeOpenCodeProjectIdentity(snapshot.projectPath),
       // Keep the launch-gate snapshot stable across equivalent host restarts.
       // The live resolved fingerprint may include ephemeral host-specific MCP payloads,
       // so use stable project + managed-config identity here instead.
-      projectBehaviorFingerprint: snapshot.profile?.projectBehaviorFingerprint ?? null,
-      managedConfigFingerprint: snapshot.profile?.managedConfigFingerprint ?? null,
+      projectBehaviorFingerprint: storedSession?.projectBehaviorFingerprint ?? snapshot.profile?.projectBehaviorFingerprint ?? null,
+      managedConfigFingerprint: storedSession?.managedConfigFingerprint ?? snapshot.profile?.managedConfigFingerprint ?? null,
       mcpServers: Object.keys(snapshot.mcp ?? {}).sort(),
       providers: uniqueSortedStrings(snapshot.providers?.connected ?? []),
     }).slice(0, 32)}`
@@ -948,19 +955,20 @@ function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
 
   return {
     providerId: 'opencode' as const,
-    binaryPath: snapshot?.host ? 'opencode' : null,
-    binaryFingerprint: snapshot?.host?.version ? `version:${snapshot.host.version}` : null,
-    version: snapshot?.host?.version ?? null,
+    binaryPath: storedSession || snapshot?.host ? 'opencode' : null,
+    binaryFingerprint: (storedSession?.opencodeVersion ?? snapshot?.host?.version)
+      ? `version:${storedSession?.opencodeVersion ?? snapshot?.host?.version}` : null,
+    version: storedSession?.opencodeVersion ?? snapshot?.host?.version ?? null,
     capabilitySnapshotId,
   }
 }
 
 function createRuntimePreconditionSnapshot(
   snapshot?: OpenCodeProvisioningSnapshot | null,
-  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime } = {},
+  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime; deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot> } = {},
 ) {
   return {
-    ...(overrides.confirmedStopRuntime ?? createRuntimeSnapshot(snapshot)),
+    ...(overrides.confirmedStopRuntime ?? overrides.deliveryRuntime ?? createRuntimeSnapshot(snapshot)),
     runtimeStoreManifestHighWatermark:
       overrides.runtimeStoreManifestHighWatermark ?? RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
     activeRunId: null,
@@ -1111,6 +1119,40 @@ async function probeStoredLaneAuthority(
   ))
   if (runtimePids.size > 1) throw new Error('OpenCode lifecycle lane process authority is ambiguous')
   const expectedRuntimePid = runtimePids.values().next().value
+  if (selectedModel.providerId === 'xai' && (command === 'opencode.sendMessage' || command === 'opencode.observeMessageDelivery')) {
+    // Discover the existing host without preparing a different credential scope.
+    // Reads stay available while native work owns publication. Actual sends
+    // recover that receipt and verify live selected authority in SessionBridge
+    // before arming the next prompt under the OAuth publication lock.
+    const ownerChecks: Array<() => Promise<void>> = []
+    let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, authorityRecords[0])
+    for (const record of authorityRecords) {
+      if (!record.opencodeVersion || !record.managedConfigFingerprint
+        || record.resolvedBehaviorFingerprint !== record.managedConfigFingerprint
+        || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
+        || record.opencodeVersion !== authorityRecords[0].opencodeVersion
+        || record.managedConfigFingerprint !== authorityRecords[0].managedConfigFingerprint
+        || record.projectBehaviorFingerprint !== authorityRecords[0].projectBehaviorFingerprint) {
+        throw new Error('OpenCode observation launch authority is unavailable')
+      }
+      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl }, assertOwner) => {
+        ownerChecks.push(assertOwner)
+        if (record === authorityRecords[0]) {
+          const client = openCodeClientFactory.create(baseUrl, phaseContext ? {
+            signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
+          } : undefined)
+          const [mcp, config] = await Promise.all([client.getMcp(), client.getConfig()])
+          snapshot = { ...snapshot, mcp, config,
+            diagnostics: ['OpenCode delivery observation used the exact persisted launch and owned endpoint.'] }
+        }
+      }, phaseContext?.signal)
+    }
+    const deliveryRuntime = createRuntimeSnapshot(snapshot, authorityRecords[0])
+    validateOpenCodeBridgeStateChangingPreconditions({ body, runtime: createRuntimePreconditionSnapshot(snapshot, { deliveryRuntime }) })
+    return { snapshot, records: authorityRecords, deliveryRuntime, signal: phaseContext?.signal,
+      assertOwner: async () => { for (const check of ownerChecks) await check() },
+      release: async (_keepAlive?: boolean) => {} }
+  }
   const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
     selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
     existingHostKey,
@@ -1187,7 +1229,9 @@ async function withStoredLaneAuthority<T>(
   })
   try {
     signal.throwIfAborted()
-    return await operation(retained)
+    const value = await operation(retained)
+    await retained.assertOwner?.()
+    return value
   } finally {
     await retained.release(envelope.command !== 'opencode.handshake' ? true : undefined)
   }
@@ -1195,7 +1239,7 @@ async function withStoredLaneAuthority<T>(
 
 function createBridgeServerIdentity(
   snapshot?: OpenCodeProvisioningSnapshot | null,
-  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime } = {},
+  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime; deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot> } = {},
 ) {
   return {
     schemaVersion: BRIDGE_SCHEMA_VERSION,
@@ -1339,6 +1383,7 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
   timeoutMs: number
   limit?: number
   diagnosticCode: string
+  signal?: AbortSignal
 }): Promise<{
   record: OpenCodeSessionRecord
   summary: OpenCodeSessionReconcileSummary
@@ -1353,6 +1398,7 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
   let responseObservation: OpenCodeDeliveryResponseObservation | null = null
 
   do {
+    input.signal?.throwIfAborted()
     const elapsedMs = Math.max(0, Date.now() - startedAt)
     const waitMs = Math.min(pollIntervalMs, Math.max(0, fallbackGraceMs - elapsedMs))
     if (waitMs > 0) {
@@ -1362,8 +1408,8 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
     reconciled = await withTimeout(
       openCodeSessionBridge.reconcileSession(
         input.record,
-        typeof input.limit === 'number' || input.sessionId
-          ? { limit: input.limit, sessionId: input.sessionId }
+        typeof input.limit === 'number' || input.sessionId || input.signal
+          ? { limit: input.limit, sessionId: input.sessionId, ...(input.signal ? { signal: input.signal } : {}) }
           : undefined,
       ),
       input.timeoutMs,
@@ -1406,7 +1452,7 @@ function success<TData>(
   startedAtMs: number,
   snapshot?: OpenCodeProvisioningSnapshot | null,
   diagnostics: BridgeDiagnosticEvent[] = [],
-  confirmedStopRuntime?: ConfirmedStopRuntime,
+  runtimeOverride?: ReturnType<typeof createRuntimeSnapshot>,
 ) {
   return {
     ok: true,
@@ -1415,7 +1461,7 @@ function success<TData>(
     command: envelope.command,
     completedAt: nowIso(),
     durationMs: Math.max(0, Date.now() - startedAtMs),
-    runtime: confirmedStopRuntime ?? createRuntimeSnapshot(snapshot),
+    runtime: runtimeOverride ?? createRuntimeSnapshot(snapshot),
     diagnostics,
     data,
   }
@@ -4897,6 +4943,7 @@ async function runSendMessage(
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
+  deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
   data: SendMessageCommandData
 }> {
   const authoritySnapshot = authority?.snapshot
@@ -4928,7 +4975,7 @@ async function runSendMessage(
 
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
-    runtime: createRuntimePreconditionSnapshot(authoritySnapshot),
+    runtime: createRuntimePreconditionSnapshot(authoritySnapshot, { deliveryRuntime: authority?.deliveryRuntime }),
   })
   await markSendMessageOutcome(outcomeBase, {
     status: 'preconditions_checked',
@@ -5112,7 +5159,7 @@ async function runSendMessage(
         diagnostics: diagnostics.map(teamDiagnosticToOutcomeString),
       })
       return {
-        snapshot,
+        snapshot, deliveryRuntime: authority?.deliveryRuntime,
         data: {
           accepted: false,
           sessionId: deliveryRecord.opencodeSessionId,
@@ -5171,6 +5218,23 @@ async function runSendMessage(
   let runtimePromptMessageId: string | null = null
   let turnSettled: OpenCodeTurnSettledSummary | null = null
   let promptEndpointAccepted = false
+  const onPromptDefinitelyUnsubmitted = async (event: {
+    sessionId: string; runtimePromptMessageId: string; error: unknown
+  }) => {
+    // Use the exact admitting prompt and immutable command identity. Do not
+    // infer non-submission from the generic failure path or native history.
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'failed_before_accept',
+      sessionId: event.sessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor,
+      runtimePromptMessageId: event.runtimePromptMessageId,
+      definitelyUnsubmitted: { runtimePromptMessageId: event.runtimePromptMessageId },
+      completedAt: nowIso(),
+      error: event.error instanceof Error ? event.error.message : String(event.error),
+      diagnostics: ['opencode_prompt_definitely_unsubmitted'],
+    })
+  }
   try {
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
     if (noReply) {
@@ -5179,6 +5243,14 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: true,
+        onPromptDefinitelyUnsubmitted,
+        onPromptSubmitting: async event => {
+          runtimePromptMessageId = event.runtimePromptMessageId
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_submitting', sessionId: event.sessionId, runtimePromptMessageId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null, prePromptCursor,
+          })
+        },
       })
       promptEndpointAccepted = true
       const runtimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
@@ -5189,6 +5261,7 @@ async function runSendMessage(
         memberName,
         ...(runtimePid ? { runtimePid } : {}),
         prePromptCursor,
+        ...(runtimePromptMessageId ? { runtimePromptMessageId } : {}),
         diagnostics: [
           ...mcpDiagnostics,
           teamDiagnostic(
@@ -5206,13 +5279,15 @@ async function runSendMessage(
         sessionId: deliveryRecord.opencodeSessionId,
         runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
         prePromptCursor,
+        // Acceptance must name the exact prompt admitted by onPromptSubmitting.
+        runtimePromptMessageId,
         acceptedAt: nowIso(),
         completedAt: nowIso(),
         sendMessageData: finalData,
         diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
       }).catch(() => undefined)
       return {
-        snapshot,
+        snapshot, deliveryRuntime: authority?.deliveryRuntime,
         data: finalData,
       }
     } else if (settlementMode === 'acceptance') {
@@ -5221,6 +5296,7 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: false,
+        onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',
@@ -5263,6 +5339,7 @@ async function runSendMessage(
         noReply: false,
         timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
         idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
+        onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',
@@ -5359,7 +5436,7 @@ async function runSendMessage(
       reconcileSummary: null,
     })
     return {
-      snapshot,
+      snapshot, deliveryRuntime: authority?.deliveryRuntime,
       data: finalData,
     }
   }
@@ -5494,7 +5571,7 @@ async function runSendMessage(
   }
 
   return {
-    snapshot,
+    snapshot, deliveryRuntime: authority?.deliveryRuntime,
     data: finalData,
   }
 }
@@ -5504,6 +5581,7 @@ async function runObserveMessageDelivery(
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
+  deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
   data: ObserveMessageDeliveryCommandData
 }> {
   const authoritySnapshot = authority?.snapshot
@@ -5537,7 +5615,7 @@ async function runObserveMessageDelivery(
   })
   validateOpenCodeBridgeStateChangingPreconditions({
     body,
-    runtime: createRuntimePreconditionSnapshot(snapshot),
+    runtime: createRuntimePreconditionSnapshot(snapshot, { deliveryRuntime: authority?.deliveryRuntime }),
   })
 
   await assertStoredDeliveryAuthority(record, authority)
@@ -5550,7 +5628,7 @@ async function runObserveMessageDelivery(
     const limited = await withTimeout(
       openCodeSessionBridge.reconcileSession(record, {
         limit: 80,
-        sessionId: requestedSessionId,
+        sessionId: requestedSessionId, signal: authority?.signal,
       }),
       OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
     )
@@ -5575,7 +5653,7 @@ async function runObserveMessageDelivery(
       await assertStoredDeliveryAuthority(limited.record, authority)
       const full = await withTimeout(
         openCodeSessionBridge.reconcileSession(limited.record, {
-          sessionId: requestedSessionId,
+          sessionId: requestedSessionId, signal: authority?.signal,
         }),
         OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
       )
@@ -5603,7 +5681,7 @@ async function runObserveMessageDelivery(
           inboundMessageId: messageId,
           prePromptCursor: asString(body.prePromptCursor),
           runtimePromptMessageId,
-          sessionId: requestedSessionId,
+          sessionId: requestedSessionId, signal: authority?.signal,
           timeoutMs: OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
           limit: 80,
           diagnosticCode: 'opencode_observe_reconcile',
@@ -5635,7 +5713,7 @@ async function runObserveMessageDelivery(
 
   await assertStoredDeliveryAuthority(record, authority)
   return {
-    snapshot,
+    snapshot, deliveryRuntime: authority?.deliveryRuntime,
     data: {
       observed: true,
       sessionId: requestedSessionId ?? record.opencodeSessionId,
@@ -6002,6 +6080,7 @@ async function handleEnvelope(
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       let snapshot: OpenCodeProvisioningSnapshot | null = null
       let confirmedStopRuntime: ConfirmedStopRuntime | undefined
+      let deliveryRuntime: ReturnType<typeof createRuntimeSnapshot> | undefined
       if (envelope.body.requiredCommand === 'opencode.stopOutcome'
         || envelope.body.requiredCommand === 'opencode.reconcileStop') {
         // Recovery negotiation must remain available after the original host exits.
@@ -6040,12 +6119,14 @@ async function handleEnvelope(
         }
       } else if (envelope.body.requiredCommand === 'opencode.reconcileTeam'
         || envelope.body.requiredCommand === 'opencode.stopTeam'
-        || envelope.body.requiredCommand === 'opencode.sendMessage') {
+        || envelope.body.requiredCommand === 'opencode.sendMessage'
+        || envelope.body.requiredCommand === 'opencode.observeMessageDelivery') {
         if (!runtimeDeadline) throw new Error('OpenCode lane authority deadline was not initialized')
         await withStoredLaneAuthority(envelope, envelope.body.requiredCommand as string,
           runtimeDeadline, externalSignal, async retained => {
             snapshot = retained.snapshot
             confirmedStopRuntime = retained.confirmedStopRuntime
+            deliveryRuntime = retained.deliveryRuntime
           })
       } else if (!lightweightLaunchHandshake) {
         snapshot = await openCodeProvisioningProbe.probe(envelope.cwd, {
@@ -6053,7 +6134,7 @@ async function handleEnvelope(
         })
       }
       const identity = createBridgeServerIdentity(snapshot, {
-        confirmedStopRuntime,
+        confirmedStopRuntime, deliveryRuntime,
         runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
           ? asNullableNumber(envelope.body.expectedManifestHighWatermark)
           : undefined,
@@ -6073,7 +6154,7 @@ async function handleEnvelope(
         ...handshake,
         identityHash: undefined,
       })
-      return { snapshot, confirmedStopRuntime, data: handshake }
+      return { snapshot, confirmedStopRuntime, deliveryRuntime, data: handshake }
     }
     case 'opencode.readiness':
       if (!runtimeDeadline) {
@@ -6208,7 +6289,7 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     || envelope.command === 'opencode.observeMessageDelivery'
     || (envelope.command === 'opencode.sendMessage' && !!expectedCapabilitySnapshotId(envelope.body))
     || (envelope.command === 'opencode.handshake'
-      && ['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam', 'opencode.sendMessage']
+      && ['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam', 'opencode.sendMessage', 'opencode.observeMessageDelivery']
         .includes(envelope.body.requiredCommand as string)
       && !shouldUseLightweightLaunchHandshake(envelope.body))
   )
@@ -6220,7 +6301,8 @@ export async function executeOpenCodeBridgeCommandEnvelope(
       runtimeDeadline?.throwIfExpired()
     }
     return success(envelope, result.data, startedAtMs, result.snapshot, [],
-      'confirmedStopRuntime' in result ? result.confirmedStopRuntime : undefined)
+      'deliveryRuntime' in result && result.deliveryRuntime ? result.deliveryRuntime
+        : 'confirmedStopRuntime' in result ? result.confirmedStopRuntime : undefined)
   } catch (error) {
     const deadlineError = isOpenCodeRuntimeDeadlineError(error) ? error : null
     return failure(

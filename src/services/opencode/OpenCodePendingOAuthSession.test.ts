@@ -10,11 +10,12 @@ import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { readOpenCodeAuthCredential, upsertOpenCodeAuthCredential, type OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
 import type { OpenCodeHostHandle, OpenCodePreparedProfile, OpenCodeSessionRecord } from './types.js'
 
-const c0 = { type: 'oauth', access: 'TEST-C0', refresh: 'single-use-C0', expires: 1000, accountId: 'TEST' }
-const c1 = { ...c0, access: 'TEST-C1', refresh: 'single-use-C1', expires: 500 }
+const c0 = { type: 'oauth', access: 'TEST-C0', refresh: 'single-use-C0', expires: 4000000000000, accountId: 'TEST' }
+const c1 = { ...c0, access: 'TEST-C1', refresh: 'single-use-C1', expires: 4000003600000 }
 const terminalMessages = (messageId: string) => [
   { info: { id: messageId, role: 'user' }, parts: [] },
   { info: { id: 'assistant', role: 'assistant', parentID: messageId, providerID: 'xai', modelID: 'grok-4.3', time: { completed: 1 } }, parts: [] },
@@ -88,6 +89,435 @@ describe('pending native OAuth session authority', () => {
     })
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  test('relay recovery observes both owned sessions while the shared OAuth writer is pending', async () => {
+    // The selected members share the native host and one saved-publication slot.
+    const other = { ...owner.record, memberName: 'other', runId: 'run-2', opencodeSessionId: 'other-session' }
+    await sessionStore.upsert(other)
+    const leases = registry.hosts[owner.record.hostKey].leases
+    leases['TEST::primary::other'] = { ...leases['TEST::primary::owner'],
+      leaseKey: 'TEST::primary::other', memberName: other.memberName, runId: other.runId, sessionId: other.opencodeSessionId }
+    await saveRegistry()
+    await arm()
+    status = { type: 'busy' }
+    messages = terminalMessages(owner.messageId)
+    messages[1].info.finish = 'tool-calls'
+    const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
+    const receipt = await readFile(receiptPath, 'utf8')
+    await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+    const nativeAuth = await readFile(profile.managedAuthPath, 'utf8')
+    const observationBridge = new OpenCodeSessionBridge({
+      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
+      clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
+        getPermissions: async () => [], getSessionMessages: async (id: string) => id === other.opencodeSessionId ? [] : messages,
+      }) as never },
+      prepareProfile: async () => { throw new Error('Observation must not prepare or reconcile native credentials') },
+    })
+    // Source resolution in the baseline uses ambient paths; isolate those too.
+    const savedEnv = { ...process.env }
+    Object.assign(process.env, env)
+    try {
+      const observed = await observationBridge.reconcileSession(owner.record)
+      expect(observed.summary.rawStatus).toBe('busy')
+      await observationBridge.reconcileSession(other)
+      expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+      expect(await readFile(profile.managedAuthPath, 'utf8')).toBe(nativeAuth)
+      expect(await readSaved()).toEqual(c0)
+      // Reading the first turn must not admit a second credential consumer.
+      let submissions = 0
+      await expect(manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
+        operation: async () => { submissions += 1 },
+      })).rejects.toThrow('pending')
+      expect(submissions).toBe(0)
+      await expect(resolve()).rejects.toThrow('pending')
+      // A terminal assistant after the tool step is still insufficient while busy.
+      messages.push({ ...terminalMessages(owner.messageId)[1], info: {
+        ...terminalMessages(owner.messageId)[1].info, id: 'terminal-assistant', finish: 'stop',
+      } })
+      await expect(resolve()).rejects.toThrow('pending')
+      status = 'idle'
+      await resolve()
+      expect(await readSaved()).toEqual(c1)
+      expect(await Bun.file(receiptPath).exists()).toBe(false)
+      await observationBridge.reconcileSession(owner.record)
+      // The original exact stored session/run survives observation and recovery.
+      expect((await sessionStore.get('TEST', 'primary', 'owner'))?.opencodeSessionId).toBe(owner.record.opencodeSessionId)
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key]
+      Object.assign(process.env, savedEnv)
+    }
+  })
+
+  test.each(['ok', 'no-reply', 'rotated', 'persist-race', 'rotated-account', 'rotated-source', 'rotated-native', 'rotated-host', 'rotated-run', 'rotated-session', 'rotated-proof', 'rotated-peer', 'rotated-cas', 'rotated-config', 'rotated-model', 'rotated-provider', 'rotated-permission', 'rotated-mcp', 'rotated-project', 'lease', 'birth', 'session', 'capability', 'cancel-entry', 'cancel-read', 'lease-read', 'birth-read', 'session-read', 'cancel-observe', 'lease-observe', 'birth-observe', 'session-observe'])
+    ('production relay handshake -> observe -> send: %s', async scenario => {
+    const { executeOpenCodeBridgeCommandEnvelope: execute } = await import('./OpenCodeBridgeCommandHandler.js')
+    const { openCodeSessionStore } = await import('./OpenCodeSessionStore.js')
+    const { openCodeSessionBridge } = await import('./OpenCodeSessionBridge.js')
+    const { openCodeClientFactory } = await import('./OpenCodeClientFactory.js')
+    const { openCodeProvisioningProbe, OpenCodeProvisioningProbe } = await import('./OpenCodeProvisioningProbe.js')
+    const { openCodeCommandOutcomeStore, OpenCodeCommandOutcomeStore } = await import('./OpenCodeCommandOutcomeStore.js')
+    const { createHash } = await import('node:crypto')
+    const hashStable = (value: Record<string, unknown>) => createHash('sha256')
+      .update(JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))))).digest('hex')
+    const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
+    const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
+    const savedEnv = { ...process.env }
+    const restores: Array<{ mockRestore(): void }> = []
+    Object.assign(process.env, env)
+    let posts = 0
+    let onMcp: (() => Promise<void>) | undefined
+    let onHistory: (() => Promise<void>) | undefined
+    const histories = new Map<string, any[]>()
+    const statuses: Record<string, unknown> = {}
+    const mcp = { 'agent-teams': { status: 'connected' } }
+    let liveDrift = false
+    const client = { getSessionStatus: async () => statuses,
+      getSessionMessages: async (id: string) => { await onHistory?.(); return histories.get(id) ?? [] }, getPermissions: async () => [],
+      getMcp: async () => { await onMcp?.(); return mcp },
+      getConfig: async () => {
+        const config = JSON.parse(JSON.stringify(profile.managedConfig).replace(/\{env:([^}]+)\}/g, (_match, name) => profile.env[name] || ''))
+        if (liveDrift && scenario === 'rotated-model') config.model = 'xai/foreign'
+        if (liveDrift && scenario === 'rotated-provider') config.provider.xai = { ...config.provider.xai, options: { baseURL: 'https://example.invalid' } }
+        if (liveDrift && scenario === 'rotated-permission') config.permission = { bash: 'deny' }
+        if (liveDrift && scenario === 'rotated-mcp') config.mcp['agent-teams'] = { type: 'remote', url: 'http://127.0.0.1:2/mcp' }
+        return config
+      },
+      listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.xdgDataHome),
+      promptSessionAsync: async (id: string, body: any) => {
+        posts += 1
+        expect(body.model).toEqual({ providerID: 'xai', modelID: 'grok-4.3' })
+        histories.set(id, [...(histories.get(id) ?? []), { info: { id: body.messageID, role: 'user' }, parts: body.parts }])
+        statuses[id] = { type: 'busy' }
+      },
+    }
+    try {
+      owner.record = { ...owner.record, toolApprovalMode: 'auto', opencodeVersion: 'TEST',
+        expectedBehaviorFingerprint: (await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: owner.record.selectedModel,
+          effectiveConfigFingerprint: profile.managedConfigFingerprint })).expectedBehaviorFingerprint,
+        resolvedBehaviorFingerprint: profile.managedConfigFingerprint }
+      await sessionStore.upsert(owner.record)
+      const other = { ...owner.record, memberName: 'other', opencodeSessionId: 'other-session' }
+      await sessionStore.upsert(other)
+      const leases = registry.hosts[owner.record.hostKey].leases
+      leases['TEST::primary::other'] = { ...leases['TEST::primary::owner'], leaseKey: 'TEST::primary::other',
+        memberName: 'other', sessionId: other.opencodeSessionId }
+      await saveRegistry()
+      const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      const hostFor = (prepared: OpenCodePreparedProfile): OpenCodeHostHandle => ({
+        hostKey: owner.record.hostKey, profileRootKey: prepared.profileRootKey, projectPath: project,
+        projectBehaviorFingerprint: prepared.projectBehaviorFingerprint, baseUrl: owner.baseUrl, port: 43210,
+        pid: process.pid, processStartedAtMs: owner.processStartedAtMs, version: 'TEST', state: 'healthy',
+        profile: prepared, resolvedConfigFingerprint: prepared.managedConfigFingerprint, diagnostics: [],
+      })
+      // Only process acquisition / native transport are synthetic. Scope recovery,
+      // preparation, publication, bridge admission and outcome writes are real.
+      restores.push(spyOn(hosts, 'ensureHost').mockImplementation(async input => hostFor(input.preparedProfile!)))
+      restores.push(spyOn(hosts, 'releaseHost').mockImplementation(async () => {}))
+      const mcpManager = { ensureAppMcp: async () => ({ mcp, summary: { status: 'present', connected: true, matchedServerName: 'agent-teams', diagnostics: [] } }) }
+      const productionProbe = new OpenCodeProvisioningProbe({ hostManager: hosts,
+        inventoryService: { probe: async (_project: any, options: any) => ({ detected: true, projectPath: project,
+          models: [], diagnostics: [], profile: await manager.prepareProfile(project, options) }) } as never,
+        mcpManager: mcpManager as never })
+      const productionBridge = new OpenCodeSessionBridge({ hostManager: hosts, sessionStore,
+        clientFactory: { create: () => client as never }, mcpManager: mcpManager as never,
+        oauthRefreshCoordinator: new (await import('./OpenCodeOAuthRefreshCoordinator.js')).OpenCodeOAuthRefreshCoordinator() })
+      const outcomes = new OpenCodeCommandOutcomeStore(path.join(root, 'outcomes.json'))
+      restores.push(spyOn(openCodeCommandOutcomeStore, 'upsert').mockImplementation((...args) => outcomes.upsert(...args)))
+      restores.push(spyOn(openCodeSessionStore, 'list').mockImplementation(() => sessionStore.list()))
+      restores.push(spyOn(openCodeSessionStore, 'get').mockImplementation((...args) => sessionStore.get(...args)))
+      restores.push(spyOn(openCodeClientFactory, 'create').mockImplementation(() => client as never))
+      restores.push(spyOn(openCodeProvisioningProbe, 'probeRetainingHost').mockImplementation((...args) => productionProbe.probeRetainingHost(...args)))
+      for (const method of ['reconcileSession', 'ensureSessionAppMcpReady', 'promptAsyncUntilAccepted', 'promptAsync'] as const) {
+        restores.push(spyOn(openCodeSessionBridge, method).mockImplementation(productionBridge[method].bind(productionBridge) as never))
+      }
+      // Added entrypoint remains real; only bind its synthetic persistent roots.
+      restores.push(spyOn(openCodeSessionBridge, 'withOwnedOAuthSessionObservation')
+        .mockImplementation(productionBridge.withOwnedOAuthSessionObservation.bind(productionBridge)))
+      const capability = `opencode:${hashStable({ version: 'TEST', projectPath: normalizeOpenCodeProjectIdentity(project),
+        projectBehaviorFingerprint: profile.projectBehaviorFingerprint, managedConfigFingerprint: profile.managedConfigFingerprint,
+        mcpServers: ['agent-teams'], providers: [] }).slice(0, 32)}`
+      const call = (command: string, member = 'owner', extra: Record<string, unknown> = {}, signal?: AbortSignal) => execute({
+        schemaVersion: 1, command, requestId: `TEST-${command}-${member}`, cwd: project,
+        startedAt: new Date().toISOString(),
+        // The production path issues several real PowerShell process-identity
+        // probes on Windows. Keep the fixture command budget above their cold
+        // runner latency; production deadlines are unchanged.
+        timeoutMs: process.platform === 'win32' ? 30_000 : 10_000,
+        body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: member,
+          // Keep each member's delivery identity stable from blocked send through retry.
+          deliveryAttemptId: `attempt-${member}`,
+          expectedCapabilitySnapshotId: capability, messageId: member === 'owner' ? 'inbox-TEST' : 'inbox-other',
+          runtimePromptMessageId: owner.messageId, sessionId: member === 'owner' ? 'native-session' : 'other-session',
+          text: 'synthetic followup', settlementMode: 'acceptance', ...(scenario === 'no-reply' ? { noReply: true } : {}), ...extra },
+      }, { signal })
+      await arm()
+      histories.set('native-session', terminalMessages(owner.messageId))
+      histories.get('native-session')![1].info.finish = 'tool-calls'
+      statuses['native-session'] = { type: 'busy' }
+      statuses['other-session'] = { type: 'busy' }
+      if (scenario.startsWith('rotated')) await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+      const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
+      const receipt = await readFile(receiptPath, 'utf8')
+      const nativeAuth = await readFile(profile.managedAuthPath, 'utf8')
+      if (!['ok', 'no-reply', 'persist-race'].includes(scenario) && !scenario.startsWith('rotated')) {
+        const controller = new AbortController()
+        const mutate = async () => {
+          if (scenario.startsWith('lease')) registry.hosts[owner.record.hostKey].leases = {}
+          if (scenario.startsWith('birth')) registry.hosts[owner.record.hostKey].processStartedAtMs += 1
+          if (scenario.startsWith('session')) {
+            const stored = JSON.parse(await readFile(sessionPath, 'utf8'))
+            for (const record of Object.values(stored.records) as any[]) if (record.memberName === 'owner') record.opencodeSessionId = 'replacement'
+            await writeFile(sessionPath, JSON.stringify(stored))
+          }
+          if (scenario.startsWith('cancel')) controller.abort(new Error('TEST cancelled'))
+          await saveRegistry()
+        }
+        if (scenario.endsWith('-read')) onMcp = mutate
+        else if (scenario.endsWith('-observe')) onHistory = mutate
+        else await mutate()
+        const result = await call(scenario.endsWith('-observe') ? 'opencode.observeMessageDelivery' : 'opencode.handshake', 'owner', { requiredCommand: 'opencode.sendMessage',
+          ...(scenario === 'capability' ? { expectedCapabilitySnapshotId: 'opencode:' + '0'.repeat(32) } : {}),
+        }, controller.signal)
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toMatch(/ownership|no longer active|authority changed|cancelled|precondition mismatch/)
+        expect(posts).toBe(0)
+        expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+        expect(await readFile(profile.managedAuthPath, 'utf8')).toBe(nativeAuth)
+        expect(await readSaved()).toEqual(c0)
+        return
+      }
+      if (scenario === 'persist-race') {
+        let injected = false
+        const original = sessionStore.upsert.bind(sessionStore)
+        restores.push(spyOn(sessionStore, 'upsert').mockImplementation(async (...args) => {
+          if (!injected) {
+            injected = true
+            await original({ ...(await sessionStore.get('TEST', 'primary', 'owner'))!, expectedBehaviorFingerprint: 'a'.repeat(64) })
+          }
+          return original(...args)
+        }))
+        expect((await call('opencode.observeMessageDelivery', 'owner')).ok).toBe(false)
+        expect(injected).toBe(true)
+        expect((await sessionStore.get('TEST', 'primary', 'owner'))?.expectedBehaviorFingerprint).toBe('a'.repeat(64))
+        expect(posts).toBe(0)
+        expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+        expect(await readFile(profile.managedAuthPath, 'utf8')).toBe(nativeAuth)
+        return
+      }
+      for (const member of ['owner', 'other']) {
+        for (const requiredCommand of ['opencode.sendMessage', 'opencode.observeMessageDelivery']) {
+          const handshake = await call('opencode.handshake', member, { requiredCommand })
+          expect(handshake.ok ? null : handshake.error.message).toBeNull()
+          if (handshake.ok) expect(handshake.runtime.capabilitySnapshotId).toBe(capability)
+        }
+        const observed = await call('opencode.observeMessageDelivery', member)
+        expect(observed.ok ? null : observed.error.message).toBeNull()
+        if (observed.ok) expect(observed.runtime.capabilitySnapshotId).toBe(capability)
+      }
+      expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+      expect(await readFile(profile.managedAuthPath, 'utf8')).toBe(nativeAuth)
+      expect(await readSaved()).toEqual(c0)
+      const blocked = await call('opencode.sendMessage', 'other')
+      expect(blocked.ok).toBe(false)
+      if (!blocked.ok) expect(blocked.error.message).toContain('pending')
+      expect(posts).toBe(0)
+      delete statuses['native-session']
+      for (const info of [
+        { ...terminalMessages('foreign-parent')[1].info, id: 'foreign-parent-terminal', finish: 'stop' },
+        { ...terminalMessages(owner.messageId)[1].info, id: 'foreign-model-terminal', modelID: 'foreign-model', finish: 'stop' },
+      ]) {
+        histories.get('native-session')!.push({ info, parts: [] })
+        const refused = await call('opencode.sendMessage', 'other')
+        expect(refused.ok).toBe(false)
+        if (!refused.ok) expect(refused.error.message).toContain('pending')
+        expect(posts).toBe(0)
+        expect(await readFile(receiptPath, 'utf8')).toBe(receipt)
+        expect(await readSaved()).toEqual(c0)
+      }
+      histories.get('native-session')!.push({ info: { ...terminalMessages(owner.messageId)[1].info,
+        id: 'terminal', finish: 'stop' }, parts: [{ type: 'text', text: 'done' }] })
+      // Another session's busy status cannot invalidate the exact owner's idle.
+      delete statuses['native-session']
+      if (scenario.startsWith('rotated-')) {
+        if (scenario === 'rotated-account') await writeFile(profile.managedAuthPath, JSON.stringify({ xai: { ...c1, accountId: 'foreign' } }))
+        else await resolveOpenCodeProfileScope({ projectPath: project, selectedModel: owner.record.selectedModel, purpose: 'launch_runtime', env })
+        liveDrift = true
+        if (scenario === 'rotated-config') await writeFile(path.join(project, 'opencode.json'), JSON.stringify({ model: 'xai/foreign' }))
+        if (scenario === 'rotated-project') await writeFile(path.join(project, 'AGENTS.md'), 'Changed project instructions')
+        if (scenario === 'rotated-source') await writeFile(global, JSON.stringify({ xai: { ...c1, refresh: 'new-login' } }))
+        if (scenario === 'rotated-native') await writeFile(profile.managedAuthPath, JSON.stringify({ xai: { ...c1, refresh: 'unowned-native' } }))
+        if (scenario === 'rotated-host') { registry.hosts[owner.record.hostKey].processStartedAtMs += 1; await saveRegistry() }
+        if (['rotated-run', 'rotated-session', 'rotated-proof', 'rotated-peer'].includes(scenario)) {
+          const stored = JSON.parse(await readFile(sessionPath, 'utf8'))
+          for (const record of Object.values(stored.records) as OpenCodeSessionRecord[]) {
+            if (record.memberName !== (scenario === 'rotated-peer' ? 'other' : 'owner')) continue
+            if (scenario === 'rotated-run' || scenario === 'rotated-peer') record.runId = 'newer-run'
+            if (scenario === 'rotated-session') record.opencodeSessionId = 'newer-session'
+            if (scenario === 'rotated-proof') record.expectedBehaviorFingerprint = 'a'.repeat(64)
+          }
+          await writeFile(sessionPath, JSON.stringify(stored))
+          if (scenario === 'rotated-peer') {
+            registry.hosts[owner.record.hostKey].leases['TEST::primary::other'].runId = 'newer-run'
+            await saveRegistry()
+            expect(await manager.readCompletedSessionOAuthRotation((await sessionStore.get('TEST', 'primary', 'other'))!, env)).toBeNull()
+            expect((await call('opencode.sendMessage', 'other', { runId: 'newer-run' })).ok).toBe(false)
+            expect(posts).toBe(0)
+            return
+          }
+        }
+        if (scenario === 'rotated-cas') {
+          // Competing publication between the operation's captured proof and arm.
+          const original = outcomes.upsert.bind(outcomes)
+          restores.push(spyOn(outcomes, 'upsert').mockImplementation(async (...args) => {
+            const result = await original(...args)
+            if (args[0].status === 'prompt_submitting') {
+              const file = `${global}.agent-teams-xai-oauth-successor.json`
+              const competing = JSON.parse(await readFile(file, 'utf8'))
+              competing.operationId = 'newer-publication'
+              await writeFile(file, JSON.stringify(competing))
+            }
+            return result
+          }))
+        }
+        const savedBefore = await readFile(global, 'utf8')
+        const managedBefore = await readFile(profile.managedAuthPath, 'utf8')
+        expect((await call('opencode.sendMessage', 'owner')).ok).toBe(false)
+        expect(posts).toBe(0)
+        expect(await readFile(global, 'utf8')).toBe(savedBefore)
+        expect(await readFile(profile.managedAuthPath, 'utf8')).toBe(managedBefore)
+        return
+      }
+      const sent = await call('opencode.sendMessage', 'owner')
+      expect(sent.ok ? null : sent.error.message).toBeNull()
+      expect(posts).toBe(1)
+      if (sent.ok) expect(sent.runtime.capabilitySnapshotId).toBe(capability)
+      expect(await readSaved()).toEqual(scenario === 'rotated' ? c1 : c0)
+      const nextReceipt = JSON.parse(await readFile(receiptPath, 'utf8'))
+      expect(nextReceipt.nativeSession.record.opencodeSessionId).toBe('native-session')
+      expect(nextReceipt.nativeSession.messageId).not.toBe(owner.messageId)
+      const accepted = JSON.parse(await readFile(path.join(root, 'outcomes.json'), 'utf8'))
+      expect(JSON.stringify(accepted)).toContain(nextReceipt.nativeSession.messageId)
+      // Observe/retry while the newly admitted turn owns the fence: no duplicate POST.
+      expect((await call('opencode.observeMessageDelivery', 'owner', { runtimePromptMessageId: nextReceipt.nativeSession.messageId })).ok).toBe(true)
+      expect((await call('opencode.sendMessage', 'owner')).ok).toBe(false)
+      expect(posts).toBe(1)
+      histories.get('native-session')!.push({ info: { ...terminalMessages(nextReceipt.nativeSession.messageId)[1].info,
+        id: 'followup-terminal', finish: 'stop' }, parts: [] })
+      delete statuses['native-session']
+      delete statuses['other-session']
+      // Terminal settlement is not permission to reuse a delivery attempt.
+      expect((await call('opencode.sendMessage', 'owner')).ok).toBe(false)
+      expect(posts).toBe(1)
+      expect((await outcomes.query({ requestId: 'TEST-opencode.sendMessage-owner' })).record?.runtimePromptMessageId)
+        .toBe(nextReceipt.nativeSession.messageId)
+      const c2 = { ...c1, access: 'TEST-C2', refresh: 'single-use-C2', expires: c1.expires + 3600000 }
+      if (scenario === 'rotated') await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c2 }))
+      const second = await call('opencode.sendMessage', 'other', { messageId: 'inbox-other' })
+      expect(second.ok ? null : second.error.message).toBeNull()
+      expect(posts).toBe(2)
+      const secondReceipt = JSON.parse(await readFile(receiptPath, 'utf8'))
+      expect(secondReceipt.nativeSession.record.opencodeSessionId).toBe('other-session')
+      expect(secondReceipt.nativeSession.messageId).not.toBe(nextReceipt.nativeSession.messageId)
+      if (scenario === 'rotated') {
+        expect(await readSaved()).toEqual(c2)
+        expect(secondReceipt.predecessor).toEqual(c2)
+        expect(secondReceipt.owner.launchCredential).toEqual(c0)
+        expect(secondReceipt.nativeSession.sessionAuthorities).toHaveLength(2)
+        const c3 = { ...c2, access: 'TEST-C3', refresh: 'single-use-C3', expires: c2.expires + 3600000 }
+        await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c3 }))
+        histories.get('other-session')!.push({ info: { ...terminalMessages(secondReceipt.nativeSession.messageId)[1].info,
+          id: 'other-terminal', finish: 'stop' }, parts: [] })
+        delete statuses['other-session']
+        const atomic = await import('../../utils/atomicWrite.js')
+        const originalWrite = atomic.writeJsonFileAtomic
+        const crash = spyOn(atomic, 'writeJsonFileAtomic').mockImplementation(async (...args) => {
+          await originalWrite(...args)
+          if (args[0] === `${global}.agent-teams-xai-oauth-successor.json`) throw new Error('TEST crash after publication')
+        })
+        try {
+          await expect(resolveOpenCodeProfileScope({ projectPath: project, selectedModel: owner.record.selectedModel,
+            purpose: 'launch_runtime', env })).rejects.toThrow('TEST crash after publication')
+        } finally { crash.mockRestore() }
+        expect(await Bun.file(receiptPath).exists()).toBe(true)
+        // The restarted command has neither resolver snapshots nor in-memory
+        // continuity. Recover the committed receipt and send through the CLI's
+        // production handler using synthetic native transport only.
+        const modulePath = (name: string) => JSON.stringify(path.join(import.meta.dir, name))
+        const script = `import { spyOn } from 'bun:test';
+          import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from ${modulePath('OpenCodeProfileManager.ts')};
+          import { openCodeSessionStore } from ${modulePath('OpenCodeSessionStore.ts')};
+          import { openCodeHostManager } from ${modulePath('OpenCodeHostManager.ts')};
+          import { openCodeClientFactory } from ${modulePath('OpenCodeClientFactory.ts')};
+          import { openCodeMcpManager } from ${modulePath('OpenCodeMcpManager.ts')};
+          import { OpenCodeCommandOutcomeStore, openCodeCommandOutcomeStore } from ${modulePath('OpenCodeCommandOutcomeStore.ts')};
+          import { effectiveAgentsFixture } from ${modulePath('OpenCodeEffectiveAgents.test-support.ts')};
+          import { executeOpenCodeBridgeCommandEnvelope as execute } from ${modulePath('OpenCodeBridgeCommandHandler.ts')};
+          const record = await openCodeSessionStore.get('TEST', 'primary', 'owner');
+          await resolveOpenCodeProfileScope({ projectPath: record.projectPath, selectedModel: record.selectedModel, purpose: 'launch_runtime' });
+          const manager = new OpenCodeProfileManager();
+          const profile = await manager.prepareOwnedOAuthSessionProfile(record);
+          if (!profile || !manager.hasOwnedOAuthSessionProfile(record, profile)) throw new Error('missing continuity');
+          let posts = 0; const history = []; const status = {};
+          const mcp = { 'agent-teams': { status: 'connected' } };
+          const client = { getMcp: async () => mcp, getConfig: async () => profile.managedConfig,
+            listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.xdgDataHome),
+            getSessionStatus: async () => status, getSessionMessages: async () => history, getPermissions: async () => [],
+            promptSessionAsync: async (id, body) => { posts++; history.push({ info: { id: body.messageID, role: 'user' }, parts: [] }); status[id] = 'busy'; } };
+          spyOn(openCodeClientFactory, 'create').mockImplementation(() => client);
+          spyOn(openCodeMcpManager, 'ensureAppMcp').mockImplementation(async () => ({ mcp,
+            summary: { matchedServerName: 'agent-teams', connected: true, status: 'present', diagnostics: [] } }));
+          spyOn(openCodeHostManager, 'ensureHost').mockImplementation(async input => ({
+            ...${JSON.stringify({ hostKey: owner.record.hostKey, profileRootKey: profile.profileRootKey, projectPath: project,
+              projectBehaviorFingerprint: profile.projectBehaviorFingerprint, baseUrl: owner.baseUrl, port: 43210,
+              pid: owner.pid, processStartedAtMs: owner.processStartedAtMs, version: 'TEST', state: 'healthy',
+              resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [] })}, profile: input.preparedProfile }));
+          spyOn(openCodeHostManager, 'releaseHost').mockImplementation(async () => {});
+          const outcomes = new OpenCodeCommandOutcomeStore(${JSON.stringify(path.join(root, 'outcomes.json'))});
+          spyOn(openCodeCommandOutcomeStore, 'upsert').mockImplementation((...args) => outcomes.upsert(...args));
+          const call = requestId => execute({ schemaVersion: 1, command: 'opencode.sendMessage', requestId, cwd: record.projectPath,
+            startedAt: new Date().toISOString(), timeoutMs: process.platform === 'win32' ? 30000 : 10000,
+            body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: 'owner', expectedCapabilitySnapshotId: ${JSON.stringify(capability)},
+              deliveryAttemptId: requestId === 'TEST-third' ? 'attempt-third' : 'attempt-owner',
+              messageId: requestId === 'TEST-third' ? 'inbox-third' : 'inbox-TEST', text: 'synthetic followup', settlementMode: 'acceptance' } });
+          const retry = await call('TEST-opencode.sendMessage-owner');
+          if (retry.ok || posts !== 0) throw new Error('duplicate delivery admitted after restart');
+          const sent = await call('TEST-third');
+          if (!sent.ok || posts !== 1) throw new Error(sent.ok ? 'wrong post count' : sent.error.message);
+          process.stdout.write(JSON.stringify({ posts, saved: await manager.readSavedOAuthCredential(profile) }));`
+        const child = Bun.spawn([process.execPath, '-e', script], { env, stdout: 'pipe', stderr: 'pipe' })
+        const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+        expect(stderr).toBe(''); expect(code).toBe(0)
+        expect(JSON.parse(stdout)).toEqual({ posts: 1, saved: c3 })
+        expect(await readSaved()).toEqual(c3)
+        const thirdReceipt = JSON.parse(await readFile(receiptPath, 'utf8'))
+        expect(thirdReceipt.predecessor).toEqual(c3)
+        expect(thirdReceipt.nativeSession.record.opencodeSessionId).toBe('native-session')
+        expect(thirdReceipt.nativeSession.messageId).not.toBe(nextReceipt.nativeSession.messageId)
+        expect((await outcomes.query({ requestId: 'TEST-third' })).record?.runtimePromptMessageId).toBe(thirdReceipt.nativeSession.messageId)
+      }
+      expect((await sessionStore.get('TEST', 'primary', 'owner'))?.opencodeSessionId).toBe('native-session')
+    } finally {
+      for (const mock of restores.reverse()) mock.mockRestore()
+      for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key]
+      Object.assign(process.env, savedEnv)
+    }
+    // This multi-command integration scenario performs real process-birth queries.
+    // Windows starts PowerShell for each query; keep the test harness deadline
+    // separate from the unchanged per-command and process-query deadlines.
+  }, process.platform === 'win32' ? 180_000 : 30_000)
+
+  test.each(['tool-calls', 'unknown', 'empty-error'])('relay recovery retains a completed %s step until the terminal assistant', async finish => {
+    await arm()
+    await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
+    messages = terminalMessages(owner.messageId)
+    messages[1].info.finish = finish === 'empty-error' ? 'tool-calls' : finish
+    if (finish === 'empty-error') messages[1].info.error = {}
+    await expect(resolve()).rejects.toThrow('pending')
+    expect(await readSaved()).toEqual(c0)
+    messages.push({ info: { ...terminalMessages(owner.messageId)[1].info, id: 'terminal', finish: 'stop' }, parts: [] })
+    await resolve()
+    expect(await readSaved()).toEqual(c1)
+  })
 
   test.each(['source-paths', 'config', 'new-login'])('revoked pending owner fences C0 while unrelated new authority can execute: %s', async mutation => {
     await arm()

@@ -10,7 +10,7 @@ import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
-import type { OpenCodeHostHandle } from './types.js'
+import type { OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
 
 type OpenCodeSelectedProfileAuthorityDeps = {
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
@@ -72,6 +72,9 @@ export async function refreshSelectedProfileAuthority(input: {
     // Only the successful post-execution readiness check may compare an owned
     // committed rotation. The retained profile is never resealed or reusable.
     completedOAuthProbe?: OpenCodeOAuthNativeProbeOwner
+    // Existing-session admission additionally requires committed native lineage,
+    // the captured session cohort and this exact live host. It issues no launch proof.
+    ownedOAuthSession?: OpenCodeSessionRecord
     phaseContext?: OpenCodePhaseContext
     onRejection?: (diagnostic: OpenCodeAuthorityRejection) => void
   }, deps: OpenCodeSelectedProfileAuthorityDeps = {}): Promise<OpenCodeHostHandle['profile'] | null> {
@@ -121,6 +124,7 @@ export async function refreshSelectedProfileAuthority(input: {
       const expectedFingerprint = input.expectedBehaviorFingerprint
       const contractIdentity = input.contractConfigIdentity
       const completedProbe = input.completedOAuthProbe ? { ...input.completedOAuthProbe } : undefined
+      const ownedSession = input.ownedOAuthSession ? structuredClone(input.ownedOAuthSession) : undefined
       const selectedModel = input.selectedModel
       const baseUrl = input.host.baseUrl
       const hostIdentity = () => [input.host.hostKey, input.host.profileRootKey,
@@ -187,9 +191,20 @@ export async function refreshSelectedProfileAuthority(input: {
       const readRotation = () => completedProbe
         ? read('profile_scope', () => openCodeProfileManager.readCompletedReadinessOAuthRotation(
           { ...input.host, profile }, selected.raw, scope, completedProbe))
-        : Promise.resolve(null)
-      const rotation = scope.scopeToken !== profile.profileScope.scopeToken && completedProbe
+        : ownedSession
+          ? read('profile_scope', () => openCodeProfileManager.readCompletedSessionOAuthRotation(ownedSession!, profile.env))
+          : Promise.resolve(null)
+      const rotation = scope.scopeToken !== profile.profileScope.scopeToken && (completedProbe || ownedSession)
         && selected.providerId === 'xai' ? await readRotation() : null
+      if (rotation && ownedSession && 'nativeSession' in rotation) {
+        const native = rotation.nativeSession
+        if (input.host.hostKey !== native.record.hostKey || input.host.baseUrl !== native.baseUrl
+          || input.host.pid !== native.pid || input.host.processStartedAtMs !== native.processStartedAtMs
+          || input.host.profileRootKey !== native.record.profileRootKey
+          || ownedSession.expectedBehaviorFingerprint !== expectedFingerprint) {
+          return reject({ check: 'scope_token_match' })
+        }
+      }
       if (scope.scopeToken !== profile.profileScope.scopeToken && !rotation) return reject({ check: 'scope_token_match' })
       if (scope.configFingerprint !== profile.profileScope.configFingerprint) return reject({ check: 'scope_config_match' })
       if (scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity && !rotation) return reject({ check: 'selected_auth_identity_match' })
@@ -208,6 +223,7 @@ export async function refreshSelectedProfileAuthority(input: {
       if (input.selectedModel !== selectedModel || input.host.baseUrl !== baseUrl
         || input.host.profile !== sourceProfile || !isDeepStrictEqual(rawEntries(sourceProfile), original)
         || !isDeepStrictEqual(hostIdentity(), originalHostIdentity)
+        || !isDeepStrictEqual(input.ownedOAuthSession, ownedSession)
         || input.expectedBehaviorFingerprint !== expectedFingerprint || input.contractConfigIdentity !== contractIdentity) {
         return reject({ check: 'selected_config_match', fields: [] })
       }

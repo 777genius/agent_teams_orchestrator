@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
+import { readProcessStartTimeMs } from '../../utils/processKill.js'
+
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
@@ -108,6 +110,12 @@ export type OpenCodePromptAsyncWithTurnSettledHooks = {
     runtimePromptMessageId: string
     baseUrl: string
   }) => Promise<void>
+  // Emitted only when OAuth arm rejects before the native client is invoked.
+  onPromptDefinitelyUnsubmitted?: (event: {
+    sessionId: string
+    runtimePromptMessageId: string
+    error: unknown
+  }) => Promise<void>
   onPromptAccepted?: (event: {
     sessionId: string
     runtimePromptMessageId: string
@@ -166,6 +174,7 @@ export function sessionManagedAuthMatches(record: OpenCodeSessionRecord, profile
       && profile.profileScope?.selectedAuthIdentity === record.profileScope.selectedAuthIdentity
   }
   return record.managedAuthFingerprint === profile.managedAuthFingerprint
+    || openCodeProfileManager.hasOwnedOAuthSessionProfile(record, profile)
 }
 
 function getMessageId(message: OpenCodeMessage): string | null {
@@ -496,6 +505,10 @@ export class OpenCodeSessionBridge {
         isOAuthNativeSessionSettled: owner => this.isOwnedOAuthNativeSessionSettled(owner),
         isOAuthNativeSessionUnsubmitted: owner => this.isOwnedOAuthNativeSessionSettled(owner, true),
       }), options.signal)
+    if (record.profileScope?.providerId === 'xai') {
+      const continued = await openCodeProfileManager.prepareOwnedOAuthSessionProfile(record, options.signal)
+      if (continued) return { profile: continued, toolApprovalMode: record.toolApprovalMode ?? 'auto' }
+    }
     if (record.toolApprovalMode) {
       return {
         profile: await this.prepareProfile(projectPath, {
@@ -761,6 +774,7 @@ export class OpenCodeSessionBridge {
         host,
         selectedModel: record.selectedModel,
         expectedBehaviorFingerprint: record.expectedBehaviorFingerprint!,
+        ownedOAuthSession: record,
         ...(options.signal ? {
           phaseContext: {
             phase: 'stop_abort',
@@ -1020,6 +1034,7 @@ export class OpenCodeSessionBridge {
     return this.withSessionHost(record, async context => {
       const completion = await openCodeProfileManager.withOwnedOAuthRefresh({
         profile: context.profile,
+        sessionRecord: capturedRecord,
         assertHostOwnership: async () => {
           if (!isDeepStrictEqual(record, capturedRecord)) {
             throw new Error('OpenCode OAuth session operation identity changed')
@@ -1049,9 +1064,12 @@ export class OpenCodeSessionBridge {
           try {
             value = await callback({ ...context, armOAuthNativeSession: async (messageId, noReply = false) => {
               if (!context.runtimePid) throw new Error('OpenCode OAuth session has no owned process')
-              nativeOwner = { record: capturedRecord, baseUrl: context.baseUrl,
+              const candidate = { record: capturedRecord, baseUrl: context.baseUrl,
                 pid: context.runtimePid, processStartedAtMs: context.processStartedAtMs!, messageId, noReply }
-              await arm(nativeOwner)
+              await arm(candidate)
+              // An attempted arm is not an admitted native operation. In
+              // particular, a publication CAS rejection cannot have sent HTTP.
+              nativeOwner = candidate
             } })
           } catch (caught) { failed = true; error = caught }
           if (!nativeOwner && failed) throw error
@@ -1113,7 +1131,9 @@ export class OpenCodeSessionBridge {
         const info = asRecord(message.info)
         return info?.role === 'assistant' && info.parentID === owner.messageId
           && info.providerID === model.providerID && info.modelID === model.modelID
-          && (Number.isFinite(asRecord(info.time)?.completed) || !!asRecord(info.error))
+          && (Object.keys(asRecord(info.error) ?? {}).length > 0 || (info.finish !== 'tool-calls' && info.finish !== 'unknown'
+            && !message.parts?.some(part => part.type === 'tool')
+            && Number.isFinite(asRecord(info.time)?.completed)))
       })
       return userPresent && (completed || cancelledByOwnedStop)
     }
@@ -1927,6 +1947,25 @@ export class OpenCodeSessionBridge {
     }, () => true)
   }
 
+  private async armPromptBeforeTransport(
+    record: OpenCodeSessionRecord,
+    runtimePromptMessageId: string,
+    noReply: boolean,
+    arm: ((messageId: string, noReply?: boolean) => Promise<void>) | undefined,
+    hooks: Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptDefinitelyUnsubmitted'>,
+  ): Promise<void> {
+    // Keep this catch strictly around arm. A client invocation, including a
+    // synchronous throw or a lost response, must never produce this evidence.
+    try {
+      await arm?.(runtimePromptMessageId, noReply)
+    } catch (error) {
+      await hooks.onPromptDefinitelyUnsubmitted?.({
+        sessionId: record.opencodeSessionId, runtimePromptMessageId, error,
+      })
+      throw error
+    }
+  }
+
   async promptAsync(
     record: OpenCodeSessionRecord,
     params: {
@@ -1935,14 +1974,17 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
-    },
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<void> {
     await this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
       const client = this.clientFactory.create(baseUrl)
-      const messageID = armOAuthNativeSession
+      const messageID = armOAuthNativeSession || params.onPromptSubmitting
         ? (await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)).runtimePromptMessageId : undefined
       try {
-        if (messageID) await armOAuthNativeSession!(messageID, params.noReply ?? false)
+        if (messageID) {
+          await params.onPromptSubmitting?.({ sessionId: record.opencodeSessionId, runtimePromptMessageId: messageID, baseUrl })
+          await this.armPromptBeforeTransport(record, messageID, params.noReply ?? false, armOAuthNativeSession, params)
+        }
         await client.promptSessionAsync(record.opencodeSessionId, {
           ...(messageID ? { messageID } : {}),
           agent: params.agent,
@@ -2000,7 +2042,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId: observation.runtimePromptMessageId,
           baseUrl,
         })
-        await armOAuthNativeSession?.(observation.runtimePromptMessageId, false)
+        await this.armPromptBeforeTransport(record, observation.runtimePromptMessageId, false, armOAuthNativeSession, params)
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: observation.runtimePromptMessageId,
           agent: params.agent,
@@ -2141,7 +2183,7 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
-    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted'>,
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<{
     runtimePromptMessageId: string
     hookDiagnostics: string[]
@@ -2160,7 +2202,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId,
           baseUrl,
         })
-        await armOAuthNativeSession?.(runtimePromptMessageId, false)
+        await this.armPromptBeforeTransport(record, runtimePromptMessageId, false, armOAuthNativeSession, params)
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: runtimePromptMessageId,
           agent: params.agent,
@@ -2198,11 +2240,22 @@ export class OpenCodeSessionBridge {
     options: {
       limit?: number
       sessionId?: string | null
+      signal?: AbortSignal
     } = {},
   ): Promise<{
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
+    if (record.profileScope?.purpose === 'launch_runtime' && record.profileScope.providerId === 'xai') {
+      // Observation must remain available while an admitted native turn owns
+      // the publication fence. Preparing a profile here both gates the read on
+      // settlement and may reconcile auth.json while that writer is still busy.
+      return this.withOwnedOAuthSessionObservation(record, async ({ baseUrl, runtimePid }, assertOwner) =>
+        this.reconcileSessionAtEndpoint(record, record, options, {
+          baseUrl, runtimePid, resolvedConfigFingerprint: record.resolvedBehaviorFingerprint,
+          profileAuthState: null, preflightDiagnostics: [], assertOwner,
+        }), options.signal)
+    }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
     const profile = sessionProfile.profile
     const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
@@ -2236,7 +2289,63 @@ export class OpenCodeSessionBridge {
         })
       }
 
-      const client = this.clientFactory.create(baseUrl)
+      return this.reconcileSessionAtEndpoint(record, activeRecord, options, {
+        baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState: profile.authState, preflightDiagnostics,
+      })
+    }, profile)
+  }
+
+  async withOwnedOAuthSessionObservation<T>(
+    record: OpenCodeSessionRecord,
+    operation: (endpoint: { baseUrl: string; runtimePid: number }, assertOwner: () => Promise<void>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    signal?.throwIfAborted()
+    const captured = structuredClone(record)
+    await this.assertOwnedOAuthSessionAuthority(captured)
+    const resolveEndpoint = async (birth?: number) => {
+      if (!this.hostManager.resolveOwnedSessionEndpoint) throw new Error('OpenCode observation requires persistent ownership')
+      return this.hostManager.resolveOwnedSessionEndpoint(captured.hostKey, {
+        teamId: captured.teamId, laneId: captured.laneId, memberName: captured.memberName,
+        runId: captured.runId, sessionId: captured.opencodeSessionId, projectPath: captured.projectPath,
+        expectedProcessStartedAtMs: birth,
+      }, signal)
+    }
+    const endpoint = await resolveEndpoint()
+    if (endpoint.pid !== captured.runtimePid) throw new Error('OpenCode observation process changed')
+    const birth = await readProcessStartTimeMs(endpoint.pid)
+    if (!birth) throw new Error('OpenCode observation requires exact process birth')
+    const assertOwner = async () => {
+      signal?.throwIfAborted()
+      await this.assertOwnedOAuthSessionAuthority(captured)
+      if (!isDeepStrictEqual(record, captured) || !isDeepStrictEqual(await resolveEndpoint(birth), endpoint)) {
+        throw new Error('OpenCode observation ownership changed')
+      }
+    }
+    await assertOwner()
+    const value = await operation({ baseUrl: endpoint.baseUrl, runtimePid: endpoint.pid }, assertOwner)
+    await assertOwner()
+    return value
+  }
+
+  private async reconcileSessionAtEndpoint(
+    record: OpenCodeSessionRecord,
+    activeRecord: OpenCodeSessionRecord,
+    options: { limit?: number; sessionId?: string | null; signal?: AbortSignal },
+    context: {
+      baseUrl: string
+      resolvedConfigFingerprint: string | null
+      runtimePid: number | null
+      profileAuthState: OpenCodeAuthState | null
+      preflightDiagnostics: string[]
+      assertOwner?: () => Promise<void>
+    },
+  ): Promise<{ record: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }> {
+    const { baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState, preflightDiagnostics, assertOwner } = context
+    if (assertOwner && options.sessionId?.trim() && options.sessionId.trim() !== record.opencodeSessionId) {
+      throw new Error('OpenCode observation requires the exact owned session')
+    }
+      const client = this.clientFactory.create(baseUrl, options.signal ? { signal: options.signal } : undefined)
       let permissionDiagnostic: string | null = null
       const [statusMap, pendingPermissions] = await Promise.all([
         client.getSessionStatus(),
@@ -2264,7 +2373,7 @@ export class OpenCodeSessionBridge {
         rawStatus,
         messages,
       })
-      summary.profileAuthState = profile.authState
+      summary.profileAuthState = profileAuthState
       const normalizedPendingPermissions = normalizeOpenCodePermissions(pendingPermissions)
         .filter(permission => permission.sessionId === targetSessionId)
       const pendingPermissionRequestIds = normalizedPendingPermissions
@@ -2287,6 +2396,7 @@ export class OpenCodeSessionBridge {
         summary.diagnostics.push(...preflightDiagnostics)
       }
 
+      await assertOwner?.()
       const nextRecord = this.buildUpdatedRecord(activeRecord, {
         lastCanonicalCursor: summary.lastCanonicalCursor,
         lastKnownRawStatus: summary.rawStatus,
@@ -2306,7 +2416,7 @@ export class OpenCodeSessionBridge {
           || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
-        await this.sessionStore.upsert(nextRecord)
+        await this.sessionStore.upsert(nextRecord, undefined, assertOwner ? record : undefined)
       }
 
       const reconciledRecord = isCurrentSession ? nextRecord : activeRecord
@@ -2314,7 +2424,6 @@ export class OpenCodeSessionBridge {
         record: runtimePid ? { ...reconciledRecord, runtimePid } : reconciledRecord,
         summary,
       }
-    }, profile)
   }
 
   async observePreview(

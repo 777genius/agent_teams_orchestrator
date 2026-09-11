@@ -25,6 +25,8 @@ export type OpenCodeOAuthSaveOwner = {
   scopeToken: string
   // Issued only by owned admission; never changes the original launch identity.
   credentialBinding?: { version: 1; scopeToken: string; fingerprint: string }
+  // Original credential retained only after a committed, same-host session transition.
+  launchCredential?: OpenCodeAuthCredential
 }
 
 export type OpenCodeOAuthNativeSessionOwner = {
@@ -34,6 +36,7 @@ export type OpenCodeOAuthNativeSessionOwner = {
   processStartedAtMs: number
   messageId: string
   noReply: boolean
+  sessionAuthorities?: OpenCodeSessionRecord[]
 }
 
 export type OpenCodeOAuthNativeProbeOwner = {
@@ -197,6 +200,87 @@ export async function readOpenCodeCommittedOAuthProbeRotation(input: {
     || !isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), authority)
     || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
   return { operationId: authority.operationId, predecessor: authority.predecessor, successor: authority.successor }
+}
+
+// Canonical observation may advance these fields; none conveys launch authority.
+export function sameOpenCodeOAuthSessionAuthority(left: OpenCodeSessionRecord, right: OpenCodeSessionRecord): boolean {
+  const identity = (record: OpenCodeSessionRecord) => {
+    const { updatedAt, lastCanonicalCursor, lastKnownRawStatus, lastKnownDurableState, ...authority } = record
+    return authority
+  }
+  return isDeepStrictEqual(identity(left), identity(right))
+}
+
+// Publication compatibility is broader than continuation authority. Legacy
+// single-owner receipts may still publish, but cannot create a new admission.
+function validSessionContinuationEvidence(authority: OpenCodeOAuthSuccessorAuthority): boolean {
+  const owner = authority.owner
+  const native = authority.completion?.nativeSession
+  const binding = owner?.credentialBinding
+  if (!authority.operationId.trim() || !owner || !binding || binding.version !== 1 || binding.scopeToken !== owner.scopeToken
+    || typeof binding.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(binding.fingerprint)
+    || (owner.launchCredential !== undefined && !isValidOpenCodeOAuthCredential(owner.launchCredential))
+    || !native || typeof native.messageId !== 'string' || !native.messageId.trim()
+    || typeof native.noReply !== 'boolean'
+    || typeof native.baseUrl !== 'string' || !native.baseUrl
+    || !Number.isSafeInteger(native.pid) || native.pid <= 0
+    || !Number.isFinite(native.processStartedAtMs) || native.processStartedAtMs <= 0
+    || !Array.isArray(native.sessionAuthorities) || native.sessionAuthorities.length === 0) return false
+  const validRecord = (record: OpenCodeSessionRecord) => !!record
+    && typeof record === 'object'
+    && [record.teamId, record.memberName, record.runId, record.opencodeSessionId,
+      record.hostKey, record.profileRootKey, record.selectedModel].every(value => typeof value === 'string' && !!value)
+    && record.providerId === 'opencode' && record.projectPath === owner.projectPath
+    && record.profileScope?.purpose === 'launch_runtime' && record.profileScope.providerId === 'xai'
+    && record.profileScope.scopeToken === owner.scopeToken
+    && record.runtimePid === native.pid && !record.stoppedAt && !record.staleReason
+  if (!validRecord(native.record)) return false
+  const identities = new Set<string>()
+  const sessions = new Set<string>()
+  for (const record of native.sessionAuthorities) {
+    if (!validRecord(record) || record.hostKey !== native.record.hostKey
+      || record.profileRootKey !== native.record.profileRootKey
+      || !isDeepStrictEqual(record.profileScope, native.record.profileScope)) return false
+    const key = JSON.stringify([record.teamId, record.laneId ?? 'primary', record.memberName])
+    if (identities.has(key) || sessions.has(record.opencodeSessionId)) return false
+    identities.add(key)
+    sessions.add(record.opencodeSessionId)
+  }
+  return native.sessionAuthorities.some(record => sameOpenCodeOAuthSessionAuthority(record, native.record))
+}
+
+export async function readOpenCodeCommittedOAuthSessionRotation(input: {
+  globalAuthPath: string
+  sourceAuthPaths: readonly string[]
+  managedAuthPath: string
+  env: NodeJS.ProcessEnv
+  record: OpenCodeSessionRecord
+}) {
+  const authority = await readSuccessorAuthority(input.globalAuthPath)
+  const native = authority?.completion?.nativeSession
+  if (!authority || !native || !validSessionContinuationEvidence(authority) || authority.completion?.nativeProbe
+    || authority.owner?.purpose !== 'launch_runtime'
+    || authority.owner.scopeToken !== input.record.profileScope?.scopeToken
+    || authority.owner.projectPath !== input.record.projectPath
+    || authority.completion?.managedAuthPath !== input.managedAuthPath
+    || native.record.hostKey !== input.record.hostKey
+    || native.record.profileRootKey !== input.record.profileRootKey
+    || native.pid !== input.record.runtimePid
+    || !native.sessionAuthorities!.some(record => sameOpenCodeOAuthSessionAuthority(record, input.record))
+    || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
+  const launchCredential = authority.owner.launchCredential ?? authority.predecessor
+  if (!isValidOpenCodeOAuthCredential(launchCredential)
+    || launchCredential.accountId !== authority.successor.accountId) return null
+  const sources = await Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore))
+  if (!matchesSuccessorSources(authority, input.sourceAuthPaths, sources)) return null
+  const saved = await readOpenCodeSavedAuthStore({ ...input, sourceStores: sources,
+    admissionProjectPath: input.record.projectPath })
+  if (!isDeepStrictEqual(saved.xai, authority.successor)
+    || !isDeepStrictEqual(await readOpenCodeAuthStore(input.managedAuthPath), { xai: authority.successor })
+    || !isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), authority)
+    || await readOptionalJson(oauthSaveReceiptPath(input.globalAuthPath)) !== null) return null
+  return { operationId: authority.operationId, predecessor: launchCredential, successor: authority.successor,
+    nativeSession: native, credentialBinding: authority.owner.credentialBinding! }
 }
 
 function revokedOAuthAdmissionPath(globalAuthPath: string, predecessor: OpenCodeOAuthCredential): string {
@@ -580,6 +664,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
   sourceAuthPaths: readonly string[]
   providerId: string
   predecessor: OpenCodeAuthCredential
+  expectedOperationId?: string
   assertOwnership: () => Promise<void>
   assertPublicationOwnership?: () => Promise<void>
   operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
@@ -626,6 +711,9 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
     }
     const before = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
     const authorityBefore = await readSuccessorAuthority(input.globalAuthPath)
+    if (input.expectedOperationId && authorityBefore?.operationId !== input.expectedOperationId) {
+      throw new Error('OpenCode OAuth continuation publication was superseded')
+    }
     const selected = (await readOpenCodeSavedAuthStore({
       sourceAuthPaths, sourceStores: before, globalAuthPath: input.globalAuthPath, env: input.env,
     }))[providerId]
@@ -667,7 +755,8 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
         await check()
         const current = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
         const native = await readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId })
-        if (!isDeepStrictEqual(native, predecessor)
+        if (!isDeepStrictEqual(await readSuccessorAuthority(input.globalAuthPath), authorityBefore)
+          || !isDeepStrictEqual(native, predecessor)
           || current.some((store, index) => !isDeepStrictEqual(store[providerId], before[index][providerId]))) {
           throw new Error('OpenCode OAuth predecessor changed before native submission')
         }
