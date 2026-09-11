@@ -69,6 +69,13 @@ jobs:
           $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
           node harness/scripts/smoke/windows-runtime-opencode-provider-json.mjs runtime/dist/cli.exe backfill-candidate.json
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+      - name: Preserve Windows runtime candidate for paired desktop qualification
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-windows-runtime-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: runtime/dist/cli.exe
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload executable regression evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -158,6 +165,8 @@ jobs:
         # child startups per test; the default 5s can expire during valid work.
         # Production operation deadlines remain enforced inside the tests.
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
+      - name: Test provider settings and HTTP body deadlines
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination
