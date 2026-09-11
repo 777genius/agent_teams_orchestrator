@@ -41,6 +41,12 @@ export const PROCESS_ATTRIBUTION_START_TIME_TOLERANCE_MS = 2_000
  */
 export const PROCESS_ATTRIBUTION_MAX_START_TIME_TOLERANCE_MS = 10_000
 export const PROCESS_ATTRIBUTION_MAX_RECORD_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/**
+ * A long-lived host sees a lease retained and released around every run, so
+ * the released list is bounded to the newest entries rather than the record
+ * growing for as long as the host lives.
+ */
+export const PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS = 64
 const PROCESS_ATTRIBUTION_ID_PATTERN = /^[0-9a-f]{32}$/
 
 export type CursorAgentAttributionKind = 'cursor-agent' | 'readiness-probe'
@@ -76,6 +82,11 @@ export type OpenCodeHostAttributionOwner = {
   updatedAt: string
 }
 
+export type OpenCodeHostAttributionReleasedOwner = OpenCodeHostAttributionOwner & {
+  /** When the host manager saw the lease go, ISO 8601. */
+  releasedAt: string
+}
+
 export type OpenCodeHostStartTimeFormat = 'linux-ticks' | 'epoch-ms' | 'unknown'
 
 export type OpenCodeHostAttributionRecord = {
@@ -94,6 +105,12 @@ export type OpenCodeHostAttributionRecord = {
   appProfileScope: string | null
   runtimeVersion: string | null
   owners: OpenCodeHostAttributionOwner[]
+  /**
+   * Leases this host no longer holds, oldest first. A release is not the end
+   * of the trees the lease spawned - a stopped lane's cursor-agent can outlive
+   * it - and this is what still names the team those trees were started for.
+   */
+  releasedOwners: OpenCodeHostAttributionReleasedOwner[]
   updatedAt: string
 }
 
@@ -198,6 +215,10 @@ export async function writeHostAttributionRecord(input: {
     return
   }
   const env = process.env
+  const recordPath = processAttributionHostRecordPath(input.directory, input.attributionId)
+  const previous = await loadRecordFile(recordPath, parseHostAttributionRecord)
+  const now = (input.now ?? (() => new Date()))()
+  const owners = input.owners.map(owner => ({ ...owner }))
   const record: OpenCodeHostAttributionRecord = {
     schemaVersion: PROCESS_ATTRIBUTION_SCHEMA_VERSION,
     attributionId: input.attributionId,
@@ -210,29 +231,98 @@ export async function writeHostAttributionRecord(input: {
     appInstanceId: env[APP_INSTANCE_ID_ENV]?.trim() || null,
     appProfileScope: env[APP_PROFILE_SCOPE_ENV]?.trim() || null,
     runtimeVersion: resolveRuntimeVersion(),
-    owners: input.owners.map(owner => ({ ...owner })),
-    updatedAt: (input.now ?? (() => new Date()))().toISOString(),
+    owners,
+    releasedOwners: carryReleasedOwners(
+      previous.state === 'ok' ? previous.record : null,
+      owners,
+      now,
+    ),
+    updatedAt: now.toISOString(),
   }
-  await writeFileAtomic(
-    processAttributionHostRecordPath(input.directory, input.attributionId),
-    JSON.stringify(record),
-    { mode: 0o600 },
-  )
+  await writeFileAtomic(recordPath, JSON.stringify(record), { mode: 0o600 })
 }
 
-/** Remove a host record and every agent record filed under the same id. */
-export async function deleteHostAttributionRecords(
+/**
+ * An owner in the previous record that is not in this one was released between
+ * the two writes; it moves behind whatever was released before it, stamped with
+ * the time it went. Nothing here decides how long that evidence lives: the
+ * list is bounded, and it goes with the host record itself.
+ */
+function carryReleasedOwners(
+  previous: OpenCodeHostAttributionRecord | null,
+  owners: readonly OpenCodeHostAttributionOwner[],
+  now: Date,
+): OpenCodeHostAttributionReleasedOwner[] {
+  if (!previous) return []
+  const current = new Set(owners.map(ownerIdentity))
+  const released = previous.owners
+    .filter(owner => !current.has(ownerIdentity(owner)))
+    .map(owner => ({ ...owner, releasedAt: now.toISOString() }))
+  return [...previous.releasedOwners, ...released].slice(-PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS)
+}
+
+function ownerIdentity(owner: OpenCodeHostAttributionOwner): string {
+  return JSON.stringify([
+    owner.teamId, owner.laneId, owner.memberName, owner.runId, owner.sessionId, owner.createdAt,
+  ])
+}
+
+export type RetireHostAttributionRecordsResult = {
+  hostRetired: boolean
+  prunedAgents: number
+  liveAgents: number
+}
+
+/**
+ * What a host leaving the registry does to its records. The host is gone, but
+ * the cursor-agent trees it spawned may not be - a host that died under a live
+ * lead is exactly the orphan the desktop sweep looks for - so the host record,
+ * with the owners that name those trees' teams, stays for as long as a live
+ * agent record is filed under it. Dead agent records go now; the host record
+ * and its directory go with the last of them, here or on a later prune.
+ */
+export async function retireHostAttributionRecords(
   directory: string,
   attributionId: string,
-): Promise<void> {
+  options: AgentJudgementOptions = {},
+): Promise<RetireHostAttributionRecordsResult> {
+  const result: RetireHostAttributionRecordsResult = {
+    hostRetired: false,
+    prunedAgents: 0,
+    liveAgents: 0,
+  }
   if (!isProcessAttributionId(attributionId)) {
-    return
+    return result
+  }
+  const agentDirectory = processAttributionAgentDirectoryPath(directory, attributionId)
+  const judge = buildAgentJudge(options)
+  for (const filePath of await listJsonFiles(agentDirectory)) {
+    const outcome = await loadRecordFile(filePath, parseAgentAttributionRecord)
+    if (outcome.state === 'corrupt' || (outcome.state === 'ok' && outcome.record.attributionId !== attributionId)) {
+      await unlink(filePath).catch(() => undefined)
+      result.prunedAgents += 1
+      continue
+    }
+    if (outcome.state !== 'ok') {
+      // A writer this build does not understand: not ours to judge, so the
+      // host record stays with it.
+      result.liveAgents += 1
+      continue
+    }
+    if (await judgeAgentRecord(outcome.record, judge) === 'live') {
+      result.liveAgents += 1
+      continue
+    }
+    await unlink(filePath).catch(() => undefined)
+    result.prunedAgents += 1
+  }
+  if (result.liveAgents > 0) {
+    return result
   }
   await unlink(processAttributionHostRecordPath(directory, attributionId)).catch(() => undefined)
-  await rm(processAttributionAgentDirectoryPath(directory, attributionId), {
-    recursive: true,
-    force: true,
-  }).catch(() => undefined)
+  await rm(agentDirectory, { recursive: true, force: true }).catch(() => undefined)
+  result.hostRetired = true
+  return result
 }
 
 function asRecordObject(value: unknown): Record<string, unknown> | null {
@@ -376,9 +466,24 @@ function parseHostAttributionRecord(value: unknown): ParseOutcome<OpenCodeHostAt
       appProfileScope: asOptionalString(source.appProfileScope),
       runtimeVersion: asOptionalString(source.runtimeVersion),
       owners: parseHostAttributionOwners(source.owners),
+      releasedOwners: parseHostAttributionReleasedOwners(source.releasedOwners),
       updatedAt: source.updatedAt,
     },
   }
+}
+
+function parseHostAttributionReleasedOwners(
+  value: unknown,
+): OpenCodeHostAttributionReleasedOwner[] {
+  if (!Array.isArray(value)) return []
+  const released: OpenCodeHostAttributionReleasedOwner[] = []
+  for (const entry of value) {
+    const source = asRecordObject(entry)
+    const [owner] = parseHostAttributionOwners([entry])
+    if (!owner || !source || typeof source.releasedAt !== 'string') continue
+    released.push({ ...owner, releasedAt: source.releasedAt })
+  }
+  return released
 }
 
 async function listJsonFiles(directoryPath: string): Promise<string[]> {
@@ -454,6 +559,79 @@ export type PruneAttributionRecordsResult = {
 
 type ProcessLiveness = 'alive' | 'dead' | 'unknown'
 
+type AgentJudgementOptions = {
+  now?: () => number
+  isProcessAlive?: (pid: number) => boolean
+  readProcessStartTimeMs?: (pid: number) => Promise<number | null>
+  maxRecordAgeMs?: number
+}
+
+type AgentJudge = {
+  liveness: (pid: number) => ProcessLiveness
+  readStartTime: (pid: number) => Promise<number | null>
+  expired: (writtenAtMs: number) => boolean
+}
+
+function buildAgentJudge(options: AgentJudgementOptions): AgentJudge {
+  const nowMs = (options.now ?? Date.now)()
+  const alive = options.isProcessAlive ?? isProcessAlive
+  const readStartTime =
+    options.readProcessStartTimeMs ?? ((pid: number) => readProcessStartTimeMs(pid))
+  const maxAgeMs = options.maxRecordAgeMs ?? PROCESS_ATTRIBUTION_MAX_RECORD_AGE_MS
+  return {
+    liveness: pid => {
+      try {
+        return alive(pid) ? 'alive' : 'dead'
+      } catch {
+        return 'unknown'
+      }
+    },
+    readStartTime: pid => readStartTime(pid).catch(() => null),
+    expired: writtenAtMs => !Number.isFinite(writtenAtMs) || nowMs - writtenAtMs > maxAgeMs,
+  }
+}
+
+/**
+ * One judgement for every path that may remove an agent record. The record is
+ * identity, so the process it names has to be alive AND be the same process: a
+ * pid the OS handed to something else after the agent exited keeps
+ * isProcessAlive true for as long as the stranger runs, and the start identity
+ * is the only thing that tells the two apart. On Linux that is the /proc start
+ * tick the preload recorded; elsewhere it is the creation time in epoch
+ * milliseconds, within the record's own tolerance. An identity that cannot be
+ * read is not proof of reuse.
+ */
+async function judgeAgentRecord(
+  record: CursorAgentAttributionRecord,
+  judge: AgentJudge,
+): Promise<'live' | 'stale'> {
+  // The process said it was leaving and could not remove its own record.
+  if (record.exitedAtMs !== null) return 'stale'
+  const liveness = judge.liveness(record.pid)
+  if (liveness === 'dead') return 'stale'
+  if (liveness === 'unknown') return judge.expired(record.writtenAtMs) ? 'stale' : 'live'
+  const live = await judge.readStartTime(record.pid)
+  if (live === null) return 'live'
+  const format = resolveHostStartTimeFormat()
+  if (format === 'linux-ticks') {
+    const ticks = parseProcStartToken(record.nativeStartToken)
+    return ticks !== null && ticks !== live ? 'stale' : 'live'
+  }
+  if (format === 'epoch-ms') {
+    const tolerance = Math.max(
+      record.startTimeToleranceMs,
+      PROCESS_ATTRIBUTION_START_TIME_TOLERANCE_MS,
+    )
+    return Math.abs(live - record.startedAtMs) > tolerance ? 'stale' : 'live'
+  }
+  return 'live'
+}
+
+function parseProcStartToken(token: string | null): number | null {
+  const match = token === null ? null : /^proc:(\d+)$/.exec(token)
+  return match ? Number(match[1]) : null
+}
+
 /**
  * A record is identity, never liveness: it survives a crash or a SIGKILL. The
  * runtime therefore reaps its own store, and every reader has to validate what
@@ -463,24 +641,17 @@ type ProcessLiveness = 'alive' | 'dead' | 'unknown'
  * Every record is judged by its own process. A dead host does not condemn the
  * agents filed under it: a host that died leaving live cursor-agent trees is
  * precisely the orphan the desktop sweep exists to find, and deleting its proof
- * would blind that sweep. The age horizon is a backstop for records whose
- * process cannot be judged at all, never a reason to delete evidence about a
- * process that is still running.
+ * would blind that sweep - so the dead host's own record, the only thing that
+ * names the teams those trees were started for, stays until the last of them
+ * is gone as well. The age horizon is a backstop for records whose process
+ * cannot be judged at all, never a reason to delete evidence about a process
+ * that is still running.
  */
 export async function pruneStaleAttributionRecords(
   directory: string,
-  options: {
-    now?: () => number
-    isProcessAlive?: (pid: number) => boolean
-    readProcessStartTimeMs?: (pid: number) => Promise<number | null>
-    maxRecordAgeMs?: number
-  } = {},
+  options: AgentJudgementOptions = {},
 ): Promise<PruneAttributionRecordsResult> {
-  const nowMs = (options.now ?? Date.now)()
-  const alive = options.isProcessAlive ?? isProcessAlive
-  const readStartTime =
-    options.readProcessStartTimeMs ?? ((pid: number) => readProcessStartTimeMs(pid))
-  const maxAgeMs = options.maxRecordAgeMs ?? PROCESS_ATTRIBUTION_MAX_RECORD_AGE_MS
+  const judge = buildAgentJudge(options)
   const records = await readAttributionRecords(directory)
   const result: PruneAttributionRecordsResult = {
     prunedHosts: 0,
@@ -488,48 +659,38 @@ export async function pruneStaleAttributionRecords(
     prunedCorrupt: 0,
   }
 
-  const probeLiveness = (pid: number): ProcessLiveness => {
-    try {
-      return alive(pid) ? 'alive' : 'dead'
-    } catch {
-      return 'unknown'
-    }
-  }
-  const expiredAt = (writtenAtMs: number): boolean =>
-    !Number.isFinite(writtenAtMs) || nowMs - writtenAtMs > maxAgeMs
-
   for (const corruptPath of records.corruptPaths) {
     await unlink(corruptPath).catch(() => undefined)
     result.prunedCorrupt += 1
   }
 
+  const hostsWithLiveAgents = new Set<string>()
+  for (const agent of records.agents) {
+    if (await judgeAgentRecord(agent.record, judge) === 'live') {
+      hostsWithLiveAgents.add(agent.record.attributionId)
+      continue
+    }
+    await unlink(agent.filePath).catch(() => undefined)
+    result.prunedAgents += 1
+  }
+
   for (const host of records.hosts) {
-    const liveness = probeLiveness(host.record.hostPid)
+    const liveness = judge.liveness(host.record.hostPid)
     let stale = liveness === 'dead'
-      || (liveness === 'unknown' && expiredAt(Date.parse(host.record.updatedAt)))
+      || (liveness === 'unknown' && judge.expired(Date.parse(host.record.updatedAt)))
     if (
       !stale &&
       liveness === 'alive' &&
       host.record.hostStartedAtNative !== null &&
       host.record.hostStartTimeFormat === resolveHostStartTimeFormat()
     ) {
-      const startedAtNative = await readStartTime(host.record.hostPid).catch(() => null)
+      const startedAtNative = await judge.readStartTime(host.record.hostPid)
       // An unreadable start time is not proof of reuse; only a differing one is.
       stale = startedAtNative !== null && startedAtNative !== host.record.hostStartedAtNative
     }
-    if (!stale) continue
-    // Only this host's own file. The agent records under the same id belong to
-    // processes with their own pids, judged on their own below.
+    if (!stale || hostsWithLiveAgents.has(host.record.attributionId)) continue
     await unlink(host.filePath).catch(() => undefined)
     result.prunedHosts += 1
-  }
-
-  for (const agent of records.agents) {
-    const liveness = probeLiveness(agent.record.pid)
-    if (liveness === 'alive') continue
-    if (liveness === 'unknown' && !expiredAt(agent.record.writtenAtMs)) continue
-    await unlink(agent.filePath).catch(() => undefined)
-    result.prunedAgents += 1
   }
 
   await removeEmptyAgentDirectories(directory)

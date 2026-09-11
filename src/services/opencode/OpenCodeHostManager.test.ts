@@ -3406,6 +3406,10 @@ describe('OpenCodeHostManager process attribution', () => {
         hostPid: 43204,
         owners: [],
       })
+      // The lease that went is what still names team-1 behind agent 999_001.
+      expect(records.hosts[0]?.record.releasedOwners.map(entry => [
+        entry.teamId, entry.runId, typeof entry.releasedAt,
+      ])).toEqual([['team-1', 'run-1', 'string']])
       expect(records.agents.map(agent => agent.record.pid)).toEqual([999_001])
       expect(await pathExists(agentRecordPath)).toBe(true)
       // The host itself is untouched by a lease release.
@@ -3413,6 +3417,56 @@ describe('OpenCodeHostManager process attribution', () => {
         hosts: Record<string, { attributionId?: string }>
       }
       expect(Object.keys(registry.hosts)).toEqual(['host-key'])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps a dead host record and the live agent under it when reconcile drops the host', async () => {
+    const { tempDir, registryPath, attributionDirectory } = await createAttributionFixture()
+    const spawned = createMockChildProcess(43207)
+    try {
+      let hostAlive = true
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43207,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: attributionFetchJson,
+        isProcessAlive: pid => (pid === 43207 && hostAlive) || pid === 999_006,
+        readProcessStartTimeMs: async pid => (pid === 43207 ? 7_000 : null),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+        processAttributionDirectory: attributionDirectory,
+      })
+      const handle = await manager.ensureHost({
+        hostKey: 'host-key',
+        resolveConfigFingerprint: false,
+      })
+      const attributionId = handle.attributionId ?? ''
+      await manager.retainHostLease('host-key', {
+        teamId: 'team-1',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-1',
+      })
+      const livePath = await writeAgentAttributionRecord(attributionDirectory, attributionId, 999_006)
+      const deadPath = await writeAgentAttributionRecord(attributionDirectory, attributionId, 999_007)
+
+      // The host died under a live lead: the registry drops the host, the dead
+      // agent record goes, and the host record stays to name the team the
+      // surviving tree was started for.
+      hostAlive = false
+      const reconciliation = await manager.reconcilePersistentHosts({ reason: 'manual' })
+
+      expect(reconciliation.hosts[0]).toMatchObject({ action: 'removed_dead' })
+      const remaining = await readAttributionRecords(attributionDirectory)
+      expect(remaining.hosts.map(host => host.record.owners.map(owner => owner.teamId)))
+        .toEqual([['team-1']])
+      expect(remaining.agents.map(agent => agent.record.pid)).toEqual([999_006])
+      expect(await pathExists(livePath)).toBe(true)
+      expect(await pathExists(deadPath)).toBe(false)
+      expect(await pathExists(registryPath)).toBe(false)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

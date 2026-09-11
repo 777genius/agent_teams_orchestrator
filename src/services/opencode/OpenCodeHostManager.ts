@@ -31,10 +31,10 @@ import {
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import {
   buildProcessAttributionSpawnEnv,
-  deleteHostAttributionRecords,
   mintProcessAttributionId,
   pruneStaleAttributionRecords,
   resolveProcessAttributionDirectory,
+  retireHostAttributionRecords,
   writeHostAttributionRecord,
   type OpenCodeHostAttributionOwner,
 } from './OpenCodeProcessAttributionStore.js'
@@ -656,14 +656,24 @@ export class OpenCodeHostManager {
     }).catch(() => undefined)
   }
 
-  private async removeHostAttributionRecords(
+  /**
+   * A host leaving the registry retires its records rather than deleting them:
+   * the agent trees it spawned may outlive it, and their records - and the
+   * host record naming the teams behind them - stay until the last of them is
+   * gone. Only dead agent records go here.
+   */
+  private async retireHostAttributionRecords(
     attributionId: string | null | undefined,
   ): Promise<void> {
     const directory = this.processAttributionDirectory
     if (!directory || !attributionId) {
       return
     }
-    await deleteHostAttributionRecords(directory, attributionId).catch(() => undefined)
+    await retireHostAttributionRecords(directory, attributionId, {
+      now: () => this.now().getTime(),
+      isProcessAlive: pid => this.isProcessAlive(pid),
+      readProcessStartTimeMs: pid => this.readProcessStartTimeMs(pid),
+    }).catch(() => undefined)
   }
 
   private getPersistentProfileTmpPath(profileRootKey: string): string {
@@ -1161,7 +1171,7 @@ export class OpenCodeHostManager {
       }
       if (await this.hasPendingOAuthHost(hostKey)) return
       delete registry.hosts[hostKey]
-      await this.removeHostAttributionRecords(record.attributionId)
+      await this.retireHostAttributionRecords(record.attributionId)
       if (Object.keys(registry.hosts).length === 0) {
         await unlink(registryPath).catch(() => undefined)
         return
@@ -1311,9 +1321,10 @@ export class OpenCodeHostManager {
       await this.writePersistentRegistryUnlocked(registry)
       // Releasing the last lease leaves the host process running and registered
       // - preflight probes retain and release a lease around every run - so the
-      // record is rewritten with no owners rather than deleted. Deleting it
-      // would strip the proof from live cursor-agent trees the moment a lane
-      // stops. Only a host leaving the registry takes its records with it.
+      // record is rewritten rather than deleted: the released lease moves to
+      // its released owners, which is what still names the team behind an
+      // agent tree that outlives the lane. Only a host leaving the registry
+      // retires its records, and even that keeps them while such a tree lives.
       await this.syncHostAttributionRecord(updated, leases)
       return true
     })
@@ -2327,7 +2338,7 @@ export class OpenCodeHostManager {
           }
           if (!this.isProcessAlive(record.pid)) {
             delete registry.hosts[hostKey]
-            await this.removeHostAttributionRecords(record.attributionId)
+            await this.retireHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
@@ -2350,7 +2361,7 @@ export class OpenCodeHostManager {
           if (skipStartupRecord(record)) continue
           if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
             delete registry.hosts[hostKey]
-            await this.removeHostAttributionRecords(record.attributionId)
+            await this.retireHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
@@ -2468,7 +2479,7 @@ export class OpenCodeHostManager {
           try {
             await this.terminatePersistentHostRecord(record, { force, startupBudget: budget })
             delete registry.hosts[hostKey]
-            await this.removeHostAttributionRecords(record.attributionId)
+            await this.retireHostAttributionRecords(record.attributionId)
             cleaned += 1
             changed = true
             hosts.push({

@@ -16,11 +16,11 @@ import {
   PROCESS_ATTRIBUTION_ID_ENV,
   PROCESS_ATTRIBUTION_KIND_ENV,
   PROCESS_ATTRIBUTION_MAX_RECORD_AGE_MS,
+  PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS,
   PROCESS_ATTRIBUTION_MAX_START_TIME_TOLERANCE_MS,
   PROCESS_ATTRIBUTION_START_TIME_TOLERANCE_MS,
   buildCursorAgentAttributionPreloadScript,
   buildProcessAttributionSpawnEnv,
-  deleteHostAttributionRecords,
   mintProcessAttributionId,
   processAttributionAgentDirectoryPath,
   processAttributionHostRecordPath,
@@ -28,6 +28,7 @@ import {
   readAttributionRecords,
   resolveHostStartTimeFormat,
   resolveProcessAttributionDirectory,
+  retireHostAttributionRecords,
   writeHostAttributionRecord,
 } from './OpenCodeProcessAttributionStore.js'
 
@@ -374,6 +375,7 @@ describe('OpenCodeProcessAttributionStore', () => {
         createdAt: '2026-09-10T10:00:00.000Z',
         updatedAt: '2026-09-10T10:05:00.000Z',
       }],
+      releasedOwners: [],
       updatedAt: '2026-09-10T10:05:00.000Z',
     })
     expect(records.agents).toHaveLength(1)
@@ -386,8 +388,12 @@ describe('OpenCodeProcessAttributionStore', () => {
       startTimeToleranceMs: PROCESS_ATTRIBUTION_START_TIME_TOLERANCE_MS,
     })
 
-    await deleteHostAttributionRecords(directory, attributionId)
+    // Retiring the host with its one agent dead takes everything with it.
+    expect(await retireHostAttributionRecords(directory, attributionId, {
+      isProcessAlive: () => false,
+    })).toEqual({ hostRetired: true, prunedAgents: 1, liveAgents: 0 })
     expect(await readAttributionRecords(directory)).toMatchObject({ hosts: [], agents: [] })
+    expect(await exists(processAttributionAgentDirectoryPath(directory, attributionId))).toBe(false)
   })
 
   test('ignores records written by a schema version it does not understand', async () => {
@@ -459,14 +465,17 @@ describe('OpenCodeProcessAttributionStore', () => {
       readProcessStartTimeMs: async pid => (pid === 111 ? 5_000 : null),
     })
 
-    expect(result).toEqual({ prunedHosts: 1, prunedAgents: 1, prunedCorrupt: 1 })
+    // The dead host 222 keeps its record: agent 666 under it is still running,
+    // and the record is what names the team that tree was started for.
+    expect(result).toEqual({ prunedHosts: 0, prunedAgents: 1, prunedCorrupt: 1 })
     const remaining = await readAttributionRecords(directory)
-    expect(remaining.hosts.map(host => host.record.attributionId)).toEqual([liveHostId])
+    expect(remaining.hosts.map(host => host.record.attributionId).sort())
+      .toEqual([deadHostId, liveHostId].sort())
     expect(remaining.agents.map(agent => agent.record.pid).sort()).toEqual([333, 666])
     expect(await exists(corruptPath)).toBe(false)
   })
 
-  test('keeps a live agent whose host record is pruned', async () => {
+  test('keeps a dead host and the live agent under it until the last agent is gone', async () => {
     const directory = await createStoreDirectory()
     const hostId = mintProcessAttributionId()
     await writeHostAttributionRecord({
@@ -481,17 +490,25 @@ describe('OpenCodeProcessAttributionStore', () => {
       buildAgentRecord({ attributionId: hostId, pid: 666, writtenAtMs: Date.now() }))
 
     // A host that died leaving live agent trees behind is exactly the orphan the
-    // desktop sweep exists to find, so its evidence has to survive the sweep.
+    // desktop sweep exists to find, so its evidence - the agent record and the
+    // host record that names the team - has to survive the sweep.
     const result = await pruneStaleAttributionRecords(directory, {
       isProcessAlive: pid => pid === 666,
     })
 
-    expect(result).toMatchObject({ prunedHosts: 1, prunedAgents: 0 })
-    expect(await exists(processAttributionHostRecordPath(directory, hostId))).toBe(false)
+    expect(result).toMatchObject({ prunedHosts: 0, prunedAgents: 0 })
+    expect(await exists(processAttributionHostRecordPath(directory, hostId))).toBe(true)
     expect(await exists(agentPath)).toBe(true)
     const remaining = await readAttributionRecords(directory)
-    expect(remaining.hosts).toEqual([])
+    expect(remaining.hosts.map(host => host.record.hostPid)).toEqual([222])
     expect(remaining.agents.map(agent => agent.record.pid)).toEqual([666])
+
+    // Once the last agent is gone there is nothing left for the record to name.
+    expect(await pruneStaleAttributionRecords(directory, {
+      isProcessAlive: () => false,
+    })).toMatchObject({ prunedHosts: 1, prunedAgents: 1 })
+    expect(await readAttributionRecords(directory)).toMatchObject({ hosts: [], agents: [] })
+    expect(await exists(processAttributionAgentDirectoryPath(directory, hostId))).toBe(false)
   })
 
   test('keeps a record past the age horizon while its process is alive', async () => {
@@ -605,15 +622,181 @@ describe('OpenCodeProcessAttributionStore', () => {
     const agentPath = await writeAgentRecordFile(directory, attributionId, '333-1.json',
       buildAgentRecord({ attributionId, pid: 333, writtenAtMs: Date.now() }))
 
+    // The host's pid is alive but belongs to a different process now; the
+    // agent's pid is simply gone.
     const result = await pruneStaleAttributionRecords(directory, {
-      isProcessAlive: () => true,
+      isProcessAlive: pid => pid === 111,
       readProcessStartTimeMs: async () => 9_999,
     })
 
-    // The reused pid condemns the host record only: pid 333 is judged by pid 333.
-    expect(result).toMatchObject({ prunedHosts: 1, prunedAgents: 0 })
-    expect(await exists(agentPath)).toBe(true)
-    expect(await readAttributionRecords(directory)).toMatchObject({ hosts: [] })
+    expect(result).toMatchObject({ prunedHosts: 1, prunedAgents: 1 })
+    expect(await exists(agentPath)).toBe(false)
+    expect(await readAttributionRecords(directory)).toMatchObject({ hosts: [], agents: [] })
+  })
+
+  test('prunes an agent whose pid was reused by a different process', async () => {
+    const format = resolveHostStartTimeFormat()
+    if (format === 'unknown') return
+    const directory = await createStoreDirectory()
+    const attributionId = mintProcessAttributionId()
+    const startedAtMs = 1_757_500_000_123
+    // The identity the preload records and the identity the OS reports have to
+    // be compared in the same unit: /proc start ticks on Linux, epoch
+    // milliseconds within the record's tolerance everywhere else.
+    const recorded = format === 'linux-ticks'
+      ? { startedAtMs, nativeStartToken: 'proc:8843211' }
+      : { startedAtMs, nativeStartToken: null }
+    const same = format === 'linux-ticks' ? 8_843_211 : startedAtMs + 1_500
+    const other = format === 'linux-ticks' ? 8_843_999 : startedAtMs + 60_000
+    const samePath = await writeAgentRecordFile(directory, attributionId, '333-1.json',
+      buildAgentRecord({ attributionId, pid: 333, writtenAtMs: Date.now(), ...recorded }))
+    const otherPath = await writeAgentRecordFile(directory, attributionId, '444-1.json',
+      buildAgentRecord({ attributionId, pid: 444, writtenAtMs: Date.now(), ...recorded }))
+    const unreadablePath = await writeAgentRecordFile(directory, attributionId, '555-1.json',
+      buildAgentRecord({ attributionId, pid: 555, writtenAtMs: Date.now(), ...recorded }))
+
+    const result = await pruneStaleAttributionRecords(directory, {
+      isProcessAlive: () => true,
+      readProcessStartTimeMs: async pid => (pid === 333 ? same : pid === 444 ? other : null),
+    })
+
+    // Only a differing identity is proof of reuse; an unreadable one is not.
+    expect(result).toMatchObject({ prunedAgents: 1 })
+    expect(await exists(samePath)).toBe(true)
+    expect(await exists(otherPath)).toBe(false)
+    expect(await exists(unreadablePath)).toBe(true)
+  })
+
+  test('prunes an agent that reported its own exit', async () => {
+    const directory = await createStoreDirectory()
+    const attributionId = mintProcessAttributionId()
+    const exitedPath = await writeAgentRecordFile(directory, attributionId, '333-1.json',
+      buildAgentRecord({ attributionId, pid: 333, writtenAtMs: Date.now(), exitedAtMs: Date.now() }))
+    const livePath = await writeAgentRecordFile(directory, attributionId, '444-1.json',
+      buildAgentRecord({ attributionId, pid: 444, writtenAtMs: Date.now() }))
+
+    // The exit handler rewrites the record only when it could not unlink it, so
+    // the process is gone whatever its pid says now.
+    const result = await pruneStaleAttributionRecords(directory, {
+      isProcessAlive: () => true,
+      readProcessStartTimeMs: async () => null,
+    })
+
+    expect(result).toMatchObject({ prunedAgents: 1 })
+    expect(await exists(exitedPath)).toBe(false)
+    expect(await exists(livePath)).toBe(true)
+  })
+
+  test('retires a host only once its last agent tree is gone', async () => {
+    const directory = await createStoreDirectory()
+    const attributionId = mintProcessAttributionId()
+    const otherId = mintProcessAttributionId()
+    await writeHostAttributionRecord({
+      directory,
+      attributionId,
+      hostPid: 111,
+      hostStartedAtNative: 5_000,
+      projectPath: '/work/retired',
+      owners: [{
+        teamId: 'team-1',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-1',
+        createdAt: '2026-09-10T10:00:00.000Z',
+        updatedAt: '2026-09-10T10:05:00.000Z',
+      }],
+    })
+    const livePath = await writeAgentRecordFile(directory, attributionId, '333-1.json',
+      buildAgentRecord({ attributionId, pid: 333, writtenAtMs: Date.now() }))
+    const deadPath = await writeAgentRecordFile(directory, attributionId, '444-1.json',
+      buildAgentRecord({ attributionId, pid: 444, writtenAtMs: Date.now() }))
+    const corruptPath = await writeAgentRecordFile(directory, attributionId, '555-1.json', '{ no')
+    const otherPath = await writeAgentRecordFile(directory, otherId, '666-1.json',
+      buildAgentRecord({ attributionId: otherId, pid: 666, writtenAtMs: Date.now() }))
+
+    // The host is gone; agent 333 is not. Its record and the host record that
+    // names team-1 both stay, and only the dead and unreadable files go.
+    expect(await retireHostAttributionRecords(directory, attributionId, {
+      isProcessAlive: pid => pid === 333,
+      readProcessStartTimeMs: async () => null,
+    })).toEqual({ hostRetired: false, prunedAgents: 2, liveAgents: 1 })
+    expect(await exists(livePath)).toBe(true)
+    expect(await exists(deadPath)).toBe(false)
+    expect(await exists(corruptPath)).toBe(false)
+    const kept = await readAttributionRecords(directory)
+    expect(kept.hosts.map(host => host.record.owners.map(owner => owner.teamId)))
+      .toEqual([['team-1']])
+    // Another host's records are not this retirement's business.
+    expect(await exists(otherPath)).toBe(true)
+
+    expect(await retireHostAttributionRecords(directory, attributionId, {
+      isProcessAlive: () => false,
+    })).toEqual({ hostRetired: true, prunedAgents: 1, liveAgents: 0 })
+    expect(await exists(processAttributionHostRecordPath(directory, attributionId))).toBe(false)
+    expect(await exists(processAttributionAgentDirectoryPath(directory, attributionId))).toBe(false)
+    expect(await exists(otherPath)).toBe(true)
+  })
+
+  test('moves a released lease to the released owners and keeps it with the record', async () => {
+    const directory = await createStoreDirectory()
+    const attributionId = mintProcessAttributionId()
+    const owner = (teamId: string) => ({
+      teamId,
+      laneId: 'primary',
+      memberName: 'alice',
+      runId: `run-${teamId}`,
+      sessionId: `session-${teamId}`,
+      createdAt: '2026-09-10T10:00:00.000Z',
+      updatedAt: '2026-09-10T10:05:00.000Z',
+    })
+    const write = (owners: ReturnType<typeof owner>[], at: string) =>
+      writeHostAttributionRecord({
+        directory,
+        attributionId,
+        hostPid: 111,
+        hostStartedAtNative: 5_000,
+        projectPath: '/work/app',
+        owners,
+        now: () => new Date(at),
+      })
+    const readHost = async () => (await readAttributionRecords(directory)).hosts[0]?.record
+
+    await write([owner('team-1'), owner('team-2')], '2026-09-10T10:05:00.000Z')
+    expect((await readHost())?.releasedOwners).toEqual([])
+
+    // team-1 stops: its lease goes, and the record remembers when.
+    await write([owner('team-2')], '2026-09-10T10:20:00.000Z')
+    expect((await readHost())?.owners.map(entry => entry.teamId)).toEqual(['team-2'])
+    expect((await readHost())?.releasedOwners).toEqual([
+      { ...owner('team-1'), releasedAt: '2026-09-10T10:20:00.000Z' },
+    ])
+
+    // The last lease goes too; both releases stay, oldest first.
+    await write([], '2026-09-10T10:30:00.000Z')
+    expect((await readHost())?.owners).toEqual([])
+    expect((await readHost())?.releasedOwners.map(entry => [entry.teamId, entry.releasedAt]))
+      .toEqual([
+        ['team-1', '2026-09-10T10:20:00.000Z'],
+        ['team-2', '2026-09-10T10:30:00.000Z'],
+      ])
+
+    // A record written by a runtime that knew no released owners reads as none.
+    const hostPath = processAttributionHostRecordPath(directory, attributionId)
+    const legacy = JSON.parse(await readFile(hostPath, 'utf8')) as Record<string, unknown>
+    delete legacy.releasedOwners
+    await writeFile(hostPath, JSON.stringify(legacy), 'utf8')
+    expect((await readHost())?.releasedOwners).toEqual([])
+
+    // The list is bounded to the newest releases.
+    const many = Array.from({ length: PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS + 5 }, (_, index) =>
+      owner(`team-${index}`))
+    await write(many, '2026-09-10T11:00:00.000Z')
+    await write([], '2026-09-10T11:01:00.000Z')
+    const released = (await readHost())?.releasedOwners ?? []
+    expect(released).toHaveLength(PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS)
+    expect(released[released.length - 1]?.teamId)
+      .toBe(`team-${PROCESS_ATTRIBUTION_MAX_RELEASED_OWNERS + 4}`)
   })
 
   test('keeps a live host whose start time cannot be read', async () => {
