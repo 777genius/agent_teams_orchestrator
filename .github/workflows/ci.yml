@@ -132,9 +132,10 @@ jobs:
   opencode-authority:
     name: OpenCode selected authority (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Fresh-process recovery adds real Windows process-identity queries. The
-    # 15-minute job cap interrupted 855 passing cases; per-test deadlines stay fixed.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
+    # Windows recovery fixtures spend ~20 minutes in real process-identity
+    # queries; the 25-minute job cap interrupted 1065 passing cases after setup.
+    # Leave room for the remaining suites without changing operation deadlines.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 35 || 15 }}
     strategy:
       fail-fast: false
       matrix:
