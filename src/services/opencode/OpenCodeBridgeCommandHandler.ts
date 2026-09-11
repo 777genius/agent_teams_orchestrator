@@ -3271,6 +3271,12 @@ async function assertOpenCodeLaunchMcpReady(
   }
 }
 
+/**
+ * Release a failed bootstrap while retaining its strict session identity.
+ * The same run can safely resume bootstrap from that known remote session. Once
+ * its materialization owner is released, a different strict run may atomically
+ * replace the stale record instead. Delivery must never bypass strict bootstrap.
+ */
 async function cleanupFailedLaunchSession(
   record: OpenCodeSessionRecord,
   ownerToken?: MaterializationOwnerToken,
@@ -3298,15 +3304,8 @@ async function cleanupFailedLaunchSession(
     ))
   }
 
-  try {
-    await openCodeSessionStore.deleteIfSession(record, ownerToken)
-  } catch (error) {
-    diagnostics.push(teamDiagnostic(
-      'opencode_launch_failed_session_delete_failed',
-      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
-      'warning',
-    ))
-  }
+  // Deliberately no delete: strict launch retry owns recovery. sendMessage does
+  // not have the proof or bootstrap input required to recreate this session.
   return diagnostics
 }
 
@@ -4996,6 +4995,9 @@ async function runSendMessage(
   const mcpDiagnostics: TeamDiagnostic[] = []
   const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
   const staleReason = record.staleReason ?? compatibilityStaleReason
+  if (staleReason === 'launch_failed') {
+    throw new Error('OpenCode member launch did not complete; retry launch for the same run or relaunch the lane')
+  }
   if (authority && (staleReason || forceSessionRefreshReason)) {
     throw new Error('OpenCode selected session cannot be recreated without strict launch proof; relaunch the lane')
   }

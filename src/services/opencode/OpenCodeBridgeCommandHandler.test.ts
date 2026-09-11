@@ -1328,6 +1328,21 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   }
 
+  test('failed selected launch requires strict launch recovery before delivery', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    state.records = [{ ...record, staleReason: 'launch_failed' }]
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+
+    expect(result.ok).toBe(false)
+    if ('error' in result) {
+      expect(result.error.message).toContain('retry launch for the same run or relaunch the lane')
+    }
+    expect(state.recreates).toBe(0)
+    expect(state.prompts).toBe(0)
+    expect(state.releases).toBe(1)
+  })
+
   test('selected delivery handshake deadline cancels probe and releases late retained authority', async () => {
     const record = buildRecord({ runId: 'run-1', selectedModel: 'zai/glm-5.2', toolApprovalMode: 'auto',
       profileScope: { purpose: 'launch_runtime', providerId: 'zai', scopeToken: 'lane-scope',
@@ -4428,9 +4443,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
       expect(result.ok).toBe(false)
       if (!result.ok) expect(result.error.message).toContain('changed before bootstrap')
+      // No cleanup-delete: strict launch can resume the known session while
+      // delivery remains fenced until bootstrap succeeds.
       expect(events).toEqual([
         'materialize:alice', 'mcp:alice', 'cleanup-stale:alice',
-        'cleanup-release:alice', 'cleanup-delete:alice',
+        'cleanup-release:alice',
       ])
     } finally {
       openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
@@ -4524,7 +4541,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(Object.keys(result.data.members)).toEqual(['alice'])
       expect(events).toEqual([
         'bootstrap:alice', 'publish:alice', 'bootstrap:bob',
-        'cleanup-stale:bob', 'cleanup-release:bob', 'cleanup-delete:bob',
+        'cleanup-stale:bob', 'cleanup-release:bob',
       ])
     } finally {
       openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
