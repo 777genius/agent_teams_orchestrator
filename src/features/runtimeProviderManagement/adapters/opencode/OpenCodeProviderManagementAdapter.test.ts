@@ -1678,7 +1678,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const result = await adapter.loadDirectory(input)
     expect(probeCalls).toHaveLength(1)
     expect(probeCalls[0]).toMatchObject({
-      projectPath, mode: 'summary', bypassCache: false, refreshModels: false, includeAppMcp: false,
+      projectPath: path.resolve(projectPath), mode: 'summary', bypassCache: false, refreshModels: false, includeAppMcp: false,
     })
     expect(result.ok).toBe(true)
     if (!result.ok) return
@@ -2057,8 +2057,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
 
     expect(result.ok).toBe(true)
-    expect(probeCalls).toEqual(['/tmp/selected-project'])
-    expect(ensureHostCalls).toEqual(['/tmp/selected-project'])
+    expect(probeCalls).toEqual([path.resolve('/tmp/selected-project')])
+    expect(ensureHostCalls).toEqual([path.resolve('/tmp/selected-project')])
   })
 
   test('does not invent API-key connect for unknown providers without advertised API auth', async () => {
