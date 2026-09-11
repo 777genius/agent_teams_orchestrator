@@ -1,8 +1,49 @@
+import { createServer } from 'node:http'
 import { describe, expect, spyOn, test } from 'bun:test'
 
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
 describe('OpenCodeClientFactory permissions API', () => {
+  for (const cancellation of ['request', 'caller']) {
+  test(`keeps ${cancellation} cancellation active while reading a stalled HTTP response body`, async () => {
+    const sockets = new Set<import('node:net').Socket>()
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.write('{')
+    })
+    server.on('connection', socket => {
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('missing test server port')
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    const caller = new AbortController()
+    const callerTimer = cancellation === 'caller'
+      ? setTimeout(() => caller.abort(new Error('settings deadline expired')), 30)
+      : undefined
+    try {
+      const result = await Promise.race([
+        new OpenCodeClientFactory().create(`http://127.0.0.1:${address.port}`, {
+          remainingMs: () => cancellation === 'request' ? 30 : 5_000,
+          signal: caller.signal,
+        }).getProviders().then(() => 'unexpected success', error => String(error)),
+        new Promise<string>(resolve => { watchdog = setTimeout(() => resolve('watchdog expired'), 300) }),
+      ])
+      expect(result).toContain(cancellation === 'request'
+        ? 'OpenCode request timed out after 30ms for /provider'
+        : 'settings deadline expired')
+    } finally {
+      if (watchdog) clearTimeout(watchdog)
+      if (callerTimer) clearTimeout(callerTimer)
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+
+  }
+
   test('only explicit instance initialization receives the startup transport budget', async () => {
     const requests: string[] = []
     const factory = new OpenCodeClientFactory({

@@ -167,7 +167,7 @@ type OpenCodeProviderManagementClient = {
 }
 
 type OpenCodeClientFactoryLike = {
-  create(baseUrl: string, options?: { signal?: AbortSignal }): OpenCodeProviderManagementClient
+  create(baseUrl: string, options?: { signal?: AbortSignal; remainingMs?: () => number }): OpenCodeProviderManagementClient
 }
 
 type OpenCodeProviderManagementAdapterDeps = {
@@ -231,6 +231,8 @@ type OpenCodeProviderManagementAdapterDeps = {
     ): Promise<unknown>
   }
   inventoryTimeoutMs?: number
+  /** Settings preparation and HTTP budget; cancellation must drain before CLI exit. */
+  viewTimeoutMs?: number
   resolveBinaryPath?: () => string | null
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
   /** Query, model normalization, and identity-publication budget after host readiness. */
@@ -2589,6 +2591,7 @@ async function readLiveView(input: {
   host: OpenCodeHostHandle
   client: OpenCodeProviderManagementClient
   diagnostics?: readonly string[]
+  degradeOnReadFailure?: boolean
 }): Promise<ProviderManagementView> {
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
@@ -2613,7 +2616,7 @@ async function readLiveView(input: {
     ...safeReadDiagnostics(serverDocResult),
   ]
 
-  return buildView({
+  const view = buildView({
     inventory: input.inventory,
     host: input.host,
     configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
@@ -2622,6 +2625,11 @@ async function readLiveView(input: {
     capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
     diagnostics,
   })
+  if (input.degradeOnReadFailure && [configProvidersResult, providersResult, providerAuthResult, serverDocResult]
+    .some(result => !result.ok)) {
+    view.runtime.state = 'degraded'
+  }
+  return view
 }
 
 function findProviderConnection(
@@ -3219,6 +3227,7 @@ export class OpenCodeProviderManagementAdapter
   private async retainProviderManagementHost(
     hostManager: OpenCodeHostManagerLike,
     host: OpenCodeHostHandle,
+    evictIdleHosts = true,
   ): Promise<OpenCodeHostLeaseInput | null> {
     if (!hostManager.retainHostLease) {
       return null
@@ -3232,7 +3241,7 @@ export class OpenCodeProviderManagementAdapter
     }
     try {
       await hostManager.retainHostLease(host.hostKey, lease)
-      await hostManager.reconcilePersistentHosts?.({
+      if (evictIdleHosts) await hostManager.reconcilePersistentHosts?.({
         mode: 'stale',
         reason: 'provider-management-idle-eviction',
         staleAgeMs: OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS,
@@ -3765,9 +3774,6 @@ export class OpenCodeProviderManagementAdapter
         abortSignal: options.abortSignal,
         progress: options.progress,
       })
-      if (!inventory.detected) {
-        return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
-      }
       if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
         return providerManagementError(
           'runtime-unhealthy',
@@ -3775,6 +3781,10 @@ export class OpenCodeProviderManagementAdapter
             ? OPEN_CODE_CATALOG_FAILURE_MESSAGE
             : inventory.probeError ?? 'OpenCode inventory probe timed out',
         )
+      }
+      // A timed-out probe cannot establish that the binary is absent.
+      if (!inventory.detected) {
+        return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
       }
       const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
       host = await hostManager.ensureHost({
@@ -3834,8 +3844,45 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? 75_000)
+    const progress = createOpenCodeInventoryProbeProgressTracker()
+    let timeoutMessage: string | undefined
+    const captureTimeout = () => {
+      timeoutMessage = catalogTimeoutDiagnostic(
+        `OpenCode provider settings timed out after ${deadline.commandBudgetMs}ms`, progress,
+      )
+    }
+    deadline.signal.addEventListener('abort', captureTimeout, { once: true })
+    try {
+      const result = await this.loadSettingsView(request, deadline, progress, () => timeoutMessage)
+      // Finalizers are awaited before the CLI may exit, even if the budget expires there.
+      if (deadline.signal.aborted && result.ok) {
+        result.value.runtime.state = 'degraded'
+        if (timeoutMessage && !result.value.diagnostics.includes(timeoutMessage)) {
+          result.value.diagnostics = [...result.value.diagnostics, timeoutMessage]
+        }
+      }
+      return result
+    } catch (error) {
+      return providerManagementError('runtime-unhealthy', timeoutMessage
+        ?? (error instanceof Error ? error.message : String(error)))
+    } finally {
+      deadline.signal.removeEventListener('abort', captureTimeout)
+      deadline.dispose()
+    }
+  }
+
+  private async loadSettingsView(
+    request: LoadProviderManagementViewInput,
+    deadline: OpenCodeRuntimeDeadline,
+    progress: OpenCodeInventoryProbeProgressTracker,
+    getTimeoutMessage: () => string | undefined,
+  ): Promise<ProviderManagementResult<ProviderManagementView>> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, request.projectPath)
+    const inventory = await this.probeInventory(inventoryService, request.projectPath, {
+      abortSignal: deadline.signal,
+      progress,
+    })
 
     if (!inventory.detected) {
       return {
@@ -3867,8 +3914,11 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
+    let liveView: ProviderManagementView | null = null
 
     try {
+      deadline.throwIfExpired()
+      const leaveHost = progress.enterStep('prepare settings host')
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
@@ -3878,24 +3928,34 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime: 'persistent',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        abortSignal: deadline.signal,
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
-      const client = clientFactory.create(host.baseUrl)
+      leaveHost()
+      deadline.throwIfExpired()
+      const leaveLease = progress.enterStep('retain settings host lease')
+      // Reading settings must not synchronously evict unrelated persistent hosts.
+      hostLease = await this.retainProviderManagementHost(hostManager, host, false)
+      leaveLease()
+      deadline.throwIfExpired()
+      const client = clientFactory.create(host.baseUrl, {
+        signal: deadline.signal,
+        remainingMs: () => deadline.remainingMs(),
+      })
+      const leaveHttp = progress.enterStep('read settings HTTP endpoints')
 
-      return {
-        ok: true,
-        value: await readLiveView({
+      liveView = await readLiveView({
+          degradeOnReadFailure: true,
           inventory,
           host,
           client,
           diagnostics: inventory.diagnostics,
-        }),
-      }
+        })
+      leaveHttp()
+      deadline.throwIfExpired()
+      return { ok: true, value: liveView }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return {
-        ok: true,
-        value: buildView({
+      const message = getTimeoutMessage() ?? (error instanceof Error ? error.message : String(error))
+      const value = liveView ?? buildView({
           inventory,
           host,
           configProviders: null,
@@ -3903,14 +3963,18 @@ export class OpenCodeProviderManagementAdapter
           providerAuth: null,
           diagnostics: [...inventory.diagnostics, message],
           hostStartError: host ? null : message,
-        }),
-      }
+        })
+      if (liveView) value.diagnostics = [...value.diagnostics, message]
+      if (deadline.signal.aborted) value.runtime.state = 'degraded'
+      return { ok: true, value }
     } finally {
       if (host) {
+        const leaveRelease = progress.enterStep('release settings host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, { keepPersistentAlive: true })
           .catch(() => undefined)
+        leaveRelease()
       }
     }
   }

@@ -323,6 +323,132 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
+  test('bounds settings host preparation after successful inventory and propagates cancellation', async () => {
+    let hostSignal: AbortSignal | undefined
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      viewTimeoutMs: 30,
+      inventoryService: { probe: async () => inventory() },
+      hostManager: {
+        ensureHost: async params => {
+          hostSignal = params?.abortSignal
+          return new Promise<never>((_resolve, reject) => {
+            hostSignal?.addEventListener('abort', () => reject(hostSignal?.reason), { once: true })
+          })
+        },
+        releaseHost: async () => {},
+      },
+    })
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([
+        adapter.loadView('opencode'),
+        new Promise<null>(resolve => { watchdog = setTimeout(() => resolve(null), 250) }),
+      ])
+      expect(result?.ok).toBe(true)
+      expect(hostSignal?.aborted).toBe(true)
+      if (result?.ok) {
+        expect(result.value.runtime.state).toBe('degraded')
+        expect(result.value.diagnostics.join(' ')).toContain('host')
+      }
+    } finally {
+      if (watchdog) clearTimeout(watchdog)
+    }
+  })
+
+  test('releases a settings host arriving after cancellation without starting HTTP or retaining a lease', async () => {
+    const released: string[] = []
+    let retained = 0
+    let clients = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      viewTimeoutMs: 10,
+      inventoryService: { probe: async () => inventory() },
+      hostManager: {
+        ensureHost: async () => {
+          await new Promise(resolve => setTimeout(resolve, 30))
+          return host()
+        },
+        retainHostLease: async () => { retained += 1 },
+        releaseHost: async key => { released.push(key) },
+      },
+      clientFactory: { create: () => { clients += 1; throw new Error('unexpected HTTP') } },
+    })
+    const result = await adapter.loadView('opencode')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.runtime.state).toBe('degraded')
+    expect(result.value.diagnostics.join(' ')).toContain('prepare settings host')
+    expect(released).toEqual([host().hostKey])
+    expect(retained).toBe(0)
+    expect(clients).toBe(0)
+  })
+
+  test('settings skips unrelated eviction and drains lease release before returning a timeout', async () => {
+    let releaseFinished = false
+    let evicted = false
+    let retained = 0
+    let released = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      viewTimeoutMs: 15,
+      inventoryService: { probe: async () => inventory() },
+      hostManager: {
+        ensureHost: async () => host(),
+        retainHostLease: async () => { retained += 1 },
+        releaseHostLease: async () => {
+          await new Promise(resolve => setTimeout(resolve, 35))
+          releaseFinished = true
+          released += 1
+        },
+        reconcilePersistentHosts: async () => {
+          evicted = true
+          throw new Error('settings must not evict other hosts')
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadView('opencode')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.runtime.state).toBe('degraded')
+    expect(result.value.diagnostics.join(' ')).toContain('release settings host lease')
+    expect(releaseFinished).toBe(true)
+    expect(retained).toBe(1)
+    expect(released).toBe(1)
+    expect(evicted).toBe(false)
+  })
+
+  for (const hasInventoryModels of [true, false]) {
+    test(`settings marks partial HTTP data degraded without inferring missing auth (inventory models: ${hasInventoryModels})`, async () => {
+      const adapter = new OpenCodeProviderManagementAdapter({
+        ...catalogIdentityDependencies(),
+        inventoryService: { probe: async () => inventory(hasInventoryModels ? {} : { models: [], providers: [] }) },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'openai', name: 'OpenAI', models: { 'gpt-5.4-mini': {} } }],
+            default: { openai: 'gpt-5.4-mini' },
+          }),
+          getProviders: async () => { throw new Error('provider endpoint unavailable') },
+          getProviderAuth: async () => ({ openai: [{ type: 'api' }] }),
+        }) },
+      })
+      const result = await adapter.loadView('opencode')
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.runtime.state).toBe('degraded')
+      expect(result.value.diagnostics).toContain('provider endpoint unavailable')
+      expect(result.value.providers.some(provider => provider.providerId === 'openai')).toBe(true)
+      expect(result.value.configuredModels.some(model => model.modelId === 'openai/gpt-5.4-mini')).toBe(true)
+    })
+  }
+
   test('uses a bounded host startup budget only for read-only provider management views', async () => {
     const ensureHostCalls: Array<{
       projectPath?: string | null
@@ -437,7 +563,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(2)
+    expect(reconcileCalls).toHaveLength(1)
     expect(
       reconcileCalls.every(
         options =>
