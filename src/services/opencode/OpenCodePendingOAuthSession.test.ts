@@ -238,7 +238,11 @@ describe('pending native OAuth session authority', () => {
         mcpServers: ['agent-teams'], providers: [] }).slice(0, 32)}`
       const call = (command: string, member = 'owner', extra: Record<string, unknown> = {}, signal?: AbortSignal) => execute({
         schemaVersion: 1, command, requestId: `TEST-${command}-${member}`, cwd: project,
-        startedAt: new Date().toISOString(), timeoutMs: 10_000,
+        startedAt: new Date().toISOString(),
+        // The production path issues several real PowerShell process-identity
+        // probes on Windows. Keep the fixture command budget above their cold
+        // runner latency; production deadlines are unchanged.
+        timeoutMs: process.platform === 'win32' ? 30_000 : 10_000,
         body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: member,
           // Keep each member's delivery identity stable from blocked send through retry.
           deliveryAttemptId: `attempt-${member}`,
@@ -471,7 +475,7 @@ describe('pending native OAuth session authority', () => {
           const outcomes = new OpenCodeCommandOutcomeStore(${JSON.stringify(path.join(root, 'outcomes.json'))});
           spyOn(openCodeCommandOutcomeStore, 'upsert').mockImplementation((...args) => outcomes.upsert(...args));
           const call = requestId => execute({ schemaVersion: 1, command: 'opencode.sendMessage', requestId, cwd: record.projectPath,
-            startedAt: new Date().toISOString(), timeoutMs: 10000,
+            startedAt: new Date().toISOString(), timeoutMs: process.platform === 'win32' ? 30000 : 10000,
             body: { teamId: 'TEST', laneId: 'primary', runId: 'run-1', memberName: 'owner', expectedCapabilitySnapshotId: ${JSON.stringify(capability)},
               deliveryAttemptId: requestId === 'TEST-third' ? 'attempt-third' : 'attempt-owner',
               messageId: requestId === 'TEST-third' ? 'inbox-third' : 'inbox-TEST', text: 'synthetic followup', settlementMode: 'acceptance' } });
