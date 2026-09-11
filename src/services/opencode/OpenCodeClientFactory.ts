@@ -199,7 +199,9 @@ export class OpenCodeClientFactory {
           },
         })
         // Keep the timer and caller abort listener until the body is consumed.
-        return await parseResponse<T>(response)
+        const result = await parseResponse<T>(response)
+        controller.signal.throwIfAborted()
+        return result
       } catch (error) {
         if (context.signal?.aborted) {
           throw resolveAbortReason(context.signal, timeoutError)

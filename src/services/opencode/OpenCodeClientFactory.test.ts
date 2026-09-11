@@ -292,6 +292,42 @@ describe('OpenCodeClientFactory permissions API', () => {
 })
 
 describe('OpenCodeClientFactory request context', () => {
+  for (const cancellation of ['request', 'caller']) {
+    for (const body of ['', '{}']) {
+      test(`rejects ${cancellation} cancellation when body consumption resolves ${JSON.stringify(body)} after abort`, async () => {
+        const caller = new AbortController()
+        const callerReason = new Error('settings deadline expired during body consumption')
+        let bodyReadStarted = false
+        const factory = new OpenCodeClientFactory({
+          fetchImpl: async (_input, init) => {
+            const signal = init?.signal as AbortSignal
+            const response = new Response(body)
+            response.text = async () => {
+              bodyReadStarted = true
+              return await new Promise<string>(resolve => {
+                signal.addEventListener('abort', () => resolve(body), { once: true })
+                if (cancellation === 'caller') caller.abort(callerReason)
+              })
+            }
+            return response
+          },
+        })
+
+        const request = factory.create('http://127.0.0.1:4096', {
+          signal: caller.signal,
+          remainingMs: () => cancellation === 'request' ? 10 : 5_000,
+        }).getProviders()
+
+        if (cancellation === 'caller') {
+          await expect(request).rejects.toBe(callerReason)
+        } else {
+          await expect(request).rejects.toThrow('OpenCode request timed out after 10ms for /provider')
+        }
+        expect(bodyReadStarted).toBe(true)
+      })
+    }
+  }
+
   test('limits an endpoint request to the remaining runtime budget', async () => {
     const requestSignals: AbortSignal[] = []
     const factory = new OpenCodeClientFactory({
