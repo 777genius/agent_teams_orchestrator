@@ -17,6 +17,11 @@ import { getTeamName } from './teammate.js'
 import { getTeammateContext } from './teammateContext.js'
 import { safeWindowsPathSegment } from './windowsReservedNames.js'
 import { withTaskMutationCoordination } from './taskMutationCoordinator.js'
+import { CanonicalTeamDirectory } from './swarm/canonicalTeamDirectory.js'
+import {
+  resolveCanonicalTeamLockAuthority,
+  withValidatedCanonicalTeamRoot,
+} from './swarm/canonicalTeamLockAuthority.js'
 
 // Listeners for task list updates (used for immediate UI refresh in same process)
 const tasksUpdated = createSignal()
@@ -1005,6 +1010,145 @@ export type UnassignTasksResult = {
   notificationMessage: string
 }
 
+/** A task-owner snapshot captured from the retained hosted team root. */
+export type TrustedTeammateTaskIdentity = {
+  teammateId: string
+  teammateName: string
+  hostedOwnerId?: string
+}
+
+/**
+ * Captures every supported task owner for one exact hosted roster member.
+ * Unlike the display-oriented roster reader, malformed or unreadable hosted
+ * identity material is an error: shutdown must not silently lose an opaque
+ * owner merely because it can still see the legacy config member.
+ */
+export async function captureTrustedTeammateTaskIdentity(
+  teamName: string,
+  teammateId: string,
+  teammateName: string,
+): Promise<TrustedTeammateTaskIdentity> {
+  const canonicalTeamRoot = join(getTeamsDir(), sanitizeName(teamName))
+  const authority = resolveCanonicalTeamLockAuthority(canonicalTeamRoot, teamName)
+  return withValidatedCanonicalTeamRoot(authority, async rootFd => {
+    const directory = await CanonicalTeamDirectory.fromRootFd(rootFd)
+    const configFile = directory.readFile('config.json')
+    if (!configFile) throw new Error('Hosted shutdown task identity config is missing')
+    const config = jsonParse(configFile.text) as {
+      name?: unknown
+      members?: unknown
+    }
+    if (config.name !== teamName || !Array.isArray(config.members)) {
+      throw new Error('Hosted shutdown task identity config is invalid')
+    }
+    const configMembers = config.members as Array<TeamMember & {
+      memberId?: unknown
+      joinedAt?: unknown
+      removedAt?: unknown
+    }>
+    const exactConfig = configMembers.filter(member =>
+      member.removedAt === undefined &&
+      member.agentId === teammateId &&
+      member.name === teammateName,
+    )
+    if (exactConfig.length !== 1) {
+      throw new Error('Hosted shutdown task identity is absent or ambiguous')
+    }
+    const configJoinedAt = exactConfig[0]!.joinedAt
+    if (!Number.isSafeInteger(configJoinedAt) || (configJoinedAt as number) < 0) {
+      throw new Error('Hosted shutdown task identity config incarnation is invalid')
+    }
+
+    const identityFile = directory.readFile('team.identity.json')
+    let teamId: string | null = null
+    if (identityFile) {
+      const identity = jsonParse(identityFile.text) as { teamId?: unknown }
+      if (typeof identity.teamId !== 'string' || !/^team_[0-9a-f]{32}$/.test(identity.teamId)) {
+        throw new Error('Hosted shutdown team identity is invalid')
+      }
+      teamId = identity.teamId
+    }
+
+    const rosterFile = directory.readFile('members.meta.json')
+    let members: Array<TeamMember & { memberId?: unknown; joinedAt?: unknown; removedAt?: unknown }>
+    if (!rosterFile) {
+      members = configMembers
+    } else {
+      if (Buffer.byteLength(rosterFile.text) > MAX_HOSTED_ROSTER_BYTES) {
+        throw new Error('Hosted shutdown roster is too large')
+      }
+      const roster = jsonParse(rosterFile.text) as { version?: unknown; members?: unknown }
+      if (roster.version !== 1 || !Array.isArray(roster.members) || roster.members.length > 512) {
+        throw new Error('Hosted shutdown roster is invalid')
+      }
+      const parsed = roster.members as HostedRosterMember[]
+      if (!parsed.every(member =>
+        member && typeof member === 'object' && !Array.isArray(member) &&
+        typeof member.name === 'string' && member.name.length > 0 && member.name.trim() === member.name &&
+        (member.agentId === undefined || (typeof member.agentId === 'string' && member.agentId.length > 0 && member.agentId.length <= 256 && member.agentId.trim() === member.agentId)) &&
+        (member.memberId === undefined || (typeof member.memberId === 'string' && /^member_[0-9a-f]{32}$/.test(member.memberId))) &&
+        (member.joinedAt === undefined || (Number.isSafeInteger(member.joinedAt) && (member.joinedAt as number) >= 0)) &&
+        (member.removedAt === undefined || (typeof member.removedAt === 'number' && Number.isFinite(member.removedAt))),
+      )) throw new Error('Hosted shutdown roster is invalid')
+      const identities = new Set<string>()
+      const activeNames = new Set<string>()
+      for (const member of parsed) {
+        const immutableIdentity = Number.isSafeInteger(member.joinedAt) && (member.joinedAt as number) >= 0
+          ? `${member.name}\0${member.joinedAt as number}`
+          : typeof member.agentId === 'string' ? member.agentId : member.name
+        const rosterIdentity = typeof member.memberId === 'string'
+          ? `member:${member.memberId}`
+          : `identity:${immutableIdentity}`
+        const activeName = member.name.toLowerCase()
+        if (identities.has(rosterIdentity) ||
+          (member.removedAt === undefined && activeNames.has(activeName))) {
+          throw new Error('Hosted shutdown roster contains duplicate identities')
+        }
+        identities.add(rosterIdentity)
+        if (member.removedAt === undefined) activeNames.add(activeName)
+      }
+      // Bind only the requested incarnation. A previously settled name-only
+      // roster row can legitimately outlive its config row; requiring every
+      // unrelated row to resolve would make sequential shutdown impossible.
+      // The exact active config match above and the roster duplicate checks
+      // still make a target with a substituted or ambiguous identity fail.
+      const targetRosterMembers = parsed
+        .filter(member => member.removedAt === undefined && member.name === teammateName)
+      if (targetRosterMembers.some(member =>
+        (member.agentId !== undefined && member.agentId !== teammateId) ||
+        (member.joinedAt !== undefined && member.joinedAt !== configJoinedAt)
+      )) {
+        throw new Error('Hosted shutdown roster target conflicts with config incarnation')
+      }
+      if (targetRosterMembers.some(member => member.agentId === undefined)) {
+        const matchingConfigMembers = configMembers.filter(member =>
+          member.removedAt === undefined && member.name === teammateName,
+        )
+        if (matchingConfigMembers.length !== 1 || matchingConfigMembers[0]!.agentId !== teammateId) {
+          throw new Error('Hosted shutdown roster target cannot be bound unambiguously')
+        }
+      }
+      members = targetRosterMembers
+        .map(member => ({ ...member, agentId: member.agentId ?? teammateId })) as Array<
+          TeamMember & { memberId?: unknown; joinedAt?: unknown; removedAt?: unknown }
+        >
+    }
+
+    const exact = members.filter(member =>
+      member.removedAt === undefined &&
+      member.agentId === teammateId &&
+      member.name === teammateName,
+    )
+    if (exact.length !== 1) throw new Error('Hosted shutdown roster identity is absent or ambiguous')
+    const ownerId = hostedOwnerId(teamId, exact[0]!)
+    return {
+      teammateId,
+      teammateName,
+      ...(ownerId ? { hostedOwnerId: ownerId } : {}),
+    }
+  })
+}
+
 /**
  * Unassigns all open tasks from a teammate and builds a notification message.
  * Used when a teammate is killed or gracefully shuts down.
@@ -1031,31 +1175,70 @@ export async function unassignTeammateTasks(
   )
 }
 
+/** Resume shutdown cleanup from a previously persisted trusted owner snapshot. */
+export async function unassignTeammateTasksWithTrustedIdentity(
+  teamName: string,
+  identity: TrustedTeammateTaskIdentity,
+  reason: 'terminated' | 'shutdown',
+): Promise<UnassignTasksResult> {
+  return withTaskMutationCoordination(teamName, () =>
+    unassignTeammateTasksCoordinated(
+      teamName,
+      identity.teammateId,
+      identity.teammateName,
+      reason,
+      identity,
+    ),
+  )
+}
+
 async function unassignTeammateTasksCoordinated(
   teamName: string,
   teammateId: string,
   teammateName: string,
   reason: 'terminated' | 'shutdown',
+  trustedIdentity?: TrustedTeammateTaskIdentity,
 ): Promise<UnassignTasksResult> {
-  const tasks = await listTasks(teamName)
-  const teamData = await readTeamMembers(teamName)
-  const exactMembers = teamData?.members.filter(
-    member => member.agentId === teammateId && member.name === teammateName,
-  ) ?? []
-  const hostedOwnerId = exactMembers.length === 1
-    ? exactMembers[0]!.hostedOwnerId
-    : undefined
+  const tasks = trustedIdentity
+    ? await listTasksForTrustedCleanup(teamName)
+    : await listTasks(teamName)
+  if (
+    trustedIdentity &&
+    (trustedIdentity.teammateId !== teammateId || trustedIdentity.teammateName !== teammateName)
+  ) throw new Error('Trusted task identity does not match cleanup target')
+  let resolvedHostedOwnerId = trustedIdentity?.hostedOwnerId
+  if (!trustedIdentity) {
+    const teamData = await readTeamMembers(teamName)
+    const exactMembers = teamData?.members.filter(
+      member => member.agentId === teammateId && member.name === teammateName,
+    ) ?? []
+    resolvedHostedOwnerId = exactMembers.length === 1
+      ? exactMembers[0]!.hostedOwnerId
+      : undefined
+  }
   const unresolvedAssignedTasks = tasks.filter(
     t =>
       t.status !== 'completed' &&
       (t.owner === teammateId ||
         t.owner === teammateName ||
-        (hostedOwnerId !== undefined && t.owner === hostedOwnerId)),
+        (resolvedHostedOwnerId !== undefined && t.owner === resolvedHostedOwnerId)),
   )
 
   // Unassign each task and reset status to open
   for (const task of unresolvedAssignedTasks) {
-    await updateTask(teamName, task.id, { owner: undefined, status: 'pending' })
+    if (trustedIdentity) {
+      await unassignTaskIfOwnerMatches(
+        teamName,
+        task.id,
+        new Set([
+          trustedIdentity.teammateId,
+          trustedIdentity.teammateName,
+          ...(trustedIdentity.hostedOwnerId ? [trustedIdentity.hostedOwnerId] : []),
+        ]),
+      )
+    } else {
+      await updateTask(teamName, task.id, { owner: undefined, status: 'pending' })
+    }
   }
 
   if (unresolvedAssignedTasks.length > 0) {
@@ -1081,6 +1264,54 @@ async function unassignTeammateTasksCoordinated(
       subject: t.subject,
     })),
     notificationMessage,
+  }
+}
+
+async function readTaskForTrustedCleanup(taskListId: string, taskId: string): Promise<Task> {
+  const value = jsonParse(await readFile(getTaskPath(taskListId, taskId), 'utf8'))
+  const parsed = TaskSchema().safeParse(value)
+  if (!parsed.success) throw new Error(`Task ${taskId} is invalid during hosted shutdown cleanup`)
+  if (parsed.data.id !== taskId) {
+    throw new Error(`Task ${taskId} payload id does not match its filename during hosted shutdown cleanup`)
+  }
+  return parsed.data
+}
+
+async function listTasksForTrustedCleanup(taskListId: string): Promise<Task[]> {
+  let files: string[]
+  try {
+    files = await readdir(getTasksDir(taskListId))
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') return []
+    throw error
+  }
+  return Promise.all(
+    files.filter(file => file.endsWith('.json'))
+      .map(file => {
+        const taskId = file.slice(0, -5)
+        if (`${sanitizePathComponent(taskId)}.json` !== file) {
+          throw new Error(`Task filename ${file} is not canonical during hosted shutdown cleanup`)
+        }
+        return readTaskForTrustedCleanup(taskListId, taskId)
+      }),
+  )
+}
+
+async function unassignTaskIfOwnerMatches(
+  taskListId: string,
+  taskId: string,
+  expectedOwners: ReadonlySet<string>,
+): Promise<void> {
+  const path = getTaskPath(taskListId, taskId)
+  let release: (() => Promise<void>) | undefined
+  try {
+    release = await lockfile.lock(path, LOCK_OPTIONS)
+    const current = await readTaskForTrustedCleanup(taskListId, taskId)
+    if (current.status === 'completed' || !current.owner || !expectedOwners.has(current.owner)) return
+    await writeJsonFileAtomic(path, { ...current, owner: undefined, status: 'pending' }, { indent: 2 })
+    notifyTasksUpdated()
+  } finally {
+    await release?.()
   }
 }
 

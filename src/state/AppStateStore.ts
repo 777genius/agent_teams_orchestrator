@@ -340,6 +340,8 @@ export type AppState = DeepImmutable<{
         cwd: string
         worktreePath?: string
         spawnedAt: number
+        /** joinedAt of the exact durable roster member represented by this row. */
+        rosterJoinedAt?: number
         processStartedAtMs?: number
         processOsIdentity?: string
         processOwnerToken?: string

@@ -18,6 +18,7 @@ import {
   getTeamFilePath,
   readTeamFileAsync,
   sanitizeName,
+  type TeamMember,
   unregisterTeamForSessionCleanup,
   updateTeamFileAsync,
 } from 'src/utils/swarm/teamHelpers.js'
@@ -60,6 +61,26 @@ export type TeamBootstrapRunnerDeps = {
 
 type SpawnTeammateInput = Parameters<TeamBootstrapRunnerDeps['spawnTeammate']>[0]
 type SpawnTeammateResult = Awaited<ReturnType<TeamBootstrapRunnerDeps['spawnTeammate']>>
+
+export function appStateTeammateFromExistingRoster(member: TeamMember) {
+  return {
+    name: member.name,
+    agentType: member.agentType,
+    color: member.color ?? assignTeammateColor(member.agentId),
+    tmuxSessionName: '',
+    tmuxPaneId: member.tmuxPaneId ?? '',
+    cwd: member.cwd || getCwd(),
+    worktreePath: member.worktreePath,
+    spawnedAt: member.joinedAt,
+    rosterJoinedAt: member.joinedAt,
+    processStartedAtMs: member.processStartedAtMs,
+    processOsIdentity: member.processOsIdentity,
+    processOwnerToken: member.processOwnerToken,
+    processRunId: member.processRunId,
+    spawnClaimToken: member.spawnClaimToken,
+    spawnClaimRunId: member.spawnClaimRunId,
+  }
+}
 
 const TRANSIENT_STARTUP_RETRY_LIMIT = 1
 const TRANSIENT_STARTUP_RETRY_DELAY_MS = 2_000
@@ -356,16 +377,7 @@ async function ensureLeaderAttachedToTeam(
       teammates: Object.fromEntries(
         refreshedTeam.members.map(member => [
           member.agentId,
-          {
-            name: member.name,
-            agentType: member.agentType,
-            color: member.color ?? assignTeammateColor(member.agentId),
-            tmuxSessionName: '',
-            tmuxPaneId: member.tmuxPaneId ?? '',
-            cwd: member.cwd || getCwd(),
-            worktreePath: member.worktreePath,
-            spawnedAt: member.joinedAt,
-          },
+          appStateTeammateFromExistingRoster(member),
         ]),
       ),
     },

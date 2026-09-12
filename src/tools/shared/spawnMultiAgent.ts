@@ -2909,6 +2909,7 @@ async function handleSpawnNativeProcess(
   }
 
   let reservationOwned = false
+  const reservationRosterJoinedAt = Date.now()
   const reservationResult = await updateTeamFileAsync(teamName, teamFile => {
     const concurrent = teamFile.members.find(member =>
       member.agentId === teammateId || sanitizeAgentName(member.name) === sanitizedName,
@@ -2953,7 +2954,7 @@ async function handleSpawnNativeProcess(
       prompt,
       color: teammateColor,
       planModeRequired: plan_mode_required,
-      joinedAt: Date.now(),
+      joinedAt: reservationRosterJoinedAt,
       bootstrapExpectedAfter: launchBoundaryIso,
       bootstrapProofToken,
       bootstrapRunId,
@@ -3011,6 +3012,7 @@ async function handleSpawnNativeProcess(
           cwd: workingDir,
           ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
           spawnedAt: Date.now(),
+          rosterJoinedAt: reservationRosterJoinedAt,
           processOwnerToken,
           processRunId,
           spawnClaimToken: input.spawnClaimToken,
@@ -3425,6 +3427,7 @@ async function handleSpawnNativeProcess(
     }
 
     let finalPublishOwned = false
+    const rosterJoinedAt = Date.now()
     const updateResult = await updateTeamFileAsync(teamName, teamFile => {
       const owned = teamFile.members.find(member => member.agentId === teammateId)
       if (owned?.processOwnerToken !== processOwnerToken || owned.processRunId !== processRunId) {
@@ -3441,7 +3444,7 @@ async function handleSpawnNativeProcess(
         prompt,
         color: teammateColor,
         planModeRequired: plan_mode_required,
-        joinedAt: Date.now(),
+        joinedAt: rosterJoinedAt,
         bootstrapExpectedAfter: launchBoundaryIso,
         bootstrapProofToken,
         bootstrapRunId,
@@ -3661,6 +3664,7 @@ async function handleSpawnNativeProcess(
             cwd: workingDir,
             ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
             spawnedAt: Date.now(),
+            rosterJoinedAt,
             processStartedAtMs,
             processOsIdentity,
             processOwnerToken,
