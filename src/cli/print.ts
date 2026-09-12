@@ -156,6 +156,12 @@ import { createCombinedAbortSignal } from 'src/utils/combinedAbortSignal.js'
 import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
 import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
+import {
+  createHostedNativeDispatchSettlementTracker,
+  dispatchAfterHostedNativeBarrier,
+  settleHostedNativeConsumerShutdown,
+  shouldContinueHostedNativeDrain,
+} from 'src/services/teamBootstrap/hostedNativeLaunch.js'
 import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
@@ -500,6 +506,8 @@ export async function runHeadless(
     workload: string | undefined
     teamBootstrapSpecPath?: string | undefined
     teamBootstrapUserPromptFile?: string | undefined
+    hostedNativeLaunchPath?: string | undefined
+    hostedNativeLaunchIdentity?: string | undefined
     bootstrapContext?: {
       commands: Command[]
       tools: Tools
@@ -821,6 +829,19 @@ export async function runHeadless(
     return
   }
 
+  if (
+    (options.hostedNativeLaunchPath || options.hostedNativeLaunchIdentity) &&
+    (!options.hostedNativeLaunchPath ||
+      !options.hostedNativeLaunchIdentity ||
+      !options.teamBootstrapSpecPath)
+  ) {
+    process.stderr.write(
+      'Error: hosted native launch requires envelope, identity, and team bootstrap spec\n',
+    )
+    gracefulShutdownSync(1)
+    return
+  }
+
   const bootstrapStartupValidationError = validateTeamBootstrapStartupOptions({
     options: {
       continue: options.continue,
@@ -845,6 +866,68 @@ export async function runHeadless(
     )
     gracefulShutdownSync(1)
     return
+  }
+
+  const hostedInput = options.hostedNativeLaunchPath
+    ? structuredIO.retainHostedInput()
+    : undefined
+  let hostedNativeTeardown: (() => Promise<void>) | undefined
+  let hostedNativeFatal = false
+  let hostedNativeStopping = false
+  let resolveHostedNativeStartupSettlement: (() => void) | undefined
+  const hostedNativeStartupSettlement = hostedInput
+    ? new Promise<void>(resolve => {
+        resolveHostedNativeStartupSettlement = resolve
+      })
+    : undefined
+  let hostedNativeConsumerStop: (() => Promise<void>) | undefined
+  let hostedNativeTeardownSettlement: Promise<void> | undefined
+  const teardownHostedNativeRuntime = (): Promise<void> => {
+    if (hostedNativeTeardownSettlement) return hostedNativeTeardownSettlement
+    // This predicate and lease close are synchronous. Every later startup,
+    // pump and consumer effect observes them before teardown begins awaiting.
+    hostedNativeStopping = true
+    hostedInput?.close()
+    let consumerStop = hostedNativeConsumerStop?.()
+    hostedNativeTeardownSettlement = (async () => {
+      await hostedNativeStartupSettlement
+      // Re-resolve an initially empty slot after startup settles so teardown
+      // cannot miss a production consumer installed across that boundary.
+      consumerStop ??= hostedNativeConsumerStop?.()
+      const stop = hostedNativeTeardown
+      hostedNativeTeardown = undefined
+      const settlements = await Promise.allSettled([
+        stop?.() ?? Promise.resolve(),
+        consumerStop ?? Promise.resolve(),
+      ])
+      const failures = settlements.flatMap(settlement =>
+        settlement.status === 'rejected' ? [settlement.reason] : [],
+      )
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) {
+        throw new AggregateError(
+          failures,
+          'Hosted native pump and print dispatch settlement both failed',
+        )
+      }
+    })()
+    return hostedNativeTeardownSettlement
+  }
+  const failHostedNativeRuntime = (error: Error): void => {
+    if (hostedNativeFatal) return
+    hostedNativeFatal = true
+    logError(error)
+    void teardownHostedNativeRuntime().catch(logError)
+    void gracefulShutdown(1, 'other', {
+      getAppState,
+      setAppState,
+      finalMessage: `Hosted native runtime failed: ${error.message}`,
+    })
+  }
+  if (hostedInput) {
+    registerCleanup(async () => {
+      await teardownHostedNativeRuntime()
+    })
   }
 
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
@@ -891,28 +974,47 @@ export async function runHeadless(
       bootstrapAppState.mcp.tools,
       bootstrapAppState.toolPermissionContext,
     )
-    await runStartupTeamBootstrap({
-      specPath: options.teamBootstrapSpecPath,
-      userPromptFilePath: options.teamBootstrapUserPromptFile,
-      structuredIO,
-      commands: options.bootstrapContext?.commands ?? [
-        ...commands,
-        ...bootstrapAppState.mcp.commands,
-      ],
-      tools:
-        options.bootstrapContext?.tools ?? [
-          ...tools,
-          ...bootstrapAllowedMcpTools,
-        ],
-      mcpClients:
-        options.bootstrapContext?.mcpClients ?? bootstrapAppState.mcp.clients,
-      agents,
-      getAppState,
-      setAppState,
-      customSystemPrompt: options.systemPrompt,
-      appendSystemPrompt: options.appendSystemPrompt,
-      thinkingConfig: options.thinkingConfig,
-    })
+    try {
+      try {
+        hostedNativeTeardown = await runStartupTeamBootstrap({
+          specPath: options.teamBootstrapSpecPath,
+          userPromptFilePath: options.teamBootstrapUserPromptFile,
+          hostedNativeLaunchPath: options.hostedNativeLaunchPath,
+          hostedNativeLaunchIdentity: options.hostedNativeLaunchIdentity,
+          hostedInput,
+          isHostedNativeStopping: () => hostedNativeStopping,
+          onHostedNativePumpFatal: failHostedNativeRuntime,
+          structuredIO,
+          commands: options.bootstrapContext?.commands ?? [
+            ...commands,
+            ...bootstrapAppState.mcp.commands,
+          ],
+          tools:
+            options.bootstrapContext?.tools ?? [
+              ...tools,
+              ...bootstrapAllowedMcpTools,
+            ],
+          mcpClients:
+            options.bootstrapContext?.mcpClients ?? bootstrapAppState.mcp.clients,
+          agents,
+          getAppState,
+          setAppState,
+          customSystemPrompt: options.systemPrompt,
+          appendSystemPrompt: options.appendSystemPrompt,
+          thinkingConfig: options.thinkingConfig,
+        })
+      } finally {
+        resolveHostedNativeStartupSettlement?.()
+        resolveHostedNativeStartupSettlement = undefined
+      }
+      if (hostedNativeStopping) {
+        await teardownHostedNativeRuntime()
+        throw new Error('Hosted native startup stopped before runtime continuation')
+      }
+    } catch (error) {
+      await teardownHostedNativeRuntime().catch(logError)
+      throw error
+    }
     headlessProfilerCheckpoint('after_teamBootstrap')
   }
 
@@ -921,6 +1023,10 @@ export async function runHeadless(
       '[team-bootstrap] runHeadless preparing conversation context after deterministic bootstrap',
     )
     await options.prepareConversationContext()
+    if (hostedNativeStopping) {
+      await teardownHostedNativeRuntime().catch(logError)
+      throw new Error('Hosted native runtime stopped during context preparation')
+    }
     headlessProfilerCheckpoint('after_prepareConversationContext')
   }
 
@@ -929,6 +1035,10 @@ export async function runHeadless(
       '[team-bootstrap] runHeadless initializing model strings after deterministic bootstrap',
     )
     await ensureModelStringsInitialized()
+    if (hostedNativeStopping) {
+      await teardownHostedNativeRuntime().catch(logError)
+      throw new Error('Hosted native runtime stopped during model initialization')
+    }
     logForDebugging(
       '[team-bootstrap] runHeadless after deferred ensureModelStringsInitialized',
     )
@@ -985,6 +1095,16 @@ export async function runHeadless(
     agents,
     options,
     turnInterruptionState,
+    hostedInput
+      ? {
+          isStopping: () => hostedNativeStopping,
+          fail: failHostedNativeRuntime,
+          installConsumerStop: stop => {
+            hostedNativeConsumerStop = stop
+            if (hostedNativeStopping) void stop().catch(logError)
+          },
+        }
+      : undefined,
   )) {
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
@@ -1118,6 +1238,11 @@ function runHeadlessStreaming(
     workload?: string | undefined
   },
   turnInterruptionState?: TurnInterruptionState,
+  hostedNativeLifecycle?: {
+    isStopping(): boolean
+    fail(error: Error): void
+    installConsumerStop(stop: () => Promise<void>): void
+  },
 ): AsyncIterable<StdoutMessage> {
   let running = false
   let runPhase:
@@ -1127,6 +1252,12 @@ function runHeadlessStreaming(
     | 'finally_post_flush'
     | undefined
   let inputClosed = false
+  const hostedDispatches = hostedNativeLifecycle
+    ? createHostedNativeDispatchSettlementTracker()
+    : undefined
+  hostedDispatches?.onFailure(error => {
+    hostedNativeLifecycle?.fail(toError(error))
+  })
   let shutdownPromptInjected = false
   let heldBackResult: StdoutMessage | null = null
   let abortController: AbortController | undefined
@@ -1963,7 +2094,7 @@ function runHeadlessStreaming(
               priority: 'later',
               isMeta: true,
             })
-            void run()
+            dispatchRun()
           }, 0)
         }
       : undefined
@@ -1976,7 +2107,7 @@ function runHeadlessStreaming(
   })
 
   const run = async () => {
-    if (running) {
+    if (running || hostedNativeLifecycle?.isStopping()) {
       return
     }
 
@@ -1988,8 +2119,13 @@ function runHeadlessStreaming(
     headlessProfilerCheckpoint('run_entry')
     // TODO(custom-tool-refactor): Should move to the init message, like browser
 
-    await updateSdkMcp()
-    headlessProfilerCheckpoint('after_updateSdkMcp')
+    // Initialization is part of the owned run lifetime. MCP/plugin failures
+    // must take the same catch/finally path that resets the running mutex.
+    const isMainThread = (cmd: QueuedCommand) => cmd.agentId === undefined
+
+    try {
+      await updateSdkMcp()
+      headlessProfilerCheckpoint('after_updateSdkMcp')
 
     // Resolve deferred plugin installation (CLAUDE_CODE_SYNC_PLUGIN_INSTALL).
     // The promise was started eagerly so installation overlaps with other init.
@@ -2030,13 +2166,8 @@ function runHeadlessStreaming(
       setupPluginHookHotReload()
     }
 
-    // Only main-thread commands (agentId===undefined) — subagent
-    // notifications are drained by the subagent's mid-turn gate in query.ts.
-    // Defined outside the try block so it's accessible in the post-finally
-    // queue re-checks at the bottom of run().
-    const isMainThread = (cmd: QueuedCommand) => cmd.agentId === undefined
-
-    try {
+      // Only main-thread commands (agentId===undefined) — subagent
+      // notifications are drained by the subagent's mid-turn gate in query.ts.
       let command: QueuedCommand | undefined
       let waitingForAgents = false
 
@@ -2045,7 +2176,9 @@ function runHeadlessStreaming(
       // ask() call so messages that queued up during a long turn coalesce
       // into a single follow-up turn instead of N separate turns.
       const drainCommandQueue = async () => {
+        if (hostedNativeLifecycle?.isStopping()) return
         while ((command = dequeue(isMainThread))) {
+          if (hostedNativeLifecycle?.isStopping()) return
           if (
             command.mode !== 'prompt' &&
             command.mode !== 'orphaned-permission' &&
@@ -2501,6 +2634,7 @@ function runHeadlessStreaming(
       // background agents that are still running. When agents complete,
       // their notifications are enqueued and the loop re-drains.
       do {
+        if (hostedNativeLifecycle?.isStopping()) break
         // Drain SDK events (task_started, task_progress) before command queue
         // so progress events precede task_notification on the stream.
         for (const event of drainSdkEvents()) {
@@ -2509,6 +2643,7 @@ function runHeadlessStreaming(
 
         runPhase = 'draining_commands'
         await drainCommandQueue()
+        if (hostedNativeLifecycle?.isStopping()) break
 
         // Check for running background tasks before exiting.
         // Exclude in_process_teammate — teammates are long-lived by design
@@ -2525,8 +2660,14 @@ function runHeadlessStreaming(
             t => isBackgroundTask(t) && t.type !== 'in_process_teammate',
           )
           const hasMainThreadQueued = peek(isMainThread) !== undefined
-          if (hasRunningBg || hasMainThreadQueued) {
-            waitingForAgents = true
+          waitingForAgents = hostedNativeLifecycle
+            ? shouldContinueHostedNativeDrain({
+                isStopping: hostedNativeLifecycle.isStopping(),
+                hasRunningBackground: hasRunningBg,
+                hasQueuedCommand: hasMainThreadQueued,
+              })
+            : hasRunningBg || hasMainThreadQueued
+          if (waitingForAgents) {
             if (!hasMainThreadQueued) {
               runPhase = 'waiting_for_agents'
               // No commands ready yet, wait for tasks to complete
@@ -2604,6 +2745,10 @@ function runHeadlessStreaming(
       idleTimeout.start()
     }
 
+    // Teardown owns queued commands by suppression. Do not enter proactive,
+    // SDK-event, mailbox, or background-task rechecks after stop is visible.
+    if (hostedNativeLifecycle?.isStopping()) return
+
     // Proactive tick: if proactive is active and queue is empty, inject a tick
     if (
       (feature('PROACTIVE') || feature('KAIROS')) &&
@@ -2622,14 +2767,14 @@ function runHeadlessStreaming(
     // saw `running === true` and returned immediately, leaving the
     // message stranded in the queue with no one to process it.
     if (peek(isMainThread) !== undefined) {
-      void run()
+      dispatchRun()
       return
     }
 
     // Check for unread teammate messages and process them
     // This mirrors what useInboxPoller does in interactive REPL mode
     // Poll until no more messages (teammates may still be working)
-    {
+    if (!hostedNativeLifecycle) {
       const currentAppState = getAppState()
       const teamContext = currentAppState.teamContext
 
@@ -2859,7 +3004,7 @@ function runHeadlessStreaming(
               isMeta: true,
               protocolKind: TEAMMATE_MESSAGE_TAG,
             })
-            void run()
+            dispatchRun()
             return // run() will come back here after processing
           }
 
@@ -2875,7 +3020,7 @@ function runHeadlessStreaming(
               value: SHUTDOWN_TEAM_PROMPT,
               uuid: randomUUID(),
             })
-            void run()
+            dispatchRun()
             return // run() will come back here after processing
           }
 
@@ -2885,6 +3030,8 @@ function runHeadlessStreaming(
       }
     }
 
+    if (hostedNativeLifecycle?.isStopping()) return
+
     if (inputClosed) {
       // Check for active swarm that needs shutdown
       const hasActiveSwarm = await (async () => {
@@ -2892,6 +3039,7 @@ function runHeadlessStreaming(
         const currentAppState = getAppState()
         if (hasWorkingInProcessTeammates(currentAppState)) {
           await waitForTeammatesToBecomeIdle(setAppState, currentAppState)
+          if (hostedNativeLifecycle?.isStopping()) return false
         }
 
         // Re-fetch state after potential wait
@@ -2907,6 +3055,8 @@ function runHeadlessStreaming(
         )
       })()
 
+      if (hostedNativeLifecycle?.isStopping()) return
+
       if (hasActiveSwarm) {
         // Team members are idle or pane-based - inject prompt to shut down team
         enqueue({
@@ -2914,7 +3064,7 @@ function runHeadlessStreaming(
           value: SHUTDOWN_TEAM_PROMPT,
           uuid: randomUUID(),
         })
-        void run()
+        dispatchRun()
       } else {
         // Wait for any in-flight push suggestion before closing the output stream.
         if (suggestionState.inflightPromise) {
@@ -2931,6 +3081,11 @@ function runHeadlessStreaming(
     }
   }
 
+  const dispatchRun = () => {
+    if (hostedDispatches) hostedDispatches.dispatch(run)
+    else void run()
+  }
+
   // Set up UDS inbox callback so the query loop is kicked off
   // when a message arrives via the UDS socket in headless mode.
   if (feature('UDS_INBOX')) {
@@ -2939,7 +3094,7 @@ function runHeadlessStreaming(
     /* eslint-enable @typescript-eslint/no-require-imports */
     setOnEnqueue(() => {
       if (!inputClosed) {
-        void run()
+        dispatchRun()
       }
     })
   }
@@ -2975,7 +3130,7 @@ function runHeadlessStreaming(
           // the ask() call.
           workload: WORKLOAD_CRON,
         })
-        void run()
+        dispatchRun()
       },
       isLoading: () => running || inputClosed,
       getJitterConfig: cronJitterConfigModule?.getCronJitterConfig,
@@ -3023,7 +3178,7 @@ function runHeadlessStreaming(
       onEnqueued: () => {
         // The first message of a session might be the orphaned permission
         // check rather than a user prompt, so kick off the loop.
-        void run()
+        dispatchRun()
       },
     })
   })
@@ -3061,10 +3216,11 @@ function runHeadlessStreaming(
   // processing and returning the result of the generation.
   // The process is complete when the input stream completes and
   // the last generation of the queue has complete.
-  void (async () => {
+  const inputConsumer = (async () => {
     let initialized = false
     logForDiagnosticsNoPII('info', 'cli_message_loop_started')
     for await (const message of structuredIO.structuredInput) {
+      if (hostedNativeLifecycle?.isStopping()) break
       // Non-user events are handled inline (no queue). started→completed in
       // the same tick carries no information, so only fire completed.
       // control_response is reported by StructuredIO.processLine (which also
@@ -3164,7 +3320,7 @@ function runHeadlessStreaming(
           // If the auto-resume logic pre-enqueued a command, drain it now
           // that initialize has set up systemPrompt, agents, hooks, etc.
           if (hasCommandsInQueue()) {
-            void run()
+            dispatchRun()
           }
         } else if (message.request.subtype === 'set_permission_mode') {
           const m = message.request // for typescript (TODO: use readonly types to avoid this)
@@ -4177,7 +4333,7 @@ function runHeadlessStreaming(
                       uuid,
                       skipSlashCommands: true,
                     })
-                    void run()
+                    dispatchRun()
                   },
                   onPermissionResponse(response) {
                     // Forward bridge permission responses into the
@@ -4317,6 +4473,7 @@ function runHeadlessStreaming(
           sessionId,
           message.uuid,
         )
+        if (hostedNativeLifecycle?.isStopping()) break
 
         // Check both historical duplicates (from file) and runtime duplicates (this session)
         if (existsInSession || receivedMessageUuids.has(message.uuid)) {
@@ -4355,14 +4512,21 @@ function runHeadlessStreaming(
         trackReceivedMessageUuid(message.uuid)
       }
 
-      enqueue({
-        mode: 'prompt' as const,
-        // file_attachments rides the protobuf catchall from the web composer.
-        // Same-ref no-op when absent (no 'file_attachments' key).
-        value: await resolveAndPrepend(message, message.message.content),
-        uuid: message.uuid,
-        priority: message.priority,
+      const dispatched = await dispatchAfterHostedNativeBarrier({
+        isStopping: () => hostedNativeLifecycle?.isStopping() ?? false,
+        prepare: () => resolveAndPrepend(message, message.message.content),
+        dispatch: resolvedMessage => {
+          enqueue({
+            mode: 'prompt' as const,
+            // file_attachments rides the protobuf catchall from the web composer.
+            // Same-ref no-op when absent (no 'file_attachments' key).
+            value: resolvedMessage,
+            uuid: message.uuid,
+            priority: message.priority,
+          })
+        },
       })
+      if (!dispatched) break
       // Increment prompt count for attribution tracking and save snapshot
       // The snapshot persists promptCount so it survives compaction
       if (feature('COMMIT_ATTRIBUTION')) {
@@ -4375,7 +4539,7 @@ function runHeadlessStreaming(
           }),
         }))
       }
-      void run()
+      dispatchRun()
     }
     inputClosed = true
     cronScheduler?.stop()
@@ -4394,6 +4558,34 @@ function runHeadlessStreaming(
       output.done()
     }
   })()
+  if (hostedNativeLifecycle) {
+    // Attach rejection custody at creation rather than waiting until teardown
+    // eventually joins this consumer.
+    void inputConsumer.catch(error => {
+      hostedNativeLifecycle.fail(toError(error))
+    })
+  }
+  hostedNativeLifecycle?.installConsumerStop(async () => {
+    // Closing admission and requesting abort are synchronous. The external
+    // cleanup task then joins both the reader and every real run invocation;
+    // run itself never awaits this callback, avoiding a self-await cycle.
+    if (abortController && !abortController.signal.aborted) {
+      abortController.abort('hosted-native-teardown')
+    }
+    let disposal: Promise<unknown>
+    try {
+      disposal = Promise.resolve(
+        structuredIO.structuredInput.return(undefined),
+      )
+    } catch (error) {
+      disposal = Promise.reject(error)
+    }
+    await settleHostedNativeConsumerShutdown({
+      disposal,
+      consumer: inputConsumer,
+      settleDispatches: () => hostedDispatches?.settle() ?? Promise.resolve(),
+    })
+  })
 
   return output
 }

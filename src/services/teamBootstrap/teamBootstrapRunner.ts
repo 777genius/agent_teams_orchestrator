@@ -41,6 +41,10 @@ import type {
   TeamBootstrapResult,
   TeamBootstrapSummary,
 } from './teamBootstrapTypes.js'
+import {
+  attachExactHostedNativeLead,
+  type HostedNativeLaunchEnvelope,
+} from './hostedNativeLaunch.js'
 
 type TeamCreateCall = (
   input: {
@@ -911,6 +915,7 @@ export async function runTeamBootstrap(params: {
   onInitialized?: () => Promise<void> | void
   now?: () => number
   monotonicNow?: () => number
+  hostedNativeLaunch?: HostedNativeLaunchEnvelope
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())
   const monotonicNow = params.monotonicNow ?? (() => performance.now())
@@ -972,17 +977,41 @@ export async function runTeamBootstrap(params: {
           teamName: params.request.teamName,
           permissionSeedTools: params.request.permissionSeedTools,
         })
-        const attachState = await ensureLeaderAttachedToTeam(
-          params.request,
-          params.context,
-          deps,
-        )
-        const shouldCreateTeam = shouldCreateTeamForBootstrap({
-          mode: params.request.mode,
-          attachState,
-          teamName: params.request.teamName,
-        })
-        const reusedExistingTeam = !shouldCreateTeam
+        if (params.hostedNativeLaunch) {
+          const envelope = params.hostedNativeLaunch
+          if (
+            params.request.teamName !== envelope.legacyKey ||
+            params.request.runId !== envelope.runId ||
+            params.request.cwd !== envelope.canonicalCwd ||
+            params.request.members.length !== 0
+          ) {
+            throw new Error(
+              'Hosted native bootstrap spec does not match its bound launch envelope',
+            )
+          }
+        }
+        const hostedAttachment = params.hostedNativeLaunch
+          ? await attachExactHostedNativeLead({
+              envelope: params.hostedNativeLaunch,
+              context: params.context,
+              description: params.request.description,
+            })
+          : null
+        const attachState = hostedAttachment
+          ? 'attached_existing' as const
+          : await ensureLeaderAttachedToTeam(
+              params.request,
+              params.context,
+              deps,
+            )
+        const shouldCreateTeam = hostedAttachment
+          ? false
+          : shouldCreateTeamForBootstrap({
+              mode: params.request.mode,
+              attachState,
+              teamName: params.request.teamName,
+            })
+        const reusedExistingTeam = hostedAttachment?.reused ?? !shouldCreateTeam
         if (shouldCreateTeam) {
           assertTimeoutBudget('before creating team config')
           await validateWorkspace('before creating team config')
@@ -1001,6 +1030,9 @@ export async function runTeamBootstrap(params: {
           )
         }
         deps.unregisterTeamForSessionCleanup(params.request.teamName)
+        if (params.hostedNativeLaunch) {
+          setLeaderTeamName(params.hostedNativeLaunch.legacyKey)
+        }
         await emitBootstrapProgressSafely('team_created', () =>
           params.emit.teamCreated(reusedExistingTeam),
         )
