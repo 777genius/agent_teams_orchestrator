@@ -1,7 +1,7 @@
-import { constants, readFileSync } from 'fs'
+import { closeSync, constants, readFileSync } from 'fs'
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm, stat } from 'fs/promises'
-import { join } from 'path'
+import { isAbsolute, join } from 'path'
 import { z } from 'zod/v4'
 import { getSessionCreatedTeams } from '../../bootstrap/state.js'
 import { writeFileAtomicSync, writeJsonFileAtomic } from '../atomicWrite.js'
@@ -22,6 +22,14 @@ import {
   killProcessBackendRuntime,
 } from './processBackend.js'
 import { safeWindowsPathSegment } from '../windowsReservedNames.js'
+import { CanonicalTeamDirectory } from './canonicalTeamDirectory.js'
+import {
+  activeCanonicalTeamRootFd,
+  resolveCanonicalTeamLockAuthority,
+  withCanonicalTeamLock,
+  withValidatedCanonicalTeamRoot,
+  type CanonicalTeamLockAuthority,
+} from './canonicalTeamLockAuthority.js'
 
 export const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -134,6 +142,27 @@ export type TeamFile = {
     isActive?: boolean // false when idle, undefined/true when active
     mode?: PermissionMode // Current permission mode for this teammate
   }>
+  /** Private hosted-runtime binding. Never exposed through the public launch plan. */
+  hostedNative?: {
+    version: 1
+    publicTeamId: string
+    legacyKey: string
+    primaryDisplayName: string
+    primaryAgentId: string
+    primaryAlias: typeof TEAM_LEAD_NAME
+    launchIdentityToken: string
+    envelopeDigest: string
+    materialDigest: string
+    profileDigest: string
+    permissionMode: 'bypassPermissions'
+    canonicalDataRoot: string
+    canonicalTeamRoot: string
+    canonicalTasksRoot: string
+    runId: string
+    role: 'native-lead' | 'external-lead'
+    readyAckPath?: string
+    mailboxCustody?: 'hosted-lead-pump' | 'external-session'
+  }
 }
 
 export type TeamMember = TeamFile['members'][number]
@@ -156,6 +185,18 @@ export type TeamMemberIdentity = Pick<
 type TeamFileMutationResult = {
   teamFile: TeamFile
   changed: boolean
+}
+
+type CanonicalTeamFileMutationResult =
+  | TeamFileMutationResult
+  | { changed: true; teamFile: TeamFileMutationResult }
+
+function isWrappedCanonicalTeamMutation(
+  result: CanonicalTeamFileMutationResult,
+): result is { changed: true; teamFile: TeamFileMutationResult } {
+  return result.changed &&
+    'changed' in result.teamFile &&
+    'teamFile' in result.teamFile
 }
 
 export type TeamFileUpdateResult =
@@ -204,8 +245,156 @@ export function getTeamFilePath(teamName: string): string {
   return join(getTeamDir(teamName), 'config.json')
 }
 
-function getTeamFileLockDir(teamName: string): string {
-  return join(getTeamDir(teamName), '.config.lock')
+/**
+ * Explicit-root variants for hosted supervisors. These deliberately never
+ * consult CLAUDE_CONFIG_DIR, so two admitted roots can safely use the same
+ * legacy team key in one supervisor process.
+ */
+export function getTeamFilePathAtCanonicalRoot(canonicalTeamRoot: string): string {
+  if (!isAbsolute(canonicalTeamRoot)) {
+    throw new Error('Canonical team root must be absolute')
+  }
+  return join(canonicalTeamRoot, 'config.json')
+}
+
+async function readTeamFileAtBoundCanonicalRoot(
+  canonicalTeamRoot: string,
+  rootFd: number,
+  legacyKey: string,
+): Promise<TeamFile | null> {
+  const directory = await CanonicalTeamDirectory.fromRootFd(rootFd)
+  const file = directory.readFile('config.json')
+  await teamFileLockExchangeTestHook?.({
+    phase: 'after-config-read',
+    lockPath: join(canonicalTeamRoot, '.config.lock'),
+    stagingPath: getTeamFilePathAtCanonicalRoot(canonicalTeamRoot),
+  })
+  if (!file) return null
+  const parsed = jsonParse(file.text) as TeamFile
+  if (parsed.name !== legacyKey) {
+    throw new Error(
+      `Team directory collision: "${legacyKey}" resolves to storage owned by "${String(parsed.name)}"`,
+    )
+  }
+  return parsed
+}
+
+function canonicalAuthority(canonicalTeamRoot: string, legacyKey: string): CanonicalTeamLockAuthority {
+  if (!isAbsolute(canonicalTeamRoot)) throw new Error('Canonical team root must be absolute')
+  return resolveCanonicalTeamLockAuthority(canonicalTeamRoot, legacyKey)
+}
+
+export async function readTeamFileAtCanonicalRoot(
+  canonicalTeamRoot: string,
+  legacyKey: string,
+): Promise<TeamFile | null> {
+  const authority = canonicalAuthority(canonicalTeamRoot, legacyKey)
+  const borrowed = activeCanonicalTeamRootFd(authority)
+  if (borrowed !== null) return readTeamFileAtBoundCanonicalRoot(canonicalTeamRoot, borrowed, legacyKey)
+  return withValidatedCanonicalTeamRoot(authority, rootFd =>
+    readTeamFileAtBoundCanonicalRoot(canonicalTeamRoot, rootFd, legacyKey))
+}
+
+export async function withTeamFileLockAtCanonicalRoot<T>(
+  canonicalTeamRoot: string,
+  legacyKey: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const authority = canonicalAuthority(canonicalTeamRoot, legacyKey)
+  return withCanonicalTeamLock(
+    authority,
+    { deadlineMs: Date.now() + TEAM_FILE_LOCK_MIGRATION_WAIT_MS },
+    async () => fn(),
+  )
+}
+
+async function writeTeamFileAtAdmittedCanonicalRoot(
+  authority: CanonicalTeamLockAuthority,
+  canonicalTeamRoot: string,
+  legacyKey: string,
+  teamFile: TeamFile,
+): Promise<void> {
+  const rootFd = activeCanonicalTeamRootFd(authority)
+  if (rootFd === null) throw new Error('Canonical team write requires the active host-issued lock authority')
+  await readTeamFileAtBoundCanonicalRoot(canonicalTeamRoot, rootFd, legacyKey)
+  const directory = await CanonicalTeamDirectory.fromRootFd(rootFd)
+  const temporaryName = `config.json.tmp.${process.pid}.${randomUUID()}`
+  await teamFileLockExchangeTestHook?.({
+    phase: 'before-config-create',
+    lockPath: join(canonicalTeamRoot, '.config.lock'),
+    stagingPath: join(canonicalTeamRoot, temporaryName),
+  })
+  // The borrowed ALS store can outlive its callback when a caller detaches
+  // this promise. Recheck the live acquisition after the last await and
+  // immediately before the synchronous create syscall.
+  if (activeCanonicalTeamRootFd(authority) !== rootFd) {
+    throw new Error('Canonical team write authority ended before staging create')
+  }
+  const owned = directory.createFile(temporaryName, jsonStringify(teamFile, null, 2))
+  try {
+    await teamFileLockExchangeTestHook?.({
+      phase: 'before-config-publish',
+      lockPath: join(canonicalTeamRoot, '.config.lock'),
+      stagingPath: join(canonicalTeamRoot, temporaryName),
+    })
+    if (!directory.namedFileIs(temporaryName, owned)) {
+      throw new Error('Canonical team config staging file was replaced')
+    }
+    // namedFileIs is synchronous. This final live-fence check is adjacent to
+    // renameat, so revocation or callback completion cannot publish a cached
+    // borrowed write after an earlier await.
+    if (activeCanonicalTeamRootFd(authority) !== rootFd) {
+      throw new Error('Canonical team write authority ended before config publish')
+    }
+    directory.rename(temporaryName, 'config.json')
+  } finally {
+    if (owned.fd !== undefined) closeSync(owned.fd)
+    // An uncertain temporary entry is deliberately retained. Its name is not
+    // an ownership proof, and canonical lock release never unlinks paths.
+  }
+}
+
+export async function writeTeamFileAtCanonicalRoot(
+  canonicalTeamRoot: string,
+  legacyKey: string,
+  teamFile: TeamFile,
+): Promise<void> {
+  if (teamFile.name !== legacyKey) {
+    throw new Error(`Team file name mismatch: expected "${legacyKey}", got "${teamFile.name}"`)
+  }
+  const authority = canonicalAuthority(canonicalTeamRoot, legacyKey)
+  if (activeCanonicalTeamRootFd(authority) !== null) {
+    return writeTeamFileAtAdmittedCanonicalRoot(authority, canonicalTeamRoot, legacyKey, teamFile)
+  }
+  return withCanonicalTeamLock(
+    authority,
+    { deadlineMs: Date.now() + TEAM_FILE_LOCK_MIGRATION_WAIT_MS },
+    () => writeTeamFileAtAdmittedCanonicalRoot(authority, canonicalTeamRoot, legacyKey, teamFile),
+  )
+}
+
+export async function updateTeamFileAtCanonicalRoot(
+  canonicalTeamRoot: string,
+  legacyKey: string,
+  mutator: (
+    teamFile: Readonly<TeamFile>,
+  ) => CanonicalTeamFileMutationResult | Promise<CanonicalTeamFileMutationResult>,
+): Promise<TeamFileUpdateResult> {
+  return withTeamFileLockAtCanonicalRoot(canonicalTeamRoot, legacyKey, async () => {
+    const current = await readTeamFileAtCanonicalRoot(canonicalTeamRoot, legacyKey)
+    if (!current) return { status: 'missing', teamFile: null }
+    const callbackResult = await mutator(current)
+    // Canonical-root acquisition callbacks wrap shared mutation helpers so
+    // they can attach their own reservation decision. Preserve the shared
+    // helper's actual callback contract instead of treating that result
+    // object itself as a TeamFile.
+    const next = isWrappedCanonicalTeamMutation(callbackResult)
+      ? callbackResult.teamFile
+      : callbackResult
+    if (!next.changed) return { status: 'unchanged', teamFile: current }
+    await writeTeamFileAtCanonicalRoot(canonicalTeamRoot, legacyKey, next.teamFile)
+    return { status: 'updated', teamFile: next.teamFile }
+  })
 }
 
 const TEAM_FILE_LOCK_STALE_MS = 30_000
@@ -314,7 +503,8 @@ function releaseWindowsTeamLockGuard(lockPath: string): void {
 }
 
 type TeamFileLockExchangeTestEvent = {
-  phase: 'before-acquire-publish' | 'before-reclaim-exchange' | 'after-reclaim-restore' | 'before-release-exchange' | 'after-release-restore'
+  phase: 'before-acquire-publish' | 'before-reclaim-exchange' | 'after-reclaim-exchange' | 'after-reclaim-restore' | 'before-release-exchange' | 'after-release-exchange' | 'after-release-restore' |
+    'before-config-create' | 'before-config-publish' | 'after-config-read'
   lockPath: string
   stagingPath: string
 }
@@ -513,15 +703,40 @@ async function writeTeamFileAtomicAsync(
   await writeJsonFileAtomic(teamFilePath, teamFile, { indent: 2 })
 }
 
+async function writeUnpublishedTeamLockMetadata(
+  directoryPath: string,
+  metadata: { pid: number; generation: string; acquiredAt: string },
+  assertRootCustody?: () => Promise<void>,
+): Promise<void> {
+  if (!assertRootCustody) {
+    await writeJsonFileAtomic(join(directoryPath, 'metadata.json'), metadata)
+    return
+  }
+  const handle = await open(join(directoryPath, 'metadata.json'), 'wx', 0o600)
+  try {
+    await handle.writeFile(jsonStringify(metadata))
+    await handle.sync()
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
 export async function withTeamFileLock<T>(
   teamName: string,
   fn: () => Promise<T>,
 ): Promise<T> {
   const teamDir = getTeamDir(teamName)
-  const lockPath = getTeamFileLockDir(teamName)
-  const start = Date.now()
   await mkdir(teamDir, { recursive: true })
+  return withTeamFileLockInRoot(teamName, teamDir, fn)
+}
 
+async function withTeamFileLockInRoot<T>(
+  teamName: string,
+  teamDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = join(teamDir, '.config.lock')
+  const start = Date.now()
   const generation = randomUUID()
   const metadataPath = join(lockPath, 'metadata.json')
   const platform = teamFileLockPlatformForTests ?? process.platform
@@ -538,7 +753,7 @@ export async function withTeamFileLock<T>(
     const candidatePath = `${lockPath}.acquire-${process.pid}-${randomUUID()}`
     try {
       await mkdir(candidatePath)
-      await writeJsonFileAtomic(join(candidatePath, 'metadata.json'), {
+      await writeUnpublishedTeamLockMetadata(candidatePath, {
         pid: process.pid,
         generation,
         acquiredAt: new Date().toISOString(),
@@ -588,7 +803,7 @@ export async function withTeamFileLock<T>(
       const replacementPath = `${lockPath}.replacement-${process.pid}-${randomUUID()}`
       try {
         await mkdir(replacementPath)
-        await writeJsonFileAtomic(join(replacementPath, 'metadata.json'), {
+        await writeUnpublishedTeamLockMetadata(replacementPath, {
           pid: process.pid,
           generation,
           acquiredAt: new Date().toISOString(),
@@ -664,7 +879,8 @@ export async function withTeamFileLock<T>(
   }
 
   try {
-    return await fn()
+    const result = await fn()
+    return result
   } finally {
     await (async () => {
       const observedStat = await stat(lockPath).catch(() => null)
@@ -676,7 +892,7 @@ export async function withTeamFileLock<T>(
       // Keep a non-empty, immediately reclaimable tombstone at the public
       // path. Removing an empty public directory here would race a successor
       // rename and could delete the successor after it acquired the lock.
-      await writeJsonFileAtomic(join(releasePath, 'metadata.json'), {
+      await writeUnpublishedTeamLockMetadata(releasePath, {
         pid: 0,
         generation: `released:${generation}`,
         acquiredAt: new Date().toISOString(),
