@@ -44,8 +44,10 @@ export function buildCursorAgentResourceExhaustedPreloadScript(): string {
   const patternSource = JSON.stringify(
     CURSOR_RESOURCE_EXHAUSTED_ACTION_REQUIRED_SET_PATTERN.source,
   )
+  // No 'use strict' here: this block is appended to the attribution block in one
+  // generated file, and only the first statement of that file is a directive.
+  // The generated file emits the directive once, at its head.
   return [
-    "'use strict'",
     "const fs = require('node:fs')",
     "const Module = require('node:module')",
     "const originalJsLoader = Module._extensions['.js']",
@@ -59,7 +61,7 @@ export function buildCursorAgentResourceExhaustedPreloadScript(): string {
     'delete process.env.AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS',
     'if (originalNodeOptions) process.env.NODE_OPTIONS = originalNodeOptions',
     'else delete process.env.NODE_OPTIONS',
-    "Module._extensions['.js'] = function agentTeamsCursorLoader(module, filename) {",
+    'const agentTeamsCursorLoader = function (module, filename) {',
     '  if (normalizeModulePath(filename) !== entryFilename) {',
     '    return originalJsLoader(module, filename)',
     '  }',
@@ -80,6 +82,12 @@ export function buildCursorAgentResourceExhaustedPreloadScript(): string {
     '    source = `${source.slice(0, match.index)}${replacement}${source.slice(match.index + match[0].length)}`',
     '  }',
     '  return module._compile(source, filename)',
+    '}',
+    // The generated shim injects this preload unconditionally because the same
+    // file also records process attribution, so the classification kill switch
+    // is enforced here instead of at injection time.
+    `if (process.env.${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV} !== '1') {`,
+    "  Module._extensions['.js'] = agentTeamsCursorLoader",
     '}',
     '',
   ].join('\n')

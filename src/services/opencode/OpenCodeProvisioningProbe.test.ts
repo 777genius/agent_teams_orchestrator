@@ -457,6 +457,56 @@ describe('OpenCodeProvisioningProbe', () => {
     ])
   })
 
+  test.each([false, true])('releases acquired references when durable lease admission fails existing=%s', async existing => {
+    const released: string[] = []
+    const acquired = { hostKey: 'fixture-host', pid: 123, projectPath: '/tmp/project', profile } as OpenCodeHostHandle
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: { probe: async () => inventory },
+      hostManager: {
+        ensureHost: async () => acquired,
+        retainHostLease: async () => { throw new Error('fixture lease write rejected') },
+        releaseHost: async key => { released.push(key) },
+      },
+    })
+    const run = existing
+      ? probe.probeRetainingHost('/tmp/project', { existingHostKey: 'fixture-host' })
+      : probe.probe('/tmp/project')
+    if (existing) await expect(run).rejects.toThrow('fixture lease write rejected')
+    else expect((await run).host).toBeNull()
+    expect(released).toEqual(['fixture-host'])
+  })
+
+  test.each(['operation-admission', 'configuration-abort'])('releases retained host and lease after %s rejects', async failure => {
+    const controller = new AbortController()
+    const releases: string[] = []
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: { probe: async () => inventory },
+      hostManager: {
+        ensureHost: async () => host,
+        retainHostLease: async () => {},
+        releaseHostLease: async () => { releases.push('lease') },
+        releaseHost: async () => { releases.push('host') },
+        withHostOperation: async (_host, _owner, operation) => {
+          if (failure === 'operation-admission') throw new Error('fixture operation rejected')
+          return operation()
+        },
+      },
+      clientFactory: { create: () => ({
+        getConfig: async () => {
+          controller.abort(new Error('fixture configuration cancelled'))
+          throw controller.signal.reason
+        },
+        getConfigProviders: async () => ({}), getProviders: async () => ({}),
+        getProviderAuth: async () => ({}), listAgents: async () => [],
+      }) as never },
+    })
+    await expect(probe.probeRetainingHost('/tmp/project', {
+      phaseContext: { phase: 'host_start', signal: controller.signal,
+        remainingMs: () => 1000, throwIfExpired: () => {} },
+    })).rejects.toThrow(failure === 'operation-admission' ? 'fixture operation rejected' : 'fixture configuration cancelled')
+    expect(releases).toEqual(['lease', 'host'])
+  })
+
   test('collects live host verification details', async () => {
     let releaseCalls = 0
     const retainedLeaseTeamIds: string[] = []

@@ -678,7 +678,12 @@ describe('pending native OAuth session authority', () => {
       baseUrl: owner.baseUrl, port: 43210, pid: owner.pid, processStartedAtMs: owner.processStartedAtMs,
       version: '1.18.4-fixture', state: 'healthy', profile,
       resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [] }
-    const probe = new OpenCodeExecutionProbe({ clientFactory, pollIntervalMs: 1, probeTimeoutMs: 1000 })
+    const probe = new OpenCodeExecutionProbe({ hostManager: {
+      // These OAuth tests supply synthetic hosts; registry concurrency has its own fixtures.
+      ensureHost: async () => { throw new Error('Synthetic OAuth fixture cannot spawn a host') },
+      releaseHost: async () => {},
+      withHostOperation: async (_host, _owner, operation) => operation(),
+    },  clientFactory, pollIntervalMs: 1, probeTimeoutMs: 1000 })
     const run = () => probe.probeModelOnHost({ host, projectPath: project, selectedModel: 'xai/grok-4.3' })
     if (outcome === 'uncertain-submit') {
       await expect(run()).rejects.toThrow('settlement is unconfirmed')

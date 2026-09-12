@@ -364,7 +364,12 @@ describe('selected readiness owned OAuth rotation', () => {
     nativeError = undefined
     observedModel = 'grok-4.3'
     diagnostics = []
-    probe = new OpenCodeExecutionProbe({ clientFactory: { create: () => ({
+    probe = new OpenCodeExecutionProbe({ hostManager: {
+      // These OAuth tests supply synthetic hosts; registry concurrency has its own fixtures.
+      ensureHost: async () => { throw new Error('Synthetic OAuth fixture cannot spawn a host') },
+      releaseHost: async () => {},
+      withHostOperation: async (_host, _owner, operation) => operation(),
+    },  clientFactory: { create: () => ({
       createSession: async () => ({ id: 'TEST-probe' }), getSession: async () => ({ id: 'TEST-probe' }),
       getSessionStatus: async () => ({ 'TEST-probe': 'idle' }), getPermissions: async () => [],
       getSessionMessages: async () => submitted ? [

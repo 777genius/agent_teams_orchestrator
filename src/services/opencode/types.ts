@@ -79,6 +79,8 @@ export type OpenCodeHostHandle = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  /** Joins this host to the attribution records its process tree writes. */
+  attributionId?: string | null
   version: string | null
   state: OpenCodeHostState
   profile: OpenCodePreparedProfile

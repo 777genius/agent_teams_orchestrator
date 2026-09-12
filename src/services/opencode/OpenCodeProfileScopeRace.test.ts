@@ -92,7 +92,12 @@ describe('profile scope preparation and execution ownership', () => {
   }
   function probe(profile: OpenCodePreparedProfile, entered = barrier(), proceed = barrier()) {
     let submittedMessageId: string | undefined
-    const engine = new OpenCodeExecutionProbe({
+    const engine = new OpenCodeExecutionProbe({ hostManager: {
+      // These OAuth tests supply synthetic hosts; registry concurrency has its own fixtures.
+      ensureHost: async () => { throw new Error('Synthetic OAuth fixture cannot spawn a host') },
+      releaseHost: async () => {},
+      withHostOperation: async (_host, _owner, operation) => operation(),
+    },
       clientFactory: { create: () => ({
         createSession: async () => ({ id: 'probe' }), getSession: async () => ({ id: 'probe' }),
         getSessionStatus: async () => ({ probe: 'idle' }), getPermissions: async () => [],

@@ -8,6 +8,8 @@ import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test'
 
 import {
+  buildCursorAgentPreloadRequireOption,
+  buildCursorAgentPreloadScript,
   buildManagedConfig,
   buildManagedConfigFingerprint,
   collectProjectBehaviorMetadata,
@@ -16,12 +18,20 @@ import {
   ensureOpenCodeNativeCliCredentialBridge,
   applyCursorManagedExecutionEnvironment,
   buildCursorHostGeneration,
+  CURSOR_PRELOAD_DISABLED_ENV,
   ensureOpenCodeNativePluginAuthCredentials,
   isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
   resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
+import {
+  PROCESS_ATTRIBUTION_DIRECTORY_ENV,
+  PROCESS_ATTRIBUTION_ID_ENV,
+  mintProcessAttributionId,
+  readAttributionRecords,
+} from './OpenCodeProcessAttributionStore.js'
+import { buildCursorAgentResourceExhaustedPreloadScript } from './OpenCodeCursorResourceExhaustedPatch.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
 import {
@@ -1621,16 +1631,104 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(await runCommandCapture(path.join(bridge.binPath, 'kiro-cli'), [], managedEnv))
       .toBe(`kiro:${hostHomePath}`)
     const cursorBridgeSource = await readFile(bridge.cursorAgentExecutablePath, 'utf8')
-    expect(cursorBridgeSource).toContain('AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED')
     expect(cursorBridgeSource).toContain('AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS')
-    expect(cursorBridgeSource).toContain('cursor-resource-exhausted-preload.cjs')
-    expect(await readFile(
-      path.join(bridge.binPath, 'cursor-resource-exhausted-preload.cjs'),
+    expect(cursorBridgeSource).toContain('cursor-agent-preload.cjs')
+    // The preload records attribution as well as classification, so the shim
+    // injects it unconditionally and the kill switch moved into the preload.
+    expect(cursorBridgeSource).not.toContain('AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED')
+    const preloadSource = await readFile(
+      path.join(bridge.binPath, 'cursor-agent-preload.cjs'),
       'utf8',
-    )).toContain('RESOURCE_EXHAUSTED')
+    )
+    expect(preloadSource).toContain('RESOURCE_EXHAUSTED')
+    expect(preloadSource).toContain('AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED')
+    expect(preloadSource).toContain('AGENT_TEAMS_PROCESS_ATTRIBUTION_DIR')
   })
 
-  test('applies the Cursor resource exhaustion override by default with a kill switch', async () => {
+  test('guards the preload on both shim branches and honours the operator escape hatch', async () => {
+    const profileRootPath = path.join(tempDir, 'profile-root')
+    const hostEnv = {
+      HOME: tempDir,
+      USERPROFILE: 'C:\\Users\\Test User',
+      PATH: tempDir,
+      CURSOR_AGENT_EXECUTABLE: 'C:\\Cursor Tools\\cursor-agent.cmd',
+      AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED: '1',
+    }
+
+    const windows = await ensureOpenCodeNativeCliCredentialBridge(
+      profileRootPath, hostEnv, 'win32',
+    )
+    const posix = await ensureOpenCodeNativeCliCredentialBridge(
+      path.join(tempDir, 'posix-profile-root'), hostEnv, 'linux',
+    )
+
+    const windowsSource = await readFile(windows.cursorAgentExecutablePath, 'utf8')
+    const posixSource = await readFile(posix.cursorAgentExecutablePath, 'utf8')
+    // cmd.exe reads the file through the console OEM code page, so the Windows
+    // shim never spells the profile path into NODE_OPTIONS: it resolves the
+    // preload beside itself, with the forward slashes node's own parser keeps,
+    // and injects only a file that exists.
+    expect(windowsSource).toContain('set "AGENT_TEAMS_CURSOR_PRELOAD=%~dp0cursor-agent-preload.cjs"')
+    expect(windowsSource).toContain('set "AGENT_TEAMS_CURSOR_PRELOAD=%AGENT_TEAMS_CURSOR_PRELOAD:\\=/%"')
+    expect(windowsSource).toContain(
+      'if "%AGENT_TEAMS_CURSOR_PRELOAD_DISABLED%"=="1" set "AGENT_TEAMS_CURSOR_PRELOAD="',
+    )
+    expect(windowsSource).toContain(
+      'if not exist "%AGENT_TEAMS_CURSOR_PRELOAD%" set "AGENT_TEAMS_CURSOR_PRELOAD="',
+    )
+    expect(windowsSource).toContain(
+      'if defined AGENT_TEAMS_CURSOR_PRELOAD set "NODE_OPTIONS=--require="%AGENT_TEAMS_CURSOR_PRELOAD%" %NODE_OPTIONS%"',
+    )
+    expect(windowsSource).not.toContain(buildCursorAgentPreloadRequireOption(
+      path.join(windows.binPath, 'cursor-agent-preload.cjs'), 'win32',
+    ))
+    // The POSIX shim can spell the path, and still injects only a readable file.
+    expect(posixSource).toContain('if [ "${AGENT_TEAMS_CURSOR_PRELOAD_DISABLED:-}" != "1" ] && [ -r ')
+    expect(posixSource).toContain(buildCursorAgentPreloadRequireOption(
+      path.join(posix.binPath, 'cursor-agent-preload.cjs'), 'linux',
+    ))
+    for (const source of [windowsSource, posixSource]) {
+      expect(source).toContain('AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS')
+      expect(source).toContain(CURSOR_PRELOAD_DISABLED_ENV)
+      // The classification kill switch lives in the preload, not in the shim.
+      expect(source).not.toContain('AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED')
+    }
+  })
+
+  test('quotes the Windows preload require in the only form node can resolve', () => {
+    // Node parses NODE_OPTIONS itself and drops backslashes inside quotes, so a
+    // quoted Windows path would arrive as an unresolvable module specifier.
+    expect(buildCursorAgentPreloadRequireOption(
+      'C:\\Users\\Test User\\bin\\cursor-agent-preload.cjs', 'win32',
+    )).toBe('--require="C:/Users/Test User/bin/cursor-agent-preload.cjs"')
+    expect(buildCursorAgentPreloadRequireOption(
+      '/home/test user/bin/cursor-agent-preload.cjs', 'linux',
+    )).toBe('--require="/home/test user/bin/cursor-agent-preload.cjs"')
+  })
+
+  test('publishes one preload with a single strict-mode directive at its head', async () => {
+    const source = buildCursorAgentPreloadScript()
+    // Only the first statement of a file is a directive: a second copy further
+    // down is a plain string expression, and the block after it would run in
+    // sloppy mode without anything saying so.
+    expect(source.startsWith("'use strict'\n")).toBe(true)
+    expect(source.match(/'use strict'/g)).toHaveLength(1)
+    expect(buildCursorAgentResourceExhaustedPreloadScript()).not.toContain('use strict')
+
+    const bridge = await ensureOpenCodeNativeCliCredentialBridge(
+      path.join(tempDir, 'profile-root'),
+      {
+        USERPROFILE: tempDir,
+        PATH: tempDir,
+        CURSOR_AGENT_EXECUTABLE: path.join(tempDir, 'cursor-agent.cmd'),
+      },
+      'win32',
+    )
+    expect(await readFile(path.join(bridge.binPath, 'cursor-agent-preload.cjs'), 'utf8'))
+      .toBe(source)
+  })
+
+  test('applies the Cursor preload by default, with the classification kill switch and the preload escape hatch', async () => {
     if (process.platform === 'win32') return
 
     const nodePath = Bun.which('node')
@@ -1646,7 +1744,14 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       [
         "const c={yM:{FREE_USER_USAGE_LIMIT:'free',GENERIC_RATE_LIMIT_EXCEEDED:'generic',RESOURCE_EXHAUSTED:'resource'}};",
         'R=new Set([c.yM.FREE_USER_USAGE_LIMIT,c.yM.GENERIC_RATE_LIMIT_EXCEEDED]);',
-        'process.stdout.write(JSON.stringify({patched:R.has(c.yM.RESOURCE_EXHAUSTED),nodeOptions:process.env.NODE_OPTIONS||null}))',
+        // The preload clears AGENT_TEAMS_PROCESS_ATTRIBUTION_* once it has
+        // written, so the fixture reads the store through copies of the names.
+        "const attributionDirectory=require('node:path').join(",
+        '  process.env.ATTRIBUTION_FIXTURE_DIR,',
+        "  'v1','agents',process.env.ATTRIBUTION_FIXTURE_ID);",
+        "let attributed=[];try{attributed=require('node:fs').readdirSync(attributionDirectory)}catch(error){}",
+        'process.stdout.write(JSON.stringify({patched:R.has(c.yM.RESOURCE_EXHAUSTED),',
+        'nodeOptions:process.env.NODE_OPTIONS||null,attributed:attributed.length}))',
       ].join(''),
       'utf8',
     )
@@ -1675,24 +1780,57 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       },
       process.platform,
     )
+    const attributionDirectory = path.join(tempDir, 'process-attribution')
+    const attributionId = mintProcessAttributionId()
     const baseEnv = {
       HOME: path.join(profileRootPath, 'home'),
       PATH: `${bridge.binPath}${path.delimiter}${hostBinPath}`,
+      [PROCESS_ATTRIBUTION_DIRECTORY_ENV]: attributionDirectory,
+      [PROCESS_ATTRIBUTION_ID_ENV]: attributionId,
+      ATTRIBUTION_FIXTURE_DIR: attributionDirectory,
+      ATTRIBUTION_FIXTURE_ID: attributionId,
     }
+    // The agent invocation both spawners produce: the preload records only a
+    // process that carries --workspace.
+    const agentArgs = ['--workspace', tempDir]
 
     expect(JSON.parse(await runCommandCapture(
       bridge.cursorAgentExecutablePath,
-      [],
+      agentArgs,
       baseEnv,
-    ))).toEqual({ patched: true, nodeOptions: null })
+    ))).toEqual({ patched: true, nodeOptions: null, attributed: 1 })
+    // The kill switch stops the classification patch only: attribution is not
+    // an override of Cursor behaviour, it is a record of what was spawned.
     expect(JSON.parse(await runCommandCapture(
       bridge.cursorAgentExecutablePath,
-      [],
+      agentArgs,
       {
         ...baseEnv,
         AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED: '1',
       },
-    ))).toEqual({ patched: false, nodeOptions: null })
+    ))).toEqual({ patched: false, nodeOptions: null, attributed: 1 })
+    // The escape hatch stops the shim from injecting anything, and the agent
+    // still runs.
+    expect(JSON.parse(await runCommandCapture(
+      bridge.cursorAgentExecutablePath,
+      agentArgs,
+      {
+        ...baseEnv,
+        [CURSOR_PRELOAD_DISABLED_ENV]: '1',
+      },
+    ))).toEqual({ patched: false, nodeOptions: null, attributed: 0 })
+    // Every run so far exited normally, so no record outlived its process.
+    expect(await readAttributionRecords(attributionDirectory)).toMatchObject({ agents: [] })
+
+    // A preload that is gone is not injected either: node aborts a process
+    // whose --require cannot be resolved, and no record is a smaller loss than
+    // no agent.
+    await rm(path.join(bridge.binPath, 'cursor-agent-preload.cjs'))
+    expect(JSON.parse(await runCommandCapture(
+      bridge.cursorAgentExecutablePath,
+      agentArgs,
+      baseEnv,
+    ))).toEqual({ patched: false, nodeOptions: null, attributed: 0 })
   })
 
   test('writes cmd-safe Cursor preload and preserves an explicit Windows executable', async () => {
