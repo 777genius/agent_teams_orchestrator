@@ -54,7 +54,7 @@ type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
-      'withConfirmedAbsentHostAuthority' | 'resolveOwnedSessionEndpoint' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'releaseHostLeaseStrict' | 'retainHostLease'
+      'withHostOperation' | 'withConfirmedAbsentHostAuthority' | 'resolveOwnedSessionEndpoint' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'releaseHostLeaseStrict' | 'retainHostLease'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
     & Partial<Pick<typeof openCodeSessionStore,
@@ -679,7 +679,7 @@ export class OpenCodeSessionBridge {
         memberName: params.identity.memberName,
         runId: params.runId ?? null,
         sessionId: session.id,
-      }).catch(() => undefined)
+      })
 
       return {
         retainedHostKey: host.hostKey,
@@ -728,8 +728,8 @@ export class OpenCodeSessionBridge {
     } catch (error) {
       if (scoped) {
         await this.hostManager.releaseHostLease?.(record.hostKey, lease).catch(() => undefined)
-        throw error
       }
+      throw error
     }
   }
 
@@ -969,6 +969,20 @@ export class OpenCodeSessionBridge {
     return this.withSessionHost(record, ({ baseUrl, runtimePid }) => check(baseUrl, runtimePid))
   }
 
+  private withSessionOperation<T>(
+    host: OpenCodeHostHandle,
+    record: OpenCodeSessionRecord,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const manager = this.hostManager
+    return manager.withHostOperation
+      ? manager.withHostOperation(host, {
+        teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+        runId: record.runId ?? null, sessionId: record.opencodeSessionId,
+      }, operation)
+      : operation() // Optional injected mock port only; concrete manager implements admission.
+  }
+
   private async withSessionHost<T>(
     record: OpenCodeSessionRecord,
     callback: (context: {
@@ -991,13 +1005,13 @@ export class OpenCodeSessionBridge {
 
     try {
       await this.retainSessionHostLease(record, record.runId)
-      return await callback({
+      return await this.withSessionOperation(host, record, () => callback({
         baseUrl: host.baseUrl,
         profile: sessionProfile.profile,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
         processStartedAtMs: host.processStartedAtMs ?? null,
-      })
+      }))
     } finally {
       await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: record.profileScope?.purpose === 'launch_runtime' })
     }
@@ -1533,6 +1547,7 @@ export class OpenCodeSessionBridge {
         bootstrap: params.expectedBootstrapForSession(existing.opencodeSessionId),
       }
       if (isOpenCodeStrictSessionCompatible(existing, expected)) {
+        await this.retainSessionHostLease(existing, existing.runId)
         return { record: existing, created: false }
       }
       if (!isOpenCodeStrictMaterializedSessionCompatible(existing, expected)) {
@@ -1939,7 +1954,9 @@ export class OpenCodeSessionBridge {
       if (record.hostKey !== params.host.hostKey) {
         throw new Error('OpenCode strict bootstrap host identity mismatch')
       }
-      return inject(params.host.baseUrl)
+      await this.retainSessionHostLease(record, record.runId)
+      const host = params.host
+      return this.withSessionOperation(host, record, () => inject(host.baseUrl))
     }
     return this.withSessionPromptHost(record, async ({ baseUrl, armOAuthNativeSession }) => {
       await armOAuthNativeSession?.(params.messageID, true)

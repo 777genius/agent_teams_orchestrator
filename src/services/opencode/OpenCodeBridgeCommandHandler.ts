@@ -166,6 +166,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.readiness',
   'opencode.cleanupHosts',
   'opencode.cleanupStartupHosts',
+  'opencode.reapUnleasedCursorAgentTrees',
   'opencode.launchTeam',
   'opencode.reconcileTeam',
   'opencode.stopTeam',
@@ -3210,6 +3211,10 @@ async function runReadiness(
   }
 }
 
+async function runCursorAgentReap(envelope: BridgeEnvelope) {
+  return { snapshot: null, data: await openCodeHostManager.reapUnleasedCursorAgentTrees(envelope.body) }
+}
+
 async function runCleanupHosts(envelope: BridgeEnvelope) {
   const startup = envelope.command === 'opencode.cleanupStartupHosts'
   if (startup && process.platform !== 'win32') throw new Error('Startup host cleanup is Windows-only')
@@ -6173,6 +6178,8 @@ async function handleEnvelope(
         throw new Error('OpenCode readiness deadline was not initialized')
       }
       return runReadiness(envelope, runtimeDeadline)
+    case 'opencode.reapUnleasedCursorAgentTrees':
+      return runCursorAgentReap(envelope)
     case 'opencode.cleanupStartupHosts':
     case 'opencode.cleanupHosts':
       return runCleanupHosts(envelope)

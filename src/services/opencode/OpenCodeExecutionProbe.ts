@@ -67,7 +67,7 @@ const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
-    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
+    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease' | 'releaseHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (
@@ -678,10 +678,16 @@ export class OpenCodeExecutionProbe {
     deadline: ProbeModelParams['runtimeDeadline'],
     phase: OpenCodePhaseContext['phase'],
     operation: (context?: OpenCodePhaseContext) => Promise<T>,
+    host?: OpenCodeHostHandle,
   ): Promise<T> {
+    const invoke = (context?: OpenCodePhaseContext) => host && this.hostManager.withHostOperation
+      ? this.hostManager.withHostOperation(host, null, () => operation(context))
+      : operation(context)
+    // Admission belongs inside the deadline race: a timeout cannot release the
+    // pin while the underlying callback is still capable of dispatching.
     return deadline
-      ? deadline.runPhase(phase, context => operation(context))
-      : operation(undefined)
+      ? deadline.runPhase(phase, context => invoke(context))
+      : invoke(undefined)
   }
 
   private createClient(host: OpenCodeHostHandle, context?: OpenCodePhaseContext): OpenCodeClient {
@@ -969,9 +975,8 @@ export class OpenCodeExecutionProbe {
     const preflightLease = createOpenCodePreflightHostLeaseInput(
       `model-probe-${params.selectedModel}`,
     )
-    await this.hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
-
     try {
+      await this.hostManager.retainHostLease?.(host.hostKey, preflightLease)
       return await this.runProbeModelWithHost({
         params,
         host,
@@ -991,6 +996,21 @@ export class OpenCodeExecutionProbe {
   }
 
   private async runProbeModelWithHost(input: {
+    params: ProbeModelParams
+    host: OpenCodeHostHandle
+    startedAtMs: number
+    prompt: string
+    expectedOutput: string
+    probeTimeoutMs: number
+    pollIntervalMs: number
+    diagnostics: Set<string>
+  }): Promise<OpenCodeExecutionProbeResult> {
+    return this.hostManager.withHostOperation
+      ? this.hostManager.withHostOperation(input.host, null, () => this.runProtectedProbeModelWithHost(input))
+      : this.runProtectedProbeModelWithHost(input)
+  }
+
+  private async runProtectedProbeModelWithHost(input: {
     params: ProbeModelParams
     host: OpenCodeHostHandle
     startedAtMs: number
@@ -1279,6 +1299,7 @@ export class OpenCodeExecutionProbe {
             }
           }
         },
+        host,
       )
 
       if (!submitted.started) {
@@ -1354,14 +1375,17 @@ export class OpenCodeExecutionProbe {
           || !nativeFailureProbe
         ) return
         nativeFailureAttempts += 1
-        nativeFailurePending = nativeFailureProbe.probe({
+        const dispatch = () => nativeFailureProbe.probe({
           selectedModel: params.selectedModel,
           // Quota/auth is account-scoped. Keep this auxiliary request out of
           // the user project so project rules and tools cannot affect it.
           projectPath: host.profile.tmpPath,
           env: host.profile.env,
           signal: nativeFailureController.signal,
-        }).then(result => {
+        })
+        nativeFailurePending = (this.hostManager.withHostOperation
+          ? this.hostManager.withHostOperation(host, null, dispatch)
+          : dispatch()).then(result => {
           if (!result) return
           if (result.outcome === 'available') {
             nativeProbeConclusive = true

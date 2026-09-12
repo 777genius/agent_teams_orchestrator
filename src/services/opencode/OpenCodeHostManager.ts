@@ -19,6 +19,9 @@ import {
   readProcessStartTimeMs,
 } from '../../utils/processKill.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
+import { reapCursorAgents, parseCursorAgentReapInput, type CursorAgentReapResult } from './OpenCodeCursorAgentAtomicReap.js'
+import type { CursorAgentNativePorts } from './OpenCodeCursorAgentTreeKill.js'
+import { readAttributionRecords } from './OpenCodeProcessAttributionStore.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
@@ -130,6 +133,7 @@ type OpenCodeHostManagerDeps = {
   now?: () => Date
   persistentRegistryPath?: string | null
   processAttributionDirectory?: string | null
+  cursorAgentNativePorts?: Partial<CursorAgentNativePorts>
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -152,6 +156,7 @@ type PersistentHostLeaseRecord = {
 }
 
 type PersistentHostRegistryRecord = {
+  cursorAgentReapContractVersion?: 1
   hostKey: string
   profileRootKey: string
   projectPath: string
@@ -962,6 +967,15 @@ export class OpenCodeHostManager {
                 && parsed.processIdentityFormat !== 'platform-native-v2'
                 && Number(record.processStartedAtMs) > 1_000_000_000_000
                 ? { processStartedAtMs: undefined } : {}),
+              // Normalization must never manufacture destructive cleanup authority.
+              cursorAgentReapContractVersion:
+                parsed.processIdentityFormat === 'platform-native-v2'
+                && record.cursorAgentReapContractVersion === 1
+                && record.leases !== null && typeof record.leases === 'object'
+                && !Array.isArray(record.leases)
+                && Object.keys(record.leases).every(key =>
+                  Object.prototype.hasOwnProperty.call(normalizePersistentHostLeases(record.leases), key))
+                  ? 1 : undefined,
               leases: normalizePersistentHostLeases(record.leases),
             },
           ],
@@ -989,8 +1003,14 @@ export class OpenCodeHostManager {
   private buildPersistentHostRecord(
     handle: OpenCodeHostHandle,
     previous?: PersistentHostRegistryRecord,
+    newGeneration = false,
   ): PersistentHostRegistryRecord {
+    const sameGeneration = previous?.pid === handle.pid
+      && previous?.processStartedAtMs === handle.processStartedAtMs
+      && previous?.attributionId === handle.attributionId
     return {
+      ...(newGeneration || (sameGeneration && previous?.cursorAgentReapContractVersion === 1)
+        ? { cursorAgentReapContractVersion: 1 as const } : {}),
       hostKey: handle.hostKey,
       profileRootKey: handle.profileRootKey,
       projectPath: handle.projectPath,
@@ -1019,7 +1039,7 @@ export class OpenCodeHostManager {
     return lockPath
   }
 
-  private async withPersistentRegistryLock<T>(callback: () => Promise<T>): Promise<T> {
+  private async withPersistentRegistryLock<T>(callback: () => Promise<T>, onCompromised?: (error: Error) => void): Promise<T> {
     const lockPath = await this.ensurePersistentRegistryLockFile()
     if (!lockPath) {
       return callback()
@@ -1027,7 +1047,9 @@ export class OpenCodeHostManager {
 
     let release: (() => Promise<void>) | undefined
     try {
-      release = await lockfile.lock(lockPath, PERSISTENT_REGISTRY_LOCK_OPTIONS)
+      release = await lockfile.lock(lockPath, onCompromised
+        ? { ...PERSISTENT_REGISTRY_LOCK_OPTIONS, onCompromised }
+        : PERSISTENT_REGISTRY_LOCK_OPTIONS)
       return await callback()
     } finally {
       if (release) {
@@ -1108,7 +1130,7 @@ export class OpenCodeHostManager {
     }
   }
 
-  private async upsertPersistentHost(handle: OpenCodeHostHandle): Promise<void> {
+  private async upsertPersistentHost(handle: OpenCodeHostHandle, newGeneration = false): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath || handle.pid <= 0) {
       return
@@ -1120,7 +1142,8 @@ export class OpenCodeHostManager {
         && (previous.pid !== handle.pid || previous.processStartedAtMs !== handle.processStartedAtMs)) {
         throw new Error('OpenCode host owns a pending OAuth publication')
       }
-      const record = this.buildPersistentHostRecord(handle, previous)
+      if (!previous && !newGeneration) throw new Error('OpenCode persistent host record disappeared')
+      const record = this.buildPersistentHostRecord(handle, previous, newGeneration)
       registry.hosts[handle.hostKey] = record
       await this.writePersistentRegistryUnlocked(registry)
       await this.syncHostAttributionRecord(record, normalizePersistentHostLeases(record.leases))
@@ -1215,26 +1238,127 @@ export class OpenCodeHostManager {
     })
   }
 
-  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+  async reapUnleasedCursorAgentTrees(body: unknown): Promise<CursorAgentReapResult> {
+    const input = parseCursorAgentReapInput(body)
+    const result: CursorAgentReapResult = { contractVersion: 1, status: 'kept', killedPids: [], diagnostics: [] }
     const registryPath = this.persistentRegistryPath
-    if (!registryPath) {
-      return
+    const directory = this.processAttributionDirectory
+    if (!registryPath || !directory) {
+      result.diagnostics.push('Persistent registry or attribution directory unavailable')
+      return result
     }
+    const deadline = Date.now() + 10_000
+    let compromised: Error | undefined
+    const guard = () => {
+      if (compromised) throw new Error(`Registry lock compromised: ${compromised.message}`)
+      if (Date.now() >= deadline) throw new Error('Cursor reap deadline exhausted')
+    }
+    try {
+      await this.withPersistentRegistryLock(async () => {
+        guard()
+        let raw: unknown
+        try { raw = JSON.parse(await readFile(registryPath, 'utf8')) }
+        catch { result.diagnostics.push('Registry missing, unreadable or corrupt'); return }
+        guard()
+        const records = await readAttributionRecords(directory)
+        guard()
+        await reapCursorAgents(input, raw, records, {
+          deadline, guard, profileScope: process.env.CLAUDE_TEAM_APP_PROFILE_SCOPE,
+          pendingOAuth: key => this.hasPendingOAuthHost(key),
+          processLifetime: key => this.hosts.get(key)?.lifetime === 'process',
+          native: this.deps.cursorAgentNativePorts,
+        }, result)
+        guard()
+      }, error => { compromised = error })
+    } catch (error) {
+      result.status = 'incomplete'
+      result.diagnostics.push(error instanceof Error ? error.message : String(error))
+    }
+    return result
+  }
+
+  /** A distinct durable lease protects delayed callbacks without inventing UI owners.
+   * Pins use ordinary lease fields so existing normalizers and raw reapers retain
+   * their veto. Only this wrapper removes pins, under the registry gate.
+   */
+  async withHostOperation<T>(
+    host: Pick<OpenCodeHostHandle, 'hostKey' | 'pid' | 'processStartedAtMs' | 'baseUrl'>,
+    owner: OpenCodeHostLeaseInput | null,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (this.hosts.get(host.hostKey)?.lifetime === 'process') return operation()
+    if (!this.persistentRegistryPath) throw new Error('OpenCode operation registry is unavailable')
+    const identity = { ...host }
+    const input = owner ? { ...owner } : createOpenCodePreflightHostLeaseInput('operation')
+    const ownerKey = buildLeaseKey(input)
+    const pinKey = `${ownerKey}::operation:${randomUUID()}`
+    const matchesHost = (record: PersistentHostRegistryRecord) =>
+      record.hostKey === identity.hostKey && record.pid === identity.pid
+      && record.processStartedAtMs === identity.processStartedAtMs
+      && record.baseUrl === identity.baseUrl
+    let original: PersistentHostLeaseRecord | undefined
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      const record = registry.hosts[identity.hostKey]
+      if (!record || !matchesHost(record)) throw new Error('OpenCode operation host generation is unavailable')
+      const leases = normalizePersistentHostLeases(record.leases)
+      original = leases[ownerKey]
+      if (owner && (!original || original.teamId !== input.teamId.trim()
+        || original.laneId !== (input.laneId?.trim() || 'primary')
+        || original.memberName !== input.memberName.trim()
+        || original.runId !== (input.runId?.trim() || null)
+        || original.sessionId !== (input.sessionId?.trim() || null))) {
+        throw new Error('OpenCode operation session lease is unavailable')
+      }
+      const now = this.nowIso()
+      leases[pinKey] = {
+        leaseKey: pinKey, teamId: input.teamId.trim(),
+        laneId: input.laneId?.trim() || 'primary', memberName: input.memberName.trim(),
+        runId: input.runId?.trim() || null, sessionId: input.sessionId?.trim() || null,
+        createdAt: now, updatedAt: now,
+      }
+      record.leases = leases
+      await this.writePersistentRegistryUnlocked(registry)
+    })
+    let failed = true
+    try {
+      const result = await operation()
+      failed = false
+      return result
+    } finally {
+      await this.withPersistentRegistryLock(async () => {
+        const registry = await this.readPersistentRegistryUnlocked()
+        const record = registry.hosts[identity.hostKey]
+        // Missing/unreadable evidence cannot establish successful pin removal.
+        if (!record) throw new Error('OpenCode operation completion registry is unavailable')
+        const leases = normalizePersistentHostLeases(record.leases)
+        const current = leases[ownerKey]
+        const uncertain = failed || !matchesHost(record) || !leases[pinKey]
+          || Boolean(owner && (!current || current.createdAt !== original?.createdAt
+            || current.runId !== original?.runId || current.sessionId !== original?.sessionId))
+        if (uncertain) {
+          delete record.cursorAgentReapContractVersion
+          // Persist revocation first. A failed second write leaves a vetoing pin.
+          await this.writePersistentRegistryUnlocked(registry)
+        }
+        delete leases[pinKey]
+        record.leases = leases
+        await this.writePersistentRegistryUnlocked(registry)
+      })
+    }
+  }
+
+  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    if (this.hosts.get(hostKey)?.lifetime === 'process') return
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) throw new Error('OpenCode persistent lease registry is unavailable')
 
     await this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
-      let record = registry.hosts[hostKey]
-      if (!record) {
-        const entry = this.hosts.get(hostKey)
-        if (!entry) {
-          return
-        }
-        if (entry.lifetime !== 'persistent') {
-          return
-        }
-        record = this.buildPersistentHostRecord(entry.handle)
-        registry.hosts[hostKey] = record
+      const record = registry.hosts[hostKey]
+      if (!record || record.hostKey !== hostKey) {
+        throw new Error('OpenCode persistent host lease requires an existing registry record')
       }
 
       const nowDate = this.now()
@@ -1315,6 +1439,11 @@ export class OpenCodeHostManager {
       if ((lease.runId && (!expectedRunId || lease.runId !== expectedRunId))
         || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return false
       if (await this.hasPendingOAuthHost(hostKey, input)) return false
+      // Releasing and then restoring an identical session must not erase the
+      // fact that Stop overlapped a delayed operation. Revocation is monotonic.
+      if (Object.keys(leases).some(key => key.startsWith(`${leaseKey}::operation:`))) {
+        delete record.cursorAgentReapContractVersion
+      }
       delete leases[leaseKey]
       const updated = { ...record, leases, updatedAt: this.nowIso() }
       registry.hosts[hostKey] = updated
@@ -1682,7 +1811,7 @@ export class OpenCodeHostManager {
         )
       }
       if (lifetime === 'persistent') {
-        await this.upsertPersistentHost(handle)
+        await this.upsertPersistentHost(handle, true)
       }
       return handle
     } catch (error) {
@@ -2265,6 +2394,8 @@ export class OpenCodeHostManager {
         droppedStaleLeaseCount = preflightDropped + genericDropped
 
         if (droppedStaleLeaseCount > 0) {
+          // Age-based reconciliation is not an explicit release by the owner.
+          delete record.cursorAgentReapContractVersion
           registry.hosts[hostKey] = {
             ...record,
             leases,
