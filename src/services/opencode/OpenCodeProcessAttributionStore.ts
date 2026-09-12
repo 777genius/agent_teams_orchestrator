@@ -60,7 +60,7 @@ export type CursorAgentAttributionRecord = {
   /** Unix epoch milliseconds, UTC, produced by the recorded process itself. */
   startedAtMs: number
   startTimeToleranceMs: number
-  /** Linux only, in the shape a /proc walk can compare without a clock. */
+  /** Exact OS birth: proc:<Linux ticks> or epoch:<Windows/macOS native milliseconds>. */
   nativeStartToken: string | null
   /** The exact `--workspace` argv element, never a re-parsed command line. */
   workspacePath: string | null
@@ -766,6 +766,16 @@ export function buildCursorAgentAttributionPreloadScript(): string {
     '        }',
     '      } catch (error) { /* identity is optional evidence */ }',
     '    }',
+    "    if (process.platform === \"darwin\" || process.platform === \"win32\") {",
+    "      try {",
+    "        const childProcess = require(\"node:child_process\")",
+    "        const command = process.platform === \"darwin\" ? \"ps\" : nodePath.win32.join(process.env.SystemRoot || \"C:\\\\Windows\", \"System32\", \"WindowsPowerShell\", \"v1.0\", \"powershell.exe\")",
+    "        const args = process.platform === \"darwin\" ? [\"-p\", String(process.pid), \"-o\", \"lstart=\"] : [\"-NoProfile\", \"-NonInteractive\", \"-Command\", \"$ErrorActionPreference = \\\"Stop\\\"; $p = [System.Diagnostics.Process]::GetProcessById(\" + process.pid + \"); try { $p.StartTime.ToUniversalTime().ToString(\\\"o\\\") } finally { $p.Dispose() }\"]",
+    "        const output = childProcess.execFileSync(command, args, { encoding: \"utf8\", timeout: 2000, windowsHide: true, stdio: [\"ignore\", \"pipe\", \"ignore\"] })",
+    "        const nativeBirth = Date.parse(output.trim())",
+    "        if (Number.isSafeInteger(nativeBirth) && nativeBirth > 0) nativeStartToken = \"epoch:\" + nativeBirth",
+    "      } catch (error) { /* missing native identity keeps cleanup ineligible */ }",
+    "    }",
     '    const record = {',
     `      schemaVersion: ${PROCESS_ATTRIBUTION_SCHEMA_VERSION},`,
     '      kind: kind,',

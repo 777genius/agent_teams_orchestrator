@@ -101,10 +101,8 @@ export async function reapCursorAgents(input: CursorAgentReapInput, raw: unknown
     if (!positive(hostBirth) || hostBirth !== host.processStartedAtMs) { reject('host native identity unavailable or changed'); continue }
     const live = await ports.birth(agent.pid, timeout())
     check()
-    const tolerance = Math.min(10000, Math.max(2000, agent.startTimeToleranceMs))
-    const matchesBirth = positive(live) && (format === 'linux-ticks'
-      ? Number.isSafeInteger(live) && agent.nativeStartToken === `proc:${live}`
-      : Number.isFinite(tolerance) && Math.abs(live - agent.startedAtMs) <= tolerance)
+    const matchesBirth = positive(live) && Number.isSafeInteger(live)
+      && agent.nativeStartToken === `${format === 'linux-ticks' ? 'proc' : 'epoch'}:${live}`
     if (!matchesBirth || !positive(live)) { reject('agent native identity unavailable or changed'); continue }
     check()
     const killed = await killCursorAgentTree({ pid: agent.pid, expectedBirth: live,

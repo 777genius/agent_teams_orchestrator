@@ -150,3 +150,17 @@ test('real registry gate serializes durable admission with full termination', as
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test.each(['darwin', 'win32'] as const)('requires an exact recorded native epoch birth on %s', async platform => {
+  for (const token of [null, 'epoch:19', 'epoch:20']) {
+    const f = fixture()
+    f.options.native.platform = platform as 'linux'
+    f.records.hosts[0]!.record.hostStartTimeFormat = 'epoch-ms'
+    f.records.agents[0]!.record.nativeStartToken = token
+    if (platform === 'win32') {
+      Object.assign(f.options.native, { taskkill: async () => { f.signals.push(101) } })
+    }
+    await reapCursorAgents(f.input, f.registry, f.records, f.options, f.result)
+    expect(f.signals).toEqual(token === 'epoch:20' ? [101] : [])
+  }
+})

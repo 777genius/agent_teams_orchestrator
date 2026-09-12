@@ -305,6 +305,15 @@ export class OpenCodeProvisioningProbe {
       }
       await hostManager.retainHostLease?.(host.hostKey, preflightLease)
     } catch (error) {
+      // A failed durable admission must not leak the reference ensureHost acquired.
+      if (host && !released) {
+        const acquired = host
+        host = undefined
+        released = true
+        await hostManager.releaseHost(acquired.hostKey, {
+          keepPersistentAlive: Boolean(options.existingHostKey) || options.disposeHostOnRelease === false,
+        }).catch(() => undefined)
+      }
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }

@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
-import { killCursorAgentTree, nativePorts } from './OpenCodeCursorAgentTreeKill.js'
+import { EventEmitter } from 'node:events'
+import { killCursorAgentTree, nativePorts, query } from './OpenCodeCursorAgentTreeKill.js'
 
 function fixture() {
   const signals: number[] = []
@@ -58,4 +59,26 @@ test('replacement between enumeration and first birth read is rejected by ancest
   f.ports.birth = async pid => pid === 2 ? 11 : 10
   expect((await killCursorAgentTree(f.input, f.ports)).complete).toBe(false)
   expect(f.signals).toEqual([])
+})
+
+test('Windows stale parent PID cannot authorize an older child generation', async () => {
+  const f = fixture(); f.ports.platform = 'win32'
+  f.ports.birth = async pid => pid === 2 ? 9 : 10
+  let taskkills = 0
+  f.ports.taskkill = async () => { taskkills += 1 }
+  expect((await killCursorAgentTree(f.input, f.ports)).complete).toBe(false)
+  expect(taskkills).toBe(0)
+})
+
+test('failed helper timeout kill retains the operation until helper close', async () => {
+  const child = Object.assign(new EventEmitter(), { pid: 123, stdout: new EventEmitter(),
+    kill: () => { child.emit('error', new Error('kill failed')); return false } })
+  let settled = false
+  const work = query('fake-helper', [], 5, (() => child) as never)
+    .then(() => { settled = true }, () => { settled = true })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect(settled).toBe(false)
+  child.emit('close', 1)
+  await work
+  expect(settled).toBe(true)
 })

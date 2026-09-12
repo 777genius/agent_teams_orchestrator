@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -1048,4 +1049,28 @@ describe('OpenCodeProcessAttributionStore', () => {
       .toEqual([])
     expect(await readAttributionRecords(run.directory)).toMatchObject({ agents: [] })
   })
+})
+
+test.each(['darwin', 'win32'] as const)('preload records native epoch identity on %s without invoking a real helper', platform => {
+  const records: Array<{ nativeStartToken: string }> = []
+  const calls: string[] = []
+  runInNewContext(buildCursorAgentAttributionPreloadScript(), {
+    process: { platform, pid: 123, ppid: 122, uptime: () => 1, cwd: () => '/fixture',
+      argv: ['node', 'agent', '--workspace', '/fixture'], on: () => {},
+      env: { [PROCESS_ATTRIBUTION_DIRECTORY_ENV]: '/fixture/records',
+        [PROCESS_ATTRIBUTION_ID_ENV]: 'a'.repeat(32) } },
+    require: (name: string) => {
+      if (name === 'node:path') return path
+      if (name === 'node:fs') return { mkdirSync: () => {}, renameSync: () => {},
+        writeFileSync: (_file: string, text: string) => { records.push(JSON.parse(text)) } }
+      if (name === 'node:child_process') return { execFileSync: (command: string) => {
+        calls.push(command); return '2026-09-12T12:00:00.000Z'
+      } }
+      throw new Error('Unexpected fixture module')
+    },
+  })
+  expect(records).toHaveLength(1)
+  expect(records[0]!.nativeStartToken).toBe(`epoch:${Date.parse('2026-09-12T12:00:00.000Z')}`)
+  expect(calls).toHaveLength(1)
+  expect(calls[0]!.endsWith(platform === 'win32' ? 'powershell.exe' : 'ps')).toBe(true)
 })

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 
@@ -15,14 +15,34 @@ export type CursorAgentNativePorts = {
   sleep: (ms: number) => Promise<void>
 }
 
-// execFile's callback runs after helper completion, including timeout killing.
-// Never race this promise against a timer and release the registry gate early.
-function query(command: string, args: string[], timeout: number): Promise<string> {
+/** Errors do not prove a launched helper has exited: wait for close. */
+export function query(command: string, args: string[], timeout: number,
+  launch: typeof spawn = spawn): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, { timeout, killSignal: 'SIGKILL', windowsHide: true,
-      maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
-      if (error) reject(error)
-      else resolve(String(stdout))
+    const child = launch(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let output = ''
+    let failure: Error | undefined
+    const stop = (error: Error) => {
+      failure ??= error
+      try { child.kill('SIGKILL') } catch (killError) {
+        failure = killError instanceof Error ? killError : new Error(String(killError))
+      }
+    }
+    const timer = setTimeout(() => stop(new Error('Native helper timed out')), timeout)
+    child.stdout?.on('data', (data: Buffer | string) => {
+      if (output.length > 4 * 1024 * 1024) return
+      output += String(data)
+      if (output.length > 4 * 1024 * 1024) stop(new Error('Native helper output exceeded limit'))
+    })
+    child.on('error', error => {
+      failure ??= error
+      // No PID means spawn failed, so no helper can execute later.
+      if (child.pid === undefined) { clearTimeout(timer); reject(failure) }
+    })
+    child.once('close', code => {
+      clearTimeout(timer)
+      if (failure || code !== 0) reject(failure ?? new Error(`Native helper exited ${code}`))
+      else resolve(output)
     })
   })
 }
@@ -113,6 +133,13 @@ export async function killCursorAgentTree(input: {
       }
       const captured = new Map<number, number>()
       for (const row of tree) captured.set(row.pid, await birth(row.pid))
+      for (const row of tree) {
+        const parentBirth = row.ppid === input.pid ? input.expectedBirth : captured.get(row.ppid)
+        const childBirth = captured.get(row.pid)
+        if (!positive(parentBirth) || !positive(childBirth) || childBirth < parentBirth) {
+          throw new Error('Child predates captured parent generation')
+        }
+      }
       const confirmed = descendants(await ports.tree(remaining()), input.pid)
       check()
       if (confirmed.length !== tree.length || tree.some(row =>
@@ -135,6 +162,13 @@ export async function killCursorAgentTree(input: {
       }
       const captured = new Map<number, number>()
       for (const row of tree) captured.set(row.pid, await birth(row.pid))
+      for (const row of tree) {
+        const parentBirth = row.ppid === input.pid ? input.expectedBirth : captured.get(row.ppid)
+        const childBirth = captured.get(row.pid)
+        if (!positive(parentBirth) || !positive(childBirth) || childBirth < parentBirth) {
+          throw new Error('Child predates captured parent generation')
+        }
+      }
       captured.set(input.pid, input.expectedBirth)
       // A PID reused before its first birth read must still belong to the
       // same captured ancestry. Then recheck births around this second table.

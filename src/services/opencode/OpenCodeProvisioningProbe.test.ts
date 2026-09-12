@@ -457,6 +457,25 @@ describe('OpenCodeProvisioningProbe', () => {
     ])
   })
 
+  test.each([false, true])('releases acquired references when durable lease admission fails existing=%s', async existing => {
+    const released: string[] = []
+    const acquired = { hostKey: 'fixture-host', pid: 123, projectPath: '/tmp/project', profile } as OpenCodeHostHandle
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: { probe: async () => inventory },
+      hostManager: {
+        ensureHost: async () => acquired,
+        retainHostLease: async () => { throw new Error('fixture lease write rejected') },
+        releaseHost: async key => { released.push(key) },
+      },
+    })
+    const run = existing
+      ? probe.probeRetainingHost('/tmp/project', { existingHostKey: 'fixture-host' })
+      : probe.probe('/tmp/project')
+    if (existing) await expect(run).rejects.toThrow('fixture lease write rejected')
+    else expect((await run).host).toBeNull()
+    expect(released).toEqual(['fixture-host'])
+  })
+
   test('collects live host verification details', async () => {
     let releaseCalls = 0
     const retainedLeaseTeamIds: string[] = []
