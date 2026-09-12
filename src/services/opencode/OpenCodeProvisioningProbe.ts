@@ -569,6 +569,10 @@ export class OpenCodeProvisioningProbe {
       return await (hostManager.withHostOperation
         ? hostManager.withHostOperation(acquiredHost, preflightLease, inspect)
         : inspect())
+    } catch (error) {
+      // No retained result reached the caller, so nobody else owns its release.
+      await release()
+      throw error
     } finally {
       if (!options.retainHost) {
         await release()
