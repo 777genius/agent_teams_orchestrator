@@ -123,6 +123,23 @@ type PendingRequest<T> = {
   request: SDKControlRequest
 }
 
+type QueuedInputLine = {
+  line: string
+  hosted: boolean
+}
+
+/**
+ * An explicit lease which keeps StructuredIO input open after stdin ends.
+ * Hosted callers must close the lease when their mailbox can no longer
+ * produce input. enqueueUserMessage returns false when delivery can no longer
+ * be accepted; true means that the turn was retained for the read iterator.
+ */
+export type HostedInputHandle = {
+  enqueueUserMessage(content: string): boolean
+  close(): void
+  readonly closed: boolean
+}
+
 /**
  * Provides a structured way to read and write SDK messages from stdio,
  * capturing the SDK protocol.
@@ -131,6 +148,7 @@ type PendingRequest<T> = {
 // entry is evicted. This bounds memory in very long sessions while keeping
 // enough history to catch duplicate control_response deliveries.
 const MAX_RESOLVED_TOOL_USE_IDS = 1000
+const MAX_CONSECUTIVE_HOSTED_MESSAGES = 8
 
 export class StructuredIO {
   readonly structuredInput: AsyncGenerator<StdinMessage | SDKMessage>
@@ -153,7 +171,15 @@ export class StructuredIO {
   // messages into mutableMessages and cause a 400 "tool_use ids must be unique"
   // error from the API.
   private readonly resolvedToolUseIds = new Set<string>()
-  private prependedLines: string[] = []
+  private prependedLines: QueuedInputLine[] = []
+  private hostedInputRetained = false
+  private hostedInputClosed = false
+  private readDisposed = false
+  private inputWake?: () => void
+  private inputWakePending = false
+  private activeInputIterator?: AsyncIterator<string>
+  private activeInputReturnRequested = false
+  private inputFinalizing = false
   private onControlRequestSent?: (request: SDKControlRequest) => void
   private onControlRequestResolved?: (requestId: string) => void
 
@@ -166,7 +192,63 @@ export class StructuredIO {
     private readonly replayUserMessages?: boolean,
   ) {
     this.input = input
-    this.structuredInput = this.read()
+    const reader = this.read()
+    this.structuredInput = {
+      next: value => reader.next(value),
+      return: async value => {
+        this.disposeInputRead()
+        return reader.return(value)
+      },
+      throw: async error => {
+        this.disposeInputRead()
+        return reader.throw(error)
+      },
+      [Symbol.asyncIterator]() {
+        return this
+      },
+      [Symbol.asyncDispose]: async () => {
+        this.disposeInputRead()
+        await reader.return(undefined)
+      },
+    }
+  }
+
+  /**
+   * Opt into a hosted input lifetime independent of the underlying stdin
+   * iterable. Only one lifetime may be retained for a StructuredIO instance.
+   */
+  retainHostedInput(): HostedInputHandle {
+    if (this.hostedInputRetained) {
+      throw new Error('Hosted input lifetime already retained')
+    }
+    if (this.readDisposed || this.inputClosed || this.inputFinalizing) {
+      throw new Error('Structured input is closed')
+    }
+    this.hostedInputRetained = true
+
+    const structuredIO = this
+    return {
+      enqueueUserMessage(content: string): boolean {
+        if (
+          structuredIO.hostedInputClosed ||
+          structuredIO.readDisposed ||
+          structuredIO.inputFinalizing
+        ) {
+          return false
+        }
+        structuredIO.queueUserMessage(content, true)
+        structuredIO.wakeInputRead()
+        return true
+      },
+      close(): void {
+        if (structuredIO.hostedInputClosed) return
+        structuredIO.hostedInputClosed = true
+        structuredIO.wakeInputRead()
+      },
+      get closed(): boolean {
+        return structuredIO.hostedInputClosed || structuredIO.readDisposed
+      },
+    }
   }
 
   /**
@@ -202,18 +284,93 @@ export class StructuredIO {
    * prependedLines between each yielded message.
    */
   prependUserMessage(content: string): void {
-    this.prependedLines.push(
-      jsonStringify({
-        type: 'user',
-        session_id: '',
-        message: { role: 'user', content },
-        parent_tool_use_id: null,
-      } satisfies SDKUserMessage) + '\n',
+    this.queueUserMessage(content, false)
+    if (this.hostedInputRetained && !this.hostedInputClosed) {
+      this.wakeInputRead()
+    }
+  }
+
+  private queueUserMessage(content: string, hosted: boolean): void {
+    this.prependedLines.push({
+      line:
+        jsonStringify({
+          type: 'user',
+          session_id: '',
+          message: { role: 'user', content },
+          parent_tool_use_id: null,
+        } satisfies SDKUserMessage) + '\n',
+      hosted,
+    })
+  }
+
+  private wakeInputRead(): void {
+    const wake = this.inputWake
+    if (wake) {
+      this.inputWake = undefined
+      wake()
+      return
+    }
+    // splitAndProcess() is an async generator, so an enqueue can run after it
+    // observes an empty queue but before read() installs its next waiter. Keep
+    // one level-triggered wake latched across that scheduling gap. The queue
+    // itself retains every accepted message, so one pending wake is enough.
+    this.inputWakePending = true
+  }
+
+  private waitForInputWake(): Promise<void> {
+    if (this.inputWakePending) {
+      this.inputWakePending = false
+      return Promise.resolve()
+    }
+    return new Promise(resolve => {
+      this.inputWake = resolve
+    })
+  }
+
+  private disposeInputRead(): void {
+    if (this.readDisposed) return
+    this.readDisposed = true
+    this.hostedInputClosed = true
+    this.wakeInputRead()
+    this.requestInputReturn()
+    this.closeInput(
+      new Error('Tool permission stream closed before response received'),
     )
+  }
+
+  private requestInputReturn(): void {
+    if (this.activeInputReturnRequested) return
+    this.activeInputReturnRequested = true
+    // Async generators queue return() behind an outstanding next(), so this
+    // is deliberately best-effort cleanup rather than a prerequisite for
+    // cancelling the downstream reader. The wake above releases read() even
+    // when the source has no return(), throws synchronously, or rejects.
+    try {
+      const returned = this.activeInputIterator?.return?.()
+      if (returned) void Promise.resolve(returned).catch(() => {})
+    } catch {
+      // Cleanup failures must not strand downstream cancellation or pending
+      // permission requests.
+    }
+  }
+
+  private closeInput(error: Error): void {
+    if (this.inputClosed) return
+    this.inputClosed = true
+    for (const request of this.pendingRequests.values()) {
+      request.reject(error)
+    }
   }
 
   private async *read() {
     let content = ''
+    let inputDone = false
+    let inputNext: Promise<IteratorResult<string>> | undefined
+    let inputNextReady = false
+    let consecutiveHostedMessages = 0
+    let queuedLines: QueuedInputLine[] = []
+    const inputIterator = this.input[Symbol.asyncIterator]()
+    this.activeInputIterator = inputIterator
 
     // Called once before for-await (an empty this.input otherwise skips the
     // loop body entirely), then again per block. prependedLines re-check is
@@ -222,13 +379,35 @@ export class StructuredIO {
     const splitAndProcess = async function* (this: StructuredIO) {
       for (;;) {
         if (this.prependedLines.length > 0) {
-          content = this.prependedLines.join('') + content
+          // A prepend accepted while a message is yielded goes ahead of the
+          // older queued remainder, matching the original content-prefixing
+          // behavior. Calls accepted in the same turn remain FIFO.
+          queuedLines = [...this.prependedLines, ...queuedLines]
           this.prependedLines = []
         }
+        const queued = queuedLines[0]
         const newline = content.indexOf('\n')
-        if (newline === -1) break
-        const line = content.slice(0, newline)
-        content = content.slice(newline + 1)
+        // Hosted turns retain prepend priority in ordinary bursts. Once the
+        // bound is reached, a complete or already-ready stdin message gets
+        // one arbitration turn; ordinary prependUserMessage ordering is not
+        // changed by the hosted-only fairness bound.
+        const yieldStdin =
+          queued?.hosted === true &&
+          consecutiveHostedMessages >= MAX_CONSECUTIVE_HOSTED_MESSAGES &&
+          (newline !== -1 || inputNextReady)
+        let line: string
+        if (queued && !yieldStdin) {
+          queuedLines.shift()
+          line = queued.line.slice(0, -1)
+          if (queued.hosted) consecutiveHostedMessages++
+          else consecutiveHostedMessages = 0
+        } else if (newline !== -1) {
+          line = content.slice(0, newline)
+          content = content.slice(newline + 1)
+          consecutiveHostedMessages = 0
+        } else {
+          break
+        }
         const message = await this.processLine(line)
         if (message) {
           logForDiagnosticsNoPII('info', 'cli_stdin_message_parsed', {
@@ -239,22 +418,89 @@ export class StructuredIO {
       }
     }.bind(this)
 
-    yield* splitAndProcess()
+    try {
+      for (;;) {
+        if (this.readDisposed) break
 
-    for await (const block of this.input) {
-      content += block
-      yield* splitAndProcess()
-    }
-    if (content) {
-      const message = await this.processLine(content)
-      if (message) {
-        yield message
+        // Keep exactly one upstream read in flight before yielding queued
+        // hosted turns. This covers startup backlog and immediately reads
+        // ahead after a block is consumed, while the wake race below still
+        // lets hosted input proceed when stdin is idle.
+        if (!inputDone && !inputNext) {
+          try {
+            inputNext = Promise.resolve(inputIterator.next())
+            void inputNext.then(
+              () => {
+                inputNextReady = true
+              },
+              () => {
+                inputNextReady = true
+              },
+            )
+          } catch (error) {
+            inputNext = Promise.reject(error)
+            // Observe before queued yields; the race still propagates this error.
+            void inputNext.catch(() => {})
+            inputNextReady = true
+          }
+        }
+
+        yield* splitAndProcess()
+        if (this.readDisposed) break
+
+        if (inputDone) {
+          if (!this.hostedInputRetained || this.hostedInputClosed) break
+          await this.waitForInputWake()
+          continue
+        }
+
+        let result: IteratorResult<string> | undefined
+        try {
+          const wake = this.waitForInputWake()
+          const outcome = await Promise.race([
+            inputNext.then(value => ({ type: 'input' as const, value })),
+            wake.then(() => ({ type: 'wake' as const })),
+          ])
+          if (this.readDisposed) break
+          if (outcome.type === 'wake') continue
+          // Discard the losing wake subscription. A later enqueue or dispose
+          // must wake the next wait, not resolve this already-lost race.
+          this.inputWake = undefined
+          result = outcome.value
+        } catch (error) {
+          // Some iterators reject their outstanding next when return() is
+          // used to cancel them. That rejection is cleanup, not a read error.
+          if (this.readDisposed) break
+          throw error
+        }
+        inputNext = undefined
+        inputNextReady = false
+        if (result.done) {
+          inputDone = true
+        } else {
+          content += result.value
+        }
       }
-    }
-    this.inputClosed = true
-    for (const request of this.pendingRequests.values()) {
-      // Reject all pending requests if the input stream
-      request.reject(
+
+      // Close acceptance before processing/yielding the final unterminated
+      // message. A lease obtained during that yield could otherwise accept a
+      // turn which this reader will never revisit.
+      this.inputFinalizing = true
+      if (!this.readDisposed && content) {
+        const message = await this.processLine(content)
+        if (message) {
+          yield message
+        }
+      }
+    } finally {
+      this.readDisposed = true
+      this.hostedInputClosed = true
+      this.wakeInputRead()
+      if (!inputDone) {
+        this.requestInputReturn()
+      }
+      this.activeInputIterator = undefined
+      this.closeInput(
         new Error('Tool permission stream closed before response received'),
       )
     }
