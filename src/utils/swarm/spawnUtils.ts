@@ -716,6 +716,73 @@ export function buildInheritedEnvObject(options?: {
   return envVars
 }
 
+const HOSTED_NATIVE_ALLOWED_ENV_KEYS = new Set<string>([
+  ...TEAMMATE_ENV_VARS,
+  'CLAUDECODE', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', 'CLAUDE_CONFIG_DIR',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', 'CLAUDE_CODE_ENTRY_PROVIDER',
+  'CLAUDE_CODE_TEAMMATE_RUNTIME', 'CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH',
+  'CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN', 'CLAUDE_CODE_BOOTSTRAP_RUN_ID',
+  'CLAUDE_CODE_TEAMMATE_STARTUP_READY_SENTINEL',
+  'PATH', 'PATHEXT', 'SystemRoot', 'ComSpec', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'NODE_ENV',
+])
+
+const HOSTED_NATIVE_FIXED_ENV_KEYS = new Set<string>([
+  'CLAUDECODE', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', 'CLAUDE_CONFIG_DIR',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', 'CLAUDE_CODE_ENTRY_PROVIDER',
+  'CLAUDE_CODE_TEAMMATE_RUNTIME', 'CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH',
+  'CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN', 'CLAUDE_CODE_BOOTSTRAP_RUN_ID',
+  'CLAUDE_CODE_TEAMMATE_STARTUP_READY_SENTINEL',
+])
+
+/** Resolve an admitted hosted child environment without ambient inheritance. */
+export function buildResolvedNativeProcessEnv(input: {
+  provider: TeammateProvider
+  canonicalDataRoot: string
+  frozenEnv: Readonly<Record<string, string>>
+  runtimeEnv?: Readonly<Record<string, string>>
+}): Record<string, string> {
+  const fixed = {
+    CLAUDECODE: '1',
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    CLAUDE_CONFIG_DIR: input.canonicalDataRoot,
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
+    CLAUDE_CODE_ENTRY_PROVIDER: input.provider,
+  } as const
+  const result: Record<string, string> = {}
+  for (const [sourceKind, source] of [['profile', input.frozenEnv], ['runtime', input.runtimeEnv ?? {}]] as const) {
+    for (const [key, value] of Object.entries(source)) {
+      if (!HOSTED_NATIVE_ALLOWED_ENV_KEYS.has(key)) throw new Error(`Unsupported hosted native environment key: ${key}`)
+      if (typeof value !== 'string' || value.includes('\0')) throw new Error(`Invalid hosted native environment value: ${key}`)
+      if (sourceKind === 'profile' && HOSTED_NATIVE_FIXED_ENV_KEYS.has(key)) throw new Error(`Hosted native profile cannot override fixed environment key: ${key}`)
+      result[key] = value
+    }
+  }
+  Object.assign(result, fixed)
+  if (input.runtimeEnv?.CLAUDE_CODE_TEAMMATE_RUNTIME !== undefined) result.CLAUDE_CODE_TEAMMATE_RUNTIME = input.runtimeEnv.CLAUDE_CODE_TEAMMATE_RUNTIME
+  return result
+}
+
+export function buildResolvedNativeProcessFlags(input: {
+  model: string
+  effort?: string
+  settingsPath: string
+  mcpConfigPath: string
+  disallowedTools?: readonly string[]
+  strictMcpConfig: true
+}): string[] {
+  for (const [label, value] of Object.entries({ model: input.model, effort: input.effort, settingsPath: input.settingsPath, mcpConfigPath: input.mcpConfigPath })) {
+    if (value !== undefined && (typeof value !== 'string' || value.length === 0 || value.includes('\0'))) throw new Error(`Invalid hosted native ${label}`)
+  }
+  const flags = ['--model', input.model, '--settings', input.settingsPath, '--mcp-config', input.mcpConfigPath, '--strict-mcp-config']
+  if (input.effort) flags.push('--effort', input.effort)
+  for (const tool of input.disallowedTools ?? []) {
+    if (!tool || tool.includes('\0')) throw new Error('Invalid hosted native disallowed tool')
+    flags.push('--disallowedTools', tool)
+  }
+  if (flags.some(value => value.includes('\0'))) throw new Error('Invalid hosted native launch flag')
+  return flags
+}
+
 const TMUX_SPAWN_SMOKE_DELAY_MS = 800
 const TMUX_TEAMMATE_EXIT_SENTINEL = '__CLAUDE_TEAMMATE_EXIT__:'
 
