@@ -25,6 +25,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
+import { ensureOpenCodeDirectory } from './ensureOpenCodeDirectory.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -421,8 +422,8 @@ export async function ensureDirectorySymlink(
   options: ProfileSymlinkOptions = {},
 ): Promise<void> {
   if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
-  await mkdir(targetPath, { recursive: true })
-  await mkdir(path.dirname(linkPath), { recursive: true })
+  await ensureOpenCodeDirectory(targetPath)
+  await ensureOpenCodeDirectory(path.dirname(linkPath))
 
   const lockPath = `${linkPath}.prepare-lock`
   await writeFile(lockPath, '', { flag: 'a' })
@@ -455,7 +456,7 @@ async function copyDirectoryContentsPreservingExisting(
     if (existing && (!entry.isDirectory() || !existing.isDirectory())) continue
 
     if (entry.isDirectory()) {
-      await mkdir(targetEntry, { recursive: true }).catch(error => {
+      await ensureOpenCodeDirectory(targetEntry).catch(error => {
         if (getErrnoCode(error) !== 'EEXIST') {
           throw error
         }
@@ -1449,7 +1450,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
     throw new Error('Managed Cursor requires an absolute native executable')
   }
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
-  await mkdir(binPath, { recursive: true })
+  await ensureOpenCodeDirectory(binPath)
   const cursorAgentPreloadPath = path.join(binPath, CURSOR_PRELOAD_FILE_NAME)
   await publishNativeCliFile(cursorAgentPreloadPath, buildCursorAgentPreloadScript(), 0o600)
 
@@ -3344,14 +3345,14 @@ export class OpenCodeProfileManager {
 
     enterStep('create profile directories')
     await Promise.all([
-      mkdir(homePath, { recursive: true }),
-      mkdir(tmpPath, { recursive: true }),
-      mkdir(xdgConfigHome, { recursive: true }),
-      mkdir(path.join(xdgDataHome, 'opencode'), { recursive: true }),
-      mkdir(xdgCacheHome, { recursive: true }),
-      mkdir(sharedNpmCachePath, { recursive: true }),
-      mkdir(sharedToolCachePath, { recursive: true }),
-      mkdir(workingDirectoryPath, { recursive: true }),
+      ensureOpenCodeDirectory(homePath),
+      ensureOpenCodeDirectory(tmpPath),
+      ensureOpenCodeDirectory(xdgConfigHome),
+      ensureOpenCodeDirectory(path.join(xdgDataHome, 'opencode')),
+      ensureOpenCodeDirectory(xdgCacheHome),
+      ensureOpenCodeDirectory(sharedNpmCachePath),
+      ensureOpenCodeDirectory(sharedToolCachePath),
+      ensureOpenCodeDirectory(workingDirectoryPath),
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {

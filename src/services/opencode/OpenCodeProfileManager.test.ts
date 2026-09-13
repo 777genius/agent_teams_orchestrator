@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, spyOn, test } from 'bun:test'
 
 import {
   buildCursorAgentPreloadRequireOption,
@@ -200,6 +200,37 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       customCatalog.profileRootPath,
       legacy.profileRootPath,
     ]).size).toBe(6)
+  })
+
+  test('prepares and retries an existing workspace despite Windows mkdir EEXIST', async () => {
+    const fs = await import('node:fs/promises')
+    const projectPath = await realpath(await mkdtemp(path.join(tempDir, 'existing-project-')))
+    const markerPath = path.join(projectPath, 'keep.txt')
+    await writeFile(markerPath, 'existing project content')
+    const originalMkdir = fs.mkdir
+    const mkdirSpy = spyOn(fs, 'mkdir').mockImplementation((async (...args: Parameters<typeof fs.mkdir>) => {
+      const [directory, options] = args
+      if (String(directory) === projectPath) {
+        throw Object.assign(new Error('Windows ReadOnly directory'), {
+          code: 'EEXIST', syscall: 'mkdir', path: projectPath,
+        })
+      }
+      return originalMkdir(directory, options)
+    }) as typeof fs.mkdir)
+    try {
+      const manager = new OpenCodeProfileManager()
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const profile = await manager.prepareProfile(projectPath, {
+          includeAppMcp: false,
+          includeManagedSubscriptionPlugins: false,
+        })
+        expect(profile.workingDirectoryPath).toBe(projectPath)
+      }
+      expect(await readFile(markerPath, 'utf8')).toBe('existing project content')
+      expect(mkdirSpy.mock.calls.some(([directory]) => String(directory) === projectPath)).toBe(false)
+    } finally {
+      mkdirSpy.mockRestore()
+    }
   })
 
   test('reports fixed preparation substeps and closes each step exactly once', async () => {
