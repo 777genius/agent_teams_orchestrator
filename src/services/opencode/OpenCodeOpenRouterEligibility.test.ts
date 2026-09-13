@@ -6,66 +6,71 @@ import {
   hasOpenCodeOpenRouterCatalogCredential,
   isOpenCodeOpenRouterFreeRouteAllowedInEnvironment,
   openCodeOpenRouterEligibilityIdentity,
-  resolveOpenCodeOpenRouterEnvironment,
+  captureOpenCodeOpenRouterEnvironment,
 } from './OpenCodeOpenRouterFallback.js'
 
-test('file credentials bind usable content and secret-free identity, including deletion', () => {
+test('file credentials bind usable content and secret-free identity, including deletion', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'issue446-files-'))
   try {
     const file = path.join(dir, 'key')
     const provider = { options: { apiKey: `{file:${file}}` } }
     const env = { OPENROUTER_API_KEY: 'synthetic-lower-priority' }
-    const identity = () => openCodeOpenRouterEligibilityIdentity(provider, env, null)
-    const usable = () => hasOpenCodeOpenRouterCatalogCredential(provider, env, null)
-    const missing = identity()
-    expect(usable()).toBe(false)
+    const capture = async () => {
+      const digests: string[] = []
+      try { return { provider: await captureOpenCodeOpenRouterEnvironment(provider, env, digests) as Record<string, unknown>, digests } }
+      catch { return { provider: { whitelist: [], options: 'invalid' }, digests } }
+    }
+    const identity = async () => { const captured = await capture(); return openCodeOpenRouterEligibilityIdentity(captured.provider, env, null, true, captured.digests) }
+    const usable = async () => hasOpenCodeOpenRouterCatalogCredential((await capture()).provider, env, null, true)
+    const missing = await identity()
+    expect(await usable()).toBe(false)
     writeFileSync(file, '')
-    const empty = identity()
+    const empty = await identity()
     expect(empty).not.toBe(missing)
-    expect(usable()).toBe(false)
+    expect(await usable()).toBe(false)
     writeFileSync(file, 'synthetic-secret-one\n')
-    const first = identity()
+    const first = await identity()
     expect(first).toMatch(/^[a-f0-9]{64}$/)
     expect(first).not.toContain('synthetic-secret')
-    expect(usable()).toBe(true)
+    expect(await usable()).toBe(true)
     writeFileSync(file, 'synthetic-secret-one')
-    expect(identity()).not.toBe(first)
+    expect(await identity()).not.toBe(first)
     writeFileSync(file, 'synthetic-secret-two')
-    expect(identity()).not.toBe(first)
+    expect(await identity()).not.toBe(first)
     writeFileSync(file, '{env:UNSET_SYNTHETIC_KEY}')
-    expect(usable()).toBe(true)
+    expect(await usable()).toBe(true)
     writeFileSync(file, '{file:missing-synthetic-file}')
-    expect(usable()).toBe(true)
+    expect(await usable()).toBe(true)
     rmSync(file)
-    expect(identity()).toBe(missing)
-    expect(usable()).toBe(false)
+    expect(await identity()).toBe(missing)
+    expect(await usable()).toBe(false)
     mkdirSync(file)
-    expect(usable()).toBe(false)
+    expect(await usable()).toBe(false)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('file-backed restrictions and options use native trimming and JSON escaping', () => {
+test('file-backed restrictions and options use native trimming and JSON escaping', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'issue446-restrictions-'))
   try {
     const file = path.join(dir, 'route')
     writeFileSync(file, 'openrouter/free\n')
     const provider = { blacklist: [`{file:${file}}`], options: { baseURL: `{file:${file}}` } }
-    const before = openCodeOpenRouterEligibilityIdentity(provider, {}, null)
-    expect(isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider, {})).toBe(false)
+    const before = openCodeOpenRouterEligibilityIdentity(await captureOpenCodeOpenRouterEnvironment(provider, {}) as any, {}, null, true)
+    expect(isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(await captureOpenCodeOpenRouterEnvironment(provider, {}) as any, {})).toBe(false)
     writeFileSync(file, 'https://synthetic.invalid/"quoted"\n')
-    expect(isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider, {})).toBe(true)
-    expect(resolveOpenCodeOpenRouterEnvironment(provider.options, {})).toEqual({ baseURL: 'https://synthetic.invalid/"quoted"' })
-    expect(openCodeOpenRouterEligibilityIdentity(provider, {}, null)).not.toBe(before)
-    expect(resolveOpenCodeOpenRouterEnvironment('{file:~/route}', { HOME: dir })).toBe('https://synthetic.invalid/"quoted"')
-    expect(resolveOpenCodeOpenRouterEnvironment('{file:{env:FILE}}', { FILE: file })).toBe('https://synthetic.invalid/"quoted"')
+    expect(isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(await captureOpenCodeOpenRouterEnvironment(provider, {}) as any, {})).toBe(true)
+    expect(await captureOpenCodeOpenRouterEnvironment(provider.options, {})).toEqual({ baseURL: 'https://synthetic.invalid/"quoted"' })
+    expect(openCodeOpenRouterEligibilityIdentity(await captureOpenCodeOpenRouterEnvironment(provider, {}) as any, {}, null, true)).not.toBe(before)
+    expect(await captureOpenCodeOpenRouterEnvironment('{file:~/route}', { HOME: dir })).toBe('https://synthetic.invalid/"quoted"')
+    expect(await captureOpenCodeOpenRouterEnvironment('{file:{env:FILE}}', { FILE: file })).toBe('https://synthetic.invalid/"quoted"')
     const credentialProvider = { env: [`{file:${file}}`] }
     writeFileSync(file, 'CUSTOM_ROUTER\n')
     const credentialEnv = { CUSTOM_ROUTER: 'synthetic-custom' }
-    expect(hasOpenCodeOpenRouterCatalogCredential(credentialProvider, credentialEnv, null)).toBe(true)
-    const credentialIdentity = openCodeOpenRouterEligibilityIdentity(credentialProvider, credentialEnv, null)
+    expect(hasOpenCodeOpenRouterCatalogCredential(await captureOpenCodeOpenRouterEnvironment(credentialProvider, credentialEnv) as any, credentialEnv, null, true)).toBe(true)
+    const credentialIdentity = openCodeOpenRouterEligibilityIdentity(await captureOpenCodeOpenRouterEnvironment(credentialProvider, credentialEnv) as any, credentialEnv, null, true)
     writeFileSync(file, 'MISSING_ROUTER')
-    expect(hasOpenCodeOpenRouterCatalogCredential(credentialProvider, credentialEnv, null)).toBe(false)
-    expect(openCodeOpenRouterEligibilityIdentity(credentialProvider, credentialEnv, null)).not.toBe(credentialIdentity)
+    expect(hasOpenCodeOpenRouterCatalogCredential(await captureOpenCodeOpenRouterEnvironment(credentialProvider, credentialEnv) as any, credentialEnv, null, true)).toBe(false)
+    expect(openCodeOpenRouterEligibilityIdentity(await captureOpenCodeOpenRouterEnvironment(credentialProvider, credentialEnv) as any, credentialEnv, null, true)).not.toBe(credentialIdentity)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -151,51 +156,52 @@ test('auth evidence bounds regular files and rejects malformed, oversized and sp
   const file = path.join(dir, 'auth.json')
   const invalid = { type: 'api', key: '' }
   try {
-    expect(read(file)).toBeNull()
+    expect(await read(file)).toBeNull()
     writeFileSync(file, JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-key' } }))
-    expect(read(file)).toEqual({ type: 'api', key: 'synthetic-key' })
+    expect(await read(file)).toEqual({ type: 'api', key: 'synthetic-key' })
     const link = path.join(dir, 'link')
     symlinkSync(file, link)
-    expect(read(link)).toEqual(read(file))
+    expect(await read(link)).toEqual(await read(file))
     for (const content of ['{invalid', '[]', 'null', 'x'.repeat(1024 * 1024 + 1)]) {
       writeFileSync(file, content)
-      expect(read(file)).toEqual(invalid)
+      expect(await read(file)).toEqual(invalid)
     }
     rmSync(file)
     mkdirSync(file)
-    expect(read(file)).toEqual(invalid)
+    expect(await read(file)).toEqual(invalid)
     if (process.platform !== 'win32') {
       const fifo = path.join(dir, 'fifo')
       expect(spawnSync('mkfifo', [fifo]).status).toBe(0)
       // No writer: any blocking FIFO open would hang this regression.
-      expect(read(fifo)).toEqual(invalid)
-      expect(read('/dev/null')).toEqual(invalid)
-      expect(read('/dev/zero')).toEqual(invalid)
+      expect(await read(fifo)).toEqual(invalid)
+      expect(await read('/dev/null')).toEqual(invalid)
+      expect(await read('/dev/zero')).toEqual(invalid)
     }
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
 test('auth descriptor rejects stat/open replacement without blocking or exposing evidence', async () => {
   const { spyOn } = await import('bun:test')
-  const fs = await import('node:fs')
+  const fs = await import('node:fs/promises')
+  const { constants } = await import('node:fs')
   const { readOpenCodeOpenRouterCredentialEvidence: read } = await import('./OpenCodeOpenRouterFallback.js')
   const dir = mkdtempSync(path.join(os.tmpdir(), 'issue446-auth-race-'))
   const file = path.join(dir, 'auth.json')
   const replacement = path.join(dir, 'replacement')
   writeFileSync(file, '{"openrouter":{"type":"api","key":"synthetic-before"}}')
   writeFileSync(replacement, '{"openrouter":{"type":"api","key":"synthetic-after"}}')
-  const original = fs.openSync
+  const original = fs.open
   let replaced = false
-  const opened = spyOn(fs, 'openSync').mockImplementation(((target, flags, mode) => {
+  const opened = spyOn(fs, 'open').mockImplementation((async (target, flags, mode) => {
     if (target === file) {
-      expect(Number(flags) & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK)
-      fs.renameSync(replacement, file)
+      expect(Number(flags) & constants.O_NONBLOCK).toBe(constants.O_NONBLOCK)
+      await fs.rename(replacement, file)
       replaced = true
     }
     return original(target, flags, mode)
-  }) as typeof fs.openSync)
+  }) as typeof fs.open)
   try {
-    expect(read(file)).toEqual({ type: 'api', key: '' })
+    expect(await read(file)).toEqual({ type: 'api', key: '' })
     expect(replaced).toBe(true)
   } finally { opened.mockRestore(); rmSync(dir, { recursive: true, force: true }) }
 })

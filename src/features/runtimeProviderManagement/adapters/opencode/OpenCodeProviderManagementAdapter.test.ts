@@ -18,6 +18,18 @@ import type {
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { ProviderManagementError, ProviderManagementResult } from '../../domain/types.js'
 
+/** Phase-budget tests inject absent authority files so their 10–20 ms timers
+ * measure host/HTTP/cleanup behavior, independently of filesystem scheduling.
+ * Authority validation and its deadlines use real files in the regressions below. */
+async function withAbsentAuthorityFiles(run: () => Promise<void>): Promise<void> {
+  const { spyOn } = await import('bun:test')
+  const authority = await import('../../../../services/opencode/OpenCodeAuthorityFile.js')
+  const read = spyOn(authority, 'readOpenCodeAuthorityFile').mockImplementation(async () => {
+    throw Object.assign(new Error('fixture authority absent'), { code: 'ENOENT' })
+  })
+  try { await run() } finally { read.mockRestore() }
+}
+
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
   return {
     detected: true,
@@ -349,7 +361,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
-  test('bounds settings host preparation after successful inventory and propagates cancellation', async () => {
+  test('bounds settings host preparation after successful inventory and propagates cancellation', async () => withAbsentAuthorityFiles(async () => {
     let hostSignal: AbortSignal | undefined
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
@@ -380,9 +392,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     } finally {
       if (watchdog) clearTimeout(watchdog)
     }
-  })
+  }))
 
-  test('releases a settings host arriving after cancellation without starting HTTP or retaining a lease', async () => {
+  test('releases a settings host arriving after cancellation without starting HTTP or retaining a lease', async () => withAbsentAuthorityFiles(async () => {
     const released: string[] = []
     let retained = 0
     let clients = 0
@@ -408,9 +420,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(released).toEqual([host().hostKey])
     expect(retained).toBe(0)
     expect(clients).toBe(0)
-  })
+  }))
 
-  test('settings skips unrelated eviction and drains lease release before returning a timeout', async () => {
+  test('settings skips unrelated eviction and drains lease release before returning a timeout', async () => withAbsentAuthorityFiles(async () => {
     let releaseFinished = false
     let evicted = false
     let retained = 0
@@ -448,7 +460,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(retained).toBe(1)
     expect(released).toBe(1)
     expect(evicted).toBe(false)
-  })
+  }))
 
   for (const hasInventoryModels of [true, false]) {
     test(`settings marks partial HTTP data degraded without inferring missing auth (inventory models: ${hasInventoryModels})`, async () => {
@@ -5991,7 +6003,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.diagnostics).toContain('OpenCode host did not become healthy')
   })
 
-  test('does not fail the view when host release fails', async () => {
+  test('fails closed when host release fails', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory(),
@@ -6017,9 +6029,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     const result = await adapter.loadView('opencode')
 
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.value.runtime.state).toBe('ready')
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.code).toBe('runtime-unhealthy')
   })
 
   test('loads provider-scoped models lazily with query filtering', async () => {
@@ -8055,7 +8066,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
   })
 
   for (const phaseCase of ['slow host succeeds', 'slow instance succeeds', 'instance is bounded', 'query is bounded', 'host is bounded', 'overall rejects late publication'] as const) {
-    test(`catalog phase budget: ${phaseCase}`, async () => {
+    test(`catalog phase budget: ${phaseCase}`, async () => withAbsentAuthorityFiles(async () => {
       let requestSignal: AbortSignal | undefined
       let releaseCount = 0
       let providersRead = 0
@@ -8144,7 +8155,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
       }
       expect(releaseCount).toBe(phaseCase === 'host is bounded' ? 0 : 1)
-    })
+    }))
   }
 
   test('keeps a late catalog write on symlink target A out of retargeted project B', async () => {
@@ -9530,3 +9541,238 @@ for (const finalizer of ['lease', 'host'] as const) {
     } finally { read.mockRestore(); await rm(projectPath, { recursive: true, force: true }) }
   })
 }
+
+for (const stage of ['lease', 'host', 'both'] as const) {
+  test.each(['pending', 'reject', 'throw'])(`Settings independently bounds ${stage} cleanup: %s`, async failure => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-cleanup-budget-'))
+    const snapshot = inventory({ projectPath: root })
+    snapshot.profile!.env = { HOME: root, XDG_CONFIG_HOME: root }
+    let leases = 0, hosts = 0
+    let rejectLate!: (error: Error) => void
+    const late = new Promise<void>((_, reject) => { rejectLate = reject })
+    // Also observed when the fixture selects a synchronous failure instead.
+    void late.catch(() => {})
+    const fail = () => {
+      if (failure === 'throw') throw new Error('synthetic-private-release')
+      return failure === 'reject' ? Promise.reject(new Error('synthetic-private-release')) : late
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      cleanupTimeoutMs: 10, viewTimeoutMs: 100,
+      inventoryService: { probe: async () => snapshot },
+      hostManager: {
+        ensureHost: async () => host(), retainHostLease: async () => {},
+        releaseHostLease: () => { leases++; return stage === 'host' ? Promise.resolve() : fail() },
+        releaseHost: () => { hosts++; return stage === 'lease' ? Promise.resolve() : fail() },
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([adapter.loadView('opencode'), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Settings failed to settle')), 500)
+      })])
+      expect(result.ok).toBe(false)
+      expect(leases).toBe(1)
+      expect(hosts).toBe(1)
+      expect(JSON.stringify(result)).not.toContain('synthetic-private-release')
+      rejectLate(new Error('synthetic-late-release'))
+      await new Promise(resolve => setTimeout(resolve, 1))
+      expect(leases).toBe(1)
+      expect(hosts).toBe(1)
+    } finally { if (timer) clearTimeout(timer); rejectLate(new Error('fixture-end')); await rm(root, { recursive: true, force: true }) }
+  })
+}
+
+for (const stage of ['enter', 'leave']) {
+  test.each(['throw', 'reject'])(`Settings contains ${stage} instrumentation failure and revalidates after release: %s`, async failure => {
+    const { spyOn } = await import('bun:test')
+    const filesystem = await import('node:fs/promises')
+    const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-observability-'))
+    const config = path.join(root, 'opencode.json')
+    await writeFile(config, '{}')
+    const snapshot = inventory({ projectPath: root })
+    snapshot.profile!.env = { HOME: root, XDG_CONFIG_HOME: root }
+    let leases = 0, hosts = 0, finalReads = 0
+    const original = filesystem.open
+    const read = spyOn(filesystem, 'open').mockImplementation(async (...args: Parameters<typeof filesystem.open>) => {
+      if (hosts && args[0] === config) finalReads++
+      return original(...args)
+    })
+    const fail = () => {
+      if (failure === 'throw') throw new Error('synthetic-observability-secret')
+      return Promise.reject(new Error('synthetic-observability-secret'))
+    }
+    const inventoryModule = await import('../../../../services/opencode/OpenCodeInventoryService.js')
+    const tracker = spyOn(inventoryModule, 'createOpenCodeInventoryProbeProgressTracker').mockImplementation(() => ({
+        enterStep: ((label: string) => {
+          if (label !== 'release settings host lease') return () => {}
+          if (stage === 'enter') return fail()
+          return fail
+        }) as never,
+        snapshot: () => ({ elapsedMs: 0, currentStep: null, currentStepElapsedMs: null, completedSteps: [] }),
+      }))
+    const adapter = new OpenCodeProviderManagementAdapter({
+      cleanupTimeoutMs: 200,
+      inventoryService: { probe: async () => snapshot },
+      hostManager: {
+        ensureHost: async () => host(), retainHostLease: async () => {},
+        releaseHostLease: async () => { leases++ },
+        releaseHost: async () => { hosts++; await writeFile(config, '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}') },
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    try {
+      const result = await adapter.loadView({ runtimeId: 'opencode', projectPath: root })
+      expect(result.ok).toBe(false)
+      expect(leases).toBe(1)
+      expect(hosts).toBe(1)
+      expect(finalReads).toBeGreaterThan(0)
+      expect(JSON.stringify(result)).not.toContain('synthetic-observability-secret')
+    } finally { tracker.mockRestore(); read.mockRestore(); await rm(root, { recursive: true, force: true }) }
+  })
+}
+
+for (const target of ['settings', 'directory', 'models'] as const) {
+  test.each(['credential-remove', 'restriction', 'file-env', 'HOME', 'XDG_CONFIG_HOME', 'OPENCODE_CONFIG', 'irrelevant', 'key-order'])
+  (`retained prepared profile revalidates current runtime for ${target}: %s`, async mutation => {
+    const { OpenCodeProfileManager, resolveOpenCodeProfileScope } = await import('../../../../services/opencode/OpenCodeProfileManager.js')
+    const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-fresh-runtime-'))
+    const names = ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'CLAUDE_MULTIMODEL_DATA_HOME', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
+      'ISSUE446_CUSTOM_KEY', 'ISSUE446_ROUTE', 'ISSUE446_FILE', 'ISSUE446_IRRELEVANT']
+    const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
+    const config = path.join(root, 'opencode.json')
+    const key = path.join(root, 'key')
+    await writeFile(key, 'synthetic-file')
+    const provider = { whitelist: ['{env:ISSUE446_ROUTE}'], options: { apiKey: mutation === 'file-env' ? '{file:{env:ISSUE446_FILE}}' : '{env:ISSUE446_CUSTOM_KEY}' } }
+    await writeFile(config, JSON.stringify({ provider: { openrouter: provider } }))
+    Object.assign(process.env, { HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: path.join(root, 'source-data'),
+      CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app'), OPENCODE_CONFIG_CONTENT: '{}',
+      ISSUE446_CUSTOM_KEY: 'synthetic-key', ISSUE446_ROUTE: 'openrouter/free', ISSUE446_FILE: key })
+    delete process.env.OPENCODE_CONFIG
+    try {
+      const scope = await resolveOpenCodeProfileScope({ projectPath: root, purpose: 'catalog', selectedModel: 'openrouter/openrouter/free' })
+      const profile = await new OpenCodeProfileManager().prepareProfile(root, { profileScope: scope })
+      const retained = { ...profile.env }
+      const snapshot = inventory({ projectPath: root, profile, models: [] })
+      let mutate = true, reads = 0, releases = 0
+      const adapter = new OpenCodeProviderManagementAdapter({
+        ...catalogIdentityDependencies(),
+        inventoryService: { probe: async () => snapshot },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => { releases++ } },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+          getProviders: async () => {
+            reads++
+            if (mutate) {
+              if (mutation === 'credential-remove') delete process.env.ISSUE446_CUSTOM_KEY
+              if (mutation === 'restriction') process.env.ISSUE446_ROUTE = 'other'
+              if (mutation === 'file-env') process.env.ISSUE446_FILE = path.join(root, 'missing')
+              if (mutation === 'HOME' || mutation === 'XDG_CONFIG_HOME') process.env[mutation] = path.join(root, 'changed')
+              if (mutation === 'OPENCODE_CONFIG') process.env.OPENCODE_CONFIG = path.join(root, 'missing')
+              if (mutation === 'irrelevant') process.env.ISSUE446_IRRELEVANT = 'synthetic-irrelevant'
+              if (mutation === 'key-order') await writeFile(config, JSON.stringify({ provider: { openrouter: { options: provider.options, whitelist: provider.whitelist } } }))
+            }
+            return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+          },
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+      const load = () => target === 'settings' ? adapter.loadView({ runtimeId: 'opencode', projectPath: root })
+        : target === 'directory' ? adapter.loadDirectory({ runtimeId: 'opencode', projectPath: root })
+          : adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath: root })
+      const result = await load()
+      expect(result.ok).toBe(mutation === 'irrelevant' || mutation === 'key-order')
+      expect(releases).toBe(1)
+      expect(profile.env).toEqual(retained)
+      expect(JSON.stringify(result)).not.toContain('synthetic-key')
+      expect(JSON.stringify(result)).not.toContain('synthetic-file')
+      // Restore authority and prove a rejected response never seeds a reusable cache.
+      mutate = false
+      Object.assign(process.env, { HOME: root, XDG_CONFIG_HOME: root, ISSUE446_CUSTOM_KEY: 'synthetic-key',
+        ISSUE446_ROUTE: 'openrouter/free', ISSUE446_FILE: key })
+      delete process.env.OPENCODE_CONFIG
+      expect((await load()).ok).toBe(true)
+      expect(reads).toBe(target === 'directory' && (mutation === 'irrelevant' || mutation === 'key-order') ? 1 : 2)
+    } finally {
+      for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name] }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}
+
+test('stalled regular authority stat leaves Settings deadline and both releases runnable', async () => {
+  const { spyOn } = await import('bun:test')
+  const filesystem = await import('node:fs/promises')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-settings-stalled-file-'))
+  const config = path.join(root, 'opencode.json')
+  await writeFile(config, '{}')
+  const snapshot = inventory({ projectPath: root })
+  snapshot.profile!.env = { HOME: root, XDG_CONFIG_HOME: root }
+  let leases = 0, hosts = 0, stalled = 0
+  let rejectLate!: (error: Error) => void
+  const pendingStat = new Promise<never>((_, reject) => { rejectLate = reject })
+  void pendingStat.catch(() => {})
+  const original = filesystem.stat
+  const read = spyOn(filesystem, 'stat').mockImplementation(((file, ...args) => {
+    if (leases && file === config) { stalled++; return pendingStat }
+    return (original as Function)(file, ...args)
+  }) as typeof filesystem.stat)
+  const adapter = new OpenCodeProviderManagementAdapter({
+    cleanupTimeoutMs: 20, viewTimeoutMs: 100,
+    inventoryService: { probe: async () => snapshot },
+    hostManager: {
+      ensureHost: async () => host(), retainHostLease: async () => {},
+      releaseHostLease: async () => { leases++ },
+      releaseHost: async () => { hosts++ },
+    },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [], default: {} }),
+      getProviders: async () => ({ all: [], connected: [], default: {} }),
+      getProviderAuth: async () => ({}),
+    }) },
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([adapter.loadView({ runtimeId: 'opencode', projectPath: root }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('blocked Settings deadline')), 500) })])
+    expect(result.ok).toBe(false)
+    expect(stalled).toBeGreaterThan(0)
+    expect(leases).toBe(1)
+    expect(hosts).toBe(1)
+    rejectLate(new Error('synthetic-late-stat'))
+    await new Promise(resolve => setTimeout(resolve, 1))
+  } finally { if (timer) clearTimeout(timer); rejectLate(new Error('fixture-end')); read.mockRestore(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('Settings bounds failed-retain rollback and still releases its host once', async () => {
+  let leases = 0, hosts = 0
+  let settle!: () => void
+  const late = new Promise<void>(resolve => { settle = resolve })
+  const adapter = new OpenCodeProviderManagementAdapter({
+    cleanupTimeoutMs: 10,
+    inventoryService: { probe: async () => inventory() },
+    hostManager: {
+      ensureHost: async () => host(),
+      retainHostLease: async () => { throw new Error('synthetic-retain-failure') },
+      releaseHostLease: async () => { leases++; await late },
+      releaseHost: async () => { hosts++ },
+    },
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([adapter.loadView('opencode'), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('rollback did not settle')), 500)
+    })])
+    expect(result.ok).toBe(false)
+    expect(leases).toBe(1)
+    expect(hosts).toBe(1)
+  } finally { if (timer) clearTimeout(timer); settle() }
+})

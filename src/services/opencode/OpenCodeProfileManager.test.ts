@@ -1,5 +1,6 @@
 import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import * as fs from 'node:fs'
+import * as fs from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -177,7 +178,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
   test('file-backed OpenRouter launch authority resolves privately and rejects content drift', async () => {
     const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
     const { refreshSelectedProfileAuthority } = await import('./OpenCodeSelectedProfileAuthority.js')
-    const { resolveOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
+    const { captureOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
     const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
     const projectPath = path.join(tempDir, 'router-file-authority')
     await mkdir(projectPath)
@@ -191,7 +192,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const scopeInput = { projectPath, purpose: 'launch_runtime' as const, selectedModel, env }
     const scope = await resolveOpenCodeProfileScope(scopeInput)
     const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
-    const live = resolveOpenCodeOpenRouterEnvironment(profile.managedConfig, profile.env)
+    const live = await captureOpenCodeOpenRouterEnvironment(profile.managedConfig, profile.env)
     const expected = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
       effectiveConfigFingerprint: profile.managedConfigFingerprint })
     const diagnostics: unknown[] = []
@@ -431,13 +432,13 @@ describe('OpenCodeProfileManager project behavior contract', () => {
   test('OpenRouter reread rejects EACCES without exposing filesystem error details', async () => {
     const projectPath = path.join(tempDir, 'router-eacces')
     await mkdir(projectPath, { recursive: true })
-    const original = fs.statSync
-    const read = spyOn(fs, 'statSync').mockImplementation(((file: unknown, ...args: unknown[]) => {
+    const original = fs.stat
+    const read = spyOn(fs, 'stat').mockImplementation((async (file: unknown, ...args: unknown[]) => {
       if (String(file) === path.join(projectPath, 'opencode.json')) {
         throw Object.assign(new Error('private-error-detail'), { code: 'EACCES' })
       }
       return (original as Function)(file, ...args)
-    }) as typeof fs.statSync)
+    }) as typeof fs.stat)
     try {
       await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, { ...process.env, OPENCODE_CONFIG_CONTENT: '{}' }))
         .rejects.toThrow('OpenRouter effective configuration could not be read')
@@ -3805,21 +3806,19 @@ test('source configuration uses bounded descriptor validation for special files 
   const replacement = path.join(root, 'replacement')
   const env = { HOME: root, XDG_CONFIG_HOME: root, OPENCODE_CONFIG: file }
   const read = () => readOpenCodeEffectiveOpenRouterConfig(root, env)
-  const originalOpen = fs.openSync
-  const originalRead = fs.readSync
+  const originalOpen = fs.open
   let opens = 0, reads = 0, replace = false
-  const opened = spyOn(fs, 'openSync').mockImplementation(((target, flags, mode) => {
+  const opened = spyOn(fs, 'open').mockImplementation((async (target, flags, mode) => {
     if (target === file) {
       opens++
-      if (!(Number(flags) & fs.constants.O_NONBLOCK)) throw new Error('blocking open forbidden')
-      if (replace) fs.renameSync(replacement, file)
+      if (!(Number(flags) & constants.O_NONBLOCK)) throw new Error('blocking open forbidden')
+      if (replace) await fs.rename(replacement, file)
     }
-    return originalOpen(target, flags, mode)
-  }) as typeof fs.openSync)
-  const content = spyOn(fs, 'readSync').mockImplementation(((...args) => {
-    reads++
-    return (originalRead as Function)(...args)
-  }) as typeof fs.readSync)
+    const handle = await originalOpen(target, flags, mode)
+    const originalRead = handle.read.bind(handle)
+    handle.read = ((...args: unknown[]) => { reads++; return (originalRead as Function)(...args) }) as typeof handle.read
+    return handle
+  }) as typeof fs.open)
   try {
     await writeFile(file, '{}')
     expect(await read()).toEqual({})
@@ -3851,7 +3850,116 @@ test('source configuration uses bounded descriptor validation for special files 
     expect(await read()).toEqual({})
   } finally {
     opened.mockRestore()
-    content.mockRestore()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test.each(['credential-remove', 'restriction', 'source', 'irrelevant'])
+('selected prepared OpenRouter refresh revalidates current runtime after evidence: %s', async mutation => {
+  const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
+  const { refreshSelectedProfileAuthority } = await import('./OpenCodeSelectedProfileAuthority.js')
+  const { captureOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
+  const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-selected-env-'))
+  const names = ['CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'CLAUDE_MULTIMODEL_DATA_HOME', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
+    'ISSUE446_SELECTED_KEY', 'ISSUE446_SELECTED_ROUTE', 'ISSUE446_SELECTED_OTHER']
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
+  Object.assign(process.env, { CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: process.execPath,
+    CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify(['-e', 'process.stdin.resume()']), HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: path.join(root, 'data'),
+    CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app'), OPENCODE_CONFIG_CONTENT: '{}',
+    ISSUE446_SELECTED_KEY: 'synthetic-selected-key', ISSUE446_SELECTED_ROUTE: 'openrouter/free' })
+  delete process.env.OPENCODE_CONFIG
+  try {
+    await writeFile(path.join(root, 'opencode.json'), JSON.stringify({ provider: { openrouter: {
+      whitelist: ['{env:ISSUE446_SELECTED_ROUTE}'], options: { apiKey: '{env:ISSUE446_SELECTED_KEY}' },
+    } } }))
+    const selectedModel = 'openrouter/openrouter/free'
+    const scope = await resolveOpenCodeProfileScope({ projectPath: root, purpose: 'launch_runtime', selectedModel })
+    const profile = await new OpenCodeProfileManager().prepareProfile(root, { profileScope: scope })
+    const live = await captureOpenCodeOpenRouterEnvironment(profile.managedConfig, profile.env)
+    const evidence = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
+      effectiveConfigFingerprint: profile.managedConfigFingerprint })
+    let mutate = false, built = 0
+    const rejections: unknown[] = []
+    const refresh = () => refreshSelectedProfileAuthority({ host: { profile, baseUrl: 'http://synthetic.invalid' } as never,
+      selectedModel, expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint, onRejection: value => rejections.push(value),
+    }, {
+      clientFactory: { create: () => ({ getConfig: async () => live,
+        listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME!),
+      }) as never },
+      mcpManager: { ensureAppMcp: async () => ({ summary: { matchedServerName: 'agent-teams', connected: true } }) as never },
+      buildEvidence: async input => {
+        built++
+        const result = await buildOpenCodeExpectedBehaviorEvidence(input)
+        if (mutate) {
+          if (mutation === 'credential-remove') delete process.env.ISSUE446_SELECTED_KEY
+          if (mutation === 'restriction') process.env.ISSUE446_SELECTED_ROUTE = 'other'
+          if (mutation === 'source') process.env.OPENCODE_CONFIG = path.join(root, 'missing')
+          if (mutation === 'irrelevant') process.env.ISSUE446_SELECTED_OTHER = 'synthetic-other'
+        }
+        return result
+      },
+    })
+    expect(await refresh()).not.toBeNull()
+    mutate = true
+    const refreshed = await refresh()
+    expect(built).toBe(2)
+    expect(refreshed === null).toBe(mutation !== 'irrelevant')
+    expect(profile.env.ISSUE446_SELECTED_KEY).toBe('synthetic-selected-key')
+    expect(JSON.stringify(rejections)).not.toContain('synthetic-selected-key')
+  } finally {
+    for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name] }
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('duplicate and aliased imported/project sources retain canonical evidence and detect changes', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-source-alias-'))
+  const config = path.join(root, 'opencode.json'), alias = path.join(root, 'alias.json')
+  await writeFile(config, '{"provider":{"openrouter":{"options":{"apiKey":"synthetic-alias"},"whitelist":["openrouter/free"]}}}')
+  await symlink(config, alias)
+  try {
+    for (const source of [config, alias]) {
+      const env = { HOME: root, XDG_CONFIG_HOME: root, OPENCODE_CONFIG: source }
+      const first: string[] = [], second: string[] = []
+      const effective = await readOpenCodeEffectiveOpenRouterConfig(root, env, true, first)
+      await readOpenCodeEffectiveOpenRouterConfig(root, env, true, second)
+      expect(first.sort()).toEqual(second.sort())
+      expect(effective).toMatchObject({ options: { apiKey: 'synthetic-alias' } })
+    }
+    await writeFile(config, '{"provider":{"openrouter":{"options":{"apiKey":"synthetic-changed"}}}}')
+    expect(await readOpenCodeEffectiveOpenRouterConfig(root, { HOME: root, OPENCODE_CONFIG: alias }))
+      .toMatchObject({ options: { apiKey: 'synthetic-changed' } })
+    await rm(config)
+    await expect(readOpenCodeEffectiveOpenRouterConfig(root, { HOME: root, OPENCODE_CONFIG: alias })).rejects.toThrow('could not be read')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('production profile auth fingerprints never use unbounded reads for a FIFO source', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-profile-fingerprint-'))
+  const source = path.join(root, 'data/opencode/auth.json')
+  await mkdir(path.dirname(source), { recursive: true })
+  execFileSync('mkfifo', [source])
+  const names = ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CONFIG']
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
+  Object.assign(process.env, { HOME: root, XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
+    CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'cache'), OPENCODE_CONFIG_CONTENT: '{}' })
+  delete process.env.OPENCODE_CONFIG
+  const original = fs.readFile
+  let unsafeReads = 0
+  const unsafe = spyOn(fs, 'readFile').mockImplementation(((file: unknown, ...args: unknown[]) => {
+    if (file === source) { unsafeReads++; return Promise.reject(new Error('unbounded auth fingerprint read')) }
+    return (original as Function)(file, ...args)
+  }) as typeof fs.readFile)
+  try {
+    const profile = await new OpenCodeProfileManager().prepareProfile(root, { includeAppMcp: false })
+    expect(profile.sourceAuthFingerprint).toBeNull()
+    expect(profile.authState).not.toBe('ok')
+    expect(unsafeReads).toBe(0)
+  } finally {
+    unsafe.mockRestore()
+    for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name] }
     await rm(root, { recursive: true, force: true })
   }
 })

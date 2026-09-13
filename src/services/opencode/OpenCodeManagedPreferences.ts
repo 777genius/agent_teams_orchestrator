@@ -1,4 +1,5 @@
-import { mkdir, readFile } from 'node:fs/promises'
+import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
+import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
@@ -149,10 +150,11 @@ export async function readOpenCodeManagedRuntimePreferences(
   profileRootPath: string,
 ): Promise<OpenCodeManagedRuntimePreferences> {
   try {
-    const raw = await readFile(getOpenCodeManagedPreferencesPath(profileRootPath), 'utf8')
+    const raw = await readOpenCodeAuthorityFile(getOpenCodeManagedPreferencesPath(profileRootPath))
     return normalizePreferences(JSON.parse(raw))
-  } catch {
-    return emptyPreferences()
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPreferences()
+    throw new Error('OpenCode runtime preferences are unavailable')
   }
 }
 
@@ -160,10 +162,11 @@ export async function readOpenCodeGlobalManagedRuntimePreferences(
   dataRootPath: string,
 ): Promise<OpenCodeManagedRuntimePreferences> {
   try {
-    const raw = await readFile(getOpenCodeGlobalManagedPreferencesPath(dataRootPath), 'utf8')
+    const raw = await readOpenCodeAuthorityFile(getOpenCodeGlobalManagedPreferencesPath(dataRootPath))
     return normalizePreferences(JSON.parse(raw))
-  } catch {
-    return emptyPreferences()
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPreferences()
+    throw new Error('OpenCode runtime preferences are unavailable')
   }
 }
 

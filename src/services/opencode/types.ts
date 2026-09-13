@@ -36,6 +36,8 @@ export type OpenCodeProfileScope = {
 }
 
 export type OpenCodePreparedProfile = {
+  /** Captured during asynchronous preparation; synchronous policy never reads disk. */
+  openRouterEligibility?: Readonly<{ allowed: boolean; credential: boolean }>
   projectPath: string
   canonicalProjectPath: string
   workingDirectoryPath: string

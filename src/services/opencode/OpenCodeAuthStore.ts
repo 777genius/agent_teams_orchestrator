@@ -1,4 +1,5 @@
-import { readFile, rm } from 'node:fs/promises'
+import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
+import { rm } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import path from 'node:path'
@@ -887,7 +888,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
 
 async function readOptionalJson(filePath: string): Promise<unknown | null> {
   try {
-    const raw = await readFile(filePath, 'utf8')
+    const raw = await readOpenCodeAuthorityFile(filePath)
     if (!raw.trim()) {
       return {}
     }
@@ -899,7 +900,7 @@ async function readOptionalJson(filePath: string): Promise<unknown | null> {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
       return null
     }
-    throw error
+    throw new Error('OpenCode authentication evidence is unavailable')
   }
 }
 
@@ -911,7 +912,7 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
 
   const record = asRecord(parsed)
   if (!record) {
-    throw new Error(`OpenCode auth store is not a JSON object: ${filePath}`)
+    throw new Error('OpenCode auth store is not a JSON object')
   }
 
   const authStore: OpenCodeAuthStore = {}
@@ -1235,7 +1236,7 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
     // Compare inside the same lock used by execution, including after waiting.
     let existing: unknown
     try {
-      existing = JSON.parse(await readFile(input.authPath, 'utf8'))
+      existing = JSON.parse(await readOpenCodeAuthorityFile(input.authPath))
     } catch (error) {
       if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') {
         throw new Error('OpenCode scoped authentication store is unavailable')

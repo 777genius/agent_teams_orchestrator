@@ -2,7 +2,6 @@ import {
   OPEN_CODE_OPENROUTER_FREE_ROUTE,
   isOpenCodeOpenRouterFreeRouteAllowed,
   hasOpenCodeOpenRouterCatalogCredential,
-  readOpenCodeOpenRouterCredentialEvidence,
   isOpenCodeOpenRouterFreeRouteAllowedInEnvironment,
 } from './OpenCodeOpenRouterFallback.js'
 import {
@@ -448,7 +447,7 @@ export function buildOpenCodeModelAccessCatalogFromProvisioningSnapshot(
   return {
     managedConfig: snapshot.profile?.managedConfig,
     runtimeEnv: snapshot.profile?.env,
-    openRouterAuth: readOpenCodeOpenRouterCredentialEvidence(snapshot.profile?.managedAuthPath),
+    openRouterEligibility: snapshot.profile?.openRouterEligibility ?? { allowed: false, credential: false },
     connectedProviders: snapshot.providers?.connected ?? [],
     models: snapshot.models ?? [],
     modelMetadata: snapshot.modelMetadata,
@@ -463,7 +462,7 @@ export function buildOpenCodeModelAccessCatalogFromInventorySnapshot(
   return {
     managedConfig: snapshot.profile?.managedConfig,
     runtimeEnv: snapshot.profile?.env,
-    openRouterAuth: readOpenCodeOpenRouterCredentialEvidence(snapshot.profile?.managedAuthPath),
+    openRouterEligibility: snapshot.profile?.openRouterEligibility ?? { allowed: false, credential: false },
     connectedProviders: snapshot.connectedProviders.map(provider => provider.id),
     models: snapshot.models,
     modelMetadata: snapshot.modelMetadata,

@@ -1,4 +1,4 @@
-import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
+import { readOpenCodeAuthorityFile, readOpenCodeAuthorityFileBytes } from './OpenCodeAuthorityFile.js'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
@@ -29,11 +29,12 @@ export function applyOpenCodeOpenRouterFallback(
   selectedProviderId?: string | null,
   selectedAuthenticated = false,
   env: NodeJS.ProcessEnv = {},
+  capturedAllowed?: boolean,
 ): void {
   if (selectedProviderId !== OPEN_CODE_OPENROUTER_FREE_ROUTE.providerId || !selectedAuthenticated) return
   const providers = config.provider as Record<string, Record<string, unknown>> | undefined
   const provider = providers?.[OPEN_CODE_OPENROUTER_FREE_ROUTE.providerId]
-  if (!isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider ?? {}, env)) return
+  if (!(capturedAllowed ?? isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider ?? {}, env))) return
   const models = provider?.models as Record<string, unknown> | undefined
   if (models && Object.hasOwn(models, OPEN_CODE_OPENROUTER_FREE_ROUTE.modelId)) return
   config.provider = {
@@ -54,6 +55,7 @@ export function applyOpenCodeOpenRouterFallback(
 /** Native config substitutes {env:...} in JSON text; ${...} is literal here. */
 export function resolveOpenCodeOpenRouterEnvironment(
   value: unknown, env: NodeJS.ProcessEnv, referenceDigests?: string[],
+  capturedFiles?: ReadonlyMap<string, string>,
 ): unknown {
   try {
     const text = JSON.stringify(value)
@@ -64,13 +66,41 @@ export function resolveOpenCodeOpenRouterEnvironment(
       return replacement || ''
     }).replace(/\{file:([^}]+)\}/g, (_, name: string) => {
       const file = name.startsWith('~/') ? path.join(env.HOME || env.USERPROFILE || '', name.slice(2)) : name
-      const content = readOpenCodeAuthorityFile(file)
+      const content = capturedFiles?.get(file)
+      if (content === undefined) throw new Error()
       referenceDigests?.push(createHash('sha256').update(JSON.stringify([file, content])).digest('hex'))
       return JSON.stringify(content.trim()).slice(1, -1)
     }))
   } catch {
     throw new Error('OpenRouter configuration environment could not be resolved')
   }
+}
+
+/** Capture file evidence asynchronously before using the pure resolver. Repeated
+ * references share one descriptor read; substitution still occurs exactly once. */
+export async function captureOpenCodeOpenRouterEnvironment(
+  value: unknown, env: NodeJS.ProcessEnv, referenceDigests?: string[],
+): Promise<unknown> {
+  try {
+    const text = JSON.stringify(value)
+    if (text === undefined) return undefined
+    const expanded = text.replace(/\{env:([^}]+)\}/g, (_, name: string) => {
+      const replacement = env[name]
+      if (replacement !== undefined && typeof replacement !== 'string') throw new Error()
+      return replacement || ''
+    })
+    const files = new Map<string, string>()
+    for (const match of expanded.matchAll(/\{file:([^}]+)\}/g)) {
+      const name = match[1]!
+      const file = name.startsWith('~/') ? path.join(env.HOME || env.USERPROFILE || '', name.slice(2)) : name
+      if (!files.has(file)) {
+        const bytes = await readOpenCodeAuthorityFileBytes(file)
+        files.set(file, bytes.toString('utf8'))
+        referenceDigests?.push(createHash('sha256').update(JSON.stringify(file)).update(bytes).digest('hex'))
+      }
+    }
+    return resolveOpenCodeOpenRouterEnvironment(value, env, referenceDigests, files)
+  } catch { throw new Error('OpenRouter configuration environment could not be resolved') }
 }
 
 export function resolveOpenCodeOpenRouterRestrictions(
@@ -175,10 +205,10 @@ export function validateOpenCodeOpenRouterConfig(config: Record<string, unknown>
 }
 
 /** Read the selected materialized auth store, never infer credentials from native membership. */
-export function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): unknown {
+export async function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): Promise<unknown> {
   if (!authPath) return null
   try {
-    const store = JSON.parse(readOpenCodeAuthorityFile(authPath))
+    const store = JSON.parse(await readOpenCodeAuthorityFile(authPath))
     if (!store || typeof store !== 'object' || Array.isArray(store)) throw new Error()
     return store.openrouter ?? null
   } catch (error) {
@@ -203,6 +233,14 @@ function canonicalEvidence(value: unknown): unknown {
       .map(([key, entry]) => [key, canonicalEvidence(entry)]),
   )
   return value
+}
+
+/** Raw contract and reference states are distinct from the resolved decision. */
+export function openCodeOpenRouterRawEnvironmentIdentity(provider: unknown, env: NodeJS.ProcessEnv): string {
+  const names = [...new Set(Array.from((JSON.stringify(provider) ?? '').matchAll(/\{env:([^}]+)\}/g), match => match[1]!))].sort()
+  return createHash('sha256').update(JSON.stringify(canonicalEvidence([
+    provider, names.map(name => [name, env[name] === undefined ? 'missing' : 'present', env[name]]),
+  ]))).digest('hex')
 }
 
 /** Bind resolved decisions and credentials without putting secret values in cache keys. */

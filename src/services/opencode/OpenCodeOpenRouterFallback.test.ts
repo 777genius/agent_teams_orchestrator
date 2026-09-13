@@ -140,19 +140,19 @@ test('file references bound regular bytes and reject oversized and special files
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const { execFileSync } = await import('node:child_process')
-  const { resolveOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
+  const { captureOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
   const root = mkdtempSync(join(tmpdir(), 'issue446-reference-'))
-  const resolve = (name: string) => resolveOpenCodeOpenRouterEnvironment(`{file:${join(root, name)}}`, {})
+  const resolve = (name: string) => captureOpenCodeOpenRouterEnvironment(`{file:${join(root, name)}}`, {})
   try {
     writeFileSync(join(root, 'regular'), '  synthetic-secret\n')
-    expect(resolve('regular')).toBe('synthetic-secret')
+    expect(await resolve('regular')).toBe('synthetic-secret')
     writeFileSync(join(root, 'limit'), 'x'.repeat(1024 * 1024))
-    expect((resolve('limit') as string).length).toBe(1024 * 1024)
+    expect((await resolve('limit') as string).length).toBe(1024 * 1024)
     writeFileSync(join(root, 'oversized'), 'x'.repeat(1024 * 1024 + 1))
     execFileSync('mkfifo', [join(root, 'fifo')])
     symlinkSync('/dev/zero', join(root, 'device'))
     for (const name of ['oversized', 'fifo', 'device', '.']) {
-      expect(() => resolve(name)).toThrow('OpenRouter configuration environment could not be resolved')
+      await expect(resolve(name)).rejects.toThrow('OpenRouter configuration environment could not be resolved')
     }
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

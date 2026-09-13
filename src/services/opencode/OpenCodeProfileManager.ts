@@ -1,4 +1,4 @@
-import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
+import { readOpenCodeAuthorityFile, readOpenCodeAuthorityFileBytes, boundedOpenCodeAuthorityOperation } from './OpenCodeAuthorityFile.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
@@ -12,7 +12,6 @@ import {
   mkdir,
   readlink,
   readdir,
-  readFile,
   realpath,
   rm,
   stat,
@@ -23,12 +22,15 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   validateOpenCodeOpenRouterConfig,
+  isOpenCodeOpenRouterFreeRouteAllowed,
   applyOpenCodeOpenRouterFallback,
-  resolveOpenCodeOpenRouterRestrictions,
-  resolveOpenCodeOpenRouterEnvironment,
+  captureOpenCodeOpenRouterEnvironment,
   hasOpenCodeOpenRouterSelectedCredential,
   openCodeOpenRouterEligibilityIdentity,
+  openCodeOpenRouterRawEnvironmentIdentity,
   readOpenCodeInlineAuthContent,
+  readOpenCodeOpenRouterCredentialEvidence,
+  hasOpenCodeOpenRouterCatalogCredential,
 } from './OpenCodeOpenRouterFallback.js'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -130,12 +132,16 @@ export { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME,
 // Symbols survive in-process environment copies but are excluded from native
 // environment strings and serialized profile settings.
 const openRouterSourceEnvironment = Symbol('openRouterSourceEnvironment')
+const openRouterRuntimeEnvironment = Symbol('openRouterRuntimeEnvironment')
 type SourceEnvironment = NodeJS.ProcessEnv & {
   [openRouterSourceEnvironment]?: Readonly<NodeJS.ProcessEnv>
+  [openRouterRuntimeEnvironment]?: Readonly<NodeJS.ProcessEnv>
 }
 
 /** structuredClone omits symbols; explicitly carry the captured source authority. */
 export function copyOpenCodeOpenRouterSourceEnvironment(source: NodeJS.ProcessEnv, target: NodeJS.ProcessEnv): void {
+  const runtime = (source as SourceEnvironment)[openRouterRuntimeEnvironment]
+  if (runtime) Object.defineProperty(target, openRouterRuntimeEnvironment, { value: runtime, enumerable: true })
   if (!(source as SourceEnvironment)[openRouterSourceEnvironment]) return
   Object.defineProperty(target, openRouterSourceEnvironment, {
     value: Object.freeze(openCodeOpenRouterSourceEnvironment(source)), enumerable: true,
@@ -151,6 +157,26 @@ export function openCodeOpenRouterSourceEnvironment(env: NodeJS.ProcessEnv): Nod
     throw new Error('OpenRouter source configuration provenance is unavailable')
   }
   return { ...(source ?? scopeSourceEnvironment(env)) }
+}
+
+/** Preserve explicitly supplied source overrides, but apply every current runtime
+ * change (including deletion) since capture. Runtime changes cannot be overwritten
+ * by retained HOME/XDG/config provenance during revalidation. */
+export function freshOpenCodeOpenRouterSourceEnvironment(
+  env: NodeJS.ProcessEnv, runtimeBaseline: NodeJS.ProcessEnv,
+  currentRuntime: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  try {
+    const source = openCodeOpenRouterSourceEnvironment(env)
+    const baseline = (env as SourceEnvironment)[openRouterRuntimeEnvironment] ?? runtimeBaseline
+    const current = { ...currentRuntime }
+    for (const name of new Set([...Object.keys(baseline), ...Object.keys(current)])) {
+      if (baseline[name] === current[name]) continue
+      if (current[name] === undefined) delete source[name]
+      else source[name] = current[name]
+    }
+    return source
+  } catch { throw new Error('OpenCode configuration environment could not be captured') }
 }
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
@@ -276,7 +302,7 @@ function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function hashBuffer(value: Buffer): string {
+function hashBuffer(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
@@ -367,7 +393,7 @@ function normalizePositiveInteger(value: number | undefined): number | null {
 
 async function readFingerprint(filePath: string): Promise<string | null> {
   try {
-    const content = await readFile(filePath)
+    const content = await readOpenCodeAuthorityFileBytes(filePath)
     return hashBuffer(content)
   } catch {
     return null
@@ -664,13 +690,17 @@ async function collectBehaviorDirectoryEntries(
   relativeDir: string,
 ): Promise<string[]> {
   const absoluteDir = path.join(rootPath, relativeDir)
-  if (!(await fileExists(absoluteDir))) {
-    return []
+  try {
+    const info = await boundedOpenCodeAuthorityOperation(() => stat(absoluteDir))
+    if (!info.isDirectory()) throw new Error()
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') return []
+    throw new Error('OpenCode project behavior is unavailable')
   }
 
   const entries: string[] = []
   const walk = async (currentDir: string): Promise<void> => {
-    const dirents = await readdir(currentDir, { withFileTypes: true })
+    const dirents = await boundedOpenCodeAuthorityOperation(() => readdir(currentDir, { withFileTypes: true }))
     dirents.sort((left, right) => left.name.localeCompare(right.name))
 
     for (const dirent of dirents) {
@@ -683,12 +713,8 @@ async function collectBehaviorDirectoryEntries(
         await walk(nextPath)
         continue
       }
-      if (!dirent.isFile()) {
-        continue
-      }
-
       const relativePath = path.relative(rootPath, nextPath)
-      const content = await readFile(nextPath)
+      const content = await readOpenCodeAuthorityFileBytes(nextPath)
       entries.push(`${relativePath}:${hashBuffer(content)}`)
     }
   }
@@ -709,11 +735,12 @@ export async function collectProjectBehaviorMetadata(
 
   for (const relativePath of PROJECT_BEHAVIOR_FILES) {
     const absolutePath = path.join(projectPath, relativePath)
-    if (!(await fileExists(absolutePath))) {
-      continue
+    let content: Buffer
+    try { content = await readOpenCodeAuthorityFileBytes(absolutePath) }
+    catch (error) {
+      if (getErrnoCode(error) === 'ENOENT') continue
+      throw new Error('OpenCode project behavior is unavailable')
     }
-
-    const content = await readFile(absolutePath)
     const fingerprint = relativePath === 'opencode.json' || relativePath === 'opencode.jsonc'
       ? hashString(JSON.stringify(redactConfigIdentity(
           safeParseJSONC(content.toString('utf8')),
@@ -726,6 +753,7 @@ export async function collectProjectBehaviorMetadata(
 
   for (const relativeDir of PROJECT_BEHAVIOR_DIRS) {
     const dirEntries = await collectBehaviorDirectoryEntries(projectPath, relativeDir)
+      .catch(() => { throw new Error('OpenCode project behavior is unavailable') })
     for (const entry of dirEntries) {
       const separatorIndex = entry.indexOf(':')
       behaviorSources.add(separatorIndex >= 0 ? entry.slice(0, separatorIndex) : entry)
@@ -1551,10 +1579,11 @@ async function readSafeOpenCodeRuntimeConfigFile(
   strict = false,
   required = false,
   env: NodeJS.ProcessEnv = {},
+  referenceDigests?: string[],
 ): Promise<Record<string, unknown>> {
   let content: string
   try {
-    content = readOpenCodeAuthorityFile(filePath)
+    content = await readOpenCodeAuthorityFile(filePath)
   } catch (error) {
     if (!required && (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR')) {
       return {}
@@ -1562,17 +1591,18 @@ async function readSafeOpenCodeRuntimeConfigFile(
     if (strict) throw new Error('OpenRouter effective configuration could not be read')
     return {}
   }
-  return strict ? parseOpenRouterRuntimeConfig(content, path.dirname(filePath), env)
+  return strict ? parseOpenRouterRuntimeConfig(content, path.dirname(filePath), env, referenceDigests)
     : pickSafeOpenCodeRuntimeConfig(safeParseJSONC(content))
 }
 
-function parseOpenRouterRuntimeConfig(content: string, directory = process.cwd(), env: NodeJS.ProcessEnv = {}): Record<string, unknown> {
+function parseOpenRouterRuntimeConfig(content: string, directory = process.cwd(), env: NodeJS.ProcessEnv = {}, referenceDigests?: string[]): Record<string, unknown> {
   const errors: import('jsonc-parser').ParseError[] = []
   const parsed = parseStrictJsonc(content.replace(/^\uFEFF/, ''), errors, { allowTrailingComma: true })
   if (errors.length || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('OpenRouter effective configuration is invalid')
   }
   validateOpenCodeOpenRouterConfig(parsed)
+  referenceDigests?.push(openCodeOpenRouterRawEnvironmentIdentity(asRecord(asRecord(parsed.provider).openrouter), env))
   // Preserve references, not credential bytes, in materialized runtime settings.
   const relocated = JSON.parse(JSON.stringify(parsed).replace(/\{file:((?:\{env:[^}]+\}|[^}])+)\}/g, (_reference, name: string) => {
     const expanded = name.replace(/\{env:([^}]+)\}/g, (_, key: string) => env[key] || '')
@@ -1587,11 +1617,12 @@ function parseOpenRouterRuntimeConfig(content: string, directory = process.cwd()
 async function readSafeOpenCodeRuntimeConfigImport(
   env: NodeJS.ProcessEnv,
   strict = false,
+  referenceDigests?: string[],
 ): Promise<Record<string, unknown>> {
   let importedConfig: Record<string, unknown> = {}
   const importedFiles = await Promise.all(
     getOpenCodeConfigImportPaths(env).map(file => readSafeOpenCodeRuntimeConfigFile(file, strict, strict && !!env.OPENCODE_CONFIG?.trim()
-      && file === path.resolve(env.HOME || env.USERPROFILE || os.homedir(), env.OPENCODE_CONFIG.trim()), env)),
+      && file === path.resolve(env.HOME || env.USERPROFILE || os.homedir(), env.OPENCODE_CONFIG.trim()), env, referenceDigests)),
   )
   for (const importedFile of importedFiles) {
     importedConfig = deepMergeOpenCodeConfig(
@@ -1603,18 +1634,18 @@ async function readSafeOpenCodeRuntimeConfigImport(
   importedConfig = deepMergeOpenCodeConfig(
     importedConfig,
     strict && env.OPENCODE_CONFIG_CONTENT !== undefined
-      ? parseOpenRouterRuntimeConfig(env.OPENCODE_CONFIG_CONTENT, process.cwd(), env)
+      ? parseOpenRouterRuntimeConfig(env.OPENCODE_CONFIG_CONTENT, process.cwd(), env, referenceDigests)
       : pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env.OPENCODE_CONFIG_CONTENT)),
   )
 
   return importedConfig
 }
 
-async function readProjectOpenCodeRuntimeConfig(projectPath: string, strict = false, env: NodeJS.ProcessEnv = {}): Promise<Record<string, unknown>> {
+async function readProjectOpenCodeRuntimeConfig(projectPath: string, strict = false, env: NodeJS.ProcessEnv = {}, referenceDigests?: string[]): Promise<Record<string, unknown>> {
   let config: Record<string, unknown> = {}
   const configs = await Promise.all(
     ['opencode.json', 'opencode.jsonc'].map(name =>
-      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name), strict, false, env)),
+      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name), strict, false, env, referenceDigests)),
   )
   for (const projectConfig of configs) {
     config = deepMergeOpenCodeConfig(
@@ -1634,10 +1665,10 @@ export async function readOpenCodeEffectiveOpenRouterConfig(
 ): Promise<Record<string, unknown>> {
   const sourceEnv = openCodeOpenRouterSourceEnvironment(env)
   const directory = await canonicalizeOpenCodeProjectPath(projectPath)
-  const imported = await readSafeOpenCodeRuntimeConfigImport(sourceEnv, true)
-  const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory, true, sourceEnv))
+  const imported = await readSafeOpenCodeRuntimeConfigImport(sourceEnv, true, referenceDigests)
+  const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory, true, sourceEnv, referenceDigests))
   const provider = asRecord(asRecord(effective.provider).openrouter)
-  const resolved = resolveOpenCodeOpenRouterEnvironment(provider, sourceEnv, referenceDigests) as Record<string, unknown>
+  const resolved = await captureOpenCodeOpenRouterEnvironment(provider, sourceEnv, referenceDigests) as Record<string, unknown>
   validateOpenCodeOpenRouterConfig({ provider: { openrouter: resolved } })
   return resolveRestrictions ? resolved : provider
 }
@@ -1727,6 +1758,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
   importedRuntimeConfig: Readonly<Record<string, unknown>>
   cursorAssetsIdentity?: string | null
   runtimeEnv: Readonly<NodeJS.ProcessEnv>
+  runtimeBaseline: Readonly<NodeJS.ProcessEnv>
   managedPaths: Readonly<ReturnType<typeof resolveClaudeMultimodelPaths>>
   scopeIdentity: Readonly<{
     purpose: OpenCodeProfilePurpose
@@ -1736,6 +1768,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
   }>
   selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
   selectedOpenRouterCredential: boolean
+  selectedOpenRouterAllowed: boolean
   authoritySourceFingerprint: string
   appMcpLaunchConfig: Readonly<ResolvedAppMcpLaunchConfig> | null
 }>
@@ -1855,7 +1888,6 @@ function selectedProviderApiKeyIdentity(
     : semanticSecretIdentity('selected-provider-api-key-environment', { providerId, value })
 }
 
-const OPEN_CODE_AUTHORITY_FILE_MAX_BYTES = 1024 * 1024
 const OPEN_CODE_PROVIDER_AUTHORITY_FAMILIES = Object.freeze({
   bedrock: Object.freeze({
     providerIds: Object.freeze(['amazon-bedrock', 'aws-bedrock', 'bedrock']),
@@ -1952,6 +1984,7 @@ type OpenCodeAuthoritySourceBinding = {
   fingerprint: string
   fullyBound: boolean
   hasStaticCredential: boolean
+  resolvedOpenRouter?: Record<string, unknown>
 }
 
 function readEnvironmentValue(
@@ -1973,11 +2006,7 @@ async function bindAuthorityFile(value: string): Promise<{
   digest?: string
 }> {
   try {
-    const before = await stat(value)
-    if (!before.isFile()) return { state: 'error' }
-    if (before.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) return { state: 'error' }
-    const bytes = await readFile(value)
-    if (bytes.byteLength > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) return { state: 'error' }
+    const bytes = await readOpenCodeAuthorityFileBytes(value)
     return {
       state: 'bound',
       digest: createHash('sha256').update(bytes).digest('hex'),
@@ -1998,10 +2027,12 @@ async function bindSelectedProviderAuthoritySources(input: {
 }): Promise<OpenCodeAuthoritySourceBinding> {
   if (input.providerId === 'openrouter') {
     const referenceDigests: string[] = []
-    const resolved = resolveOpenCodeOpenRouterEnvironment(input.providerConfig, input.env, referenceDigests)
+    const resolved = await captureOpenCodeOpenRouterEnvironment(input.providerConfig, input.env, referenceDigests)
     return {
-      fingerprint: openCodeOpenRouterEligibilityIdentity(asRecord(resolved), input.env, null, true, referenceDigests),
+      fingerprint: openCodeOpenRouterEligibilityIdentity(asRecord(resolved), input.env,
+        openCodeOpenRouterRawEnvironmentIdentity(input.providerConfig, input.env), true, referenceDigests),
       fullyBound: true,
+      resolvedOpenRouter: asRecord(resolved),
       hasStaticCredential: hasOpenCodeOpenRouterSelectedCredential(asRecord(resolved), input.env, null, false, true),
     }
   }
@@ -2300,6 +2331,7 @@ async function resolveOpenCodeProfileScopeInternal(
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
 ): Promise<OpenCodeProfileScope> {
+  const runtimeBaseline = Object.freeze({ ...process.env })
   const envSnapshot = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'openrouter'
     ? openCodeOpenRouterSourceEnvironment(input.env ?? process.env)
     : scopeSourceEnvironment(input.env ?? process.env)
@@ -2337,17 +2369,18 @@ async function resolveOpenCodeProfileScopeInternal(
     }
   }
   const strictOpenRouterConfig = providerId === 'openrouter'
+  const sourceReferenceDigests: string[] = []
   const imported = strictOpenRouterConfig
-    ? await readSafeOpenCodeRuntimeConfigImport(env, true)
+    ? await readSafeOpenCodeRuntimeConfigImport(env, true, sourceReferenceDigests)
     : env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
       ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
       : await readSafeOpenCodeRuntimeConfigImport(env)
-  const project = await readProjectOpenCodeRuntimeConfig(projectPath, strictOpenRouterConfig, env)
+  const project = await readProjectOpenCodeRuntimeConfig(projectPath, strictOpenRouterConfig, env, strictOpenRouterConfig ? sourceReferenceDigests : undefined)
   const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
   if (providerId === 'openrouter') {
     // Validate against the captured environment, but retain raw config so native
     // launch performs substitution exactly once (including nested references).
-    resolveOpenCodeOpenRouterRestrictions(asRecord(asRecord(mergedRuntimeConfig.provider).openrouter), env)
+    await captureOpenCodeOpenRouterEnvironment(asRecord(asRecord(mergedRuntimeConfig.provider).openrouter), env)
   }
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
     ? isolateScopedRuntimeConfig(mergedRuntimeConfig, providerId, input.purpose)
@@ -2386,8 +2419,8 @@ async function resolveOpenCodeProfileScopeInternal(
   }
   const selectedAuthIsCredential = isValidatedStrictAuthCredential(providerId, selectedAuth.credential)
   const selectedOpenRouterCredential = providerId === 'openrouter'
-    && hasOpenCodeOpenRouterSelectedCredential(asRecord(selectedProviderConfig), env,
-      selectedAuth.credential, selectedAuthIsCredential)
+    && hasOpenCodeOpenRouterSelectedCredential(authoritySources.resolvedOpenRouter!, env,
+      selectedAuth.credential, selectedAuthIsCredential, true)
   if (isStrictAuthorityPurpose(input.purpose) && selectedAuth.identity === 'error'
     && !(providerId === 'openrouter' && selectedOpenRouterCredential
       && asRecord(asRecord(selectedProviderConfig).options).apiKey !== undefined)) {
@@ -2443,6 +2476,7 @@ async function resolveOpenCodeProfileScopeInternal(
         selectedModel: input.selectedModel.trim(),
       })
   const authoritySourceFingerprint = semanticSecretIdentity('selected-provider-authority', {
+    ...(strictOpenRouterConfig ? { sourceReferenceDigests: sourceReferenceDigests.sort() } : {}),
     sourceFingerprint: authoritySources.fingerprint,
     authlessAuthorityFingerprint,
     ...(cursorAssetsIdentity ? { cursorAssetsIdentity } : {}),
@@ -2536,11 +2570,13 @@ async function resolveOpenCodeProfileScopeInternal(
       projectPath,
       importedRuntimeConfig,
       runtimeEnv: env,
+      runtimeBaseline,
       cursorAssetsIdentity,
       managedPaths: snapshotManagedPaths,
       scopeIdentity: buildScopeIdentity(scope),
       selectedAuthCredential: selectedAuth.credential,
       selectedOpenRouterCredential,
+      selectedOpenRouterAllowed: isOpenCodeOpenRouterFreeRouteAllowed(authoritySources.resolvedOpenRouter),
       authoritySourceFingerprint,
       appMcpLaunchConfig,
     })
@@ -3314,7 +3350,7 @@ export class OpenCodeProfileManager {
       }),
     )
     applyOpenCodeOpenRouterFallback(managedConfig, policy?.scope.providerId,
-      configSnapshot?.selectedOpenRouterCredential === true, runtimeEnv)
+      configSnapshot?.selectedOpenRouterCredential === true, runtimeEnv, configSnapshot?.selectedOpenRouterAllowed)
     applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
       ?? (options.includeManagedSubscriptionPlugins === false
@@ -3631,10 +3667,25 @@ export class OpenCodeProfileManager {
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
+    let openRouterEligibility = { allowed: false, credential: false }
+    try {
+      const effective = asRecord(await captureOpenCodeOpenRouterEnvironment(
+        asRecord(asRecord(managedConfig.provider).openrouter), runtimeEnv))
+      const auth = await readOpenCodeOpenRouterCredentialEvidence(managedAuthPath)
+      openRouterEligibility = {
+        allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
+        credential: hasOpenCodeOpenRouterCatalogCredential(effective, runtimeEnv, auth, true),
+      }
+    } catch { /* Uncertain evidence stays denied. */ }
     const preparedEnv = applyOpenCodeAutoUpdatePolicy(env)
-    Object.defineProperty(preparedEnv, openRouterSourceEnvironment, {
-      value: Object.freeze({ ...runtimeEnv }), enumerable: true,
-    })
+    if (!policy || policy.scope.providerId === 'openrouter') {
+      Object.defineProperty(preparedEnv, openRouterRuntimeEnvironment, {
+        value: configSnapshot?.runtimeBaseline ?? Object.freeze({ ...process.env }), enumerable: true,
+      })
+      Object.defineProperty(preparedEnv, openRouterSourceEnvironment, {
+        value: Object.freeze({ ...runtimeEnv }), enumerable: true,
+      })
+    }
 
     return {
       projectPath: resolvedProjectPath,
@@ -3669,6 +3720,7 @@ export class OpenCodeProfileManager {
       authoritySourceFingerprint: configSnapshot?.authoritySourceFingerprint ?? null,
       authState,
       env: preparedEnv,
+      openRouterEligibility: Object.freeze(openRouterEligibility),
     }
     }, options.abortSignal)
     } finally {

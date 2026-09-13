@@ -3,12 +3,12 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
 import { buildOpenCodeLaunchProviderContract } from './OpenCodeLaunchProviderContract.js'
-import { resolveOpenCodeOpenRouterEnvironment } from './OpenCodeOpenRouterFallback.js'
+import { captureOpenCodeOpenRouterEnvironment } from './OpenCodeOpenRouterFallback.js'
 import { raceOpenCodeAbortSignal } from './OpenCodeRuntimeDeadline.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
-import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager, copyOpenCodeOpenRouterSourceEnvironment } from './OpenCodeProfileManager.js'
+import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager, copyOpenCodeOpenRouterSourceEnvironment, freshOpenCodeOpenRouterSourceEnvironment } from './OpenCodeProfileManager.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
 import type { OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
@@ -143,7 +143,7 @@ export async function refreshSelectedProfileAuthority(input: {
         // Resolve only into the detached comparison, never the returned profile.
         // Start from raw config so env/file substitution happens exactly once.
         ;(expected.provider as Record<string, unknown>).openrouter =
-          resolveOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, fileDigests)
+          await captureOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, fileDigests)
       }
       const expectedProvider = buildOpenCodeLaunchProviderContract(expected, selected.providerId)
       const expectedSelected = selectedConfig(expected)
@@ -168,7 +168,8 @@ export async function refreshSelectedProfileAuthority(input: {
         read('project_behavior', () => (deps.collectBehavior ?? collectProjectBehaviorMetadata)(profile.canonicalProjectPath, profile.env)),
         read('profile_scope', () => (deps.resolveScope ?? resolveOpenCodeProfileScope)({
           projectPath: profile.canonicalProjectPath, purpose: 'launch_runtime',
-          selectedModel: selected.raw, env: profile.env, cacheSnapshot: false,
+          selectedModel: selected.raw, env: selected.providerId === 'openrouter'
+            ? freshOpenCodeOpenRouterSourceEnvironment(profile.env, process.env) : profile.env, cacheSnapshot: false,
         })),
       ])
       phase = 'authority_checks'
@@ -230,9 +231,16 @@ export async function refreshSelectedProfileAuthority(input: {
       }), input.phaseContext?.signal)
       if (rotation && !isDeepStrictEqual(await readRotation(), rotation)) return reject({ check: 'selected_auth_identity_match' })
       input.phaseContext?.throwIfExpired()
+      if (selected.providerId === 'openrouter') {
+        const currentScope = await read('profile_scope', () => (deps.resolveScope ?? resolveOpenCodeProfileScope)({
+          projectPath: profile.canonicalProjectPath, purpose: 'launch_runtime', selectedModel: selected.raw,
+          env: freshOpenCodeOpenRouterSourceEnvironment(profile.env, process.env), cacheSnapshot: false,
+        }))
+        if (!isDeepStrictEqual(currentScope, scope)) return reject({ check: 'scope_token_match' })
+      }
       if (fileDigests.length) {
         const currentDigests: string[] = []
-        resolveOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, currentDigests)
+        await captureOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, currentDigests)
         if (!isDeepStrictEqual(currentDigests, fileDigests)) {
           return reject({ check: 'selected_config_match', fields: ['provider'] })
         }

@@ -1,3 +1,4 @@
+import { boundedOpenCodeAuthorityOperation } from '../../../../services/opencode/OpenCodeAuthorityFile.js'
 import path from 'node:path'
 import {
   OPEN_CODE_OPENROUTER_FREE_ROUTE,
@@ -5,7 +6,8 @@ import {
   hasOpenCodeOpenRouterCatalogCredential,
   readOpenCodeOpenRouterCredentialEvidence,
   openCodeOpenRouterEligibilityIdentity,
-  resolveOpenCodeOpenRouterEnvironment,
+  openCodeOpenRouterRawEnvironmentIdentity,
+  captureOpenCodeOpenRouterEnvironment,
 } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
 
 import {
@@ -60,7 +62,7 @@ import {
   canonicalizeOpenCodeProjectPath,
   readOpenCodeEffectiveOpenRouterConfig,
   getOpenCodeSourceAuthPaths,
-  openCodeOpenRouterSourceEnvironment,
+  freshOpenCodeOpenRouterSourceEnvironment,
   openCodeProfileManager,
   resolveOpenCodeProfileScope,
 } from '../../../../services/opencode/OpenCodeProfileManager.js'
@@ -245,6 +247,8 @@ type OpenCodeProviderManagementAdapterDeps = {
   inventoryTimeoutMs?: number
   /** Settings preparation and HTTP budget; cancellation must drain before CLI exit. */
   viewTimeoutMs?: number
+  /** Independent budget for each cleanup/observability stage. */
+  cleanupTimeoutMs?: number
   resolveBinaryPath?: () => string | null
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
   /** Query, model normalization, and identity-publication budget after host readiness. */
@@ -2053,10 +2057,12 @@ function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): s
 }
 
 class OpenRouterEligibilityChangedError extends Error {}
+class ProviderManagementCleanupError extends Error {}
 
 const openRouterEligibility = Symbol('openRouterEligibility')
 type OpenRouterEligibilitySnapshot = Readonly<{
   env: NodeJS.ProcessEnv
+  runtimeBaseline?: NodeJS.ProcessEnv
   auth: unknown
   identity: string
   sources?: ReadonlyArray<readonly [string, unknown]>
@@ -2068,36 +2074,29 @@ type EligibilityInventory = OpenCodeInventorySnapshot & {
   [openRouterEligibility]?: OpenRouterEligibilitySnapshot
 }
 
-function readOpenRouterCredentialSources(inventory: OpenCodeInventorySnapshot, env: NodeJS.ProcessEnv) {
+async function readOpenRouterCredentialSources(inventory: OpenCodeInventorySnapshot, env: NodeJS.ProcessEnv) {
   if (!inventory.profile) return []
-  return Array.from(new Set([
+  return Promise.all(Array.from(new Set([
     inventory.profile.globalAuthPath, ...getOpenCodeSourceAuthPaths(env),
     inventory.profile.sourceAuthPath, inventory.profile.managedAuthPath,
-  ].filter((file): file is string => !!file))).map(file =>
-    [file, readOpenCodeOpenRouterCredentialEvidence(file)] as const)
+  ].filter((file): file is string => !!file))).map(async file =>
+    [file, await readOpenCodeOpenRouterCredentialEvidence(file)] as const))
 }
 
 function eligibilitySnapshot(inventory: OpenCodeInventorySnapshot): OpenRouterEligibilitySnapshot {
   const captured = (inventory as EligibilityInventory)[openRouterEligibility]
   if (captured) return captured
-  const env = Object.freeze(openCodeOpenRouterSourceEnvironment(inventory.profile?.env ?? {}))
-  const sources = readOpenRouterCredentialSources(inventory, env)
-  const auth = sources.find(([file]) => file === inventory.profile?.managedAuthPath)?.[1] ?? null
-  const provider = asRecord(asRecord(inventory.profile?.managedConfig.provider)?.openrouter) ?? {}
-  const referenceDigests: string[] = []
-  let effective: Record<string, unknown>
-  try {
-    effective = resolveOpenCodeOpenRouterEnvironment(provider, env, referenceDigests) as Record<string, unknown>
-  } catch { effective = { whitelist: [] } }
-  return Object.freeze({ env, auth, sources, identity: openCodeOpenRouterEligibilityIdentity(effective, env, { auth, sources }, true, referenceDigests),
-    decision: Object.freeze({ allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
-      credential: hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true) }) })
+  const env = Object.freeze({ ...inventory.profile?.env })
+  const decision = inventory.profile?.openRouterEligibility ?? { allowed: false, credential: false }
+  return Object.freeze({ env, auth: null, identity: openCodeOpenRouterEligibilityIdentity({}, {}, decision, true),
+    decision: Object.freeze(decision) })
 }
 
 /** Each response and its key share one captured config/environment/auth decision. */
 async function withEffectiveOpenRouterConfig(
   inventory: OpenCodeInventorySnapshot,
   projectPath = inventory.projectPath,
+  runtimeBaseline: NodeJS.ProcessEnv = Object.freeze({ ...process.env }),
 ): Promise<OpenCodeInventorySnapshot> {
   if (!inventory.profile) return inventory
   let env: Readonly<NodeJS.ProcessEnv> = Object.freeze({})
@@ -2105,23 +2104,23 @@ async function withEffectiveOpenRouterConfig(
   let effective: Record<string, unknown>
   let rawProvider: Record<string, unknown> | undefined
   try {
-    env = Object.freeze(openCodeOpenRouterSourceEnvironment(inventory.profile.env))
-    rawProvider = await readOpenCodeEffectiveOpenRouterConfig(projectPath, env, false)
-    effective = resolveOpenCodeOpenRouterEnvironment(rawProvider, env, referenceDigests) as Record<string, unknown>
+    env = Object.freeze(freshOpenCodeOpenRouterSourceEnvironment(inventory.profile.env, runtimeBaseline))
+    rawProvider = await readOpenCodeEffectiveOpenRouterConfig(projectPath, env, false, referenceDigests)
+    effective = await captureOpenCodeOpenRouterEnvironment(rawProvider, env, referenceDigests) as Record<string, unknown>
   } catch {
     effective = { whitelist: [] }
   }
-  const sources = readOpenRouterCredentialSources(inventory, env)
+  const sources = await readOpenRouterCredentialSources(inventory, env)
   const auth = sources.find(([file]) => file === inventory.profile!.managedAuthPath)?.[1] ?? null
   const sourceIdentity = [env.HOME, env.USERPROFILE, env.XDG_CONFIG_HOME, env.XDG_DATA_HOME,
     env.OPENCODE_CONFIG, inventory.profile.sourceAuthPath, inventory.profile.globalAuthPath,
     inventory.profile.managedAuthPath, rawProvider,
     structuredClone(asRecord(inventory.profile.managedConfig.provider)?.openrouter),
-    openCodeOpenRouterEligibilityIdentity(effective, inventory.profile.env, null, true)]
+    openCodeOpenRouterRawEnvironmentIdentity(rawProvider ?? {}, env)]
   const identityForAuth = (resultingAuth: unknown, resultingSources: ReadonlyArray<readonly [string, unknown]>) =>
     openCodeOpenRouterEligibilityIdentity(effective, env,
       { auth: resultingAuth, sources: resultingSources, sourceIdentity }, true, referenceDigests)
-  const snapshot = Object.freeze({ env, auth, sources, sourceInventory: inventory,
+  const snapshot = Object.freeze({ env, runtimeBaseline, auth, sources, sourceInventory: inventory,
     identityForAuth,
     identity: identityForAuth(auth, sources),
     decision: Object.freeze({ allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
@@ -2145,7 +2144,7 @@ async function withEffectiveOpenRouterConfig(
 }
 
 async function revalidateOpenRouterEligibility(inventory: OpenCodeInventorySnapshot): Promise<void> {
-  const refreshed = await withEffectiveOpenRouterConfig(eligibilitySnapshot(inventory).sourceInventory ?? inventory, inventory.projectPath)
+  const refreshed = await withEffectiveOpenRouterConfig(eligibilitySnapshot(inventory).sourceInventory ?? inventory, inventory.projectPath, eligibilitySnapshot(inventory).runtimeBaseline)
   if (eligibilitySnapshot(refreshed).identity !== eligibilitySnapshot(inventory).identity) {
     throw new OpenRouterEligibilityChangedError('OpenRouter eligibility changed during provider loading; retry the request')
   }
@@ -3248,19 +3247,42 @@ function getModelAccessError(input: {
   return null
 }
 
+/** Instrumentation is never an owner of request or cleanup control flow. */
+function enterProviderManagementProgressStep(
+  progress: OpenCodeInventoryProbeProgressTracker | undefined, label: string,
+): () => void {
+  const observe = (operation: () => unknown) => {
+    try { void Promise.resolve(operation()).catch(() => {}) } catch { /* observability only */ }
+  }
+  try {
+    const leave = progress?.enterStep(label)
+    if (typeof leave === 'function') return () => observe(leave)
+    // Contain even an invalid tracker returning a rejected promise.
+    observe(() => leave)
+  } catch { /* observability only */ }
+  return () => {}
+}
+
 function catalogTimeoutDiagnostic(
   prefix: string,
   progress: OpenCodeInventoryProbeProgressTracker,
 ): string {
-  const snapshot = progress.snapshot()
-  let message = snapshot.currentStep
-    ? `${prefix} during ${snapshot.currentStep} (${snapshot.currentStepElapsedMs}ms)`
-    : prefix
-  if (snapshot.completedSteps.length > 0) {
-    message += `; completed: ${snapshot.completedSteps
-      .map(step => `${step.label} (${step.durationMs}ms)`).join(', ')}`
-  }
-  return message
+  try {
+    const snapshot = progress.snapshot()
+    // Trackers are injected observability and may violate their declared shape.
+    if (snapshot && typeof (snapshot as unknown as Promise<unknown>).then === 'function') {
+      void Promise.resolve(snapshot).catch(() => {})
+      return prefix
+    }
+    let message = snapshot.currentStep
+      ? `${prefix} during ${snapshot.currentStep} (${snapshot.currentStepElapsedMs}ms)`
+      : prefix
+    if (snapshot.completedSteps.length > 0) {
+      message += `; completed: ${snapshot.completedSteps
+        .map(step => `${step.label} (${step.durationMs}ms)`).join(', ')}`
+    }
+    return message
+  } catch { return prefix }
 }
 
 export class OpenCodeProviderManagementAdapter
@@ -3388,7 +3410,8 @@ export class OpenCodeProviderManagementAdapter
       })
       return lease
     } catch {
-      await hostManager.releaseHostLease?.(host.hostKey, lease).catch(() => undefined)
+      const released = await this.cleanupStage(() => hostManager.releaseHostLease?.(host.hostKey, lease))
+      if (!released) throw new ProviderManagementCleanupError(OPEN_CODE_CATALOG_FAILURE_MESSAGE)
       return null
     }
   }
@@ -3401,7 +3424,28 @@ export class OpenCodeProviderManagementAdapter
     if (!lease || !hostManager.releaseHostLease) {
       return
     }
-    try { await hostManager.releaseHostLease(host.hostKey, lease) } catch { /* best-effort lease release */ }
+    await hostManager.releaseHostLease(host.hostKey, lease)
+  }
+
+  private async cleanupStage(operation: () => unknown): Promise<boolean> {
+    try {
+      await boundedOpenCodeAuthorityOperation(async () => { await operation() }, this.deps.cleanupTimeoutMs ?? 1_000)
+      return true
+    } catch { return false }
+  }
+
+  private async releaseManagedHost(
+    hostManager: OpenCodeHostManagerLike, host: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput | null, persistent: boolean,
+    progress?: OpenCodeInventoryProbeProgressTracker, step = 'release catalog host lease',
+  ): Promise<boolean> {
+    let leave: unknown
+    const certain = await this.cleanupStage(async () => { leave = await progress?.enterStep(step) })
+    // Each stage gets its own attempt and budget, including after request expiry.
+    const leaseReleased = await this.cleanupStage(() => this.releaseProviderManagementHost(hostManager, host, lease))
+    const hostReleased = await this.cleanupStage(() => hostManager.releaseHost(host.hostKey, { keepPersistentAlive: persistent }))
+    const observed = await this.cleanupStage(() => { if (typeof leave === 'function') return leave() })
+    return certain && leaseReleased && hostReleased && observed
   }
 
   private getDirectoryCacheKey(input: {
@@ -3914,16 +3958,13 @@ export class OpenCodeProviderManagementAdapter
     let hostLease: OpenCodeHostLeaseInput | null = null
     let effectiveInventory: OpenCodeInventorySnapshot | undefined
     let authorizedInventory: OpenCodeInventorySnapshot | undefined
+    let cleanupCertain = true
     const release = async () => {
       const retained = host
       host = null
       if (!retained) return
-      const leaveReleaseStep = options.progress?.enterStep('release catalog host lease')
-      await this.releaseProviderManagementHost(hostManager, retained, hostLease)
-      await hostManager.releaseHost(retained.hostKey, {
-        keepPersistentAlive: hostLifetime === 'persistent',
-      }).catch(() => undefined)
-      leaveReleaseStep?.()
+      cleanupCertain = await this.releaseManagedHost(hostManager, retained, hostLease,
+        hostLifetime === 'persistent', options.progress)
     }
 
     try {
@@ -3945,7 +3986,7 @@ export class OpenCodeProviderManagementAdapter
       if (!inventory.detected) {
         return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
       }
-      const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
+      const leaveHostStep = enterProviderManagementProgressStep(options.progress, 'ensure managed catalog host')
       host = await hostManager.ensureHost({
         projectPath: projectPath ?? inventory.projectPath,
         preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
@@ -3956,7 +3997,7 @@ export class OpenCodeProviderManagementAdapter
         abortSignal: options.abortSignal,
       })
       leaveHostStep?.()
-      const leaveLeaseStep = options.progress?.enterStep('retain catalog host lease')
+      const leaveLeaseStep = enterProviderManagementProgressStep(options.progress, 'retain catalog host lease')
       if (hostLifetime === 'persistent') {
         hostLease = await this.retainProviderManagementHost(hostManager, host)
       }
@@ -3999,11 +4040,10 @@ export class OpenCodeProviderManagementAdapter
     } finally {
       await release()
       if (effectiveInventory) {
-        try { await revalidateOpenRouterEligibility(effectiveInventory) }
-        catch {
-          return providerManagementError(options.failureCode ?? 'runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
-        }
+        const valid = await this.cleanupStage(() => revalidateOpenRouterEligibility(effectiveInventory!))
+        cleanupCertain = valid && cleanupCertain
       }
+      if (!cleanupCertain) return providerManagementError(options.failureCode ?? 'runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
     }
   }
 
@@ -4099,7 +4139,7 @@ export class OpenCodeProviderManagementAdapter
     try {
       effectiveInventory = await withEffectiveOpenRouterConfig(inventory, request.projectPath ?? inventory.projectPath)
       deadline.throwIfExpired()
-      const leaveHost = progress.enterStep('prepare settings host')
+      const leaveHost = enterProviderManagementProgressStep(progress, 'prepare settings host')
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
@@ -4113,7 +4153,7 @@ export class OpenCodeProviderManagementAdapter
       })
       leaveHost()
       deadline.throwIfExpired()
-      const leaveLease = progress.enterStep('retain settings host lease')
+      const leaveLease = enterProviderManagementProgressStep(progress, 'retain settings host lease')
       // Reading settings must not synchronously evict unrelated persistent hosts.
       hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       leaveLease()
@@ -4122,7 +4162,7 @@ export class OpenCodeProviderManagementAdapter
         signal: deadline.signal,
         remainingMs: () => deadline.remainingMs(),
       })
-      const leaveHttp = progress.enterStep('read settings HTTP endpoints')
+      const leaveHttp = enterProviderManagementProgressStep(progress, 'read settings HTTP endpoints')
 
       liveView = await readLiveView({
           degradeOnReadFailure: true,
@@ -4136,7 +4176,7 @@ export class OpenCodeProviderManagementAdapter
       deadline.throwIfExpired()
       return { ok: true, value: liveView }
     } catch (error) {
-      if (error instanceof OpenRouterEligibilityChangedError) {
+      if (error instanceof OpenRouterEligibilityChangedError || error instanceof ProviderManagementCleanupError) {
         return providerManagementError('runtime-unhealthy', error.message, true)
       }
       const message = getTimeoutMessage() ?? (error instanceof Error ? error.message : String(error))
@@ -4154,22 +4194,12 @@ export class OpenCodeProviderManagementAdapter
       return { ok: true, value }
     } finally {
       if (host) {
-        const leaveRelease = progress.enterStep('release settings host lease')
-        try {
-          await this.releaseProviderManagementHost(hostManager, host, hostLease)
-          if (effectiveInventory) {
-            try { await revalidateOpenRouterEligibility(effectiveInventory) }
-            catch { eligibilityChanged = true }
-          }
-        } finally {
-          try { await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: true }) }
-          catch { /* best-effort host release */ }
-          finally { leaveRelease() }
-        }
+        eligibilityChanged = !await this.releaseManagedHost(hostManager, host, hostLease, true,
+          progress, 'release settings host lease')
       }
       if (effectiveInventory) {
-        try { await revalidateOpenRouterEligibility(effectiveInventory) }
-        catch { eligibilityChanged = true }
+        const valid = await this.cleanupStage(() => revalidateOpenRouterEligibility(effectiveInventory!))
+        eligibilityChanged = !valid || eligibilityChanged
       }
       if (eligibilityChanged) {
         return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE, true)
@@ -4361,7 +4391,7 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     } catch (error) {
-      if (error instanceof OpenRouterEligibilityChangedError) {
+      if (error instanceof OpenRouterEligibilityChangedError || error instanceof ProviderManagementCleanupError) {
         return providerManagementError('runtime-unhealthy', error.message, true)
       }
       const message = error instanceof Error ? error.message : String(error)
@@ -4381,16 +4411,14 @@ export class OpenCodeProviderManagementAdapter
       }
     } finally {
       if (host) {
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
-          .catch(() => undefined)
+        const released = await this.releaseManagedHost(hostManager, host, hostLease, hostLifetime === 'persistent')
         try {
-          await revalidateOpenRouterEligibility(inventory)
+          const valid = await this.cleanupStage(() => revalidateOpenRouterEligibility(inventory))
+          if (!released || !valid) throw new OpenRouterEligibilityChangedError(OPEN_CODE_CATALOG_FAILURE_MESSAGE)
           publishDirectory?.()
         } catch (error) {
           if (cacheKey) this.directoryCache.delete(cacheKey)
-          if (error instanceof OpenRouterEligibilityChangedError) {
+          if (error instanceof OpenRouterEligibilityChangedError || error instanceof ProviderManagementCleanupError) {
             return providerManagementError('runtime-unhealthy', error.message, true)
           }
           throw error
@@ -4636,7 +4664,7 @@ export class OpenCodeProviderManagementAdapter
         // Native cold startup owns the existing host budget, not the query budget.
         deadline.throwIfExpired()
         startPhaseTimeout('instance')
-        const leaveIdentityStep = progress.enterStep('verify prepared catalog identity')
+        const leaveIdentityStep = enterProviderManagementProgressStep(progress, 'verify prepared catalog identity')
         const identity = await this.readCatalogIdentity({
           projectPath: canonicalProjectPath,
           providerId,
@@ -4656,7 +4684,7 @@ export class OpenCodeProviderManagementAdapter
         // Health only proves the server is listening. Its first directory-scoped
         // request also initializes plugins/config, so do that once under the
         // startup phase, without consuming the subsequent query's budget.
-        const leaveInstanceStep = progress.enterStep('initialize catalog instance and read config providers')
+        const leaveInstanceStep = enterProviderManagementProgressStep(progress, 'initialize catalog instance and read config providers')
         const configProvidersResult = await safeRead(() => client.getConfigProviders({ initializeInstance: true }))
         leaveInstanceStep()
         if (abortController.signal.aborted) throwOpenCodeAbortReason(abortController.signal)
@@ -4665,7 +4693,7 @@ export class OpenCodeProviderManagementAdapter
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
-        const leaveHttpStep = progress.enterStep('read catalog HTTP endpoints and preferences')
+        const leaveHttpStep = enterProviderManagementProgressStep(progress, 'read catalog HTTP endpoints and preferences')
         const [providersResult, preferencesResult] = await Promise.all([
           safeRead(() => client.getProviders()),
           managedPreferencesResult,
@@ -4707,7 +4735,7 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
-        const leavePublishStep = progress.enterStep('verify catalog publish identity')
+        const leavePublishStep = enterProviderManagementProgressStep(progress, 'verify catalog publish identity')
         const publishIdentity = await this.readCatalogIdentity({
           projectPath: canonicalProjectPath,
           providerId,
@@ -5638,15 +5666,15 @@ export class OpenCodeProviderManagementAdapter
         const captured = eligibilitySnapshot(inventory)
         const removedSources = captured.sources?.map(([file, auth]) =>
           [file, authPaths.has(file) ? null : auth] as const) ?? []
-        const assertSources = (sources: ReadonlyArray<readonly [string, unknown]>) => {
+        const assertSources = async (sources: ReadonlyArray<readonly [string, unknown]>) => {
           for (const [file, expected] of sources) {
-            if (openCodeOpenRouterEligibilityIdentity({}, {}, readOpenCodeOpenRouterCredentialEvidence(file))
+            if (openCodeOpenRouterEligibilityIdentity({}, {}, await readOpenCodeOpenRouterCredentialEvidence(file))
               !== openCodeOpenRouterEligibilityIdentity({}, {}, expected)) {
               throw new OpenRouterEligibilityChangedError('OpenRouter credential authority changed; retry the request')
             }
           }
         }
-        if (providerId === 'openrouter') assertSources(removedSources)
+        if (providerId === 'openrouter') await assertSources(removedSources)
         this.invalidateDirectoryCache()
         const refreshedInventory = await this.probeInventory(
           inventoryService,
@@ -5680,15 +5708,15 @@ export class OpenCodeProviderManagementAdapter
           // adopt arbitrary observed credentials as the new authority.
           const permitted = isOpenCodeInventoryTimeoutSnapshot(refreshedInventory)
             ? [new Map(removedSources), reconciledSources] : [reconciledSources]
-          const observed = removedSources.map(([file]) =>
-            [file, readOpenCodeOpenRouterCredentialEvidence(file)] as const)
+          const observed = await Promise.all(removedSources.map(async ([file]) =>
+            [file, await readOpenCodeOpenRouterCredentialEvidence(file)] as const))
           const changes = permitted.find(candidate =>
             openCodeOpenRouterEligibilityIdentity({}, {}, observed)
               === openCodeOpenRouterEligibilityIdentity({}, {}, [...candidate]))
           if (!changes) {
             throw new OpenRouterEligibilityChangedError('OpenRouter credential authority changed; retry the request')
           }
-          assertSources([...changes])
+          await assertSources([...changes])
           authorizeCredentialTransition(changes.get(inventory.profile!.managedAuthPath) ?? null, changes)
         }
         const viewWithRefreshDiagnostics =

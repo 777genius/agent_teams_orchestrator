@@ -500,3 +500,19 @@ for (const [options, envKey, auth, allowed] of [
     expect(result.kind).toBe(allowed ? 'credentialed' : 'not_authenticated')
   })
 }
+
+test('synchronous snapshot policy consumes captured evidence without consulting authority paths', async () => {
+  const { buildOpenCodeModelAccessCatalogFromInventorySnapshot, buildOpenCodeModelAccessCatalogFromProvisioningSnapshot } =
+    await import('./OpenCodeModelAccessPolicy.js')
+  const profile = {
+    managedConfig: { provider: { openrouter: { options: { apiKey: '{file:/unreadable}' } } } },
+    env: {}, openRouterEligibility: { allowed: true, credential: true },
+    get managedAuthPath() { throw new Error('synchronous policy consulted filesystem authority') },
+  }
+  for (const input of [
+    buildOpenCodeModelAccessCatalogFromInventorySnapshot({ profile, models: [], connectedProviders: [{ id: 'openrouter' }] } as never),
+    buildOpenCodeModelAccessCatalogFromProvisioningSnapshot({ profile, models: [], providers: { connected: ['openrouter'], all: [] } } as never),
+  ]) {
+    expect(evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free', catalog: input }).launchAllowed).toBe(true)
+  }
+})
