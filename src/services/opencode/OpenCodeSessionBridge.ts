@@ -2166,6 +2166,9 @@ export class OpenCodeSessionBridge {
     },
   ): Promise<unknown> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
+      // Recheck the selected record after host/lease acquisition and inside the
+      // session operation guard, immediately before dispatch.
+      await this.assertExactSessionAuthority(record)
       const client = this.clientFactory.create(baseUrl)
       return client.answerPermission({
         requestId: params.requestId,

@@ -27,6 +27,7 @@ import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
   parseOpenCodeBridgePreconditions,
+  parseOptionalOpenCodeManifestHighWatermark,
   requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
@@ -127,7 +128,13 @@ import type {
 } from './types.js'
 
 const BRIDGE_SCHEMA_VERSION = 1
-const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
+// Manifest high watermarks are owned by the desktop app's runtime store. The
+// bridge has none of its own, so this is the value reported when there is no
+// supplied watermark to echo: a command or handshake that carries none, and the
+// runStop() 'lane belongs to another active run' early return, which answers
+// before the command preconditions are parsed and therefore reports this even
+// when the command did supply a watermark.
+const UNSPECIFIED_MANIFEST_HIGH_WATERMARK = 0
 // App-managed bootstrap deliberately bypasses the launch-time model tool-call
 // requirement for OpenCode only. Bump this when changing the injected context
 // or the candidate proof shape so the desktop app can reject stale evidence.
@@ -671,10 +678,6 @@ function asStringArray(value: unknown): string[] {
     : []
 }
 
-function asNullableNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
 function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
   if (value === undefined || value === null) {
     return []
@@ -975,7 +978,7 @@ function createRuntimePreconditionSnapshot(
   return {
     ...(overrides.confirmedStopRuntime ?? overrides.deliveryRuntime ?? createRuntimeSnapshot(snapshot)),
     runtimeStoreManifestHighWatermark:
-      overrides.runtimeStoreManifestHighWatermark ?? RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+      overrides.runtimeStoreManifestHighWatermark ?? UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
     // A capable runtime is detected by this block, never by parsing a version
     // string: an older runtime simply does not advertise one.
     processAttribution: {
@@ -3444,9 +3447,6 @@ async function runLaunch(
   if (preconditions?.expectedRunId && preconditions.expectedRunId !== runId) {
     throw new Error('OpenCode bridge expectedRunId precondition does not match command runId')
   }
-  if ((preconditions?.expectedManifestHighWatermark ?? 0) > RUNTIME_STORE_MANIFEST_HIGH_WATERMARK) {
-    throw new Error('OpenCode bridge runtime manifest high watermark precondition is stale')
-  }
   if (!preconditions?.commandLeaseId) {
     throw new Error('OpenCode strict launch requires full preconditions and commandLeaseId')
   }
@@ -4612,8 +4612,8 @@ async function runStop(
         members: {},
         warnings: [],
         diagnostics,
-        manifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
-        runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+        manifestHighWatermark: UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
+        runtimeStoreManifestHighWatermark: UNSPECIFIED_MANIFEST_HIGH_WATERMARK,
       },
     }
   }
@@ -5747,7 +5747,6 @@ async function runObserveMessageDelivery(
 async function runAnswerPermission(envelope: BridgeEnvelope) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
-  const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   const requestId = asString(body.requestId)
   const decision = asString(body.decision)
@@ -5761,6 +5760,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
+  const laneId = parseOpenCodeBridgePreconditions(body.preconditions)?.laneId ?? asString(body.laneId)
   const candidates = memberName
     ? (
       laneId
@@ -5770,7 +5770,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
         )
     )
     : (await openCodeSessionStore.list()).filter(
-      record => record.teamId === teamId && (!laneId || record.laneId === laneId),
+      record => record.teamId === teamId && (!laneId || (record.laneId ?? 'primary') === laneId),
     )
   if (!laneId && candidates.filter((candidate): candidate is OpenCodeSessionRecord => candidate !== null).length > 1) {
     throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
@@ -5779,6 +5779,14 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
   }
+  if (laneId && (record.laneId ?? 'primary') !== laneId) {
+    throw new Error('OpenCode bridge selected session laneId does not match command laneId')
+  }
+  validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: { ...createRuntimePreconditionSnapshot(snapshot), activeRunId: record.runId },
+    requireActiveRunAuthority: true,
+  })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
   const laneRecords = (await openCodeSessionStore.list()).filter(
     candidate => candidate.teamId === record.teamId && candidate.laneId === record.laneId,
@@ -6094,6 +6102,9 @@ async function handleEnvelope(
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
+      const expectedManifestHighWatermark = parseOptionalOpenCodeManifestHighWatermark(
+        envelope.body.expectedManifestHighWatermark, 'expectedManifestHighWatermark',
+      )
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       let snapshot: OpenCodeProvisioningSnapshot | null = null
       let confirmedStopRuntime: ConfirmedStopRuntime | undefined
@@ -6152,9 +6163,9 @@ async function handleEnvelope(
       }
       const identity = createBridgeServerIdentity(snapshot, {
         confirmedStopRuntime, deliveryRuntime,
-        runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
-          ? asNullableNumber(envelope.body.expectedManifestHighWatermark)
-          : undefined,
+        // Every handshake that carries the app's manifest high watermark gets it
+        // back unchanged, whatever command it negotiates.
+        runtimeStoreManifestHighWatermark: expectedManifestHighWatermark,
       })
       const handshake = {
         schemaVersion: BRIDGE_SCHEMA_VERSION,

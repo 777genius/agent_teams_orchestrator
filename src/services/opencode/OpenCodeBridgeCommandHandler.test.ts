@@ -1017,6 +1017,83 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
+  test('handshake echoes the requested manifest high watermark for every command', async () => {
+    // The app owns the manifest high watermark; the bridge only reports back
+    // whatever the handshake carried, whichever command it negotiates.
+    const record = buildRecord({
+      runId: 'run-1', selectedModel: 'openai/gpt-5.6-sol', toolApprovalMode: 'auto',
+      profileScope: { purpose: 'launch_runtime', providerId: 'openai', scopeToken: 'lane-scope',
+        configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+    })
+    openCodeSessionStore.list = async () => [record]
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeProvisioningProbe.probeRetainingHost = async () => ({
+      snapshot, host: snapshot.host, release: async () => {},
+    })
+
+    const permission = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.answerPermission',
+        teamId: 'team-a',
+        laneId: 'primary',
+        expectedRunId: 'run-1',
+        expectedManifestHighWatermark: 2,
+      }),
+    )
+
+    expect(permission.ok).toBe(true)
+    if (permission.ok) {
+      expect(permission.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(2)
+    }
+
+    const stop = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.stopTeam',
+        teamId: 'team-a',
+        laneId: 'primary',
+        runId: 'run-1',
+        expectedRunId: 'run-1',
+        expectedCapabilitySnapshotId: 'selected',
+        expectedManifestHighWatermark: 41,
+      }),
+    )
+
+    expect(stop.ok).toBe(true)
+    if (stop.ok) {
+      expect(stop.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(41)
+    }
+  })
+
+  for (const value of ['1', -1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity]) {
+    test(`rejects handshake watermark ${value} before probing or acquiring a host`, async () => {
+      let effects = 0
+      openCodeProvisioningProbe.probe = async () => { effects++; return snapshot }
+      openCodeProvisioningProbe.probeRetainingHost = async () => {
+        effects++
+        return { snapshot, host: snapshot.host, release: async () => {} }
+      }
+      for (const requiredCommand of ['opencode.answerPermission', 'opencode.launchTeam']) {
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          requiredCommand, selectedModel: 'openai/gpt-5.6-sol', expectedManifestHighWatermark: value,
+        }))
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toContain('non-negative safe integer')
+      }
+      expect(effects).toBe(0)
+    })
+  }
+
+  for (const value of [undefined, null, 0, Number.MAX_SAFE_INTEGER]) {
+    test(`accepts optional handshake watermark ${value}`, async () => {
+      openCodeProvisioningProbe.probe = async () => snapshot
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.answerPermission', expectedManifestHighWatermark: value,
+      }))
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(value ?? 0)
+    })
+  }
+
   test('uses selected scope handshake when launch commands require a capability snapshot', async () => {
     let probeCalled = false
     let probeOptions: unknown = null
@@ -7189,39 +7266,48 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(ensureSessionCalls).toBe(1)
   })
 
-  test('rejects launch before creating sessions when the runtime manifest precondition is stale', async () => {
+  test('launches with the app-owned manifest high watermark the bridge does not track', async () => {
+    // The watermark counts committed batches in the app's own runtime store.
+    // The bridge keeps no such store, so a non-zero value is evidence to echo,
+    // never a precondition to reject the launch on.
     let ensureSessionCalls = 0
-    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
         laneId: input.laneId,
         memberName: input.memberName,
         selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
       })
     }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
 
-    const result = await executeOpenCodeBridgeCommandEnvelope(
-      buildEnvelope('opencode.launchTeam', {
-        runId: 'run-stale-manifest',
-        laneId: 'secondary:opencode:bob',
-        teamId: 'team-a',
-        teamName: 'team-a',
-        projectPath: '/tmp/project',
-        selectedModel: 'openrouter/minimax-m2.5-free',
-        manifestHighWatermark: 1,
-        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
-      }),
-    )
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-app-manifest-watermark',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'openrouter/minimax-m2.5-free',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    ;(envelope.body.preconditions as Record<string, unknown>).expectedManifestHighWatermark = 41
 
-    expect(result.ok).toBe(false)
-    if (result.ok) {
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
       return
     }
-    expect(result.error.message).toContain(
-      'OpenCode bridge runtime manifest high watermark precondition is stale',
-    )
-    expect(ensureSessionCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(1)
+    expect(result.data).toMatchObject({
+      manifestHighWatermark: 41,
+      runtimeStoreManifestHighWatermark: 41,
+    })
   })
 
   test('rejects launch before creating sessions when the lane precondition targets another mixed lane', async () => {
@@ -10447,6 +10533,133 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.teamLaunchState).toBe('ready')
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.alice?.runtimePid).toBe(123)
+  })
+
+  for (const runId of ['run-other', null]) {
+    for (const nested of [false, true]) {
+      test(`rejects permission record run ${runId} with nested expectation ${nested}`, async () => {
+        openCodeProvisioningProbe.probe = async () => snapshot
+        const record = buildRecord({ runId })
+        openCodeSessionStore.get = async () => record
+        openCodeSessionStore.list = async () => [record]
+        let answers = 0
+        openCodeSessionBridge.answerPermission = async () => { answers++ }
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.answerPermission', {
+          teamId: 'team-a', laneId: 'primary', memberName: record.memberName,
+          requestId: 'perm-1', decision: 'allow',
+          ...(nested ? { runId: 'run-1', preconditions: {
+            handshakeIdentityHash: 'handshake-1', laneId: 'primary', expectedRunId: 'run-1',
+            expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: null, commandLeaseId: null, idempotencyKey: 'permission',
+          } } : { runId: 'run-1' }),
+        }))
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toContain('active run precondition is stale')
+        expect(answers).toBe(0)
+      })
+    }
+  }
+
+  for (const memberName of ['alice', undefined]) {
+    for (const scenario of ['missing', 'matching', 'wrong-store-lane', 'legacy-primary'] as const) {
+      test(`selects nested permission lane with member ${memberName}: ${scenario}`, async () => {
+        openCodeProvisioningProbe.probe = async () => snapshot
+        const laneId = scenario === 'legacy-primary' ? 'primary' : 'laneA'
+        const wrongRecord = buildRecord({ laneId: 'laneB', runId: 'run-1', memberName: 'alice' })
+        const matchingRecord = buildRecord({
+          laneId: scenario === 'legacy-primary' ? undefined : laneId,
+          runId: 'run-1', memberName: 'alice',
+        })
+        const records = scenario === 'matching' || scenario === 'legacy-primary'
+          ? [wrongRecord, matchingRecord] : [wrongRecord]
+        const lookups: string[] = []
+        openCodeSessionStore.list = async () => records
+        openCodeSessionStore.get = async (_team, lane) => {
+          lookups.push(lane)
+          return scenario === 'wrong-store-lane' ? wrongRecord
+            : records.find(record => (record.laneId ?? 'primary') === lane) ?? null
+        }
+        const answered: OpenCodeSessionRecord[] = []
+        openCodeSessionBridge.answerPermission = async record => { answered.push(record) }
+        openCodeSessionBridge.reconcileSession = (async record => ({
+          summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+        })) as typeof openCodeSessionBridge.reconcileSession
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.answerPermission', {
+          teamId: 'team-a', memberName, requestId: 'perm-1', decision: 'allow',
+          preconditions: {
+            handshakeIdentityHash: 'handshake-1', laneId, expectedRunId: 'run-1',
+            expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: 2, commandLeaseId: null, idempotencyKey: 'permission',
+          },
+        }))
+        const succeeds = scenario === 'matching' || scenario === 'legacy-primary'
+        expect(result.ok).toBe(succeeds)
+        expect(answered).toEqual(succeeds ? [matchingRecord] : [])
+        expect(lookups).toEqual(memberName ? [laneId] : [])
+        if (!result.ok) {
+          expect(result.error.message).toContain(memberName && scenario === 'wrong-store-lane'
+            ? 'selected session laneId does not match command laneId'
+            : 'No OpenCode session record found')
+        }
+        if (result.ok) expect(result.data.manifestHighWatermark).toBe(2)
+      })
+    }
+  }
+
+  test('answers a permission against a non-zero app manifest high watermark', async () => {
+    // Reproduces the live failure: after a launch the app's lane manifest
+    // watermark is >= 1, and answering a permission carried that value into a
+    // comparison against a bridge constant of 0.
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'secondary:opencode:alice',
+        memberName: 'alice',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    const answered: Array<{ requestId: string; decision: string }> = []
+    openCodeSessionBridge.answerPermission = (async (_record, input) => {
+      answered.push(input)
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        pendingPermissionRequestIds: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        requestId: 'perm-1',
+        decision: 'allow',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:alice',
+          expectedRunId: 'run-1',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: 2,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-permission-watermark',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(answered).toEqual([{ requestId: 'perm-1', decision: 'allow' }])
+    expect(result.data).toMatchObject({
+      idempotencyKey: 'idempotency-permission-watermark',
+      manifestHighWatermark: 2,
+      runtimeStoreManifestHighWatermark: 2,
+    })
   })
 
   test('keeps lane-level permission state after answering one member when another member is still blocked', async () => {
