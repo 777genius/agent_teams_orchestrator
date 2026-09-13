@@ -1,5 +1,5 @@
 import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import * as fsPromises from 'node:fs/promises'
+import * as fs from 'node:fs'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -431,13 +431,13 @@ describe('OpenCodeProfileManager project behavior contract', () => {
   test('OpenRouter reread rejects EACCES without exposing filesystem error details', async () => {
     const projectPath = path.join(tempDir, 'router-eacces')
     await mkdir(projectPath, { recursive: true })
-    const original = fsPromises.readFile
-    const read = spyOn(fsPromises, 'readFile').mockImplementation(((file: unknown, ...args: unknown[]) => {
+    const original = fs.statSync
+    const read = spyOn(fs, 'statSync').mockImplementation(((file: unknown, ...args: unknown[]) => {
       if (String(file) === path.join(projectPath, 'opencode.json')) {
-        return Promise.reject(Object.assign(new Error('private-error-detail'), { code: 'EACCES' }))
+        throw Object.assign(new Error('private-error-detail'), { code: 'EACCES' })
       }
       return (original as Function)(file, ...args)
-    }) as typeof fsPromises.readFile)
+    }) as typeof fs.statSync)
     try {
       await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, { ...process.env, OPENCODE_CONFIG_CONTENT: '{}' }))
         .rejects.toThrow('OpenRouter effective configuration could not be read')
@@ -3796,4 +3796,62 @@ test('complete Cursor wrapper uses discovered absolute CLI and owned mcptool wit
     })
     expect(output).toBe(`native:${root}:${env.XDG_CONFIG_HOME}:${env.CURSOR_CONFIG_DIR}:a b\nmanaged:c d`)
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('source configuration uses bounded descriptor validation for special files and replacement races', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-source-reader-'))
+  const file = path.join(root, 'opencode.json')
+  const replacement = path.join(root, 'replacement')
+  const env = { HOME: root, XDG_CONFIG_HOME: root, OPENCODE_CONFIG: file }
+  const read = () => readOpenCodeEffectiveOpenRouterConfig(root, env)
+  const originalOpen = fs.openSync
+  const originalRead = fs.readSync
+  let opens = 0, reads = 0, replace = false
+  const opened = spyOn(fs, 'openSync').mockImplementation(((target, flags, mode) => {
+    if (target === file) {
+      opens++
+      if (!(Number(flags) & fs.constants.O_NONBLOCK)) throw new Error('blocking open forbidden')
+      if (replace) fs.renameSync(replacement, file)
+    }
+    return originalOpen(target, flags, mode)
+  }) as typeof fs.openSync)
+  const content = spyOn(fs, 'readSync').mockImplementation(((...args) => {
+    reads++
+    return (originalRead as Function)(...args)
+  }) as typeof fs.readSync)
+  try {
+    await writeFile(file, '{}')
+    expect(await read()).toEqual({})
+    for (const kind of ['fifo', 'device', 'directory', 'oversized']) {
+      await rm(file, { recursive: true, force: true })
+      if (kind === 'fifo') execFileSync('mkfifo', [file])
+      if (kind === 'device') await symlink('/dev/zero', file)
+      if (kind === 'directory') await mkdir(file)
+      if (kind === 'oversized') await writeFile(file, ' '.repeat(1024 * 1024 + 1))
+      opens = reads = 0
+      await expect(read()).rejects.toThrow('OpenRouter effective configuration could not be read')
+      expect(opens).toBe(0)
+      expect(reads).toBe(0)
+    }
+    for (const kind of ['regular', 'fifo']) {
+      await rm(file, { force: true })
+      await writeFile(file, '{}')
+      if (kind === 'fifo') execFileSync('mkfifo', [replacement])
+      else await writeFile(replacement, '{"provider":{"openrouter":{"npm":"synthetic-replacement"}}}')
+      replace = true
+      reads = 0
+      await expect(read()).rejects.toThrow('OpenRouter effective configuration could not be read')
+      expect(reads).toBe(0)
+      replace = false
+    }
+    await rm(file)
+    await writeFile(replacement, '{}')
+    await symlink(replacement, file)
+    expect(await read()).toEqual({})
+  } finally {
+    opened.mockRestore()
+    content.mockRestore()
+    await rm(root, { recursive: true, force: true })
+  }
 })

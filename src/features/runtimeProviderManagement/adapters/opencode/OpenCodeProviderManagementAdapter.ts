@@ -3401,7 +3401,7 @@ export class OpenCodeProviderManagementAdapter
     if (!lease || !hostManager.releaseHostLease) {
       return
     }
-    await hostManager.releaseHostLease(host.hostKey, lease).catch(() => undefined)
+    try { await hostManager.releaseHostLease(host.hostKey, lease) } catch { /* best-effort lease release */ }
   }
 
   private getDirectoryCacheKey(input: {
@@ -4155,15 +4155,17 @@ export class OpenCodeProviderManagementAdapter
     } finally {
       if (host) {
         const leaveRelease = progress.enterStep('release settings host lease')
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        if (effectiveInventory) {
-          try { await revalidateOpenRouterEligibility(effectiveInventory) }
-          catch { eligibilityChanged = true }
+        try {
+          await this.releaseProviderManagementHost(hostManager, host, hostLease)
+          if (effectiveInventory) {
+            try { await revalidateOpenRouterEligibility(effectiveInventory) }
+            catch { eligibilityChanged = true }
+          }
+        } finally {
+          try { await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: true }) }
+          catch { /* best-effort host release */ }
+          finally { leaveRelease() }
         }
-        await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: true })
-          .catch(() => undefined)
-        leaveRelease()
       }
       if (effectiveInventory) {
         try { await revalidateOpenRouterEligibility(effectiveInventory) }
@@ -5668,14 +5670,26 @@ export class OpenCodeProviderManagementAdapter
             sourceStores: sourceEntries.map(([, auth]) => asRecord(auth) ? { openrouter: asRecord(auth)! } : {}),
             globalAuthPath: inventory.profile?.globalAuthPath ?? '',
           }).openrouter ?? null
-          const reconciled = isOpenCodeInventoryTimeoutSnapshot(refreshedInventory) ? null : expected
-          const changes = new Map<string, unknown>(removedSources)
-          if (inventory.profile?.managedAuthPath) changes.set(inventory.profile.managedAuthPath, reconciled)
-          if (asRecord(reconciled)?.type === 'oauth' && inventory.profile?.globalAuthPath) {
-            changes.set(inventory.profile.globalAuthPath, reconciled)
+          const reconciledSources = new Map<string, unknown>(removedSources)
+          if (inventory.profile?.managedAuthPath) reconciledSources.set(inventory.profile.managedAuthPath, expected)
+          if (asRecord(expected)?.type === 'oauth' && inventory.profile?.globalAuthPath) {
+            reconciledSources.set(inventory.profile.globalAuthPath, expected)
+          }
+          // A timeout can occur before preparation or after it reconciles auth.
+          // Match one complete trusted outcome, never mix individual sources or
+          // adopt arbitrary observed credentials as the new authority.
+          const permitted = isOpenCodeInventoryTimeoutSnapshot(refreshedInventory)
+            ? [new Map(removedSources), reconciledSources] : [reconciledSources]
+          const observed = removedSources.map(([file]) =>
+            [file, readOpenCodeOpenRouterCredentialEvidence(file)] as const)
+          const changes = permitted.find(candidate =>
+            openCodeOpenRouterEligibilityIdentity({}, {}, observed)
+              === openCodeOpenRouterEligibilityIdentity({}, {}, [...candidate]))
+          if (!changes) {
+            throw new OpenRouterEligibilityChangedError('OpenRouter credential authority changed; retry the request')
           }
           assertSources([...changes])
-          authorizeCredentialTransition(reconciled, changes)
+          authorizeCredentialTransition(changes.get(inventory.profile!.managedAuthPath) ?? null, changes)
         }
         const viewWithRefreshDiagnostics =
           refresh.postViewDiagnostics.length > 0

@@ -1,3 +1,4 @@
+import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
@@ -1553,7 +1554,7 @@ async function readSafeOpenCodeRuntimeConfigFile(
 ): Promise<Record<string, unknown>> {
   let content: string
   try {
-    content = await readFile(filePath, 'utf8')
+    content = readOpenCodeAuthorityFile(filePath)
   } catch (error) {
     if (!required && (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR')) {
       return {}

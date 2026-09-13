@@ -1,40 +1,6 @@
-import { closeSync, constants, fstatSync, openSync, readSync, statSync } from 'node:fs'
+import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
-
-/** Same 1 MiB bound as profile authority files. */
-const OPEN_CODE_AUTHORITY_FILE_MAX_BYTES = 1024 * 1024
-
-function readReferenceFile(file: string): string {
-  const before = statSync(file)
-  if (!before.isFile() || before.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
-  // Nonblocking open also closes the stat/open FIFO replacement race.
-  let fd: number
-  try { fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK) }
-  catch { throw new Error() }
-  try {
-    const opened = fstatSync(fd)
-    if (!opened.isFile() || opened.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES
-      || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error()
-    const bytes = Buffer.alloc(OPEN_CODE_AUTHORITY_FILE_MAX_BYTES + 1)
-    let length = 0
-    while (length < bytes.length) {
-      const count = readSync(fd, bytes, length, bytes.length - length, null)
-      if (!count) break
-      length += count
-    }
-    const after = fstatSync(fd)
-    const current = statSync(file)
-    if (length > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES || after.size !== opened.size
-      || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
-      || current.dev !== opened.dev || current.ino !== opened.ino) throw new Error()
-    return bytes.subarray(0, length).toString('utf8')
-  } catch {
-    throw new Error()
-  } finally {
-    closeSync(fd)
-  }
-}
 
 /** Compatibility route for OpenCode releases whose embedded models.dev omits the router. */
 export const OPEN_CODE_OPENROUTER_FREE_ROUTE = {
@@ -98,7 +64,7 @@ export function resolveOpenCodeOpenRouterEnvironment(
       return replacement || ''
     }).replace(/\{file:([^}]+)\}/g, (_, name: string) => {
       const file = name.startsWith('~/') ? path.join(env.HOME || env.USERPROFILE || '', name.slice(2)) : name
-      const content = readReferenceFile(file)
+      const content = readOpenCodeAuthorityFile(file)
       referenceDigests?.push(createHash('sha256').update(JSON.stringify([file, content])).digest('hex'))
       return JSON.stringify(content.trim()).slice(1, -1)
     }))
@@ -212,7 +178,7 @@ export function validateOpenCodeOpenRouterConfig(config: Record<string, unknown>
 export function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): unknown {
   if (!authPath) return null
   try {
-    const store = JSON.parse(readReferenceFile(authPath))
+    const store = JSON.parse(readOpenCodeAuthorityFile(authPath))
     if (!store || typeof store !== 'object' || Array.isArray(store)) throw new Error()
     return store.openrouter ?? null
   } catch (error) {

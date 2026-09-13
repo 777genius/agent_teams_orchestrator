@@ -9323,8 +9323,10 @@ for (const finalizer of ['lease', 'host']) {
   })
 }
 
-test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native-release', 'global-release', 'managed-release'])
-('forget verifies real native auth reconciliation: %s', async mutation => {
+for (const credentialType of ['api', 'oauth'] as const) {
+for (const timeout of [false, true]) {
+test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native-release', 'global-release', 'managed-release', ...(credentialType === 'oauth' ? ['partial-global', 'partial-managed'] : []), ...(timeout ? ['unreconciled'] : [])])
+(`forget verifies real native auth reconciliation (type=${credentialType}, inventory timeout=${timeout}): %s`, async mutation => {
   const { reconcileOpenCodeManagedAuthStores, readOpenCodeAuthCredential } = await import('../../../../services/opencode/OpenCodeAuthStore.js')
   const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-forget-reconcile-'))
   const snapshot = inventory({ projectPath, models: [] })
@@ -9334,7 +9336,8 @@ test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native
   profile.globalAuthPath = path.join(projectPath, 'global.json')
   profile.sourceAuthPath = path.join(projectPath, '.local/share/opencode/auth.json')
   await mkdir(path.dirname(profile.sourceAuthPath), { recursive: true })
-  const native = { type: 'api', key: 'synthetic-native' }
+  const native = credentialType === 'api' ? { type: 'api', key: 'synthetic-native' }
+    : { type: 'oauth', access: 'synthetic-access', refresh: 'synthetic-refresh', expires: 12345678900000 }
   await writeFile(profile.sourceAuthPath, JSON.stringify({ openrouter: native }))
   for (const file of [profile.managedAuthPath, profile.globalAuthPath]) await writeFile(file, '{"openrouter":{"type":"api","key":"synthetic-managed"}}')
   let probes = 0, reconciliations = 0
@@ -9343,14 +9346,23 @@ test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native
     await writeFile(file, '{"openrouter":{"type":"api","key":"synthetic-unauthorized"}}')
   }
   const adapter = new OpenCodeProviderManagementAdapter({
+    inventoryTimeoutMs: timeout ? 1_000 : undefined,
     profileManager: { listManagedAuthPaths: async () => [] },
     inventoryService: { probe: async () => {
       if (++probes > 1) {
+        if (mutation === 'unreconciled') return new Promise<OpenCodeInventorySnapshot>(() => {})
         if (mutation === 'native-action') await mutate()
         await reconcileOpenCodeManagedAuthStores({ globalAuthPath: profile.globalAuthPath!,
           managedAuthPath: profile.managedAuthPath, sourceAuthPaths: [profile.globalAuthPath!, profile.sourceAuthPath!] })
         reconciliations++
+        if (mutation.startsWith('partial-')) await writeFile(
+          mutation === 'partial-global' ? profile.globalAuthPath! : profile.managedAuthPath, '{}')
         if (mutation === 'global-action' || mutation === 'managed-action') await mutate()
+        if (timeout) {
+          // Model inventory stalls after production reconciliation has written disk.
+          // Let the adapter's real refresh deadline produce the timeout snapshot.
+          return new Promise<OpenCodeInventorySnapshot>(() => {})
+        }
       }
       return snapshot
     } },
@@ -9367,15 +9379,25 @@ test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native
   })
   try {
     const result = await adapter.forgetManagedCredential({ runtimeId: 'opencode', projectPath, providerId: 'openrouter' })
-    expect(reconciliations).toBe(1)
-    expect(result.ok).toBe(mutation === 'stable')
+    expect(reconciliations).toBe(mutation === 'unreconciled' ? 0 : 1)
+    expect(result.ok).toBe(mutation === 'stable' || mutation === 'unreconciled')
+    expect(await readOpenCodeAuthCredential({ authPath: profile.sourceAuthPath!, providerId: 'openrouter' }))
+      .toEqual(mutation.startsWith('native-') ? { type: 'api', key: 'synthetic-unauthorized' } : native)
+    if (mutation === 'unreconciled') {
+      expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' })).toBeNull()
+      expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath!, providerId: 'openrouter' })).toBeNull()
+    }
     if (mutation === 'stable') {
       expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' })).toEqual(native)
-      expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath!, providerId: 'openrouter' })).toBeNull()
+      expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath!, providerId: 'openrouter' })).toEqual(credentialType === 'oauth' ? native : null)
     }
     expect(JSON.stringify(result)).not.toContain('synthetic-unauthorized')
   } finally { await rm(projectPath, { recursive: true, force: true }) }
 })
+
+}
+
+}
 
 test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof'])
 ('OpenRouter failed replacement restores exact disk credentials: %s', async failure => {
@@ -9448,3 +9470,63 @@ test.each([false, true])('settings timeout still validates finalizer authority (
     expect(releases).toBe(1)
   } finally { await rm(projectPath, { recursive: true, force: true }) }
 })
+
+for (const finalizer of ['lease', 'host'] as const) {
+  test.each(['fifo', 'symlink-fifo', 'throw'])
+  (`settings bounded revalidation releases both finalizers once after ${finalizer}: %s`, async mutation => {
+    const fs = await import('node:fs')
+    const promises = await import('node:fs/promises')
+    const { spyOn } = await import('bun:test')
+    const { execFileSync } = await import('node:child_process')
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-bounded-finalizer-'))
+    const configPath = path.join(projectPath, 'opencode.json')
+    const fifo = path.join(projectPath, 'fifo')
+    const snapshot = inventory({ projectPath, models: [] })
+    snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+    await writeFile(configPath, '{"provider":{"openrouter":{}}}')
+    let leaseReleases = 0, hostReleases = 0, unsafeReads = 0
+    const readFile = promises.readFile
+    // Counterfactual safety: intercept the old unbounded API before it can open
+    // the real FIFO. A regression fails the count assertion, never hangs Bun.
+    const read = spyOn(promises, 'readFile').mockImplementation(((file, ...args) => {
+      if (String(file) === configPath && fs.statSync(configPath).isFIFO()) {
+        unsafeReads++
+        return Promise.reject(new Error('synthetic-unsafe-read'))
+      }
+      return (readFile as Function)(file, ...args)
+    }) as typeof promises.readFile)
+    const mutate = async () => {
+      if (mutation === 'throw') {
+        Object.defineProperty(snapshot.profile!, 'managedConfig', {
+          get() { throw new Error('synthetic-private-revalidation') },
+        })
+      } else {
+        await rm(configPath)
+        execFileSync('mkfifo', [mutation === 'fifo' ? configPath : fifo])
+        if (mutation === 'symlink-fifo') await symlink(fifo, configPath)
+      }
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      viewTimeoutMs: 100,
+      inventoryService: { probe: async () => snapshot },
+      hostManager: {
+        ensureHost: async () => host(), retainHostLease: async () => {},
+        releaseHostLease: async () => { leaseReleases++; if (finalizer === 'lease') await mutate() },
+        releaseHost: async () => { hostReleases++; if (finalizer === 'host') await mutate() },
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', models: {} }], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    try {
+      const result = await adapter.loadView({ runtimeId: 'opencode', projectPath })
+      expect(result.ok).toBe(false)
+      expect(unsafeReads).toBe(0)
+      expect(leaseReleases).toBe(1)
+      expect(hostReleases).toBe(1)
+      expect(JSON.stringify(result)).not.toContain('synthetic-private')
+    } finally { read.mockRestore(); await rm(projectPath, { recursive: true, force: true }) }
+  })
+}
