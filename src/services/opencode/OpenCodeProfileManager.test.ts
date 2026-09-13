@@ -140,6 +140,104 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('prepared OpenRouter authority refresh preserves source provenance across structured cloning', async () => {
+    const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
+    const { refreshSelectedProfileAuthority } = await import('./OpenCodeSelectedProfileAuthority.js')
+    const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
+    const projectPath = path.join(tempDir, 'router-authority')
+    await mkdir(projectPath)
+    const imported = path.join(tempDir, 'authority-import.json')
+    await writeFile(imported, '{"provider":{"openrouter":{"options":{"apiKey":"synthetic-key"}}}}')
+    const env = { ...process.env, OPENCODE_CONFIG: imported, OPENCODE_CONFIG_CONTENT: '{}' }
+    const selectedModel = 'openrouter/openrouter/free'
+    const scope = await resolveOpenCodeProfileScope({ projectPath, purpose: 'launch_runtime', selectedModel, env })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const expected = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
+      effectiveConfigFingerprint: profile.managedConfigFingerprint })
+    const diagnostics: unknown[] = []
+    const refresh = () => refreshSelectedProfileAuthority({
+      host: { profile, baseUrl: 'http://synthetic.invalid' } as never,
+      selectedModel, expectedBehaviorFingerprint: expected.expectedBehaviorFingerprint,
+      onRejection: value => diagnostics.push(value),
+    }, {
+      clientFactory: { create: () => ({ getConfig: async () => profile.managedConfig,
+        listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME!),
+      }) as never },
+      mcpManager: { ensureAppMcp: async () => ({ summary: { matchedServerName: 'agent-teams', connected: true } }) as never },
+    })
+    const refreshed = await refresh()
+    expect(diagnostics).toEqual([])
+    expect(refreshed).not.toBeNull()
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, refreshed!.env)).toMatchObject({ options: { apiKey: 'synthetic-key' } })
+    await writeFile(imported, '{"provider":{"openrouter":{"options":{"apiKey":"synthetic-rotated"}}}}')
+    expect(await refresh()).toBeNull()
+    expect(JSON.stringify(diagnostics)).not.toContain('synthetic-key')
+  })
+
+  test('file-backed OpenRouter launch authority resolves privately and rejects content drift', async () => {
+    const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
+    const { refreshSelectedProfileAuthority } = await import('./OpenCodeSelectedProfileAuthority.js')
+    const { resolveOpenCodeOpenRouterEnvironment } = await import('./OpenCodeOpenRouterFallback.js')
+    const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
+    const projectPath = path.join(tempDir, 'router-file-authority')
+    await mkdir(projectPath)
+    const keyPath = path.join(projectPath, 'key')
+    const configPath = path.join(projectPath, 'opencode.json')
+    const secret = 'synthetic-file-secret'
+    await writeFile(keyPath, secret)
+    await writeFile(configPath, JSON.stringify({ provider: { openrouter: { options: { apiKey: '{file:./key}' } } } }))
+    const env = { ...process.env, OPENCODE_CONFIG_CONTENT: '{}' }
+    const selectedModel = 'openrouter/openrouter/free'
+    const scopeInput = { projectPath, purpose: 'launch_runtime' as const, selectedModel, env }
+    const scope = await resolveOpenCodeProfileScope(scopeInput)
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const live = resolveOpenCodeOpenRouterEnvironment(profile.managedConfig, profile.env)
+    const expected = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
+      effectiveConfigFingerprint: profile.managedConfigFingerprint })
+    const diagnostics: unknown[] = []
+    let afterRead: (() => Promise<void>) | undefined
+    const refresh = () => refreshSelectedProfileAuthority({
+      host: { profile, baseUrl: 'http://synthetic.invalid' } as never,
+      selectedModel, expectedBehaviorFingerprint: expected.expectedBehaviorFingerprint, onRejection: value => diagnostics.push(value),
+    }, {
+      clientFactory: { create: () => ({ getConfig: async () => live,
+        listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME!),
+      }) as never },
+      mcpManager: { ensureAppMcp: async () => ({ summary: { matchedServerName: 'agent-teams', connected: true } }) as never },
+      buildEvidence: async input => {
+        const evidence = await buildOpenCodeExpectedBehaviorEvidence(input)
+        await afterRead?.()
+        return evidence
+      },
+    })
+    const refreshed = await refresh()
+    expect(diagnostics).toEqual([])
+    expect(refreshed).not.toBeNull()
+    expect(JSON.stringify(refreshed)).not.toContain(secret)
+    expect(JSON.stringify(scope)).not.toContain(secret)
+    expect(profile.env.OPENCODE_CONFIG_CONTENT).not.toContain(secret)
+    expect(await readFile(profile.managedAuthPath, 'utf8')).not.toContain(secret)
+    for (const changed of [secret + '-rotated', secret + '\n']) {
+      await writeFile(keyPath, changed)
+      expect(await refresh()).toBeNull()
+      await writeFile(keyPath, secret)
+      afterRead = () => writeFile(keyPath, changed)
+      expect(await refresh()).toBeNull()
+      afterRead = undefined
+      await writeFile(keyPath, secret)
+    }
+    await rm(keyPath)
+    expect(await refresh()).toBeNull()
+    await expect(resolveOpenCodeProfileScope(scopeInput)).rejects.toThrow()
+    await mkdir(keyPath) // deterministic unreadable-as-text fixture, including privileged test users
+    expect(await refresh()).toBeNull()
+    await expect(resolveOpenCodeProfileScope(scopeInput)).rejects.toThrow()
+    await writeFile(configPath, JSON.stringify({ provider: { openrouter: { options: { apiKey: '{file:bad\u0000path}' } } } }))
+    expect(await refresh()).toBeNull()
+    await expect(resolveOpenCodeProfileScope(scopeInput)).rejects.toThrow()
+    expect(JSON.stringify(diagnostics)).not.toContain(secret)
+  })
+
   test('OpenRouter refresh rereads original imports and removes deleted project settings', async () => {
     const projectPath = path.join(tempDir, 'router-provenance')
     await mkdir(projectPath)
@@ -230,6 +328,37 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const custom = await resolveOpenCodeProfileScope({ ...input, env: { ...baseEnv, CUSTOM_ROUTER_KEY: 'synthetic-custom' } })
     expect(custom.providerId).toBe('openrouter')
     await expect(resolveOpenCodeProfileScope({ ...input, env: { ...baseEnv, CUSTOM_ROUTER_KEY: ' ' } })).rejects.toThrow()
+  })
+
+  test.each(['', ' ', '{invalid'])('OpenRouter strict profiles use disk auth for native inline fallback %j', async content => {
+    const projectPath = path.join(tempDir, 'router-inline-fallback')
+    await mkdir(projectPath)
+    const env = { ...process.env, OPENCODE_CONFIG_CONTENT: '{}', OPENROUTER_API_KEY: '', OPENCODE_AUTH_CONTENT: content }
+    await upsertOpenCodeAuthCredential({ authPath: path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+      providerId: 'openrouter', credential: { type: 'api', key: 'synthetic-disk-fallback' } })
+    const input = { projectPath, selectedModel: 'openrouter/openrouter/free', purpose: 'launch_runtime' as const, env }
+    const scope = await resolveOpenCodeProfileScope(input)
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' }))
+      .toMatchObject({ type: 'api', key: 'synthetic-disk-fallback' })
+    expect(profile.env.OPENCODE_AUTH_CONTENT).toBe(content)
+    await expect(resolveOpenCodeProfileScope({ ...input, env: { ...env, OPENCODE_AUTH_CONTENT: '{}' } })).rejects.toThrow()
+  })
+
+  test('OpenRouter strict profiles reject multiple custom env names without an SDK credential', async () => {
+    const projectPath = path.join(tempDir, 'router-multiple-env')
+    await mkdir(projectPath)
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({ provider: { openrouter: { env: ['CUSTOM_ONE', 'CUSTOM_TWO'] } } }))
+    const env = { ...process.env, OPENCODE_CONFIG_CONTENT: '{}', OPENCODE_AUTH_CONTENT: '{}',
+      OPENROUTER_API_KEY: '', CUSTOM_ONE: 'synthetic-one', CUSTOM_TWO: 'synthetic-two' }
+    const input = { projectPath, selectedModel: 'openrouter/openrouter/free', purpose: 'launch_runtime' as const, env }
+    await expect(resolveOpenCodeProfileScope(input)).rejects.toThrow()
+    const scope = await resolveOpenCodeProfileScope({ ...input, env: { ...env, OPENROUTER_API_KEY: 'synthetic-sdk' } })
+    expect(scope.providerId).toBe('openrouter')
+    expect(await resolveOpenCodeProfileScope({ ...input, env: { ...env, OPENROUTER_API_KEY: 'synthetic-sdk', CUSTOM_ONE: 'ignored' } }))
+      .toEqual(scope)
+    expect(await resolveOpenCodeProfileScope({ ...input, env: { ...env, OPENROUTER_API_KEY: 'synthetic-sdk-rotated' } }))
+      .not.toEqual(scope)
   })
 
   test('does not materialize OpenRouter for legacy or disconnected selected catalog profiles', async () => {

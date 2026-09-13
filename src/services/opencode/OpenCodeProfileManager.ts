@@ -27,6 +27,7 @@ import {
   resolveOpenCodeOpenRouterEnvironment,
   hasOpenCodeOpenRouterSelectedCredential,
   openCodeOpenRouterEligibilityIdentity,
+  readOpenCodeInlineAuthContent,
 } from './OpenCodeOpenRouterFallback.js'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -130,6 +131,14 @@ export { OPEN_CODE_TEAMMATE_AGENT_NAME, OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME,
 const openRouterSourceEnvironment = Symbol('openRouterSourceEnvironment')
 type SourceEnvironment = NodeJS.ProcessEnv & {
   [openRouterSourceEnvironment]?: Readonly<NodeJS.ProcessEnv>
+}
+
+/** structuredClone omits symbols; explicitly carry the captured source authority. */
+export function copyOpenCodeOpenRouterSourceEnvironment(source: NodeJS.ProcessEnv, target: NodeJS.ProcessEnv): void {
+  if (!(source as SourceEnvironment)[openRouterSourceEnvironment]) return
+  Object.defineProperty(target, openRouterSourceEnvironment, {
+    value: Object.freeze(openCodeOpenRouterSourceEnvironment(source)), enumerable: true,
+  })
 }
 
 export function openCodeOpenRouterSourceEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -2699,9 +2708,9 @@ async function readSelectedAuthFromSources(input: {
 }> {
   let selected: Awaited<ReturnType<typeof readOpenCodeAuthCredential>> = null
   try {
-    // Native inline auth replaces the disk store. Keep its bytes in the runtime
-    // environment; the OpenRouter authority fingerprint already binds them.
-    if (input.providerId === 'openrouter' && input.env?.OPENCODE_AUTH_CONTENT !== undefined) {
+    // Successfully parsed inline auth replaces disk auth; empty/malformed text
+    // falls back to disk. Its raw bytes stay bound by the authority fingerprint.
+    if (input.providerId === 'openrouter' && readOpenCodeInlineAuthContent(input.env ?? {})) {
       return { credential: null, identity: authCredentialIdentity(input.providerId, null) }
     }
     const sourceStores = await Promise.all(input.sourcePaths.map(readOpenCodeAuthStore))

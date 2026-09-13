@@ -3,11 +3,12 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
 import { buildOpenCodeLaunchProviderContract } from './OpenCodeLaunchProviderContract.js'
+import { resolveOpenCodeOpenRouterEnvironment } from './OpenCodeOpenRouterFallback.js'
 import { raceOpenCodeAbortSignal } from './OpenCodeRuntimeDeadline.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
-import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager, copyOpenCodeOpenRouterSourceEnvironment } from './OpenCodeProfileManager.js'
 import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
 import type { OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
@@ -120,6 +121,7 @@ export async function refreshSelectedProfileAuthority(input: {
     try {
       input.phaseContext?.throwIfExpired()
       profile = structuredClone(sourceProfile)
+      copyOpenCodeOpenRouterSourceEnvironment(sourceProfile.env, profile.env)
       const original = rawEntries(profile)
       const expectedFingerprint = input.expectedBehaviorFingerprint
       const contractIdentity = input.contractConfigIdentity
@@ -135,10 +137,18 @@ export async function refreshSelectedProfileAuthority(input: {
       }
       const expected = JSON.parse(JSON.stringify(profile.managedConfig)
         .replace(/\{env:([^}]+)\}/g, (_match, name: string) => profile.env[name] || '')) as Record<string, unknown>
+      const fileDigests: string[] = []
+      const rawOpenRouter = (profile.managedConfig.provider as Record<string, unknown> | undefined)?.openrouter
+      if (selected.providerId === 'openrouter' && rawOpenRouter !== undefined) {
+        // Resolve only into the detached comparison, never the returned profile.
+        // Start from raw config so env/file substitution happens exactly once.
+        ;(expected.provider as Record<string, unknown>).openrouter =
+          resolveOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, fileDigests)
+      }
       const expectedProvider = buildOpenCodeLaunchProviderContract(expected, selected.providerId)
       const expectedSelected = selectedConfig(expected)
       const expectedPolicies = buildExpectedOpenCodeAgentPolicies(expected, profile.env.XDG_DATA_HOME)
-      if (hasFileReference(expectedProvider) || hasFileReference(expectedSelected)) {
+      if ((selected.providerId !== 'openrouter' && hasFileReference(expectedProvider)) || hasFileReference(expectedSelected)) {
         return reject({ check: 'selected_config_match', fields: ['provider'] })
       }
       const requestContext = input.phaseContext
@@ -220,6 +230,13 @@ export async function refreshSelectedProfileAuthority(input: {
       }), input.phaseContext?.signal)
       if (rotation && !isDeepStrictEqual(await readRotation(), rotation)) return reject({ check: 'selected_auth_identity_match' })
       input.phaseContext?.throwIfExpired()
+      if (fileDigests.length) {
+        const currentDigests: string[] = []
+        resolveOpenCodeOpenRouterEnvironment(rawOpenRouter, profile.env, currentDigests)
+        if (!isDeepStrictEqual(currentDigests, fileDigests)) {
+          return reject({ check: 'selected_config_match', fields: ['provider'] })
+        }
+      }
       if (input.selectedModel !== selectedModel || input.host.baseUrl !== baseUrl
         || input.host.profile !== sourceProfile || !isDeepStrictEqual(rawEntries(sourceProfile), original)
         || !isDeepStrictEqual(hostIdentity(), originalHostIdentity)

@@ -95,6 +95,23 @@ export function isOpenCodeOpenRouterCredentialOverrideUsable(
   } catch { return false }
 }
 
+/** Auth.all (OpenCode v1.18.4 / v1.18.29, src/auth/index.ts): only parsed nonempty inline
+ * content replaces disk auth. Valid JSON of an invalid shape still replaces it. */
+export function readOpenCodeInlineAuthContent(env: NodeJS.ProcessEnv): { value: unknown } | null {
+  if (!env.OPENCODE_AUTH_CONTENT) return null
+  try { return { value: JSON.parse(env.OPENCODE_AUTH_CONTENT) } }
+  catch { return null }
+}
+
+/** Native src/provider/provider.ts assigns provider.key only for a single env
+ * name. The pinned @openrouter/ai-sdk-provider 2.9.0 otherwise uses OPENROUTER_API_KEY. */
+function selectedOpenRouterEnvironment(provider: Record<string, unknown>, env: NodeJS.ProcessEnv): [string, string | undefined] | null {
+  const names = provider.env ?? ['OPENROUTER_API_KEY']
+  if (!Array.isArray(names) || names.some(name => typeof name !== 'string')) return null
+  const name = names.length === 1 && env[names[0]] ? names[0] : 'OPENROUTER_API_KEY'
+  return [name, env[name]]
+}
+
 /** Native precedence: explicit options, API auth store, then provider environment. */
 export function hasOpenCodeOpenRouterSelectedCredential(
   provider: Record<string, unknown>, env: NodeJS.ProcessEnv,
@@ -108,23 +125,20 @@ export function hasOpenCodeOpenRouterSelectedCredential(
   }
   if (!isOpenCodeOpenRouterCredentialOverrideUsable(provider, env, resolved)) return false
   if ((provider.options as Record<string, unknown> | undefined)?.apiKey !== undefined) return true
-  if (env.OPENCODE_AUTH_CONTENT !== undefined) {
-    try {
-      const store = JSON.parse(env.OPENCODE_AUTH_CONTENT)
-      if (!store || typeof store !== 'object' || Array.isArray(store)) return false
-      auth = null
-      if (Object.hasOwn(store, 'openrouter')) {
-        const entry = store.openrouter
-        return entry?.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim()
-      }
-    } catch { return false }
+  const inline = readOpenCodeInlineAuthContent(env)
+  if (inline) {
+    const store = inline.value
+    if (!store || typeof store !== 'object' || Array.isArray(store)) return false
+    auth = null
+    if (Object.hasOwn(store, 'openrouter')) {
+      const entry = (store as Record<string, unknown>).openrouter as Record<string, unknown> | null
+      return entry?.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim()
+    }
   }
   if (auth && typeof auth === 'object' && (auth as Record<string, unknown>).type === 'api') return validatedAuth
   try {
-    const names = resolved ? provider.env ?? ['OPENROUTER_API_KEY']
-      : resolveOpenCodeOpenRouterEnvironment(provider.env ?? ['OPENROUTER_API_KEY'], env)
-    if (!Array.isArray(names) || names.some(name => typeof name !== 'string')) return false
-    return names.some(name => typeof env[name] === 'string' && !!env[name]!.trim())
+    const credential = selectedOpenRouterEnvironment(provider, env)?.[1]
+    return typeof credential === 'string' && !!credential.trim()
   } catch { return false }
 }
 
@@ -193,12 +207,10 @@ export function openCodeOpenRouterEligibilityIdentity(
     effective = resolved ? provider
       : resolveOpenCodeOpenRouterEnvironment(provider, env, references) as Record<string, unknown>
   } catch { effective = { whitelist: [], options: 'invalid' } }
-  const names = effective.env ?? ['OPENROUTER_API_KEY']
-  const credentialEnvironment = Array.isArray(names) && names.every(name => typeof name === 'string')
-    ? names.map(name => [name, env[name]]) : 'invalid'
+  const credentialEnvironment = selectedOpenRouterEnvironment(effective, env)
   return createHash('sha256').update(JSON.stringify([
     effective.whitelist, effective.blacklist, effective.options, references,
-    auth, env.OPENCODE_AUTH_CONTENT, credentialEnvironment,
+    auth, env.OPENCODE_AUTH_CONTENT, effective.env, credentialEnvironment,
     hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true),
     isOpenCodeOpenRouterFreeRouteAllowed(effective),
   ])).digest('hex')

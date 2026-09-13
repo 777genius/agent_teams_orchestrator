@@ -74,16 +74,46 @@ test('inline auth and configured provider environment follow credential preceden
   const inline = { OPENCODE_AUTH_CONTENT: JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-inline' } }) }
   expect(hasOpenCodeOpenRouterCatalogCredential({}, inline, null)).toBe(true)
   expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENCODE_AUTH_CONTENT: '{}' }, disk)).toBe(false)
-  expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENCODE_AUTH_CONTENT: '{invalid' }, disk)).toBe(false)
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENCODE_AUTH_CONTENT: '{invalid' }, disk)).toBe(true)
   expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENCODE_AUTH_CONTENT: '{"openrouter":{"type":"api","key":" "}}' }, disk)).toBe(false)
   expect(hasOpenCodeOpenRouterCatalogCredential({ options: { apiKey: '' } }, inline, disk)).toBe(false)
   expect(hasOpenCodeOpenRouterCatalogCredential({ options: { apiKey: 'synthetic-option' } }, { OPENCODE_AUTH_CONTENT: 'invalid' }, null)).toBe(true)
   expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ROUTER'] }, { CUSTOM_ROUTER: 'synthetic-custom' }, null)).toBe(true)
-  expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ROUTER'] }, { OPENROUTER_API_KEY: 'synthetic-default' }, null)).toBe(false)
+  expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ROUTER'] }, { OPENROUTER_API_KEY: 'synthetic-default' }, null)).toBe(true)
   expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ROUTER'] }, { CUSTOM_ROUTER: ' ' }, null)).toBe(false)
   expect(openCodeOpenRouterEligibilityIdentity({}, inline, null)).not.toBe(openCodeOpenRouterEligibilityIdentity({}, {
     OPENCODE_AUTH_CONTENT: JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-rotated' } }),
   }, null))
   expect(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ROUTER'] }, { CUSTOM_ROUTER: 'one' }, null))
     .not.toBe(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ROUTER'] }, { CUSTOM_ROUTER: 'two' }, null))
+})
+
+// Pinned Auth.all returns parsed inline JSON without validating its shape;
+// only falsy content / JSON parse failure reaches the disk read.
+test.each(['', ' ', '{invalid', '[invalid'])('native inline auth falls back to disk: %j', content => {
+  const env = { OPENCODE_AUTH_CONTENT: content }
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, env, { type: 'api', key: 'synthetic-disk' })).toBe(true)
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, env, null)).toBe(false)
+})
+
+test.each(['{}', 'null', '[]', 'false', '"string"'])('parsed inline auth never falls back to disk: %s', content => {
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENCODE_AUTH_CONTENT: content },
+    { type: 'api', key: 'synthetic-disk' })).toBe(false)
+})
+
+test('native single-name key and multiple-name SDK fallback bind only supplied credentials', () => {
+  const provider = { env: ['CUSTOM_ONE', 'CUSTOM_TWO'] }
+  for (const env of [{ CUSTOM_ONE: 'synthetic-one' }, { CUSTOM_TWO: 'synthetic-two' },
+    { CUSTOM_ONE: 'synthetic-one', CUSTOM_TWO: 'synthetic-two' }]) {
+    expect(hasOpenCodeOpenRouterCatalogCredential(provider, env, null)).toBe(false)
+    expect(hasOpenCodeOpenRouterCatalogCredential(provider, { ...env, OPENROUTER_API_KEY: 'synthetic-sdk' }, null)).toBe(true)
+  }
+  const env = { CUSTOM_ONE: 'synthetic-one', OPENROUTER_API_KEY: 'synthetic-sdk' }
+  const identity = openCodeOpenRouterEligibilityIdentity(provider, env, null)
+  expect(openCodeOpenRouterEligibilityIdentity(provider, { ...env, CUSTOM_ONE: 'ignored-rotation' }, null)).toBe(identity)
+  expect(openCodeOpenRouterEligibilityIdentity(provider, { ...env, OPENROUTER_API_KEY: 'sdk-rotation' }, null)).not.toBe(identity)
+  expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ONE'] }, env, null)).toBe(true)
+  expect(hasOpenCodeOpenRouterCatalogCredential({ env: ['CUSTOM_ONE'] }, { ...env, CUSTOM_ONE: ' ' }, null)).toBe(false)
+  expect(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ONE'] }, env, null))
+    .not.toBe(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ONE'] }, { ...env, CUSTOM_ONE: 'rotation' }, null))
 })

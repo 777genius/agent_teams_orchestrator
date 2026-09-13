@@ -3886,6 +3886,18 @@ export class OpenCodeProviderManagementAdapter
     const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
+    let effectiveInventory: OpenCodeInventorySnapshot | undefined
+    const release = async () => {
+      const retained = host
+      host = null
+      if (!retained) return
+      const leaveReleaseStep = options.progress?.enterStep('release catalog host lease')
+      await this.releaseProviderManagementHost(hostManager, retained, hostLease)
+      await hostManager.releaseHost(retained.hostKey, {
+        keepPersistentAlive: hostLifetime === 'persistent',
+      }).catch(() => undefined)
+      leaveReleaseStep?.()
+    }
 
     try {
       const inventory = await this.probeInventory(inventoryService, projectPath, {
@@ -3923,14 +3935,13 @@ export class OpenCodeProviderManagementAdapter
       }
       leaveLeaseStep?.()
       const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
-      const effectiveInventory = await withEffectiveOpenRouterConfig(
+      effectiveInventory = await withEffectiveOpenRouterConfig(
         inventory, projectPath ?? inventory.projectPath,
       )
       const result = await raceOpenCodeAbortSignal(
         run({ inventory: effectiveInventory, inventoryService, host, client }),
         options.abortSignal,
       )
-      await revalidateOpenRouterEligibility(effectiveInventory)
       return result
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
@@ -3941,15 +3952,12 @@ export class OpenCodeProviderManagementAdapter
           : redactDiagnostic(redactSecret(rawMessage, options.secretToRedact)),
       )
     } finally {
-      if (host) {
-        const leaveReleaseStep = options.progress?.enterStep('release catalog host lease')
-        await this.releaseProviderManagementHost(hostManager, host, hostLease)
-        await hostManager
-          .releaseHost(host.hostKey, {
-            keepPersistentAlive: hostLifetime === 'persistent',
-          })
-          .catch(() => undefined)
-        leaveReleaseStep?.()
+      await release()
+      if (effectiveInventory) {
+        try { await revalidateOpenRouterEligibility(effectiveInventory) }
+        catch {
+          return providerManagementError(options.failureCode ?? 'runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+        }
       }
     }
   }
@@ -4176,6 +4184,8 @@ export class OpenCodeProviderManagementAdapter
     const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
+    let cacheKey: string | undefined
+    let publishDirectory: (() => void) | undefined
 
     try {
       host = await hostManager.ensureHost({
@@ -4190,7 +4200,7 @@ export class OpenCodeProviderManagementAdapter
       })
       hostLease = await this.retainProviderManagementHost(hostManager, host)
       await revalidateOpenRouterEligibility(inventory)
-      const cacheKey = this.getDirectoryCacheKey({
+      cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
         host,
@@ -4272,8 +4282,8 @@ export class OpenCodeProviderManagementAdapter
         limit: Number.MAX_SAFE_INTEGER,
         cursor: null,
       })
-      this.writeDirectoryCache(
-        cacheKey,
+      publishDirectory = () => this.writeDirectoryCache(
+        cacheKey!,
         uncachedDirectory,
         buildProviderDirectoryModelSearchIndex(directorySource),
       )
@@ -4315,7 +4325,9 @@ export class OpenCodeProviderManagementAdapter
           .catch(() => undefined)
         try {
           await revalidateOpenRouterEligibility(inventory)
+          publishDirectory?.()
         } catch (error) {
+          if (cacheKey) this.directoryCache.delete(cacheKey)
           if (error instanceof OpenRouterEligibilityChangedError) {
             return providerManagementError('runtime-unhealthy', error.message, true)
           }
@@ -4489,6 +4501,7 @@ export class OpenCodeProviderManagementAdapter
     ) {
       return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
     }
+    const previousEntry = this.catalogCache.get(prePreparationIdentity.key)
     const abortController = new AbortController()
     const abortFromDeadline = () => {
       abortController.abort(deadline.signal.reason)
@@ -4526,15 +4539,30 @@ export class OpenCodeProviderManagementAdapter
             identityTimeout = setTimeout(() => resolve(null), CATALOG_IDENTITY_RECHECK_TIMEOUT_MS)
           }),
         ])
-        return identity?.reusable
+        const cached = identity?.reusable
           && identity.managedAuthConsistent
           && identity.key === prePreparationIdentity.key
           ? this.catalogCache.get(identity.key)
           : undefined
+        if (!cached) {
+          if (this.catalogCache.get(prePreparationIdentity.key) === previousEntry) {
+            this.catalogCache.delete(prePreparationIdentity.key)
+          }
+          return undefined
+        }
+        try {
+          await revalidateOpenRouterEligibility(cached.inventory)
+          return cached
+        } catch {
+          if (this.catalogCache.get(cached.identity) === cached) this.catalogCache.delete(cached.identity)
+          return undefined
+        }
       } finally {
         if (identityTimeout) clearTimeout(identityTimeout)
       }
     }
+    let pendingEntry: ProviderCatalogCacheEntry | undefined
+    let catalogInventory: OpenCodeInventorySnapshot | undefined
     let catalogInstanceStarted = false
     let startPhaseTimeout = (_phase: 'instance' | 'query'): void => {}
     const operation = this.withManagedOpenCodeClient(
@@ -4542,6 +4570,7 @@ export class OpenCodeProviderManagementAdapter
       input.projectPath,
       async ({ inventory, client }) => {
         catalogInstanceStarted = true
+        catalogInventory = inventory
         // Native cold startup owns the existing host budget, not the query budget.
         deadline.throwIfExpired()
         startPhaseTimeout('instance')
@@ -4642,7 +4671,7 @@ export class OpenCodeProviderManagementAdapter
           )
         }
         await revalidateOpenRouterEligibility(inventory)
-        this.catalogCache.set(entry.identity, entry)
+        pendingEntry = entry
         return {
           ok: true,
           value: modelsView,
@@ -4662,6 +4691,31 @@ export class OpenCodeProviderManagementAdapter
     try {
     return await raceOpenCodeAbortSignal(Promise.race([
       operation.then(async value => {
+        if (catalogInventory) {
+          // No result or cache entry can escape an awaited host finalizer with
+          // the authority captured before that finalizer.
+          try {
+            const identity = await this.readCatalogIdentity({
+              projectPath: canonicalProjectPath, providerId, expectedScope: profileScope,
+              expectedBinaryPath: catalogInventory.binaryPath,
+            })
+            await revalidateOpenRouterEligibility(catalogInventory)
+            if (!identity.reusable || !identity.managedAuthConsistent
+              || identity.key !== prePreparationIdentity.key) throw new Error(OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+            if (pendingEntry && value.ok && !abortController.signal.aborted) {
+              if (this.catalogGenerationByScope.get(scopeKey) !== generation) {
+                return providerManagementError('runtime-unhealthy',
+                  'OpenCode catalog response was superseded by a newer provider request')
+              }
+              this.catalogCache.set(pendingEntry.identity, pendingEntry)
+            }
+          } catch {
+            if (this.catalogCache.get(prePreparationIdentity.key) === previousEntry) {
+              this.catalogCache.delete(prePreparationIdentity.key)
+            }
+            return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+          }
+        }
         if (abortController.signal.aborted) {
           return new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(() => {})
         }
@@ -4693,13 +4747,15 @@ export class OpenCodeProviderManagementAdapter
           if (ownsGeneration) {
             this.catalogGenerationByScope.set(scopeKey, generation + 1)
           }
-          const cached = await readReusableStaleCatalog()
           let cleanupTimeout: ReturnType<typeof setTimeout> | undefined
-          await Promise.race([
-            operation.then(() => undefined),
-            new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
+          const drained = await Promise.race([
+            operation.then(() => true),
+            new Promise<false>(settle => { cleanupTimeout = setTimeout(() => settle(false), 1_000) }),
           ])
           if (cleanupTimeout) clearTimeout(cleanupTimeout)
+          // Timeout fallback is also a response: validate only after release,
+          // and do not return stale success while a finalizer remains pending.
+          const cached = drained ? await readReusableStaleCatalog() : undefined
           resolve(cached && ownsGeneration && this.catalogGenerationByScope.get(scopeKey) === generation + 1
             ? {
                 ok: true,

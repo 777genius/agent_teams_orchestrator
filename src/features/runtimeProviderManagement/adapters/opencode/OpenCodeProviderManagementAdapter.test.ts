@@ -8311,7 +8311,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       })
       expect(providerCalls).toBe(1)
       expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size)
-        .toBe(1)
+        .toBe(0) // post-finalizer source validation also retires the old evidence
       expect(JSON.stringify(changed)).not.toContain('changed.invalid')
     } finally {
       if (previousConfig === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
@@ -8627,7 +8627,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/tmp/project',
       })
       expect(result.ok).toBe(true)
-      expect(identityReads).toBe(3)
+      expect(identityReads).toBe(4) // includes the post-finalizer publication check
     } finally {
       if (previousData === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
       else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousData
@@ -8978,3 +8978,177 @@ for (const mutation of ['disk-auth', 'inline-auth', 'config', 'referenced-file',
     } finally { release(); await rm(projectPath, { recursive: true, force: true }) }
   })
 }
+
+for (const target of ['models', 'directory-host', 'directory-lease'] as const) {
+  for (const mutation of ['config', 'auth', 'file', 'whitespace', 'inline-auth'] as const) {
+    for (const seeded of [false, true]) {
+      test(`OpenRouter ${target} finalizer rejects ${mutation} and evicts cache (seeded=${seeded})`, async () => {
+        const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-release-'))
+        const configPath = path.join(projectPath, 'opencode.json')
+        const keyPath = path.join(projectPath, 'key')
+        const authPath = path.join(projectPath, 'auth.json')
+        const snapshot = inventory({ projectPath, models: [], connectedProviders: [] })
+        snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath, OPENCODE_CONFIG_CONTENT: '{}' }
+        snapshot.profile!.managedAuthPath = authPath
+        const auth = JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-release-key' } })
+        await writeFile(authPath, auth)
+        await writeFile(keyPath, 'synthetic-file')
+        const config = JSON.stringify({ provider: { openrouter: mutation === 'file' || mutation === 'whitespace'
+          ? { options: { apiKey: '{file:./key}' } } : {} } })
+        await writeFile(configPath, config)
+        if (mutation === 'inline-auth') snapshot.profile!.env.OPENCODE_AUTH_CONTENT = auth
+        let entered!: () => void, release!: () => void
+        const started = new Promise<void>(resolve => { entered = resolve })
+        const barrier = new Promise<void>(resolve => { release = resolve })
+        let block = false, reads = 0, releases = 0, leaseReleases = 0
+        const adapter = new OpenCodeProviderManagementAdapter({
+          ...catalogIdentityDependencies(),
+          inventoryService: { probe: async () => snapshot },
+          hostManager: {
+            ensureHost: async () => host(), retainHostLease: async () => {},
+            releaseHostLease: async () => {
+              if (block && target === 'directory-lease') { entered(); await barrier }
+              leaseReleases++
+            },
+            releaseHost: async () => {
+              if (block && target !== 'directory-lease') { entered(); await barrier }
+              releases++
+            },
+          },
+          clientFactory: { create: () => ({
+            getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+            getProviders: async () => {
+              reads++
+              return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+            },
+            getProviderAuth: async () => ({}),
+          }) },
+        })
+        const caches = adapter as unknown as { catalogCache: Map<string, unknown>; directoryCache: Map<string, unknown> }
+        const cache = target === 'models' ? caches.catalogCache : caches.directoryCache
+        const load = () => target === 'models'
+          ? adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
+          : adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+        let pending: ReturnType<typeof load> | undefined
+        try {
+          if (seeded) { expect((await load()).ok).toBe(true); expect(cache.size).toBe(1) }
+          block = true
+          pending = load()
+          await started
+          // A cold response cannot publish while either finalizer is outstanding.
+          expect(cache.size).toBe(seeded ? 1 : 0)
+          if (mutation === 'config') await writeFile(configPath, '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
+          if (mutation === 'auth') await writeFile(authPath, '{"openrouter":{"type":"api","key":""}}')
+          if (mutation === 'file') await writeFile(keyPath, '')
+          if (mutation === 'whitespace') await writeFile(keyPath, 'synthetic-file\n')
+          if (mutation === 'inline-auth') snapshot.profile!.env.OPENCODE_AUTH_CONTENT = '{}'
+          release()
+          const result = await pending
+          expect(result.ok).toBe(false)
+          expect(cache.size).toBe(0)
+          expect(releases).toBe(seeded ? 2 : 1)
+          if (target !== 'models') expect(leaseReleases).toBe(seeded ? 2 : 1)
+          // Even restoring authority must force a fresh endpoint read after rejection.
+          block = false
+          await writeFile(configPath, config)
+          await writeFile(authPath, auth)
+          await writeFile(keyPath, 'synthetic-file')
+          if (mutation === 'inline-auth') snapshot.profile!.env.OPENCODE_AUTH_CONTENT = auth
+          const previousReads = reads
+          expect((await load()).ok).toBe(true)
+          expect(reads).toBe(previousReads + 1)
+          expect(cache.size).toBe(1)
+        } finally {
+          release()
+          await pending
+          await rm(projectPath, { recursive: true, force: true })
+        }
+      })
+    }
+  }
+}
+
+test.each(['unchanged', 'auth', 'config', 'pending'])('catalog timeout fallback waits for finalizers and rereads authority: %s', async mutation => {
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-timeout-release-'))
+  const snapshot = inventory({ projectPath, models: [] })
+  snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+  snapshot.profile!.managedAuthPath = path.join(projectPath, 'auth.json')
+  await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":"synthetic-key"}}')
+  let entered!: () => void, release!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const barrier = new Promise<void>(resolve => { release = resolve })
+  let slow = false
+  const adapter = new OpenCodeProviderManagementAdapter({
+    ...catalogIdentityDependencies(), catalogTimeoutMs: 100,
+    inventoryService: { probe: async () => snapshot },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+      if (slow) { entered(); await barrier }
+    } },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+      getProviders: async () => {
+        if (slow) return new Promise(() => {})
+        return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+      },
+      getProviderAuth: async () => ({}),
+    }) },
+  })
+  const load = () => adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
+  let pending: ReturnType<typeof load> | undefined
+  try {
+    expect((await load()).ok).toBe(true)
+    slow = true
+    pending = load()
+    await started
+    if (mutation === 'auth') await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":""}}')
+    if (mutation === 'config') await writeFile(path.join(projectPath, 'opencode.json'), '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
+    if (mutation !== 'pending') release()
+    const result = await pending
+    expect(result.ok).toBe(mutation === 'unchanged')
+    if (result.ok) expect(result.value.catalogState).toBe('stale')
+    if (mutation === 'pending') {
+      await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":""}}')
+      release()
+      const cache = (adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache
+      for (let attempts = 0; cache.size && attempts < 100; attempts++) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(cache.size).toBe(0) // late finalization must evict the old evidence too
+    }
+    if (mutation === 'auth' || mutation === 'config') expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
+  } finally {
+    release()
+    await pending
+    await rm(projectPath, { recursive: true, force: true })
+  }
+})
+
+test('catalog supersession during finalizer rejects the old response without evicting the new cache', async () => {
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-supersession-'))
+  let entered!: () => void, release!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const barrier = new Promise<void>(resolve => { release = resolve })
+  let releases = 0, reads = 0
+  const adapter = new OpenCodeProviderManagementAdapter({
+    ...catalogIdentityDependencies(),
+    inventoryService: { probe: async () => inventory({ models: [] }) },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+      if (++releases === 1) { entered(); await barrier }
+    } },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [], default: {} }),
+      getProviders: async () => ({ all: [{ id: 'openai', models: { [`model-${++reads}`]: {} } }], connected: ['openai'], default: {} }),
+      getProviderAuth: async () => ({}),
+    }) },
+  })
+  const input = { runtimeId: 'opencode' as const, providerId: 'openai', projectPath }
+  const old = adapter.loadModels(input)
+  try {
+    await started
+    expect((await adapter.loadModels(input)).ok).toBe(true)
+    const cache = (adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache
+    const latest = [...cache.values()]
+    expect(latest).toHaveLength(1)
+    release()
+    expect((await old).ok).toBe(false)
+    expect([...cache.values()]).toEqual(latest)
+  } finally { release(); await old; await rm(projectPath, { recursive: true, force: true }) }
+})
