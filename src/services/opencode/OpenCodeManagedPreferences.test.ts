@@ -185,3 +185,19 @@ describe('OpenCodeManagedPreferences', () => {
     expect(persisted.modelLimitOverrides).toEqual({})
   })
 })
+
+for (const newerWriter of [false, true]) {
+  test(`guarded default rollback preserves exact prior state and newer writers: ${newerWriter}`, async () => {
+    const root = await makeProfile()
+    const file = getOpenCodeManagedPreferencesPath(root)
+    let rollback!: () => Promise<void>
+    await setOpenCodeManagedDefaultModel(root, 'openrouter/openrouter/free', {
+      validate: async () => {}, ownRollback: operation => { rollback = operation },
+    })
+    if (newerWriter) await setOpenCodeManagedDefaultModel(root, 'openai/newer')
+    await rollback()
+    await rollback()
+    if (newerWriter) expect((await readOpenCodeManagedRuntimePreferences(root)).defaultModelId).toBe('openai/newer')
+    else await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+}

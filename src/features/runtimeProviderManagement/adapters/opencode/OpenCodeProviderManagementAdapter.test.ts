@@ -8895,7 +8895,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
       inventoryService: { probe: async () => { const snapshot = inventory({
-        connectedProviders: connected ? [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] : [],
+        // Stale inventory membership must yield to the live connected list.
+        connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }],
         models: upstream ? ['openrouter/openrouter/free'] : [],
       }); snapshot.profile!.env = { OPENROUTER_API_KEY: 'key' }; return snapshot } },
       hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
@@ -8908,8 +8909,17 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', query: 'free' })
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.value.models).toHaveLength(1)
-    expect(result.value.models[0]).toMatchObject({ modelId: 'openrouter/openrouter/free', free: true, accessKind: connected ? 'credentialed' : upstream ? 'not_authenticated' : 'unknown_model' })
+    expect(result.value.models).toHaveLength(connected ? 1 : 0)
+    if (connected) expect(result.value.models[0]).toMatchObject({ modelId: 'openrouter/openrouter/free', free: true, accessKind: 'credentialed' })
+    const directory = await adapter.loadDirectory({ runtimeId: 'opencode', query: 'openrouter/free' })
+    expect(directory.ok).toBe(true)
+    if (directory.ok) expect(directory.value.entries).toHaveLength(connected ? 1 : 0)
+    const settings = await adapter.loadView('opencode')
+    expect(settings.ok).toBe(true)
+    if (settings.ok) {
+      expect(settings.value.providers.find(provider => provider.providerId === 'openrouter')?.state === 'connected').toBe(connected)
+      if (!connected) expect(settings.value.configuredModels.some(model => model.modelId === 'openrouter/openrouter/free')).toBe(false)
+    }
     const unrelated = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openai' })
     expect(unrelated.ok && unrelated.value.models).toEqual([])
   })
@@ -9410,7 +9420,8 @@ test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native
 
 }
 
-test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof'])
+test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof',
+  'release-throw', 'release-reject', 'release-late-resolve', 'release-late-reject'])
 ('OpenRouter failed replacement restores exact disk credentials: %s', async failure => {
   const { upsertOpenCodeApiAuth, readOpenCodeAuthCredential } = await import('../../../../services/opencode/OpenCodeAuthStore.js')
   const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-rollback-'))
@@ -9424,13 +9435,35 @@ test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof'])
   await upsertOpenCodeApiAuth(profile.managedAuthPath, 'openrouter', managed)
   await upsertOpenCodeApiAuth(profile.globalAuthPath, 'openrouter', global)
   let applied = false
+  let hostCount = 0, leaseReleases = 0, rollbacks = 0
+  const releases: string[] = []
+  let settle!: () => void, rejectLate!: (error: Error) => void
+  const late = new Promise<void>((resolve, reject) => { settle = resolve; rejectLate = reject })
+  const unhandled: unknown[] = []
+  const onUnhandled = (error: unknown) => { unhandled.push(error) }
+  process.on('unhandledRejection', onUnhandled)
   const adapter = new OpenCodeProviderManagementAdapter({
+    cleanupTimeoutMs: 100,
     inventoryService: { probe: async () => snapshot },
-    hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
-    authStore: { upsertApiAuth: async input => {
-      if (failure === 'mirror' && input.authPath === profile.managedAuthPath) throw new Error('synthetic-mirror-failure')
-      await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth)
-    } },
+    hostManager: {
+      ensureHost: async () => host({ hostKey: ++hostCount === 1 ? 'outer' : 'admission' }),
+      retainHostLease: async () => {},
+      releaseHostLease: async () => { leaseReleases++ },
+      releaseHost: key => {
+        releases.push(key)
+        if (key !== 'admission' || !failure.startsWith('release-')) return Promise.resolve()
+        if (failure === 'release-throw') throw new Error('synthetic-private-release')
+        if (failure === 'release-reject') return Promise.reject(new Error('synthetic-private-release'))
+        return late
+      },
+    },
+    authStore: {
+      upsertApiAuth: async input => {
+        if (failure === 'mirror' && input.authPath === profile.managedAuthPath) throw new Error('synthetic-mirror-failure')
+        await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth)
+      },
+      removeCredential: async () => {},
+    },
     executionProbe: { probeModel: async input => ({ ...executionProbeResult(input.selectedModel),
       outcome: failure === 'proof' ? 'not_authenticated' : 'available' }) },
     clientFactory: { create: () => ({
@@ -9445,16 +9478,37 @@ test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof'])
         if (failure === 'set-throw') throw new Error('synthetic-set-failure')
         return failure !== 'set-false'
       },
-      deleteProviderAuth: async () => true,
+      deleteProviderAuth: async () => { rollbacks++; return true },
     }) },
   })
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    const result = await adapter.connectWithApiKey({ runtimeId: 'opencode', projectPath, providerId: 'openrouter', apiKey: 'synthetic-new' })
+    const result = await Promise.race([adapter.connectWithApiKey({ runtimeId: 'opencode', projectPath, providerId: 'openrouter', apiKey: 'synthetic-new' }), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('admission release blocked rollback')), 2_000)
+    })])
     expect(result.ok).toBe(false)
     expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' })).toEqual(managed)
     expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath, providerId: 'openrouter' })).toEqual(global)
     expect(JSON.stringify(result)).not.toContain('synthetic-new')
-  } finally { await rm(projectPath, { recursive: true, force: true }) }
+    if (failure.startsWith('release-')) {
+      expect(hostCount).toBe(2)
+      expect(releases).toEqual(['admission', 'outer'])
+      expect(leaseReleases).toBe(1)
+      expect(rollbacks).toBe(1)
+      if (failure === 'release-late-reject') rejectLate(new Error('synthetic-private-late-release'))
+      else settle()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(releases).toEqual(['admission', 'outer'])
+      expect(rollbacks).toBe(1)
+      expect(unhandled).toEqual([])
+      expect(JSON.stringify(result)).not.toContain('synthetic-private')
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+    settle()
+    process.off('unhandledRejection', onUnhandled)
+    await rm(projectPath, { recursive: true, force: true })
+  }
 })
 
 test.each([false, true])('settings timeout still validates finalizer authority (mutation=%s)', async mutate => {
@@ -9776,3 +9830,194 @@ test('Settings bounds failed-retain rollback and still releases its host once', 
     expect(hosts).toBe(1)
   } finally { if (timer) clearTimeout(timer); settle() }
 })
+
+for (const failure of ['throw', 'reject', 'late-resolve', 'late-reject'] as const) {
+  test(`Settings bounds retain ownership and owns its late settlement: ${failure}`, async () => withAbsentAuthorityFiles(async () => {
+    let settle!: () => void, reject!: (error: Error) => void
+    const pending = new Promise<void>((resolve, fail) => { settle = resolve; reject = fail })
+    let hosts = 0
+    const leases: unknown[] = []
+    let retained: unknown
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown) => { unhandled.push(error) }
+    process.on('unhandledRejection', onUnhandled)
+    const adapter = new OpenCodeProviderManagementAdapter({
+      cleanupTimeoutMs: 10, viewTimeoutMs: 100,
+      inventoryService: { probe: async () => inventory() },
+      hostManager: {
+        ensureHost: async () => host(),
+        retainHostLease: (_key, lease) => {
+          retained = lease
+          if (failure === 'throw') throw new Error('private-retain-error')
+          if (failure === 'reject') return Promise.reject(new Error('private-retain-error'))
+          return pending
+        },
+        releaseHostLease: async (_key, lease) => { leases.push(lease) },
+        releaseHost: async () => { hosts++ },
+      },
+    })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([adapter.loadView('opencode'), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('pending retain blocked Settings')), 500)
+      })])
+      expect(result.ok).toBe(false)
+      expect(hosts).toBe(1)
+      expect(leases).toHaveLength(failure.startsWith('late-') ? 0 : 1)
+      if (failure === 'late-reject') reject(new Error('private-late-retain'))
+      else settle()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(leases).toEqual([retained])
+      expect(hosts).toBe(1)
+      expect(unhandled).toEqual([])
+      expect(JSON.stringify(result)).not.toContain('private-')
+    } finally {
+      if (timer) clearTimeout(timer)
+      settle()
+      process.off('unhandledRejection', onUnhandled)
+    }
+  }))
+}
+
+test.each(['credential', 'restriction', 'file-path', 'import-file-path', 'HOME', 'irrelevant', 'key-order'])
+('Settings linearizes environment during final credential-source revalidation: %s', async mutation => {
+  const { spyOn } = await import('bun:test')
+  const authority = await import('../../../../services/opencode/OpenCodeOpenRouterFallback.js')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-mid-revalidation-'))
+  const names = ['ISSUE446_REVIEW_KEY', 'ISSUE446_REVIEW_ROUTE', 'ISSUE446_REVIEW_FILE', 'ISSUE446_REVIEW_OTHER', 'HOME', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT']
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
+  Object.assign(process.env, { ISSUE446_REVIEW_KEY: 'synthetic-key', ISSUE446_REVIEW_ROUTE: 'openrouter/free',
+    ISSUE446_REVIEW_FILE: path.join(root, 'key'), OPENCODE_CONFIG_CONTENT: mutation === 'key-order'
+      ? '{"provider":{"openrouter":{"api":"https://synthetic.invalid","npm":"@synthetic/provider"}}}' : '{}' })
+  await writeFile(path.join(root, 'key'), 'synthetic-file-key')
+  const sourceConfig = path.join(root, mutation === 'import-file-path' ? 'import.json' : 'opencode.json')
+  if (mutation === 'import-file-path') process.env.OPENCODE_CONFIG = sourceConfig
+  else delete process.env.OPENCODE_CONFIG
+  await writeFile(sourceConfig, JSON.stringify({ provider: { openrouter: {
+    whitelist: ['{env:ISSUE446_REVIEW_ROUTE}'], options: { apiKey: mutation.endsWith('file-path')
+      ? '{file:{env:ISSUE446_REVIEW_FILE}}' : '{env:ISSUE446_REVIEW_KEY}' },
+  } } }))
+  const snapshot = inventory({ projectPath: root, models: [] })
+  snapshot.profile!.env = { ...process.env, HOME: root, XDG_CONFIG_HOME: root }
+  snapshot.profile!.managedAuthPath = path.join(root, 'auth.json')
+  let released = false, paused = false
+  let enter!: () => void, resume!: () => void
+  const entered = new Promise<void>(resolve => { enter = resolve })
+  const barrier = new Promise<void>(resolve => { resume = resolve })
+  const original = authority.readOpenCodeOpenRouterCredentialEvidence
+  const read = spyOn(authority, 'readOpenCodeOpenRouterCredentialEvidence').mockImplementation(async file => {
+    const evidence = await original(file)
+    if (released && file === snapshot.profile!.managedAuthPath && !paused) {
+      paused = true
+      enter()
+      await barrier
+    }
+    return evidence
+  })
+  const adapter = new OpenCodeProviderManagementAdapter({
+    inventoryService: { probe: async () => snapshot },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => { released = true } },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [], default: {} }),
+      getProviders: async () => ({ all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }),
+      getProviderAuth: async () => ({}),
+    }) },
+  })
+  const pending = adapter.loadView({ runtimeId: 'opencode', projectPath: root })
+  try {
+    await entered
+    if (mutation === 'credential') delete process.env.ISSUE446_REVIEW_KEY
+    if (mutation === 'restriction') process.env.ISSUE446_REVIEW_ROUTE = 'other'
+    if (mutation.endsWith('file-path')) process.env.ISSUE446_REVIEW_FILE = path.join(root, 'absent')
+    if (mutation === 'HOME') process.env.HOME = path.join(root, 'changed')
+    if (mutation === 'irrelevant') process.env.ISSUE446_REVIEW_OTHER = 'irrelevant'
+    if (mutation === 'key-order') {
+      // Equivalent inline source objects retain semantic identity.
+      process.env.OPENCODE_CONFIG_CONTENT = '{"provider":{"openrouter":{"npm":"@synthetic/provider","api":"https://synthetic.invalid"}}}'
+    }
+    resume()
+    const result = await pending
+    expect(paused).toBe(true)
+    expect(result.ok).toBe(mutation === 'irrelevant' || mutation === 'key-order')
+    expect(JSON.stringify(result)).not.toContain('synthetic-key')
+    if (!result.ok) expect(JSON.stringify(result)).not.toContain(root)
+  } finally {
+    resume()
+    await pending
+    read.mockRestore()
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name]
+      else process.env[name] = previous[name]
+    }
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+for (const scope of ['project', 'all_projects'] as const) {
+  for (const phase of ['endpoint', 'probe', 'write', 'release'] as const) {
+    test.each(['disk', 'environment'])(`default revalidation preserves ${scope} preferences after ${phase} drift: %s`, async source => {
+      const preferences = await import('../../../../services/opencode/OpenCodeManagedPreferences.js')
+      const { readFile } = await import('node:fs/promises')
+      const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-default-authority-'))
+      const beforeEnv = process.env.ISSUE446_DEFAULT_ROUTE
+      process.env.ISSUE446_DEFAULT_ROUTE = 'openrouter/free'
+      const configPath = path.join(root, 'opencode.json')
+      await writeFile(configPath, JSON.stringify({ provider: { openrouter: {
+        whitelist: [source === 'disk' ? 'openrouter/free' : '{env:ISSUE446_DEFAULT_ROUTE}'],
+      } } }))
+      const snapshot = inventory({ projectPath: root, models: [] })
+      snapshot.profile!.profileRootPath = path.join(root, 'profile')
+      snapshot.profile!.env = { ...process.env, HOME: root, XDG_CONFIG_HOME: root, OPENROUTER_API_KEY: 'synthetic-key' }
+      snapshot.profile!.managedAuthPath = path.join(root, 'auth.json')
+      const file = scope === 'project' ? preferences.getOpenCodeManagedPreferencesPath(snapshot.profile!.profileRootPath)
+        : preferences.getOpenCodeGlobalManagedPreferencesPath(root)
+      await mkdir(path.dirname(file), { recursive: true })
+      const original = '{ "schemaVersion": 2, "defaultModelId": "openai/previous", "modelLimitOverrides": {}, "updatedAt": null }\n'
+      await writeFile(file, original)
+      let writes = 0, probes = 0
+      const mutate = async () => {
+        if (source === 'disk') await writeFile(configPath, '{"provider":{"openrouter":{"whitelist":[]}}}')
+        else delete process.env.ISSUE446_DEFAULT_ROUTE
+      }
+      const guardWrite = (guard: import('../../../../services/opencode/OpenCodeManagedPreferences.js').OpenCodeDefaultModelWriteGuard | undefined) => {
+        if (!guard) throw new Error('missing production authority guard')
+        let validations = 0
+        return { ...guard, validate: async () => {
+          if (++validations === 2 && phase === 'write') await mutate()
+          await guard.validate()
+        } }
+      }
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => snapshot },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => { if (phase === 'release') await mutate() } },
+        executionProbe: { probeModel: async input => { probes++; if (phase === 'probe') await mutate(); return executionProbeResult(input.selectedModel) } },
+        managedPreferences: {
+          setDefaultModel: async (profile, model, guard) => { writes++; return preferences.setOpenCodeManagedDefaultModel(profile, model, guardWrite(guard)) },
+          setAllProjectsDefaultModel: async (model, guard) => { writes++; return preferences.setOpenCodeManagedGlobalDefaultModel(root, model, guardWrite(guard)) },
+        },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => {
+            if (phase === 'endpoint') await mutate()
+            return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+          },
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+      try {
+        const result = await adapter.setDefaultModel({ runtimeId: 'opencode', providerId: 'openrouter',
+          modelId: 'openrouter/openrouter/free', projectPath: root, scope, probe: phase === 'probe' })
+        expect(result.ok).toBe(false)
+        expect(writes).toBe(phase === 'endpoint' || phase === 'probe' ? 0 : 1)
+        expect(probes).toBe(phase === 'probe' ? 1 : 0)
+        expect(await readFile(file, 'utf8')).toBe(original)
+        expect(JSON.stringify(result)).not.toContain(root)
+        expect(JSON.stringify(result)).not.toContain('synthetic-key')
+      } finally {
+        if (beforeEnv === undefined) delete process.env.ISSUE446_DEFAULT_ROUTE
+        else process.env.ISSUE446_DEFAULT_ROUTE = beforeEnv
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+}

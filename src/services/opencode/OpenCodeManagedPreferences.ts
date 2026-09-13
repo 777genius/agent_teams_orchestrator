@@ -1,8 +1,8 @@
 import { readOpenCodeAuthorityFile } from './OpenCodeAuthorityFile.js'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 
-import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
+import { writeFileAtomic, writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { lock } from '../../utils/lockfile.js'
 
 const OPEN_CODE_MANAGED_PREFERENCES_FILE = 'agent-teams-runtime-preferences.json'
@@ -180,9 +180,46 @@ export async function writeOpenCodeManagedRuntimePreferences(
   )
 }
 
+export type OpenCodeDefaultModelWriteGuard = {
+  validate: () => Promise<void>
+  ownRollback: (rollback: () => Promise<void>) => void
+}
+
+/** Called under the preference lock. Restore only this write's exact bytes;
+ * a newer writer owns its own state and must never be overwritten by rollback. */
+async function writeGuardedDefault(
+  preferencesPath: string,
+  preferences: OpenCodeManagedRuntimePreferences,
+  guard?: OpenCodeDefaultModelWriteGuard,
+): Promise<void> {
+  if (!guard) return writePreferencesFile(preferencesPath, preferences)
+  let previous: string | null = null
+  try { previous = await readOpenCodeAuthorityFile(preferencesPath) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  const written = JSON.stringify(normalizePreferences(preferences), null, 2)
+  const restore = async () => {
+    let current: string
+    try { current = await readOpenCodeAuthorityFile(preferencesPath) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
+    if (current !== written) return
+    if (previous === null) await rm(preferencesPath, { force: true })
+    else await writeFileAtomic(preferencesPath, previous)
+  }
+  await guard.validate()
+  guard.ownRollback(() => withPreferenceWriteQueue(preferencesPath, restore))
+  try {
+    await writeFileAtomic(preferencesPath, written)
+    await guard.validate()
+  } catch (error) {
+    await restore()
+    throw error
+  }
+}
+
 export async function setOpenCodeManagedDefaultModel(
   profileRootPath: string,
   defaultModelId: string,
+  guard?: OpenCodeDefaultModelWriteGuard,
 ): Promise<OpenCodeManagedRuntimePreferences> {
   const preferencesPath = getOpenCodeManagedPreferencesPath(profileRootPath)
   return withPreferenceWriteQueue(preferencesPath, async () => {
@@ -193,7 +230,7 @@ export async function setOpenCodeManagedDefaultModel(
       defaultModelId: normalizeModelId(defaultModelId),
       updatedAt: new Date().toISOString(),
     }
-    await writePreferencesFile(preferencesPath, preferences)
+    await writeGuardedDefault(preferencesPath, preferences, guard)
     return preferences
   })
 }
@@ -218,6 +255,7 @@ export async function clearOpenCodeManagedDefaultModel(
 export async function setOpenCodeManagedGlobalDefaultModel(
   dataRootPath: string,
   defaultModelId: string,
+  guard?: OpenCodeDefaultModelWriteGuard,
 ): Promise<OpenCodeManagedRuntimePreferences> {
   const preferencesPath = getOpenCodeGlobalManagedPreferencesPath(dataRootPath)
   return withPreferenceWriteQueue(preferencesPath, async () => {
@@ -228,7 +266,7 @@ export async function setOpenCodeManagedGlobalDefaultModel(
       defaultModelId: normalizeModelId(defaultModelId),
       updatedAt: new Date().toISOString(),
     }
-    await writePreferencesFile(preferencesPath, preferences)
+    await writeGuardedDefault(preferencesPath, preferences, guard)
     return preferences
   })
 }

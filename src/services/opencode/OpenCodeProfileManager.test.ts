@@ -141,6 +141,42 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  for (const stage of ['enter', 'leave'] as const) {
+    test.each(['throw', 'reject', 'late-reject', 'thenable'])(`prepareProfile contains ${stage} progress failure: %s`, async failure => {
+      const rejected: unknown[] = []
+      const onUnhandled = (error: unknown) => { rejected.push(error) }
+      process.on('unhandledRejection', onUnhandled)
+      const late: Array<() => void> = []
+      const labels: string[] = []
+      let leaves = 0
+      const fail = (): unknown => {
+        if (failure === 'throw') throw new Error('private-tracker-error')
+        if (failure === 'reject') return Promise.reject(new Error('private-tracker-error'))
+        if (failure === 'thenable') return { then(_resolve: unknown, reject: (error: Error) => void) { reject(new Error('private-tracker-error')) } }
+        return new Promise((_, reject) => { late.push(() => reject(new Error('private-tracker-error'))) })
+      }
+      try {
+        const profile = await new OpenCodeProfileManager().prepareProfile(tempDir, {
+          includeAppMcp: false, includeManagedSubscriptionPlugins: false,
+          progress: { enterStep: ((label: string) => {
+            labels.push(label)
+            if (stage === 'enter') return fail()
+            return () => { leaves++; return fail() }
+          }) as never },
+        })
+        expect(profile.managedConfig).toBeDefined()
+        expect(labels.some(label => label.endsWith('verify auth and finalize environment'))).toBe(true)
+        if (stage === 'leave') expect(leaves).toBe(labels.length)
+        for (const reject of late) reject()
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(rejected).toEqual([])
+      } finally {
+        for (const reject of late) reject()
+        process.off('unhandledRejection', onUnhandled)
+      }
+    })
+  }
+
   test('prepared OpenRouter authority refresh preserves source provenance across structured cloning', async () => {
     const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
     const { refreshSelectedProfileAuthority } = await import('./OpenCodeSelectedProfileAuthority.js')

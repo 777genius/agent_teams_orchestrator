@@ -1580,6 +1580,7 @@ async function readSafeOpenCodeRuntimeConfigFile(
   required = false,
   env: NodeJS.ProcessEnv = {},
   referenceDigests?: string[],
+  rawProviders?: unknown[],
 ): Promise<Record<string, unknown>> {
   let content: string
   try {
@@ -1591,17 +1592,18 @@ async function readSafeOpenCodeRuntimeConfigFile(
     if (strict) throw new Error('OpenRouter effective configuration could not be read')
     return {}
   }
-  return strict ? parseOpenRouterRuntimeConfig(content, path.dirname(filePath), env, referenceDigests)
+  return strict ? parseOpenRouterRuntimeConfig(content, path.dirname(filePath), env, referenceDigests, rawProviders)
     : pickSafeOpenCodeRuntimeConfig(safeParseJSONC(content))
 }
 
-function parseOpenRouterRuntimeConfig(content: string, directory = process.cwd(), env: NodeJS.ProcessEnv = {}, referenceDigests?: string[]): Record<string, unknown> {
+function parseOpenRouterRuntimeConfig(content: string, directory = process.cwd(), env: NodeJS.ProcessEnv = {}, referenceDigests?: string[], rawProviders?: unknown[]): Record<string, unknown> {
   const errors: import('jsonc-parser').ParseError[] = []
   const parsed = parseStrictJsonc(content.replace(/^\uFEFF/, ''), errors, { allowTrailingComma: true })
   if (errors.length || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('OpenRouter effective configuration is invalid')
   }
   validateOpenCodeOpenRouterConfig(parsed)
+  rawProviders?.push(asRecord(asRecord(parsed.provider).openrouter))
   referenceDigests?.push(openCodeOpenRouterRawEnvironmentIdentity(asRecord(asRecord(parsed.provider).openrouter), env))
   // Preserve references, not credential bytes, in materialized runtime settings.
   const relocated = JSON.parse(JSON.stringify(parsed).replace(/\{file:((?:\{env:[^}]+\}|[^}])+)\}/g, (_reference, name: string) => {
@@ -1618,11 +1620,12 @@ async function readSafeOpenCodeRuntimeConfigImport(
   env: NodeJS.ProcessEnv,
   strict = false,
   referenceDigests?: string[],
+  rawProviders?: unknown[],
 ): Promise<Record<string, unknown>> {
   let importedConfig: Record<string, unknown> = {}
   const importedFiles = await Promise.all(
     getOpenCodeConfigImportPaths(env).map(file => readSafeOpenCodeRuntimeConfigFile(file, strict, strict && !!env.OPENCODE_CONFIG?.trim()
-      && file === path.resolve(env.HOME || env.USERPROFILE || os.homedir(), env.OPENCODE_CONFIG.trim()), env, referenceDigests)),
+      && file === path.resolve(env.HOME || env.USERPROFILE || os.homedir(), env.OPENCODE_CONFIG.trim()), env, referenceDigests, rawProviders)),
   )
   for (const importedFile of importedFiles) {
     importedConfig = deepMergeOpenCodeConfig(
@@ -1634,18 +1637,18 @@ async function readSafeOpenCodeRuntimeConfigImport(
   importedConfig = deepMergeOpenCodeConfig(
     importedConfig,
     strict && env.OPENCODE_CONFIG_CONTENT !== undefined
-      ? parseOpenRouterRuntimeConfig(env.OPENCODE_CONFIG_CONTENT, process.cwd(), env, referenceDigests)
+      ? parseOpenRouterRuntimeConfig(env.OPENCODE_CONFIG_CONTENT, process.cwd(), env, referenceDigests, rawProviders)
       : pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env.OPENCODE_CONFIG_CONTENT)),
   )
 
   return importedConfig
 }
 
-async function readProjectOpenCodeRuntimeConfig(projectPath: string, strict = false, env: NodeJS.ProcessEnv = {}, referenceDigests?: string[]): Promise<Record<string, unknown>> {
+async function readProjectOpenCodeRuntimeConfig(projectPath: string, strict = false, env: NodeJS.ProcessEnv = {}, referenceDigests?: string[], rawProviders?: unknown[]): Promise<Record<string, unknown>> {
   let config: Record<string, unknown> = {}
   const configs = await Promise.all(
     ['opencode.json', 'opencode.jsonc'].map(name =>
-      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name), strict, false, env, referenceDigests)),
+      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name), strict, false, env, referenceDigests, rawProviders)),
   )
   for (const projectConfig of configs) {
     config = deepMergeOpenCodeConfig(
@@ -1662,11 +1665,12 @@ export async function readOpenCodeEffectiveOpenRouterConfig(
   env: NodeJS.ProcessEnv = process.env,
   resolveRestrictions = true,
   referenceDigests?: string[],
+  rawProviders?: unknown[],
 ): Promise<Record<string, unknown>> {
   const sourceEnv = openCodeOpenRouterSourceEnvironment(env)
   const directory = await canonicalizeOpenCodeProjectPath(projectPath)
-  const imported = await readSafeOpenCodeRuntimeConfigImport(sourceEnv, true, referenceDigests)
-  const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory, true, sourceEnv, referenceDigests))
+  const imported = await readSafeOpenCodeRuntimeConfigImport(sourceEnv, true, referenceDigests, rawProviders)
+  const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory, true, sourceEnv, referenceDigests, rawProviders))
   const provider = asRecord(asRecord(effective.provider).openrouter)
   const resolved = await captureOpenCodeOpenRouterEnvironment(provider, sourceEnv, referenceDigests) as Record<string, unknown>
   validateOpenCodeOpenRouterConfig({ provider: { openrouter: resolved } })
@@ -3217,10 +3221,25 @@ export class OpenCodeProfileManager {
     options: OpenCodePrepareProfileOptions = {},
     ownedSession?: OpenCodeSessionRecord,
   ): Promise<OpenCodePreparedProfile> {
-    let leaveStep: (() => void) | undefined
+    // Tracker callbacks are untrusted instrumentation, never preparation owners.
+    // Observe returned thenables immediately without awaiting them, including
+    // callable thenables and asynchronous leave callbacks.
+    const observe = (operation: () => unknown): unknown => {
+      try {
+        const value = operation()
+        void Promise.resolve(value).catch(() => {})
+        return value
+      } catch { return undefined }
+    }
+    let leaveStep: unknown
+    const leave = (): void => {
+      const callback = leaveStep
+      leaveStep = undefined
+      if (typeof callback === 'function') observe(() => callback())
+    }
     const enterStep = (label: string): void => {
-      leaveStep?.()
-      leaveStep = options.progress?.enterStep(`prepare managed OpenCode profile: ${label}`)
+      leave()
+      leaveStep = observe(() => options.progress?.enterStep(`prepare managed OpenCode profile: ${label}`))
     }
     enterStep('resolve project and scope')
     try {
@@ -3724,7 +3743,7 @@ export class OpenCodeProfileManager {
     }
     }, options.abortSignal)
     } finally {
-      leaveStep?.()
+      leave()
     }
   }
 }
