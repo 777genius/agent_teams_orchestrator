@@ -8762,6 +8762,60 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (result.ok) expect(result.value.models).toEqual([])
   })
 
+  test.each([
+    { blacklist: ['openrouter/free'] },
+    { whitelist: ['moonshotai/kimi-k2:free'] },
+    { whitelist: ['moonshotai/kimi-k2:free', 'openrouter/openrouter/free'] },
+  ])('reads project router exclusions for native catalogs and post-connect verification %j', async restrictions => {
+    const project = await mkdtemp(path.join(os.tmpdir(), 'openrouter project-'))
+    const projectPath = path.join(project, 'child', '..')
+    await mkdir(path.join(project, 'child'))
+    await writeFile(path.join(project, 'opencode.json'), JSON.stringify({ provider: { openrouter: restrictions } }))
+    const modelProbes: Array<{ selectedModel: string; projectPath?: string | null }> = []
+    const hostPaths: Array<string | null | undefined> = []
+    let connected = false
+    // Both native endpoints have already filtered their model maps and omit
+    // whitelist/blacklist. The unscoped refreshed inventory is deliberately stale.
+    const nativeProvider = { id: 'openrouter', models: { 'moonshotai/kimi-k2:free': {} } }
+    const stale = inventory({ models: ['openrouter/moonshotai/kimi-k2:free'] })
+    stale.profile!.managedConfig = { provider: { openrouter: { whitelist: ['openrouter/free'] } } }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => structuredClone(stale) },
+      hostManager: {
+        ensureHost: async input => { hostPaths.push(input.projectPath); return host() },
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [nativeProvider], default: {} }),
+        getProviders: async () => ({ all: [nativeProvider], connected: connected ? ['openrouter'] : [], default: {} }),
+        getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        setProviderAuth: async () => { connected = true; return true },
+      }) },
+      authStore: { upsertApiKey: async () => {}, removeCredential: async () => {} },
+      executionProbe: { probeModel: async input => {
+        modelProbes.push(input)
+        return executionProbeResult(input.selectedModel)
+      } },
+    })
+    try {
+      const catalog = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
+      expect(catalog.ok).toBe(true)
+      if (catalog.ok) expect(catalog.value.models.map(model => model.modelId)).not.toContain('openrouter/openrouter/free')
+      const directory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+      expect(directory.ok && directory.value.entries).toEqual([])
+      const connectedResult = await adapter.connectWithApiKey({ runtimeId: 'opencode', providerId: 'openrouter',
+        projectPath, apiKey: 'test-key' })
+      expect(connectedResult.ok).toBe(true)
+      expect(modelProbes.map(probe => probe.selectedModel)).toEqual(['openrouter/moonshotai/kimi-k2:free'])
+      expect(modelProbes.every(probe => probe.projectPath === projectPath)).toBe(true)
+      expect(hostPaths.every(directory => directory === projectPath)).toBe(true)
+      expect(stale.profile!.managedConfig).toEqual({ provider: { openrouter: { whitelist: ['openrouter/free'] } } })
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
+  })
+
   test.each([[false, false], [false, true], [true, false], [true, true]])('OpenRouter free fallback is listed once (upstream: %s, connected: %s)', async (upstream, connected) => {
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),

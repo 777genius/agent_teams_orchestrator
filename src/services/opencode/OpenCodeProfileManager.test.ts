@@ -21,6 +21,7 @@ import {
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
   resolveOpenCodeProfileScope,
+  readOpenCodeEffectiveOpenRouterConfig,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -169,6 +170,90 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         expect(provider.models).toBeUndefined()
         expect(JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT!).provider.openrouter).toEqual(provider)
       }
+    }
+  })
+
+  test('project-only router restrictions survive directory normalization in all profile purposes', async () => {
+    const projectPath = path.join(tempDir, 'project router')
+    await mkdir(projectPath, { recursive: true })
+    const directory = path.join(projectPath, 'child', '..')
+    await mkdir(path.join(projectPath, 'child'))
+    for (const restrictions of [
+      { blacklist: ['openrouter/free'] },
+      { whitelist: ['other'] },
+      { whitelist: ['openrouter/openrouter/free'] },
+    ]) {
+      await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
+        provider: { openrouter: { ...restrictions, options: { apiKey: 'project-key' } } },
+      }))
+      const env = { ...process.env, OPENROUTER_API_KEY: '', OPENCODE_CONFIG_CONTENT: '{}' }
+      expect(await readOpenCodeEffectiveOpenRouterConfig(directory, env)).toMatchObject(restrictions)
+      for (const purpose of ['catalog', 'execution_probe', 'launch_runtime'] as const) {
+        const profileScope = await resolveOpenCodeProfileScope({
+          projectPath: directory, purpose, selectedModel: 'openrouter/openrouter/free', env,
+        })
+        const profile = await new OpenCodeProfileManager().prepareProfile(directory, { profileScope })
+        const provider = (profile.managedConfig.provider as Record<string, Record<string, unknown>>).openrouter!
+        expect(provider).toMatchObject({ ...restrictions, options: { apiKey: 'project-key' } })
+        expect(provider.models).toBeUndefined()
+      }
+    }
+  })
+
+  test('OpenRouter rejects every unusable static credential shape in disconnected profiles', async () => {
+    const projectPath = path.join(tempDir, 'invalid-router-credentials')
+    await mkdir(projectPath, { recursive: true })
+    const invalidValues: unknown[] = [undefined, null, '', '  \t\n', [], ['key'], {}, { key: 'key' }, false, true, 0, 123]
+    for (const source of ['env', 'options'] as const) {
+      for (const value of invalidValues) {
+        const env = {
+          ...process.env,
+          OPENROUTER_API_KEY: source === 'env' ? value : '',
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { openrouter: {
+            options: source === 'options' ? { apiKey: value } : {},
+          } } }),
+        } as NodeJS.ProcessEnv
+        const input = { projectPath, selectedModel: 'openrouter/openrouter/free', env }
+        const profileScope = await resolveOpenCodeProfileScope({ ...input, purpose: 'catalog' })
+        const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope })
+        const provider = (profile.managedConfig.provider as Record<string, Record<string, unknown>>).openrouter!
+        expect(provider.models).toBeUndefined()
+        for (const purpose of ['execution_probe', 'launch_runtime'] as const) {
+          await expect(resolveOpenCodeProfileScope({ ...input, purpose }))
+            .rejects.toThrow('requires explicit selected authentication')
+        }
+      }
+    }
+  })
+
+  test('OpenRouter ignores options.authorization and accepts scalar keys and validated auth-store credentials', async () => {
+    const projectPath = path.join(tempDir, 'router-credential-sources')
+    await mkdir(projectPath, { recursive: true })
+    const base = { ...process.env, OPENROUTER_API_KEY: '', OPENCODE_CONFIG_CONTENT: '{}' }
+    const unsupported = { ...base, OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      provider: { openrouter: { options: { authorization: 'not-an-openrouter-api-key' } } },
+    }) }
+    await expect(resolveOpenCodeProfileScope({ projectPath, purpose: 'execution_probe',
+      selectedModel: 'openrouter/openrouter/free', env: unsupported }))
+      .rejects.toThrow('requires explicit selected authentication')
+    for (const env of [
+      { ...base, OPENROUTER_API_KEY: 'env-key' },
+      { ...base, OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { openrouter: { options: { apiKey: 'option-key' } } } }) },
+    ]) {
+      const profileScope = await resolveOpenCodeProfileScope({ projectPath, purpose: 'catalog',
+        selectedModel: 'openrouter/openrouter/free', env })
+      const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope })
+      expect(profile.managedConfig.provider).toMatchObject({ openrouter: { models: { 'openrouter/free': {} } } })
+    }
+    await upsertOpenCodeAuthCredential({
+      authPath: path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+      providerId: 'openrouter', credential: { type: 'api', key: 'saved-key' },
+    })
+    for (const purpose of ['catalog', 'execution_probe', 'launch_runtime'] as const) {
+      const profileScope = await resolveOpenCodeProfileScope({ projectPath, purpose,
+        selectedModel: 'openrouter/openrouter/free', env: base })
+      const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope })
+      expect(profile.managedConfig.provider).toMatchObject({ openrouter: { models: { 'openrouter/free': {} } } })
     }
   })
 

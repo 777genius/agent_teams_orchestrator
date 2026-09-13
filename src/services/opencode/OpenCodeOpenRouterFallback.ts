@@ -11,7 +11,6 @@ export function isOpenCodeOpenRouterFreeRouteAllowed(...entries: unknown[]): boo
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true
     const { whitelist, blacklist } = entry as Record<string, unknown>
     const matches = (values: unknown[]) => values.includes(OPEN_CODE_OPENROUTER_FREE_ROUTE.modelId)
-      || values.includes(OPEN_CODE_OPENROUTER_FREE_ROUTE.id)
     return !(Array.isArray(blacklist) && matches(blacklist))
       && (!Array.isArray(whitelist) || matches(whitelist))
   })

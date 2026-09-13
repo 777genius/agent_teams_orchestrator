@@ -41,7 +41,7 @@ for (const selected of [undefined, null, '', 'openai', 'openrouter']) {
     }
   })
 }
-for (const restrictions of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }]) {
+for (const restrictions of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }, { whitelist: ['openrouter/openrouter/free'] }]) {
   test(`preserves exclusions ${JSON.stringify(restrictions)}`, () => {
     const config = { provider: { openrouter: restrictions } }
     const before = structuredClone(config)
@@ -55,4 +55,12 @@ test('connected selected scope honors a whitelist containing the nested route', 
   applyOpenCodeOpenRouterFallback(config, 'openrouter', true)
   expect(config.provider.openrouter).toMatchObject({ whitelist: ['openrouter/free'],
     models: { 'openrouter/free': { name: 'OpenRouter Free Router', cost: { input: 0, output: 0 } } } })
+})
+
+test('full catalog IDs in blacklist do not match native relative model keys', () => {
+  const config = { provider: { openrouter: { blacklist: ['openrouter/openrouter/free'] } } }
+  applyOpenCodeOpenRouterFallback(config, 'openrouter', true)
+  expect(config.provider.openrouter).toMatchObject({ models: {
+    'openrouter/free': { name: 'OpenRouter Free Router' },
+  } })
 })

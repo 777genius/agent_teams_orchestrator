@@ -413,7 +413,7 @@ test('OpenRouter fallback requires its own connected provider when catalog is mi
   }
 })
 
-for (const restriction of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }]) {
+for (const restriction of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }, { whitelist: ['openrouter/openrouter/free'] }]) {
   for (const source of ['managed', 'config', 'live']) {
     test(`excluded router cannot launch even with earlier execution proof: ${source} ${JSON.stringify(restriction)}`, () => {
       const restricted = catalog({

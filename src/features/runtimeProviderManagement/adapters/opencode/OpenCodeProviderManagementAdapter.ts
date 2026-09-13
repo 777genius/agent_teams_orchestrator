@@ -50,6 +50,7 @@ import {
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import {
   canonicalizeOpenCodeProjectPath,
+  readOpenCodeEffectiveOpenRouterConfig,
   openCodeProfileManager,
   resolveOpenCodeProfileScope,
 } from '../../../../services/opencode/OpenCodeProfileManager.js'
@@ -2041,6 +2042,40 @@ function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): s
   return source ? source.slice(0, 80) : null
 }
 
+/** Native provider responses omit restriction fields after filtering their model maps. */
+async function withEffectiveOpenRouterRestrictions(
+  inventory: OpenCodeInventorySnapshot,
+  projectPath = inventory.projectPath,
+): Promise<OpenCodeInventorySnapshot> {
+  if (!inventory.profile) return inventory
+  const effective = await readOpenCodeEffectiveOpenRouterConfig(projectPath)
+  const providers = asRecord(inventory.profile.managedConfig.provider)
+  if (!providers?.openrouter
+    && !Object.hasOwn(effective, 'whitelist') && !Object.hasOwn(effective, 'blacklist')) {
+    return { ...inventory, projectPath }
+  }
+  const { whitelist: _whitelist, blacklist: _blacklist, ...managedProvider } =
+    asRecord(providers?.openrouter) ?? {}
+  return {
+    ...inventory,
+    projectPath,
+    profile: {
+      ...inventory.profile,
+      managedConfig: {
+        ...inventory.profile.managedConfig,
+        provider: {
+          ...providers,
+          openrouter: {
+            ...managedProvider,
+            ...(Object.hasOwn(effective, 'whitelist') ? { whitelist: effective.whitelist } : {}),
+            ...(Object.hasOwn(effective, 'blacklist') ? { blacklist: effective.blacklist } : {}),
+          },
+        },
+      },
+    },
+  }
+}
+
 function buildProviderManagementAccessCatalog(input: {
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
@@ -3284,9 +3319,11 @@ export class OpenCodeProviderManagementAdapter
     inventory: OpenCodeInventorySnapshot
     host: OpenCodeHostHandle | null
   }): string {
+    const openrouter = asRecord(asRecord(input.inventory.profile?.managedConfig.provider)?.openrouter)
     return [
       input.runtimeId,
       input.inventory.projectPath,
+      JSON.stringify([openrouter?.whitelist, openrouter?.blacklist]),
       input.host?.version ?? input.inventory.version ?? 'unknown-version',
       input.inventory.profile?.profileRootKey ?? 'missing-profile',
       input.host?.resolvedConfigFingerprint ??
@@ -3582,9 +3619,11 @@ export class OpenCodeProviderManagementAdapter
       return { ok: true, value: null }
     }
 
+    const effectiveInventory = input.providerId === 'openrouter'
+      ? await withEffectiveOpenRouterRestrictions(input.inventory) : input.inventory
     const validationModelIds = getProviderCredentialValidationModelIds({
       providerId: input.providerId,
-      inventory: input.inventory,
+      inventory: effectiveInventory,
       configProviders: input.configProviders,
       providers: input.providers,
     })
@@ -3700,12 +3739,15 @@ export class OpenCodeProviderManagementAdapter
       if (!refresh.inventory.detected || !refresh.inventory.profile) {
         throw new Error('OpenCode refreshed managed profile is unavailable')
       }
+      const effectiveInventory = await withEffectiveOpenRouterRestrictions(
+        refresh.inventory, input.inventory.projectPath,
+      )
       // Auth callback/PUT can leave the instance's provider snapshot stale.
       // Process lifetime without an explicit hostKey allocates a unique host,
       // even when refresh falls back to the previous profile after a timeout.
       // Read admission and model selection there, before execution verification.
       host = await hostManager.ensureHost({
-        projectPath: refresh.inventory.projectPath,
+        projectPath: effectiveInventory.projectPath,
         preparedProfile: refresh.inventory.profile,
         hostLifetime: 'process',
         resolveConfigFingerprint: false,
@@ -3725,13 +3767,13 @@ export class OpenCodeProviderManagementAdapter
       const providers = providersResult.value
       const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
       const provider = buildProviderConnections({
-        inventory: refresh.inventory,
+        inventory: effectiveInventory,
         configProviders,
         providers,
         providerAuth: input.providerAuth,
         capabilities: input.capabilities,
       }).find(candidate => candidate.providerId === input.providerId) ?? null
-      return { ok: true, value: { inventory: refresh.inventory, configProviders, providers, provider } }
+      return { ok: true, value: { inventory: effectiveInventory, configProviders, providers, provider } }
     } catch {
       return providerManagementError(
         'runtime-unhealthy',
@@ -3816,8 +3858,11 @@ export class OpenCodeProviderManagementAdapter
       }
       leaveLeaseStep?.()
       const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
+      const effectiveInventory = await withEffectiveOpenRouterRestrictions(
+        inventory, projectPath ?? inventory.projectPath,
+      )
       return await raceOpenCodeAbortSignal(
-        run({ inventory, inventoryService, host, client }),
+        run({ inventory: effectiveInventory, inventoryService, host, client }),
         options.abortSignal,
       )
     } catch (error) {
@@ -4004,11 +4049,12 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, input.projectPath, {
+    const probedInventory = await this.probeInventory(inventoryService, input.projectPath, {
       mode: input.summary ? 'summary' : input.refresh ? 'full' : 'profile',
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
     })
+    const inventory = await withEffectiveOpenRouterRestrictions(probedInventory, input.projectPath ?? probedInventory.projectPath)
 
     if (!inventory.detected) {
       return {

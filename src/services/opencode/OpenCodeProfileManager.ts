@@ -1560,6 +1560,20 @@ async function readProjectOpenCodeRuntimeConfig(projectPath: string): Promise<Re
   return config
 }
 
+/** Read the same imported/project configuration used by selected runtime profiles. */
+export async function readOpenCodeEffectiveOpenRouterConfig(
+  projectPath?: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Record<string, unknown>> {
+  const sourceEnv = scopeSourceEnvironment(env)
+  const directory = await canonicalizeOpenCodeProjectPath(projectPath)
+  const imported = sourceEnv[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
+    ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(sourceEnv[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
+    : await readSafeOpenCodeRuntimeConfigImport(sourceEnv)
+  const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory))
+  return asRecord(asRecord(effective.provider).openrouter)
+}
+
 const SECRET_IDENTITY_KEY = /(?:^|[-_.])(api[-_.]?key|token|secret|password|authorization|proxy[-_.]?authorization|credential|cookie|set[-_.]?cookie|auth)(?:$|[-_.])/i
 const ENV_REFERENCE = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g
 
@@ -1935,7 +1949,9 @@ async function bindSelectedProviderAuthoritySources(input: {
     required = true,
   ): Promise<boolean> => {
     const effective = readEnvironmentValue(input.env, name)
-    if (effective.state !== 'present') {
+    if (effective.state !== 'present'
+      || (input.providerId === 'openrouter'
+        && (typeof effective.value !== 'string' || effective.value.trim().length === 0))) {
       if (required || effective.state === 'error') fullyBound = false
       sources.push({ name, syntax, pathKeys, state: effective.state })
       return false
@@ -1968,6 +1984,13 @@ async function bindSelectedProviderAuthoritySources(input: {
   }
 
   const visit = async (value: unknown, pathKeys: string[]): Promise<void> => {
+    // OpenRouter consumes a scalar options.apiKey; nested values and authorization
+    // are not credential evidence for its SDK.
+    if (input.providerId === 'openrouter' && pathKeys[0] === 'options'
+      && pathKeys.length === 1 && Array.isArray(value)) return
+    if (input.providerId === 'openrouter' && pathKeys[0] === 'options'
+      && (pathKeys[1] === 'apiKey' || pathKeys[1] === 'authorization')
+      && (pathKeys[1] !== 'apiKey' || typeof value !== 'string' || !value.trim())) return
     if (Array.isArray(value)) {
       for (const item of value) await visit(item, pathKeys)
       return
