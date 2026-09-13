@@ -124,3 +124,40 @@ test('abort during removal restores the symlink before reporting cancellation', 
     expect(await fs.readFile(path.join(source, 'new'), 'utf8')).toBe('new')
   } finally { remove.mockRestore() }
 })
+
+for (const kind of ['file', 'dangling directory link'] as const) {
+  test(`preserves a ${kind} that wins the race while merging a missing directory`, async () => {
+    await fs.mkdir(path.join(source, 'nested'))
+    await fs.writeFile(path.join(source, 'nested', 'new'), 'profile')
+    const conflictPath = path.join(target, 'nested')
+    const linkTarget = path.join(root, 'deleted-directory')
+    if (kind === 'dangling directory link') await fs.mkdir(linkTarget)
+    const realMkdir = fs.mkdir
+    let raced = false
+    const create = spyOn(fs, 'mkdir').mockImplementation((async (...args: Parameters<typeof fs.mkdir>) => {
+      if (String(args[0]) === conflictPath && !raced) {
+        raced = true
+        if (kind === 'file') {
+          await fs.writeFile(conflictPath, 'shared-race-winner')
+        } else {
+          await fs.symlink(linkTarget, conflictPath, process.platform === 'win32' ? 'junction' : 'dir')
+          await fs.rmdir(linkTarget)
+        }
+      }
+      return realMkdir(...args)
+    }) as typeof fs.mkdir)
+    try {
+      await ensureDirectorySymlink(source, target)
+      expect(raced).toBe(true)
+      if (kind === 'file') {
+        expect(await fs.readFile(conflictPath, 'utf8')).toBe('shared-race-winner')
+      } else {
+        expect((await fs.lstat(conflictPath)).isSymbolicLink()).toBe(true)
+        await expect(fs.stat(conflictPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      }
+      expect(await fs.readlink(source)).toBe(target)
+    } finally {
+      create.mockRestore()
+    }
+  })
+}
