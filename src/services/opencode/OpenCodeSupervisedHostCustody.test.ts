@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises'
 import { OpenCodeClientFactory, isOpenCodeClientFactoryBoundToCustody } from './OpenCodeClientFactory.js'
 import { OpenCodeHostManager, isOpenCodeHostManagerBoundToCustody } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge, prepareOpenCodePermissionProfileToken } from './OpenCodeSessionBridge.js'
+import { OpenCodeSessionStore, retainHostedSessionPublicationStore } from './OpenCodeSessionStore.js'
 import { assertTrustedOpenCodeCustody, createOpenCodeSupervisedCustodyAcquirer,
   type TrustedOpenCodeCustody, type OpenCodeSupervisorAdmissionSource } from './OpenCodeSupervisedHostCustody.js'
 import { supervisedFixture, supervisedLease } from './OpenCodeSupervisedCustody.test-fixture.js'
@@ -38,12 +39,13 @@ describe('OpenCode supervised admission', () => {
       const stable = { mode: 'supervisor-adopt-only' as const, custody }
       const manager = new OpenCodeHostManager({ acquisitionPolicy: stable })
       const factory = new OpenCodeClientFactory({ acquisitionPolicy: stable })
-      const sessionStore = { get: async () => null, upsert: async () => 'created' as const, markStale: async () => null }
+      const sessionStore = new OpenCodeSessionStore(`${fixture.profile.profileRootPath}/constructor-sessions.json`)
+      const hostedSessionPublicationStore = retainHostedSessionPublicationStore(sessionStore)
       const constructors = [
         (acquisitionPolicy: typeof stable) => new OpenCodeClientFactory({ acquisitionPolicy }),
         (acquisitionPolicy: typeof stable) => new OpenCodeHostManager({ acquisitionPolicy }),
         (acquisitionPolicy: typeof stable) => new OpenCodeSessionBridge({ acquisitionPolicy,
-          hostManager: manager, clientFactory: factory, sessionStore }),
+          hostManager: manager, clientFactory: factory, sessionStore, hostedSessionPublicationStore }),
       ]
       for (const construct of constructors) {
         let reads = 0

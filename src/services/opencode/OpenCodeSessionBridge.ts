@@ -23,7 +23,11 @@ import {
   openCodeClientFactory,
 } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
-import { isOpenCodeHostManagerBoundToCustody, openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeHostManagerBoundToCustody,
+  OpenCodeHostedAcquisitionCleanupPendingError,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 import { assertTrustedOpenCodeCustody, type OpenCodeHostAcquisitionPolicy,
   type TrustedOpenCodeCustody } from './OpenCodeSupervisedHostCustody.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
@@ -40,7 +44,10 @@ import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import {
+  isHostedSessionPublicationStoreFor,
+  openCodeSessionStore,
+} from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
 import type {
@@ -51,6 +58,7 @@ import type {
   OpenCodeNormalizedPermission,
   OpenCodeHostedApprovalCapability,
   OpenCodeHostedApprovalPermission,
+  OpenCodeHostHandle,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionRecord,
@@ -62,6 +70,15 @@ import type {
   OpenCodeToolApprovalMode,
 } from './types.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
+import type {
+  OpenCodeHostedAcquisition,
+  OpenCodeHostedAcquisitionSnapshot,
+  OpenCodeHostedAcquisitionTuple,
+} from './OpenCodeHostManager.js'
+import type {
+  OpenCodeHostedMetadataResult,
+  OpenCodeHostedSessionPublicationStore,
+} from './OpenCodeSessionStore.js'
 
 type OpenCodeSessionBridgeDeps = {
   acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
@@ -69,9 +86,12 @@ type OpenCodeSessionBridgeDeps = {
     & Partial<Pick<
       typeof openCodeHostManager,
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease' |
-      'prepareEffectHostToken' | 'verifyEffectHost'
+      'prepareEffectHostToken' | 'verifyEffectHost' | 'reserveHostedAcquisition' |
+      'acquireHostedHost' | 'inspectHostedAcquisition' | 'promoteHostedAcquisition' |
+      'releaseHostedAcquisition'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
+  hostedSessionPublicationStore?: OpenCodeHostedSessionPublicationStore
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -105,6 +125,150 @@ type SessionIdentity = {
   teamId: string
   laneId: string
   memberName: string
+}
+
+type OpenCodeEnsureSessionParams = {
+  teamId: string
+  laneId?: string
+  memberName: string
+  selectedModel: string
+  selectedVariant?: string
+  title?: string | null
+  projectPath?: string | null
+  preparedProfile?: OpenCodePreparedProfile | null
+  runId?: string | null
+  fresh?: boolean
+  toolApprovalMode?: OpenCodeToolApprovalMode
+  hostedAttempt?: OpenCodeHostedSessionAttemptContext
+}
+
+export type OpenCodeHostedSessionAttemptFence = Readonly<{
+  ownerPlanGeneration: string
+  ownerIncarnation: string
+  operationEpoch: number
+  attemptOrdinal: number
+}>
+
+export type OpenCodeHostedSessionAttemptBinding = Readonly<{
+  teamId: string
+  runId: string
+  ownerLaneId: string
+  memberName: string
+  profileRootKey: string
+  hostKey: string
+  openCodeArtifactDigest: string | null
+}>
+
+export type OpenCodeHostedSessionAttemptSnapshot = Readonly<{
+  attemptId: string
+  fence: OpenCodeHostedSessionAttemptFence
+  binding: OpenCodeHostedSessionAttemptBinding
+  phase: 'prepared' | 'armed' | 'no_effect' | 'create_unknown' | 'created' | 'uncertain'
+  record: Readonly<OpenCodeSessionRecord> | null
+  returnedSessionId: string | null
+  cleanupPending: Readonly<{
+    provisionalLease: boolean
+    sessionLease: boolean
+    hostReference: boolean
+  }>
+  effectInFlight: boolean
+  cleanupRequested: boolean
+  metadata: 'not_started' | 'applied' | 'conflict' | 'unknown'
+  metadataImages: Readonly<{
+    expected: Readonly<OpenCodeSessionRecord> | null
+    next: Readonly<OpenCodeSessionRecord> | null
+  }>
+  metadataCurrent: Readonly<OpenCodeSessionRecord> | null
+  metadataError: unknown
+  cleanupError: unknown
+  acquisition: OpenCodeHostedAcquisitionSnapshot | null
+}>
+
+export type OpenCodeHostedSessionAttemptHandle = Readonly<{
+  snapshot(): OpenCodeHostedSessionAttemptSnapshot
+}>
+
+const hostedSessionAttemptContextBrand: unique symbol = Symbol('OpenCodeHostedSessionAttemptContext')
+
+export type OpenCodeHostedSessionAttemptContext = Readonly<{
+  [hostedSessionAttemptContextBrand]: true
+  handle: OpenCodeHostedSessionAttemptHandle
+}>
+
+export type OpenCodeHostedSessionAttemptCallbacks = Readonly<{
+  attemptId: string
+  fence: OpenCodeHostedSessionAttemptFence
+  binding: OpenCodeHostedSessionAttemptBinding
+  validateAttempt(): boolean | Promise<boolean>
+  armAttempt(attempt: OpenCodeHostedSessionAttemptSnapshot): Promise<void>
+  recordCreated(attempt: OpenCodeHostedSessionAttemptSnapshot): Promise<void>
+  recordUncertain(attempt: OpenCodeHostedSessionAttemptSnapshot): Promise<void>
+}>
+
+export class OpenCodeHostedSessionEffectError extends Error {
+  readonly attempt: OpenCodeHostedSessionAttemptHandle
+  readonly callbackFailure: unknown
+  readonly predecessorCleanup: Readonly<OpenCodeSessionRecord> | null
+
+  constructor(
+    message: string,
+    cause: unknown,
+    attempt: OpenCodeHostedSessionAttemptHandle,
+    callbackFailure?: unknown,
+    predecessorCleanup: Readonly<OpenCodeSessionRecord> | null = null,
+  ) {
+    super(message, { cause })
+    this.name = 'OpenCodeHostedSessionEffectError'
+    this.attempt = attempt
+    this.callbackFailure = callbackFailure
+    this.predecessorCleanup = predecessorCleanup
+  }
+}
+
+export class OpenCodeHostedSessionCleanupPendingError extends Error {
+  readonly attempt: OpenCodeHostedSessionAttemptHandle
+  constructor(attempt: OpenCodeHostedSessionAttemptHandle) {
+    super('OpenCode hosted session attempt cleanup is pending while an effect is in flight')
+    this.name = 'OpenCodeHostedSessionCleanupPendingError'
+    this.attempt = attempt
+  }
+}
+
+type MutableHostedSessionAttempt = {
+  phase: OpenCodeHostedSessionAttemptSnapshot['phase']
+  record: OpenCodeSessionRecord | null
+}
+
+type HostedSessionAttemptRegistration = {
+  callbacks: OpenCodeHostedSessionAttemptCallbacks
+  mutable: MutableHostedSessionAttempt
+  handle: OpenCodeHostedSessionAttemptHandle
+  consumed: boolean
+  hostKey: string | null
+  sessionId: string | null
+  provisionalLeasePending: boolean
+  sessionLeasePending: boolean
+  hostReferencePending: boolean
+  receipt: OpenCodeHostedAcquisition | null
+  actualTuple: OpenCodeHostedAcquisitionTuple | null
+  effectInFlight: boolean
+  cleanupRequested: boolean
+  cleanupFlight: Promise<void> | null
+  cleanupSettled: boolean
+  metadata: 'not_started' | 'applied' | 'conflict' | 'unknown'
+  predecessor: Readonly<OpenCodeSessionRecord> | null
+  predecessorRegistration: HostedSessionAttemptRegistration | null
+  next: Readonly<OpenCodeSessionRecord> | null
+  metadataCurrent: Readonly<OpenCodeSessionRecord> | null
+  metadataError: unknown
+  cleanupError: unknown
+}
+
+type RetainedSessionHost = {
+  hostKey: string
+  sessionId: string
+  hostReferencePending: boolean
+  hostedAttempt: HostedSessionAttemptRegistration | null
 }
 
 type PreparedSessionProfile = {
@@ -387,6 +551,55 @@ function canonicalEffectValue(value: unknown): string {
   ).join(',')}}`
 }
 
+function isOptionalString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === 'string'
+}
+
+function assertHostedEnsurePrimitives(input: OpenCodeEnsureSessionParams): void {
+  const laneId = input.laneId ?? 'primary'
+  const runId = input.runId ?? ''
+  if (typeof input.teamId !== 'string' || !input.teamId || input.teamId !== input.teamId.trim() ||
+    typeof laneId !== 'string' || !laneId || laneId !== laneId.trim() ||
+    typeof input.memberName !== 'string' || !input.memberName || input.memberName !== input.memberName.trim() ||
+    typeof runId !== 'string' || !runId || runId !== runId.trim() ||
+    typeof input.selectedModel !== 'string' || !input.selectedModel.trim() ||
+    input.selectedModel !== input.selectedModel.trim() ||
+    !isOptionalString(input.selectedVariant) ||
+    (typeof input.selectedVariant === 'string' &&
+      (!input.selectedVariant || input.selectedVariant !== input.selectedVariant.trim())) ||
+    !isOptionalString(input.title) || !isOptionalString(input.projectPath) ||
+    (input.fresh !== undefined && typeof input.fresh !== 'boolean') ||
+    (input.toolApprovalMode !== undefined && input.toolApprovalMode !== 'auto' && input.toolApprovalMode !== 'manual') ||
+    input.teamId.includes('::') || laneId.includes('::') || input.memberName.includes('::') || runId.includes('::')) {
+    throw new Error('OpenCode hosted session request primitives invalid')
+  }
+  parseProviderScopedModel(input.selectedModel)
+}
+
+function assertHostedPreparedProfile(
+  profile: OpenCodePreparedProfile,
+  expected: TrustedOpenCodeCustody['expected'],
+): void {
+  if (!profile || typeof profile !== 'object' ||
+    (profile.custody !== undefined && profile.custody !== 'supervisor') ||
+    typeof profile.projectPath !== 'string' || typeof profile.profileRootKey !== 'string' ||
+    typeof profile.profileRootPath !== 'string' || typeof profile.projectBehaviorFingerprint !== 'string' ||
+    typeof profile.managedConfigFingerprint !== 'string' || !Array.isArray(profile.behaviorSources) ||
+    !profile.behaviorSources.every(value => typeof value === 'string') ||
+    !profile.managedConfig || typeof profile.managedConfig !== 'object' || Array.isArray(profile.managedConfig) ||
+    !profile.env || typeof profile.env !== 'object' || Array.isArray(profile.env) ||
+    !['ok', 'missing', 'stale'].includes(profile.authState)) {
+    throw new Error('OpenCode hosted prepared profile invalid')
+  }
+  for (const key of ['projectPath', 'profileRootKey', 'profileRootPath',
+    'projectBehaviorFingerprint', 'managedConfigFingerprint', 'sourceAuthFingerprint',
+    'managedAuthFingerprint', 'sourceAuthSources'] as const) {
+    if (canonicalEffectValue(profile[key]) !== canonicalEffectValue(expected.profile[key])) {
+      throw new Error('OpenCode hosted prepared profile does not match supervisor admission')
+    }
+  }
+}
+
 const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v2' as const
 
 function decodeHostedApprovalCapability(value: unknown): {
@@ -497,7 +710,10 @@ function isTransientOpenCodeCreateSessionError(error: unknown): boolean {
 }
 
 export class OpenCodeSessionBridge {
-  readonly #retainedSessionHosts = new Map<string, string>()
+  readonly #retainedSessionHosts = new Map<string, RetainedSessionHost>()
+  readonly #hostedSessionAttempts = new WeakMap<OpenCodeHostedSessionAttemptContext, HostedSessionAttemptRegistration>()
+  readonly #hostedSessionAttemptHandles = new WeakMap<OpenCodeHostedSessionAttemptHandle, HostedSessionAttemptRegistration>()
+  readonly #unsettledHostedSessionAttempts = new Set<HostedSessionAttemptRegistration>()
 
   private readonly custody?: TrustedOpenCodeCustody
   private readonly deps: OpenCodeSessionBridgeDeps
@@ -512,6 +728,8 @@ export class OpenCodeSessionBridge {
       if (new.target !== OpenCodeSessionBridge) throw new Error('OpenCode supervised bridge must use the admitted implementation')
       if (!deps.hostManager || !isOpenCodeHostManagerBoundToCustody(deps.hostManager, custody) ||
         !deps.clientFactory || !isOpenCodeClientFactoryBoundToCustody(deps.clientFactory, custody) || !deps.sessionStore ||
+        !deps.hostedSessionPublicationStore ||
+        !isHostedSessionPublicationStoreFor(deps.hostedSessionPublicationStore, deps.sessionStore) ||
         (deps.mcpManager && !isOpenCodeMcpManagerBoundToCustody(deps.mcpManager, custody)) ||
         deps.prepareProfile || deps.preparePermissionProfileToken || deps.captureProcessIdentity ||
         deps.captureEstablishedPeerIdentity || deps.captureLoopbackEndpointIdentity) {
@@ -522,6 +740,10 @@ export class OpenCodeSessionBridge {
         acquisitionPolicy: Object.freeze({ mode: 'supervisor-adopt-only', custody }),
         sessionStore: Object.freeze({ get: deps.sessionStore.get.bind(deps.sessionStore),
           upsert: deps.sessionStore.upsert.bind(deps.sessionStore), markStale: deps.sessionStore.markStale.bind(deps.sessionStore) }),
+        hostedSessionPublicationStore: Object.freeze({
+          readExact: deps.hostedSessionPublicationStore.readExact.bind(deps.hostedSessionPublicationStore),
+          compareAndSwap: deps.hostedSessionPublicationStore.compareAndSwap.bind(deps.hostedSessionPublicationStore),
+        }),
         mcpManager: deps.mcpManager && Object.freeze({ ensureAppMcp: deps.mcpManager.ensureAppMcp.bind(deps.mcpManager) }),
         eventTranslator: deps.eventTranslator && Object.freeze({ reconcileSessionMessages: deps.eventTranslator.reconcileSessionMessages.bind(deps.eventTranslator) }),
         logProjector: deps.logProjector && Object.freeze({ projectSummary: deps.logProjector.projectSummary.bind(deps.logProjector) }),
@@ -542,8 +764,187 @@ export class OpenCodeSessionBridge {
     }
   }
 
-  private snapshotSession(record: OpenCodeSessionRecord): OpenCodeSessionRecord {
-    return this.custody ? Object.freeze(structuredClone(record)) : record
+  private snapshotSession(record: Readonly<OpenCodeSessionRecord>): OpenCodeSessionRecord {
+    return this.custody ? Object.freeze(structuredClone(record)) : structuredClone(record)
+  }
+
+  createHostedSessionAttemptContext(
+    input: OpenCodeHostedSessionAttemptCallbacks,
+  ): OpenCodeHostedSessionAttemptContext {
+    if (!input || typeof input !== 'object' || typeof input.attemptId !== 'string' ||
+      !input.fence || typeof input.fence !== 'object' || !input.binding || typeof input.binding !== 'object' ||
+      typeof input.validateAttempt !== 'function' || typeof input.armAttempt !== 'function' ||
+      typeof input.recordCreated !== 'function' || typeof input.recordUncertain !== 'function' ||
+      typeof input.binding.teamId !== 'string' || typeof input.binding.runId !== 'string' ||
+      typeof input.binding.ownerLaneId !== 'string' || typeof input.binding.memberName !== 'string' ||
+      typeof input.binding.profileRootKey !== 'string' || typeof input.binding.hostKey !== 'string' ||
+      (input.binding.openCodeArtifactDigest !== null &&
+        typeof input.binding.openCodeArtifactDigest !== 'string') ||
+      typeof input.fence.ownerPlanGeneration !== 'string' ||
+      typeof input.fence.ownerIncarnation !== 'string') {
+      throw new Error('OpenCode hosted session attempt binding invalid')
+    }
+    const callbacks: OpenCodeHostedSessionAttemptCallbacks = Object.freeze({
+      attemptId: input.attemptId,
+      fence: Object.freeze({ ...input.fence }),
+      binding: Object.freeze({ ...input.binding }),
+      validateAttempt: input.validateAttempt,
+      armAttempt: input.armAttempt,
+      recordCreated: input.recordCreated,
+      recordUncertain: input.recordUncertain,
+    })
+    if (!callbacks.attemptId.trim() || !callbacks.binding.runId.trim() ||
+      !callbacks.binding.teamId.trim() || !callbacks.binding.ownerLaneId.trim() ||
+      !callbacks.binding.memberName.trim() || !callbacks.binding.profileRootKey.trim() ||
+      !callbacks.binding.hostKey.trim() || !callbacks.fence.ownerPlanGeneration.trim() ||
+      !callbacks.fence.ownerIncarnation.trim() ||
+      !Number.isSafeInteger(callbacks.fence.operationEpoch) || callbacks.fence.operationEpoch < 0 ||
+      !Number.isSafeInteger(callbacks.fence.attemptOrdinal) || callbacks.fence.attemptOrdinal < 0) {
+      throw new Error('OpenCode hosted session attempt binding invalid')
+    }
+    const mutable: MutableHostedSessionAttempt = { phase: 'prepared', record: null }
+    let registration: HostedSessionAttemptRegistration | undefined
+    const snapshot = (): OpenCodeHostedSessionAttemptSnapshot => {
+      if (!registration) throw new Error('OpenCode hosted session attempt registration unavailable')
+      const receiptSnapshot = registration.receipt && this.hostManager.inspectHostedAcquisition
+        ? this.hostManager.inspectHostedAcquisition(registration.receipt)
+        : null
+      return Object.freeze({
+        attemptId: callbacks.attemptId,
+        fence: Object.freeze({ ...callbacks.fence }),
+        binding: Object.freeze({ ...callbacks.binding }),
+        phase: mutable.phase,
+        record: mutable.record ? Object.freeze(structuredClone(mutable.record)) : null,
+        returnedSessionId: registration.sessionId,
+        cleanupPending: Object.freeze({
+          provisionalLease: receiptSnapshot?.pending.provisional ?? registration.provisionalLeasePending,
+          sessionLease: receiptSnapshot?.pending.session ?? registration.sessionLeasePending,
+          hostReference: receiptSnapshot?.pending.reference ?? registration.hostReferencePending,
+        }),
+        effectInFlight: registration.effectInFlight,
+        cleanupRequested: registration.cleanupRequested,
+        metadata: registration.metadata,
+        metadataImages: Object.freeze({
+          expected: registration.predecessor ? Object.freeze(structuredClone(registration.predecessor)) : null,
+          next: registration.next ? Object.freeze(structuredClone(registration.next)) : null,
+        }),
+        metadataCurrent: registration.metadataCurrent
+          ? Object.freeze(structuredClone(registration.metadataCurrent))
+          : null,
+        metadataError: registration.metadataError,
+        cleanupError: registration.cleanupError,
+        acquisition: receiptSnapshot,
+      })
+    }
+    const handle = Object.freeze({ snapshot })
+    const context = Object.freeze({
+      [hostedSessionAttemptContextBrand]: true as const,
+      handle,
+    })
+    registration = {
+      callbacks,
+      mutable,
+      handle,
+      consumed: false,
+      hostKey: null,
+      sessionId: null,
+      provisionalLeasePending: false,
+      sessionLeasePending: false,
+      hostReferencePending: false,
+      receipt: null,
+      actualTuple: null,
+      effectInFlight: false,
+      cleanupRequested: false,
+      cleanupFlight: null,
+      cleanupSettled: false,
+      metadata: 'not_started',
+      predecessor: null,
+      predecessorRegistration: null,
+      next: null,
+      metadataCurrent: null,
+      metadataError: null,
+      cleanupError: null,
+    }
+    this.#hostedSessionAttempts.set(context, registration)
+    this.#hostedSessionAttemptHandles.set(handle, registration)
+    return context
+  }
+
+  private hostedAttemptSnapshot(registration: HostedSessionAttemptRegistration) {
+    return registration.handle.snapshot()
+  }
+
+  private requireHostedAttemptLive(registration: HostedSessionAttemptRegistration): void {
+    if (registration.cleanupRequested) {
+      throw new OpenCodeHostedSessionCleanupPendingError(registration.handle)
+    }
+  }
+
+  private async recordHostedUncertain(
+    registration: HostedSessionAttemptRegistration,
+    cause: unknown,
+    message: string,
+  ): Promise<OpenCodeHostedSessionEffectError> {
+    registration.mutable.phase = 'uncertain'
+    let callbackFailure: unknown
+    try {
+      await registration.callbacks.recordUncertain(this.hostedAttemptSnapshot(registration))
+    } catch (error) {
+      callbackFailure = error
+    }
+    return new OpenCodeHostedSessionEffectError(message, cause, registration.handle, callbackFailure)
+  }
+
+  private async settleHostedAttemptCleanup(registration: HostedSessionAttemptRegistration): Promise<void> {
+    registration.cleanupRequested = true
+    if (!registration.effectInFlight && !registration.consumed) registration.consumed = true
+    if (registration.effectInFlight) throw new OpenCodeHostedSessionCleanupPendingError(registration.handle)
+    if (registration.cleanupSettled) return
+    if (registration.cleanupFlight) return registration.cleanupFlight
+    const flight = Promise.resolve().then(async () => {
+      if (registration.effectInFlight) throw new OpenCodeHostedSessionCleanupPendingError(registration.handle)
+      if (registration.receipt) {
+        const release = this.hostManager.releaseHostedAcquisition
+        if (!release) throw new Error('OpenCode hosted receipt cleanup capability unavailable')
+        try {
+          await release.call(this.hostManager, registration.receipt)
+        } catch (error) {
+          if (error instanceof OpenCodeHostedAcquisitionCleanupPendingError) {
+            throw new OpenCodeHostedSessionCleanupPendingError(registration.handle)
+          }
+          throw error
+        }
+      }
+      registration.provisionalLeasePending = false
+      registration.sessionLeasePending = false
+      registration.hostReferencePending = false
+      const record = registration.mutable.record
+      if (record) {
+        const key = this.buildExactSessionKey(record)
+        const retained = this.#retainedSessionHosts.get(key)
+        if (retained?.hostedAttempt === registration) retained.hostReferencePending = false
+      }
+      this.#unsettledHostedSessionAttempts.delete(registration)
+      registration.cleanupSettled = true
+    })
+    registration.cleanupFlight = flight
+    try {
+      await flight
+      registration.cleanupError = null
+    } catch (error) {
+      registration.cleanupError = error
+      throw error
+    } finally {
+      if (registration.cleanupFlight === flight) registration.cleanupFlight = null
+    }
+  }
+
+  async releaseHostedSessionAttempt(handle: OpenCodeHostedSessionAttemptHandle): Promise<void> {
+    const registration = this.#hostedSessionAttemptHandles.get(handle)
+    if (!registration) {
+      throw new Error('OpenCode hosted session attempt handle unavailable')
+    }
+    await this.settleHostedAttemptCleanup(registration)
   }
 
   private requireSupervisedDependency(key: keyof OpenCodeSessionBridgeDeps): void {
@@ -735,34 +1136,113 @@ export class OpenCodeSessionBridge {
     title?: string | null
     runId?: string | null
     toolApprovalMode?: OpenCodeToolApprovalMode
+    hostedAttempt?: OpenCodeHostedSessionAttemptContext
   }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
     if (this.custody) params = { ...params, identity: { ...params.identity } }
-    const host = await this.hostManager.ensureHost({
-      projectPath: params.profile.projectPath,
-      preparedProfile: params.profile,
-      lease: {
-        teamId: params.identity.teamId,
-        laneId: params.identity.laneId,
-        memberName: params.identity.memberName,
-        runId: params.runId ?? null,
-      },
-    })
+    const hosted = params.hostedAttempt
+      ? this.#hostedSessionAttempts.get(params.hostedAttempt)
+      : undefined
+
+    if (params.hostedAttempt && (!hosted || !hosted.consumed || !hosted.effectInFlight)) {
+      throw new Error('OpenCode hosted session attempt context invalid or already consumed')
+    }
+
+    let host: OpenCodeHostHandle
+    try {
+      if (hosted) {
+        if (!hosted.receipt || !this.hostManager.acquireHostedHost) {
+          throw new Error('OpenCode hosted receipt acquisition capability unavailable')
+        }
+        host = await this.hostManager.acquireHostedHost(hosted.receipt, {
+          projectPath: params.profile.projectPath,
+          preparedProfile: params.profile,
+        })
+      } else {
+        host = await this.hostManager.ensureHost({
+          projectPath: params.profile.projectPath,
+          preparedProfile: params.profile,
+          lease: {
+            teamId: params.identity.teamId,
+            laneId: params.identity.laneId,
+            memberName: params.identity.memberName,
+            runId: params.runId ?? null,
+          },
+        })
+      }
+    } catch (error) {
+      if (hosted) {
+        const acquired = hosted.receipt && this.hostManager.inspectHostedAcquisition?.(hosted.receipt).acquireState === 'acquired'
+        hosted.mutable.phase = acquired ? 'uncertain' : 'no_effect'
+        throw new OpenCodeHostedSessionEffectError(
+          'OpenCode hosted session host acquisition failed', error, hosted.handle,
+        )
+      }
+      throw error
+    }
     let promotedSessionId: string | null = null
+    if (hosted) {
+      hosted.hostKey = host.hostKey
+      hosted.hostReferencePending = true
+      hosted.provisionalLeasePending = true
+      this.requireHostedAttemptLive(hosted)
+    }
 
     try {
       const client = this.clientFactory.create(host.baseUrl)
       const sessionTitle = params.title?.trim() || `${params.identity.teamId} - ${params.identity.memberName}`
       let session: OpenCodeSessionSummary | null = null
       let lastCreateError: unknown = null
-      for (const [attemptIndex, retryDelayMs] of [0, ...OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS].entries()) {
+      const createRetryDelays = hosted ? [0] : [0, ...OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS]
+      for (const [attemptIndex, retryDelayMs] of createRetryDelays.entries()) {
         if (retryDelayMs > 0) {
           await delayMs(retryDelayMs)
         }
         try {
+          if (hosted) {
+            let current = false
+            try {
+              current = await hosted.callbacks.validateAttempt()
+            } catch (error) {
+              hosted.mutable.phase = 'no_effect'
+              throw new OpenCodeHostedSessionEffectError(
+                'OpenCode hosted session attempt validation failed', error, hosted.handle,
+              )
+            }
+            if (!current) {
+              hosted.mutable.phase = 'no_effect'
+              throw new OpenCodeHostedSessionEffectError(
+                'OpenCode hosted session attempt is stale',
+                new Error('OpenCode hosted session attempt binding or fence is stale'),
+                hosted.handle,
+              )
+            }
+            this.requireHostedAttemptLive(hosted)
+            try {
+              hosted.mutable.phase = 'armed'
+              await hosted.callbacks.armAttempt(this.hostedAttemptSnapshot(hosted))
+            } catch (error) {
+              hosted.mutable.phase = 'no_effect'
+              throw new OpenCodeHostedSessionEffectError(
+                'OpenCode hosted session attempt arm failed', error, hosted.handle,
+              )
+            }
+            this.requireHostedAttemptLive(hosted)
+            // There must be no awaited work between the durable arm and this
+            // actual provider effect. Unknown completion is never retried.
+            hosted.mutable.phase = 'create_unknown'
+          }
           session = await client.createSession({ title: sessionTitle })
           break
         } catch (error) {
           lastCreateError = error
+          if (hosted) {
+            if (hosted.mutable.phase === 'no_effect') throw error
+            throw await this.recordHostedUncertain(
+              hosted,
+              error,
+              'OpenCode hosted session create outcome is uncertain',
+            )
+          }
           if (
             this.custody || attemptIndex >= OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS.length ||
             !isTransientOpenCodeCreateSessionError(error)
@@ -775,6 +1255,12 @@ export class OpenCodeSessionBridge {
         throw lastCreateError instanceof Error
           ? lastCreateError
           : new Error('OpenCode session creation failed')
+      }
+      if (hosted) {
+        if (!session.id || typeof session.id !== 'string') {
+          throw new Error('OpenCode hosted create returned an invalid session identity')
+        }
+        hosted.sessionId = session.id
       }
       const now = buildNowIso()
       const record: OpenCodeSessionRecord = {
@@ -806,50 +1292,128 @@ export class OpenCodeSessionBridge {
         createdAt: now,
         updatedAt: now,
       }
-      await this.hostManager.retainHostLease?.(host.hostKey, {
-        teamId: params.identity.teamId,
-        laneId: params.identity.laneId,
-        memberName: params.identity.memberName,
-        runId: params.runId ?? null,
-        sessionId: session.id,
-      })
+      if (hosted) {
+        hosted.mutable.record = structuredClone(record)
+        hosted.mutable.phase = 'created'
+        // Retain the exact returned identity synchronously before any recorder,
+        // metadata-store, or lease-promotion await can fail.
+        const exactSessionKey = this.buildExactSessionKey(record)
+        if (this.#retainedSessionHosts.has(exactSessionKey)) {
+          throw new Error('OpenCode hosted returned session identity already has an active acquisition')
+        }
+        this.#retainedSessionHosts.set(exactSessionKey, {
+          hostKey: host.hostKey,
+          sessionId: record.opencodeSessionId,
+          hostReferencePending: true,
+          hostedAttempt: hosted,
+        })
+        try {
+          await hosted.callbacks.recordCreated(this.hostedAttemptSnapshot(hosted))
+        } catch (error) {
+          throw await this.recordHostedUncertain(
+            hosted,
+            error,
+            'OpenCode hosted session created-record persistence failed',
+          )
+        }
+        this.requireHostedAttemptLive(hosted)
+      }
+      if (hosted) {
+        if (!hosted.receipt || !this.hostManager.promoteHostedAcquisition) {
+          throw new Error('OpenCode hosted receipt promotion capability unavailable')
+        }
+        await this.hostManager.promoteHostedAcquisition(hosted.receipt, session.id)
+      } else await this.hostManager.retainHostLease?.(host.hostKey, {
+          teamId: params.identity.teamId,
+          laneId: params.identity.laneId,
+          memberName: params.identity.memberName,
+          runId: params.runId ?? null,
+          sessionId: session.id,
+        })
       promotedSessionId = session.id
-      await this.hostManager.releaseHostLease?.(host.hostKey, {
+      if (hosted) hosted.sessionLeasePending = true
+      if (!hosted) await this.hostManager.releaseHostLease?.(host.hostKey, {
         teamId: params.identity.teamId,
         laneId: params.identity.laneId,
         memberName: params.identity.memberName,
         runId: params.runId ?? null,
       })
+      if (hosted) {
+        hosted.provisionalLeasePending = false
+        this.requireHostedAttemptLive(hosted)
+      }
 
       return {
         retainedHostKey: host.hostKey,
         record,
       }
     } catch (error) {
-      if (promotedSessionId) {
+      if (hosted && hosted.mutable.phase === 'prepared') {
+        hosted.mutable.phase = 'no_effect'
+      }
+      if (hosted && hosted.mutable.phase !== 'no_effect') {
+        // The exact host/session attempt remains under caller custody. Cleanup
+        // must use the retained handle and cannot guess from the latest row.
+        if (error instanceof OpenCodeHostedSessionEffectError) throw error
+        throw await this.recordHostedUncertain(
+          hosted,
+          error,
+          'OpenCode hosted session persistence or lease promotion failed',
+        )
+      }
+      if (hosted) {
+        let cleanupFailure: unknown
+        try {
+          await this.settleHostedAttemptCleanup(hosted)
+        } catch (cleanupError) {
+          cleanupFailure = cleanupError
+        }
+        if (error instanceof OpenCodeHostedSessionEffectError && cleanupFailure !== undefined) {
+          throw new OpenCodeHostedSessionEffectError(
+            error.message,
+            error.cause,
+            hosted.handle,
+            error.callbackFailure ?? cleanupFailure,
+            error.predecessorCleanup,
+          )
+        }
+        if (!(error instanceof OpenCodeHostedSessionEffectError)) {
+          throw new OpenCodeHostedSessionEffectError(
+            'OpenCode hosted session pre-effect setup failed',
+            error,
+            hosted.handle,
+            cleanupFailure,
+          )
+        }
+      } else {
+        if (promotedSessionId) {
+          await this.hostManager.releaseHostLease?.(host.hostKey, {
+            teamId: params.identity.teamId,
+            laneId: params.identity.laneId,
+            memberName: params.identity.memberName,
+            runId: params.runId ?? null,
+            sessionId: promotedSessionId,
+          }).catch(() => undefined)
+        }
         await this.hostManager.releaseHostLease?.(host.hostKey, {
           teamId: params.identity.teamId,
           laneId: params.identity.laneId,
           memberName: params.identity.memberName,
           runId: params.runId ?? null,
-          sessionId: promotedSessionId,
         }).catch(() => undefined)
+        await this.hostManager.releaseHost(host.hostKey)
       }
-      await this.hostManager.releaseHostLease?.(host.hostKey, {
-        teamId: params.identity.teamId,
-        laneId: params.identity.laneId,
-        memberName: params.identity.memberName,
-        runId: params.runId ?? null,
-      }).catch(() => undefined)
-      await this.hostManager.releaseHost(host.hostKey)
       throw error
     }
   }
 
-  private buildSessionKey(
-    identity: Pick<SessionIdentity, 'teamId' | 'memberName'> & { laneId?: string | null },
+  private buildExactSessionKey(
+    identity: Pick<SessionIdentity, 'teamId' | 'memberName'> & {
+      laneId?: string | null
+      opencodeSessionId: string
+    },
   ): string {
-    return `${identity.teamId}::${identity.laneId?.trim() || 'primary'}::${identity.memberName}`
+    return `${identity.teamId}::${identity.laneId?.trim() || 'primary'}::${identity.memberName}::session:${identity.opencodeSessionId}`
   }
 
   private async retainSessionHost(
@@ -858,8 +1422,9 @@ export class OpenCodeSessionBridge {
     profile?: OpenCodePreparedProfile,
   ) {
     record = this.snapshotSession(record)
-    const sessionKey = this.buildSessionKey(record)
-    if (this.#retainedSessionHosts.get(sessionKey) === record.hostKey) {
+    const sessionKey = this.buildExactSessionKey(record)
+    const retained = this.#retainedSessionHosts.get(sessionKey)
+    if (retained?.hostKey === record.hostKey && retained.sessionId === record.opencodeSessionId) {
       await this.hostManager.retainHostLease?.(record.hostKey, {
         teamId: record.teamId,
         laneId: record.laneId,
@@ -888,26 +1453,65 @@ export class OpenCodeSessionBridge {
         sessionId: record.opencodeSessionId,
       },
     })
-    this.#retainedSessionHosts.set(sessionKey, record.hostKey)
+    this.#retainedSessionHosts.set(sessionKey, {
+      hostKey: record.hostKey,
+      sessionId: record.opencodeSessionId,
+      hostReferencePending: true,
+      hostedAttempt: null,
+    })
     return host
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
+  async releaseSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>,
+    options: { strictHosted?: boolean } = {},
+  ): Promise<void> {
     record = { ...record }
-    const sessionKey = this.buildSessionKey(record)
-    const retainedHostKey = this.#retainedSessionHosts.get(sessionKey)
-    await this.hostManager.releaseHostLease?.(record.hostKey, {
+    options = { ...options }
+    const sessionKey = this.buildExactSessionKey(record)
+    const retained = this.#retainedSessionHosts.get(sessionKey)
+    if (retained?.hostedAttempt) {
+      const registeredRecord = retained.hostedAttempt.mutable.record
+      if (!registeredRecord || retained.hostKey !== record.hostKey ||
+        retained.sessionId !== record.opencodeSessionId ||
+        registeredRecord.teamId !== record.teamId || registeredRecord.laneId !== record.laneId ||
+        registeredRecord.memberName !== record.memberName || registeredRecord.hostKey !== record.hostKey ||
+        registeredRecord.opencodeSessionId !== record.opencodeSessionId) {
+        throw new Error('OpenCode hosted exact session record does not match its retained acquisition')
+      }
+      await this.settleHostedAttemptCleanup(retained.hostedAttempt)
+      return
+    }
+    if (options.strictHosted && !retained) {
+      throw new Error('OpenCode hosted exact session record is unavailable')
+    }
+    const releaseLease = this.hostManager.releaseHostLease
+    if (options.strictHosted && !releaseLease) {
+      throw new Error('OpenCode hosted exact session release capability unavailable')
+    }
+    await releaseLease?.call(this.hostManager, record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
       sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
-    if (!retainedHostKey) {
+    }).catch(error => {
+      if (options.strictHosted) throw error
+    })
+    if (!retained || retained.hostKey !== record.hostKey ||
+      retained.sessionId !== record.opencodeSessionId || !retained.hostReferencePending) {
       return
     }
 
+    if (options.strictHosted) {
+      await this.hostManager.releaseHost(retained.hostKey)
+      retained.hostReferencePending = false
+      if (this.#retainedSessionHosts.get(sessionKey) === retained) {
+        this.#retainedSessionHosts.delete(sessionKey)
+      }
+      return
+    }
     this.#retainedSessionHosts.delete(sessionKey)
-    await this.hostManager.releaseHost(retainedHostKey)
+    await this.hostManager.releaseHost(retained.hostKey)
   }
 
   async ensureSessionAppMcpReady(
@@ -1146,24 +1750,181 @@ export class OpenCodeSessionBridge {
     }
   }
 
-  async ensureSession(params: {
-    teamId: string
-    laneId?: string
-    memberName: string
-    selectedModel: string
-    selectedVariant?: string
-    title?: string | null
-    projectPath?: string | null
-    preparedProfile?: OpenCodePreparedProfile | null
-    runId?: string | null
-    fresh?: boolean
-    toolApprovalMode?: OpenCodeToolApprovalMode
-  }): Promise<OpenCodeSessionRecord> {
+  async ensureSession(input: OpenCodeEnsureSessionParams): Promise<OpenCodeSessionRecord> {
+    const suppliedHostedAttempt = input.hostedAttempt
+    const admittedHostedAttempt = suppliedHostedAttempt === undefined
+      ? undefined
+      : this.#hostedSessionAttempts.get(suppliedHostedAttempt)
+    if (suppliedHostedAttempt !== undefined && !admittedHostedAttempt) {
+      throw new Error('OpenCode hosted session attempt context unavailable')
+    }
+    const params: OpenCodeEnsureSessionParams = {
+      teamId: input.teamId,
+      laneId: input.laneId,
+      memberName: input.memberName,
+      selectedModel: input.selectedModel,
+      selectedVariant: input.selectedVariant,
+      title: input.title,
+      projectPath: input.projectPath,
+      preparedProfile: admittedHostedAttempt && input.preparedProfile
+        ? structuredClone(input.preparedProfile)
+        : input.preparedProfile,
+      runId: input.runId,
+      fresh: input.fresh,
+      toolApprovalMode: input.toolApprovalMode,
+      hostedAttempt: suppliedHostedAttempt,
+    }
+    const hosted = admittedHostedAttempt
+    if (!hosted) return this.ensureSessionInternal(params)
+    if (!this.custody) {
+      throw new OpenCodeHostedSessionEffectError(
+        'OpenCode hosted session attempt binding or actual capability is unavailable',
+        new Error('OpenCode hosted attempt requires the immutable actual supervised tuple'),
+        hosted.handle,
+      )
+    }
+    assertHostedEnsurePrimitives(params)
+    if (params.preparedProfile) assertHostedPreparedProfile(params.preparedProfile, this.custody.expected)
+    if (params.projectPath !== undefined && params.projectPath !== null &&
+      params.projectPath !== this.custody.expected.profile.projectPath) {
+      throw new Error('OpenCode hosted project path does not match supervisor admission')
+    }
+    if (params.toolApprovalMode !== undefined &&
+      params.toolApprovalMode !== this.custody.expected.profile.toolApprovalMode) {
+      throw new Error('OpenCode hosted tool approval mode does not match supervisor admission')
+    }
+    if (hosted.consumed) throw new Error('OpenCode hosted session attempt context invalid or already consumed')
+    const laneId = params.laneId?.trim() || 'primary'
+    const runId = params.runId ?? ''
+    const binding = hosted.callbacks.binding
+    const expected = this.custody?.expected
+    const manager = this.hostManager
+    const publication = this.deps.hostedSessionPublicationStore
+    const supported = Boolean(this.custody && expected && publication &&
+      manager.reserveHostedAcquisition && manager.acquireHostedHost &&
+      manager.inspectHostedAcquisition && manager.promoteHostedAcquisition &&
+      manager.releaseHostedAcquisition &&
+      isOpenCodeHostManagerBoundToCustody(manager, this.custody!))
+    const primitiveIdentityValid = params.teamId === params.teamId.trim() &&
+      params.memberName === params.memberName.trim() && runId === runId.trim() &&
+      !params.teamId.includes('::') && !params.memberName.includes('::') &&
+      !runId.includes('::') && !laneId.includes('::')
+    const exactBinding = supported && primitiveIdentityValid && Boolean(runId) &&
+      binding.teamId === params.teamId && binding.runId === runId &&
+      binding.ownerLaneId === laneId && binding.memberName === params.memberName &&
+      binding.profileRootKey === expected!.profile.profileRootKey &&
+      binding.hostKey === this.custody!.hostKey &&
+      binding.openCodeArtifactDigest === `sha256:${expected!.executable.sha256}`
+    if (!exactBinding) {
+      hosted.consumed = true
+      hosted.mutable.phase = 'no_effect'
+      throw new OpenCodeHostedSessionEffectError(
+        'OpenCode hosted session attempt binding or actual capability is unavailable',
+        new Error('OpenCode hosted attempt requires the immutable actual supervised tuple'),
+        hosted.handle,
+      )
+    }
+    hosted.consumed = true
+    hosted.effectInFlight = true
+    try {
+      let current = false
+      try { current = await hosted.callbacks.validateAttempt() } catch (cause) {
+        hosted.mutable.phase = 'no_effect'
+        throw new OpenCodeHostedSessionEffectError('OpenCode hosted session attempt validation failed', cause, hosted.handle)
+      }
+      if (!current) {
+        hosted.mutable.phase = 'no_effect'
+        throw new OpenCodeHostedSessionEffectError('OpenCode hosted session attempt is stale',
+          new Error('OpenCode hosted session attempt fence is stale'), hosted.handle)
+      }
+      this.requireHostedAttemptLive(hosted)
+      const predecessor = await publication!.readExact({ teamId: params.teamId, laneId, memberName: params.memberName })
+      hosted.predecessor = predecessor
+      this.requireHostedAttemptLive(hosted)
+      if (predecessor) {
+        const retained = this.#retainedSessionHosts.get(this.buildExactSessionKey(predecessor))
+        if (!retained?.hostedAttempt?.receipt || retained.hostKey !== predecessor.hostKey ||
+          retained.sessionId !== predecessor.opencodeSessionId ||
+          retained.hostedAttempt.mutable.record?.teamId !== predecessor.teamId ||
+          retained.hostedAttempt.mutable.record?.laneId !== predecessor.laneId ||
+          retained.hostedAttempt.mutable.record?.memberName !== predecessor.memberName ||
+          retained.hostedAttempt.mutable.record?.hostKey !== predecessor.hostKey ||
+          retained.hostedAttempt.mutable.record?.opencodeSessionId !== predecessor.opencodeSessionId ||
+          retained.hostedAttempt.actualTuple?.teamId !== predecessor.teamId ||
+          retained.hostedAttempt.actualTuple?.runId !== predecessor.runId ||
+          retained.hostedAttempt.actualTuple?.laneId !== predecessor.laneId ||
+          retained.hostedAttempt.actualTuple?.memberName !== predecessor.memberName ||
+          retained.hostedAttempt.actualTuple?.profileRootKey !== predecessor.profileRootKey ||
+          retained.hostedAttempt.actualTuple?.hostKey !== predecessor.hostKey ||
+          retained.hostedAttempt.actualTuple?.openCodeArtifactDigest !== predecessor.openCodeArtifactDigest) {
+          hosted.mutable.phase = 'no_effect'
+          throw new OpenCodeHostedSessionEffectError(
+            'OpenCode hosted predecessor ownership is unavailable',
+            new Error('Persisted predecessor has no exact locally retained receipt'),
+            hosted.handle,
+          )
+        }
+        hosted.predecessorRegistration = retained.hostedAttempt
+      }
+      const tuple: OpenCodeHostedAcquisitionTuple = {
+        teamId: params.teamId, runId, laneId, memberName: params.memberName,
+        profileRootKey: binding.profileRootKey, hostKey: binding.hostKey,
+        openCodeArtifactDigest: binding.openCodeArtifactDigest,
+      }
+      hosted.actualTuple = Object.freeze({ ...tuple })
+      hosted.receipt = manager.reserveHostedAcquisition!(tuple)
+      this.#unsettledHostedSessionAttempts.add(hosted)
+      const record = await this.ensureSessionInternal(params)
+      this.requireHostedAttemptLive(hosted)
+      return record
+    } catch (error) {
+      if (error instanceof OpenCodeHostedSessionCleanupPendingError) throw error
+      let cleanupFailure: unknown = null
+      if (hosted.receipt) {
+        const acquisition = manager.inspectHostedAcquisition!(hosted.receipt)
+        if (acquisition.acquireState === 'reserved' || acquisition.acquireState === 'not_acquired') {
+          try {
+            await manager.releaseHostedAcquisition!(hosted.receipt)
+            this.#unsettledHostedSessionAttempts.delete(hosted)
+          } catch (cleanupError) {
+            cleanupFailure = cleanupError
+            hosted.cleanupError = cleanupError
+          }
+        }
+      }
+      if (hosted.mutable.phase === 'prepared') hosted.mutable.phase = 'no_effect'
+      if (error instanceof OpenCodeHostedSessionEffectError) {
+        if (cleanupFailure === null) throw error
+        throw new OpenCodeHostedSessionEffectError(
+          error.message,
+          error.cause,
+          hosted.handle,
+          error.callbackFailure ?? cleanupFailure,
+          error.predecessorCleanup,
+        )
+      }
+      throw new OpenCodeHostedSessionEffectError(
+        'OpenCode hosted session setup failed before a provider effect',
+        error,
+        hosted.handle,
+        cleanupFailure,
+      )
+    } finally {
+      hosted.effectInFlight = false
+    }
+  }
+
+  private async ensureSessionInternal(params: OpenCodeEnsureSessionParams): Promise<OpenCodeSessionRecord> {
     if (this.custody) params = { ...params,
       preparedProfile: params.preparedProfile ? structuredClone(params.preparedProfile) : params.preparedProfile }
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
-    const stored = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const hostedRegistration = params.hostedAttempt
+      ? this.#hostedSessionAttempts.get(params.hostedAttempt)
+      : undefined
+    const stored = hostedRegistration
+      ? hostedRegistration.predecessor
+      : await this.sessionStore.get(params.teamId, laneId, params.memberName)
     const existing = stored ? this.snapshotSession(stored) : stored
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
@@ -1186,6 +1947,7 @@ export class OpenCodeSessionBridge {
             toolApprovalMode: 'auto',
           }
     const profile = requestedProfile.profile
+    if (hostedRegistration) this.requireHostedAttemptLive(hostedRegistration)
     const existingManagedConfigFingerprint = existing
       ? getRecordManagedConfigFingerprint(existing)
       : null
@@ -1197,6 +1959,7 @@ export class OpenCodeSessionBridge {
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
       (!existingManagedConfigFingerprint || existingManagedConfigFingerprint === profile.managedConfigFingerprint) &&
+      !params.hostedAttempt &&
       params.fresh !== true &&
       !existing.staleReason
     ) {
@@ -1208,8 +1971,9 @@ export class OpenCodeSessionBridge {
       return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
     }
 
+    let existingStaleReason: string | null = null
     if (existing) {
-      const staleReason =
+      existingStaleReason =
         params.fresh === true
           ? 'fresh_launch_requested'
           : existing.selectedModel !== params.selectedModel
@@ -1226,13 +1990,15 @@ export class OpenCodeSessionBridge {
                   ? 'managed_auth_changed'
                   : existing.staleReason ?? 'session_refresh_required'
 
-      await this.sessionStore.markStale(
-        params.teamId,
-        laneId,
-        params.memberName,
-        staleReason,
-      )
-      await this.releaseSession(existing)
+      if (!params.hostedAttempt) {
+        await this.sessionStore.markStale(
+          params.teamId,
+          laneId,
+          params.memberName,
+          existingStaleReason,
+        )
+        await this.releaseSession(existing)
+      }
     }
 
     const created = await this.createFreshSessionRecord({
@@ -1247,14 +2013,87 @@ export class OpenCodeSessionBridge {
       title: params.title,
       runId: params.runId ?? null,
       toolApprovalMode: requestedProfile.toolApprovalMode,
+      hostedAttempt: params.hostedAttempt,
     })
+    if (hostedRegistration) this.requireHostedAttemptLive(hostedRegistration)
     try {
-      await this.sessionStore.upsert(created.record)
-      this.#retainedSessionHosts.set(
-        this.buildSessionKey(created.record),
-        created.retainedHostKey,
-      )
+      if (params.hostedAttempt) {
+        const hosted = this.#hostedSessionAttempts.get(params.hostedAttempt)
+        if (!hosted) throw new Error('OpenCode hosted session attempt context unavailable')
+        const publication = this.deps.hostedSessionPublicationStore
+        if (!publication) throw new Error('OpenCode hosted conditional metadata capability unavailable')
+        hosted.next = Object.freeze(structuredClone(created.record))
+        // This is the last sticky-cancellation edge before publication starts.
+        // No await may be introduced between this check and compareAndSwap.
+        this.requireHostedAttemptLive(hosted)
+        const result: OpenCodeHostedMetadataResult = await publication.compareAndSwap({
+          key: { teamId: params.teamId, laneId, memberName: params.memberName },
+          expected: hosted.predecessor,
+          next: hosted.next,
+        })
+        if (result.status === 'conflict') {
+          hosted.metadata = 'conflict'
+          hosted.metadataCurrent = result.current
+            ? Object.freeze(structuredClone(result.current))
+            : null
+          throw new Error(`OpenCode hosted metadata conflict; current session is ${
+            result.current?.opencodeSessionId ?? 'absent'}`)
+        }
+        if (result.status === 'unavailable') {
+          hosted.metadata = result.publication === 'unknown' ? 'unknown' : 'not_started'
+          hosted.metadataError = result.cause
+          throw new Error(`OpenCode hosted metadata publication ${result.publication}`, { cause: result.cause })
+        }
+        hosted.metadata = 'applied'
+        this.requireHostedAttemptLive(hosted)
+        if (existing) {
+          const predecessorRegistration = hosted.predecessorRegistration
+          if (!predecessorRegistration) throw new Error('OpenCode hosted predecessor receipt disappeared')
+          try {
+            await this.settleHostedAttemptCleanup(predecessorRegistration)
+          } catch (cause) {
+            throw new OpenCodeHostedSessionEffectError(
+              'OpenCode hosted replacement was published but predecessor cleanup failed',
+              cause,
+              hosted.handle,
+              undefined,
+              Object.freeze(structuredClone(existing)),
+            )
+          }
+        }
+      } else {
+        await this.sessionStore.upsert(created.record)
+        this.#retainedSessionHosts.set(
+          this.buildExactSessionKey(created.record),
+          {
+            hostKey: created.retainedHostKey,
+            sessionId: created.record.opencodeSessionId,
+            hostReferencePending: true,
+            hostedAttempt: null,
+          },
+        )
+      }
     } catch (error) {
+      if (params.hostedAttempt) {
+        const hosted = this.#hostedSessionAttempts.get(params.hostedAttempt)
+        if (hosted) {
+          const hostedError = await this.recordHostedUncertain(
+            hosted,
+            error,
+            'OpenCode hosted session metadata publication or predecessor cleanup failed',
+          )
+          if (error instanceof OpenCodeHostedSessionEffectError && error.predecessorCleanup) {
+            throw new OpenCodeHostedSessionEffectError(
+              error.message,
+              error.cause,
+              hosted.handle,
+              error.callbackFailure ?? hostedError.callbackFailure,
+              error.predecessorCleanup,
+            )
+          }
+          throw hostedError
+        }
+      }
       await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
         teamId: created.record.teamId,
         laneId: created.record.laneId,

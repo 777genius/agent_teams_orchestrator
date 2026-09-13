@@ -121,6 +121,31 @@ describe('OpenCodeSessionBridge', () => {
     resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
   })
 
+  test('strict hosted release refuses an unknown exact record before legacy decrement', async () => {
+    const bridge = new OpenCodeSessionBridge()
+    await expect(bridge.releaseSession(buildRecord(), { strictHosted: true }))
+      .rejects.toThrow('exact session record is unavailable')
+  })
+
+  test('rejects a supplied unauthenticated hosted context before store or profile effects', async () => {
+    let storeReads = 0
+    let profileReads = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => { storeReads += 1; return null },
+        upsert: async () => 'created',
+        markStale: async () => null,
+      },
+      prepareProfile: async () => { profileReads += 1; return profile },
+    })
+    await expect(bridge.ensureSession({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-a',
+      selectedModel: 'openai/gpt-5.4-mini',
+      hostedAttempt: Object.freeze({ handle: Object.freeze({ snapshot() { return {} } }) }) as never,
+    })).rejects.toThrow('hosted session attempt context unavailable')
+    expect({ storeReads, profileReads }).toEqual({ storeReads: 0, profileReads: 0 })
+  })
+
   test('reuses an existing clean session record', async () => {
     let createSessionCalls = 0
     let prepareProfileCalls = 0

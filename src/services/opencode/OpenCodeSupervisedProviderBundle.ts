@@ -4,7 +4,7 @@ import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeMcpManager } from './OpenCodeMcpManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
-import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { OpenCodeSessionStore, retainHostedSessionPublicationStore } from './OpenCodeSessionStore.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { OpenCodeTranscriptProjector } from './OpenCodeTranscriptProjector.js'
@@ -33,9 +33,10 @@ export function createOpenCodeSupervisedProviderBundle(custody: TrustedOpenCodeC
   // drain. No stale session mutation or binding pin survives bundle loss.
   custody.retainOwnerResource(() => bindingFences.revoke())
   const sessions = new OpenCodeSessionStore(sessionStorePath, bindingFences)
+  const hostedSessionPublicationStore = retainHostedSessionPublicationStore(sessions)
   const translator = new OpenCodeEventTranslator({ transcriptProjector: new OpenCodeTranscriptProjector() })
   const bridge = new OpenCodeSessionBridge({ acquisitionPolicy, hostManager: hosts, clientFactory: clients,
-    sessionStore: sessions, mcpManager: mcp, eventTranslator: translator,
+    sessionStore: sessions, hostedSessionPublicationStore, mcpManager: mcp, eventTranslator: translator,
     logProjector: new OpenCodeLogProjector(), offlineReader: new OpenCodeOfflineSessionReader(custody),
     previewObserver: new OpenCodePreviewObserver({ acquisitionPolicy }),
     turnSettledObserver: new OpenCodeTurnSettledObserver({ acquisitionPolicy }),
@@ -60,7 +61,10 @@ export function createOpenCodeSupervisedProviderBundle(custody: TrustedOpenCodeC
       return prepareExecutingOpenCodeArtifactDigestToken(custody.expected.process.pid, digest)
     },
   })
-  return Object.freeze({ lifecycle, approvals: Object.freeze({
+  return Object.freeze({ lifecycle, hostedAttempts: Object.freeze({
+    createContext: bridge.createHostedSessionAttemptContext.bind(bridge),
+    release: bridge.releaseHostedSessionAttempt.bind(bridge),
+  }), approvals: Object.freeze({
     observe: approvals.observe.bind(approvals), deliver: approvals.deliver.bind(approvals),
   }), close: custody.closeOwnerResources.bind(custody) })
 }

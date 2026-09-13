@@ -101,7 +101,11 @@ const PERSISTENT_HOST_STARTUP_LOCK_MIN_RETRY_MS = 100
 const PERSISTENT_HOST_STARTUP_LOCK_MAX_RETRY_MS = 500
 
 type ManagedHostEntry = {
-  supervisor?: { custody: TrustedOpenCodeCustody; leases: Set<string> }
+  supervisor?: {
+    custody: TrustedOpenCodeCustody
+    leases: Set<string>
+    hostedHoldings: Map<object, { provisional: boolean; sessionId: string | null }>
+  }
   handle: OpenCodeHostHandle
   child: ChildProcess | null
   refCount: number
@@ -133,6 +137,8 @@ type OpenCodeHostManagerDeps = {
   persistentRegistryPath?: string | null
   beforeTempOwnershipMarkerPublish?: () => Promise<void>
   resolveOpenCodeArtifactDigest?: (binaryPath: string) => OpenCodeArtifactDigest | null
+  /** Deterministic lower-boundary fault injection after receipt commit. */
+  afterHostedAcquisitionCommitForTest?: () => void
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -141,6 +147,56 @@ export type OpenCodeHostLeaseInput = {
   memberName: string
   runId?: string | null
   sessionId?: string | null
+}
+
+declare const openCodeHostedAcquisitionBrand: unique symbol
+export type OpenCodeHostedAcquisition = Readonly<{ [openCodeHostedAcquisitionBrand]: true }>
+
+export type OpenCodeHostedAcquisitionTuple = Readonly<{
+  teamId: string
+  runId: string
+  laneId: string
+  memberName: string
+  profileRootKey: string
+  hostKey: string
+  openCodeArtifactDigest: string | null
+}>
+
+export type OpenCodeHostedPreparedHostInput = Readonly<{
+  projectPath: string
+  preparedProfile: OpenCodePreparedProfile
+  healthTimeoutMs?: number | null
+  abortSignal?: AbortSignal
+}>
+
+export type OpenCodeHostedAcquisitionSnapshot = Readonly<{
+  actualTuple: OpenCodeHostedAcquisitionTuple
+  host: OpenCodeHostHandle | null
+  acquireState: 'reserved' | 'inflight' | 'not_acquired' | 'acquired'
+  promotionState: 'absent' | 'inflight' | 'present'
+  sessionId: string | null
+  pending: Readonly<{ provisional: boolean; session: boolean; reference: boolean }>
+}>
+
+export class OpenCodeHostedAcquisitionCleanupPendingError extends Error {
+  constructor() {
+    super('OpenCode hosted acquisition cleanup is pending while an effect is in flight')
+    this.name = 'OpenCodeHostedAcquisitionCleanupPendingError'
+  }
+}
+
+type HostedAcquisitionState = {
+  receipt: OpenCodeHostedAcquisition
+  tuple: OpenCodeHostedAcquisitionTuple
+  released: boolean
+  entry: ManagedHostEntry | null
+  host: OpenCodeHostHandle | null
+  acquireState: OpenCodeHostedAcquisitionSnapshot['acquireState']
+  promotionState: OpenCodeHostedAcquisitionSnapshot['promotionState']
+  sessionId: string | null
+  provisionalPending: boolean
+  sessionPending: boolean
+  referencePending: boolean
 }
 
 type PersistentHostLeaseRecord = {
@@ -317,6 +373,34 @@ function buildLeaseKey(input: OpenCodeHostLeaseInput): string {
   return `${teamId}::${laneId}::${memberName}::run:${runId}::__pre_session__`
 }
 
+function snapshotHostedAcquisitionTuple(input: OpenCodeHostedAcquisitionTuple): OpenCodeHostedAcquisitionTuple {
+  const tuple = {
+    teamId: input.teamId,
+    runId: input.runId,
+    laneId: input.laneId,
+    memberName: input.memberName,
+    profileRootKey: input.profileRootKey,
+    hostKey: input.hostKey,
+    openCodeArtifactDigest: input.openCodeArtifactDigest,
+  }
+  for (const [name, value] of Object.entries({
+    teamId: tuple.teamId, runId: tuple.runId, laneId: tuple.laneId,
+    memberName: tuple.memberName, profileRootKey: tuple.profileRootKey,
+  })) {
+    if (!value || value !== value.trim() || value.includes('::')) {
+      throw new Error(`OpenCode hosted acquisition ${name} is not canonical`)
+    }
+  }
+  if (tuple.openCodeArtifactDigest !== null &&
+    (!tuple.openCodeArtifactDigest || tuple.openCodeArtifactDigest !== tuple.openCodeArtifactDigest.trim())) {
+    throw new Error('OpenCode hosted acquisition artifact is not canonical')
+  }
+  if (tuple.laneId !== (tuple.laneId.trim() || 'primary')) {
+    throw new Error('OpenCode hosted acquisition lane is not canonical')
+  }
+  return Object.freeze(tuple)
+}
+
 function normalizeOpenCodeHostHealthTimeoutMs(timeoutMs?: number | null): number {
   if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
     return OPEN_CODE_HOST_HEALTH_TIMEOUT_MS
@@ -427,6 +511,8 @@ export function isOpenCodeHostManagerBoundToCustody(value: object, custody: Trus
 
 export class OpenCodeHostManager {
   readonly #hosts = new Map<string, ManagedHostEntry>()
+  readonly #hostedAcquisitions = new WeakMap<object, HostedAcquisitionState>()
+  readonly #unsettledHostedAcquisitions = new Set<HostedAcquisitionState>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
@@ -466,6 +552,176 @@ export class OpenCodeHostManager {
   }
 
   isBoundToCustody(custody: TrustedOpenCodeCustody): boolean { return this.custody === custody }
+
+  reserveHostedAcquisition(actual: OpenCodeHostedAcquisitionTuple): OpenCodeHostedAcquisition {
+    if (!this.custody) throw new Error('OpenCode hosted acquisition requires the sealed supervised manager')
+    const tuple = snapshotHostedAcquisitionTuple(actual)
+    if (tuple.hostKey !== this.custody.hostKey ||
+      tuple.profileRootKey !== this.custody.expected.profile.profileRootKey ||
+      tuple.openCodeArtifactDigest !== `sha256:${this.custody.expected.executable.sha256}`) {
+      throw new Error('OpenCode hosted acquisition tuple does not match custody')
+    }
+    const receipt = Object.freeze({}) as OpenCodeHostedAcquisition
+    const state: HostedAcquisitionState = {
+      receipt, tuple, released: false, entry: null, host: null,
+      acquireState: 'reserved', promotionState: 'absent',
+      sessionId: null, provisionalPending: false, sessionPending: false, referencePending: false,
+    }
+    this.#hostedAcquisitions.set(receipt, state)
+    this.#unsettledHostedAcquisitions.add(state)
+    return receipt
+  }
+
+  inspectHostedAcquisition(receipt: OpenCodeHostedAcquisition): OpenCodeHostedAcquisitionSnapshot {
+    const state = this.#hostedAcquisitions.get(receipt)
+    if (!state) throw new Error('OpenCode hosted acquisition receipt was not issued by this manager')
+    return Object.freeze({
+      actualTuple: state.tuple,
+      host: state.host,
+      acquireState: state.acquireState,
+      promotionState: state.promotionState,
+      sessionId: state.sessionId,
+      pending: Object.freeze({
+        provisional: state.provisionalPending,
+        session: state.sessionPending,
+        reference: state.referencePending,
+      }),
+    })
+  }
+
+  async acquireHostedHost(
+    receipt: OpenCodeHostedAcquisition,
+    input: OpenCodeHostedPreparedHostInput,
+  ): Promise<OpenCodeHostHandle> {
+    const state = this.#hostedAcquisitions.get(receipt)
+    if (!this.custody || !state || state.released || state.acquireState !== 'reserved') {
+      throw new Error('OpenCode hosted acquisition receipt is unavailable or already used')
+    }
+    const projectPath = input.projectPath
+    const preparedProfile = structuredClone(input.preparedProfile)
+    const healthTimeoutMs = input.healthTimeoutMs
+    const abortSignal = input.abortSignal
+    if (abortSignal !== undefined && !(abortSignal instanceof AbortSignal)) {
+      throw new Error('OpenCode hosted acquisition requires a native AbortSignal')
+    }
+    if (projectPath !== this.custody.expected.profile.projectPath ||
+      preparedProfile.projectPath !== projectPath || preparedProfile.profileRootKey !== state.tuple.profileRootKey) {
+      throw new Error('OpenCode hosted prepared host input does not match its receipt')
+    }
+    const deadline = new OpenCodeRuntimeDeadline(normalizeOpenCodeHostHealthTimeoutMs(healthTimeoutMs))
+    const abort = () => deadline.abort(abortSignal?.reason)
+    let abortListenerInstalled = false
+    let releaseOwnerResource: (() => void) | null = null
+    state.acquireState = 'inflight'
+    try {
+      if (abortSignal) {
+        abortSignal.addEventListener('abort', abort, { once: true })
+        abortListenerInstalled = true
+        if (abortSignal.aborted) abort()
+      }
+      releaseOwnerResource = this.custody.retainOwnerResource(() =>
+        deadline.abort(new Error('OpenCode supervised custody lost')))
+      const previous = this.#supervisedTail
+      const pending = deadline.runPhase('host_start', async context => {
+        await raceOpenCodeAbortSignal(previous, context.signal)
+        context.throwIfExpired()
+        return context
+      }).then(context => this.adoptSupervisedHost({
+        projectPath,
+        hostKey: state.tuple.hostKey,
+        preparedProfile,
+        abortSignal,
+        lease: {
+          teamId: state.tuple.teamId,
+          laneId: state.tuple.laneId,
+          memberName: state.tuple.memberName,
+          runId: state.tuple.runId,
+        },
+      }, context, state))
+      this.#supervisedTail = previous.then(() => pending).catch(() => undefined)
+      const handle = await pending
+      this.deps.afterHostedAcquisitionCommitForTest?.()
+      return handle
+    } catch (error) {
+      if (!state.entry) state.acquireState = 'not_acquired'
+      throw error
+    } finally {
+      let finalizerError: unknown = null
+      try { deadline.dispose() } catch (error) { finalizerError = error }
+      try {
+        if (abortListenerInstalled) abortSignal?.removeEventListener('abort', abort)
+      } catch (error) {
+        finalizerError ??= error
+      }
+      try { releaseOwnerResource?.() } catch (error) { finalizerError ??= error }
+      if (finalizerError !== null) throw finalizerError
+    }
+  }
+
+  async promoteHostedAcquisition(receipt: OpenCodeHostedAcquisition, sessionIdInput: string): Promise<void> {
+    const state = this.#hostedAcquisitions.get(receipt)
+    const sessionId = sessionIdInput.trim()
+    if (!this.custody || !state || state.released || state.acquireState !== 'acquired' || !state.entry || !sessionId ||
+      sessionId !== sessionIdInput) throw new Error('OpenCode hosted acquisition promotion unavailable')
+    if (state.promotionState === 'present') {
+      if (state.sessionId === sessionId) return
+      throw new Error('OpenCode hosted acquisition was promoted to a different session')
+    }
+    if (state.promotionState === 'inflight') throw new OpenCodeHostedAcquisitionCleanupPendingError()
+    state.promotionState = 'inflight'
+    try {
+      const token = await this.custody.prepareLeaseToken({
+        teamId: state.tuple.teamId, laneId: state.tuple.laneId,
+        memberName: state.tuple.memberName, sessionId,
+      })
+      const entry = state.entry
+      const supervisor = entry.supervisor
+      if (!token || !token.consume() || this.#hosts.get(state.tuple.hostKey) !== entry ||
+        supervisor?.hostedHoldings.get(receipt)?.provisional !== true) {
+        throw new Error('OpenCode hosted session admission unavailable')
+      }
+      const holding = supervisor.hostedHoldings.get(receipt)!
+      holding.provisional = false
+      holding.sessionId = sessionId
+      state.provisionalPending = false
+      state.sessionPending = true
+      state.sessionId = sessionId
+      state.promotionState = 'present'
+    } catch (error) {
+      if (state.promotionState === 'inflight') state.promotionState = 'absent'
+      throw error
+    }
+  }
+
+  async releaseHostedAcquisition(receipt: OpenCodeHostedAcquisition): Promise<void> {
+    const state = this.#hostedAcquisitions.get(receipt)
+    if (!state) throw new Error('OpenCode hosted acquisition receipt was not issued by this manager')
+    if (state.acquireState === 'inflight' || state.promotionState === 'inflight') {
+      throw new OpenCodeHostedAcquisitionCleanupPendingError()
+    }
+    if (state.released) return
+    if (!state.referencePending) {
+      if (state.acquireState === 'reserved') state.acquireState = 'not_acquired'
+      state.released = true
+      this.#unsettledHostedAcquisitions.delete(state)
+      return
+    }
+    const entry = state.entry
+    const supervisor = entry?.supervisor
+    if (!entry || !supervisor || this.#hosts.get(state.tuple.hostKey) !== entry ||
+      supervisor.hostedHoldings.get(receipt) === undefined) {
+      throw new Error('OpenCode hosted acquisition entry generation is unavailable')
+    }
+    supervisor.hostedHoldings.delete(receipt)
+    state.provisionalPending = false
+    state.sessionPending = false
+    entry.refCount = Math.max(0, entry.refCount - 1)
+    state.referencePending = false
+    state.released = true
+    if (entry.refCount === 0 && supervisor.leases.size === 0 &&
+      supervisor.hostedHoldings.size === 0) this.#hosts.delete(state.tuple.hostKey)
+    this.#unsettledHostedAcquisitions.delete(state)
+  }
 
   private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
     if (!binaryPath || this.deps.spawnHostProcess || process.platform !== 'linux') return null
@@ -1149,7 +1405,10 @@ export class OpenCodeHostManager {
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
     input = Object.freeze({ ...input })
     if (this.custody) {
-      this.#hosts.get(hostKey)?.supervisor?.leases.delete(buildLeaseKey(input))
+      const entry = this.#hosts.get(hostKey)
+      entry?.supervisor?.leases.delete(buildLeaseKey(input))
+      if (entry?.supervisor && entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
+        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
       return
     }
     const registryPath = this.persistentRegistryPath
@@ -1800,7 +2059,7 @@ export class OpenCodeHostManager {
     projectPath?: string | null; hostKey?: string | null
     preparedProfile?: OpenCodePreparedProfile; profileOptions?: OpenCodePrepareProfileOptions
     abortSignal?: AbortSignal; lease?: OpenCodeHostLeaseInput
-  }, context: OpenCodePhaseContext): Promise<OpenCodeHostHandle> {
+  }, context: OpenCodePhaseContext, hostedAcquisition?: HostedAcquisitionState): Promise<OpenCodeHostHandle> {
     const custody = this.custody!
     assertTrustedOpenCodeCustody(custody)
     const e = custody.expected
@@ -1869,7 +2128,19 @@ export class OpenCodeHostManager {
       const existing = this.#hosts.get(custody.hostKey)
       if (existing) {
         if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
-        existing.supervisor.leases.add(leaseKey)
+        if (hostedAcquisition) {
+          existing.supervisor.hostedHoldings.set(hostedAcquisition.receipt, {
+            provisional: true,
+            sessionId: null,
+          })
+          hostedAcquisition.entry = existing
+          hostedAcquisition.host = existing.handle
+          hostedAcquisition.provisionalPending = true
+          hostedAcquisition.referencePending = true
+          hostedAcquisition.acquireState = 'acquired'
+        } else {
+          existing.supervisor.leases.add(leaseKey)
+        }
         existing.refCount += 1
         return existing.handle
       }
@@ -1885,8 +2156,18 @@ export class OpenCodeHostManager {
         if (key !== 'state') Object.defineProperty(handle, key, { writable: false, configurable: false })
       }
       Object.seal(handle)
-      this.#hosts.set(custody.hostKey, { handle, child: null, refCount: 1, ownedByProcess: false,
-        lifetime: 'process', supervisor: { custody, leases: new Set([leaseKey]) } })
+      const entry: ManagedHostEntry = { handle, child: null, refCount: 1, ownedByProcess: false,
+        lifetime: 'process', supervisor: { custody,
+          leases: new Set(hostedAcquisition ? [] : [leaseKey]), hostedHoldings: new Map() } }
+      if (hostedAcquisition) {
+        entry.supervisor!.hostedHoldings.set(hostedAcquisition.receipt, { provisional: true, sessionId: null })
+        hostedAcquisition.entry = entry
+        hostedAcquisition.host = handle
+        hostedAcquisition.provisionalPending = true
+        hostedAcquisition.referencePending = true
+        hostedAcquisition.acquireState = 'acquired'
+      }
+      this.#hosts.set(custody.hostKey, entry)
       return handle
     } finally {
       finished = true
@@ -2088,8 +2369,12 @@ export class OpenCodeHostManager {
         return false
       }
       entry.handle.state = 'disposed'
-      entry.supervisor.leases.clear()
-      this.#hosts.delete(hostKey)
+      // Disposal ends custody/effect authority, but local ownership bookkeeping
+      // remains until each legacy or receipt owner releases its own exact hold.
+      // Deleting it here would make a committed receipt unable to settle, or
+      // tempt a later release to debit an unrelated entry generation.
+      if (entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
+        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
       await this.custody.closeOwnerResources()
       return true
     }
@@ -2488,7 +2773,8 @@ export class OpenCodeHostManager {
       const entry = this.#hosts.get(hostKey)
       if (!entry?.supervisor) return
       entry.refCount = Math.max(0, entry.refCount - 1)
-      if (entry.refCount === 0 && entry.supervisor.leases.size === 0) this.#hosts.delete(hostKey)
+      if (entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
+        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
       return
     }
     const entry = this.#hosts.get(hostKey)

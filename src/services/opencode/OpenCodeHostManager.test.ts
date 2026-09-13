@@ -7,13 +7,16 @@ import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
 
+import { canonicalHostedApprovalJson } from './OpenCodeClientFactory.js'
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+  OpenCodeHostedAcquisitionCleanupPendingError,
   OpenCodeHostManager,
   buildOpenCodeHostSpawnOptions,
   resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
+import { supervisedFixture, supervisedLease, supervisedTestStage } from './OpenCodeSupervisedCustody.test-fixture.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
 
@@ -122,6 +125,295 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
+  test.skipIf(process.platform !== 'linux')('uses opaque hosted receipts independently from legacy leases and releases once', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      expect(custody.hostKey).toMatch(/^supervised::[0-9a-f]{64}$/)
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const legacy = await manager.ensureHost({ preparedProfile: fixture.profile, lease: {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      } })
+      const receipt = manager.reserveHostedAcquisition({
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      })
+      const hosted = await manager.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })
+      expect(hosted).toBe(legacy)
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        actualTuple: { hostKey: custody.hostKey },
+        acquireState: 'acquired', promotionState: 'absent',
+        pending: { provisional: true, session: false, reference: true },
+      })
+      await manager.promoteHostedAcquisition(receipt, supervisedLease.sessionId)
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        promotionState: 'present', sessionId: supervisedLease.sessionId,
+        pending: { provisional: false, session: true, reference: true },
+      })
+      await Promise.all([
+        manager.releaseHostedAcquisition(receipt),
+        manager.releaseHostedAcquisition(receipt),
+      ])
+      await manager.releaseHostedAcquisition(receipt)
+      expect(manager.getHost(custody.hostKey)).toBe(legacy)
+      await manager.releaseHostLease(custody.hostKey, {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      })
+      await manager.releaseHost(custody.hostKey)
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('release permanently closes a reservation without disturbing a coexisting legacy owner', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const legacy = await manager.ensureHost({ preparedProfile: fixture.profile, lease: {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      } })
+      const receipt = manager.reserveHostedAcquisition({
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      })
+
+      await Promise.all([
+        manager.releaseHostedAcquisition(receipt),
+        manager.releaseHostedAcquisition(receipt),
+      ])
+      await manager.releaseHostedAcquisition(receipt)
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        acquireState: 'not_acquired', pending: { reference: false },
+      })
+      await expect(manager.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })).rejects.toThrow('unavailable or already used')
+      await expect(manager.promoteHostedAcquisition(receipt, supervisedLease.sessionId))
+        .rejects.toThrow('promotion unavailable')
+      expect(manager.getHost(custody.hostKey)).toBe(legacy)
+
+      await manager.releaseHostLease(custody.hostKey, {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      })
+      await manager.releaseHost(custody.hostKey)
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('disposal during promotion preserves exact receipt generations and sibling ownership', async () => {
+    const promotionStarted = createDeferred<void>()
+    const allowPromotion = createDeferred<void>()
+    const fixture = await supervisedFixture({ mutateBundle(bundle) {
+      const prepareLeaseToken = bundle.prepareLeaseToken
+      bundle.prepareLeaseToken = async lease => {
+        if (lease.sessionId) {
+          promotionStarted.resolve()
+          await allowPromotion.promise
+        }
+        return prepareLeaseToken(lease)
+      }
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const legacy = await manager.ensureHost({ preparedProfile: fixture.profile, lease: {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      } })
+      const tuple = {
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      }
+      const promotingReceipt = manager.reserveHostedAcquisition(tuple)
+      const siblingReceipt = manager.reserveHostedAcquisition(tuple)
+      const host = await manager.acquireHostedHost(promotingReceipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })
+      expect(host).toBe(legacy)
+      expect(await manager.acquireHostedHost(siblingReceipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })).toBe(host)
+
+      const promotion = manager.promoteHostedAcquisition(promotingReceipt, supervisedLease.sessionId)
+      await supervisedTestStage(promotionStarted.promise, promotion, 'hosted receipt promotion')
+      expect(await manager.disposeHost(custody.hostKey)).toBe(true)
+      expect(manager.getHost(custody.hostKey)).toBe(host)
+      expect(host.state).toBe('disposed')
+      await expect(manager.releaseHostedAcquisition(promotingReceipt))
+        .rejects.toBeInstanceOf(OpenCodeHostedAcquisitionCleanupPendingError)
+
+      allowPromotion.resolve()
+      await expect(promotion).rejects.toThrow('session admission unavailable')
+      expect(manager.inspectHostedAcquisition(promotingReceipt)).toMatchObject({
+        promotionState: 'absent', pending: { provisional: true, reference: true },
+      })
+      await manager.releaseHostedAcquisition(promotingReceipt)
+      await manager.releaseHostedAcquisition(promotingReceipt)
+      expect(manager.getHost(custody.hostKey)).toBe(host)
+      expect(manager.inspectHostedAcquisition(siblingReceipt).pending.reference).toBe(true)
+
+      await manager.releaseHostedAcquisition(siblingReceipt)
+      await manager.releaseHostedAcquisition(siblingReceipt)
+      expect(manager.getHost(custody.hostKey)).toBe(legacy)
+      await manager.releaseHostLease(custody.hostKey, {
+        teamId: supervisedLease.teamId, laneId: supervisedLease.laneId,
+        memberName: supervisedLease.memberName, runId: supervisedLease.runId,
+      })
+      await manager.releaseHost(custody.hostKey)
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+    } finally { allowPromotion.resolve(); await fixture.close() }
+  }, 120_000)
+
+  test('refuses hosted receipts on a desktop manager before host effects', () => {
+    const manager = new OpenCodeHostManager({ prepareProfile: async () => baseProfile })
+    expect(() => manager.reserveHostedAcquisition({
+      teamId: 'team', runId: 'run', laneId: 'primary', memberName: 'worker',
+      profileRootKey: 'profile-root', hostKey: 'host', openCodeArtifactDigest: null,
+    })).toThrow('sealed supervised manager')
+    expect(manager.getHost('host')).toBeNull()
+  })
+
+  test.skipIf(process.platform !== 'linux')('custody expiry blocks new acquisition but permits exact receipt release', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const tuple = {
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      }
+      const receipt = manager.reserveHostedAcquisition(tuple)
+      await manager.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })
+      await manager.promoteHostedAcquisition(receipt, supervisedLease.sessionId)
+      fixture.revoke()
+      const rejected = manager.reserveHostedAcquisition(tuple)
+      await expect(manager.acquireHostedHost(rejected, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })).rejects.toThrow()
+      expect(manager.inspectHostedAcquisition(rejected).acquireState).toBe('not_acquired')
+      await manager.releaseHostedAcquisition(receipt)
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+      await manager.releaseHostedAcquisition(rejected)
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('receipt cleanup cannot settle while acquisition is in flight', async () => {
+    let healthStarted!: () => void
+    let releaseHealth!: () => void
+    const started = new Promise<void>(resolve => { healthStarted = resolve })
+    const gate = new Promise<void>(resolve => { releaseHealth = resolve })
+    const fixture = await supervisedFixture({ handle(request, response) {
+      if (request.url === '/global/health') {
+        healthStarted()
+        void gate.then(() => response.end('{"healthy":true}'))
+        return
+      }
+      const result = request.url === '/agent' ? [] :
+        request.url?.endsWith('hosted-approval-capability') ? fixture.expected.hosted : {}
+      response.end(canonicalHostedApprovalJson(result))
+    } })
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({ acquisitionPolicy: { mode: 'supervisor-adopt-only', custody } })
+      const receipt = manager.reserveHostedAcquisition({
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      })
+      const acquisition = manager.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })
+      await supervisedTestStage(started, acquisition, 'hosted receipt acquisition')
+      await expect(manager.releaseHostedAcquisition(receipt))
+        .rejects.toBeInstanceOf(OpenCodeHostedAcquisitionCleanupPendingError)
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        acquireState: 'inflight', pending: { reference: false },
+      })
+      releaseHealth()
+      await acquisition
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        acquireState: 'acquired', pending: { provisional: true, reference: true },
+      })
+      await Promise.all([
+        manager.releaseHostedAcquisition(receipt),
+        manager.releaseHostedAcquisition(receipt),
+      ])
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+    } finally { releaseHealth?.(); await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('a receipt is opaque to every other actual manager', async () => {
+    const fixture = await supervisedFixture()
+    try {
+      const custody = await fixture.acquire()
+      const policy = { mode: 'supervisor-adopt-only' as const, custody }
+      const owner = new OpenCodeHostManager({ acquisitionPolicy: policy })
+      const foreign = new OpenCodeHostManager({ acquisitionPolicy: policy })
+      const receipt = owner.reserveHostedAcquisition({
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      })
+      expect(() => foreign.inspectHostedAcquisition(receipt)).toThrow('not issued by this manager')
+      await expect(foreign.releaseHostedAcquisition(receipt)).rejects.toThrow('not issued by this manager')
+      await owner.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })
+      await owner.releaseHostedAcquisition(receipt)
+      expect(owner.getHost(custody.hostKey)).toBeNull()
+      expect(foreign.getHost(custody.hostKey)).toBeNull()
+    } finally { await fixture.close() }
+  }, 120_000)
+
+  test.skipIf(process.platform !== 'linux')('a post-commit outer finalizer failure leaves the actual receipt acquired and releasable once', async () => {
+    const fixture = await supervisedFixture()
+    const finalizerFailure = new Error('forced outer finalizer failure')
+    try {
+      const custody = await fixture.acquire()
+      const manager = new OpenCodeHostManager({
+        acquisitionPolicy: { mode: 'supervisor-adopt-only', custody },
+        afterHostedAcquisitionCommitForTest() { throw finalizerFailure },
+      })
+      const receipt = manager.reserveHostedAcquisition({
+        teamId: supervisedLease.teamId, runId: supervisedLease.runId,
+        laneId: supervisedLease.laneId, memberName: supervisedLease.memberName,
+        profileRootKey: fixture.profile.profileRootKey, hostKey: custody.hostKey,
+        openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
+      })
+      await expect(manager.acquireHostedHost(receipt, {
+        projectPath: fixture.profile.projectPath, preparedProfile: fixture.profile,
+      })).rejects.toBe(finalizerFailure)
+      expect(manager.inspectHostedAcquisition(receipt)).toMatchObject({
+        acquireState: 'acquired',
+        pending: { provisional: true, session: false, reference: true },
+      })
+      expect(manager.getHost(custody.hostKey)).not.toBeNull()
+      await manager.releaseHostedAcquisition(receipt)
+      await manager.releaseHostedAcquisition(receipt)
+      expect(manager.inspectHostedAcquisition(receipt).pending).toEqual({
+        provisional: false, session: false, reference: false,
+      })
+      expect(manager.getHost(custody.hostKey)).toBeNull()
+    } finally { await fixture.close() }
+  }, 120_000)
   test('rejects effect authority from a custom process factory without executable artifact proof', async () => {
     const spawned = createMockChildProcess(4242)
     let alive = true
