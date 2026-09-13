@@ -51,7 +51,8 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
       sourceAuthFingerprint: 'source-auth',
       managedAuthFingerprint: 'managed-auth',
       authState: 'ok',
-      env: {},
+      // Positive auth fixtures provide usable credential evidence beyond native membership.
+      env: { OPENROUTER_API_KEY: 'fixture-key' },
     },
     connectedProviders: [
       {
@@ -8766,6 +8767,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     { blacklist: ['openrouter/free'] },
     { whitelist: ['moonshotai/kimi-k2:free'] },
     { whitelist: ['moonshotai/kimi-k2:free', 'openrouter/openrouter/free'] },
+    { options: { apiKey: '' } },
+    { options: { apiKey: '{env:MISSING_OPENROUTER_TEST_KEY}' } },
   ])('reads project router exclusions for native catalogs and post-connect verification %j', async restrictions => {
     const project = await mkdtemp(path.join(os.tmpdir(), 'openrouter project-'))
     const projectPath = path.join(project, 'child', '..')
@@ -8816,11 +8819,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
-  test('failed OpenRouter config reread cannot reopen a previously denied catalog route', async () => {
+  test.each(['{"provider": broken', ...[{ provider: null }, { provider: { openrouter: null } },
+    { provider: { openrouter: { whitelist: 'openrouter/free' } } },
+    { provider: { openrouter: { blacklist: 1 } } }].map(value => JSON.stringify(value))])('failed OpenRouter config reread cannot reopen a previously denied catalog route: %s', async content => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), 'openrouter-reread-failure-'))
-    await writeFile(path.join(projectPath, 'opencode.json'), '{"provider": broken')
+    await writeFile(path.join(projectPath, 'opencode.json'), content)
     const stale = inventory({ models: ['openrouter/openrouter/free'],
       connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] })
+    stale.profile!.env = { OPENROUTER_API_KEY: 'key' }
     stale.profile!.managedConfig = { provider: { openrouter: { blacklist: ['openrouter/free'] } } }
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
@@ -8833,8 +8839,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
     try {
       const models = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
-      expect(models.ok).toBe(true)
       if (models.ok) expect(models.value.models.map(model => model.modelId)).not.toContain('openrouter/openrouter/free')
+      else expect(models.error.code).toBe('runtime-unhealthy')
       const directory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
       expect(directory.ok && directory.value.entries).toEqual([])
       expect(stale.profile!.managedConfig).toEqual({ provider: { openrouter: { blacklist: ['openrouter/free'] } } })
@@ -8844,10 +8850,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
   test.each([[false, false], [false, true], [true, false], [true, true]])('OpenRouter free fallback is listed once (upstream: %s, connected: %s)', async (upstream, connected) => {
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
-      inventoryService: { probe: async () => inventory({
+      inventoryService: { probe: async () => { const snapshot = inventory({
         connectedProviders: connected ? [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] : [],
         models: upstream ? ['openrouter/openrouter/free'] : [],
-      }) },
+      }); snapshot.profile!.env = { OPENROUTER_API_KEY: 'key' }; return snapshot } },
       hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
       clientFactory: { create: () => ({
         getConfigProviders: async () => ({ providers: [], default: {} }),
@@ -8863,4 +8869,57 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const unrelated = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openai' })
     expect(unrelated.ok && unrelated.value.models).toEqual([])
   })
+})
+
+test('OpenRouter refresh binds effective options and resolved restrictions in directory eligibility', async () => {
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'openrouter-effective-eligibility-'))
+  const snapshot = inventory({ projectPath, models: [],
+    connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] })
+  snapshot.profile!.env = { ROUTE: 'openrouter/free', OPENROUTER_API_KEY: 'env-key', OPENCODE_CONFIG_CONTENT: '{}' }
+  snapshot.profile!.managedConfig = { provider: { openrouter: {
+    options: { apiKey: 'stale-key', baseURL: 'https://old.example' }, models: { custom: { name: 'User' } },
+  } } }
+  snapshot.profile!.managedAuthPath = path.join(projectPath, 'auth.json')
+  const original = structuredClone(snapshot.profile!.managedConfig)
+  const adapter = new OpenCodeProviderManagementAdapter({
+    ...catalogIdentityDependencies(),
+    inventoryService: { probe: async () => structuredClone(snapshot) },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+      getProviders: async () => ({ all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }),
+      getProviderAuth: async () => ({}),
+    }) },
+  })
+  const assertVisible = async (visible: boolean) => {
+    const directory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+    expect(directory.ok).toBe(true)
+    if (directory.ok) expect(directory.value.entries.length > 0).toBe(visible)
+    const models = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
+    expect(models.ok).toBe(true)
+    if (models.ok) expect(models.value.models.some(model => model.modelId === 'openrouter/openrouter/free')).toBe(visible)
+  }
+  const configure = (options?: Record<string, unknown>) => writeFile(path.join(projectPath, 'opencode.json'),
+    JSON.stringify({ provider: { openrouter: { whitelist: ['{env:ROUTE}'], ...(options ? { options } : {}) } } }))
+  try {
+    await configure({ apiKey: '' })
+    await assertVisible(false) // Refreshed invalid explicit options shadow the stale key and env.
+    await configure({ apiKey: 'fresh-key' })
+    await assertVisible(true)
+    snapshot.profile!.env.ROUTE = 'other'
+    await assertVisible(false) // Same raw restriction and host fingerprints, different captured env.
+    snapshot.profile!.env.ROUTE = 'openrouter/free'
+    await assertVisible(true)
+    await writeFile(snapshot.profile!.managedAuthPath, JSON.stringify({ openrouter: { type: 'api', key: '' } }))
+    await configure()
+    await assertVisible(false) // Removing explicit options exposes the invalid selected auth store.
+    await configure({ apiKey: 'fresh-key' })
+    await assertVisible(true) // Explicit options override the invalid selected store.
+    await configure()
+    await rm(snapshot.profile!.managedAuthPath)
+    await assertVisible(true) // With no API auth entry, environment credentials are selected.
+    delete snapshot.profile!.env.OPENROUTER_API_KEY
+    await assertVisible(false) // Native connected membership cannot manufacture a credential.
+    expect(snapshot.profile!.managedConfig).toEqual(original)
+  } finally { await rm(projectPath, { recursive: true, force: true }) }
 })

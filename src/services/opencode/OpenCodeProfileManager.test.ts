@@ -275,6 +275,18 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       .rejects.toThrow('OpenRouter effective configuration is invalid')
   })
 
+  test('OpenRouter strict reread rejects schema-invalid provider and restriction shapes', async () => {
+    const projectPath = path.join(tempDir, 'router-schema')
+    await mkdir(projectPath, { recursive: true })
+    for (const config of [{ provider: null }, { provider: [] }, { provider: { openrouter: null } },
+      { provider: { openrouter: false } }, { provider: { openrouter: { whitelist: 'openrouter/free' } } },
+      { provider: { openrouter: { blacklist: 123 } } }, { provider: { openrouter: { whitelist: [null] } } }]) {
+      await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify(config))
+      await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, { OPENCODE_CONFIG_CONTENT: '{}' }))
+        .rejects.toThrow('configuration is invalid')
+    }
+  })
+
   test('OpenRouter rejects every unusable static credential shape in disconnected profiles', async () => {
     const projectPath = path.join(tempDir, 'invalid-router-credentials')
     await mkdir(projectPath, { recursive: true })

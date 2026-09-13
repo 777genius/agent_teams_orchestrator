@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+
 /** Compatibility route for OpenCode releases whose embedded models.dev omits the router. */
 export const OPEN_CODE_OPENROUTER_FREE_ROUTE = {
   providerId: 'openrouter',
@@ -8,8 +11,11 @@ export const OPEN_CODE_OPENROUTER_FREE_ROUTE = {
 /** Restrictions use provider-relative model keys, as OpenCode config does. */
 export function isOpenCodeOpenRouterFreeRouteAllowed(...entries: unknown[]): boolean {
   return entries.every(entry => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true
+    if (entry === undefined) return true
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
     const { whitelist, blacklist } = entry as Record<string, unknown>
+    if ([whitelist, blacklist].some(value => value !== undefined
+      && (!Array.isArray(value) || value.some(item => typeof item !== 'string')))) return false
     const matches = (values: unknown[]) => values.includes(OPEN_CODE_OPENROUTER_FREE_ROUTE.modelId)
     return !(Array.isArray(blacklist) && matches(blacklist))
       && (!Array.isArray(whitelist) || matches(whitelist))
@@ -100,4 +106,63 @@ export function isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(
 ): boolean {
   try { return isOpenCodeOpenRouterFreeRouteAllowed(resolveOpenCodeOpenRouterRestrictions(provider, env)) }
   catch { return false }
+}
+
+/** Validate before safe-config projection can erase malformed provider shapes. */
+export function validateOpenCodeOpenRouterConfig(config: Record<string, unknown>): void {
+  const record = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === 'object' && !Array.isArray(value)
+  if (config.provider === undefined) return
+  if (!record(config.provider)) throw new Error('OpenRouter provider configuration is invalid')
+  const provider = config.provider.openrouter
+  if (provider === undefined) return
+  if (!record(provider)) throw new Error('OpenRouter provider configuration is invalid')
+  for (const key of ['whitelist', 'blacklist']) {
+    const value = provider[key]
+    if (value !== undefined && (!Array.isArray(value) || value.some(item => typeof item !== 'string'))) {
+      throw new Error('OpenRouter model restriction configuration is invalid')
+    }
+  }
+  if (provider.options !== undefined && !record(provider.options)) {
+    throw new Error('OpenRouter options configuration is invalid')
+  }
+}
+
+/** Read the selected materialized auth store, never infer credentials from native membership. */
+export function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): unknown {
+  if (!authPath) return null
+  try {
+    const store = JSON.parse(readFileSync(authPath, 'utf8'))
+    if (!store || typeof store !== 'object' || Array.isArray(store)) throw new Error()
+    return store.openrouter ?? null
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    // An unreadable selected store must not fall through to environment credentials.
+    return { type: 'api', key: '' }
+  }
+}
+
+export function hasOpenCodeOpenRouterCatalogCredential(
+  provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown,
+): boolean {
+  const entry = auth as Record<string, unknown> | null
+  return hasOpenCodeOpenRouterSelectedCredential(provider, env, auth,
+    !!entry && entry.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim())
+}
+
+/** Bind resolved decisions and credentials without putting secret values in cache keys. */
+export function openCodeOpenRouterEligibilityIdentity(
+  provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown,
+): string {
+  let restrictions: unknown
+  let options: unknown
+  try {
+    const resolved = resolveOpenCodeOpenRouterRestrictions(provider, env)
+    restrictions = [resolved.whitelist, resolved.blacklist]
+  } catch { restrictions = 'invalid' }
+  try { options = resolveOpenCodeOpenRouterEnvironment(provider.options, env) }
+  catch { options = 'invalid' }
+  return createHash('sha256').update(JSON.stringify([restrictions, options, auth, env.OPENROUTER_API_KEY,
+    hasOpenCodeOpenRouterCatalogCredential(provider, env, auth),
+    isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider, env)])).digest('hex')
 }

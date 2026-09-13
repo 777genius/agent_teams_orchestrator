@@ -122,3 +122,15 @@ test('fallback evaluates snapshot restrictions once and retains native config fo
   applyOpenCodeOpenRouterFallback(nested, 'openrouter', true, env)
   expect(nested.provider.openrouter).toEqual({ whitelist: ['{env:NESTED}'] })
 })
+
+test('resolved eligibility identity follows captured environment and credential precedence', async () => {
+  const { openCodeOpenRouterEligibilityIdentity, hasOpenCodeOpenRouterCatalogCredential } = await import('./OpenCodeOpenRouterFallback.js')
+  const provider = { whitelist: ['{env:ROUTE}'], options: { apiKey: '{env:KEY}' } }
+  const env = { ROUTE: 'openrouter/free', KEY: 'valid' }
+  const identity = openCodeOpenRouterEligibilityIdentity(provider, env, null)
+  expect(openCodeOpenRouterEligibilityIdentity(provider, { ...env, ROUTE: 'other' }, null)).not.toBe(identity)
+  expect(openCodeOpenRouterEligibilityIdentity(provider, { ...env, KEY: '' }, null)).not.toBe(identity)
+  expect(hasOpenCodeOpenRouterCatalogCredential(provider, env, { type: 'api', key: '' })).toBe(true)
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, { OPENROUTER_API_KEY: 'env' }, { type: 'api', key: '' })).toBe(false)
+  expect(hasOpenCodeOpenRouterCatalogCredential({}, {}, null)).toBe(false)
+})

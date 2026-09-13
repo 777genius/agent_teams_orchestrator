@@ -20,7 +20,13 @@ import {
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { applyOpenCodeOpenRouterFallback, resolveOpenCodeOpenRouterRestrictions, resolveOpenCodeOpenRouterEnvironment, hasOpenCodeOpenRouterSelectedCredential } from './OpenCodeOpenRouterFallback.js'
+import {
+  validateOpenCodeOpenRouterConfig,
+  applyOpenCodeOpenRouterFallback,
+  resolveOpenCodeOpenRouterRestrictions,
+  resolveOpenCodeOpenRouterEnvironment,
+  hasOpenCodeOpenRouterSelectedCredential,
+} from './OpenCodeOpenRouterFallback.js'
 import { isDeepStrictEqual } from 'node:util'
 
 import { getCwd } from '../../utils/cwd.js'
@@ -1535,6 +1541,7 @@ function parseOpenRouterRuntimeConfig(content: string): Record<string, unknown> 
   if (errors.length || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('OpenRouter effective configuration is invalid')
   }
+  validateOpenCodeOpenRouterConfig(parsed)
   return pickSafeOpenCodeRuntimeConfig(parsed)
 }
 
@@ -1592,6 +1599,7 @@ export async function readOpenCodeEffectiveOpenRouterConfig(
   const effective = deepMergeOpenCodeConfig(imported, await readProjectOpenCodeRuntimeConfig(directory, true))
   const provider = asRecord(asRecord(effective.provider).openrouter)
   const resolved = resolveOpenCodeOpenRouterRestrictions(provider, sourceEnv)
+  validateOpenCodeOpenRouterConfig({ provider: { openrouter: resolved } })
   return resolveRestrictions ? resolved : provider
 }
 

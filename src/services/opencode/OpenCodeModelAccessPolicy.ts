@@ -1,4 +1,10 @@
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed, isOpenCodeOpenRouterCredentialOverrideUsable, isOpenCodeOpenRouterFreeRouteAllowedInEnvironment } from './OpenCodeOpenRouterFallback.js'
+import {
+  OPEN_CODE_OPENROUTER_FREE_ROUTE,
+  isOpenCodeOpenRouterFreeRouteAllowed,
+  hasOpenCodeOpenRouterCatalogCredential,
+  readOpenCodeOpenRouterCredentialEvidence,
+  isOpenCodeOpenRouterFreeRouteAllowedInEnvironment,
+} from './OpenCodeOpenRouterFallback.js'
 import {
   formatOpenCodeModelRef,
   normalizeOpenCodeProviderId,
@@ -19,6 +25,7 @@ import type {
 export type OpenCodeModelAccessCatalog = {
   managedConfig?: Record<string, unknown>
   runtimeEnv?: NodeJS.ProcessEnv
+  openRouterAuth?: unknown
   connectedProviders: readonly string[]
   models: readonly string[]
   modelMetadata?: OpenCodeProvisioningSnapshot['modelMetadata']
@@ -249,9 +256,9 @@ export function evaluateOpenCodeModelAccess(input: {
   }
 
   if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
-    && !isOpenCodeOpenRouterCredentialOverrideUsable(
+    && !hasOpenCodeOpenRouterCatalogCredential(
       asRecord(asRecord(input.catalog.managedConfig?.provider)?.openrouter) ?? {},
-      input.catalog.runtimeEnv ?? {},
+      input.catalog.runtimeEnv ?? {}, input.catalog.openRouterAuth,
     )) {
     return { kind: 'not_authenticated', providerId: parsed.providerId, modelId: parsed.modelId,
       launchAllowed: false, requiresExecutionProof: false,
@@ -259,7 +266,9 @@ export function evaluateOpenCodeModelAccess(input: {
   }
 
   const executionOutcome = input.executionOutcome ?? null
-  if (executionOutcome?.outcome === 'available') {
+  const modelKnown = hasKnownOpenCodeModel(input.catalog, parsed.providerId, parsed.modelId)
+  if (executionOutcome?.outcome === 'available'
+    && (parsed.raw !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id || modelKnown)) {
     return {
       kind: 'verified',
       providerId: parsed.providerId,
@@ -270,7 +279,6 @@ export function evaluateOpenCodeModelAccess(input: {
     }
   }
 
-  const modelKnown = hasKnownOpenCodeModel(input.catalog, parsed.providerId, parsed.modelId)
   if (!modelKnown) {
     return {
       kind: 'unknown_model',
@@ -432,6 +440,7 @@ export function buildOpenCodeModelAccessCatalogFromProvisioningSnapshot(
   return {
     managedConfig: snapshot.profile?.managedConfig,
     runtimeEnv: snapshot.profile?.env,
+    openRouterAuth: readOpenCodeOpenRouterCredentialEvidence(snapshot.profile?.managedAuthPath),
     connectedProviders: snapshot.providers?.connected ?? [],
     models: snapshot.models ?? [],
     modelMetadata: snapshot.modelMetadata,
@@ -446,6 +455,7 @@ export function buildOpenCodeModelAccessCatalogFromInventorySnapshot(
   return {
     managedConfig: snapshot.profile?.managedConfig,
     runtimeEnv: snapshot.profile?.env,
+    openRouterAuth: readOpenCodeOpenRouterCredentialEvidence(snapshot.profile?.managedAuthPath),
     connectedProviders: snapshot.connectedProviders.map(provider => provider.id),
     models: snapshot.models,
     modelMetadata: snapshot.modelMetadata,

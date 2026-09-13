@@ -406,10 +406,16 @@ describe('OpenCodeModelAccessPolicy', () => {
 test('OpenRouter fallback requires its own connected provider when catalog is missing', () => {
   for (const connectedProviders of [[], ['openai'], ['openrouter']]) {
     const access = evaluateOpenCodeModelAccess({
-      selectedModel: 'openrouter/openrouter/free', catalog: catalog({ connectedProviders }),
+      selectedModel: 'openrouter/openrouter/free', catalog: catalog({ connectedProviders, runtimeEnv: { OPENROUTER_API_KEY: 'key' } }),
     })
     expect(access.kind).toBe(connectedProviders.includes('openrouter') ? 'credentialed' : 'unknown_model')
     expect(access.launchAllowed).toBe(connectedProviders.includes('openrouter'))
+    const proven = evaluateOpenCodeModelAccess({
+      selectedModel: 'openrouter/openrouter/free',
+      catalog: catalog({ connectedProviders, runtimeEnv: { OPENROUTER_API_KEY: 'key' } }),
+      executionOutcome: { outcome: 'available', reason: null },
+    })
+    expect(proven.launchAllowed).toBe(connectedProviders.includes('openrouter'))
   }
 })
 
@@ -453,9 +459,27 @@ test('OpenRouter free route is never configured authless even with custom loopba
 for (const key of ['whitelist', 'blacklist']) {
   test(`raw ${key} uses the catalog environment before accepting proof`, () => {
     const result = evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
-      catalog: catalog({ connectedProviders: ['openrouter'], runtimeEnv: Object.freeze({ ROUTE: 'openrouter/free' }),
+      catalog: catalog({ connectedProviders: ['openrouter'], runtimeEnv: Object.freeze({ ROUTE: 'openrouter/free', OPENROUTER_API_KEY: 'key' }),
         managedConfig: { provider: { openrouter: { [key]: ['{env:ROUTE}'] } } } }),
       executionOutcome: { outcome: 'available' } as any })
     expect(result.launchAllowed).toBe(key === 'whitelist')
+  })
+}
+
+for (const [options, envKey, auth, allowed] of [
+  [undefined, undefined, null, false],
+  [undefined, 'env-key', null, true],
+  [undefined, 'env-key', { type: 'api', key: ' ' }, false],
+  [undefined, undefined, { type: 'api', key: 'saved-key' }, true],
+  [{ apiKey: '' }, 'env-key', { type: 'api', key: 'saved-key' }, false],
+  [{ apiKey: 'explicit-key' }, undefined, { type: 'api', key: '' }, true],
+] as const) {
+  test(`native OpenRouter membership requires selected credential evidence: ${JSON.stringify([options, envKey, auth])}`, () => {
+    const result = evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
+      catalog: catalog({ connectedProviders: ['openrouter'], models: [],
+        managedConfig: { provider: { openrouter: { options } } },
+        runtimeEnv: { OPENROUTER_API_KEY: envKey }, openRouterAuth: auth }) })
+    expect(result.launchAllowed).toBe(allowed)
+    expect(result.kind).toBe(allowed ? 'credentialed' : 'not_authenticated')
   })
 }

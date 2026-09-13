@@ -1,5 +1,12 @@
 import path from 'node:path'
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed, isOpenCodeOpenRouterCredentialOverrideUsable, isOpenCodeOpenRouterFreeRouteAllowedInEnvironment } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
+import {
+  OPEN_CODE_OPENROUTER_FREE_ROUTE,
+  isOpenCodeOpenRouterFreeRouteAllowed,
+  hasOpenCodeOpenRouterCatalogCredential,
+  readOpenCodeOpenRouterCredentialEvidence,
+  openCodeOpenRouterEligibilityIdentity,
+  isOpenCodeOpenRouterFreeRouteAllowedInEnvironment,
+} from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
 
 import {
   openCodeClientFactory,
@@ -2043,7 +2050,7 @@ function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): s
 }
 
 /** Native provider responses omit restriction fields after filtering their model maps. */
-async function withEffectiveOpenRouterRestrictions(
+async function withEffectiveOpenRouterConfig(
   inventory: OpenCodeInventorySnapshot,
   projectPath = inventory.projectPath,
 ): Promise<OpenCodeInventorySnapshot> {
@@ -2057,11 +2064,10 @@ async function withEffectiveOpenRouterRestrictions(
     effective = { whitelist: [] }
   }
   const providers = asRecord(inventory.profile.managedConfig.provider)
-  if (!providers?.openrouter
-    && !Object.hasOwn(effective, 'whitelist') && !Object.hasOwn(effective, 'blacklist')) {
+  if (!providers?.openrouter && Object.keys(effective).length === 0) {
     return { ...inventory, projectPath }
   }
-  const { whitelist: _whitelist, blacklist: _blacklist, ...managedProvider } =
+  const { whitelist: _whitelist, blacklist: _blacklist, options: _options, ...managedProvider } =
     asRecord(providers?.openrouter) ?? {}
   return {
     ...inventory,
@@ -2074,6 +2080,7 @@ async function withEffectiveOpenRouterRestrictions(
           ...providers,
           openrouter: {
             ...managedProvider,
+            ...(Object.hasOwn(effective, 'options') ? { options: effective.options } : {}),
             ...(Object.hasOwn(effective, 'whitelist') ? { whitelist: effective.whitelist } : {}),
             ...(Object.hasOwn(effective, 'blacklist') ? { blacklist: effective.blacklist } : {}),
           },
@@ -2094,6 +2101,7 @@ function buildProviderManagementAccessCatalog(input: {
     ),
     managedConfig: input.inventory.profile?.managedConfig,
     runtimeEnv: input.inventory.profile?.env,
+    openRouterAuth: readOpenCodeOpenRouterCredentialEvidence(input.inventory.profile?.managedAuthPath),
     models: input.inventory.models,
     modelMetadata: input.inventory.modelMetadata,
     configProviders: input.configProviders,
@@ -2783,7 +2791,8 @@ function collectProviderModelIds(input: {
     .filter(modelId => modelId !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id
       || (isOpenCodeOpenRouterFreeRouteAllowed(configProvider, liveProvider)
         && isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(configuredProvider ?? {}, input.inventory.profile?.env ?? {})
-        && isOpenCodeOpenRouterCredentialOverrideUsable(configuredProvider ?? {}, input.inventory.profile?.env ?? {})))
+        && hasOpenCodeOpenRouterCatalogCredential(configuredProvider ?? {}, input.inventory.profile?.env ?? {},
+          readOpenCodeOpenRouterCredentialEvidence(input.inventory.profile?.managedAuthPath))))
     .filter(modelId =>
       input.includeDeprecatedModelIds?.has(modelId)
       || getProviderModelCatalogStatus({
@@ -3333,7 +3342,8 @@ export class OpenCodeProviderManagementAdapter
     return [
       input.runtimeId,
       input.inventory.projectPath,
-      JSON.stringify([openrouter?.whitelist, openrouter?.blacklist]),
+      openCodeOpenRouterEligibilityIdentity(openrouter ?? {}, input.inventory.profile?.env ?? {},
+        readOpenCodeOpenRouterCredentialEvidence(input.inventory.profile?.managedAuthPath)),
       input.host?.version ?? input.inventory.version ?? 'unknown-version',
       input.inventory.profile?.profileRootKey ?? 'missing-profile',
       input.host?.resolvedConfigFingerprint ??
@@ -3630,7 +3640,7 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const effectiveInventory = input.providerId === 'openrouter'
-      ? await withEffectiveOpenRouterRestrictions(input.inventory) : input.inventory
+      ? await withEffectiveOpenRouterConfig(input.inventory) : input.inventory
     const validationModelIds = getProviderCredentialValidationModelIds({
       providerId: input.providerId,
       inventory: effectiveInventory,
@@ -3749,7 +3759,7 @@ export class OpenCodeProviderManagementAdapter
       if (!refresh.inventory.detected || !refresh.inventory.profile) {
         throw new Error('OpenCode refreshed managed profile is unavailable')
       }
-      const effectiveInventory = await withEffectiveOpenRouterRestrictions(
+      const effectiveInventory = await withEffectiveOpenRouterConfig(
         refresh.inventory, input.inventory.projectPath,
       )
       // Auth callback/PUT can leave the instance's provider snapshot stale.
@@ -3868,7 +3878,7 @@ export class OpenCodeProviderManagementAdapter
       }
       leaveLeaseStep?.()
       const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
-      const effectiveInventory = await withEffectiveOpenRouterRestrictions(
+      const effectiveInventory = await withEffectiveOpenRouterConfig(
         inventory, projectPath ?? inventory.projectPath,
       )
       return await raceOpenCodeAbortSignal(
@@ -4064,7 +4074,7 @@ export class OpenCodeProviderManagementAdapter
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
     })
-    const inventory = await withEffectiveOpenRouterRestrictions(probedInventory, input.projectPath ?? probedInventory.projectPath)
+    const inventory = await withEffectiveOpenRouterConfig(probedInventory, input.projectPath ?? probedInventory.projectPath)
 
     if (!inventory.detected) {
       return {
