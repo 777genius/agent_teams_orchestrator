@@ -1,4 +1,4 @@
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed } from './OpenCodeOpenRouterFallback.js'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed, isOpenCodeOpenRouterCredentialOverrideUsable, isOpenCodeOpenRouterFreeRouteAllowedInEnvironment } from './OpenCodeOpenRouterFallback.js'
 import {
   formatOpenCodeModelRef,
   normalizeOpenCodeProviderId,
@@ -18,6 +18,7 @@ import type {
 
 export type OpenCodeModelAccessCatalog = {
   managedConfig?: Record<string, unknown>
+  runtimeEnv?: NodeJS.ProcessEnv
   connectedProviders: readonly string[]
   models: readonly string[]
   modelMetadata?: OpenCodeProvisioningSnapshot['modelMetadata']
@@ -238,13 +239,23 @@ export function evaluateOpenCodeModelAccess(input: {
   }
 
   if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
-    && !isOpenCodeOpenRouterFreeRouteAllowed(
-      asRecord(input.catalog.managedConfig?.provider)?.openrouter,
-      ...findProviderEntries(input.catalog, parsed.providerId),
-    )) {
+    && (!isOpenCodeOpenRouterFreeRouteAllowed(...findProviderEntries(input.catalog, parsed.providerId))
+      || !isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(
+        asRecord(asRecord(input.catalog.managedConfig?.provider)?.openrouter) ?? {}, input.catalog.runtimeEnv ?? {},
+      ))) {
     return { kind: 'unknown_model', providerId: parsed.providerId, modelId: parsed.modelId,
       launchAllowed: false, requiresExecutionProof: false,
       reason: 'OpenRouter Free Router is excluded by provider model restrictions' }
+  }
+
+  if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    && !isOpenCodeOpenRouterCredentialOverrideUsable(
+      asRecord(asRecord(input.catalog.managedConfig?.provider)?.openrouter) ?? {},
+      input.catalog.runtimeEnv ?? {},
+    )) {
+    return { kind: 'not_authenticated', providerId: parsed.providerId, modelId: parsed.modelId,
+      launchAllowed: false, requiresExecutionProof: false,
+      reason: 'OpenRouter Free Router requires a usable selected credential' }
   }
 
   const executionOutcome = input.executionOutcome ?? null
@@ -282,7 +293,8 @@ export function evaluateOpenCodeModelAccess(input: {
     }
   }
 
-  if (isAuthlessCapableKnownModel(input.catalog, parsed.providerId, parsed.modelId)) {
+  if (parsed.raw !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    && isAuthlessCapableKnownModel(input.catalog, parsed.providerId, parsed.modelId)) {
     return {
       kind: 'configured_authless',
       providerId: parsed.providerId,
@@ -419,6 +431,7 @@ export function buildOpenCodeModelAccessCatalogFromProvisioningSnapshot(
 ): OpenCodeModelAccessCatalog {
   return {
     managedConfig: snapshot.profile?.managedConfig,
+    runtimeEnv: snapshot.profile?.env,
     connectedProviders: snapshot.providers?.connected ?? [],
     models: snapshot.models ?? [],
     modelMetadata: snapshot.modelMetadata,
@@ -432,6 +445,7 @@ export function buildOpenCodeModelAccessCatalogFromInventorySnapshot(
 ): OpenCodeModelAccessCatalog {
   return {
     managedConfig: snapshot.profile?.managedConfig,
+    runtimeEnv: snapshot.profile?.env,
     connectedProviders: snapshot.connectedProviders.map(provider => provider.id),
     models: snapshot.models,
     modelMetadata: snapshot.modelMetadata,

@@ -1,11 +1,12 @@
 import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import * as fsPromises from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, setDefaultTimeout, test } from 'bun:test'
 
 import {
   buildManagedConfig,
@@ -198,6 +199,80 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         expect(provider.models).toBeUndefined()
       }
     }
+  })
+
+  test('OpenRouter environment capture errors remain value-free', async () => {
+    const env = Object.defineProperty({}, 'ROUTE', { enumerable: true, get() { throw new Error('private-error-detail') } })
+    await expect(readOpenCodeEffectiveOpenRouterConfig(tempDir, env))
+      .rejects.toThrow('OpenCode configuration environment could not be captured')
+  })
+
+  test('OpenRouter reread rejects EACCES without exposing filesystem error details', async () => {
+    const projectPath = path.join(tempDir, 'router-eacces')
+    await mkdir(projectPath, { recursive: true })
+    const original = fsPromises.readFile
+    const read = spyOn(fsPromises, 'readFile').mockImplementation(((file: unknown, ...args: unknown[]) => {
+      if (String(file) === path.join(projectPath, 'opencode.json')) {
+        return Promise.reject(Object.assign(new Error('private-error-detail'), { code: 'EACCES' }))
+      }
+      return (original as Function)(file, ...args)
+    }) as typeof fsPromises.readFile)
+    try {
+      await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, { ...process.env, OPENCODE_CONFIG_CONTENT: '{}' }))
+        .rejects.toThrow('OpenRouter effective configuration could not be read')
+    } finally { read.mockRestore() }
+  })
+
+  test('OpenRouter expands snapshot restrictions before profile fallback insertion', async () => {
+    const projectPath = path.join(tempDir, 'router-expanded-restrictions')
+    await mkdir(projectPath, { recursive: true })
+    for (const key of ['whitelist', 'blacklist']) {
+      const env = { ...process.env, ROUTE: 'openrouter/free', OPENROUTER_API_KEY: 'env-key',
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { openrouter: { [key]: ['{env:ROUTE}'] } } }) }
+      const scope = await resolveOpenCodeProfileScope({ projectPath, purpose: 'catalog', selectedModel: 'openrouter/openrouter/free', env })
+      env.ROUTE = 'changed-after-snapshot'
+      const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+      const provider = (profile.managedConfig.provider as Record<string, Record<string, unknown>>).openrouter!
+      expect(provider[key]).toEqual(['{env:ROUTE}'])
+      expect(Boolean((provider.models as Record<string, unknown> | undefined)?.['openrouter/free'])).toBe(key === 'whitelist')
+    }
+  })
+
+  test('OpenRouter invalid options override valid environment and saved credentials', async () => {
+    const projectPath = path.join(tempDir, 'router-shadowed-credentials')
+    await mkdir(projectPath, { recursive: true })
+    await upsertOpenCodeAuthCredential({ authPath: path.join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+      providerId: 'openrouter', credential: { type: 'api', key: 'saved-key' } })
+    for (const apiKey of [null, '', ' ', false, 123, [], {}, '{env:MISSING_ROUTER_KEY}']) {
+      const env = { ...process.env, OPENROUTER_API_KEY: 'env-key', OPENCODE_CONFIG_CONTENT:
+        JSON.stringify({ provider: { openrouter: { options: { apiKey } } } }) }
+      const input = { projectPath, selectedModel: 'openrouter/openrouter/free', env }
+      const scope = await resolveOpenCodeProfileScope({ ...input, purpose: 'catalog' })
+      const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+      expect((profile.managedConfig.provider as Record<string, Record<string, unknown>>).openrouter!.models).toBeUndefined()
+      for (const purpose of ['execution_probe', 'launch_runtime'] as const) {
+        await expect(resolveOpenCodeProfileScope({ ...input, purpose })).rejects.toThrow('requires explicit selected authentication')
+      }
+    }
+  })
+
+  test('OpenRouter reread distinguishes absent config from malformed config and read failure', async () => {
+    const projectPath = path.join(tempDir, 'router-reread')
+    await mkdir(projectPath, { recursive: true })
+    const env = { ...process.env, OPENCODE_CONFIG_CONTENT: '{}' }
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, env)).toEqual({})
+    const configPath = path.join(projectPath, 'opencode.json')
+    await writeFile(configPath, '{"provider": {"openrouter": {}, broken')
+    await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, env))
+      .rejects.toThrow('OpenRouter effective configuration is invalid')
+    await rm(configPath)
+    await mkdir(configPath)
+    await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, env))
+      .rejects.toThrow('OpenRouter effective configuration could not be read')
+    await rm(configPath, { recursive: true })
+    await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath,
+      { ...env, OPENCODE_CONFIG_CONTENT: '{"provider":' }))
+      .rejects.toThrow('OpenRouter effective configuration is invalid')
   })
 
   test('OpenRouter rejects every unusable static credential shape in disconnected profiles', async () => {

@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed, isOpenCodeOpenRouterCredentialOverrideUsable, isOpenCodeOpenRouterFreeRouteAllowedInEnvironment } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
 
 import {
   openCodeClientFactory,
@@ -2048,7 +2048,14 @@ async function withEffectiveOpenRouterRestrictions(
   projectPath = inventory.projectPath,
 ): Promise<OpenCodeInventorySnapshot> {
   if (!inventory.profile) return inventory
-  const effective = await readOpenCodeEffectiveOpenRouterConfig(projectPath)
+  let effective: Record<string, unknown>
+  try {
+    effective = await readOpenCodeEffectiveOpenRouterConfig(projectPath, inventory.profile.env, false)
+  } catch {
+    // A failed refresh is not evidence that previously captured restrictions disappeared.
+    // Deny the fallback even when the prior snapshot had no restrictions.
+    effective = { whitelist: [] }
+  }
   const providers = asRecord(inventory.profile.managedConfig.provider)
   if (!providers?.openrouter
     && !Object.hasOwn(effective, 'whitelist') && !Object.hasOwn(effective, 'blacklist')) {
@@ -2086,6 +2093,7 @@ function buildProviderManagementAccessCatalog(input: {
       getConnectedProviderMap(input.inventory, input.providers).keys(),
     ),
     managedConfig: input.inventory.profile?.managedConfig,
+    runtimeEnv: input.inventory.profile?.env,
     models: input.inventory.models,
     modelMetadata: input.inventory.modelMetadata,
     configProviders: input.configProviders,
@@ -2773,7 +2781,9 @@ function collectProviderModelIds(input: {
   const configuredProvider = asRecord(asRecord(input.inventory.profile?.managedConfig?.provider)?.[input.providerId])
   return Array.from(modelIds)
     .filter(modelId => modelId !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id
-      || isOpenCodeOpenRouterFreeRouteAllowed(configuredProvider, configProvider, liveProvider))
+      || (isOpenCodeOpenRouterFreeRouteAllowed(configProvider, liveProvider)
+        && isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(configuredProvider ?? {}, input.inventory.profile?.env ?? {})
+        && isOpenCodeOpenRouterCredentialOverrideUsable(configuredProvider ?? {}, input.inventory.profile?.env ?? {})))
     .filter(modelId =>
       input.includeDeprecatedModelIds?.has(modelId)
       || getProviderModelCatalogStatus({

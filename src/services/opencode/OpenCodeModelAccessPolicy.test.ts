@@ -429,3 +429,33 @@ for (const restriction of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }
     })
   }
 }
+
+for (const apiKey of [null, '', ' ', false, [], {}, '{env:MISSING}']) {
+  test(`invalid OpenRouter override cannot be reopened by execution proof: ${JSON.stringify(apiKey)}`, () => {
+    const access = evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
+      catalog: catalog({ connectedProviders: ['openrouter'], models: ['openrouter/openrouter/free'],
+        managedConfig: { provider: { openrouter: { options: { apiKey } } } } }),
+      executionOutcome: { outcome: 'available' } as any })
+    expect(access.launchAllowed).toBe(false)
+    expect(access.kind).toBe('not_authenticated')
+  })
+}
+
+test('OpenRouter free route is never configured authless even with custom loopback metadata', () => {
+  const result = evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
+    catalog: catalog({ models: ['openrouter/openrouter/free'], configProviders: { providers: [
+      { id: 'openrouter', npm: '@ai-sdk/openai-compatible', options: { baseURL: 'http://127.0.0.1:11434' }, models: { 'openrouter/free': {} } },
+    ], default: {} } }) })
+  expect(result.kind).toBe('not_authenticated')
+  expect(result.launchAllowed).toBe(false)
+})
+
+for (const key of ['whitelist', 'blacklist']) {
+  test(`raw ${key} uses the catalog environment before accepting proof`, () => {
+    const result = evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
+      catalog: catalog({ connectedProviders: ['openrouter'], runtimeEnv: Object.freeze({ ROUTE: 'openrouter/free' }),
+        managedConfig: { provider: { openrouter: { [key]: ['{env:ROUTE}'] } } } }),
+      executionOutcome: { outcome: 'available' } as any })
+    expect(result.launchAllowed).toBe(key === 'whitelist')
+  })
+}

@@ -8816,6 +8816,31 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
+  test('failed OpenRouter config reread cannot reopen a previously denied catalog route', async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'openrouter-reread-failure-'))
+    await writeFile(path.join(projectPath, 'opencode.json'), '{"provider": broken')
+    const stale = inventory({ models: ['openrouter/openrouter/free'],
+      connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] })
+    stale.profile!.managedConfig = { provider: { openrouter: { blacklist: ['openrouter/free'] } } }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => structuredClone(stale) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], connected: ['openrouter'], default: {} }),
+      }) },
+    })
+    try {
+      const models = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath })
+      expect(models.ok).toBe(true)
+      if (models.ok) expect(models.value.models.map(model => model.modelId)).not.toContain('openrouter/openrouter/free')
+      const directory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+      expect(directory.ok && directory.value.entries).toEqual([])
+      expect(stale.profile!.managedConfig).toEqual({ provider: { openrouter: { blacklist: ['openrouter/free'] } } })
+    } finally { await rm(projectPath, { recursive: true, force: true }) }
+  })
+
   test.each([[false, false], [false, true], [true, false], [true, true]])('OpenRouter free fallback is listed once (upstream: %s, connected: %s)', async (upstream, connected) => {
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
