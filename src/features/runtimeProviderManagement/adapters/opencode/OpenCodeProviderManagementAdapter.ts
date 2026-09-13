@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
 
 import {
   openCodeClientFactory,
@@ -344,7 +345,7 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'opencode/nemotron-3-super-free',
     'opencode/nemotron-3-ultra-free',
   ],
-  openrouter: ['openrouter/openrouter/free'],
+  openrouter: [OPEN_CODE_OPENROUTER_FREE_ROUTE.id],
   xai: [
     'xai/grok-4.5',
     'xai/grok-4.3',
@@ -2694,6 +2695,9 @@ function collectProviderModelIds(input: {
   includeDeprecatedModelIds?: ReadonlySet<string>
 }): string[] {
   const modelIds = new Set<string>()
+  if (input.providerId === OPEN_CODE_OPENROUTER_FREE_ROUTE.providerId) {
+    modelIds.add(OPEN_CODE_OPENROUTER_FREE_ROUTE.id)
+  }
   const prefix = `${input.providerId}/`
 
   for (const modelId of input.inventory.models) {
@@ -2771,7 +2775,7 @@ function getProviderCredentialValidationModelIds(input: {
     }
   }
   const isFreeCandidate = (modelId: string): boolean =>
-    modelId === `${input.providerId}/openrouter/free`
+    modelId === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
     || isOpenCodeModelFree(modelId, input.inventory.modelMetadata)
   const preferredModelIds = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId] ?? []
 

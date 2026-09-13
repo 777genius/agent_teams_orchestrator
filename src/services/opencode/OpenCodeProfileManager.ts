@@ -20,6 +20,7 @@ import {
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { applyOpenCodeOpenRouterFallback } from './OpenCodeOpenRouterFallback.js'
 import { isDeepStrictEqual } from 'node:util'
 
 import { getCwd } from '../../utils/cwd.js'
@@ -3191,6 +3192,7 @@ export class OpenCodeProfileManager {
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
+    applyOpenCodeOpenRouterFallback(managedConfig, policy?.scope.providerId)
     applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
       ?? (options.includeManagedSubscriptionPlugins === false

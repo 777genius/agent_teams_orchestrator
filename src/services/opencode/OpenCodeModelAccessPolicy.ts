@@ -1,3 +1,4 @@
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE } from './OpenCodeOpenRouterFallback.js'
 import {
   formatOpenCodeModelRef,
   normalizeOpenCodeProviderId,
@@ -158,6 +159,12 @@ function hasKnownOpenCodeModel(
   modelId: string,
 ): boolean {
   const scopedModel = formatOpenCodeModelRef(providerId, modelId)
+  if (
+    scopedModel === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    && normalizeProviderIdSet(catalog.connectedProviders).has(providerId)
+  ) {
+    return true
+  }
   if (
     catalog.models.some(model => parseOpenCodeProviderScopedModelRef(model)?.raw === scopedModel)
   ) {

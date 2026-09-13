@@ -171,6 +171,17 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const probe = await prepare('execution_probe', 'deepinfra', 'config-a')
     const provider = await prepare('catalog', 'openrouter', 'config-a')
     const config = await prepare('catalog', 'deepinfra', 'config-b')
+    expect(provider.managedConfig.provider).toMatchObject({
+      openrouter: { options: { route: 'config-a', apiKey: 'openrouter-static-key' },
+        models: { 'openrouter/free': { name: 'OpenRouter Free Router', cost: { input: 0, output: 0 } } } },
+    })
+    expect((catalog.managedConfig.provider as Record<string, unknown>).openrouter).toBeUndefined()
+    for (const purpose of ['execution_probe', 'launch_runtime'] as const) {
+      const scoped = await prepare(purpose, 'openrouter', 'config-a')
+      expect(scoped.managedConfig.provider).toEqual(provider.managedConfig.provider)
+      expect(JSON.parse(scoped.env.OPENCODE_CONFIG_CONTENT!).provider).toEqual(provider.managedConfig.provider)
+    }
+
     await expect(prepare('launch_runtime', 'kiro', 'config-a'))
       .rejects.toThrow('does not support extension-bound provider kiro')
     await expect(prepare('execution_probe', 'cursor-acp', 'config-a'))

@@ -402,3 +402,13 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.reason).toContain('was not found in the live provider catalog')
   })
 })
+
+test('OpenRouter fallback requires its own connected provider when catalog is missing', () => {
+  for (const connectedProviders of [[], ['openai'], ['openrouter']]) {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'openrouter/openrouter/free', catalog: catalog({ connectedProviders }),
+    })
+    expect(access.kind).toBe(connectedProviders.includes('openrouter') ? 'credentialed' : 'unknown_model')
+    expect(access.launchAllowed).toBe(connectedProviders.includes('openrouter'))
+  }
+})

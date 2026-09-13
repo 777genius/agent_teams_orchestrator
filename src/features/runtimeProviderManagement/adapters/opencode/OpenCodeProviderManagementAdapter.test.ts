@@ -5240,13 +5240,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     ])
     expect(probeCalls).toEqual([{ bypassCache: undefined }, { bypassCache: true }])
-    expect(modelProbes).toEqual(['openrouter/moonshotai/kimi-k2:free'])
+    expect(modelProbes).toEqual(['openrouter/openrouter/free'])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       modelCount: 1,
       ownership: ['managed'],
-      verifiedModelId: 'openrouter/moonshotai/kimi-k2:free',
+      verifiedModelId: 'openrouter/openrouter/free',
     })
   })
 
@@ -5327,12 +5327,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toHaveLength(2)
     expect(removedCredentials).toEqual([])
-    expect(modelProbes).toEqual(['openrouter/moonshotai/kimi-k2:free'])
+    expect(modelProbes).toEqual(['openrouter/openrouter/free'])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       ownership: ['managed'],
-      verifiedModelId: 'openrouter/moonshotai/kimi-k2:free',
+      verifiedModelId: 'openrouter/openrouter/free',
     })
   })
 
@@ -8723,4 +8723,27 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(JSON.stringify(result)).not.toContain('unprefixed-final-identity-secret')
     },
   )
+
+  test.each([[false, false], [false, true], [true, false], [true, true]])('OpenRouter free fallback is listed once (upstream: %s, connected: %s)', async (upstream, connected) => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => inventory({
+        connectedProviders: connected ? [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] : [],
+        models: upstream ? ['openrouter/openrouter/free'] : [],
+      }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', models: upstream ? { 'openrouter/free': {} } : {} }], connected: connected ? ['openrouter'] : [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', query: 'free' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models).toHaveLength(1)
+    expect(result.value.models[0]).toMatchObject({ modelId: 'openrouter/openrouter/free', free: true, accessKind: connected ? 'credentialed' : upstream ? 'not_authenticated' : 'unknown_model' })
+    const unrelated = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openai' })
+    expect(unrelated.ok && unrelated.value.models).toEqual([])
+  })
 })

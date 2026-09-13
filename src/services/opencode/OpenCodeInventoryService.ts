@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE } from './OpenCodeOpenRouterFallback.js'
 import stripAnsi from 'strip-ansi'
 
 import { getCwd } from '../../utils/cwd.js'
@@ -772,7 +773,8 @@ export function isOpenCodeModelFree(
   if (isOpenCodeCuratedSubscriptionProviderId(providerId)) {
     return false
   }
-  if (normalizedModelId.toLowerCase().endsWith(':free')) {
+  if (normalizedModelId === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    || normalizedModelId.toLowerCase().endsWith(':free')) {
     return true
   }
 
