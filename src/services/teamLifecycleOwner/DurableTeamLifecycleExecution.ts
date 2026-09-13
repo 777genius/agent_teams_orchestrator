@@ -1,11 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants } from 'node:fs'
-import { lstat, open } from 'node:fs/promises'
+import { lstat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import * as lockfile from '../../utils/lockfile.js'
-
-import { writeFileAtomic } from '../../utils/atomicWrite.js'
-import { fsyncFileAndParent } from '../hostedControl/HostedTaskMutationWal.js'
 import type { HostedLifecycleAction, HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
 import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 import type {
@@ -17,18 +12,14 @@ import type {
   TeamLifecycleLaneInput,
   TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
-
-type DurableState = {
-  schemaVersion: 4
-  revision: number
-  planFingerprint: string
-  toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
-  phase: HostedLifecycleProviderSnapshot['phase']
-  runId: string | null
-  recoverable: boolean
-  ownerIncarnation: string | null
-  recoveryBindings: Record<string, string>
-}
+import { createTeamLifecycleEffectJournal, type TeamLifecycleEffectJournal } from './TeamLifecycleEffectJournal.js'
+import {
+  assertIdleCustody,
+  createInitialDurableState,
+  stringifyDurableState,
+  type DurableStateV5 as DurableState,
+} from './TeamLifecycleDurableState.js'
+import { TeamLifecycleJournalTransactions } from './TeamLifecycleJournalTransactions.js'
 
 type LaneInput = TeamLifecycleLaneInput & { runId: string }
 
@@ -47,21 +38,29 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   readonly #initializationMarkerPath: string
   readonly #effectTimeoutMs: number
   readonly #compensationTimeoutMs: number
+  readonly transactions: TeamLifecycleJournalTransactions
+  readonly journal: TeamLifecycleEffectJournal
   #acceptingEffects = true
   #closePromise: Promise<void> | null = null
   #shutdownPromise: Promise<void> | null = null
-  #tail: Promise<void> = Promise.resolve()
+  #operationTail: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly statePath: string,
     adapters: readonly TeamLifecycleLaneEffectPort[],
     private readonly providerId = 'team-lifecycle-owner',
     timeouts: { effectTimeoutMs?: number; compensationTimeoutMs?: number } = {},
+    infrastructure: { transactions?: TeamLifecycleJournalTransactions } = {},
   ) {
     if (!isAbsolute(statePath) || statePath.includes('\0')) {
       throw new TypeError('Team lifecycle state path must be absolute')
     }
     this.#initializationMarkerPath = `${statePath}.initialized`
+    if (infrastructure.transactions && infrastructure.transactions.statePath !== statePath) {
+      throw new TypeError('Team lifecycle transaction path does not match executor state path')
+    }
+    this.transactions = infrastructure.transactions ?? new TeamLifecycleJournalTransactions(statePath)
+    this.journal = createTeamLifecycleEffectJournal({ transactions: this.transactions })
     this.#effectTimeoutMs = positiveTimeout(timeouts.effectTimeoutMs ?? 300_000, 'effect')
     this.#compensationTimeoutMs = positiveTimeout(timeouts.compensationTimeoutMs ?? 10_000, 'compensation')
     const entries = adapters.map(adapter => [adapter.kind, adapter] as const)
@@ -96,6 +95,10 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
           throw new Error('Team lifecycle run is owned by another incarnation')
         } else {
           const observations = await this.#inspectLanes(plan, state.runId, state.recoveryBindings)
+          const observed = state
+          state = await this.#read(plan)
+          if (state.runId !== observed.runId || state.ownerIncarnation !== observed.ownerIncarnation ||
+            state.operationEpoch !== observed.operationEpoch) throw new Error('Team lifecycle inspection publication is stale')
           if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
             state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
           }
@@ -135,15 +138,20 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
       if (state.phase === 'idle') return
 
+      if (state.ownerIncarnation !== this.#ownerIncarnation &&
+        (plan.lanes.some(lane => lane.kind === 'native') || Object.keys(state.attempts).length > 0)) {
+        await this.#rejectNativeControllerReplacement(plan, state)
+      }
+
       if (state.phase === 'running' && state.runId) {
-        await this.#adoptRecoveredRunning(plan, state, effectGuard)
+        await this.#adoptRecoveredRunning(plan, { ...state, runId: state.runId }, effectGuard)
         return
       }
 
       if (!state.runId) throw new Error('Team lifecycle startup state is ambiguous')
       await this.#failRecoveredState(
         plan,
-        state,
+        { ...state, runId: state.runId },
         new Error(`Team lifecycle startup found interrupted ${state.phase} state`),
         effectGuard,
       )
@@ -162,9 +170,10 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         ...before, phase: 'launching', runId, recoverable: false,
         ownerIncarnation: this.#ownerIncarnation,
         recoveryBindings: {},
+        operationEpoch: before.operationEpoch + 1,
       }, input.plan)
       this.#ownedRuns.set(runId, input.plan)
-      this.#trackJob(runId, this.#completeLaunch(input.plan, runId, input.effectGuard ?? EFFECT_ALLOWED))
+      this.#trackJob(runId, this.#completeLaunch(input.plan, runId, launching.operationEpoch, input.effectGuard ?? EFFECT_ALLOWED))
       return snapshot(this.providerId, launching)
     })
   }
@@ -181,8 +190,10 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       this.#assertGeneration(before, input.expectedProviderGeneration)
       if (before.phase !== 'running' || before.runId !== input.runId ||
         before.ownerIncarnation !== this.#ownerIncarnation) throw new Error('Team lifecycle run is stale')
-      const stopping = await this.#write({ ...before, phase: 'stopping', recoverable: false }, input.plan)
-      this.#trackJob(before.runId, this.#completeStop(input.plan, before.runId, input.effectGuard ?? EFFECT_ALLOWED))
+      const runId = before.runId
+      const stopping = await this.#write({ ...before, phase: 'stopping', recoverable: false,
+        operationEpoch: before.operationEpoch + 1 }, input.plan)
+      this.#trackJob(runId, this.#completeStop(input.plan, runId, stopping.operationEpoch, input.effectGuard ?? EFFECT_ALLOWED))
       return snapshot(this.providerId, stopping)
     })
   }
@@ -205,6 +216,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         before.ownerIncarnation !== this.#ownerIncarnation) {
         throw new Error('Team lifecycle run is stale')
       }
+      const reserved = await this.#write({ ...before, operationEpoch: before.operationEpoch + 1 }, input.plan)
       const observations = await this.#applyLanes(
         input.plan,
         before.runId,
@@ -214,8 +226,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (!observations.every(observation => observation.phase === 'idle')) {
         throw new Error(`Team lifecycle ${action} was not confirmed`)
       }
+      const current = await this.#read(input.plan)
+      if (current.runId !== before.runId || current.ownerIncarnation !== this.#ownerIncarnation ||
+        current.operationEpoch !== reserved.operationEpoch) throw new Error('Team lifecycle terminal publication is stale')
       const idleState = await this.#write({
-        ...before, phase: 'idle', runId: null, recoverable: false, ownerIncarnation: null,
+        ...current, phase: 'idle', runId: null, recoverable: false, ownerIncarnation: null,
         recoveryBindings: {},
       }, input.plan)
       this.#ownedRuns.delete(before.runId)
@@ -262,8 +277,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
           stopped = (await this.#applyLanesForTeardown(plan, current.runId))
             .every(observation => observation.phase === 'idle')
         } catch {}
+        const publish = await this.#read(plan)
+        if (publish.runId !== current.runId || publish.ownerIncarnation !== current.ownerIncarnation ||
+          publish.operationEpoch !== current.operationEpoch) return
         await this.#write({
-          ...current,
+          ...publish,
           phase: stopped ? 'idle' : 'failed',
           runId: stopped ? null : current.runId,
           recoverable: !stopped,
@@ -275,7 +293,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     }
   }
 
-  async #completeLaunch(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
+  async #completeLaunch(plan: TeamLifecycleLaunchPlan, runId: string, operationEpoch: number, effectGuard: EffectGuard): Promise<void> {
     let observations: TeamLifecycleLaneObservation[]
     try {
       observations = await this.#applyLanes(plan, runId, 'launch', effectGuard)
@@ -284,11 +302,12 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     }
     await this.#serialized(async () => {
       const current = await this.#read(plan)
-      if (current.ownerIncarnation !== this.#ownerIncarnation) return
+      if (current.ownerIncarnation !== this.#ownerIncarnation || current.operationEpoch !== operationEpoch) {
+        return this.#trackStaleTeardown(plan, runId)
+      }
       if (current.runId === runId && current.phase === 'running') return
       if (current.runId !== runId || current.phase !== 'launching') {
-        await this.#applyLanesForTeardown(plan, runId).catch(() => [])
-        return
+        return this.#trackStaleTeardown(plan, runId)
       }
       const next = launchCompletion(observations)
       if (next.phase === 'launching') {
@@ -311,7 +330,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     })
   }
 
-  async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
+  async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, operationEpoch: number, effectGuard: EffectGuard): Promise<void> {
     let stopped = false
     try {
       stopped = (await this.#applyLanes(plan, runId, 'stop', effectGuard))
@@ -320,7 +339,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     await this.#serialized(async () => {
       const current = await this.#read(plan)
       if (current.runId !== runId || current.phase !== 'stopping' ||
-        current.ownerIncarnation !== this.#ownerIncarnation) return
+        current.ownerIncarnation !== this.#ownerIncarnation || current.operationEpoch !== operationEpoch) return
       await this.#write({
         ...current,
         phase: stopped ? 'idle' : 'failed',
@@ -340,14 +359,17 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     } catch {
       observations = [{ phase: 'failed', recoverable: true }]
     }
+    const current = await this.#read(plan)
+    if (current.runId !== state.runId || current.ownerIncarnation !== state.ownerIncarnation ||
+      current.operationEpoch !== state.operationEpoch || current.phase !== 'launching') return current
     const next = launchCompletion(observations)
     if (next.phase === 'launching') {
       return observationsHaveRecoveryBindings(plan, observations)
-        ? this.#write({ ...state, recoveryBindings: launchRecoveryBindings(plan, observations) }, plan)
-        : state
+        ? this.#write({ ...current, recoveryBindings: launchRecoveryBindings(plan, observations) }, plan)
+        : current
     }
     return this.#write({
-      ...state,
+      ...current,
       phase: next.phase,
       recoverable: next.recoverable,
       recoveryBindings: next.phase === 'running' ? launchRecoveryBindings(plan, observations) : {},
@@ -360,7 +382,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     effectGuard?: EffectGuard,
   ): Promise<DurableState> {
     if (!hasExactRecoveryBindings(plan, state.recoveryBindings)) {
-      await this.#failRecoveredState(
+      return this.#failRecoveredState(
         plan,
         state,
         new Error('Recovered team lifecycle run has no exact durable provider session binding'),
@@ -373,20 +395,23 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         ? await this.#inspectLanesGuarded(plan, state.runId, state.recoveryBindings, effectGuard)
         : await this.#inspectLanes(plan, state.runId, state.recoveryBindings)
     } catch (error) {
-      await this.#failRecoveredState(plan, state, error, effectGuard)
+      return this.#failRecoveredState(plan, state, error, effectGuard)
     }
-    if (observations!.every(observation => observation.phase === 'running')) {
+    if (observations.every(observation => observation.phase === 'running')) {
       // Reading the exact durable plan/run tuple under the replacement runtime's
       // exclusive authority is its adoption boundary. From this point shutdown
       // must compensate the recovered external run just like a local launch.
+      const current = await this.#read(plan)
+      if (current.runId !== state.runId || current.ownerIncarnation !== state.ownerIncarnation ||
+        current.operationEpoch !== state.operationEpoch) throw new Error('Recovered lifecycle publication is stale')
       const adopted = await this.#write({
-        ...state,
+        ...current,
         ownerIncarnation: this.#ownerIncarnation,
       }, plan)
       this.#ownedRuns.set(state.runId, plan)
       return adopted
     }
-    await this.#failRecoveredState(
+    return this.#failRecoveredState(
       plan,
       state,
       new Error('Recovered team lifecycle lanes do not confirm the exact running tuple'),
@@ -407,8 +432,12 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         : this.#applyLanesForTeardown(plan, state.runId)))
         .every(observation => observation.phase === 'idle')
     } catch {}
+    const current = await this.#read(plan)
+    if (current.runId !== state.runId || current.operationEpoch !== state.operationEpoch) {
+      throw new Error('Recovered lifecycle failure publication is stale', { cause })
+    }
     await this.#write({
-      ...state,
+      ...current,
       phase: stopped ? 'idle' : 'failed',
       runId: stopped ? null : state.runId,
       recoverable: !stopped,
@@ -416,6 +445,20 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       recoveryBindings: stopped ? {} : state.recoveryBindings,
     }, plan)
     throw new Error('Unable to adopt recovered team lifecycle run', { cause })
+  }
+
+  async #rejectNativeControllerReplacement(plan: TeamLifecycleLaunchPlan, state: DurableState): Promise<never> {
+    const current = await this.#read(plan)
+    if (current.revision !== state.revision) throw new Error('Native lifecycle replacement evidence changed')
+    await this.#write({ ...current, phase: 'failed', recoverable: false, ownerIncarnation: null,
+      operationEpoch: current.operationEpoch + 1,
+      disposition: { kind: 'native-controller-replacement-required', runId: current.runId,
+        reason: 'boot-local-native-channels-are-not-adoptable' } }, plan)
+    throw new Error('Native team lifecycle state cannot be adopted by a replacement controller')
+  }
+
+  async #trackStaleTeardown(plan: TeamLifecycleLaunchPlan, runId: string): Promise<void> {
+    await this.#applyLanesForTeardown(plan, runId).catch(() => [])
   }
 
   #trackJob(runId: string, operation: Promise<void>): void {
@@ -614,105 +657,50 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   async #read(plan: TeamLifecycleLaunchPlan): Promise<DurableState> {
     const expectedPlan = planFingerprint(plan)
-    const handle = await open(this.statePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
-    })
-    if (!handle) {
-      const marker = await open(
-        this.#initializationMarkerPath,
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-      ).catch(error => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-        throw error
-      })
-      if (!marker) return initialState(plan)
-      try {
-        const stat = await marker.stat()
-        if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size < 2 || stat.size > 1024 ||
-          (process.getuid?.() !== undefined && stat.uid !== process.getuid())) {
-          throw new Error('Unsafe team lifecycle initialization marker')
-        }
-      } finally { await marker.close() }
-      throw new Error('Team lifecycle durable state disappeared after initialization')
+    if (!(await this.transactions.exists())) {
+      return this.transactions.initialize(createInitialDurableState(expectedPlan, plan.toolApprovalMode))
     }
-    try {
-      const [stat, current] = await Promise.all([handle.stat(), lstat(this.statePath)])
-      if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
-        stat.ino !== current.ino || (stat.mode & 0o077) !== 0 || stat.size > 64 * 1024 ||
-        (process.getuid?.() !== undefined && stat.uid !== process.getuid())) {
-        throw new Error('Unsafe team lifecycle durable state')
-      }
-      const state = decodeState(JSON.parse(await handle.readFile('utf8')))
-      if (state.toolApprovalMode !== plan.toolApprovalMode) {
-        throw new Error('Team lifecycle durable approval mode changed')
-      }
-      if (state.planFingerprint !== expectedPlan) {
-        if (state.phase !== 'idle') throw new Error('Active team lifecycle plan changed')
-        return initialState(plan)
-      }
-      return state
-    } finally {
-      await handle.close()
-    }
+    await this.transactions.migrateLegacyIfNeeded()
+    const state = await this.transactions.read(value => value)
+    if (state.toolApprovalMode !== plan.toolApprovalMode) throw new Error('Team lifecycle durable approval mode changed')
+    if (state.planFingerprint === expectedPlan) return state
+    if (state.phase !== 'idle') throw new Error('Active team lifecycle plan changed')
+    return this.transactions.update(current => {
+      if (current.revision !== state.revision || current.phase !== 'idle') throw new Error('Team lifecycle plan rotation raced')
+      return { state: createInitialDurableState(expectedPlan, plan.toolApprovalMode, {
+        revision: current.revision,
+        operationEpoch: current.operationEpoch + 1,
+        attempts: current.attempts,
+        tombstones: current.tombstones,
+        disposition: current.disposition,
+        legacyUnresolved: current.legacyUnresolved,
+      }), value: undefined }
+    }).then(() => this.transactions.read(value => value))
   }
 
   async #write(input: DurableState, plan: TeamLifecycleLaunchPlan): Promise<DurableState> {
-    const state: DurableState = {
-      ...input,
-      schemaVersion: 4,
-      toolApprovalMode: plan.toolApprovalMode,
-      revision: input.revision + 1,
-      planFingerprint: planFingerprint(plan),
-    }
-    await writeFileAtomic(this.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 })
-    await fsyncFileAndParent(this.statePath)
-    await this.#writeInitializationMarker()
-    return state
-  }
-
-  async #writeInitializationMarker(): Promise<void> {
-    const marker = `${JSON.stringify({ schemaVersion: 1, initialized: true })}\n`
-    const exists = await lstat(this.#initializationMarkerPath).then(() => true).catch(error => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-      throw error
+    const expectedPlan = planFingerprint(plan)
+    if (input.phase === 'idle') assertIdleCustody(input)
+    await this.transactions.update(current => {
+      if (current.revision !== input.revision) throw new Error('Team lifecycle durable state changed concurrently')
+      if (input.planFingerprint !== expectedPlan || input.toolApprovalMode !== plan.toolApprovalMode) {
+        throw new Error('Team lifecycle write plan binding changed')
+      }
+      return { state: input, value: undefined }
     })
-    if (!exists) {
-      await writeFileAtomic(this.#initializationMarkerPath, marker, { mode: 0o600 })
-      await fsyncFileAndParent(this.#initializationMarkerPath)
-    }
+    return this.transactions.read(value => value)
   }
 
   async #serialized<T>(operation: () => Promise<T>): Promise<T> {
-    const prior = this.#tail
+    const prior = this.#operationTail
     let release!: () => void
-    this.#tail = new Promise<void>(resolve => { release = resolve })
+    this.#operationTail = new Promise<void>(resolve => { release = resolve })
     await prior
-    let unlock: (() => Promise<void>) | null = null
     try {
-      unlock = await lockfile.lock(`${this.statePath}.owner`, {
-        realpath: false,
-        retries: { retries: 20, minTimeout: 5, maxTimeout: 100 },
-      })
       return await operation()
     } finally {
-      await unlock?.()
       release()
     }
-  }
-}
-
-function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
-  return {
-    schemaVersion: 4,
-    revision: 0,
-    planFingerprint: planFingerprint(plan),
-    toolApprovalMode: plan.toolApprovalMode,
-    phase: 'idle',
-    runId: null,
-    recoverable: false,
-    ownerIncarnation: null,
-    recoveryBindings: {},
   }
 }
 
@@ -742,7 +730,7 @@ function snapshot(providerId: string, state: DurableState): HostedLifecycleProvi
 }
 
 function generation(state: DurableState): string {
-  return `generation_${createHash('sha256').update(JSON.stringify(state)).digest('hex')}`
+  return `generation_${createHash('sha256').update(stringifyDurableState(state)).digest('hex')}`
 }
 
 function planFingerprint(plan: TeamLifecycleLaunchPlan): string {
@@ -798,41 +786,4 @@ function assertRecoveryBinding(
   if (expected && observation.recoveryBinding !== expected) {
     throw new Error(`Lifecycle lane ${laneId} provider session set changed from its durable binding`)
   }
-}
-
-function decodeState(value: unknown): DurableState {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid team lifecycle state')
-  const record = value as Record<string, unknown>
-  const legacyOwner = record.schemaVersion === 2
-  const legacyBindings = record.schemaVersion === 2 || record.schemaVersion === 3
-  const keys = ['schemaVersion', 'revision', 'planFingerprint', 'toolApprovalMode', 'phase', 'runId', 'recoverable',
-    ...(legacyOwner ? [] : ['ownerIncarnation']), ...(legacyBindings ? [] : ['recoveryBindings'])]
-  if (Object.keys(record).length !== keys.length || Object.keys(record).some(key => !keys.includes(key)) ||
-    ![2, 3, 4].includes(record.schemaVersion as number) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
-    typeof record.planFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.planFingerprint) ||
-    !['idle', 'launching', 'running', 'stopping', 'failed'].includes(String(record.phase)) ||
-    !(record.runId === null || typeof record.runId === 'string' && /^run_[A-Za-z0-9][A-Za-z0-9._-]{0,250}$/.test(record.runId)) ||
-    !['manual', 'auto'].includes(String(record.toolApprovalMode)) ||
-    typeof record.recoverable !== 'boolean' || (!legacyOwner && !(record.ownerIncarnation === null ||
-      typeof record.ownerIncarnation === 'string' && /^owner_[0-9a-f]{32}$/.test(record.ownerIncarnation))) ||
-    (!legacyBindings && !validRecoveryBindings(record.recoveryBindings))) {
-    throw new Error('Invalid team lifecycle state')
-  }
-  if (record.phase === 'idle' ? record.runId !== null : record.runId === null) {
-    throw new Error('Invalid team lifecycle state/run binding')
-  }
-  return {
-    ...record,
-    schemaVersion: 4,
-    ownerIncarnation: legacyOwner ? null : record.ownerIncarnation,
-    recoveryBindings: legacyBindings ? {} : record.recoveryBindings,
-  } as DurableState
-}
-
-function validRecoveryBindings(value: unknown): value is Record<string, string> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const entries = Object.entries(value as Record<string, unknown>)
-  return entries.length <= 64 && entries.every(([laneId, binding]) =>
-    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(laneId) &&
-    typeof binding === 'string' && /^session-set_[0-9a-f]{64}$/.test(binding))
 }

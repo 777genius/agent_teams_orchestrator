@@ -8,9 +8,11 @@ import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.j
 import {
   OpenCodeTeamLifecycleLane,
   type TeamLifecycleLaneEffectPort,
+  type TeamLifecycleLaneInput,
   type TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
 import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
+import { TeamLifecycleJournalTransactions } from './TeamLifecycleJournalTransactions.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
@@ -33,6 +35,112 @@ const plan: TeamLifecycleLaunchPlan = {
 
 const TEST_RECOVERY_BINDING = `session-set_${'a'.repeat(64)}`
 
+type ExecuteBridge = NonNullable<ConstructorParameters<typeof OpenCodeTeamLifecycleLane>[0]>
+type BridgeSuccess = Extract<Awaited<ReturnType<ExecuteBridge>>, { data: unknown }>
+type TeamCommandData = Extract<BridgeSuccess['data'], { teamLaunchState: string }>
+type TeamCommandMember = TeamCommandData['members'][string]
+type StopCommandData = Extract<BridgeSuccess['data'], { stopped: boolean; members: object }>
+type LifecycleBridgeCommand = 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam'
+type LifecycleBridgeRequest = {
+  requestId: string
+  command: LifecycleBridgeCommand
+  body: object
+}
+
+const FIXTURE_OBSERVED_AT = '2026-01-01T00:00:00.000Z'
+
+function bridgeRequest(input: unknown): LifecycleBridgeRequest {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Fixture expected a bridge request')
+  if (!('requestId' in input) || typeof input.requestId !== 'string') throw new Error('Fixture expected a bridge request id')
+  if (!('command' in input) || (
+    input.command !== 'opencode.launchTeam' &&
+    input.command !== 'opencode.reconcileTeam' &&
+    input.command !== 'opencode.stopTeam'
+  )) throw new Error('Fixture received an unexpected bridge command')
+  if (!('body' in input) || !input.body || typeof input.body !== 'object' || Array.isArray(input.body)) {
+    throw new Error('Fixture expected a bridge body')
+  }
+  return { requestId: input.requestId, command: input.command, body: input.body }
+}
+
+function bridgeSuccess(input: unknown, data: BridgeSuccess['data']): BridgeSuccess {
+  const request = bridgeRequest(input)
+  const command = request.command
+  return { ok: true, schemaVersion: 1, requestId: request.requestId, command,
+    completedAt: FIXTURE_OBSERVED_AT, durationMs: 0,
+    runtime: { providerId: 'opencode', binaryPath: null, binaryFingerprint: null, version: null, capabilitySnapshotId: null },
+    diagnostics: [], data }
+}
+
+function teamMember(
+  sessionId: string,
+  launchState: TeamCommandMember['launchState'] = 'confirmed_alive',
+): TeamCommandMember {
+  const evidenceKind = launchState === 'permission_blocked'
+    ? 'permission_blocked'
+    : launchState === 'failed'
+      ? 'member_launch_failed'
+      : launchState === 'created'
+        ? 'member_session_recorded'
+        : 'member_ready'
+  return {
+    sessionId,
+    launchState,
+    model: 'provider/model',
+    evidence: [{ kind: evidenceKind, observedAt: FIXTURE_OBSERVED_AT }],
+    diagnostics: [],
+  }
+}
+
+function teamCommandData(
+  teamLaunchState: TeamCommandData['teamLaunchState'],
+  members: TeamCommandData['members'],
+  runId = 'run_fixture',
+): TeamCommandData {
+  return {
+    runId,
+    teamLaunchState,
+    members,
+    warnings: [],
+    diagnostics: [],
+    manifestHighWatermark: null,
+    runtimeStoreManifestHighWatermark: null,
+    durableCheckpoints: [{ name: 'delivery_ready', observedAt: FIXTURE_OBSERVED_AT }],
+  }
+}
+
+function stopCommandData(runId: string): StopCommandData {
+  return {
+    runId,
+    stopped: true,
+    members: {
+      worker: { sessionId: 'session-worker', stopped: true, diagnostics: [] },
+    },
+    warnings: [],
+    diagnostics: [],
+    manifestHighWatermark: null,
+    runtimeStoreManifestHighWatermark: null,
+  }
+}
+
+function bridgeRunId(request: LifecycleBridgeRequest): string {
+  if (!('runId' in request.body) || typeof request.body.runId !== 'string') {
+    throw new Error('Fixture expected a lifecycle run id')
+  }
+  return request.body.runId
+}
+
+function requiredRunId(value: { runId: string | null }): string {
+  if (!value.runId) throw new Error('Fixture expected an active run')
+  return value.runId
+}
+
+function planWithSelectedModel(selectedModel: string): TeamLifecycleLaunchPlan {
+  const lane = plan.lanes[0]
+  if (!lane || lane.kind !== 'opencode') throw new Error('Fixture expected an OpenCode lane')
+  return { ...plan, lanes: [{ ...lane, selectedModel }] }
+}
+
 function running(
   recoveryBinding = TEST_RECOVERY_BINDING,
 ): TeamLifecycleLaneObservation {
@@ -52,7 +160,7 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
   async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
     return input.runId ? this.inspectResult ?? this.launchResult : { phase: 'idle', recoverable: false }
   }
-  async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
+  async launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     this.actions.push('launch')
     this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
     return this.launchResult
@@ -74,6 +182,18 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
 }
 
 describe('DurableTeamLifecycleExecution', () => {
+  test('mounts caller-supplied same-file journal transactions for the next B composition slice', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-shared-transactions-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const transactions = new TeamLifecycleJournalTransactions(statePath)
+    const execution = new DurableTeamLifecycleExecution(statePath, [new FakeLane()], 'team-lifecycle-owner', {}, { transactions })
+    expect(execution.transactions).toBe(transactions)
+    await execution.inspect(plan)
+    await expect(execution.journal.snapshotRun('not-a-run')).resolves.toMatchObject({ attempts: [], tombstones: [] })
+    expect(() => new DurableTeamLifecycleExecution(join(root, 'other.json'), [new FakeLane()], 'team-lifecycle-owner', {}, { transactions })).toThrow('does not match')
+  })
+
   test('publishes launching before effects, confirms running, then confirms stop to idle', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-execution-'))
     roots.push(root)
@@ -92,7 +212,7 @@ describe('DurableTeamLifecycleExecution', () => {
 
     const running = await waitForPhase(execution, 'running')
     expect(lane.launched).toEqual([{
-      runId: running.runId,
+      runId: requiredRunId(running),
       teamId: plan.teamId,
       toolApprovalMode: 'manual',
     }])
@@ -237,7 +357,7 @@ describe('DurableTeamLifecycleExecution', () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-close-deadline-'))
     roots.push(root)
     class HungLane extends FakeLane {
-      override async launch(input: { signal?: AbortSignal }): Promise<TeamLifecycleLaneObservation> {
+      override async launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
         this.actions.push('launch')
         return new Promise((_, reject) => {
           const abort = () => reject(input.signal?.reason)
@@ -336,7 +456,7 @@ describe('DurableTeamLifecycleExecution', () => {
     await stopEntered
     expect(closed).toBe(false)
     expect(lane.actions).toEqual(['launch', 'stop'])
-    expect(lane.stoppedRunIds).toEqual([running.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(running)])
     expect(lane.stoppedApprovalModes).toEqual(['manual'])
     expect(execution.supports(plan, 'launch')).toBe(false)
 
@@ -375,7 +495,7 @@ describe('DurableTeamLifecycleExecution', () => {
     })
     await replacementOwner.shutdown()
 
-    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(persisted)])
     expect(lane.stoppedApprovalModes).toEqual(['manual'])
     await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
       phase: 'idle',
@@ -401,7 +521,7 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(replacement.recoverAtStartup(plan, () => true)).rejects.toThrow(
       'Unable to adopt recovered team lifecycle run',
     )
-    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(persisted)])
     await expect(replacement.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
@@ -428,7 +548,7 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(lane.stoppedRunIds).toEqual([])
 
     await newGeneration.shutdown()
-    expect(lane.stoppedRunIds).toEqual([running.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(running)])
   })
 
   test('shutdown compensates only the exact owned tuple after admitted plan rotation', async () => {
@@ -448,10 +568,7 @@ describe('DurableTeamLifecycleExecution', () => {
     })
     await waitForPhase(execution, 'idle')
 
-    const planB: TeamLifecycleLaunchPlan = {
-      ...plan,
-      lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/replacement-model' }],
-    }
+    const planB = planWithSelectedModel('provider/replacement-model')
     const idleB = await execution.inspect(planB)
     await execution.launch({
       plan: planB, commandId: 'command-plan-b-launch', runId: null,
@@ -460,7 +577,7 @@ describe('DurableTeamLifecycleExecution', () => {
     const runningB = await waitForPhase(execution, 'running', planB)
     await execution.shutdown()
 
-    expect(lane.stoppedRunIds).toEqual([runningA.runId, runningB.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(runningA), requiredRunId(runningB)])
   })
 
   test('replacement owner cleans the exact persisted tuple when running adoption fails', async () => {
@@ -483,7 +600,7 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(replacementOwner.recoverAtStartup(plan, () => true)).rejects.toThrow(
       'Unable to adopt recovered team lifecycle run',
     )
-    expect(lane.stoppedRunIds).toEqual([persisted.runId])
+    expect(lane.stoppedRunIds).toEqual([requiredRunId(persisted)])
 
     lane.inspectResult = null
     await expect(replacementOwner.inspect(plan)).resolves.toMatchObject({
@@ -643,7 +760,7 @@ describe('DurableTeamLifecycleExecution', () => {
     const changedPlans: TeamLifecycleLaunchPlan[] = [
       { ...plan, workspaceRoot: '/sandbox/other-project' },
       { ...plan, toolApprovalMode: 'auto' },
-      { ...plan, lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/other-default' }] },
+      planWithSelectedModel('provider/other-default'),
       {
         ...plan,
         lanes: [{
@@ -663,21 +780,19 @@ describe('DurableTeamLifecycleExecution', () => {
 
 describe('OpenCodeTeamLifecycleLane', () => {
   test('maps admitted launch data and requires positive bridge confirmations', async () => {
-    const calls: Array<Record<string, unknown>> = []
-    const execute = (async (input: unknown) => {
-      const request = input as Record<string, unknown>
+    const calls: LifecycleBridgeRequest[] = []
+    const execute: ExecuteBridge = async (input: unknown) => {
+      const request = bridgeRequest(input)
       calls.push(request)
       const command = request.command
-      return {
-        ok: true,
-        data: command === 'opencode.stopTeam'
-          ? { stopped: true }
-          : {
-              teamLaunchState: command === 'opencode.launchTeam' ? 'permission_blocked' : 'ready',
-              members: { worker: { sessionId: 'session-worker' } },
-            },
-      }
-    }) as never
+      return bridgeSuccess(input, command === 'opencode.stopTeam'
+        ? stopCommandData(bridgeRunId(request))
+        : teamCommandData(
+            command === 'opencode.launchTeam' ? 'permission_blocked' : 'ready',
+            { worker: teamMember('session-worker', command === 'opencode.launchTeam' ? 'permission_blocked' : 'confirmed_alive') },
+            bridgeRunId(request),
+          ))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     const admittedLane = plan.lanes[0]!
     const input = {
@@ -699,7 +814,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     expect(calls.map(call => call.command)).toEqual([
       'opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam',
     ])
-    expect((calls[0]!.body as Record<string, unknown>).members).toEqual([
+    expect('members' in calls[0]!.body ? calls[0]!.body.members : undefined).toEqual([
       { name: 'worker', prompt: 'Implement the fixture.', effort: 'high' },
     ])
     expect(calls[0]!.body).toMatchObject({ toolApprovalMode: 'manual', skipPermissions: false })
@@ -709,17 +824,15 @@ describe('OpenCodeTeamLifecycleLane', () => {
     let releaseLaunch!: () => void
     const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve })
     const calls: string[] = []
-    const execute = (async (input: unknown) => {
-      const command = String((input as Record<string, unknown>).command)
+    const execute: ExecuteBridge = async (input: unknown) => {
+      const request = bridgeRequest(input)
+      const command = request.command
       calls.push(command)
       if (command === 'opencode.launchTeam') await launchGate
-      return {
-        ok: true,
-        data: command === 'opencode.stopTeam'
-          ? { stopped: true }
-          : { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
-      }
-    }) as never
+      return bridgeSuccess(input, command === 'opencode.stopTeam'
+        ? stopCommandData(bridgeRunId(request))
+        : teamCommandData('ready', { worker: teamMember('session-worker') }, bridgeRunId(request)))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 300_000, () => true)
     const input = {
       planTeamId: plan.teamId,
@@ -746,15 +859,15 @@ describe('OpenCodeTeamLifecycleLane', () => {
   })
 
   test('rejects substituted, omitted, and duplicate provider session identities', async () => {
-    let teamLaunchState = 'launching'
-    let members: Record<string, { sessionId: string }> = {
-      worker: { sessionId: 'session-worker' },
-      reviewer: { sessionId: 'session-reviewer' },
+    let teamLaunchState: 'launching' | 'ready' = 'launching'
+    let members: TeamCommandData['members'] = {
+      worker: teamMember('session-worker', 'created'),
+      reviewer: teamMember('session-reviewer', 'created'),
     }
-    const execute = (async () => ({
-      ok: true,
-      data: { teamLaunchState, members },
-    })) as never
+    const execute: ExecuteBridge = async input => {
+      const request = bridgeRequest(input)
+      return bridgeSuccess(input, teamCommandData(teamLaunchState, members, bridgeRunId(request)))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     const admittedLane = {
       ...plan.lanes[0]!,
@@ -772,17 +885,17 @@ describe('OpenCodeTeamLifecycleLane', () => {
     expect(launched.recoveryBinding).toMatch(/^session-set_[0-9a-f]{64}$/)
 
     members = {
-      worker: { sessionId: 'session-substituted' },
-      reviewer: { sessionId: 'session-reviewer' },
+      worker: teamMember('session-substituted'),
+      reviewer: teamMember('session-reviewer'),
     }
     await expect(lane.inspect({ ...input, recoveryBinding: launched.recoveryBinding }))
       .rejects.toThrow('does not match the durable launch binding')
     teamLaunchState = 'ready'
-    members = { worker: { sessionId: 'session-worker' } }
+    members = { worker: teamMember('session-worker') }
     await expect(lane.inspect(input)).rejects.toThrow('changed the exact admitted member set')
     members = {
-      worker: { sessionId: 'session-duplicate' },
-      reviewer: { sessionId: 'session-duplicate' },
+      worker: teamMember('session-duplicate'),
+      reviewer: teamMember('session-duplicate'),
     }
     await expect(lane.inspect(input)).rejects.toThrow('missing or duplicate session id')
   })
@@ -793,17 +906,19 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
     const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
     const calls: string[] = []
-    const execute = (async (input: unknown) => {
-      calls.push(String((input as Record<string, unknown>).requestId))
+    const execute: ExecuteBridge = async (input: unknown) => {
+      const request = bridgeRequest(input)
+      calls.push(request.requestId)
       if (calls.length === 1) {
         markFirstStarted()
         await firstGate
       }
-      return {
-        ok: true,
-        data: { teamLaunchState: 'ready', members: { worker: { sessionId: `session-${calls.length}` } } },
-      }
-    }) as never
+      return bridgeSuccess(input, teamCommandData(
+        'ready',
+        { worker: teamMember(`session-${calls.length}`) },
+        bridgeRunId(request),
+      ))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     let current = true
     const first = lane.launch({
@@ -826,8 +941,10 @@ describe('OpenCodeTeamLifecycleLane', () => {
       phase: 'running', recoverable: false,
       recoveryBinding: expect.stringMatching(/^session-set_[0-9a-f]{64}$/),
     })
-    expect(await queuedOutcome).toBeInstanceOf(Error)
-    expect((await queuedOutcome as Error).message).toContain('authority changed before provider effect')
+    const queuedError = await queuedOutcome
+    expect(queuedError).toBeInstanceOf(Error)
+    if (!(queuedError instanceof Error)) throw new Error('Fixture expected the queued request to fail')
+    expect(queuedError.message).toContain('authority changed before provider effect')
     expect(calls).toHaveLength(1)
   })
 
@@ -841,18 +958,16 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
     const calls: string[] = []
     let blockNext = false
-    const execute = (async (input: unknown) => {
-      calls.push(String((input as Record<string, unknown>).command))
+    const execute: ExecuteBridge = async (input: unknown) => {
+      const request = bridgeRequest(input)
+      calls.push(request.command)
       if (blockNext) {
         blockNext = false
         markFirstStarted()
         await firstGate
       }
-      return {
-        ok: true,
-        data: { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
-      }
-    }) as never
+      return bridgeSuccess(input, teamCommandData('ready', { worker: teamMember('session-worker') }, bridgeRunId(request)))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     const crashedOwner = new DurableTeamLifecycleExecution(statePath, [lane])
     const idle = await crashedOwner.inspect(plan)
@@ -888,14 +1003,12 @@ describe('OpenCodeTeamLifecycleLane', () => {
   })
 
   test('maps an admitted auto plan to explicit automatic wire semantics', async () => {
-    let launchBody: Record<string, unknown> | null = null
-    const execute = (async (input: unknown) => {
-      launchBody = (input as { body: Record<string, unknown> }).body
-      return {
-        ok: true,
-        data: { teamLaunchState: 'ready', members: { worker: { sessionId: 'session-worker' } } },
-      }
-    }) as never
+    let launchBody: object | null = null
+    const execute: ExecuteBridge = async (input: unknown) => {
+      const request = bridgeRequest(input)
+      launchBody = request.body
+      return bridgeSuccess(input, teamCommandData('ready', { worker: teamMember('session-worker') }, bridgeRunId(request)))
+    }
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     await lane.launch({
       planTeamId: plan.teamId,
@@ -905,6 +1018,142 @@ describe('OpenCodeTeamLifecycleLane', () => {
       runId: 'run_auto',
     })
     expect(launchBody).toMatchObject({ toolApprovalMode: 'auto', skipPermissions: true })
+  })
+
+  test('never holds the durable transaction lock across launch, inspect, stop, and terminal adapter callbacks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reentrant-transactions-'))
+    roots.push(root)
+    let execution!: DurableTeamLifecycleExecution
+    const callbacks: string[] = []
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode',
+      supports: () => true,
+      inspect: async () => {
+        callbacks.push('inspect')
+        await execution.transactions.read(state => state.revision)
+        return running()
+      },
+      launch: async () => {
+        callbacks.push('launch')
+        await execution.transactions.update(state => ({ state, value: undefined }))
+        return running()
+      },
+      cancel: async () => {
+        callbacks.push('cancel')
+        await execution.transactions.read(state => state.operationEpoch)
+        return { phase: 'idle', recoverable: false }
+      },
+      stop: async () => {
+        callbacks.push('stop')
+        await execution.transactions.update(state => ({ state, value: undefined }))
+        return { phase: 'idle', recoverable: false }
+      },
+      recover: async () => {
+        callbacks.push('recover')
+        await execution.transactions.read(state => state.revision)
+        return { phase: 'idle', recoverable: false }
+      },
+    }
+    execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idle = await execution.inspect(plan)
+    const launched = await execution.launch({ plan, commandId: 'reentrant-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration })
+    const ready = await waitForPhase(execution, 'running')
+    expect(ready.runId).toBe(launched.runId)
+    const stopping = await execution.stop({ plan, commandId: 'reentrant-stop', runId: ready.runId,
+      expectedProviderGeneration: ready.providerGeneration })
+    expect(stopping.phase).toBe('stopping')
+    await expect(waitForPhase(execution, 'idle')).resolves.toMatchObject({ runId: null })
+    expect(callbacks).toEqual(['launch', 'inspect', 'stop'])
+  })
+
+  test('allows same-file transaction reentry during startup recovery and shutdown teardown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reentrant-recovery-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const firstLane = new FakeLane()
+    const first = new DurableTeamLifecycleExecution(statePath, [firstLane])
+    const idle = await first.inspect(plan)
+    await first.launch({ plan, commandId: 'startup-fixture', runId: null, expectedProviderGeneration: idle.providerGeneration })
+    await waitForPhase(first, 'running')
+
+    let replacement!: DurableTeamLifecycleExecution
+    const callbacks: string[] = []
+    const reentrantLane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode', supports: () => true,
+      inspect: async () => {
+        callbacks.push('startup-inspect')
+        await replacement.transactions.update(state => ({ state, value: undefined }))
+        return running()
+      },
+      stop: async () => {
+        callbacks.push('shutdown-stop')
+        await replacement.transactions.read(state => state.revision)
+        return { phase: 'idle', recoverable: false }
+      },
+      launch: async () => ({ phase: 'failed', recoverable: true }),
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    replacement = new DurableTeamLifecycleExecution(statePath, [reentrantLane])
+    await replacement.recoverAtStartup(plan, () => true)
+    await replacement.shutdown()
+    expect(callbacks).toEqual(['startup-inspect', 'shutdown-stop'])
+    const state = await replacement.transactions.read(value => value)
+    expect(state).toMatchObject({ phase: 'idle', runId: null })
+  })
+
+  test('fences late launch publication after a newer same-file operation epoch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-late-publication-'))
+    roots.push(root)
+    let execution!: DurableTeamLifecycleExecution
+    let release!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const actions: string[] = []
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode', supports: () => true,
+      launch: async () => { actions.push('launch'); entered(); await gate; return running() },
+      stop: async () => { actions.push('stale-stop'); await execution.transactions.read(state => state.revision); return { phase: 'idle', recoverable: false } },
+      inspect: async () => ({ phase: 'launching', recoverable: false }),
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idle = await execution.inspect(plan)
+    await execution.launch({ plan, commandId: 'late-launch', runId: null, expectedProviderGeneration: idle.providerGeneration })
+    await started
+    await execution.transactions.update(state => ({ state: { ...state, operationEpoch: state.operationEpoch + 1 }, value: undefined }))
+    release()
+    await execution.close()
+    expect(actions).toEqual(['launch', 'stale-stop'])
+    expect(await execution.transactions.read(state => state.phase)).toBe('launching')
+  })
+
+  test('fails closed without inspect/adopt/stop when a replacement sees a native controller run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-native-nonadoption-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const nativePlan: TeamLifecycleLaunchPlan = { ...plan, lanes: [{ ...plan.lanes[0]!, laneId: 'native-lane', kind: 'native', provider: 'codex' }] }
+    const calls: string[] = []
+    const nativeLane: TeamLifecycleLaneEffectPort = {
+      kind: 'native', supports: () => true,
+      launch: async () => { calls.push('launch'); return running() },
+      inspect: async () => { calls.push('inspect'); return running() },
+      stop: async () => { calls.push('stop'); return { phase: 'idle', recoverable: false } },
+      cancel: async () => ({ phase: 'idle', recoverable: false }), recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    const first = new DurableTeamLifecycleExecution(statePath, [nativeLane])
+    const idle = await first.inspect(nativePlan)
+    await first.launch({ plan: nativePlan, commandId: 'native-fixture', runId: null, expectedProviderGeneration: idle.providerGeneration })
+    await waitForPhase(first, 'running', nativePlan)
+    calls.length = 0
+    const replacement = new DurableTeamLifecycleExecution(statePath, [nativeLane])
+    await expect(replacement.recoverAtStartup(nativePlan, () => true)).rejects.toThrow('cannot be adopted')
+    expect(calls).toEqual([])
+    expect(await replacement.transactions.read(state => state)).toMatchObject({ phase: 'failed', recoverable: false,
+      disposition: { kind: 'native-controller-replacement-required' } })
   })
 })
 
