@@ -57,6 +57,9 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     return this.#serialized(scope, async () => {
       const plan = await this.options.planStore.load(scope)
       if (!plan) return { kind: 'not_owned' }
+      // Schema 3 is a structural projection only until a composition-owned Product
+      // authority binds its identities, primary and generation to the execution port.
+      if (plan.plan.schemaVersion === 3) return { kind: 'unavailable' }
       const observed = await this.options.execution.inspect(plan.plan)
       if (!observed || !this.#validSnapshot(observed)) return { kind: 'unavailable' }
       const snapshot = bindPlanGeneration(observed, plan.planGeneration)
@@ -77,6 +80,7 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     return this.#serialized(input.scope, async () => {
       const admission = await this.options.planStore.load(input.scope)
       if (!admission) return { kind: 'not_found' }
+      if (admission.plan.schemaVersion === 3) return { kind: 'unavailable' }
       const rawBefore = await this.options.execution.inspect(admission.plan)
       if (!rawBefore || !this.#validSnapshot(rawBefore)) return { kind: 'unavailable' }
       const before = bindPlanGeneration(rawBefore, admission.planGeneration)

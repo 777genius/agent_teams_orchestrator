@@ -9,7 +9,9 @@ import {
   PrivateFileTeamLifecycleLaunchPlanStore,
   parseTeamLifecycleLaunchPlan,
   type TeamLifecycleLaunchPlan,
+  type TeamLifecycleLaunchPlanV3,
   type TeamLifecycleLaunchPlanStore,
+  type TeamLifecycleRuntimePlanRefV3,
 } from './TeamLifecycleLaunchPlan.js'
 import {
   TeamLifecycleOwnerService,
@@ -47,13 +49,21 @@ class FakeExecution implements TeamLifecycleExecutionPort {
   calls: Array<{ action: string; expected: string; providers: string[] }> = []
   concurrent = 0
   maxConcurrent = 0
+  inspectCalls = 0
+  supportsCalls = 0
   state: HostedLifecycleProviderSnapshot = snapshot('generation_1', 'idle', null)
   confirm = true
   supported = new Set<HostedLifecycleAction>(['launch', 'cancel', 'stop', 'recover'])
   recoverResult: HostedLifecycleProviderSnapshot | null = null
 
-  supports(_plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean { return this.supported.has(action) }
-  async inspect(): Promise<HostedLifecycleProviderSnapshot> { return this.state }
+  supports(_plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean {
+    this.supportsCalls += 1
+    return this.supported.has(action)
+  }
+  async inspect(): Promise<HostedLifecycleProviderSnapshot> {
+    this.inspectCalls += 1
+    return this.state
+  }
   async launch(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
     return this.apply('launch', input, snapshot('generation_2', 'running', 'run_created'))
   }
@@ -79,6 +89,72 @@ class FakeExecution implements TeamLifecycleExecutionPort {
 }
 
 describe('TeamLifecycleOwnerService', () => {
+  test('admits schema 3 structure but does not call the legacy executor without private Product authority', async () => {
+    const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'team-lifecycle-v3-boundary-'))
+    const directory = await fs.realpath(temporaryDir)
+    const file = path.join(directory, 'plan.json')
+    const canonicalTeamId = `team_${'1'.repeat(32)}`
+    const canonicalScope = { workspaceId: scope.workspaceId, teamId: canonicalTeamId }
+    const reference: TeamLifecycleRuntimePlanRefV3 = {
+      teamId: canonicalTeamId,
+      runId: `run_${'2'.repeat(32)}`,
+      generation: 9,
+      planHash: `sha256:${'3'.repeat(64)}`,
+    }
+    const openCodeOnly: TeamLifecycleLaunchPlanV3 = {
+      schemaVersion: 3,
+      ...canonicalScope,
+      workspaceRoot: '/tmp/hosted-workspace',
+      toolApprovalMode: 'auto',
+      runtimePlanRef: reference,
+      primaryOrdinal: 0,
+      lanes: [{
+        laneId: 'opencode_one', kind: 'opencode', provider: 'opencode', selectedModel: 'provider/model',
+        members: [{ name: 'worker-one', prompt: 'Perform the admitted work.', ordinal: 0, agentId: `member_${'4'.repeat(32)}` }],
+      }],
+    }
+    const mixedRepeated: TeamLifecycleLaunchPlanV3 = {
+      ...openCodeOnly,
+      primaryOrdinal: 3,
+      lanes: [
+        { laneId: 'native_one', kind: 'native', provider: 'anthropic', members: [
+          { name: 'worker-a', prompt: 'Perform task A.', ordinal: 0, agentId: `member_${'5'.repeat(32)}` },
+          { name: 'worker-d', prompt: 'Perform task D.', ordinal: 3, agentId: `member_${'8'.repeat(32)}` },
+        ] },
+        { laneId: 'opencode_two', kind: 'opencode', provider: 'opencode', selectedModel: 'provider/model', members: [
+          { name: 'worker-b', prompt: 'Perform task B.', ordinal: 1, agentId: `member_${'6'.repeat(32)}` },
+        ] },
+        { laneId: 'native_two', kind: 'native', provider: 'anthropic', members: [
+          { name: 'worker-c', prompt: 'Perform task C.', ordinal: 2, agentId: `member_${'7'.repeat(32)}` },
+        ] },
+      ],
+    }
+
+    try {
+      const execution = new FakeExecution()
+      const service = new TeamLifecycleOwnerService({
+        planStore: new PrivateFileTeamLifecycleLaunchPlanStore(file),
+        execution,
+      })
+      for (const candidate of [openCodeOnly, mixedRepeated]) {
+        await fs.writeFile(file, JSON.stringify(candidate), { mode: 0o600 })
+        expect(await service.inspect(canonicalScope)).toEqual({ kind: 'unavailable' })
+        expect(await service.execute({
+          scope: canonicalScope,
+          action: 'launch',
+          commandId: 'command_schema3_unbound',
+          runId: null,
+          expectedProviderGeneration: 'generation_untrusted',
+        })).toEqual({ kind: 'unavailable' })
+      }
+      expect(execution.inspectCalls).toBe(0)
+      expect(execution.supportsCalls).toBe(0)
+      expect(execution.calls).toEqual([])
+    } finally {
+      await fs.rm(temporaryDir, { recursive: true, force: true })
+    }
+  })
+
   test('owns a strict private plan covering Anthropic, Codex, Gemini and OpenCode through one composite port', async () => {
     const execution = new FakeExecution()
     const service = new TeamLifecycleOwnerService({ planStore: new MemoryPlanStore(), execution })

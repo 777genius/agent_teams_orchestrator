@@ -11,13 +11,13 @@ import {
   type TeamLifecycleLaneInput,
   type TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
-import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
+import type { TeamLifecycleLaunchPlan, TeamLifecycleLaunchPlanV2 } from './TeamLifecycleLaunchPlan.js'
 import { TeamLifecycleJournalTransactions } from './TeamLifecycleJournalTransactions.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
 
-const plan: TeamLifecycleLaunchPlan = {
+const plan: TeamLifecycleLaunchPlanV2 = {
   schemaVersion: 2,
   workspaceId: 'workspace-test',
   teamId: `team_${'a'.repeat(32)}`,
@@ -135,7 +135,7 @@ function requiredRunId(value: { runId: string | null }): string {
   return value.runId
 }
 
-function planWithSelectedModel(selectedModel: string): TeamLifecycleLaunchPlan {
+function planWithSelectedModel(selectedModel: string): TeamLifecycleLaunchPlanV2 {
   const lane = plan.lanes[0]
   if (!lane || lane.kind !== 'opencode') throw new Error('Fixture expected an OpenCode lane')
   return { ...plan, lanes: [{ ...lane, selectedModel }] }
