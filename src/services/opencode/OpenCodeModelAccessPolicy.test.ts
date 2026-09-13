@@ -412,3 +412,20 @@ test('OpenRouter fallback requires its own connected provider when catalog is mi
     expect(access.launchAllowed).toBe(connectedProviders.includes('openrouter'))
   }
 })
+
+for (const restriction of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }]) {
+  for (const source of ['managed', 'config', 'live']) {
+    test(`excluded router cannot launch even with earlier execution proof: ${source} ${JSON.stringify(restriction)}`, () => {
+      const restricted = catalog({
+        connectedProviders: ['openrouter'], models: ['openrouter/openrouter/free'],
+        managedConfig: source === 'managed' ? { provider: { openrouter: restriction } } : undefined,
+        configProviders: source === 'config' ? { providers: [{ id: 'openrouter', ...restriction }], default: {} } : null,
+        providers: source === 'live' ? { all: [{ id: 'openrouter', ...restriction }], connected: ['openrouter'], default: {} } : null,
+      })
+      for (const executionOutcome of [null, { outcome: 'available' as const, reason: null }]) {
+        expect(evaluateOpenCodeModelAccess({ selectedModel: 'openrouter/openrouter/free',
+          catalog: restricted, executionOutcome }).launchAllowed).toBe(false)
+      }
+    })
+  }
+}

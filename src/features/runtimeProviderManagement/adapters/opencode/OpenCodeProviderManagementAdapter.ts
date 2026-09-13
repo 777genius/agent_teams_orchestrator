@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed } from '../../../../services/opencode/OpenCodeOpenRouterFallback.js'
 
 import {
   openCodeClientFactory,
@@ -1576,7 +1576,12 @@ function getDefaultModelForProvider(
   if (!modelId) {
     return null
   }
-  const scopedModelId = modelId.startsWith(`${providerId}/`)
+  const relativeModels = [
+    ...Object.keys(asRecord(configProviders?.providers?.find(provider => provider.id === providerId)?.models) ?? {}),
+    ...Object.keys(asRecord(providers?.all?.find(provider => provider.id === providerId)?.models) ?? {}),
+    ...(providerId === OPEN_CODE_OPENROUTER_FREE_ROUTE.providerId ? [OPEN_CODE_OPENROUTER_FREE_ROUTE.modelId] : []),
+  ]
+  const scopedModelId = !relativeModels.includes(modelId) && modelId.startsWith(`${providerId}/`)
     ? modelId
     : `${providerId}/${modelId}`
   if (providerId !== 'xai' || !/\b(?:image|video)\b/i.test(scopedModelId)) {
@@ -2045,6 +2050,7 @@ function buildProviderManagementAccessCatalog(input: {
     connectedProviders: Array.from(
       getConnectedProviderMap(input.inventory, input.providers).keys(),
     ),
+    managedConfig: input.inventory.profile?.managedConfig,
     models: input.inventory.models,
     modelMetadata: input.inventory.modelMetadata,
     configProviders: input.configProviders,
@@ -2729,7 +2735,10 @@ function collectProviderModelIds(input: {
     }
   }
 
+  const configuredProvider = asRecord(asRecord(input.inventory.profile?.managedConfig?.provider)?.[input.providerId])
   return Array.from(modelIds)
+    .filter(modelId => modelId !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+      || isOpenCodeOpenRouterFreeRouteAllowed(configuredProvider, configProvider, liveProvider))
     .filter(modelId =>
       input.includeDeprecatedModelIds?.has(modelId)
       || getProviderModelCatalogStatus({

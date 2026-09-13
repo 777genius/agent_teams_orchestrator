@@ -5151,7 +5151,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
   })
 
-  test('persists accepted OpenCode auth writes into the managed auth store after live provider evidence', async () => {
+  test.each([null, { blacklist: ['openrouter/free'] }, { whitelist: ['moonshotai/kimi-k2:free'] }])('verifies only permitted OpenRouter candidates after auth writes %j', async restrictions => {
     const authWrites: Array<{
       authPath: string
       providerId: string
@@ -5192,7 +5192,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       clientFactory: {
         create: () => ({
-          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getConfigProviders: async () => ({ providers: restrictions ? [{ id: 'openrouter', ...restrictions }] : [], default: {} }),
           getProviders: async () => ({
             all: [{ id: 'openrouter', name: 'OpenRouter' }],
             connected: authApplied ? ['openrouter'] : [],
@@ -5240,13 +5240,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     ])
     expect(probeCalls).toEqual([{ bypassCache: undefined }, { bypassCache: true }])
-    expect(modelProbes).toEqual(['openrouter/openrouter/free'])
+    const expectedModel = restrictions ? 'openrouter/moonshotai/kimi-k2:free' : 'openrouter/openrouter/free'
+    expect(modelProbes).toEqual([expectedModel])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       modelCount: 1,
       ownership: ['managed'],
-      verifiedModelId: 'openrouter/openrouter/free',
+      verifiedModelId: expectedModel,
     })
   })
 
@@ -8723,6 +8724,43 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(JSON.stringify(result)).not.toContain('unprefixed-final-identity-secret')
     },
   )
+
+  test.each([
+    ['openrouter', 'openrouter/free', 'openrouter/openrouter/free'],
+    ['openrouter', 'openrouter/openrouter/free', 'openrouter/openrouter/free'],
+    ['openai', 'gpt-5.4-mini', 'openai/gpt-5.4-mini'],
+    ['openai', 'openai/gpt-5.4-mini', 'openai/gpt-5.4-mini'],
+  ])('canonicalizes provider response default %s %s', async (providerId, modelId, expected) => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => inventory({ models: [], connectedProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: providerId, models: {} }], default: { [providerId]: modelId } }),
+        getProviders: async () => ({ all: [{ id: providerId, models: {} }], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode' })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.value.entries.find(entry => entry.providerId === providerId)?.defaultModelId).toBe(expected)
+  })
+
+  test.each([{ blacklist: ['openrouter/free'] }, { whitelist: [] }, { whitelist: ['other'] }])('excludes restricted router from catalog %j', async restrictions => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => inventory({ models: ['openrouter/openrouter/free'], connectedProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', ...restrictions }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], connected: ['openrouter'], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', query: 'free' })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.value.models).toEqual([])
+  })
 
   test.each([[false, false], [false, true], [true, false], [true, true]])('OpenRouter free fallback is listed once (upstream: %s, connected: %s)', async (upstream, connected) => {
     const adapter = new OpenCodeProviderManagementAdapter({

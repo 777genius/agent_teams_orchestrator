@@ -138,6 +138,40 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('does not materialize OpenRouter for legacy or disconnected selected catalog profiles', async () => {
+    const manager = new OpenCodeProfileManager()
+    const projectPath = path.join(tempDir, 'disconnected-router')
+    await mkdir(projectPath, { recursive: true })
+    const env = { ...process.env, OPENROUTER_API_KEY: '', OPENCODE_CONFIG_CONTENT: '{}' }
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'openrouter/openrouter/free', env,
+    })
+    const disconnected = await manager.prepareProfile(projectPath, { profileScope })
+    expect((disconnected.managedConfig.provider as Record<string, unknown> | undefined)?.openrouter).toBeUndefined()
+    const legacy = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+    expect((legacy.managedConfig.provider as Record<string, unknown> | undefined)?.openrouter).toBeUndefined()
+  })
+
+  test('preserves router exclusions in catalog, probe and launch config', async () => {
+    const projectPath = path.join(tempDir, 'restricted-router')
+    await mkdir(projectPath, { recursive: true })
+    for (const purpose of ['catalog', 'execution_probe', 'launch_runtime'] as const) {
+      for (const restrictions of [{ blacklist: ['openrouter/free'] }, { whitelist: [] }]) {
+        const profileScope = await resolveOpenCodeProfileScope({
+          projectPath, purpose, selectedModel: 'openrouter/openrouter/free',
+          env: { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            provider: { openrouter: { options: { apiKey: 'selected-test-key' }, ...restrictions } },
+          }) },
+        })
+        const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope })
+        const provider = (profile.managedConfig.provider as Record<string, Record<string, unknown>>).openrouter!
+        expect(provider).toMatchObject(restrictions)
+        expect(provider.models).toBeUndefined()
+        expect(JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT!).provider.openrouter).toEqual(provider)
+      }
+    }
+  })
+
   test('isolates scoped profile roots by normalized project, purpose, provider, and config', async () => {
     const manager = new OpenCodeProfileManager()
     const projectPath = path.join(tempDir, 'project')

@@ -1,4 +1,4 @@
-import { OPEN_CODE_OPENROUTER_FREE_ROUTE } from './OpenCodeOpenRouterFallback.js'
+import { OPEN_CODE_OPENROUTER_FREE_ROUTE, isOpenCodeOpenRouterFreeRouteAllowed } from './OpenCodeOpenRouterFallback.js'
 import {
   formatOpenCodeModelRef,
   normalizeOpenCodeProviderId,
@@ -17,6 +17,7 @@ import type {
 } from './types.js'
 
 export type OpenCodeModelAccessCatalog = {
+  managedConfig?: Record<string, unknown>
   connectedProviders: readonly string[]
   models: readonly string[]
   modelMetadata?: OpenCodeProvisioningSnapshot['modelMetadata']
@@ -178,6 +179,7 @@ function isAuthlessCapableKnownModel(
   providerId: string,
   modelId: string,
 ): boolean {
+  if (formatOpenCodeModelRef(providerId, modelId) === OPEN_CODE_OPENROUTER_FREE_ROUTE.id) return false
   const entries = findProviderEntries(catalog, providerId)
   if (
     entries.some(entry =>
@@ -233,6 +235,16 @@ export function evaluateOpenCodeModelAccess(input: {
       requiresExecutionProof: false,
       reason: `OpenCode model must be provider-scoped, received "${selected}"`,
     }
+  }
+
+  if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    && !isOpenCodeOpenRouterFreeRouteAllowed(
+      asRecord(input.catalog.managedConfig?.provider)?.openrouter,
+      ...findProviderEntries(input.catalog, parsed.providerId),
+    )) {
+    return { kind: 'unknown_model', providerId: parsed.providerId, modelId: parsed.modelId,
+      launchAllowed: false, requiresExecutionProof: false,
+      reason: 'OpenRouter Free Router is excluded by provider model restrictions' }
   }
 
   const executionOutcome = input.executionOutcome ?? null
@@ -406,6 +418,7 @@ export function buildOpenCodeModelAccessCatalogFromProvisioningSnapshot(
   snapshot: OpenCodeProvisioningSnapshot,
 ): OpenCodeModelAccessCatalog {
   return {
+    managedConfig: snapshot.profile?.managedConfig,
     connectedProviders: snapshot.providers?.connected ?? [],
     models: snapshot.models ?? [],
     modelMetadata: snapshot.modelMetadata,
@@ -418,6 +431,7 @@ export function buildOpenCodeModelAccessCatalogFromInventorySnapshot(
   snapshot: OpenCodeInventorySnapshot,
 ): OpenCodeModelAccessCatalog {
   return {
+    managedConfig: snapshot.profile?.managedConfig,
     connectedProviders: snapshot.connectedProviders.map(provider => provider.id),
     models: snapshot.models,
     modelMetadata: snapshot.modelMetadata,

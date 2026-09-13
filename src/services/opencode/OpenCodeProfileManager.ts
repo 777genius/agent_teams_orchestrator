@@ -1653,6 +1653,7 @@ type OpenCodeEffectiveConfigSnapshot = Readonly<{
     selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
   }>
   selectedAuthCredential: Awaited<ReturnType<typeof readOpenCodeAuthCredential>>
+  selectedHasStaticCredential: boolean
   authoritySourceFingerprint: string
   appMcpLaunchConfig: Readonly<ResolvedAppMcpLaunchConfig> | null
 }>
@@ -2429,6 +2430,7 @@ async function resolveOpenCodeProfileScopeInternal(
       managedPaths: snapshotManagedPaths,
       scopeIdentity: buildScopeIdentity(scope),
       selectedAuthCredential: selectedAuth.credential,
+      selectedHasStaticCredential: authoritySources.hasStaticCredential,
       authoritySourceFingerprint,
       appMcpLaunchConfig,
     })
@@ -3192,7 +3194,9 @@ export class OpenCodeProfileManager {
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
-    applyOpenCodeOpenRouterFallback(managedConfig, policy?.scope.providerId)
+    applyOpenCodeOpenRouterFallback(managedConfig, policy?.scope.providerId,
+      Boolean(configSnapshot && (configSnapshot.selectedHasStaticCredential
+        || isValidatedStrictAuthCredential('openrouter', configSnapshot.selectedAuthCredential))))
     applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
       ?? (options.includeManagedSubscriptionPlugins === false
