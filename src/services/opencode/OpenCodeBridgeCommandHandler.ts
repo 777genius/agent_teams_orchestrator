@@ -27,6 +27,7 @@ import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
   parseOpenCodeBridgePreconditions,
+  parseOptionalOpenCodeManifestHighWatermark,
   requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
@@ -675,10 +676,6 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map(item => asString(item)).filter((item): item is string => item !== null)
     : []
-}
-
-function asNullableNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
@@ -5782,6 +5779,11 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
   }
+  validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: { ...createRuntimePreconditionSnapshot(snapshot), activeRunId: record.runId },
+    requireActiveRunAuthority: true,
+  })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
   const laneRecords = (await openCodeSessionStore.list()).filter(
     candidate => candidate.teamId === record.teamId && candidate.laneId === record.laneId,
@@ -6097,6 +6099,9 @@ async function handleEnvelope(
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
+      const expectedManifestHighWatermark = parseOptionalOpenCodeManifestHighWatermark(
+        envelope.body.expectedManifestHighWatermark, 'expectedManifestHighWatermark',
+      )
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       let snapshot: OpenCodeProvisioningSnapshot | null = null
       let confirmedStopRuntime: ConfirmedStopRuntime | undefined
@@ -6157,9 +6162,7 @@ async function handleEnvelope(
         confirmedStopRuntime, deliveryRuntime,
         // Every handshake that carries the app's manifest high watermark gets it
         // back unchanged, whatever command it negotiates.
-        runtimeStoreManifestHighWatermark: asNullableNumber(
-          envelope.body.expectedManifestHighWatermark,
-        ),
+        runtimeStoreManifestHighWatermark: expectedManifestHighWatermark,
       })
       const handshake = {
         schemaVersion: BRIDGE_SCHEMA_VERSION,

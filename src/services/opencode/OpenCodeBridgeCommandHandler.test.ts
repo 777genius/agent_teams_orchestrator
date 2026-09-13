@@ -1064,6 +1064,36 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
+  for (const value of ['1', -1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity]) {
+    test(`rejects handshake watermark ${value} before probing or acquiring a host`, async () => {
+      let effects = 0
+      openCodeProvisioningProbe.probe = async () => { effects++; return snapshot }
+      openCodeProvisioningProbe.probeRetainingHost = async () => {
+        effects++
+        return { snapshot, host: snapshot.host, release: async () => {} }
+      }
+      for (const requiredCommand of ['opencode.answerPermission', 'opencode.launchTeam']) {
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          requiredCommand, selectedModel: 'openai/gpt-5.6-sol', expectedManifestHighWatermark: value,
+        }))
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toContain('non-negative safe integer')
+      }
+      expect(effects).toBe(0)
+    })
+  }
+
+  for (const value of [undefined, null, 0, Number.MAX_SAFE_INTEGER]) {
+    test(`accepts optional handshake watermark ${value}`, async () => {
+      openCodeProvisioningProbe.probe = async () => snapshot
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.answerPermission', expectedManifestHighWatermark: value,
+      }))
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(value ?? 0)
+    })
+  }
+
   test('uses selected scope handshake when launch commands require a capability snapshot', async () => {
     let probeCalled = false
     let probeOptions: unknown = null
@@ -10504,6 +10534,31 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.alice?.runtimePid).toBe(123)
   })
+
+  for (const runId of ['run-other', null]) {
+    for (const nested of [false, true]) {
+      test(`rejects permission record run ${runId} with nested expectation ${nested}`, async () => {
+        openCodeProvisioningProbe.probe = async () => snapshot
+        const record = buildRecord({ runId })
+        openCodeSessionStore.get = async () => record
+        openCodeSessionStore.list = async () => [record]
+        let answers = 0
+        openCodeSessionBridge.answerPermission = async () => { answers++ }
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.answerPermission', {
+          teamId: 'team-a', laneId: 'primary', memberName: record.memberName,
+          requestId: 'perm-1', decision: 'allow',
+          ...(nested ? { runId: 'run-1', preconditions: {
+            handshakeIdentityHash: 'handshake-1', laneId: 'primary', expectedRunId: 'run-1',
+            expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: null, commandLeaseId: null, idempotencyKey: 'permission',
+          } } : { runId: 'run-1' }),
+        }))
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.error.message).toContain('active run precondition is stale')
+        expect(answers).toBe(0)
+      })
+    }
+  }
 
   test('answers a permission against a non-zero app manifest high watermark', async () => {
     // Reproduces the live failure: after a launch the app's lane manifest

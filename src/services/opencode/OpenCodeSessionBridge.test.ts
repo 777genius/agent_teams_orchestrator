@@ -2049,6 +2049,11 @@ describe('OpenCodeSessionBridge', () => {
       profile: manualProfile,
     }
     const bridge = new OpenCodeSessionBridge({
+      sessionStore: {
+        get: async () => buildRecord({
+          toolApprovalMode: 'manual', managedConfigFingerprint: 'manual-config-v1',
+        }),
+      } as unknown as OpenCodeSessionStore,
       prepareProfile: async (_projectPath, options) => {
         expect(options?.toolApprovalMode).toBe('manual')
         return manualProfile
@@ -2111,6 +2116,31 @@ describe('OpenCodeSessionBridge', () => {
       sessionId: 'session-1',
       decision: 'allow',
     }])
+  })
+
+  test('rejects permission dispatch when the session is replaced during host acquisition', async () => {
+    const record = buildRecord()
+    let current = record
+    let answers = 0
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: { get: async () => current } as unknown as OpenCodeSessionStore,
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => {
+          current = buildRecord({ opencodeSessionId: 'replacement', runId: 'replacement-run' })
+          return host
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: { create: () => ({
+        answerPermission: async () => { answers++ },
+      }) } as any,
+    })
+    await expect(bridge.answerPermission(record, {
+      requestId: 'perm-1', decision: 'allow',
+    })).rejects.toThrow('no longer active')
+    expect(answers).toBe(0)
   })
 
   test('marks stale and creates a new session when the model changes', async () => {

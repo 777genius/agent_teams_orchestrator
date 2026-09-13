@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   parseOpenCodeBridgePreconditions,
+  parseOptionalOpenCodeManifestHighWatermark,
   requireOpenCodeExpectedBehaviorFingerprint,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
@@ -130,7 +131,7 @@ describe('OpenCodeBridgePreconditions', () => {
 
   test('echoes a supplied watermark verbatim and falls back to the runtime value', () => {
     // A lower watermark than the one the app holds must survive the round trip
-    // unchanged, so the app can still reject a stale replay of its own command.
+    // unchanged as correlation evidence; the echo does not prevent effects.
     expect(
       validateOpenCodeBridgeStateChangingPreconditions({
         body: {
@@ -206,6 +207,20 @@ describe('OpenCodeBridgePreconditions', () => {
       expect(() =>
         parseOpenCodeBridgePreconditions(preconditions({ expectedManifestHighWatermark: value })),
       ).toThrow('expectedManifestHighWatermark must be a non-negative safe integer or null')
+    }
+  })
+
+  test('uses strict watermark parsing for optional, nested and legacy fields', () => {
+    for (const value of ['0', -1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity]) {
+      expect(() => parseOptionalOpenCodeManifestHighWatermark(value, 'expectedManifestHighWatermark')).toThrow()
+      expect(() => parseOpenCodeBridgePreconditions(preconditions({ expectedManifestHighWatermark: value }))).toThrow()
+      expect(() => validateOpenCodeBridgeStateChangingPreconditions({
+        body: { manifestHighWatermark: value },
+        runtime: { capabilitySnapshotId: null, runtimeStoreManifestHighWatermark: 0 },
+      })).toThrow()
+    }
+    for (const value of [undefined, null, 0, Number.MAX_SAFE_INTEGER]) {
+      expect(parseOptionalOpenCodeManifestHighWatermark(value, 'expectedManifestHighWatermark')).toBe(value)
     }
   })
 
