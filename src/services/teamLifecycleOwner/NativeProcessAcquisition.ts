@@ -205,6 +205,10 @@ export type PrepareNativeProcessAcquisitionInput = Readonly<{
 }>
 
 function stable(value: unknown): string {
+  // This is a deterministic hash preimage, not a JSON document or persistence
+  // codec. Bigint has its own unquoted primitive domain so its exact decimal
+  // value cannot collide with a number, string, array, or tag-shaped object.
+  if (typeof value === 'bigint') return `bigint:${value.toString(10)}`
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined)
     .sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`).join(',')}}`

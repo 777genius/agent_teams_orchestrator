@@ -5,7 +5,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
-import type { NodeAnchorProviderStdio, SupervisedProcessRef } from '@agent-teams/owner-anchor-library'
+import type {
+  HostedChildEnvironmentPolicy,
+  NodeAnchorLaunchAuthorityCatalog,
+  NodeAnchorProviderStdio,
+  ResolvedEnvironmentAuthorityRef,
+  ResolvedExecutableAuthorityRef,
+  ResolvedRuntimeBinaryPolicy,
+  ResolvedWorkdirAuthorityRef,
+  RuntimeBinaryId,
+  SupervisedProcessRef,
+  WorkspaceExecutionGrant,
+  WorkspaceExecutionGrantId,
+} from '@agent-teams/owner-anchor-library'
 import { computeHostedNativeEnvelopeDigest, type HostedNativeLaunchEnvelope, type HostedNativeReadyAcknowledgement } from 'src/services/teamBootstrap/hostedNativeLaunch.js'
 import { buildResolvedNativeProcessEnv, buildResolvedNativeProcessFlags } from 'src/utils/swarm/spawnUtils.js'
 import * as canonicalTeamHelpers from 'src/utils/swarm/teamHelpers.js'
@@ -21,6 +33,16 @@ afterEach(async () => {
 })
 const tagged = (bytes: Uint8Array | string): `sha256:${string}` => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
 const plain = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex')
+// Independent copy of the accepted pre-bigint preimage rules, used only to
+// prove that preparation still emits legacy recipe bytes for JSON-domain data.
+const legacyStable = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(legacyStable).join(',')}]`
+  if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${legacyStable(item)}`).join(',')}}`
+  return JSON.stringify(value) ?? 'null'
+}
+const legacyDigest = (value: unknown): `sha256:${string}` => tagged(legacyStable(value))
 const cancellation = { cancellationId: 'cancel:fixture-000000000000', isCancellationRequested: () => false }
 const ANCHOR_CAPABILITY_HASH = 'sha256:8ef0fab620172bdb761af87fc471cb3a1abb46710f148037762cee5d403720b5' as const
 
@@ -115,10 +137,13 @@ async function fixture(options: { worker?: boolean; launchTimeoutMs?: number } =
     '--team-bootstrap-user-prompt-file', userPromptFilePath, '--hosted-native-launch', envelopePath, '--hosted-native-launch-identity', attemptToken,
     '--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions', ...flags]
   const env = buildResolvedNativeProcessEnv({ provider: 'anthropic', canonicalDataRoot: data, frozenEnv: { PATH: '/admitted/bin' } })
-  const binaryPolicy = { policy: 'registered_exact_binary' as const, binaryId: 'binary:cli', binaryRevision: 3, binaryHash: tagged(executableBytes) }
-  const environmentPolicy = { policy: 'explicit_allowlist' as const, variables: Object.keys(env) }
+  const binaryPolicy: ResolvedRuntimeBinaryPolicy = { policy: 'registered_exact_binary', binaryId: 'binary:cli' as RuntimeBinaryId,
+    binaryRevision: 3, binaryHash: tagged(executableBytes) }
+  const environmentPolicy: HostedChildEnvironmentPolicy = { policy: 'explicit_allowlist',
+    variables: Object.keys(env).sort().map(name => ({ name, provenance: name === 'PATH' ? 'provider_static' : 'runtime_metadata' })) }
   const resourcePolicy = { maxRuntimeMs: 60_000, gracefulStopMs: 1_000, maxOutputBytes: 4_096, maxProcessCount: 16 }
-  const workdirGrant = { grantId: 'grant:0000000000000000', workspaceId: 'workspace_00000000000000000000000000000000',
+  const workdirGrant: WorkspaceExecutionGrant = { grantId: 'grant:0000000000000000' as WorkspaceExecutionGrantId,
+    workspaceId: 'workspace_00000000000000000000000000000000' as WorkspaceExecutionGrant['workspaceId'],
     registrationRevision: 1, bindingGeneration: 2, mountGeneration: 3, permission: 'execute_process' as const }
   const executionUnit = { executionUnitId: 'unit:lead', backendBinding: { backend: 'provisioning_cli' as const, bindingId: 'binding:native', bindingRevision: 2 },
     laneId: 'lane-a', memberIds: ['member-alpha'], binaryPolicy, environmentPolicy, credentialExposureSet: { secretRefs: [] },
@@ -139,7 +164,8 @@ async function fixture(options: { worker?: boolean; launchTimeoutMs?: number } =
   const workerEnv = buildResolvedNativeProcessEnv({ provider: 'codex', canonicalDataRoot: data, frozenEnv: { PATH: '/worker/bin' },
     runtimeEnv: { CLAUDE_CODE_TEAMMATE_RUNTIME: 'headless', CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH: runtimeEventsPath,
       CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN: bootstrapProofToken, CLAUDE_CODE_BOOTSTRAP_RUN_ID: material.runId } })
-  const workerEnvironmentPolicy = { policy: 'explicit_allowlist' as const, variables: Object.keys(workerEnv) }
+  const workerEnvironmentPolicy: HostedChildEnvironmentPolicy = { policy: 'explicit_allowlist',
+    variables: Object.keys(workerEnv).sort().map(name => ({ name, provenance: name === 'PATH' ? 'provider_static' : 'runtime_metadata' })) }
   const workerExecutionUnit = { executionUnitId: 'unit:worker', backendBinding: { backend: 'provisioning_cli' as const,
     bindingId: 'binding:native-worker', bindingRevision: 2 }, laneId: 'lane-b', memberIds: ['member-beta'], binaryPolicy,
     environmentPolicy: workerEnvironmentPolicy, credentialExposureSet: { secretRefs: [] }, credentialIsolation: 'dedicated_execution_unit' as const,
@@ -150,10 +176,12 @@ async function fixture(options: { worker?: boolean; launchTimeoutMs?: number } =
       argvAuthority: { executableRef: 'executable:cli', binaryPolicy, argv: workerArgv, argvHash: tagged(JSON.stringify(workerArgv)) },
       workdirAuthority: { workdirRef: 'workdir:admitted', grant: workdirGrant },
       environmentAuthority: { environmentRef: 'environment:beta', policy: workerEnvironmentPolicy }, resourcePolicy } }
-  const catalog = { executables: [{ executableRef: 'executable:cli', executablePath, binaryPolicy }],
-    workdirs: [{ workdirRef: 'workdir:admitted', workdirPath: cwd, grant: workdirGrant }],
-    environments: [{ environmentRef: 'environment:alpha', policy: environmentPolicy, values: env },
-      ...(options.worker ? [{ environmentRef: 'environment:beta', policy: workerEnvironmentPolicy, values: workerEnv }] : [])] }
+  const catalog: NodeAnchorLaunchAuthorityCatalog = { executables: [{ executableRef: 'executable:cli' as ResolvedExecutableAuthorityRef,
+    executablePath, binaryPolicy }], workdirs: [{ workdirRef: 'workdir:admitted' as ResolvedWorkdirAuthorityRef,
+      workdirPath: cwd, grant: workdirGrant, registeredRootEvidence: { device: 0n, inode: 9_007_199_254_740_993n, mountId: 1n } }],
+    environments: [{ environmentRef: 'environment:alpha' as ResolvedEnvironmentAuthorityRef, policy: environmentPolicy, values: env },
+      ...(options.worker ? [{ environmentRef: 'environment:beta' as ResolvedEnvironmentAuthorityRef,
+        policy: workerEnvironmentPolicy, values: workerEnv }] : [])] }
   const processRef = 'process:fixture:0000000001' as SupervisedProcessRef
   const stdio: NodeAnchorProviderStdio & { processRef: SupervisedProcessRef } = { processRef, capabilityVersion: 1,
     capabilityHash: ANCHOR_CAPABILITY_HASH, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), maxOutputBytes: 4096,
@@ -198,11 +226,12 @@ async function fixture(options: { worker?: boolean; launchTimeoutMs?: number } =
       launch: (({ canonicalAuthority: _authority, ...launch }) => launch)(envelope) } as never } }
   const workerAttempt = { memberOrdinal: 1, role: 'native-worker' as const, attemptToken: workerToken, binding: workerBinding as never,
     runtimeEventsPath, bootstrapProofToken, bootstrapRunId: material.runId }
-  const prepared = await prepareNativeProcessAcquisition({ material, admittedLibrary, launchCatalog: catalog as never,
+  const prepared = await prepareNativeProcessAcquisition({ material, admittedLibrary, launchCatalog: catalog,
     nativeAttempts: [nativeAttempt, ...(options.worker ? [workerAttempt] : [])], openCodeMembers: [] })
-  const acquisition = () => createNativeProcessAcquisition({ admittedLibrary, store: {} as never, ownerBinding: {} as never,
-    controllerInstanceId: material.ownerControllerInstanceId as never, launchCatalog: catalog as never,
-    launchCatalogDigest: computeNativeLaunchCatalogDigest(catalog as never), neutralWorkingDirectory: cwd,
+  const acquisition = (lifetimeCatalog: NodeAnchorLaunchAuthorityCatalog = catalog) => createNativeProcessAcquisition({
+    admittedLibrary, store: {} as never, ownerBinding: {} as never,
+    controllerInstanceId: material.ownerControllerInstanceId as never, launchCatalog: lifetimeCatalog,
+    launchCatalogDigest: computeNativeLaunchCatalogDigest(lifetimeCatalog), neutralWorkingDirectory: cwd,
     launchTimeoutMs: options.launchTimeoutMs ?? 40, stopTimeoutMs: 100, recoveryTimeoutMs: 100, readinessPollMs: 2, prepared })
   const authorization = (overrides: Partial<NativeAttemptEffectAuthorization> = {}): NativeAttemptEffectAuthorization => ({ authorizationId: 'authorization-1',
     ownerBootId: material.ownerBootId, ownerControllerInstanceId: material.ownerControllerInstanceId,
@@ -287,20 +316,96 @@ async function seedReadyPrimary(value: Awaited<ReturnType<typeof fixture>>): Pro
 }
 
 describe('native acquisition public lifecycle fixtures', () => {
+  test('keeps pinned legacy public vectors while separating exact bigint primitive domains', () => {
+    expect(computeNativeProductPlanRefDigest(null))
+      .toBe('sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b')
+    expect(computeNativeProductPlanRefDigest({ nested: { x: true }, b: 'two', a: 1 }))
+      .toBe('sha256:c17e35c189b5d1c56a335acb6c4dd7590d5ddc05bc8d5f4d326c2160639a66f0')
+
+    const scalarEncodings = [1n, 1, '1', 'bigint:1', { $bigint: '1' },
+      { kind: 'bigint', value: '1' }, [1n], ['bigint:1']]
+      .map(value => computeNativeProductPlanRefDigest(value))
+    expect(new Set(scalarEncodings).size).toBe(scalarEncodings.length)
+
+    const escaped = 'quoted:" slash:\\ delimiters:[]{},:'
+    const nestedEncodings = [
+      { outer: [{ evidence: 1n, escaped }] },
+      { outer: [{ evidence: 1, escaped }] },
+      { outer: [{ evidence: '1', escaped }] },
+      { outer: [{ evidence: 'bigint:1', escaped }] },
+      { outer: [{ evidence: { $bigint: '1' }, escaped }] },
+      { outer: [{ evidence: { kind: 'bigint', value: '1' }, escaped }] },
+    ].map(value => computeNativeProductPlanRefDigest(value))
+    expect(new Set(nestedEncodings).size).toBe(nestedEncodings.length)
+    expect(computeNativeProductPlanRefDigest({ z: [1n, escaped], a: { b: true } }))
+      .toBe(computeNativeProductPlanRefDigest({ a: { b: true }, z: [1n, escaped] }))
+    expect(computeNativeProductPlanRefDigest([1n, escaped]))
+      .not.toBe(computeNativeProductPlanRefDigest([escaped, 1n]))
+    expect(computeNativeProductPlanRefDigest({ repeated: 9_007_199_254_740_993n }))
+      .toBe(computeNativeProductPlanRefDigest({ repeated: 9_007_199_254_740_993n }))
+  })
+
+  test('prepares Product-typed lead and worker catalogs without changing legacy recipe bytes', async () => {
+    const value = await fixture({ worker: true })
+    expect(value.prepared.catalogDigest).toBe(computeNativeLaunchCatalogDigest(value.catalog))
+    expect(value.prepared.recipes.map(recipe => recipe.expected.role)).toEqual(['native-lead', 'native-worker'])
+    expect(value.prepared.launchCatalog.workdirs[0]?.registeredRootEvidence)
+      .toEqual({ device: 0n, inode: 9_007_199_254_740_993n, mountId: 1n })
+    expect(value.acquisition()).toBeDefined()
+    const { materialDigest, ...materialBase } = value.material
+    expect(materialDigest).toBe(plain(legacyStable(materialBase)))
+    for (const recipe of value.prepared.recipes) {
+      const { recipeDigest, ...logical } = recipe.expected
+      const expectedDigest = legacyDigest({ logical, command: recipe.command, argv: recipe.argv, cwd: recipe.cwd,
+        env: recipe.env, lead: recipe.lead, runtimeEventsPath: recipe.runtimeEventsPath,
+        bootstrapProofToken: recipe.bootstrapProofToken, bootstrapRunId: recipe.bootstrapRunId })
+      expect(recipeDigest).toBe(expectedDigest.slice('sha256:'.length))
+      expect(recipe.expected.materialDigest).toBe(value.material.materialDigest)
+    }
+    expect(value.control.starts).toHaveLength(0)
+  })
+
+  test('hashes adjacent large inode evidence exactly and rejects every lifetime evidence substitution', async () => {
+    const value = await fixture()
+    const evidence = value.catalog.workdirs[0]!.registeredRootEvidence
+    const withEvidence = (registeredRootEvidence: typeof evidence): NodeAnchorLaunchAuthorityCatalog => ({
+      ...value.catalog,
+      workdirs: [{ ...value.catalog.workdirs[0]!, registeredRootEvidence }],
+    })
+    const adjacentLow = withEvidence({ ...evidence, inode: 9_007_199_254_740_992n })
+    const adjacentHigh = withEvidence({ ...evidence, inode: 9_007_199_254_740_993n })
+    expect(computeNativeLaunchCatalogDigest(adjacentLow)).not.toBe(computeNativeLaunchCatalogDigest(adjacentHigh))
+
+    for (const substituted of [
+      withEvidence({ ...evidence, device: evidence.device + 1n }),
+      withEvidence({ ...evidence, inode: evidence.inode + 1n }),
+      withEvidence({ ...evidence, mountId: evidence.mountId + 1n }),
+    ]) {
+      expect(computeNativeLaunchCatalogDigest(substituted)).not.toBe(value.prepared.catalogDigest)
+      expect(() => value.acquisition(substituted)).toThrow('frozen catalog')
+    }
+
+    const mutableInputEvidence = evidence as { device: bigint; inode: bigint; mountId: bigint }
+    mutableInputEvidence.inode += 2n
+    expect(value.prepared.launchCatalog.workdirs[0]?.registeredRootEvidence.inode).toBe(9_007_199_254_740_993n)
+    expect(() => value.acquisition()).toThrow('frozen catalog')
+    expect(value.control.starts).toHaveLength(0)
+  })
+
   test('prepares the concrete recipe and rejects catalog mismatch before Product start', async () => {
     const value = await fixture()
     expect(value.prepared.recipes[0]).toMatchObject({ command: value.executablePath, expected: { role: 'native-lead', memberOrdinal: 0 } })
     const mismatchedCatalog = { ...value.catalog, environments: value.catalog.environments.map(environment => ({ ...environment,
       values: { ...environment.values, PATH: '/substituted/bin' } })) }
     await expect(prepareNativeProcessAcquisition({ material: value.material, admittedLibrary: value.admittedLibrary,
-      launchCatalog: mismatchedCatalog as never, nativeAttempts: [value.nativeAttempt], openCodeMembers: [] }))
+      launchCatalog: mismatchedCatalog, nativeAttempts: [value.nativeAttempt], openCodeMembers: [] }))
       .rejects.toThrow('does not exactly join')
     const { lead: _issuedAssociation, ...withoutIssuedAssociation } = value.nativeAttempt
     await expect(prepareNativeProcessAcquisition({ material: value.material, admittedLibrary: value.admittedLibrary,
-      launchCatalog: value.catalog as never, nativeAttempts: [withoutIssuedAssociation], openCodeMembers: [] }))
+      launchCatalog: value.catalog, nativeAttempts: [withoutIssuedAssociation], openCodeMembers: [] }))
       .rejects.toThrow('exact finalized issued envelope')
     expect(() => createNativeProcessAcquisition({ admittedLibrary: value.admittedLibrary, store: {} as never, ownerBinding: {} as never,
-      controllerInstanceId: 'controller-1-long' as never, launchCatalog: value.catalog as never, launchCatalogDigest: 'substituted', neutralWorkingDirectory: '/',
+      controllerInstanceId: 'controller-1-long' as never, launchCatalog: value.catalog, launchCatalogDigest: 'substituted', neutralWorkingDirectory: '/',
       launchTimeoutMs: 10, stopTimeoutMs: 10, recoveryTimeoutMs: 10, readinessPollMs: 1, prepared: value.prepared })).toThrow('frozen catalog')
     expect(value.control.starts).toHaveLength(0)
   })
