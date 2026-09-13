@@ -2743,6 +2743,22 @@ async function readSelectedManagedAuthIdentity(
   }
 }
 
+export function getOpenCodeSourceAuthPaths(
+  env: NodeJS.ProcessEnv = process.env,
+  homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
+): string[] {
+  const xdgDataHome =
+    env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
+  return Array.from(new Set([
+    path.join(xdgDataHome, 'opencode', 'auth.json'),
+    // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
+    // isolated runtime directory. Always include the canonical user OpenCode
+    // auth store as the highest-priority source so a fresh `opencode auth`
+    // login can override stale app-global OAuth credentials.
+    path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
+  ]))
+}
+
 export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
@@ -2750,20 +2766,8 @@ export class OpenCodeProfileManager {
     return resolveClaudeMultimodelPaths()
   }
 
-  private getSourceAuthPaths(
-    env: NodeJS.ProcessEnv = process.env,
-    homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
-  ): string[] {
-    const xdgDataHome =
-      env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
-    return Array.from(new Set([
-      path.join(xdgDataHome, 'opencode', 'auth.json'),
-      // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
-      // isolated runtime directory. Always include the canonical user OpenCode
-      // auth store as the highest-priority source so a fresh `opencode auth`
-      // login can override stale app-global OAuth credentials.
-      path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
-    ]))
+  private getSourceAuthPaths(env: NodeJS.ProcessEnv = process.env, homePath?: string): string[] {
+    return getOpenCodeSourceAuthPaths(env, homePath)
   }
 
   getGlobalAuthPath(dataPath = this.paths.data): string {

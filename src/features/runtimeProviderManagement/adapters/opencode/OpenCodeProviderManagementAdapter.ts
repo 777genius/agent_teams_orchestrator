@@ -22,6 +22,7 @@ import {
 } from '../../../../services/opencode/OpenCodeCuratedSubscriptionCatalog.js'
 import {
   readOpenCodeAuthCredential,
+  mergeOpenCodeManagedAuthSources,
   removeOpenCodeAuthCredential,
   upsertOpenCodeAuthCredential,
   upsertOpenCodeApiAuth,
@@ -58,6 +59,7 @@ import {
 import {
   canonicalizeOpenCodeProjectPath,
   readOpenCodeEffectiveOpenRouterConfig,
+  getOpenCodeSourceAuthPaths,
   openCodeOpenRouterSourceEnvironment,
   openCodeProfileManager,
   resolveOpenCodeProfileScope,
@@ -2057,25 +2059,37 @@ type OpenRouterEligibilitySnapshot = Readonly<{
   env: NodeJS.ProcessEnv
   auth: unknown
   identity: string
-  identityForAuth?: (auth: unknown) => string
+  sources?: ReadonlyArray<readonly [string, unknown]>
+  sourceInventory?: OpenCodeInventorySnapshot
+  identityForAuth?: (auth: unknown, sources: ReadonlyArray<readonly [string, unknown]>) => string
   decision: Readonly<{ allowed: boolean; credential: boolean }>
 }>
 type EligibilityInventory = OpenCodeInventorySnapshot & {
   [openRouterEligibility]?: OpenRouterEligibilitySnapshot
 }
 
+function readOpenRouterCredentialSources(inventory: OpenCodeInventorySnapshot, env: NodeJS.ProcessEnv) {
+  if (!inventory.profile) return []
+  return Array.from(new Set([
+    inventory.profile.globalAuthPath, ...getOpenCodeSourceAuthPaths(env),
+    inventory.profile.sourceAuthPath, inventory.profile.managedAuthPath,
+  ].filter((file): file is string => !!file))).map(file =>
+    [file, readOpenCodeOpenRouterCredentialEvidence(file)] as const)
+}
+
 function eligibilitySnapshot(inventory: OpenCodeInventorySnapshot): OpenRouterEligibilitySnapshot {
   const captured = (inventory as EligibilityInventory)[openRouterEligibility]
   if (captured) return captured
   const env = Object.freeze(openCodeOpenRouterSourceEnvironment(inventory.profile?.env ?? {}))
-  const auth = readOpenCodeOpenRouterCredentialEvidence(inventory.profile?.managedAuthPath)
+  const sources = readOpenRouterCredentialSources(inventory, env)
+  const auth = sources.find(([file]) => file === inventory.profile?.managedAuthPath)?.[1] ?? null
   const provider = asRecord(asRecord(inventory.profile?.managedConfig.provider)?.openrouter) ?? {}
   const referenceDigests: string[] = []
   let effective: Record<string, unknown>
   try {
     effective = resolveOpenCodeOpenRouterEnvironment(provider, env, referenceDigests) as Record<string, unknown>
   } catch { effective = { whitelist: [] } }
-  return Object.freeze({ env, auth, identity: openCodeOpenRouterEligibilityIdentity(effective, env, auth, true, referenceDigests),
+  return Object.freeze({ env, auth, sources, identity: openCodeOpenRouterEligibilityIdentity(effective, env, { auth, sources }, true, referenceDigests),
     decision: Object.freeze({ allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
       credential: hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true) }) })
 }
@@ -2089,24 +2103,33 @@ async function withEffectiveOpenRouterConfig(
   let env: Readonly<NodeJS.ProcessEnv> = Object.freeze({})
   const referenceDigests: string[] = []
   let effective: Record<string, unknown>
+  let rawProvider: Record<string, unknown> | undefined
   try {
     env = Object.freeze(openCodeOpenRouterSourceEnvironment(inventory.profile.env))
-    effective = await readOpenCodeEffectiveOpenRouterConfig(projectPath, env, true, referenceDigests)
+    rawProvider = await readOpenCodeEffectiveOpenRouterConfig(projectPath, env, false)
+    effective = resolveOpenCodeOpenRouterEnvironment(rawProvider, env, referenceDigests) as Record<string, unknown>
   } catch {
     effective = { whitelist: [] }
   }
-  const auth = readOpenCodeOpenRouterCredentialEvidence(inventory.profile.managedAuthPath)
-  const snapshot = Object.freeze({ env, auth,
-    identityForAuth: (resultingAuth: unknown) => openCodeOpenRouterEligibilityIdentity(effective, env, resultingAuth, true, referenceDigests),
-    identity: openCodeOpenRouterEligibilityIdentity(effective, env, auth, true, referenceDigests),
+  const sources = readOpenRouterCredentialSources(inventory, env)
+  const auth = sources.find(([file]) => file === inventory.profile!.managedAuthPath)?.[1] ?? null
+  const sourceIdentity = [env.HOME, env.USERPROFILE, env.XDG_CONFIG_HOME, env.XDG_DATA_HOME,
+    env.OPENCODE_CONFIG, inventory.profile.sourceAuthPath, inventory.profile.globalAuthPath,
+    inventory.profile.managedAuthPath, rawProvider,
+    structuredClone(asRecord(inventory.profile.managedConfig.provider)?.openrouter),
+    openCodeOpenRouterEligibilityIdentity(effective, inventory.profile.env, null, true)]
+  const identityForAuth = (resultingAuth: unknown, resultingSources: ReadonlyArray<readonly [string, unknown]>) =>
+    openCodeOpenRouterEligibilityIdentity(effective, env,
+      { auth: resultingAuth, sources: resultingSources, sourceIdentity }, true, referenceDigests)
+  const snapshot = Object.freeze({ env, auth, sources, sourceInventory: inventory,
+    identityForAuth,
+    identity: identityForAuth(auth, sources),
     decision: Object.freeze({ allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
       credential: hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true) }) })
   const providers = asRecord(inventory.profile.managedConfig.provider)
   if (!providers?.openrouter && Object.keys(effective).length === 0) {
     return { ...inventory, projectPath, [openRouterEligibility]: snapshot } as EligibilityInventory
   }
-  const { whitelist: _whitelist, blacklist: _blacklist, options: _options, env: _env, ...managedProvider } =
-    asRecord(providers?.openrouter) ?? {}
   return {
     ...inventory,
     [openRouterEligibility]: snapshot,
@@ -2115,14 +2138,14 @@ async function withEffectiveOpenRouterConfig(
       ...inventory.profile,
       managedConfig: {
         ...inventory.profile.managedConfig,
-        provider: { ...providers, openrouter: { ...managedProvider, ...effective } },
+        provider: { ...providers, openrouter: effective },
       },
     },
   } as EligibilityInventory
 }
 
 async function revalidateOpenRouterEligibility(inventory: OpenCodeInventorySnapshot): Promise<void> {
-  const refreshed = await withEffectiveOpenRouterConfig(inventory)
+  const refreshed = await withEffectiveOpenRouterConfig(eligibilitySnapshot(inventory).sourceInventory ?? inventory, inventory.projectPath)
   if (eligibilitySnapshot(refreshed).identity !== eligibilitySnapshot(inventory).identity) {
     throw new OpenRouterEligibilityChangedError('OpenRouter eligibility changed during provider loading; retry the request')
   }
@@ -2691,7 +2714,9 @@ async function readLiveView(input: {
   diagnostics?: readonly string[]
   degradeOnReadFailure?: boolean
 }): Promise<ProviderManagementView> {
-  const inventory = await withEffectiveOpenRouterConfig(input.inventory, input.projectPath ?? input.inventory.projectPath)
+  const inventory = (input.inventory as EligibilityInventory)[openRouterEligibility]
+    ? input.inventory
+    : await withEffectiveOpenRouterConfig(input.inventory, input.projectPath ?? input.inventory.projectPath)
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
     : Promise.resolve({
@@ -3859,7 +3884,7 @@ export class OpenCodeProviderManagementAdapter
       inventoryService: OpenCodeInventoryServiceLike
       host: OpenCodeHostHandle
       client: OpenCodeProviderManagementClient
-      authorizeCredentialTransition: (auth: unknown) => void
+      authorizeCredentialTransition: (auth: unknown, changes?: ReadonlyMap<string, unknown>) => void
     }) => Promise<ProviderManagementResult<T>>,
     options: {
       failureCode?: ProviderManagementErrorCode
@@ -3945,11 +3970,17 @@ export class OpenCodeProviderManagementAdapter
           // Change only the authorized auth component. Config, environment and
           // file evidence remain bound to the pre-action snapshot, and the
           // resulting identity is adopted only after admission/execution succeeds.
-          authorizeCredentialTransition: auth => {
+          authorizeCredentialTransition: (auth, changes) => {
             const snapshot = eligibilitySnapshot(effectiveInventory!)
             if (!snapshot.identityForAuth) return
+            const sources = (snapshot.sources ?? []).map(([file, previous]) => {
+              const affected = file === effectiveInventory!.profile?.managedAuthPath
+                || file === effectiveInventory!.profile?.globalAuthPath
+              return [file, changes ? (changes.has(file) ? changes.get(file) : previous)
+                : affected ? auth : previous] as const
+            })
             authorizedInventory = { ...effectiveInventory!, [openRouterEligibility]: {
-              ...snapshot, auth, identity: snapshot.identityForAuth(auth),
+              ...snapshot, auth, sources, identity: snapshot.identityForAuth(auth, sources),
             } } as EligibilityInventory
           },
         }),
@@ -4062,8 +4093,11 @@ export class OpenCodeProviderManagementAdapter
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
     let liveView: ProviderManagementView | null = null
+    let effectiveInventory: OpenCodeInventorySnapshot | undefined
+    let eligibilityChanged = false
 
     try {
+      effectiveInventory = await withEffectiveOpenRouterConfig(inventory, request.projectPath ?? inventory.projectPath)
       deadline.throwIfExpired()
       const leaveHost = progress.enterStep('prepare settings host')
       host = await hostManager.ensureHost({
@@ -4093,7 +4127,7 @@ export class OpenCodeProviderManagementAdapter
       liveView = await readLiveView({
           degradeOnReadFailure: true,
           projectPath: request.projectPath,
-          inventory,
+          inventory: effectiveInventory,
           host,
           client,
           diagnostics: inventory.diagnostics,
@@ -4107,7 +4141,7 @@ export class OpenCodeProviderManagementAdapter
       }
       const message = getTimeoutMessage() ?? (error instanceof Error ? error.message : String(error))
       const value = liveView ?? buildView({
-          inventory,
+          inventory: effectiveInventory ?? inventory,
           host,
           configProviders: null,
           providers: null,
@@ -4122,10 +4156,21 @@ export class OpenCodeProviderManagementAdapter
       if (host) {
         const leaveRelease = progress.enterStep('release settings host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
+        if (effectiveInventory) {
+          try { await revalidateOpenRouterEligibility(effectiveInventory) }
+          catch { eligibilityChanged = true }
+        }
         await hostManager
           .releaseHost(host.hostKey, { keepPersistentAlive: true })
           .catch(() => undefined)
         leaveRelease()
+      }
+      if (effectiveInventory) {
+        try { await revalidateOpenRouterEligibility(effectiveInventory) }
+        catch { eligibilityChanged = true }
+      }
+      if (eligibilityChanged) {
+        return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE, true)
       }
     }
   }
@@ -5412,7 +5457,10 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        if (providerId === 'openrouter') authorizeCredentialTransition(authBody)
+        if (providerId === 'openrouter') {
+          await revalidateOpenRouterEligibility(inventory)
+          authorizeCredentialTransition(authBody)
+        }
         let authApplied: boolean
         try {
           authApplied = await client.setProviderAuth(providerId, { ...authBody })
@@ -5566,7 +5614,7 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        if (providerId === 'openrouter') authorizeCredentialTransition(null)
+        if (providerId === 'openrouter') await revalidateOpenRouterEligibility(inventory)
         const authDeleted = await client.deleteProviderAuth(providerId)
         if (authDeleted !== true) {
           return providerManagementError(
@@ -5585,6 +5633,18 @@ export class OpenCodeProviderManagementAdapter
         for (const authPath of authPaths) {
           await authStore.removeCredential({ authPath, providerId })
         }
+        const captured = eligibilitySnapshot(inventory)
+        const removedSources = captured.sources?.map(([file, auth]) =>
+          [file, authPaths.has(file) ? null : auth] as const) ?? []
+        const assertSources = (sources: ReadonlyArray<readonly [string, unknown]>) => {
+          for (const [file, expected] of sources) {
+            if (openCodeOpenRouterEligibilityIdentity({}, {}, readOpenCodeOpenRouterCredentialEvidence(file))
+              !== openCodeOpenRouterEligibilityIdentity({}, {}, expected)) {
+              throw new OpenRouterEligibilityChangedError('OpenRouter credential authority changed; retry the request')
+            }
+          }
+        }
+        if (providerId === 'openrouter') assertSources(removedSources)
         this.invalidateDirectoryCache()
         const refreshedInventory = await this.probeInventory(
           inventoryService,
@@ -5598,6 +5658,25 @@ export class OpenCodeProviderManagementAdapter
           refreshedInventory,
           fallbackInventory => removeManagedProviderFromInventory(fallbackInventory, providerId),
         )
+        if (providerId === 'openrouter') {
+          // Reconciliation may import a captured native credential after removal.
+          // Derive its result from trusted pre-action sources, never from an
+          // arbitrary credential observed after the refresh.
+          const sourceEntries = removedSources.filter(([file]) => file !== inventory.profile?.managedAuthPath)
+          const expected = mergeOpenCodeManagedAuthSources({
+            sourceAuthPaths: sourceEntries.map(([file]) => file),
+            sourceStores: sourceEntries.map(([, auth]) => asRecord(auth) ? { openrouter: asRecord(auth)! } : {}),
+            globalAuthPath: inventory.profile?.globalAuthPath ?? '',
+          }).openrouter ?? null
+          const reconciled = isOpenCodeInventoryTimeoutSnapshot(refreshedInventory) ? null : expected
+          const changes = new Map<string, unknown>(removedSources)
+          if (inventory.profile?.managedAuthPath) changes.set(inventory.profile.managedAuthPath, reconciled)
+          if (asRecord(reconciled)?.type === 'oauth' && inventory.profile?.globalAuthPath) {
+            changes.set(inventory.profile.globalAuthPath, reconciled)
+          }
+          assertSources([...changes])
+          authorizeCredentialTransition(reconciled, changes)
+        }
         const viewWithRefreshDiagnostics =
           refresh.postViewDiagnostics.length > 0
             ? buildView({

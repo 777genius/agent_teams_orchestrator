@@ -117,3 +117,85 @@ test('native single-name key and multiple-name SDK fallback bind only supplied c
   expect(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ONE'] }, env, null))
     .not.toBe(openCodeOpenRouterEligibilityIdentity({ env: ['CUSTOM_ONE'] }, { ...env, CUSTOM_ONE: 'rotation' }, null))
 })
+
+const launchProvider = { api: 'https://synthetic.invalid', npm: '@synthetic/provider',
+  models: { route: { id: 'upstream', name: 'Route' } }, options: { apiKey: 'synthetic-private' } }
+
+test('complete resolved launch contract has canonical secret-free identity', () => {
+  const identity = openCodeOpenRouterEligibilityIdentity(launchProvider, {}, null)
+  expect(identity).toMatch(/^[a-f0-9]{64}$/)
+  expect(openCodeOpenRouterEligibilityIdentity({ options: launchProvider.options,
+    models: { route: { name: 'Route', id: 'upstream' } }, npm: launchProvider.npm, api: launchProvider.api }, {}, null)).toBe(identity)
+  expect(openCodeOpenRouterEligibilityIdentity(launchProvider, {}, null)).toBe(identity)
+})
+
+test.each([
+  ['api', { ...launchProvider, api: 'https://changed.invalid' }],
+  ['npm', { ...launchProvider, npm: '@synthetic/changed' }],
+  ['model mapping', { ...launchProvider, models: { route: { id: 'changed', name: 'Route' } } }],
+  ['model addition', { ...launchProvider, models: { ...launchProvider.models, added: {} } }],
+  ['model deletion', { ...launchProvider, models: {} }],
+  ['models deletion', { ...launchProvider, models: undefined }],
+  ['api deletion', { ...launchProvider, api: undefined }],
+  ['npm deletion', { ...launchProvider, npm: undefined }],
+])('launch identity independently binds %s', (_name, changed) => {
+  expect(openCodeOpenRouterEligibilityIdentity(changed as Record<string, unknown>, {}, null))
+    .not.toBe(openCodeOpenRouterEligibilityIdentity(launchProvider, {}, null))
+})
+
+test('auth evidence bounds regular files and rejects malformed, oversized and special files', async () => {
+  const { readOpenCodeOpenRouterCredentialEvidence: read } = await import('./OpenCodeOpenRouterFallback.js')
+  const { symlinkSync } = await import('node:fs')
+  const { spawnSync } = await import('node:child_process')
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'issue446-auth-evidence-'))
+  const file = path.join(dir, 'auth.json')
+  const invalid = { type: 'api', key: '' }
+  try {
+    expect(read(file)).toBeNull()
+    writeFileSync(file, JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-key' } }))
+    expect(read(file)).toEqual({ type: 'api', key: 'synthetic-key' })
+    const link = path.join(dir, 'link')
+    symlinkSync(file, link)
+    expect(read(link)).toEqual(read(file))
+    for (const content of ['{invalid', '[]', 'null', 'x'.repeat(1024 * 1024 + 1)]) {
+      writeFileSync(file, content)
+      expect(read(file)).toEqual(invalid)
+    }
+    rmSync(file)
+    mkdirSync(file)
+    expect(read(file)).toEqual(invalid)
+    if (process.platform !== 'win32') {
+      const fifo = path.join(dir, 'fifo')
+      expect(spawnSync('mkfifo', [fifo]).status).toBe(0)
+      // No writer: any blocking FIFO open would hang this regression.
+      expect(read(fifo)).toEqual(invalid)
+      expect(read('/dev/null')).toEqual(invalid)
+      expect(read('/dev/zero')).toEqual(invalid)
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('auth descriptor rejects stat/open replacement without blocking or exposing evidence', async () => {
+  const { spyOn } = await import('bun:test')
+  const fs = await import('node:fs')
+  const { readOpenCodeOpenRouterCredentialEvidence: read } = await import('./OpenCodeOpenRouterFallback.js')
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'issue446-auth-race-'))
+  const file = path.join(dir, 'auth.json')
+  const replacement = path.join(dir, 'replacement')
+  writeFileSync(file, '{"openrouter":{"type":"api","key":"synthetic-before"}}')
+  writeFileSync(replacement, '{"openrouter":{"type":"api","key":"synthetic-after"}}')
+  const original = fs.openSync
+  let replaced = false
+  const opened = spyOn(fs, 'openSync').mockImplementation(((target, flags, mode) => {
+    if (target === file) {
+      expect(Number(flags) & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK)
+      fs.renameSync(replacement, file)
+      replaced = true
+    }
+    return original(target, flags, mode)
+  }) as typeof fs.openSync)
+  try {
+    expect(read(file)).toEqual({ type: 'api', key: '' })
+    expect(replaced).toBe(true)
+  } finally { opened.mockRestore(); rmSync(dir, { recursive: true, force: true }) }
+})

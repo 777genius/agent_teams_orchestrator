@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
@@ -9,10 +9,13 @@ function readReferenceFile(file: string): string {
   const before = statSync(file)
   if (!before.isFile() || before.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
   // Nonblocking open also closes the stat/open FIFO replacement race.
-  const fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK)
+  let fd: number
+  try { fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK) }
+  catch { throw new Error() }
   try {
     const opened = fstatSync(fd)
-    if (!opened.isFile() || opened.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
+    if (!opened.isFile() || opened.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES
+      || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error()
     const bytes = Buffer.alloc(OPEN_CODE_AUTHORITY_FILE_MAX_BYTES + 1)
     let length = 0
     while (length < bytes.length) {
@@ -20,8 +23,14 @@ function readReferenceFile(file: string): string {
       if (!count) break
       length += count
     }
-    if (length > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
+    const after = fstatSync(fd)
+    const current = statSync(file)
+    if (length > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES || after.size !== opened.size
+      || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+      || current.dev !== opened.dev || current.ino !== opened.ino) throw new Error()
     return bytes.subarray(0, length).toString('utf8')
+  } catch {
+    throw new Error()
   } finally {
     closeSync(fd)
   }
@@ -203,7 +212,7 @@ export function validateOpenCodeOpenRouterConfig(config: Record<string, unknown>
 export function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): unknown {
   if (!authPath) return null
   try {
-    const store = JSON.parse(readFileSync(authPath, 'utf8'))
+    const store = JSON.parse(readReferenceFile(authPath))
     if (!store || typeof store !== 'object' || Array.isArray(store)) throw new Error()
     return store.openrouter ?? null
   } catch (error) {
@@ -221,6 +230,15 @@ export function hasOpenCodeOpenRouterCatalogCredential(
     !!entry && entry.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim(), resolved)
 }
 
+function canonicalEvidence(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalEvidence)
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, entry]) => [key, canonicalEvidence(entry)]),
+  )
+  return value
+}
+
 /** Bind resolved decisions and credentials without putting secret values in cache keys. */
 export function openCodeOpenRouterEligibilityIdentity(
   provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown,
@@ -233,10 +251,10 @@ export function openCodeOpenRouterEligibilityIdentity(
       : resolveOpenCodeOpenRouterEnvironment(provider, env, references) as Record<string, unknown>
   } catch { effective = { whitelist: [], options: 'invalid' } }
   const credentialEnvironment = selectedOpenRouterEnvironment(effective, env)
-  return createHash('sha256').update(JSON.stringify([
-    effective.whitelist, effective.blacklist, effective.options, references,
+  return createHash('sha256').update(JSON.stringify(canonicalEvidence([
+    effective, references.sort(),
     auth, env.OPENCODE_AUTH_CONTENT, effective.env, credentialEnvironment,
     hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true),
     isOpenCodeOpenRouterFreeRouteAllowed(effective),
-  ])).digest('hex')
+  ]))).digest('hex')
 }

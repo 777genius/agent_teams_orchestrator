@@ -81,15 +81,16 @@ async function credentialFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-existing-connect-'))
   credentialFixtureRoots.push(root)
   const authPath = path.join(root, 'auth.json')
+  const globalAuthPath = path.join(root, 'global-auth.json')
   return {
-    authPath,
+    authPath, globalAuthPath,
     inventory: (overrides: Partial<OpenCodeInventorySnapshot> = {}) => {
       const snapshot = inventory(overrides)
-      if (snapshot.profile) snapshot.profile.managedAuthPath = authPath
+      if (snapshot.profile) { snapshot.profile.managedAuthPath = authPath; snapshot.profile.globalAuthPath = globalAuthPath }
       return snapshot
     },
     persist: async (input: { authPath: string; providerId: string; apiKey?: string; auth?: { key: string } }) => {
-      if (input.authPath === authPath) await writeFile(authPath, JSON.stringify({
+      if ([authPath, globalAuthPath].includes(input.authPath)) await writeFile(input.authPath, JSON.stringify({
         [input.providerId]: input.auth ?? { type: 'api', key: input.apiKey },
       }))
     },
@@ -4903,7 +4904,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(authWrites).toEqual([
         {
           authPath:
-            '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+            fixture.globalAuthPath,
           providerId,
           key: apiKey,
         },
@@ -5259,7 +5260,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toEqual([
       {
-        authPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        authPath: fixture.globalAuthPath,
         providerId: 'openrouter',
         apiKey: 'sk-test-secret',
       },
@@ -9012,16 +9013,23 @@ for (const mutation of ['disk-auth', 'inline-auth', 'config', 'referenced-file',
 }
 
 for (const target of ['models', 'directory-host', 'directory-lease'] as const) {
-  for (const mutation of ['config', 'auth', 'file', 'whitespace', 'inline-auth'] as const) {
+  for (const mutation of ['config', 'auth', 'global-auth', 'native-auth', 'api', 'npm', 'models', 'file', 'whitespace', 'inline-auth'] as const) {
     for (const seeded of [false, true]) {
       test(`OpenRouter ${target} finalizer rejects ${mutation} and evicts cache (seeded=${seeded})`, async () => {
         const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-release-'))
         const configPath = path.join(projectPath, 'opencode.json')
         const keyPath = path.join(projectPath, 'key')
         const authPath = path.join(projectPath, 'auth.json')
+        const globalAuthPath = path.join(projectPath, 'global.json')
+        const nativeAuthPath = path.join(projectPath, '.local/share/opencode/auth.json')
+        await mkdir(path.dirname(nativeAuthPath), { recursive: true })
         const snapshot = inventory({ projectPath, models: [], connectedProviders: [] })
         snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath, OPENCODE_CONFIG_CONTENT: '{}' }
-        if (snapshot.profile) snapshot.profile.managedAuthPath = authPath
+        if (snapshot.profile) {
+          snapshot.profile.managedAuthPath = authPath
+          snapshot.profile.globalAuthPath = globalAuthPath
+          snapshot.profile.sourceAuthPath = nativeAuthPath
+        }
         const auth = JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-release-key' } })
         await writeFile(authPath, auth)
         await writeFile(keyPath, 'synthetic-file')
@@ -9070,6 +9078,9 @@ for (const target of ['models', 'directory-host', 'directory-lease'] as const) {
           // A cold response cannot publish while either finalizer is outstanding.
           expect(cache.size).toBe(seeded ? 1 : 0)
           if (mutation === 'config') await writeFile(configPath, '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
+          if (mutation === 'global-auth') await writeFile(globalAuthPath, auth)
+          if (mutation === 'native-auth') await writeFile(nativeAuthPath, auth)
+          if (['api', 'npm', 'models'].includes(mutation)) await writeFile(configPath, JSON.stringify({ provider: { openrouter: { [mutation]: mutation === 'models' ? { added: {} } : 'synthetic-contract' } } }))
           if (mutation === 'auth') await writeFile(authPath, '{"openrouter":{"type":"api","key":""}}')
           if (mutation === 'file') await writeFile(keyPath, '')
           if (mutation === 'whitespace') await writeFile(keyPath, 'synthetic-file\n')
@@ -9082,6 +9093,8 @@ for (const target of ['models', 'directory-host', 'directory-lease'] as const) {
           if (target !== 'models') expect(leaseReleases).toBe(seeded ? 2 : 1)
           // Even restoring authority must force a fresh endpoint read after rejection.
           block = false
+          await rm(globalAuthPath, { force: true })
+          await rm(nativeAuthPath, { force: true })
           await writeFile(configPath, config)
           await writeFile(authPath, auth)
           await writeFile(keyPath, 'synthetic-file')
@@ -9214,7 +9227,7 @@ for (const option of ['blacklist', 'credential']) {
 }
 
 for (const action of ['connect', 'replace', 'forget']) {
-  for (const mutation of ['none', 'release-auth', 'release-config']) {
+  for (const mutation of ['none', 'release-auth', 'release-global', 'release-config']) {
     test(`OpenRouter ${action} verifies real credential transition and release barrier: ${mutation}`, async () => {
       const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-action-'))
       const snapshot = inventory({ projectPath, availableProviders: ['openrouter'], models: ['openrouter/openrouter/free'], connectedProviders: [] })
@@ -9229,6 +9242,7 @@ for (const action of ['connect', 'replace', 'forget']) {
         inventoryService: { probe: async () => ({ ...snapshot, connectedProviders: connected
           ? [{ id: 'openrouter', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }] : [] }) },
         hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+          if (proofComplete && mutation === 'release-global') await writeFile(snapshot.profile!.globalAuthPath!, '{"openrouter":{"type":"api","key":"unauthorized-global"}}')
           if (proofComplete && mutation === 'release-auth') await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":"unauthorized"}}')
           if (proofComplete && mutation === 'release-config') await writeFile(path.join(projectPath, 'opencode.json'), '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
         } },
@@ -9254,3 +9268,183 @@ for (const action of ['connect', 'replace', 'forget']) {
     })
   }
 }
+
+for (const finalizer of ['lease', 'host']) {
+  test.each(['stable', 'managed', 'global', 'native', 'config', 'file', 'environment', 'source', 'api', 'npm', 'models', 'managed-contract'])
+  (`settings revalidates after ${finalizer} finalizer: %s`, async mutation => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-settings-finalizer-'))
+    const snapshot = inventory({ projectPath, models: [] })
+    const profile = snapshot.profile!
+    profile.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath, OPENROUTER_API_KEY: 'synthetic-env' }
+    profile.managedAuthPath = path.join(projectPath, 'managed.json')
+    profile.globalAuthPath = path.join(projectPath, 'global.json')
+    profile.sourceAuthPath = path.join(projectPath, '.local/share/opencode/auth.json')
+    await mkdir(path.dirname(profile.sourceAuthPath), { recursive: true })
+    const configPath = path.join(projectPath, 'opencode.json')
+    const keyPath = path.join(projectPath, 'key')
+    const provider = { api: 'https://synthetic.invalid', npm: '@synthetic/provider',
+      models: { route: { id: 'mapped' } }, options: { apiKey: '{file:./key}' } }
+    await writeFile(configPath, JSON.stringify({ provider: { openrouter: provider } }))
+    await writeFile(keyPath, 'synthetic-file')
+    let leaseReleases = 0, hostReleases = 0
+    const mutate = async () => {
+      if (['managed', 'global', 'native'].includes(mutation)) {
+        const file = mutation === 'managed' ? profile.managedAuthPath : mutation === 'global' ? profile.globalAuthPath! : profile.sourceAuthPath!
+        await writeFile(file, '{"openrouter":{"type":"api","key":"synthetic-changed"}}')
+      }
+      if (mutation === 'managed-contract') profile.managedConfig = { provider: { openrouter: { npm: 'synthetic-change' } } }
+      if (mutation === 'file') await writeFile(keyPath, 'synthetic-changed')
+      if (mutation === 'environment') profile.env = { ...profile.env, OPENROUTER_API_KEY: 'synthetic-changed' }
+      if (mutation === 'source') profile.env = { ...profile.env, XDG_CONFIG_HOME: path.join(projectPath, 'other') }
+      if (['config', 'api', 'npm', 'models'].includes(mutation)) await writeFile(configPath,
+        JSON.stringify({ provider: { openrouter: { ...provider, [mutation === 'config' ? 'blacklist' : mutation]:
+          mutation === 'models' ? {} : mutation === 'config' ? ['openrouter/free'] : 'changed' } } }))
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => snapshot },
+      hostManager: {
+        ensureHost: async () => host(), retainHostLease: async () => {},
+        releaseHostLease: async () => { leaseReleases++; if (finalizer === 'lease') await mutate() },
+        releaseHost: async () => { hostReleases++; if (finalizer === 'host') await mutate() },
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    try {
+      const result = await adapter.loadView({ runtimeId: 'opencode', projectPath })
+      expect(result.ok).toBe(mutation === 'stable')
+      expect(leaseReleases).toBe(1)
+      expect(hostReleases).toBe(1)
+      expect(JSON.stringify(result)).not.toContain('synthetic-changed')
+    } finally { await rm(projectPath, { recursive: true, force: true }) }
+  })
+}
+
+test.each(['stable', 'native-action', 'global-action', 'managed-action', 'native-release', 'global-release', 'managed-release'])
+('forget verifies real native auth reconciliation: %s', async mutation => {
+  const { reconcileOpenCodeManagedAuthStores, readOpenCodeAuthCredential } = await import('../../../../services/opencode/OpenCodeAuthStore.js')
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-forget-reconcile-'))
+  const snapshot = inventory({ projectPath, models: [] })
+  const profile = snapshot.profile!
+  profile.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+  profile.managedAuthPath = path.join(projectPath, 'managed.json')
+  profile.globalAuthPath = path.join(projectPath, 'global.json')
+  profile.sourceAuthPath = path.join(projectPath, '.local/share/opencode/auth.json')
+  await mkdir(path.dirname(profile.sourceAuthPath), { recursive: true })
+  const native = { type: 'api', key: 'synthetic-native' }
+  await writeFile(profile.sourceAuthPath, JSON.stringify({ openrouter: native }))
+  for (const file of [profile.managedAuthPath, profile.globalAuthPath]) await writeFile(file, '{"openrouter":{"type":"api","key":"synthetic-managed"}}')
+  let probes = 0, reconciliations = 0
+  const mutate = async () => {
+    const file = mutation.startsWith('native') ? profile.sourceAuthPath! : mutation.startsWith('global') ? profile.globalAuthPath! : profile.managedAuthPath
+    await writeFile(file, '{"openrouter":{"type":"api","key":"synthetic-unauthorized"}}')
+  }
+  const adapter = new OpenCodeProviderManagementAdapter({
+    profileManager: { listManagedAuthPaths: async () => [] },
+    inventoryService: { probe: async () => {
+      if (++probes > 1) {
+        if (mutation === 'native-action') await mutate()
+        await reconcileOpenCodeManagedAuthStores({ globalAuthPath: profile.globalAuthPath!,
+          managedAuthPath: profile.managedAuthPath, sourceAuthPaths: [profile.globalAuthPath!, profile.sourceAuthPath!] })
+        reconciliations++
+        if (mutation === 'global-action' || mutation === 'managed-action') await mutate()
+      }
+      return snapshot
+    } },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+      if (mutation.endsWith('-release')) await mutate()
+    } },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+      getProviders: async () => ({ all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }),
+      getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+      getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+      deleteProviderAuth: async () => true,
+    }) },
+  })
+  try {
+    const result = await adapter.forgetManagedCredential({ runtimeId: 'opencode', projectPath, providerId: 'openrouter' })
+    expect(reconciliations).toBe(1)
+    expect(result.ok).toBe(mutation === 'stable')
+    if (mutation === 'stable') {
+      expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' })).toEqual(native)
+      expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath!, providerId: 'openrouter' })).toBeNull()
+    }
+    expect(JSON.stringify(result)).not.toContain('synthetic-unauthorized')
+  } finally { await rm(projectPath, { recursive: true, force: true }) }
+})
+
+test.each(['set-false', 'set-throw', 'mirror', 'admission', 'proof'])
+('OpenRouter failed replacement restores exact disk credentials: %s', async failure => {
+  const { upsertOpenCodeApiAuth, readOpenCodeAuthCredential } = await import('../../../../services/opencode/OpenCodeAuthStore.js')
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-rollback-'))
+  const snapshot = inventory({ projectPath, models: ['openrouter/openrouter/free'], availableProviders: ['openrouter'] })
+  const profile = snapshot.profile!
+  profile.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+  profile.managedAuthPath = path.join(projectPath, 'managed.json')
+  profile.globalAuthPath = path.join(projectPath, 'global.json')
+  const managed = { type: 'api' as const, key: 'synthetic-old-managed', metadata: { account: 'managed' } }
+  const global = { type: 'api' as const, key: 'synthetic-old-global', metadata: { account: 'global' } }
+  await upsertOpenCodeApiAuth(profile.managedAuthPath, 'openrouter', managed)
+  await upsertOpenCodeApiAuth(profile.globalAuthPath, 'openrouter', global)
+  let applied = false
+  const adapter = new OpenCodeProviderManagementAdapter({
+    inventoryService: { probe: async () => snapshot },
+    hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+    authStore: { upsertApiAuth: async input => {
+      if (failure === 'mirror' && input.authPath === profile.managedAuthPath) throw new Error('synthetic-mirror-failure')
+      await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth)
+    } },
+    executionProbe: { probeModel: async input => ({ ...executionProbeResult(input.selectedModel),
+      outcome: failure === 'proof' ? 'not_authenticated' : 'available' }) },
+    clientFactory: { create: () => ({
+      getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], default: {} }),
+      getProviders: async () => ({ all: [{ id: 'openrouter', models: { 'openrouter/free': {} } }],
+        connected: applied && failure !== 'admission' ? ['openrouter'] : [], default: {} }),
+      getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+      getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+      setProviderAuth: async (_providerId, auth) => {
+        applied = true
+        await upsertOpenCodeApiAuth(profile.managedAuthPath, 'openrouter', auth)
+        if (failure === 'set-throw') throw new Error('synthetic-set-failure')
+        return failure !== 'set-false'
+      },
+      deleteProviderAuth: async () => true,
+    }) },
+  })
+  try {
+    const result = await adapter.connectWithApiKey({ runtimeId: 'opencode', projectPath, providerId: 'openrouter', apiKey: 'synthetic-new' })
+    expect(result.ok).toBe(false)
+    expect(await readOpenCodeAuthCredential({ authPath: profile.managedAuthPath, providerId: 'openrouter' })).toEqual(managed)
+    expect(await readOpenCodeAuthCredential({ authPath: profile.globalAuthPath, providerId: 'openrouter' })).toEqual(global)
+    expect(JSON.stringify(result)).not.toContain('synthetic-new')
+  } finally { await rm(projectPath, { recursive: true, force: true }) }
+})
+
+test.each([false, true])('settings timeout still validates finalizer authority (mutation=%s)', async mutate => {
+  const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-settings-timeout-'))
+  const snapshot = inventory({ projectPath, models: [] })
+  snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+  snapshot.profile!.globalAuthPath = path.join(projectPath, 'global.json')
+  let releases = 0
+  const adapter = new OpenCodeProviderManagementAdapter({
+    viewTimeoutMs: 30,
+    inventoryService: { probe: async () => snapshot },
+    hostManager: {
+      ensureHost: async () => { await new Promise(resolve => setTimeout(resolve, 50)); return host() },
+      releaseHost: async () => {
+        releases++
+        if (mutate) await writeFile(snapshot.profile!.globalAuthPath!, '{"openrouter":{"type":"api","key":"synthetic-timeout-change"}}')
+      },
+    },
+  })
+  try {
+    const result = await adapter.loadView({ runtimeId: 'opencode', projectPath })
+    expect(result.ok).toBe(!mutate)
+    if (result.ok) expect(result.value.runtime.state).toBe('degraded')
+    expect(releases).toBe(1)
+  } finally { await rm(projectPath, { recursive: true, force: true }) }
+})
