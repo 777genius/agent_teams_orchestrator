@@ -46,18 +46,8 @@ test('directory symlink/junction succeeds without mkdir; broken link fails', asy
   await fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir')
   await ensure(link, { stat: fs.stat, mkdir: async () => { assert.fail('mkdir on directory link') } })
   await fs.rmdir(target)
-  const observation = async () => ({
-    target: await fs.stat(target).then(s => ({ directory: s.isDirectory() }), e => ({ code: e.code })),
-    link: await fs.stat(link).then(s => ({ directory: s.isDirectory() }), e => ({ code: e.code })),
-    realpath: await fs.realpath(link).catch(e => ({ code: e.code })),
-  })
-  if (process.platform === 'win32') console.log('junction before ensure', await observation())
-  const outcome = ensure(link)
-  if (process.platform === 'win32') {
-    await outcome.catch(() => {})
-    console.log('junction after ensure', await observation())
-  }
-  await assert.rejects(outcome)
+  await assert.rejects(ensure(link), { code: 'EEXIST' })
+  await assert.rejects(fs.stat(target), { code: 'ENOENT' })
   assert.ok((await fs.lstat(link)).isSymbolicLink())
 })
 
@@ -79,6 +69,23 @@ for (const result of ['directory', 'file', 'missing'] as const) {
   })
 }
 
+for (const result of ['directory', 'file', 'missing'] as const) {
+  test(`successful mkdir is verified: ${result}`, async t => {
+    const root = await fixture(t)
+    let calls = 0
+    const run = ensure(path.join(root, 'new'), {
+      stat: async () => {
+        if (++calls === 1 || result === 'missing') throw failure('ENOENT')
+        return result === 'directory' ? directory : file
+      },
+      mkdir: async () => undefined,
+    })
+    if (result === 'directory') await run
+    else await assert.rejects(run, { code: 'EEXIST' })
+    assert.equal(calls, 2)
+  })
+}
+
 test('real concurrent creator wins between stat and mkdir', async t => {
   const root = await fixture(t)
   const target = path.join(root, 'race')
@@ -94,7 +101,7 @@ test('real concurrent creator wins between stat and mkdir', async t => {
 })
 
 for (const code of ['EACCES', 'EPERM', 'ENOSPC', 'EIO']) {
-  for (const stage of ['initial stat', 'mkdir', 'confirmation stat']) {
+  for (const stage of ['initial stat', 'mkdir', 'confirmation stat', 'post-create stat']) {
     test(`${stage} preserves ${code}`, async t => {
       const root = await fixture(t)
       const error = failure(code)
@@ -107,6 +114,7 @@ for (const code of ['EACCES', 'EPERM', 'ENOSPC', 'EIO']) {
         },
         mkdir: async () => {
           assert.notEqual(stage, 'initial stat')
+          if (stage === 'post-create stat') return
           throw stage === 'mkdir' ? error : failure('EEXIST')
         },
       }), e => e === error)

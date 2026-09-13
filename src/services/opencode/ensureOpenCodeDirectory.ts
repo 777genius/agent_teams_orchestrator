@@ -28,16 +28,24 @@ export async function ensureOpenCodeDirectory(
     if (errno(error) !== 'ENOENT') throw error
   }
 
+  let mkdirError: unknown
   try {
     await operations.mkdir(directory, { recursive: true })
   } catch (error) {
     if (errno(error) !== 'EEXIST') throw error
-    // A concurrent creator may have won. EEXIST alone is never success.
-    const existing = await operations.stat(directory).catch(statError => {
-      if (errno(statError) !== 'ENOENT') throw statError
-      // Preserve mkdir's conflict for dangling links and concurrently removed paths.
-      return null
+    mkdirError = error
+  }
+  // Bun can report mkdir success for a dangling Windows junction. Verify both
+  // successful creation and EEXIST races before accepting the directory.
+  const existing = await operations.stat(directory).catch(statError => {
+    if (errno(statError) !== 'ENOENT') throw statError
+    return null
+  })
+  if (!existing?.isDirectory()) {
+    // Keep EEXIST so migration callers can inspect conflicts with lstat without
+    // traversing or replacing dangling links. Preserve the original mkdir error.
+    throw mkdirError ?? Object.assign(new Error(`Not a directory: ${directory}`), {
+      code: 'EEXIST', path: directory, syscall: 'mkdir',
     })
-    if (!existing?.isDirectory()) throw error
   }
 }
