@@ -5747,7 +5747,6 @@ async function runObserveMessageDelivery(
 async function runAnswerPermission(envelope: BridgeEnvelope) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
-  const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   const requestId = asString(body.requestId)
   const decision = asString(body.decision)
@@ -5761,6 +5760,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
+  const laneId = parseOpenCodeBridgePreconditions(body.preconditions)?.laneId ?? asString(body.laneId)
   const candidates = memberName
     ? (
       laneId
@@ -5770,7 +5770,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
         )
     )
     : (await openCodeSessionStore.list()).filter(
-      record => record.teamId === teamId && (!laneId || record.laneId === laneId),
+      record => record.teamId === teamId && (!laneId || (record.laneId ?? 'primary') === laneId),
     )
   if (!laneId && candidates.filter((candidate): candidate is OpenCodeSessionRecord => candidate !== null).length > 1) {
     throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
@@ -5778,6 +5778,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   const record = candidates.find((candidate): candidate is OpenCodeSessionRecord => candidate !== null)
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
+  }
+  if (laneId && (record.laneId ?? 'primary') !== laneId) {
+    throw new Error('OpenCode bridge selected session laneId does not match command laneId')
   }
   validateOpenCodeBridgeStateChangingPreconditions({
     body,

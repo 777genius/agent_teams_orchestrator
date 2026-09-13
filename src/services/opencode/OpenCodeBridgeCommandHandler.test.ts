@@ -10560,6 +10560,52 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   }
 
+  for (const memberName of ['alice', undefined]) {
+    for (const scenario of ['missing', 'matching', 'wrong-store-lane', 'legacy-primary'] as const) {
+      test(`selects nested permission lane with member ${memberName}: ${scenario}`, async () => {
+        openCodeProvisioningProbe.probe = async () => snapshot
+        const laneId = scenario === 'legacy-primary' ? 'primary' : 'laneA'
+        const wrongRecord = buildRecord({ laneId: 'laneB', runId: 'run-1', memberName: 'alice' })
+        const matchingRecord = buildRecord({
+          laneId: scenario === 'legacy-primary' ? undefined : laneId,
+          runId: 'run-1', memberName: 'alice',
+        })
+        const records = scenario === 'matching' || scenario === 'legacy-primary'
+          ? [wrongRecord, matchingRecord] : [wrongRecord]
+        const lookups: string[] = []
+        openCodeSessionStore.list = async () => records
+        openCodeSessionStore.get = async (_team, lane) => {
+          lookups.push(lane)
+          return scenario === 'wrong-store-lane' ? wrongRecord
+            : records.find(record => (record.laneId ?? 'primary') === lane) ?? null
+        }
+        const answered: OpenCodeSessionRecord[] = []
+        openCodeSessionBridge.answerPermission = async record => { answered.push(record) }
+        openCodeSessionBridge.reconcileSession = (async record => ({
+          summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+        })) as typeof openCodeSessionBridge.reconcileSession
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.answerPermission', {
+          teamId: 'team-a', memberName, requestId: 'perm-1', decision: 'allow',
+          preconditions: {
+            handshakeIdentityHash: 'handshake-1', laneId, expectedRunId: 'run-1',
+            expectedCapabilitySnapshotId: null, expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: 2, commandLeaseId: null, idempotencyKey: 'permission',
+          },
+        }))
+        const succeeds = scenario === 'matching' || scenario === 'legacy-primary'
+        expect(result.ok).toBe(succeeds)
+        expect(answered).toEqual(succeeds ? [matchingRecord] : [])
+        expect(lookups).toEqual(memberName ? [laneId] : [])
+        if (!result.ok) {
+          expect(result.error.message).toContain(memberName && scenario === 'wrong-store-lane'
+            ? 'selected session laneId does not match command laneId'
+            : 'No OpenCode session record found')
+        }
+        if (result.ok) expect(result.data.manifestHighWatermark).toBe(2)
+      })
+    }
+  }
+
   test('answers a permission against a non-zero app manifest high watermark', async () => {
     // Reproduces the live failure: after a launch the app's lane manifest
     // watermark is >= 1, and answering a permission carried that value into a
