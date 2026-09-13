@@ -267,7 +267,9 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
 
   test('two actual bridge/store instances select one absent-row CAS winner without releasing either sibling', async () => {
     let sessionOrdinal = 0
-    const healthReplies: Array<() => void> = []
+    let createdCount = 0
+    let bothCreated!: () => void
+    const created = new Promise<void>(resolve => { bothCreated = resolve })
     const fixture = await supervisedFixture({
       mutateBundle(bundle) {
         const original = bundle.prepareLeaseToken
@@ -278,8 +280,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
       },
       handle(request, response) {
         if (request.url === '/global/health') {
-          healthReplies.push(() => response.end('{"healthy":true}'))
-          if (healthReplies.length === 2) healthReplies.splice(0).forEach(reply => reply())
+          response.end('{"healthy":true}')
           return
         }
         if (request.method === 'POST' && request.url === '/session') {
@@ -318,7 +319,12 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
             openCodeArtifactDigest: `sha256:${fixture.expected.executable.sha256}`,
           },
           validateAttempt: () => true,
-          armAttempt: async () => {}, recordCreated: async () => {}, recordUncertain: async () => {},
+          armAttempt: async () => {},
+          recordCreated: async () => {
+            if (++createdCount === 2) bothCreated()
+            await supervisedTestWait(created, 'both absent-row race session creates', 30_000)
+          },
+          recordUncertain: async () => {},
         })
       const leftContext = makeContext(left.bridge, 0)
       const rightContext = makeContext(right.bridge, 1)
@@ -908,6 +914,7 @@ describe.skipIf(process.platform !== 'linux')('OpenCode supervised session bridg
       await expect(pending).resolves.toBe(true)
       expect(fixture.requests.at(-1)!.url).toBe('/session/ses_test/abort')
       expect(fixture.connections.some(connection => Buffer.concat(connection.chunks).includes(Buffer.from('ses_substituted')))).toBe(false)
+      expect(manager.getHost(custody.hostKey)).toBeNull()
       const before = fixture.requests.length
       await expect(bridge.reconcileSession(sessionRecord(fixture, custody.hostKey), { sessionId: 'ses_unadmitted' }))
         .rejects.toThrow('not the admitted session')

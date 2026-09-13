@@ -88,7 +88,7 @@ type OpenCodeSessionBridgeDeps = {
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease' |
       'prepareEffectHostToken' | 'verifyEffectHost' | 'reserveHostedAcquisition' |
       'acquireHostedHost' | 'inspectHostedAcquisition' | 'promoteHostedAcquisition' |
-      'releaseHostedAcquisition'
+      'releaseHostedAcquisition' | 'withSupervisedHostOperation'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   hostedSessionPublicationStore?: OpenCodeHostedSessionPublicationStore
@@ -1568,7 +1568,7 @@ export class OpenCodeSessionBridge {
         toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
       }
       : await this.prepareProfileForSessionRecord(record)
-    const host = await this.hostManager.ensureHost({
+    const hostInput = {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
@@ -1578,9 +1578,9 @@ export class OpenCodeSessionBridge {
         memberName: record.memberName,
         sessionId: record.opencodeSessionId,
       },
-    })
+    }
 
-    try {
+    const invoke = async (host: OpenCodeHostHandle): Promise<T> => {
       const effectProfile = this.custody ? await this.custody.readPreparedProfile() : sessionProfile.profile
       const effectHost: OpenCodePermissionEffectContext['host'] = {
         custody: host.custody, hostKey: host.hostKey, profileRootKey: host.profileRootKey,
@@ -1596,6 +1596,15 @@ export class OpenCodeSessionBridge {
         runtimePid: host.pid > 0 ? host.pid : null,
         host: this.custody ? Object.freeze(effectHost) : effectHost,
       })
+    }
+    if (this.custody) {
+      const withOperation = this.hostManager.withSupervisedHostOperation
+      if (!withOperation) throw new Error('OpenCode supervised host operation capability unavailable')
+      return withOperation.call(this.hostManager, hostInput, invoke)
+    }
+    const host = await this.hostManager.ensureHost(hostInput)
+    try {
+      return await invoke(host)
     } finally {
       await this.hostManager.releaseHost(host.hostKey)
     }

@@ -105,6 +105,7 @@ type ManagedHostEntry = {
     custody: TrustedOpenCodeCustody
     leases: Set<string>
     hostedHoldings: Map<object, { provisional: boolean; sessionId: string | null }>
+    operationHoldings: Set<object>
   }
   handle: OpenCodeHostHandle
   child: ChildProcess | null
@@ -139,6 +140,8 @@ type OpenCodeHostManagerDeps = {
   resolveOpenCodeArtifactDigest?: (binaryPath: string) => OpenCodeArtifactDigest | null
   /** Deterministic lower-boundary fault injection after receipt commit. */
   afterHostedAcquisitionCommitForTest?: () => void
+  /** Deterministic lower-boundary fault injection after operation commit. */
+  afterSupervisedOperationCommitForTest?: () => void
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -147,6 +150,21 @@ export type OpenCodeHostLeaseInput = {
   memberName: string
   runId?: string | null
   sessionId?: string | null
+}
+
+export type OpenCodeSupervisedHostOperationInput = Readonly<{
+  projectPath?: string | null
+  hostKey?: string | null
+  profileOptions?: OpenCodePrepareProfileOptions
+  preparedProfile?: OpenCodePreparedProfile
+  healthTimeoutMs?: number | null
+  abortSignal?: AbortSignal
+  lease: OpenCodeHostLeaseInput
+}>
+
+type SupervisedOperationState = {
+  readonly identity: object
+  entry: ManagedHostEntry | null
 }
 
 declare const openCodeHostedAcquisitionBrand: unique symbol
@@ -718,9 +736,79 @@ export class OpenCodeHostManager {
     entry.refCount = Math.max(0, entry.refCount - 1)
     state.referencePending = false
     state.released = true
-    if (entry.refCount === 0 && supervisor.leases.size === 0 &&
-      supervisor.hostedHoldings.size === 0) this.#hosts.delete(state.tuple.hostKey)
+    if (this.#hosts.get(state.tuple.hostKey) === entry && entry.refCount === 0 &&
+      supervisor.leases.size === 0 && supervisor.hostedHoldings.size === 0 &&
+      supervisor.operationHoldings.size === 0) this.#hosts.delete(state.tuple.hostKey)
     this.#unsettledHostedAcquisitions.delete(state)
+  }
+
+  /** Retains one exact supervised host entry only for the lifetime of callback. */
+  async withSupervisedHostOperation<T>(
+    input: OpenCodeSupervisedHostOperationInput,
+    callback: (host: OpenCodeHostHandle) => Promise<T>,
+  ): Promise<T> {
+    if (!this.custody) throw new Error('OpenCode supervised host operation requires the sealed supervised manager')
+    if (typeof callback !== 'function') throw new Error('OpenCode supervised host operation callback unavailable')
+    if (input.abortSignal !== undefined && !(input.abortSignal instanceof AbortSignal)) {
+      throw new Error('OpenCode supervised host operation requires a native AbortSignal')
+    }
+    const params = Object.freeze({
+      projectPath: input.projectPath,
+      hostKey: input.hostKey,
+      profileOptions: input.profileOptions ? Object.freeze({ ...input.profileOptions }) : undefined,
+      preparedProfile: input.preparedProfile
+        ? Object.freeze(structuredClone(input.preparedProfile)) as OpenCodePreparedProfile
+        : undefined,
+      healthTimeoutMs: input.healthTimeoutMs,
+      abortSignal: input.abortSignal,
+      lease: Object.freeze({ ...input.lease }),
+    })
+    const operation: SupervisedOperationState = { identity: Object.freeze({}), entry: null }
+    const deadline = new OpenCodeRuntimeDeadline(normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs))
+    const abort = () => deadline.abort(params.abortSignal?.reason)
+    let abortListenerInstalled = false
+    let releaseOwnerResource: (() => void) | null = null
+    try {
+      let host: OpenCodeHostHandle
+      try {
+        if (params.abortSignal) {
+          params.abortSignal.addEventListener('abort', abort, { once: true })
+          abortListenerInstalled = true
+          if (params.abortSignal.aborted) abort()
+        }
+        releaseOwnerResource = this.custody.retainOwnerResource(() =>
+          deadline.abort(new Error('OpenCode supervised custody lost')))
+        const previous = this.#supervisedTail
+        const pending = deadline.runPhase('host_start', async context => {
+          await raceOpenCodeAbortSignal(previous, context.signal)
+          context.throwIfExpired()
+          return context
+        }).then(context => this.adoptSupervisedHost(params, context, undefined, operation))
+        this.#supervisedTail = previous.then(() => pending).catch(() => undefined)
+        host = await pending
+        this.deps.afterSupervisedOperationCommitForTest?.()
+      } finally {
+        let finalizerError: unknown = null
+        try { deadline.dispose() } catch (error) { finalizerError = error }
+        try {
+          if (abortListenerInstalled) params.abortSignal?.removeEventListener('abort', abort)
+        } catch (error) { finalizerError ??= error }
+        try { releaseOwnerResource?.() } catch (error) { finalizerError ??= error }
+        if (finalizerError !== null) throw finalizerError
+      }
+      // Acquisition serialization ends at commit; callbacks may reenter the
+      // manager or remain pending without blocking later adoptions.
+      return await callback(host)
+    } finally {
+      const entry = operation.entry
+      const supervisor = entry?.supervisor
+      if (entry && supervisor && this.#hosts.get(this.custody.hostKey) === entry &&
+        supervisor.operationHoldings.delete(operation.identity) && entry.refCount === 0 &&
+        supervisor.leases.size === 0 && supervisor.hostedHoldings.size === 0 &&
+        supervisor.operationHoldings.size === 0) {
+        this.#hosts.delete(this.custody.hostKey)
+      }
+    }
   }
 
   private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
@@ -1407,8 +1495,9 @@ export class OpenCodeHostManager {
     if (this.custody) {
       const entry = this.#hosts.get(hostKey)
       entry?.supervisor?.leases.delete(buildLeaseKey(input))
-      if (entry?.supervisor && entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
-        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
+      if (entry?.supervisor && this.#hosts.get(hostKey) === entry && entry.refCount === 0 &&
+        entry.supervisor.leases.size === 0 && entry.supervisor.hostedHoldings.size === 0 &&
+        entry.supervisor.operationHoldings.size === 0) this.#hosts.delete(hostKey)
       return
     }
     const registryPath = this.persistentRegistryPath
@@ -2059,7 +2148,8 @@ export class OpenCodeHostManager {
     projectPath?: string | null; hostKey?: string | null
     preparedProfile?: OpenCodePreparedProfile; profileOptions?: OpenCodePrepareProfileOptions
     abortSignal?: AbortSignal; lease?: OpenCodeHostLeaseInput
-  }, context: OpenCodePhaseContext, hostedAcquisition?: HostedAcquisitionState): Promise<OpenCodeHostHandle> {
+  }, context: OpenCodePhaseContext, hostedAcquisition?: HostedAcquisitionState,
+  operation?: SupervisedOperationState): Promise<OpenCodeHostHandle> {
     const custody = this.custody!
     assertTrustedOpenCodeCustody(custody)
     const e = custody.expected
@@ -2128,7 +2218,10 @@ export class OpenCodeHostManager {
       const existing = this.#hosts.get(custody.hostKey)
       if (existing) {
         if (existing.supervisor?.custody !== custody) throw new Error('OpenCode supervised handle replaced')
-        if (hostedAcquisition) {
+        if (operation) {
+          existing.supervisor.operationHoldings.add(operation.identity)
+          operation.entry = existing
+        } else if (hostedAcquisition) {
           existing.supervisor.hostedHoldings.set(hostedAcquisition.receipt, {
             provisional: true,
             sessionId: null,
@@ -2141,7 +2234,7 @@ export class OpenCodeHostManager {
         } else {
           existing.supervisor.leases.add(leaseKey)
         }
-        existing.refCount += 1
+        if (!operation) existing.refCount += 1
         return existing.handle
       }
       const handle: OpenCodeHostHandle = {
@@ -2156,10 +2249,13 @@ export class OpenCodeHostManager {
         if (key !== 'state') Object.defineProperty(handle, key, { writable: false, configurable: false })
       }
       Object.seal(handle)
-      const entry: ManagedHostEntry = { handle, child: null, refCount: 1, ownedByProcess: false,
+      const entry: ManagedHostEntry = { handle, child: null, refCount: operation ? 0 : 1, ownedByProcess: false,
         lifetime: 'process', supervisor: { custody,
-          leases: new Set(hostedAcquisition ? [] : [leaseKey]), hostedHoldings: new Map() } }
-      if (hostedAcquisition) {
+          leases: new Set(hostedAcquisition || operation ? [] : [leaseKey]), hostedHoldings: new Map(),
+          operationHoldings: new Set(operation ? [operation.identity] : []) } }
+      if (operation) {
+        operation.entry = entry
+      } else if (hostedAcquisition) {
         entry.supervisor!.hostedHoldings.set(hostedAcquisition.receipt, { provisional: true, sessionId: null })
         hostedAcquisition.entry = entry
         hostedAcquisition.host = handle
@@ -2373,8 +2469,9 @@ export class OpenCodeHostManager {
       // remains until each legacy or receipt owner releases its own exact hold.
       // Deleting it here would make a committed receipt unable to settle, or
       // tempt a later release to debit an unrelated entry generation.
-      if (entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
-        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
+      if (this.#hosts.get(hostKey) === entry && entry.refCount === 0 &&
+        entry.supervisor.leases.size === 0 && entry.supervisor.hostedHoldings.size === 0 &&
+        entry.supervisor.operationHoldings.size === 0) this.#hosts.delete(hostKey)
       await this.custody.closeOwnerResources()
       return true
     }
@@ -2773,8 +2870,9 @@ export class OpenCodeHostManager {
       const entry = this.#hosts.get(hostKey)
       if (!entry?.supervisor) return
       entry.refCount = Math.max(0, entry.refCount - 1)
-      if (entry.refCount === 0 && entry.supervisor.leases.size === 0 &&
-        entry.supervisor.hostedHoldings.size === 0) this.#hosts.delete(hostKey)
+      if (this.#hosts.get(hostKey) === entry && entry.refCount === 0 &&
+        entry.supervisor.leases.size === 0 && entry.supervisor.hostedHoldings.size === 0 &&
+        entry.supervisor.operationHoldings.size === 0) this.#hosts.delete(hostKey)
       return
     }
     const entry = this.#hosts.get(hostKey)
