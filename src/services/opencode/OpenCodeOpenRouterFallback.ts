@@ -1,6 +1,31 @@
-import { readFileSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
+
+/** Same 1 MiB bound as profile authority files. */
+const OPEN_CODE_AUTHORITY_FILE_MAX_BYTES = 1024 * 1024
+
+function readReferenceFile(file: string): string {
+  const before = statSync(file)
+  if (!before.isFile() || before.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
+  // Nonblocking open also closes the stat/open FIFO replacement race.
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK)
+  try {
+    const opened = fstatSync(fd)
+    if (!opened.isFile() || opened.size > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
+    const bytes = Buffer.alloc(OPEN_CODE_AUTHORITY_FILE_MAX_BYTES + 1)
+    let length = 0
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null)
+      if (!count) break
+      length += count
+    }
+    if (length > OPEN_CODE_AUTHORITY_FILE_MAX_BYTES) throw new Error()
+    return bytes.subarray(0, length).toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
 
 /** Compatibility route for OpenCode releases whose embedded models.dev omits the router. */
 export const OPEN_CODE_OPENROUTER_FREE_ROUTE = {
@@ -64,7 +89,7 @@ export function resolveOpenCodeOpenRouterEnvironment(
       return replacement || ''
     }).replace(/\{file:([^}]+)\}/g, (_, name: string) => {
       const file = name.startsWith('~/') ? path.join(env.HOME || env.USERPROFILE || '', name.slice(2)) : name
-      const content = readFileSync(file, 'utf8')
+      const content = readReferenceFile(file)
       referenceDigests?.push(createHash('sha256').update(JSON.stringify([file, content])).digest('hex'))
       return JSON.stringify(content.trim()).slice(1, -1)
     }))

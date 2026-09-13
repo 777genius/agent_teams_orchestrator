@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -69,6 +69,30 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
     probeError: null,
     diagnostics: [],
     ...overrides,
+  }
+}
+
+// Positive connect fixtures must change the same disk evidence that release validates.
+const credentialFixtureRoots: string[] = []
+afterEach(async () => {
+  for (const root of credentialFixtureRoots.splice(0)) await rm(root, { recursive: true, force: true })
+})
+async function credentialFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'issue446-existing-connect-'))
+  credentialFixtureRoots.push(root)
+  const authPath = path.join(root, 'auth.json')
+  return {
+    authPath,
+    inventory: (overrides: Partial<OpenCodeInventorySnapshot> = {}) => {
+      const snapshot = inventory(overrides)
+      if (snapshot.profile) snapshot.profile.managedAuthPath = authPath
+      return snapshot
+    },
+    persist: async (input: { authPath: string; providerId: string; apiKey?: string; auth?: { key: string } }) => {
+      if (input.authPath === authPath) await writeFile(authPath, JSON.stringify({
+        [input.providerId]: input.auth ?? { type: 'api', key: input.apiKey },
+      }))
+    },
   }
 }
 
@@ -3960,12 +3984,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
   })
 
   test('connects providers through OpenCode auth set on the managed host', async () => {
+    const fixture = await credentialFixture()
     const authWrites: Array<{ providerId: string; key: string }> = []
     const modelProbes: Array<{ selectedModel: string; outputTokens?: number }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
-          inventory({
+          fixture.inventory({
             connectedProviders: [],
             availableProviders: [],
             models: [],
@@ -4002,7 +4027,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           },
         }),
       },
-      authStore: authStore(),
+      authStore: { ...authStore(), upsertApiKey: fixture.persist },
       executionProbe: {
         probeModel: async input => {
           modelProbes.push({
@@ -4785,6 +4810,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
   ])(
     'connects $providerId only after mirroring auth and proving its subscription model',
     async ({ providerId, displayName, apiKey, modelId, providerDefaultModelId }) => {
+    const fixture = await credentialFixture()
       const authWrites: Array<{
         authPath: string
         providerId: string
@@ -4798,7 +4824,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       const adapter = new OpenCodeProviderManagementAdapter({
         inventoryService: {
           probe: async (_projectPath, options) =>
-            inventory({
+            fixture.inventory({
               connectedProviders: options?.bypassCache
                 ? [
                     {
@@ -4846,6 +4872,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         authStore: {
           upsertApiAuth: async input => {
+          await fixture.persist(input)
             authWrites.push({
               authPath: input.authPath,
               providerId: input.providerId,
@@ -4881,7 +4908,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           key: apiKey,
         },
         {
-          authPath: '/tmp/profile/data/opencode/auth.json',
+          authPath: fixture.authPath,
           providerId,
           key: apiKey,
         },
@@ -5153,6 +5180,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
   })
 
   test.each([null, { blacklist: ['openrouter/free'] }, { whitelist: ['moonshotai/kimi-k2:free'] }])('verifies only permitted OpenRouter candidates after auth writes %j', async restrictions => {
+    const fixture = await credentialFixture()
     const authWrites: Array<{
       authPath: string
       providerId: string
@@ -5165,7 +5193,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       inventoryService: {
         probe: async (_projectPath, options) => {
           probeCalls.push({ bypassCache: options?.bypassCache })
-          return inventory(
+          return fixture.inventory(
             options?.bypassCache
               ? {
                   connectedProviders: [
@@ -5208,6 +5236,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       authStore: {
         upsertApiKey: async input => {
+          await fixture.persist(input)
           authWrites.push(input)
         },
         removeCredential: async () => {},
@@ -5235,7 +5264,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         apiKey: 'sk-test-secret',
       },
       {
-        authPath: '/tmp/profile/data/opencode/auth.json',
+        authPath: fixture.authPath,
         providerId: 'openrouter',
         apiKey: 'sk-test-secret',
       },
@@ -5253,6 +5282,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
   })
 
   test('keeps a successful connect when post-write inventory refresh times out', async () => {
+    const fixture = await credentialFixture()
     const authWrites: Array<{
       authPath: string
       providerId: string
@@ -5268,7 +5298,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probe: async () => {
           probeCallCount += 1
           if (probeCallCount > 1) {
-            return inventory({
+            return fixture.inventory({
               connectedProviders: [],
               availableProviders: [],
               models: [],
@@ -5277,7 +5307,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
               diagnostics: [timeoutMessage],
             })
           }
-          return inventory({
+          return fixture.inventory({
             connectedProviders: [],
             availableProviders: ['openrouter'],
             models: ['openrouter/moonshotai/kimi-k2:free'],
@@ -5305,6 +5335,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       authStore: {
         upsertApiKey: async input => {
+          await fixture.persist(input)
           authWrites.push(input)
         },
         removeCredential: async input => {
@@ -8770,6 +8801,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     { options: { apiKey: '' } },
     { options: { apiKey: '{env:MISSING_OPENROUTER_TEST_KEY}' } },
   ])('reads project router exclusions for native catalogs and post-connect verification %j', async restrictions => {
+    const fixture = await credentialFixture()
     const project = await mkdtemp(path.join(os.tmpdir(), 'openrouter project-'))
     const projectPath = path.join(project, 'child', '..')
     await mkdir(path.join(project, 'child'))
@@ -8780,7 +8812,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     // Both native endpoints have already filtered their model maps and omit
     // whitelist/blacklist. The unscoped refreshed inventory is deliberately stale.
     const nativeProvider = { id: 'openrouter', models: { 'moonshotai/kimi-k2:free': {} } }
-    const stale = inventory({ models: ['openrouter/moonshotai/kimi-k2:free'] })
+    const stale = fixture.inventory({ models: ['openrouter/moonshotai/kimi-k2:free'] })
     stale.profile!.managedConfig = { provider: { openrouter: { whitelist: ['openrouter/free'] } } }
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
@@ -8795,7 +8827,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
         setProviderAuth: async () => { connected = true; return true },
       }) },
-      authStore: { upsertApiKey: async () => {}, removeCredential: async () => {} },
+      authStore: { upsertApiKey: fixture.persist, removeCredential: async () => {} },
       executionProbe: { probeModel: async input => {
         modelProbes.push(input)
         return executionProbeResult(input.selectedModel)
@@ -8989,7 +9021,7 @@ for (const target of ['models', 'directory-host', 'directory-lease'] as const) {
         const authPath = path.join(projectPath, 'auth.json')
         const snapshot = inventory({ projectPath, models: [], connectedProviders: [] })
         snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath, OPENCODE_CONFIG_CONTENT: '{}' }
-        snapshot.profile!.managedAuthPath = authPath
+        if (snapshot.profile) snapshot.profile.managedAuthPath = authPath
         const auth = JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-release-key' } })
         await writeFile(authPath, auth)
         await writeFile(keyPath, 'synthetic-file')
@@ -9152,3 +9184,73 @@ test('catalog supersession during finalizer rejects the old response without evi
     expect([...cache.values()]).toEqual(latest)
   } finally { release(); await old; await rm(projectPath, { recursive: true, force: true }) }
 })
+
+for (const option of ['blacklist', 'credential']) {
+  for (const mutate of [false, true]) {
+    test(`settings captures project-only ${option} before endpoint reads (mutation=${mutate})`, async () => {
+      const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-settings-'))
+      const snapshot = inventory({ projectPath, availableProviders: ['openrouter'], models: [] })
+      snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+      snapshot.profile!.managedAuthPath = path.join(projectPath, 'auth.json')
+      const configPath = path.join(projectPath, 'opencode.json')
+      await writeFile(configPath, JSON.stringify({ provider: { openrouter: option === 'blacklist'
+        ? { blacklist: ['openrouter/free'] } : { options: { apiKey: 'synthetic-project-key' } } } }))
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => snapshot },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+          getProviders: async () => {
+            if (mutate) await writeFile(configPath, '{"provider":{"openrouter":{"options":{"apiKey":"changed"}}}}')
+            return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+          },
+          getProviderAuth: async () => ({}),
+        }) },
+      })
+      try { expect((await adapter.loadView({ runtimeId: 'opencode', projectPath })).ok).toBe(!mutate) }
+      finally { await rm(projectPath, { recursive: true, force: true }) }
+    })
+  }
+}
+
+for (const action of ['connect', 'replace', 'forget']) {
+  for (const mutation of ['none', 'release-auth', 'release-config']) {
+    test(`OpenRouter ${action} verifies real credential transition and release barrier: ${mutation}`, async () => {
+      const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-action-'))
+      const snapshot = inventory({ projectPath, availableProviders: ['openrouter'], models: ['openrouter/openrouter/free'], connectedProviders: [] })
+      snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath }
+      snapshot.profile!.managedAuthPath = path.join(projectPath, 'auth.json')
+      snapshot.profile!.globalAuthPath = path.join(projectPath, 'global-auth.json')
+      let connected = action !== 'connect'
+      let proofComplete = action === 'forget'
+      if (connected) await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":"old-key"}}')
+      const adapter = new OpenCodeProviderManagementAdapter({
+        profileManager: { listManagedAuthPaths: async () => [] },
+        inventoryService: { probe: async () => ({ ...snapshot, connectedProviders: connected
+          ? [{ id: 'openrouter', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }] : [] }) },
+        hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+          if (proofComplete && mutation === 'release-auth') await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":"unauthorized"}}')
+          if (proofComplete && mutation === 'release-config') await writeFile(path.join(projectPath, 'opencode.json'), '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
+        } },
+        clientFactory: { create: () => ({
+          getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], default: {} }),
+          getProviders: async () => ({ all: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], connected: connected ? ['openrouter'] : [], default: {} }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          setProviderAuth: async () => { connected = true; return true },
+          deleteProviderAuth: async () => { connected = false; return true },
+        }) },
+        executionProbe: { probeModel: async input => { proofComplete = true; return executionProbeResult(input.selectedModel) } },
+      })
+      try {
+        const result = action !== 'forget'
+          ? await adapter.connectWithApiKey({ runtimeId: 'opencode', projectPath, providerId: 'openrouter', apiKey: 'new-key' })
+          : await adapter.forgetManagedCredential({ runtimeId: 'opencode', projectPath, providerId: 'openrouter' })
+        expect(result.ok).toBe(mutation === 'none')
+        const { readFile } = await import('node:fs/promises')
+        const auth = JSON.parse(await readFile(snapshot.profile!.managedAuthPath, 'utf8'))
+        expect(auth.openrouter?.key).toBe(mutation === 'release-auth' ? 'unauthorized' : action !== 'forget' ? 'new-key' : undefined)
+      } finally { await rm(projectPath, { recursive: true, force: true }) }
+    })
+  }
+}

@@ -2057,6 +2057,7 @@ type OpenRouterEligibilitySnapshot = Readonly<{
   env: NodeJS.ProcessEnv
   auth: unknown
   identity: string
+  identityForAuth?: (auth: unknown) => string
   decision: Readonly<{ allowed: boolean; credential: boolean }>
 }>
 type EligibilityInventory = OpenCodeInventorySnapshot & {
@@ -2096,6 +2097,7 @@ async function withEffectiveOpenRouterConfig(
   }
   const auth = readOpenCodeOpenRouterCredentialEvidence(inventory.profile.managedAuthPath)
   const snapshot = Object.freeze({ env, auth,
+    identityForAuth: (resultingAuth: unknown) => openCodeOpenRouterEligibilityIdentity(effective, env, resultingAuth, true, referenceDigests),
     identity: openCodeOpenRouterEligibilityIdentity(effective, env, auth, true, referenceDigests),
     decision: Object.freeze({ allowed: isOpenCodeOpenRouterFreeRouteAllowed(effective),
       credential: hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true) }) })
@@ -2682,16 +2684,14 @@ function buildView(input: {
 }
 
 async function readLiveView(input: {
+  projectPath?: string | null
   inventory: OpenCodeInventorySnapshot
   host: OpenCodeHostHandle
   client: OpenCodeProviderManagementClient
   diagnostics?: readonly string[]
   degradeOnReadFailure?: boolean
 }): Promise<ProviderManagementView> {
-  const inventory: EligibilityInventory = {
-    ...input.inventory,
-    [openRouterEligibility]: eligibilitySnapshot(input.inventory),
-  }
+  const inventory = await withEffectiveOpenRouterConfig(input.inventory, input.projectPath ?? input.inventory.projectPath)
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
     : Promise.resolve({
@@ -3859,6 +3859,7 @@ export class OpenCodeProviderManagementAdapter
       inventoryService: OpenCodeInventoryServiceLike
       host: OpenCodeHostHandle
       client: OpenCodeProviderManagementClient
+      authorizeCredentialTransition: (auth: unknown) => void
     }) => Promise<ProviderManagementResult<T>>,
     options: {
       failureCode?: ProviderManagementErrorCode
@@ -3887,6 +3888,7 @@ export class OpenCodeProviderManagementAdapter
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
     let effectiveInventory: OpenCodeInventorySnapshot | undefined
+    let authorizedInventory: OpenCodeInventorySnapshot | undefined
     const release = async () => {
       const retained = host
       host = null
@@ -3939,9 +3941,21 @@ export class OpenCodeProviderManagementAdapter
         inventory, projectPath ?? inventory.projectPath,
       )
       const result = await raceOpenCodeAbortSignal(
-        run({ inventory: effectiveInventory, inventoryService, host, client }),
+        run({ inventory: effectiveInventory, inventoryService, host, client,
+          // Change only the authorized auth component. Config, environment and
+          // file evidence remain bound to the pre-action snapshot, and the
+          // resulting identity is adopted only after admission/execution succeeds.
+          authorizeCredentialTransition: auth => {
+            const snapshot = eligibilitySnapshot(effectiveInventory!)
+            if (!snapshot.identityForAuth) return
+            authorizedInventory = { ...effectiveInventory!, [openRouterEligibility]: {
+              ...snapshot, auth, identity: snapshot.identityForAuth(auth),
+            } } as EligibilityInventory
+          },
+        }),
         options.abortSignal,
       )
+      if (result.ok && authorizedInventory) effectiveInventory = authorizedInventory
       return result
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
@@ -4078,6 +4092,7 @@ export class OpenCodeProviderManagementAdapter
 
       liveView = await readLiveView({
           degradeOnReadFailure: true,
+          projectPath: request.projectPath,
           inventory,
           host,
           client,
@@ -5289,7 +5304,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, client }) => {
+      async ({ inventory, inventoryService, client, authorizeCredentialTransition }) => {
         if (!client.setProviderAuth) {
           return providerManagementError(
             'unsupported-action',
@@ -5397,6 +5412,7 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
+        if (providerId === 'openrouter') authorizeCredentialTransition(authBody)
         let authApplied: boolean
         try {
           authApplied = await client.setProviderAuth(providerId, { ...authBody })
@@ -5540,7 +5556,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, host, client }) => {
+      async ({ inventory, inventoryService, host, client, authorizeCredentialTransition }) => {
         const serverDoc = client.getServerDoc ? await client.getServerDoc() : null
         const capabilities = getCapabilities(serverDoc)
         if (!capabilities.deleteAuth || !client.deleteProviderAuth) {
@@ -5550,6 +5566,7 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
+        if (providerId === 'openrouter') authorizeCredentialTransition(null)
         const authDeleted = await client.deleteProviderAuth(providerId)
         if (authDeleted !== true) {
           return providerManagementError(
