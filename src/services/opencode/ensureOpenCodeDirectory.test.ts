@@ -46,7 +46,18 @@ test('directory symlink/junction succeeds without mkdir; broken link fails', asy
   await fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir')
   await ensure(link, { stat: fs.stat, mkdir: async () => { assert.fail('mkdir on directory link') } })
   await fs.rmdir(target)
-  await assert.rejects(ensure(link))
+  const observation = async () => ({
+    target: await fs.stat(target).then(s => ({ directory: s.isDirectory() }), e => ({ code: e.code })),
+    link: await fs.stat(link).then(s => ({ directory: s.isDirectory() }), e => ({ code: e.code })),
+    realpath: await fs.realpath(link).catch(e => ({ code: e.code })),
+  })
+  if (process.platform === 'win32') console.log('junction before ensure', await observation())
+  const outcome = ensure(link)
+  if (process.platform === 'win32') {
+    await outcome.catch(() => {})
+    console.log('junction after ensure', await observation())
+  }
+  await assert.rejects(outcome)
   assert.ok((await fs.lstat(link)).isSymbolicLink())
 })
 
