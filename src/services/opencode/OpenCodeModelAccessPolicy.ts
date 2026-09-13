@@ -26,6 +26,7 @@ export type OpenCodeModelAccessCatalog = {
   managedConfig?: Record<string, unknown>
   runtimeEnv?: NodeJS.ProcessEnv
   openRouterAuth?: unknown
+  openRouterEligibility?: Readonly<{ allowed: boolean; credential: boolean }>
   connectedProviders: readonly string[]
   models: readonly string[]
   modelMetadata?: OpenCodeProvisioningSnapshot['modelMetadata']
@@ -247,19 +248,19 @@ export function evaluateOpenCodeModelAccess(input: {
 
   if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
     && (!isOpenCodeOpenRouterFreeRouteAllowed(...findProviderEntries(input.catalog, parsed.providerId))
-      || !isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(
+      || !(input.catalog.openRouterEligibility?.allowed ?? isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(
         asRecord(asRecord(input.catalog.managedConfig?.provider)?.openrouter) ?? {}, input.catalog.runtimeEnv ?? {},
-      ))) {
+      )))) {
     return { kind: 'unknown_model', providerId: parsed.providerId, modelId: parsed.modelId,
       launchAllowed: false, requiresExecutionProof: false,
       reason: 'OpenRouter Free Router is excluded by provider model restrictions' }
   }
 
   if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
-    && !hasOpenCodeOpenRouterCatalogCredential(
+    && !(input.catalog.openRouterEligibility?.credential ?? hasOpenCodeOpenRouterCatalogCredential(
       asRecord(asRecord(input.catalog.managedConfig?.provider)?.openrouter) ?? {},
       input.catalog.runtimeEnv ?? {}, input.catalog.openRouterAuth,
-    )) {
+    ))) {
     return { kind: 'not_authenticated', providerId: parsed.providerId, modelId: parsed.modelId,
       launchAllowed: false, requiresExecutionProof: false,
       reason: 'OpenRouter Free Router requires a usable selected credential' }
@@ -267,6 +268,13 @@ export function evaluateOpenCodeModelAccess(input: {
 
   const executionOutcome = input.executionOutcome ?? null
   const modelKnown = hasKnownOpenCodeModel(input.catalog, parsed.providerId, parsed.modelId)
+  if (parsed.raw === OPEN_CODE_OPENROUTER_FREE_ROUTE.id
+    && modelKnown
+    && !normalizeProviderIdSet(input.catalog.connectedProviders).has(parsed.providerId)) {
+    return { kind: 'not_authenticated', providerId: parsed.providerId, modelId: parsed.modelId,
+      launchAllowed: false, requiresExecutionProof: false,
+      reason: 'OpenRouter Free Router requires a currently connected provider' }
+  }
   if (executionOutcome?.outcome === 'available'
     && (parsed.raw !== OPEN_CODE_OPENROUTER_FREE_ROUTE.id || modelKnown)) {
     return {

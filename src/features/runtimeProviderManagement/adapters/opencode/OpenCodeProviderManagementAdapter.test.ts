@@ -8923,3 +8923,58 @@ test('OpenRouter refresh binds effective options and resolved restrictions in di
     expect(snapshot.profile!.managedConfig).toEqual(original)
   } finally { await rm(projectPath, { recursive: true, force: true }) }
 })
+
+for (const mutation of ['disk-auth', 'inline-auth', 'config', 'referenced-file', 'referenced-whitespace', 'release-auth'] as const) {
+  test(`OpenRouter directory rejects an eligibility mutation behind an endpoint barrier: ${mutation}`, async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'issue446-barrier-'))
+    let entered!: () => void
+    let release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    const snapshot = inventory({ projectPath, models: [],
+      connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }] })
+    snapshot.profile!.env = { HOME: projectPath, XDG_CONFIG_HOME: projectPath,
+      OPENCODE_AUTH_CONTENT: JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-inline' } }) }
+    snapshot.profile!.managedAuthPath = path.join(projectPath, 'auth.json')
+    if (mutation !== 'inline-auth') delete snapshot.profile!.env.OPENCODE_AUTH_CONTENT
+    await writeFile(snapshot.profile!.managedAuthPath, JSON.stringify({ openrouter: { type: 'api', key: 'synthetic-disk' } }))
+    const keyPath = path.join(projectPath, 'key')
+    if (mutation === 'referenced-file' || mutation === 'referenced-whitespace') {
+      await writeFile(keyPath, 'synthetic-file')
+      await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({ provider: { openrouter: { options: { apiKey: '{file:./key}' } } } }))
+    }
+    let calls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => snapshot },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {
+        if (mutation === 'release-auth') { entered(); await barrier }
+      } },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: {} }], default: {} }),
+        getProviders: async () => {
+          calls++
+          if (mutation !== 'release-auth') { entered(); await barrier }
+          return { all: [{ id: 'openrouter', models: {} }], connected: ['openrouter'], default: {} }
+        },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    try {
+      const pending = adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+      await started
+      if (mutation === 'disk-auth' || mutation === 'release-auth') await writeFile(snapshot.profile!.managedAuthPath, '{"openrouter":{"type":"api","key":""}}')
+      if (mutation === 'inline-auth') snapshot.profile!.env.OPENCODE_AUTH_CONTENT = '{}'
+      if (mutation === 'config') await writeFile(path.join(projectPath, 'opencode.json'), '{"provider":{"openrouter":{"blacklist":["openrouter/free"]}}}')
+      if (mutation === 'referenced-file') await writeFile(keyPath, '')
+      if (mutation === 'referenced-whitespace') await writeFile(keyPath, 'synthetic-file\n')
+      release()
+      const result = await pending
+      expect(result.ok).toBe(false)
+      const current = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath, query: 'openrouter/free' })
+      expect(current.ok).toBe(true)
+      if (current.ok) expect(current.value.entries).toHaveLength(mutation === 'referenced-whitespace' ? 1 : 0)
+      expect(calls).toBe(2)
+    } finally { release(); await rm(projectPath, { recursive: true, force: true }) }
+  })
+}

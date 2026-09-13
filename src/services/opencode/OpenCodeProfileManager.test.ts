@@ -140,6 +140,98 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('OpenRouter refresh rereads original imports and removes deleted project settings', async () => {
+    const projectPath = path.join(tempDir, 'router-provenance')
+    await mkdir(projectPath)
+    const imported = path.join(tempDir, 'import.json')
+    await writeFile(imported, '{"provider":{"openrouter":{"options":{"baseURL":"https://synthetic.invalid"}}}}')
+    const projectConfig = path.join(projectPath, 'opencode.json')
+    await writeFile(projectConfig, '{"provider":{"openrouter":{"blacklist":["openrouter/free"],"options":{"apiKey":"synthetic-project"}}}}')
+    const env = { ...process.env, OPENCODE_CONFIG: imported, OPENCODE_CONFIG_CONTENT: '{}', OPENROUTER_API_KEY: 'synthetic-env' }
+    const scope = await resolveOpenCodeProfileScope({ projectPath, purpose: 'catalog', selectedModel: 'openrouter/openrouter/free', env })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).toMatchObject({ blacklist: ['openrouter/free'] })
+    await rm(projectConfig)
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).toEqual({ options: { baseURL: 'https://synthetic.invalid' } })
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, { ...profile.env })).toEqual({ options: { baseURL: 'https://synthetic.invalid' } })
+    await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, JSON.parse(JSON.stringify(profile.env)))).rejects.toThrow('provenance')
+    for (const content of ['{invalid', '{"provider":null}']) {
+      await writeFile(imported, content)
+      for (let refresh = 0; refresh < 2; refresh++) {
+        await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).rejects.toThrow()
+      }
+    }
+    await rm(imported)
+    for (let refresh = 0; refresh < 2; refresh++) {
+      await expect(readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).rejects.toThrow('could not be read')
+    }
+  })
+
+  test('OpenRouter source-relative file credentials remain references and rotate scope identity', async () => {
+    const projectPath = path.join(tempDir, 'router-file-authority')
+    await mkdir(projectPath)
+    const key = path.join(projectPath, 'key')
+    await writeFile(key, 'synthetic-file-one')
+    await writeFile(path.join(projectPath, 'route'), 'openrouter/free')
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({ provider: { openrouter: {
+      options: { apiKey: '{file:./key}' }, blacklist: ['{file:./route}'],
+    } } }))
+    const input = { projectPath, purpose: 'execution_probe' as const, selectedModel: 'openrouter/openrouter/free',
+      env: { ...process.env, OPENCODE_CONFIG_CONTENT: '{}', OPENROUTER_API_KEY: '' } }
+    const first = await resolveOpenCodeProfileScope(input)
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: first })
+    expect(JSON.stringify(profile.managedConfig)).not.toContain('synthetic-file-one')
+    expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).toMatchObject({ blacklist: ['openrouter/free'] })
+    await writeFile(key, 'synthetic-file-two')
+    expect(await resolveOpenCodeProfileScope(input)).not.toEqual(first)
+    await writeFile(key, '')
+    await expect(resolveOpenCodeProfileScope(input)).rejects.toThrow()
+    await rm(key)
+    await expect(resolveOpenCodeProfileScope(input)).rejects.toThrow()
+  })
+
+  test('OpenRouter resolves environment-backed file paths and home references before profile HOME rewriting', async () => {
+    const projectPath = path.join(tempDir, 'router-file-paths')
+    await mkdir(projectPath)
+    const key = path.join(tempDir, 'key')
+    await writeFile(key, 'synthetic-path-key')
+    for (const reference of ['{file:{env:ROUTER_KEY_FILE}}', '{file:~/key}']) {
+      await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({ provider: { openrouter: {
+        options: { apiKey: reference },
+      } } }))
+      const env = { ...process.env, HOME: tempDir, ROUTER_KEY_FILE: key, OPENCODE_CONFIG_CONTENT: '{}' }
+      const scope = await resolveOpenCodeProfileScope({ projectPath, purpose: 'catalog', selectedModel: 'openrouter/openrouter/free', env })
+      const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+      expect(profile.managedConfig.provider).toMatchObject({ openrouter: { options: { apiKey: `{file:${key}}` } } })
+      expect(JSON.stringify(profile.managedConfig)).not.toContain('synthetic-path-key')
+      expect(await readOpenCodeEffectiveOpenRouterConfig(projectPath, profile.env)).toMatchObject({ options: { apiKey: 'synthetic-path-key' } })
+    }
+  })
+
+  test('OpenRouter strict profiles accept inline auth and configured environment without a disk credential', async () => {
+    const projectPath = path.join(tempDir, 'router-native-auth')
+    await mkdir(projectPath)
+    const inlineAuth = (key: string) => JSON.stringify({ openrouter: { type: 'api', key } })
+    const baseEnv = { ...process.env, OPENCODE_CONFIG_CONTENT: '{}', OPENROUTER_API_KEY: '' }
+    const input = { projectPath, purpose: 'execution_probe' as const, selectedModel: 'openrouter/openrouter/free' }
+    const env = { ...baseEnv, OPENCODE_AUTH_CONTENT: inlineAuth('synthetic-inline-one') }
+    const nativeAuth = path.join(env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+    await mkdir(path.dirname(nativeAuth), { recursive: true })
+    await writeFile(nativeAuth, '{invalid-disk-auth')
+    const first = await resolveOpenCodeProfileScope({ ...input, env })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: first })
+    expect(profile.env.OPENCODE_AUTH_CONTENT).toBe(env.OPENCODE_AUTH_CONTENT)
+    expect(await readFile(profile.managedAuthPath, 'utf8')).not.toContain('synthetic-inline-one')
+    expect(await resolveOpenCodeProfileScope({ ...input, env: { ...env,
+      OPENCODE_AUTH_CONTENT: inlineAuth('synthetic-inline-two'),
+    } })).not.toEqual(first)
+    await rm(nativeAuth)
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({ provider: { openrouter: { env: ['CUSTOM_ROUTER_KEY'] } } }))
+    const custom = await resolveOpenCodeProfileScope({ ...input, env: { ...baseEnv, CUSTOM_ROUTER_KEY: 'synthetic-custom' } })
+    expect(custom.providerId).toBe('openrouter')
+    await expect(resolveOpenCodeProfileScope({ ...input, env: { ...baseEnv, CUSTOM_ROUTER_KEY: ' ' } })).rejects.toThrow()
+  })
+
   test('does not materialize OpenRouter for legacy or disconnected selected catalog profiles', async () => {
     const manager = new OpenCodeProfileManager()
     const projectPath = path.join(tempDir, 'disconnected-router')

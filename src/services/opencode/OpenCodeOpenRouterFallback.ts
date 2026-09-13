@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import path from 'node:path'
 
 /** Compatibility route for OpenCode releases whose embedded models.dev omits the router. */
 export const OPEN_CODE_OPENROUTER_FREE_ROUTE = {
@@ -51,7 +52,9 @@ export function applyOpenCodeOpenRouterFallback(
 }
 
 /** Native config substitutes {env:...} in JSON text; ${...} is literal here. */
-export function resolveOpenCodeOpenRouterEnvironment(value: unknown, env: NodeJS.ProcessEnv): unknown {
+export function resolveOpenCodeOpenRouterEnvironment(
+  value: unknown, env: NodeJS.ProcessEnv, referenceDigests?: string[],
+): unknown {
   try {
     const text = JSON.stringify(value)
     if (text === undefined) return undefined
@@ -59,6 +62,11 @@ export function resolveOpenCodeOpenRouterEnvironment(value: unknown, env: NodeJS
       const replacement = env[name]
       if (replacement !== undefined && typeof replacement !== 'string') throw new Error()
       return replacement || ''
+    }).replace(/\{file:([^}]+)\}/g, (_, name: string) => {
+      const file = name.startsWith('~/') ? path.join(env.HOME || env.USERPROFILE || '', name.slice(2)) : name
+      const content = readFileSync(file, 'utf8')
+      referenceDigests?.push(createHash('sha256').update(JSON.stringify([file, content])).digest('hex'))
+      return JSON.stringify(content.trim()).slice(1, -1)
     }))
   } catch {
     throw new Error('OpenRouter configuration environment could not be resolved')
@@ -75,28 +83,48 @@ export function resolveOpenCodeOpenRouterRestrictions(
 
 /** A configured apiKey shadows every lower-priority credential, including when invalid. */
 export function isOpenCodeOpenRouterCredentialOverrideUsable(
-  provider: Record<string, unknown>, env: NodeJS.ProcessEnv,
+  provider: Record<string, unknown>, env: NodeJS.ProcessEnv, resolved = false,
 ): boolean {
   const options = provider.options
   if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options))) return false
   const key = (options as Record<string, unknown> | undefined)?.apiKey
   if (key === undefined) return true
   try {
-    const resolved = resolveOpenCodeOpenRouterEnvironment(key, env)
-    return typeof resolved === 'string' && resolved.trim().length > 0
+    const credential = resolved ? key : resolveOpenCodeOpenRouterEnvironment(key, env)
+    return typeof credential === 'string' && credential.trim().length > 0
   } catch { return false }
 }
 
 /** Native precedence: explicit options, API auth store, then provider environment. */
 export function hasOpenCodeOpenRouterSelectedCredential(
   provider: Record<string, unknown>, env: NodeJS.ProcessEnv,
-  auth: unknown, validatedAuth: boolean,
+  auth: unknown, validatedAuth: boolean, resolved = false,
 ): boolean {
-  if (!isOpenCodeOpenRouterCredentialOverrideUsable(provider, env)) return false
+  if (!resolved) {
+    try {
+      const effective = resolveOpenCodeOpenRouterEnvironment(provider, env) as Record<string, unknown>
+      return hasOpenCodeOpenRouterSelectedCredential(effective, env, auth, validatedAuth, true)
+    } catch { return false }
+  }
+  if (!isOpenCodeOpenRouterCredentialOverrideUsable(provider, env, resolved)) return false
   if ((provider.options as Record<string, unknown> | undefined)?.apiKey !== undefined) return true
+  if (env.OPENCODE_AUTH_CONTENT !== undefined) {
+    try {
+      const store = JSON.parse(env.OPENCODE_AUTH_CONTENT)
+      if (!store || typeof store !== 'object' || Array.isArray(store)) return false
+      auth = null
+      if (Object.hasOwn(store, 'openrouter')) {
+        const entry = store.openrouter
+        return entry?.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim()
+      }
+    } catch { return false }
+  }
   if (auth && typeof auth === 'object' && (auth as Record<string, unknown>).type === 'api') return validatedAuth
   try {
-    return typeof env.OPENROUTER_API_KEY === 'string' && env.OPENROUTER_API_KEY.trim().length > 0
+    const names = resolved ? provider.env ?? ['OPENROUTER_API_KEY']
+      : resolveOpenCodeOpenRouterEnvironment(provider.env ?? ['OPENROUTER_API_KEY'], env)
+    if (!Array.isArray(names) || names.some(name => typeof name !== 'string')) return false
+    return names.some(name => typeof env[name] === 'string' && !!env[name]!.trim())
   } catch { return false }
 }
 
@@ -126,6 +154,10 @@ export function validateOpenCodeOpenRouterConfig(config: Record<string, unknown>
   if (provider.options !== undefined && !record(provider.options)) {
     throw new Error('OpenRouter options configuration is invalid')
   }
+  if (provider.env !== undefined && (!Array.isArray(provider.env)
+    || provider.env.some(name => typeof name !== 'string'))) {
+    throw new Error('OpenRouter credential environment configuration is invalid')
+  }
 }
 
 /** Read the selected materialized auth store, never infer credentials from native membership. */
@@ -143,26 +175,31 @@ export function readOpenCodeOpenRouterCredentialEvidence(authPath?: string): unk
 }
 
 export function hasOpenCodeOpenRouterCatalogCredential(
-  provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown,
+  provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown, resolved = false,
 ): boolean {
   const entry = auth as Record<string, unknown> | null
   return hasOpenCodeOpenRouterSelectedCredential(provider, env, auth,
-    !!entry && entry.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim())
+    !!entry && entry.type === 'api' && typeof entry.key === 'string' && !!entry.key.trim(), resolved)
 }
 
 /** Bind resolved decisions and credentials without putting secret values in cache keys. */
 export function openCodeOpenRouterEligibilityIdentity(
   provider: Record<string, unknown>, env: NodeJS.ProcessEnv, auth: unknown,
+  resolved = false, referenceDigests: readonly string[] = [],
 ): string {
-  let restrictions: unknown
-  let options: unknown
+  const references = [...referenceDigests]
+  let effective: Record<string, unknown>
   try {
-    const resolved = resolveOpenCodeOpenRouterRestrictions(provider, env)
-    restrictions = [resolved.whitelist, resolved.blacklist]
-  } catch { restrictions = 'invalid' }
-  try { options = resolveOpenCodeOpenRouterEnvironment(provider.options, env) }
-  catch { options = 'invalid' }
-  return createHash('sha256').update(JSON.stringify([restrictions, options, auth, env.OPENROUTER_API_KEY,
-    hasOpenCodeOpenRouterCatalogCredential(provider, env, auth),
-    isOpenCodeOpenRouterFreeRouteAllowedInEnvironment(provider, env)])).digest('hex')
+    effective = resolved ? provider
+      : resolveOpenCodeOpenRouterEnvironment(provider, env, references) as Record<string, unknown>
+  } catch { effective = { whitelist: [], options: 'invalid' } }
+  const names = effective.env ?? ['OPENROUTER_API_KEY']
+  const credentialEnvironment = Array.isArray(names) && names.every(name => typeof name === 'string')
+    ? names.map(name => [name, env[name]]) : 'invalid'
+  return createHash('sha256').update(JSON.stringify([
+    effective.whitelist, effective.blacklist, effective.options, references,
+    auth, env.OPENCODE_AUTH_CONTENT, credentialEnvironment,
+    hasOpenCodeOpenRouterCatalogCredential(effective, env, auth, true),
+    isOpenCodeOpenRouterFreeRouteAllowed(effective),
+  ])).digest('hex')
 }

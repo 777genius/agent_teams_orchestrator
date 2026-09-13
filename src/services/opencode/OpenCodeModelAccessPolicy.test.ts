@@ -33,6 +33,23 @@ function catalog(overrides: Partial<Catalog> = {}): Catalog {
 }
 
 describe('OpenCodeModelAccessPolicy', () => {
+  test('rejects upstream-present free router success proof after provider disconnects', () => {
+    const input = {
+      selectedModel: 'openrouter/openrouter/free',
+      catalog: catalog({
+        models: ['openrouter/openrouter/free'],
+        runtimeEnv: { OPENROUTER_API_KEY: 'synthetic-key' },
+        providers: { all: [{ id: 'openrouter', models: { 'openrouter/free': {} } }], connected: [] },
+      }),
+      executionOutcome: { outcome: 'available' as const, reason: null },
+    }
+    expect(evaluateOpenCodeModelAccess(input).kind).toBe('not_authenticated')
+    expect(evaluateOpenCodeModelAccess(input).launchAllowed).toBe(false)
+    expect(evaluateOpenCodeModelAccess({ ...input,
+      catalog: { ...input.catalog, connectedProviders: ['openrouter'] },
+    }).kind).toBe('verified')
+  })
+
   test('allows connected providers without an execution proof', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'openrouter/moonshotai/kimi-k2',
