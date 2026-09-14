@@ -361,6 +361,13 @@ export type AppState = DeepImmutable<{
       color?: string
       summary?: string
       messageKind?: 'agent_error' | 'member_work_sync_nudge' | 'task_comment_notification'
+      workSyncRuntimeTicketId?: string
+      workSyncRuntimeGeneration?: number
+      workSyncRuntimeInstanceId?: string
+      workSyncControlRevision?: number
+      workSyncIntentId?: string
+      workSyncPayloadHash?: string
+      workSyncAdmissionPayloadHash?: string
     }>
   }
   // Worker sandbox permission requests (leader side) - for network access approval

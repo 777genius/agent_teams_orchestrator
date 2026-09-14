@@ -5,6 +5,11 @@ import {
   subscribeToCommandQueue,
 } from '../utils/messageQueueManager.js'
 import type { QueryGuard } from '../utils/QueryGuard.js'
+import {
+  getBoundWorkSyncContinuationTicket,
+  isWorkSyncPostTurnAdmissionWindowOpen,
+  processBoundWorkSyncContinuationAdmission,
+} from '../utils/workSyncContinuationAdmission.js'
 import { processQueueIfReady } from '../utils/queueProcessor.js'
 
 type UseQueueProcessorParams = {
@@ -53,17 +58,25 @@ export function useQueueProcessor({
     if (hasActiveLocalJsxUI) return
     if (queueSnapshot.length === 0) return
 
-    // Reservation is now owned by handlePromptSubmit (inside executeUserInput's
-    // try block). The sync chain executeQueuedInput → handlePromptSubmit →
-    // executeUserInput → queryGuard.reserve() runs before the first real await,
-    // so by the time React re-runs this effect (due to the dequeue-triggered
-    // snapshot change), isQueryActive is already true (dispatching) and the
-    // guard above returns early. handlePromptSubmit's finally releases the
-    // reservation via cancelReservation() (no-op if onQuery already ran end()).
-    processQueueIfReady({
-      executeInput: executeQueuedInput,
-      isBootstrapAdmissionPending,
-    })
+    // Drain D1 mailbox commands before ordinary queued prompts. A leftover D0
+    // nudge must not tryStart during the idle window after settle.
+    void (async () => {
+      while (isWorkSyncPostTurnAdmissionWindowOpen()) {
+        await processBoundWorkSyncContinuationAdmission()
+        if (queryGuard.isActive || getBoundWorkSyncContinuationTicket()) {
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      await processBoundWorkSyncContinuationAdmission()
+      if (queryGuard.isActive || getBoundWorkSyncContinuationTicket()) {
+        return
+      }
+      processQueueIfReady({
+        executeInput: executeQueuedInput,
+        isBootstrapAdmissionPending,
+      })
+    })()
   }, [
     queueSnapshot,
     isBootstrapAdmissionPending,

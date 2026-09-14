@@ -33,6 +33,19 @@ import { updateLastInteractionTime, getLastInteractionTime, getOriginalCwd, getP
 import { asSessionId, asAgentId } from '../types/ids.js';
 import { logForDebugging } from '../utils/debug.js';
 import { QueryGuard } from '../utils/QueryGuard.js';
+import { bindWorkSyncActiveQueryIdentity } from '../utils/workSyncActiveQueryIdentity.js';
+import {
+  bindWorkSyncContinuationAdmission,
+  unbindWorkSyncContinuationAdmission,
+  armWorkSyncPostTurnAdmissionWindow,
+} from '../utils/workSyncContinuationAdmission.js';
+import { writeWorkSyncAdmissionCapability } from '../utils/workSyncAdmissionCapability.js';
+import {
+  bindWorkSyncTurnSettledOwnerGate,
+  publishStagedWorkSyncTurnSettledIfOwnerReleased,
+  unbindWorkSyncTurnSettledOwnerGate,
+} from '../utils/workSyncTurnSettledOwnerGate.js';
+import { requestLocalWorkSyncUserStop } from '../utils/workSyncRuntimeStopClient.js';
 import { isEnvTruthy } from '../utils/envUtils.js';
 import { formatTokens, truncateToWidth } from '../utils/format.js';
 import { consumeEarlyInput } from '../utils/earlyInput.js';
@@ -913,6 +926,43 @@ export function REPL({
   // error-prone dual-state pattern where isLoading (React state, async
   // batched) and isQueryRunning (ref, sync) could desync. See QueryGuard.ts.
   const queryGuard = React.useRef(new QueryGuard()).current;
+  const incomingPromptKindRef = React.useRef<InboxPromptSubmitOptions['submissionKind']>(undefined);
+
+  React.useEffect(() => {
+    const teamName = getTeamName();
+    const memberName = getAgentName();
+    if (!teamName || !memberName) {
+      return;
+    }
+    bindWorkSyncContinuationAdmission({
+      guard: queryGuard,
+      teamName,
+      memberName,
+    });
+    bindWorkSyncTurnSettledOwnerGate();
+    const providerId = shouldUseCodexProviderRoutingForCurrentProcess()
+      ? 'codex'
+      : 'anthropic';
+    void writeWorkSyncAdmissionCapability({
+      schemaVersion: 1,
+      recoveryProtocolVersion: 2,
+      teamName,
+    teamIncarnation: process.env.CLAUDE_TEAM_INCARNATION?.trim() || 'unspecified',
+      memberName,
+      providerId,
+      runtimeMode: providerId === 'codex' ? 'app-server' : 'repl',
+      runtimeInstanceId: queryGuard.runtimeInstanceId,
+      generation: queryGuard.generation,
+      processorReady: true,
+      publishedAt: new Date().toISOString(),
+    }).catch(error => {
+      logForDebugging(`[WorkSyncAdmission] capability write failed: ${String(error)}`);
+    });
+    return () => {
+      unbindWorkSyncContinuationAdmission();
+      unbindWorkSyncTurnSettledOwnerGate();
+    };
+  }, [queryGuard]);
 
   // Subscribe to the guard — true during dispatching or running.
   // This is the single source of truth for "is a local query in flight".
@@ -2148,6 +2198,7 @@ export function REPL({
       proactiveModule?.pauseProactive();
     }
     queryGuard.forceEnd();
+    requestLocalWorkSyncUserStop(queryGuard);
     skipIdleCheckRef.current = false;
 
     // Preserve partially-streamed text so the user can read what was
@@ -2918,7 +2969,22 @@ export function REPL({
     // Concurrent guard via state machine. tryStart() atomically checks
     // and transitions idle→running, returning the generation number.
     // Returns null if already running — no separate check-then-set.
-    const thisGeneration = queryGuard.tryStart();
+    const incomingKind = incomingPromptKindRef.current
+    incomingPromptKindRef.current = undefined
+    let thisGeneration: number | null = null
+    if (incomingKind === 'work_sync_continuation') {
+      const ticket = queryGuard.continuationTicket
+      if (!ticket) {
+        logForDebugging(
+          '[WorkSyncAdmission] ticketed envelope reached onQuery without a held continuation ticket',
+        )
+        return
+      }
+      const started = queryGuard.startReservedContinuation(ticket)
+      thisGeneration = started.ok ? started.generation : null
+    } else {
+      thisGeneration = queryGuard.tryStart()
+    }
     if (thisGeneration === null) {
       logEvent('tengu_concurrent_onquery_detected', {});
 
@@ -2937,6 +3003,10 @@ export function REPL({
       return;
     }
     try {
+      bindWorkSyncActiveQueryIdentity({
+        runtimeInstanceId: queryGuard.runtimeInstanceId,
+        completedGeneration: thisGeneration,
+      });
       // isLoading is derived from queryGuard — tryStart() above already
       // transitioned dispatching→running, so no setter call needed here.
       resetTimingRefs();
@@ -2973,6 +3043,13 @@ export function REPL({
       // running→idle. Returns false if a newer query owns the guard
       // (cancel+resubmit race where the stale finally fires as a microtask).
       if (queryGuard.end(thisGeneration)) {
+        await publishStagedWorkSyncTurnSettledIfOwnerReleased(true)
+        if (
+          incomingKind === 'mailbox' ||
+          incomingKind === 'work_sync_continuation'
+        ) {
+          armWorkSyncPostTurnAdmissionWindow()
+        }
         setLastQueryCompletionTime(Date.now());
         skipIdleCheckRef.current = false;
         // Always reset loading state in finally - this ensures cleanup even
@@ -3043,6 +3120,8 @@ export function REPL({
         // controller makes ctrl+c fire onCancel() (aborting nothing) instead of
         // propagating to the double-press exit flow.
         setAbortController(null);
+      } else {
+        await publishStagedWorkSyncTurnSettledIfOwnerReleased(false)
       }
 
       // Auto-restore: if the user interrupted before any meaningful response
@@ -4062,6 +4141,7 @@ export function REPL({
     // include the queue.
     const commandQueue = getCommandQueue();
     const commandQueueModes = Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown'))));
+    incomingPromptKindRef.current = options?.submissionKind
     const decision = decideIncomingPromptAdmission({
       submissionKind: options?.submissionKind ?? 'runtime_delivery',
       bootstrapAdmissionPending: bootstrapAdmissionPendingRef.current,

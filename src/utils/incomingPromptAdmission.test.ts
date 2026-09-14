@@ -75,6 +75,32 @@ describe('incoming prompt admission', () => {
     }
   })
 
+  test('accepts a matching work-sync continuation while dispatching', () => {
+    expect(
+      decideIncomingPromptAdmission({
+        submissionKind: 'work_sync_continuation',
+        bootstrapAdmissionPending: false,
+        queryGuardStatus: 'dispatching',
+        blockingQueueModes: [],
+      }),
+    ).toEqual({ accepted: true })
+  })
+
+  test('rejects a work-sync continuation while idle so it cannot use tryStart', () => {
+    expect(
+      decideIncomingPromptAdmission({
+        submissionKind: 'work_sync_continuation',
+        bootstrapAdmissionPending: false,
+        queryGuardStatus: 'idle',
+        blockingQueueModes: [],
+      }),
+    ).toEqual({
+      accepted: false,
+      rejectionReason: 'query_active',
+      retryable: true,
+    })
+  })
+
   test('accepts normal runtime prompts when idle and no blocking queue modes exist', () => {
     expect(
       decideIncomingPromptAdmission({

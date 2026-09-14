@@ -20,6 +20,15 @@ type CoordinatorDeps = {
   now?: () => Date
 }
 
+function deriveOpenCodeCompletedGeneration(identity: string): number {
+  let hash = 2166136261
+  for (let index = 0; index < identity.length; index += 1) {
+    hash ^= identity.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
 function isTerminalDeliveryProof(observation: OpenCodeDeliveryResponseObservation | undefined): boolean {
   return observation?.state === 'responded_visible_message' ||
     observation?.state === 'responded_plain_text' ||
@@ -211,6 +220,10 @@ export class OpenCodeTurnSettledEmissionCoordinator {
           runtimePromptMessageId,
         }),
         ...(runtimePromptMessageId ? { runtimePromptMessageId, turnId: runtimePromptMessageId } : {}),
+        runtimeInstanceId: `opencode:${input.record.laneId}`,
+        completedGeneration: deriveOpenCodeCompletedGeneration(
+          runtimePromptMessageId || input.record.opencodeSessionId,
+        ),
         ...(input.record.selectedModel ? { selectedModel: input.record.selectedModel } : {}),
         ...(typeof input.record.runtimePid === 'number' && input.record.runtimePid > 0
           ? { runtimePid: input.record.runtimePid }
@@ -247,6 +260,10 @@ export class OpenCodeTurnSettledEmissionCoordinator {
         cwd: input.record.projectPath,
         outcome: outcomeFromLaunch(input),
         ...(turnId ? { turnId } : {}),
+        runtimeInstanceId: `opencode:${input.record.laneId}`,
+        completedGeneration: deriveOpenCodeCompletedGeneration(
+          turnId || input.record.opencodeSessionId,
+        ),
         ...(input.record.selectedModel ? { selectedModel: input.record.selectedModel } : {}),
         ...(typeof input.record.runtimePid === 'number' && input.record.runtimePid > 0
           ? { runtimePid: input.record.runtimePid }

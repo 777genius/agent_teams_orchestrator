@@ -79,6 +79,13 @@ export type TeammateMessage = {
   claimedAt?: string
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
+  workSyncRuntimeTicketId?: string
+  workSyncRuntimeGeneration?: number
+  workSyncRuntimeInstanceId?: string
+  workSyncControlRevision?: number
+  workSyncIntentId?: string
+  workSyncPayloadHash?: string
+  workSyncAdmissionPayloadHash?: string
   messageKind?: TeammateMessageKind
   agentError?: AgentErrorMetadataV1
   runtimeRecovery?: RuntimeRecoveryNudgeMetadataV1

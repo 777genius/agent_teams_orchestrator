@@ -4,6 +4,7 @@ export type IncomingPromptSubmissionKind =
   | 'mailbox'
   | 'task'
   | 'tick'
+  | 'work_sync_continuation'
 
 export type IncomingPromptQueryGuardStatus =
   | 'idle'
@@ -48,6 +49,24 @@ export function decideIncomingPromptAdmission({
       rejectionReason: 'bootstrap_pending',
       retryable: true,
     }
+  }
+
+  if (submissionKind === 'work_sync_continuation') {
+    if (queryGuardStatus !== 'dispatching') {
+      return {
+        accepted: false,
+        rejectionReason: 'query_active',
+        retryable: true,
+      }
+    }
+    if (blockingQueueModes.length > 0) {
+      return {
+        accepted: false,
+        rejectionReason: 'command_queue_busy',
+        retryable: true,
+      }
+    }
+    return { accepted: true }
   }
 
   if (queryGuardStatus !== 'idle') {

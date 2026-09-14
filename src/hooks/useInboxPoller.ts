@@ -26,6 +26,16 @@ import {
   handlePlanApprovalResponse,
 } from '../utils/inProcessTeammateHelpers.js'
 import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmission.js'
+import {
+  getBoundWorkSyncContinuationTicket,
+  isWorkSyncAdmissionHandshakeOpen,
+  isWorkSyncPostTurnAdmissionWindowOpen,
+  processBoundWorkSyncContinuationAdmission,
+} from '../utils/workSyncContinuationAdmission.js'
+import {
+  isMatchingWorkSyncContinuationTicket,
+  readWorkSyncInboxContinuationTicket,
+} from '../utils/workSyncInboxTicket.js'
 import { createAssistantMessage } from '../utils/messages.js'
 import {
   permissionModeFromString,
@@ -365,8 +375,10 @@ export function getBootstrapProcessingMessage({
 
 export function getOrdinaryPendingMessage({
   pendingMessages,
+  deferUnticketedWorkSyncNudges = false,
 }: {
   pendingMessages: readonly PendingInboxMirrorMessage[]
+  deferUnticketedWorkSyncNudges?: boolean
 }): PendingInboxMirrorMessage | undefined {
   const actionableMessages = pendingMessages.filter(
     message =>
@@ -378,11 +390,61 @@ export function getOrdinaryPendingMessage({
         isBootstrapMailboxInstructionText(message.text)
       ),
   )
-
-  return (
-    actionableMessages.find(message => message.messageKind === 'member_work_sync_nudge')
-    ?? actionableMessages[0]
+  const ticketedNudge = actionableMessages.find(
+    message =>
+      message.messageKind === 'member_work_sync_nudge' &&
+      readWorkSyncInboxContinuationTicket(message) != null,
   )
+  if (ticketedNudge) {
+    return ticketedNudge
+  }
+  if (!deferUnticketedWorkSyncNudges) {
+    return (
+      actionableMessages.find(message => message.messageKind === 'member_work_sync_nudge')
+      ?? actionableMessages[0]
+    )
+  }
+  return actionableMessages.find(
+    message => message.messageKind !== 'member_work_sync_nudge',
+  )
+}
+
+export function resolveIncomingMailboxSubmissionKind(input: {
+  bootstrapPendingMessage?: { messageId?: string } | null
+  ordinaryPendingMessage?: Parameters<typeof readWorkSyncInboxContinuationTicket>[0]
+}): IncomingPromptSubmissionKind {
+  if (input.bootstrapPendingMessage) {
+    return 'bootstrap'
+  }
+  const ticket = input.ordinaryPendingMessage
+    ? readWorkSyncInboxContinuationTicket(input.ordinaryPendingMessage)
+    : null
+  return ticket ? 'work_sync_continuation' : 'mailbox'
+}
+
+function shouldHoldTicketedWorkSyncUntilExactMatch(message: {
+  messageKind?: string
+  messageId?: string
+  workSyncRuntimeTicketId?: string
+  workSyncRuntimeGeneration?: number
+  workSyncRuntimeInstanceId?: string
+  workSyncIntentId?: string
+}): boolean {
+  const ticket = readWorkSyncInboxContinuationTicket(message)
+  if (!ticket) {
+    return false
+  }
+  const held = getBoundWorkSyncContinuationTicket()
+  if (!held) {
+    return true
+  }
+  return !isMatchingWorkSyncContinuationTicket({
+    message,
+    runtimeInstanceId: held.runtimeInstanceId,
+    reservationNonce: held.reservationNonce,
+    intentId: held.intentId,
+    expectedGeneration: held.expectedGeneration,
+  })
 }
 
 export function getProcessingOrdinaryMessage({
@@ -416,16 +478,33 @@ export function shouldDeferPendingInboxDelivery(params: {
     return true
   }
 
-  if (!params.isLoading) {
-    return false
+  if (params.isLoading) {
+    const ticketed = getOrdinaryPendingMessage({
+      pendingMessages: params.pendingMessages,
+      deferUnticketedWorkSyncNudges: true,
+    })
+    if (
+      ticketed?.messageKind === 'member_work_sync_nudge' &&
+      readWorkSyncInboxContinuationTicket(ticketed) &&
+      !shouldHoldTicketedWorkSyncUntilExactMatch(ticketed)
+    ) {
+      return false
+    }
+    const bootstrapPendingMessage = getBootstrapPendingMessage({
+      pendingMessages: params.pendingMessages,
+      isTeammateSession: params.isTeammateSession,
+    })
+    return bootstrapPendingMessage == null
   }
 
-  const bootstrapPendingMessage = getBootstrapPendingMessage({
-    pendingMessages: params.pendingMessages,
-    isTeammateSession: params.isTeammateSession,
-  })
+  if (
+    isWorkSyncPostTurnAdmissionWindowOpen() &&
+    !getBoundWorkSyncContinuationTicket()
+  ) {
+    return true
+  }
 
-  return bootstrapPendingMessage == null
+  return false
 }
 
 export function getBootstrapInlineHandoffPrompt({
@@ -2153,11 +2232,13 @@ export function useInboxPoller({
     pollInFlightRef.current = true
 
     try {
-      // Use ref to avoid dependency on appState object (prevents infinite loop)
       const currentAppState = store.getState()
       const agentName = getAgentNameToPoll(currentAppState)
       if (!agentName) return
       const teamName = currentAppState.teamContext?.teamName
+      if (teamName) {
+        await processBoundWorkSyncContinuationAdmission()
+      }
       const sessionId = getSessionId()
       const staleMirroredMessageIds = new Set(
         currentAppState.inbox.messages
@@ -3764,10 +3845,28 @@ export function useInboxPoller({
 
     const ordinaryPendingMessage =
       bootstrapPendingMessage == null
-        ? getOrdinaryPendingMessage({ pendingMessages })
+        ? getOrdinaryPendingMessage({
+            pendingMessages,
+            deferUnticketedWorkSyncNudges: isWorkSyncAdmissionHandshakeOpen(),
+          })
         : undefined
 
     void (async () => {
+      if (
+        ordinaryPendingMessage &&
+        shouldHoldTicketedWorkSyncUntilExactMatch(ordinaryPendingMessage)
+      ) {
+        logForDebugging(
+          '[InboxPoller] Holding ticketed work-sync envelope until the exact reserved ticket matches',
+        )
+        return
+      }
+      if (!bootstrapPendingMessage && !ordinaryPendingMessage) {
+        logForDebugging(
+          '[InboxPoller] Holding automatic work-sync until a matching D1 ticket is reserved',
+        )
+        return
+      }
       logForDebugging(
         `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
       )
@@ -3957,7 +4056,10 @@ export function useInboxPoller({
 
       const submitted = onSubmitTeammateMessage(prompt, {
         isMeta: true,
-        submissionKind: bootstrapPendingMessage ? 'bootstrap' : 'mailbox',
+        submissionKind: resolveIncomingMailboxSubmissionKind({
+          bootstrapPendingMessage,
+          ordinaryPendingMessage,
+        }),
         ...(nativeBootstrapInjection
           ? { prefixMessages: nativeBootstrapInjection.prefixMessages }
           : {}),

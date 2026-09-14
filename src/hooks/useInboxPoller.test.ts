@@ -36,6 +36,10 @@ import {
   createSystemMessage,
   createUserMessage,
 } from '../utils/messages.js'
+import {
+  armWorkSyncPostTurnAdmissionWindow,
+  resetWorkSyncAdmissionProcessorForTests,
+} from '../utils/workSyncContinuationAdmission.js'
 
 describe('useInboxPoller queued mailbox meta prompt', () => {
   test('detects bootstrap teammate mailbox instructions', () => {
@@ -450,6 +454,47 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBe('work-sync-nudge')
   })
 
+  test('after handshake, skips unticketed work-sync nudges so D1 reserve can win idle', () => {
+    const pendingMessages = [
+      {
+        id: 'nudge',
+        messageId: 'work-sync-nudge',
+        mailboxClaimedBySessionId: 's',
+        from: 'system',
+        status: 'pending' as const,
+        timestamp: '2026-04-09T13:00:01.000Z',
+        text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        messageKind: 'member_work_sync_nudge' as const,
+      },
+      {
+        id: 'ticketed',
+        messageId: 'work-sync-ticketed',
+        mailboxClaimedBySessionId: 's',
+        from: 'system',
+        status: 'pending' as const,
+        timestamp: '2026-04-09T13:00:02.000Z',
+        text: 'Early continuation: continue remaining assigned work.',
+        messageKind: 'member_work_sync_nudge' as const,
+        workSyncRuntimeTicketId: 'ticket-1',
+        workSyncRuntimeGeneration: 3,
+        workSyncRuntimeInstanceId: 'runtime-1',
+        workSyncIntentId: 'intent-c1',
+      },
+    ]
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages,
+        deferUnticketedWorkSyncNudges: true,
+      })?.messageId,
+    ).toBe('work-sync-ticketed')
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [pendingMessages[0]!],
+        deferUnticketedWorkSyncNudges: true,
+      }),
+    ).toBeUndefined()
+  })
+
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
     const prompt = getOrdinaryInlineHandoffPrompt({
       from: 'user',
@@ -725,6 +770,30 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         ],
       }),
     ).toBe(true)
+  })
+
+  test('defers ordinary delivery during the post-turn D1 admission window', () => {
+    armWorkSyncPostTurnAdmissionWindow(Date.now(), 5_000)
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: false,
+        focusedInputDialog: undefined,
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'nudge',
+            messageId: 'work-sync-nudge',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'system',
+            status: 'pending',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Work sync check: call member_work_sync_status.',
+            messageKind: 'member_work_sync_nudge',
+          },
+        ],
+      }),
+    ).toBe(true)
+    resetWorkSyncAdmissionProcessorForTests()
   })
 
   test('always defers when a dialog is focused', () => {

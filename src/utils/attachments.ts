@@ -252,6 +252,7 @@ import {
   isStructuredProtocolMessage,
   isIdleNotification,
 } from './teammateMailbox.js'
+import { readWorkSyncInboxContinuationTicket } from './workSyncInboxTicket.js'
 import {
   getAgentName,
   getAgentId,
@@ -3637,7 +3638,11 @@ export async function getTeammateMailboxAttachments(
     (shouldReadRegularMailboxMessagesFromFile ||
       shouldReadProtocolMailboxMessagesFromFile)
   const fileBackedWorkSyncNudgeMessages = shouldReadFileBackedWorkSyncNudges
-    ? allUnreadMessages.filter(m => m.messageKind === 'member_work_sync_nudge')
+    ? allUnreadMessages.filter(
+        m =>
+          m.messageKind === 'member_work_sync_nudge' &&
+          !readWorkSyncInboxContinuationTicket(m),
+      )
     : []
   const fileBackedRegularMessages = shouldReadRegularMailboxMessagesFromFile
     ? allUnreadMessages.filter(

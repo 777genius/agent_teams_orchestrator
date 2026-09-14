@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -180,6 +180,9 @@ describe('runCodexNativeAppServer', () => {
 
     await writeFile(path.join(sourceHome, 'config.toml'), 'service_tier = "priority"\n')
     await writeFile(path.join(sourceHome, 'auth.json'), '{"tokens":true}\n')
+    await mkdir(path.join(sourceHome, 'sessions'), { recursive: true })
+    await writeFile(path.join(sourceHome, 'sessions', 'busy.jsonl'), '{}\n')
+    await writeFile(path.join(sourceHome, 'history.jsonl'), '{}\n')
 
     fake.stdin.on('data', chunk => {
       for (const line of String(chunk).split('\n')) {
@@ -244,6 +247,8 @@ describe('runCodexNativeAppServer', () => {
               expect(spawnedCodexHome).not.toBe(sourceHome)
               expect(existsSync(path.join(spawnedCodexHome!, 'config.toml'))).toBe(false)
               expect(existsSync(path.join(spawnedCodexHome!, 'auth.json'))).toBe(true)
+              expect(existsSync(path.join(spawnedCodexHome!, 'sessions'))).toBe(false)
+              expect(existsSync(path.join(spawnedCodexHome!, 'history.jsonl'))).toBe(false)
               return fake.child as never
             },
           },
