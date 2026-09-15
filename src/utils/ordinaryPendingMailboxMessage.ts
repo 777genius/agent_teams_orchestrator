@@ -2,6 +2,7 @@ import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import {
   getBoundWorkSyncContinuationTicket,
   isWorkSyncPostTurnAdmissionWindowOpen,
+  readWorkSyncAdmissionControlRevision,
 } from './workSyncContinuationAdmission.js'
 import {
   isMatchingWorkSyncContinuationTicket,
@@ -23,6 +24,7 @@ export type OrdinaryPendingMailboxMessage = {
   workSyncRuntimeInstanceId?: string
   workSyncIntentId?: string
   workSyncAdmissionPayloadHash?: string
+  workSyncControlRevision?: number
 }
 
 function isBootstrapMailboxInstructionText(text: string): boolean {
@@ -79,6 +81,23 @@ export function classifyTicketedWorkSyncEnvelope(
   return isWorkSyncPostTurnAdmissionWindowOpen() ? 'wait' : 'stale'
 }
 
+function isStaleUnticketedWorkSyncNudge(
+  message: OrdinaryPendingMailboxMessage,
+): boolean {
+  if (message.messageKind !== 'member_work_sync_nudge') {
+    return false
+  }
+  if (readWorkSyncInboxContinuationTicket(message)) {
+    return false
+  }
+  const current = readWorkSyncAdmissionControlRevision()
+  if (current == null) {
+    return false
+  }
+  const envelopeRevision = message.workSyncControlRevision
+  return envelopeRevision == null || envelopeRevision < current
+}
+
 export function getOrdinaryPendingMessage<T extends OrdinaryPendingMailboxMessage>({
   pendingMessages,
   deferUnticketedWorkSyncNudges = false,
@@ -108,7 +127,9 @@ export function getOrdinaryPendingMessage<T extends OrdinaryPendingMailboxMessag
     return undefined
   }
   const remaining = actionableMessages.filter(
-    message => classifyTicketedWorkSyncEnvelope(message) !== 'stale',
+    message =>
+      classifyTicketedWorkSyncEnvelope(message) !== 'stale' &&
+      !isStaleUnticketedWorkSyncNudge(message),
   )
   if (!deferUnticketedWorkSyncNudges) {
     return (

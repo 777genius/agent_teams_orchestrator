@@ -630,6 +630,13 @@ export function shouldDeferUnticketedWorkSyncNudges(): boolean {
   )
 }
 
+export function readWorkSyncAdmissionControlRevision(): number | undefined {
+  if (!controlState?.handshakeCompleted) {
+    return undefined
+  }
+  return controlState.controlRevision
+}
+
 export const WORK_SYNC_POST_TURN_ADMISSION_WINDOW_MS = 5_000
 
 let postTurnAdmissionUntilMs = 0

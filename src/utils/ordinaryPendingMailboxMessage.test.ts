@@ -7,9 +7,11 @@ import {
 import { QueryGuard } from './QueryGuard.js'
 import {
   armWorkSyncPostTurnAdmissionWindow,
+  applyWorkSyncAdmissionCommand,
   bindWorkSyncContinuationAdmission,
   clearWorkSyncPostTurnAdmissionWindowForTests,
   resetWorkSyncAdmissionProcessorForTests,
+  shouldDeferUnticketedWorkSyncNudges,
   unbindWorkSyncContinuationAdmission,
 } from './workSyncContinuationAdmission.js'
 
@@ -96,6 +98,73 @@ describe('ordinary pending mailbox selection', () => {
         deferUnticketedWorkSyncNudges: false,
       })?.messageId,
     ).toBe('work-sync-continue')
+  })
+
+  test('does not revive a mirrored D0 after Stop then Resume', () => {
+    const guard = new QueryGuard('runtime-1')
+    const nowIso = '2026-09-14T18:00:00.000Z'
+    const nowMs = Date.parse(nowIso)
+    const sync = (revision: number, stopped: boolean) =>
+      applyWorkSyncAdmissionCommand({
+        guard,
+        command: {
+          schemaVersion: 1,
+          requestId: `req-${revision}-${stopped ? 'stop' : 'open'}`,
+          op: 'sync_control',
+          scope: {
+            teamName: 'team-a',
+            teamIncarnation: 'inc-1',
+            memberName: 'bob',
+            runtimeInstanceId: 'runtime-1',
+          },
+          controlRevision: revision,
+          stopped,
+          issuedAt: nowIso,
+        },
+        nowIso,
+        nowMs,
+      })
+    sync(10, false)
+    const d0 = {
+      messageId: 'work-sync-d0',
+      from: 'system',
+      text: 'Work sync check: call member_work_sync_status.',
+      messageKind: 'member_work_sync_nudge',
+      workSyncControlRevision: 10,
+    }
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [d0, userMailbox],
+        deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
+      })?.messageId,
+    ).toBe('work-sync-d0')
+    sync(11, true)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [d0, userMailbox],
+        deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
+      })?.messageId,
+    ).toBe('user-1')
+    sync(12, false)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(false)
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [d0, userMailbox],
+        deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
+      })?.messageId,
+    ).toBe('user-1')
+    const freshContinue = {
+      ...d0,
+      messageId: 'work-sync-continue-12',
+      workSyncControlRevision: 12,
+    }
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [d0, freshContinue, userMailbox],
+        deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
+      })?.messageId,
+    ).toBe('work-sync-continue-12')
   })
 
   test('holds ticketed envelopes only during the post-turn wait window', () => {
