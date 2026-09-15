@@ -122,6 +122,15 @@ const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS = 120_000
 const CODEX_CONFIG_FILE_NAME = 'config.toml'
 const CODEX_APP_SERVER_HOME_PREFIX = 'codex-app-server-home-'
 const REQUIRED_CODEX_HOME_OVERLAY_ENTRIES = new Set(['accounts', 'auth.json'])
+const SKIP_CODEX_HOME_OVERLAY_ENTRIES = new Set([
+  CODEX_CONFIG_FILE_NAME,
+  'sessions',
+  'session_index.json',
+  'history.jsonl',
+  'logs',
+  'tmp',
+  '.tmp',
+])
 
 function defaultResolveVersion(executablePath: string): string | null {
   try {
@@ -224,7 +233,7 @@ async function createCodexAppServerHomeOverlay(
     }
 
     for (const entry of entries) {
-      if (entry.name === CODEX_CONFIG_FILE_NAME) {
+      if (SKIP_CODEX_HOME_OVERLAY_ENTRIES.has(entry.name)) {
         continue
       }
       await linkCodexHomeEntry(
@@ -448,8 +457,11 @@ function mapNotificationToEvents(
       const threadId = extractThreadId(params)
       return threadId ? [{ type: 'thread_started', threadId }] : []
     }
-    case 'turn/started':
-      return [{ type: 'turn_started' }]
+    case 'turn/started': {
+      const turnId =
+        stringValue(params.turnId) ?? stringValue(asRecord(params.turn).id)
+      return [{ type: 'turn_started', ...(turnId ? { turnId } : {}) }]
+    }
     case 'thread/tokenUsage/updated': {
       const event = mapTokenUsageNotification(params)
       return event ? [event] : []
@@ -474,7 +486,13 @@ function mapNotificationToEvents(
           : status === 'interrupted'
             ? 'Codex app-server turn was interrupted.'
             : null)
-      return [{ type: 'turn_completed', errorMessage }]
+      return [{
+        type: 'turn_completed',
+        ...(stringValue(params.turnId) ?? stringValue(turn.id)
+          ? { turnId: stringValue(params.turnId) ?? stringValue(turn.id) }
+          : {}),
+        errorMessage,
+      }]
     }
     case 'warning':
     case 'error': {

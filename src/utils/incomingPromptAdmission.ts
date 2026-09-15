@@ -4,6 +4,7 @@ export type IncomingPromptSubmissionKind =
   | 'mailbox'
   | 'task'
   | 'tick'
+  | 'work_sync_continuation'
 
 export type IncomingPromptQueryGuardStatus =
   | 'idle'
@@ -50,6 +51,24 @@ export function decideIncomingPromptAdmission({
     }
   }
 
+  if (submissionKind === 'work_sync_continuation') {
+    if (queryGuardStatus !== 'dispatching') {
+      return {
+        accepted: false,
+        rejectionReason: 'query_active',
+        retryable: true,
+      }
+    }
+    if (blockingQueueModes.length > 0) {
+      return {
+        accepted: false,
+        rejectionReason: 'command_queue_busy',
+        retryable: true,
+      }
+    }
+    return { accepted: true }
+  }
+
   if (queryGuardStatus !== 'idle') {
     return {
       accepted: false,
@@ -67,4 +86,17 @@ export function decideIncomingPromptAdmission({
   }
 
   return { accepted: true }
+}
+
+export function startQueryForIncomingKind(input: {
+  incomingKind: IncomingPromptSubmissionKind | undefined
+  continuationTicket: unknown | null
+  startReservedContinuation: () => { ok: true; generation: number } | { ok: false }
+  tryStart: () => number | null
+}): number | null {
+  if (input.incomingKind === 'work_sync_continuation' && input.continuationTicket) {
+    const started = input.startReservedContinuation()
+    return started.ok ? started.generation : null
+  }
+  return input.tryStart()
 }

@@ -50,6 +50,11 @@ import {
   type CodexNativeTurnSettledOutcome,
 } from './runtimeTurnSettledEmitter.js'
 import {
+  isWorkSyncTurnSettledOwnerGateBound,
+  stageWorkSyncTurnSettledEvent,
+} from '../../utils/workSyncTurnSettledOwnerGate.js'
+import { readWorkSyncActiveQueryIdentity } from '../../utils/workSyncActiveQueryIdentity.js'
+import {
   createCodexNativeExecutionSummaryMessage,
   createCodexNativeThreadStatusMessage,
 } from './statusAuthority.js'
@@ -508,6 +513,8 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
+  const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
+  let capturedTurnId: string | null = null
   const emitRuntimeTurnSettled = async (input: {
     outcome: CodexNativeTurnSettledOutcome
     threadId?: string | null
@@ -517,10 +524,17 @@ export async function* executeCodexNativeTurn(
       cwd: params.cwd,
       outcome: input.outcome,
       threadId: input.threadId,
+      turnId: capturedTurnId,
+      runtimeInstanceId: capturedQueryIdentity?.runtimeInstanceId,
+      completedGeneration: capturedQueryIdentity?.completedGeneration,
       detail: input.detail,
       identity: resolveTurnSettledIdentityFromAppState(params.initialAppState),
     })
     if (!event) {
+      return
+    }
+    if (isWorkSyncTurnSettledOwnerGateBound()) {
+      stageWorkSyncTurnSettledEvent(event)
       return
     }
     await emitCodexNativeTurnSettledBestEffort(
@@ -664,6 +678,14 @@ export async function* executeCodexNativeTurn(
       }
 
       const projection = projector.apply(next.value.event)
+      if (
+        (next.value.event.type === 'turn_started' ||
+          next.value.event.type === 'turn_completed') &&
+        next.value.event.turnId &&
+        !capturedTurnId
+      ) {
+        capturedTurnId = next.value.event.turnId
+      }
 
       for (const message of projection.appendedMessages) {
         await appendProjectedMessage({

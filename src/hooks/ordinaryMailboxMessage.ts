@@ -24,5 +24,24 @@ export function createPendingMailboxMirrorMessage(
     status: 'pending',
     color: message.color,
     summary: message.summary,
+    ...(message.workSyncRuntimeTicketId
+      ? { workSyncRuntimeTicketId: message.workSyncRuntimeTicketId }
+      : {}),
+    ...(message.workSyncRuntimeGeneration != null
+      ? { workSyncRuntimeGeneration: message.workSyncRuntimeGeneration }
+      : {}),
+    ...(message.workSyncRuntimeInstanceId
+      ? { workSyncRuntimeInstanceId: message.workSyncRuntimeInstanceId }
+      : {}),
+    ...(message.workSyncControlRevision != null
+      ? { workSyncControlRevision: message.workSyncControlRevision }
+      : {}),
+    ...(message.workSyncIntentId ? { workSyncIntentId: message.workSyncIntentId } : {}),
+    ...(message.workSyncPayloadHash
+      ? { workSyncPayloadHash: message.workSyncPayloadHash }
+      : {}),
+    ...(message.workSyncAdmissionPayloadHash
+      ? { workSyncAdmissionPayloadHash: message.workSyncAdmissionPayloadHash }
+      : {}),
   }
 }

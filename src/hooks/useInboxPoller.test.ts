@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   extractTaskRefFromMailboxText,
@@ -36,6 +39,13 @@ import {
   createSystemMessage,
   createUserMessage,
 } from '../utils/messages.js'
+import {
+  armWorkSyncPostTurnAdmissionWindow,
+  bindWorkSyncContinuationAdmission,
+  resetWorkSyncAdmissionProcessorForTests,
+  unbindWorkSyncContinuationAdmission,
+} from '../utils/workSyncContinuationAdmission.js'
+import { QueryGuard } from '../utils/QueryGuard.js'
 
 describe('useInboxPoller queued mailbox meta prompt', () => {
   test('detects bootstrap teammate mailbox instructions', () => {
@@ -450,6 +460,137 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBe('work-sync-nudge')
   })
 
+  test('after handshake, skips unticketed work-sync nudges so D1 reserve can win idle', () => {
+    const pendingMessages = [
+      {
+        id: 'nudge',
+        messageId: 'work-sync-nudge',
+        mailboxClaimedBySessionId: 's',
+        from: 'system',
+        status: 'pending' as const,
+        timestamp: '2026-04-09T13:00:01.000Z',
+        text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        messageKind: 'member_work_sync_nudge' as const,
+      },
+      {
+        id: 'ticketed',
+        messageId: 'work-sync-ticketed',
+        mailboxClaimedBySessionId: 's',
+        from: 'system',
+        status: 'pending' as const,
+        timestamp: '2026-04-09T13:00:02.000Z',
+        text: 'Early continuation: continue remaining assigned work.',
+        messageKind: 'member_work_sync_nudge' as const,
+        workSyncRuntimeTicketId: 'ticket-1',
+        workSyncRuntimeGeneration: 0,
+        workSyncRuntimeInstanceId: 'runtime-1',
+        workSyncIntentId: 'intent-c1',
+      },
+    ]
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c1',
+      reservationNonce: 'ticket-1',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
+    try {
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages,
+          deferUnticketedWorkSyncNudges: true,
+        })?.messageId,
+      ).toBe('work-sync-ticketed')
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [pendingMessages[0]!],
+          deferUnticketedWorkSyncNudges: true,
+        }),
+      ).toBeUndefined()
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [pendingMessages[0]!],
+          deferUnticketedWorkSyncNudges: false,
+        })?.messageId,
+      ).toBe('work-sync-nudge')
+    } finally {
+      unbindWorkSyncContinuationAdmission()
+    }
+  })
+
+  test('skips a stale ticketed envelope so a newer ticket or user mailbox can proceed', () => {
+    const stale = {
+      id: 'c1',
+      messageId: 'work-sync-c1',
+      mailboxClaimedBySessionId: 's',
+      from: 'system',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:01.000Z',
+      text: 'Early continuation C1.',
+      messageKind: 'member_work_sync_nudge' as const,
+      workSyncRuntimeTicketId: 'ticket-c1',
+      workSyncRuntimeGeneration: 0,
+      workSyncRuntimeInstanceId: 'runtime-1',
+      workSyncIntentId: 'intent-c1',
+    }
+    const next = {
+      id: 'c2',
+      messageId: 'work-sync-c2',
+      mailboxClaimedBySessionId: 's',
+      from: 'system',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:02.000Z',
+      text: 'Early continuation C2.',
+      messageKind: 'member_work_sync_nudge' as const,
+      workSyncRuntimeTicketId: 'ticket-c2',
+      workSyncRuntimeGeneration: 0,
+      workSyncRuntimeInstanceId: 'runtime-1',
+      workSyncIntentId: 'intent-c2',
+    }
+    const user = {
+      id: 'user-row',
+      messageId: 'user-1',
+      mailboxClaimedBySessionId: 's',
+      from: 'user',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:03.000Z',
+      text: 'Please look at this.',
+    }
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c2',
+      reservationNonce: 'ticket-c2',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
+    try {
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [stale, next],
+          deferUnticketedWorkSyncNudges: true,
+        })?.messageId,
+      ).toBe('work-sync-c2')
+    } finally {
+      unbindWorkSyncContinuationAdmission()
+    }
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [stale, user],
+        deferUnticketedWorkSyncNudges: true,
+      })?.messageId,
+    ).toBe('user-1')
+  })
+
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
     const prompt = getOrdinaryInlineHandoffPrompt({
       from: 'user',
@@ -725,6 +866,115 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         ],
       }),
     ).toBe(true)
+  })
+
+  test('defers ordinary delivery during the post-turn D1 admission window', () => {
+    armWorkSyncPostTurnAdmissionWindow(Date.now(), 5_000)
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: false,
+        focusedInputDialog: undefined,
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'nudge',
+            messageId: 'work-sync-nudge',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'system',
+            status: 'pending',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Work sync check: call member_work_sync_status.',
+            messageKind: 'member_work_sync_nudge',
+          },
+        ],
+      }),
+    ).toBe(true)
+    resetWorkSyncAdmissionProcessorForTests()
+  })
+
+  test('defers ticketed continuation while the test consume-hold file exists', () => {
+    const holdPath = join(tmpdir(), `work-sync-hold-${Date.now()}`)
+    writeFileSync(holdPath, 'hold\n')
+    const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 1,
+      intentId: 'work-sync-nudge',
+      reservationNonce: 'ticket-1',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
+    try {
+      expect(
+        shouldDeferPendingInboxDelivery({
+          isLoading: false,
+          focusedInputDialog: undefined,
+          isTeammateSession: true,
+          pendingMessages: [
+            {
+              id: 'nudge',
+              messageId: 'work-sync-nudge',
+              mailboxClaimedBySessionId: 'session-1',
+              from: 'system',
+              status: 'pending',
+              timestamp: '2026-04-22T19:50:57.224Z',
+              text: 'Early continuation',
+              messageKind: 'member_work_sync_nudge',
+              workSyncRuntimeTicketId: 'ticket-1',
+              workSyncRuntimeInstanceId: 'runtime-1',
+              workSyncRuntimeGeneration: 1,
+            },
+          ],
+        }),
+      ).toBe(true)
+    } finally {
+      unbindWorkSyncContinuationAdmission()
+      unlinkSync(holdPath)
+      if (previous === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = previous
+      }
+    }
+  })
+
+  test('does not defer bootstrap while the test consume-hold file exists', () => {
+    const holdPath = join(tmpdir(), `work-sync-hold-bootstrap-${Date.now()}`)
+    writeFileSync(holdPath, 'hold\n')
+    const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    try {
+      expect(
+        shouldDeferPendingInboxDelivery({
+          isLoading: false,
+          focusedInputDialog: undefined,
+          isTeammateSession: true,
+          pendingMessages: [
+            {
+              id: 'bootstrap-row',
+              messageId: 'bootstrap-msg',
+              mailboxClaimedBySessionId: 'session-1',
+              from: 'team-lead',
+              status: 'pending',
+              timestamp: '2026-04-22T19:50:57.224Z',
+              text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"relay-works-6","memberName":"alice"}',
+            },
+          ],
+        }),
+      ).toBe(false)
+    } finally {
+      unlinkSync(holdPath)
+      if (previous === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = previous
+      }
+    }
   })
 
   test('always defers when a dialog is focused', () => {

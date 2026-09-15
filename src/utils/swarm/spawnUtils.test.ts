@@ -1068,6 +1068,23 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
+  it('forwards the test consume-hold path to tmux teammates', () => {
+    const originalHold = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = '/tmp/HOLD_CONSUME'
+    try {
+      const env = buildInheritedEnvVars({ provider: 'codex' })
+      expect(env).toContain(
+        'CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH=/tmp/HOLD_CONSUME',
+      )
+    } finally {
+      if (originalHold === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = originalHold
+      }
+    }
+  })
+
   it('clears Codex API key env vars for ChatGPT-auth codex teammates', () => {
     const originalApiKey = process.env.OPENAI_API_KEY
     const originalCodexApiKey = process.env.CODEX_API_KEY

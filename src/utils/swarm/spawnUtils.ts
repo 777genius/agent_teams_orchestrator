@@ -250,6 +250,10 @@ const TEAMMATE_ENV_VARS = [
   // turn completion events here so the desktop member-work-sync reconciler can
   // react after a managed Codex turn stops.
   'AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT',
+  // Live canary barrier: inbox may persist, but consume/start stays blocked
+  // while this path exists. Process-backend teammates inherit process.env;
+  // tmux panes only get the explicit TEAMMATE_ENV_VARS allowlist.
+  'CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH',
   // CCR marker — teammates need this for CCR-aware code paths. Auth finds
   // its own way via /home/claude/.claude/remote/.oauth_token regardless;
   // the FD env var wouldn't help (pipe FDs don't cross tmux).
