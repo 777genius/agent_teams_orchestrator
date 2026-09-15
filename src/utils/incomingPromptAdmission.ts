@@ -87,3 +87,16 @@ export function decideIncomingPromptAdmission({
 
   return { accepted: true }
 }
+
+export function startQueryForIncomingKind(input: {
+  incomingKind: IncomingPromptSubmissionKind | undefined
+  continuationTicket: unknown | null
+  startReservedContinuation: () => { ok: true; generation: number } | { ok: false }
+  tryStart: () => number | null
+}): number | null {
+  if (input.incomingKind === 'work_sync_continuation' && input.continuationTicket) {
+    const started = input.startReservedContinuation()
+    return started.ok ? started.generation : null
+  }
+  return input.tryStart()
+}

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   decideIncomingPromptAdmission,
   getBlockingIncomingPromptQueueModes,
+  startQueryForIncomingKind,
 } from './incomingPromptAdmission.js'
 
 describe('incoming prompt admission', () => {
@@ -153,5 +154,29 @@ describe('incoming prompt admission', () => {
       rejectionReason: 'bootstrap_pending',
       retryable: true,
     })
+  })
+})
+
+describe('startQueryForIncomingKind', () => {
+  test('starts a reserved continuation when the ticket is still held', () => {
+    expect(
+      startQueryForIncomingKind({
+        incomingKind: 'work_sync_continuation',
+        continuationTicket: { intentId: 'intent-c1' },
+        startReservedContinuation: () => ({ ok: true, generation: 4 }),
+        tryStart: () => 99,
+      }),
+    ).toBe(4)
+  })
+
+  test('falls back to ordinary tryStart when a leftover continuation kind has no ticket', () => {
+    expect(
+      startQueryForIncomingKind({
+        incomingKind: 'work_sync_continuation',
+        continuationTicket: null,
+        startReservedContinuation: () => ({ ok: false }),
+        tryStart: () => 7,
+      }),
+    ).toBe(7)
   })
 })

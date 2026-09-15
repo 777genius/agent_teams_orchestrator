@@ -210,7 +210,7 @@ import {
   useInboxPoller,
 } from '../hooks/useInboxPoller.js';
 import type { AgentErrorUserNotification, InboxPromptSubmitOptions, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
-import { decideIncomingPromptAdmission, getBlockingIncomingPromptQueueModes } from '../utils/incomingPromptAdmission.js';
+import { decideIncomingPromptAdmission, getBlockingIncomingPromptQueueModes, startQueryForIncomingKind } from '../utils/incomingPromptAdmission.js';
 import { useNativeAppManagedBootstrapContextInjection } from '../hooks/useNativeAppManagedBootstrapContextInjection.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -2971,20 +2971,23 @@ export function REPL({
     // Returns null if already running — no separate check-then-set.
     const incomingKind = incomingPromptKindRef.current
     incomingPromptKindRef.current = undefined
-    let thisGeneration: number | null = null
-    if (incomingKind === 'work_sync_continuation') {
-      const ticket = queryGuard.continuationTicket
-      if (!ticket) {
-        logForDebugging(
-          '[WorkSyncAdmission] ticketed envelope reached onQuery without a held continuation ticket',
-        )
-        return
-      }
-      const started = queryGuard.startReservedContinuation(ticket)
-      thisGeneration = started.ok ? started.generation : null
-    } else {
-      thisGeneration = queryGuard.tryStart()
+    if (incomingKind === 'work_sync_continuation' && !queryGuard.continuationTicket) {
+      logForDebugging(
+        '[WorkSyncAdmission] ticketed envelope reached onQuery without a held continuation ticket',
+      )
     }
+    const thisGeneration = startQueryForIncomingKind({
+      incomingKind,
+      continuationTicket: queryGuard.continuationTicket,
+      startReservedContinuation: () => {
+        const ticket = queryGuard.continuationTicket
+        if (!ticket) {
+          return { ok: false as const }
+        }
+        return queryGuard.startReservedContinuation(ticket)
+      },
+      tryStart: () => queryGuard.tryStart(),
+    })
     if (thisGeneration === null) {
       logEvent('tengu_concurrent_onquery_detected', {});
 
@@ -4141,7 +4144,6 @@ export function REPL({
     // include the queue.
     const commandQueue = getCommandQueue();
     const commandQueueModes = Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown'))));
-    incomingPromptKindRef.current = options?.submissionKind
     const decision = decideIncomingPromptAdmission({
       submissionKind: options?.submissionKind ?? 'runtime_delivery',
       bootstrapAdmissionPending: bootstrapAdmissionPendingRef.current,
@@ -4158,6 +4160,7 @@ export function REPL({
         commandQueueModes,
       };
     }
+    incomingPromptKindRef.current = options?.submissionKind
     const newAbortController = createAbortController();
     setAbortController(newAbortController);
 

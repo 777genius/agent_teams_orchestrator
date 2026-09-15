@@ -1,4 +1,4 @@
-import { closeLocalWorkSyncAdmissionForUserStop } from './workSyncContinuationAdmission.js'
+import { closeLocalWorkSyncAdmissionForUserStop, persistBoundWorkSyncAdmissionLiveState } from './workSyncContinuationAdmission.js'
 import { getTeamName, getAgentName } from './teammate.js'
 import type { QueryGuard } from './QueryGuard.js'
 
@@ -34,6 +34,7 @@ export async function postMemberWorkSyncRuntimeStop(input: {
 
 export function requestLocalWorkSyncUserStop(guard: QueryGuard): void {
   closeLocalWorkSyncAdmissionForUserStop(guard)
+  void persistBoundWorkSyncAdmissionLiveState()
   void postMemberWorkSyncRuntimeStop({
     localStopId: `local-stop:${guard.runtimeInstanceId}:${guard.generation}`,
     reason: 'runtime_local_user_stop',

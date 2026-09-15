@@ -13,9 +13,11 @@ import {
   buildWorkSyncAdmissionAckPath,
   buildWorkSyncAdmissionCommandPath,
   buildWorkSyncAdmissionRoot,
+  closeLocalWorkSyncAdmissionForUserStop,
   drainWorkSyncAdmissionCommands,
   encodeTeamMemberStorageKey,
   getWorkSyncIdleDeliveryRetryDelayMs,
+  isWorkSyncAdmissionHandshakeOpen,
   publishWorkSyncAdmissionFileNoReplace,
   resetWorkSyncAdmissionProcessorForTests,
   unbindWorkSyncContinuationAdmission,
@@ -574,5 +576,41 @@ describe('work-sync continuation admission', () => {
       }
       await rm(teamsDir, { recursive: true, force: true })
     }
+  })
+
+  test('local user stop bumps revision so a later open handshake cannot clear it', () => {
+    const guard = new QueryGuard('runtime-1')
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-open',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 1,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(isWorkSyncAdmissionHandshakeOpen()).toBe(true)
+    closeLocalWorkSyncAdmissionForUserStop(guard)
+    const reopened = applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-reopen',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 1,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(reopened.ack).toMatchObject({ ok: false, code: 'superseded' })
+    expect(isWorkSyncAdmissionHandshakeOpen()).toBe(false)
   })
 })

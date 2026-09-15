@@ -117,6 +117,7 @@ export function closeLocalWorkSyncAdmissionForUserStop(guard: QueryGuard): void 
   const control = controlState ?? initializeWorkSyncAdmissionControl(guard.runtimeInstanceId)
   control.stopped = true
   control.localAdmissionClosed = true
+  control.controlRevision += 1
   const ticket = guard.continuationTicket
   if (ticket) {
     guard.cancelReservedContinuation(ticket)
@@ -642,6 +643,22 @@ export function getWorkSyncIdleDeliveryRetryDelayMs(nowMs = Date.now()): number 
 
 export function clearWorkSyncPostTurnAdmissionWindowForTests(): void {
   postTurnAdmissionUntilMs = 0
+}
+
+export async function persistBoundWorkSyncAdmissionLiveState(
+  now = new Date(),
+): Promise<void> {
+  if (!boundGuard || !boundTeamName || !boundMemberName) {
+    return
+  }
+  await persistWorkSyncAdmissionLiveState({
+    root: buildWorkSyncAdmissionRoot({
+      teamName: boundTeamName,
+      memberName: boundMemberName,
+    }),
+    guard: boundGuard,
+    nowIso: now.toISOString(),
+  })
 }
 
 export async function processBoundWorkSyncContinuationAdmission(
