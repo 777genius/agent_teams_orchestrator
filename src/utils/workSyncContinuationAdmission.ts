@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
@@ -94,6 +95,15 @@ let controlState: WorkSyncAdmissionControl | null = null
 
 function intentNonceKey(intentId: string, reservationNonce: string): string {
   return `${intentId}:${reservationNonce}`
+}
+
+export const WORK_SYNC_TEST_HOLD_CONSUME_PATH_ENV =
+  'CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH'
+
+/** Test-owned barrier: inbox may persist, but consume/start stays blocked while the file exists. */
+export function isWorkSyncTestConsumeHoldOpen(): boolean {
+  const holdPath = process.env[WORK_SYNC_TEST_HOLD_CONSUME_PATH_ENV]?.trim()
+  return Boolean(holdPath && existsSync(holdPath))
 }
 
 export function resetWorkSyncAdmissionProcessorForTests(): void {
@@ -582,6 +592,10 @@ export const WORK_SYNC_POST_TURN_ADMISSION_WINDOW_MS = 5_000
 
 let postTurnAdmissionUntilMs = 0
 
+export function remainingWorkSyncPostTurnAdmissionWindowMs(nowMs = Date.now()): number {
+  return Math.max(0, postTurnAdmissionUntilMs - nowMs)
+}
+
 export function armWorkSyncPostTurnAdmissionWindow(
   nowMs = Date.now(),
   windowMs = WORK_SYNC_POST_TURN_ADMISSION_WINDOW_MS,
@@ -591,6 +605,17 @@ export function armWorkSyncPostTurnAdmissionWindow(
 
 export function isWorkSyncPostTurnAdmissionWindowOpen(nowMs = Date.now()): boolean {
   return nowMs < postTurnAdmissionUntilMs
+}
+
+/** Idle delivery must re-enter after post-turn wait or when the consume-hold file disappears. */
+export function getWorkSyncIdleDeliveryRetryDelayMs(nowMs = Date.now()): number | null {
+  if (isWorkSyncPostTurnAdmissionWindowOpen(nowMs)) {
+    return Math.max(1, remainingWorkSyncPostTurnAdmissionWindowMs(nowMs))
+  }
+  if (isWorkSyncTestConsumeHoldOpen()) {
+    return 250
+  }
+  return null
 }
 
 export function clearWorkSyncPostTurnAdmissionWindowForTests(): void {

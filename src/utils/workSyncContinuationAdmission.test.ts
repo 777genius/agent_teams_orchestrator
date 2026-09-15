@@ -1,3 +1,4 @@
+import { unlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,12 +8,14 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { QueryGuard } from './QueryGuard.js'
 import {
   applyWorkSyncAdmissionCommand,
+  armWorkSyncPostTurnAdmissionWindow,
   bindWorkSyncContinuationAdmission,
   buildWorkSyncAdmissionAckPath,
   buildWorkSyncAdmissionCommandPath,
   buildWorkSyncAdmissionRoot,
   drainWorkSyncAdmissionCommands,
   encodeTeamMemberStorageKey,
+  getWorkSyncIdleDeliveryRetryDelayMs,
   publishWorkSyncAdmissionFileNoReplace,
   resetWorkSyncAdmissionProcessorForTests,
   unbindWorkSyncContinuationAdmission,
@@ -420,5 +423,27 @@ describe('work-sync continuation admission', () => {
     expect(reserved.ack).toMatchObject({ ok: true, code: 'reserved' })
     expect(reserved.control.teamIncarnation).toBe('inc-1')
     expect(guard.continuationTicket?.reservationNonce).toBe('nonce-c1')
+  })
+
+  test('retries idle delivery after the post-turn window and while consume-hold is open', () => {
+    const now = Date.now()
+    armWorkSyncPostTurnAdmissionWindow(now, 1_000)
+    expect(getWorkSyncIdleDeliveryRetryDelayMs(now)).toBe(1_000)
+    expect(getWorkSyncIdleDeliveryRetryDelayMs(now + 1_000)).toBeNull()
+
+    const holdPath = join(tmpdir(), `work-sync-idle-retry-${now}`)
+    const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    writeFileSync(holdPath, 'hold\n')
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    try {
+      expect(getWorkSyncIdleDeliveryRetryDelayMs(now + 2_000)).toBe(250)
+    } finally {
+      unlinkSync(holdPath)
+      if (previous === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = previous
+      }
+    }
   })
 })

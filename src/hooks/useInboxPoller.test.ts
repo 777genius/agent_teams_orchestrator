@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   extractTaskRefFromMailboxText,
@@ -493,6 +496,12 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         deferUnticketedWorkSyncNudges: true,
       }),
     ).toBeUndefined()
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [pendingMessages[0]!],
+        deferUnticketedWorkSyncNudges: false,
+      })?.messageId,
+    ).toBe('work-sync-nudge')
   })
 
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
@@ -794,6 +803,78 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       }),
     ).toBe(true)
     resetWorkSyncAdmissionProcessorForTests()
+  })
+
+  test('defers ticketed continuation while the test consume-hold file exists', () => {
+    const holdPath = join(tmpdir(), `work-sync-hold-${Date.now()}`)
+    writeFileSync(holdPath, 'hold\n')
+    const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    try {
+      expect(
+        shouldDeferPendingInboxDelivery({
+          isLoading: false,
+          focusedInputDialog: undefined,
+          isTeammateSession: true,
+          pendingMessages: [
+            {
+              id: 'nudge',
+              messageId: 'work-sync-nudge',
+              mailboxClaimedBySessionId: 'session-1',
+              from: 'system',
+              status: 'pending',
+              timestamp: '2026-04-22T19:50:57.224Z',
+              text: 'Early continuation',
+              messageKind: 'member_work_sync_nudge',
+              workSyncRuntimeTicketId: 'ticket-1',
+              workSyncRuntimeInstanceId: 'runtime-1',
+              workSyncRuntimeGeneration: 1,
+            },
+          ],
+        }),
+      ).toBe(true)
+    } finally {
+      unlinkSync(holdPath)
+      if (previous === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = previous
+      }
+    }
+  })
+
+  test('does not defer bootstrap while the test consume-hold file exists', () => {
+    const holdPath = join(tmpdir(), `work-sync-hold-bootstrap-${Date.now()}`)
+    writeFileSync(holdPath, 'hold\n')
+    const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+    process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    try {
+      expect(
+        shouldDeferPendingInboxDelivery({
+          isLoading: false,
+          focusedInputDialog: undefined,
+          isTeammateSession: true,
+          pendingMessages: [
+            {
+              id: 'bootstrap-row',
+              messageId: 'bootstrap-msg',
+              mailboxClaimedBySessionId: 'session-1',
+              from: 'team-lead',
+              status: 'pending',
+              timestamp: '2026-04-22T19:50:57.224Z',
+              text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"relay-works-6","memberName":"alice"}',
+            },
+          ],
+        }),
+      ).toBe(false)
+    } finally {
+      unlinkSync(holdPath)
+      if (previous === undefined) {
+        delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
+      } else {
+        process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = previous
+      }
+    }
   })
 
   test('always defers when a dialog is focused', () => {

@@ -28,8 +28,10 @@ import {
 import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmission.js'
 import {
   getBoundWorkSyncContinuationTicket,
+  getWorkSyncIdleDeliveryRetryDelayMs,
   isWorkSyncAdmissionHandshakeOpen,
   isWorkSyncPostTurnAdmissionWindowOpen,
+  isWorkSyncTestConsumeHoldOpen,
   processBoundWorkSyncContinuationAdmission,
 } from '../utils/workSyncContinuationAdmission.js'
 import {
@@ -476,6 +478,19 @@ export function shouldDeferPendingInboxDelivery(params: {
 }): boolean {
   if (params.focusedInputDialog) {
     return true
+  }
+
+  if (isWorkSyncTestConsumeHoldOpen()) {
+    const ticketed = getOrdinaryPendingMessage({
+      pendingMessages: params.pendingMessages,
+      deferUnticketedWorkSyncNudges: true,
+    })
+    if (
+      ticketed?.messageKind === 'member_work_sync_nudge' &&
+      readWorkSyncInboxContinuationTicket(ticketed)
+    ) {
+      return true
+    }
   }
 
   if (params.isLoading) {
@@ -2198,9 +2213,17 @@ export function useInboxPoller({
     Map<string, BootstrapReadinessWaitState>
   >(new Map())
   const [bootstrapReadinessTick, setBootstrapReadinessTick] = useState(0)
+  const [idleDeliveryRetryTick, setIdleDeliveryRetryTick] = useState(0)
+  const idleDeliveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  )
 
   useEffect(() => {
     return () => {
+      if (idleDeliveryRetryTimerRef.current) {
+        clearTimeout(idleDeliveryRetryTimerRef.current)
+        idleDeliveryRetryTimerRef.current = null
+      }
       for (const attempt of bootstrapAttemptsRef.current.values()) {
         if (attempt.timer) {
           clearTimeout(attempt.timer)
@@ -3087,7 +3110,18 @@ export function useInboxPoller({
         pendingMessages: liveOwnedMessagesForGate,
       })
     ) {
+      const retryMs = getWorkSyncIdleDeliveryRetryDelayMs()
+      if (retryMs != null && idleDeliveryRetryTimerRef.current == null) {
+        idleDeliveryRetryTimerRef.current = setTimeout(() => {
+          idleDeliveryRetryTimerRef.current = null
+          setIdleDeliveryRetryTick(tick => tick + 1)
+        }, retryMs)
+      }
       return
+    }
+    if (idleDeliveryRetryTimerRef.current) {
+      clearTimeout(idleDeliveryRetryTimerRef.current)
+      idleDeliveryRetryTimerRef.current = null
     }
 
     const staleMirroredMessageIds = new Set(
@@ -4245,6 +4279,7 @@ export function useInboxPoller({
     onBootstrapConfirmed,
     setAppState,
     inboxStateSignature,
+    idleDeliveryRetryTick,
     store,
   ])
 
