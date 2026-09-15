@@ -52,6 +52,7 @@ export function isMatchingWorkSyncContinuationTicket(input: {
   reservationNonce: string
   intentId: string
   expectedGeneration: number
+  admissionPayloadHash?: string
 }): boolean {
   const ticket = readWorkSyncInboxContinuationTicket(input.message)
   if (!ticket) return false
@@ -62,6 +63,10 @@ export function isMatchingWorkSyncContinuationTicket(input: {
     ticket.runtimeInstanceId &&
     ticket.runtimeInstanceId !== input.runtimeInstanceId
   ) {
+    return false
+  }
+  const reservedHash = input.admissionPayloadHash?.trim()
+  if (reservedHash && ticket.admissionPayloadHash !== reservedHash) {
     return false
   }
   return true

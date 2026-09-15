@@ -446,6 +446,7 @@ function shouldHoldTicketedWorkSyncUntilExactMatch(message: {
     reservationNonce: held.reservationNonce,
     intentId: held.intentId,
     expectedGeneration: held.expectedGeneration,
+    admissionPayloadHash: held.admissionPayloadHash,
   })
 }
 

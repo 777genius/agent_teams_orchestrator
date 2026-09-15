@@ -446,4 +446,133 @@ describe('work-sync continuation admission', () => {
       }
     }
   })
+
+  test('rejects a reserve from a stale control revision after resume', () => {
+    const guard = new QueryGuard('runtime-1')
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-stop-11',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 11,
+        stopped: true,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-resume-12',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 12,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    const reserved = applyWorkSyncAdmissionCommand({
+      guard,
+      command: reserveCommand(guard, { controlRevision: 10, requestId: 'req-stale-reserve' }),
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(reserved.ack).toMatchObject({ ok: false, code: 'superseded' })
+    expect(guard.status).toBe('idle')
+  })
+
+  test('expires a reserved continuation at the advertised deadline', () => {
+    const guard = new QueryGuard('runtime-1')
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-open',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 1,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    const reserved = applyWorkSyncAdmissionCommand({
+      guard,
+      command: reserveCommand(guard, {
+        commandDeadline: '2026-09-14T18:00:05.000Z',
+      }),
+      nowIso: NOW,
+      nowMs: NOW_MS,
+      maxTtlMs: 5_000,
+    })
+    expect(reserved.ack.ok).toBe(true)
+    expect(guard.expireReservedContinuation(NOW_MS + 5_001)).toBe(true)
+    expect(guard.status).toBe('idle')
+    expect(guard.continuationTicket).toBeNull()
+  })
+
+  test('persists an expired continuation even when no command files remain', async () => {
+    const teamsDir = await mkdtemp(join(tmpdir(), 'work-sync-expire-'))
+    const previous = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = teamsDir
+    try {
+      const guard = new QueryGuard('runtime-1')
+      applyWorkSyncAdmissionCommand({
+        guard,
+        command: {
+          schemaVersion: 1,
+          requestId: 'req-open',
+          op: 'sync_control',
+          scope: scope(guard.runtimeInstanceId),
+          controlRevision: 1,
+          stopped: false,
+          issuedAt: NOW,
+        },
+        nowIso: NOW,
+        nowMs: NOW_MS,
+      })
+      applyWorkSyncAdmissionCommand({
+        guard,
+        command: reserveCommand(guard, {
+          commandDeadline: '2026-09-14T18:00:05.000Z',
+        }),
+        nowIso: NOW,
+        nowMs: NOW_MS,
+        maxTtlMs: 5_000,
+      })
+      const root = buildWorkSyncAdmissionRoot({
+        teamName: 'team-a',
+        memberName: 'bob',
+        teamsDir: join(teamsDir, 'teams'),
+      })
+      await drainWorkSyncAdmissionCommands({
+        guard,
+        teamName: 'team-a',
+        memberName: 'bob',
+        nowIso: '2026-09-14T18:00:06.000Z',
+        nowMs: NOW_MS + 6_000,
+        teamsDir: join(teamsDir, 'teams'),
+      })
+      expect(guard.continuationTicket).toBeNull()
+      const snapshot = JSON.parse(
+        await readFile(join(root, 'snapshot.json'), 'utf8'),
+      ) as { continuation?: unknown; status?: string }
+      expect(snapshot.continuation).toBeNull()
+      expect(snapshot.status).toBe('idle')
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previous
+      }
+      await rm(teamsDir, { recursive: true, force: true })
+    }
+  })
 })

@@ -340,11 +340,22 @@ export function applyWorkSyncAdmissionCommand(input: {
     })
   }
 
+  if (input.command.controlRevision !== control.controlRevision) {
+    return fail('superseded', {
+      intentId: input.command.intentId,
+      reservationNonce: input.command.reservationNonce,
+    })
+  }
+
+  const maxTtlMs = input.maxTtlMs ?? 30_000
+  const remainingMs = Math.min(Math.max(0, deadlineMs - input.nowMs), maxTtlMs)
   const reserved = input.guard.reserveContinuation({
     runtimeInstanceId: input.command.scope.runtimeInstanceId,
     expectedGeneration: input.command.expectedGeneration,
     intentId: input.command.intentId,
     reservationNonce: input.command.reservationNonce,
+    admissionPayloadHash: input.command.admissionPayloadHash,
+    expiresAtMs: input.nowMs + remainingMs,
   })
   if (!reserved.ok) {
     return fail(reserved.code, {
@@ -354,8 +365,6 @@ export function applyWorkSyncAdmissionCommand(input: {
   }
   bindWorkSyncTeamIncarnation(control, input.command.scope.teamIncarnation)
 
-  const maxTtlMs = input.maxTtlMs ?? 30_000
-  const remainingMs = Math.min(Math.max(0, deadlineMs - input.nowMs), maxTtlMs)
   const expiresAt = new Date(input.nowMs + remainingMs).toISOString()
   const ack: WorkSyncAdmissionAck = {
     ...ackBase,
@@ -450,16 +459,29 @@ export async function drainWorkSyncAdmissionCommands(input: {
   nowMs: number
   teamsDir?: string
 }): Promise<number> {
+  const expired = input.guard.expireReservedContinuation(input.nowMs)
   const root = buildWorkSyncAdmissionRoot({
     teamName: input.teamName,
     memberName: input.memberName,
     teamsDir: input.teamsDir,
   })
+  if (expired) {
+    await persistWorkSyncAdmissionLiveState({
+      root,
+      guard: input.guard,
+      nowIso: input.nowIso,
+    })
+  }
   const commandsDir = join(root, input.guard.runtimeInstanceId, 'commands')
   let names: string[] = []
   try {
     names = (await readdir(commandsDir)).filter(name => name.endsWith('.json'))
   } catch {
+    await persistWorkSyncAdmissionLiveState({
+      root,
+      guard: input.guard,
+      nowIso: input.nowIso,
+    })
     return 0
   }
   const loaded: WorkSyncAdmissionCommand[] = []

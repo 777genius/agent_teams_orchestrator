@@ -45,4 +45,26 @@ describe('work-sync inbox ticket matching', () => {
       }),
     ).toBeNull()
   })
+
+  test('rejects a ticketed envelope whose admission hash does not match the reserve', () => {
+    const message = {
+      messageKind: 'member_work_sync_nudge' as const,
+      messageId: 'intent-c1',
+      workSyncRuntimeTicketId: 'nonce-c1',
+      workSyncRuntimeGeneration: 1,
+      workSyncRuntimeInstanceId: 'runtime-1',
+      workSyncIntentId: 'intent-c1',
+      workSyncAdmissionPayloadHash: 'hash-other',
+    }
+    expect(
+      isMatchingWorkSyncContinuationTicket({
+        message,
+        runtimeInstanceId: 'runtime-1',
+        reservationNonce: 'nonce-c1',
+        intentId: 'intent-c1',
+        expectedGeneration: 1,
+        admissionPayloadHash: 'hash-a',
+      }),
+    ).toBe(false)
+  })
 })

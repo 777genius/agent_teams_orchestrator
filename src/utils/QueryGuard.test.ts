@@ -190,4 +190,19 @@ describe('QueryGuard continuation tickets', () => {
     expect(guard.reserve()).toBe(true)
     expect(guard.continuationTicket).toBeNull()
   })
+
+  test('expires a reserved continuation so ordinary user submit can proceed', () => {
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c1',
+      reservationNonce: 'nonce-c1',
+      expiresAtMs: Date.now() - 1,
+    })
+    expect(guard.expireReservedContinuation(Date.now())).toBe(true)
+    expect(guard.status).toBe('idle')
+    expect(guard.continuationTicket).toBeNull()
+    expect(guard.reserve()).toBe(true)
+  })
 })

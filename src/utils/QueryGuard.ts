@@ -35,6 +35,8 @@ export type ContinuationTicket = {
   expectedGeneration: number
   reservationNonce: string
   intentId: string
+  admissionPayloadHash?: string
+  expiresAtMs?: number
 }
 
 export type ContinuationReserveResult =
@@ -83,6 +85,8 @@ export class QueryGuard {
     expectedGeneration: number
     intentId: string
     reservationNonce?: string
+    admissionPayloadHash?: string
+    expiresAtMs?: number
   }): ContinuationReserveResult {
     if (this._status !== 'idle' || this._continuation) {
       return { ok: false, code: 'busy' }
@@ -102,6 +106,10 @@ export class QueryGuard {
       expectedGeneration: this._generation,
       reservationNonce: input.reservationNonce?.trim() || randomUUID(),
       intentId,
+      ...(input.admissionPayloadHash?.trim()
+        ? { admissionPayloadHash: input.admissionPayloadHash.trim() }
+        : {}),
+      ...(input.expiresAtMs != null ? { expiresAtMs: input.expiresAtMs } : {}),
     }
     this._continuation = ticket
     this._status = 'dispatching'
@@ -246,11 +254,26 @@ export class QueryGuard {
     return this._status !== 'idle'
   }
 
+  expireReservedContinuation(nowMs = Date.now()): boolean {
+    const ticket = this._continuation
+    if (!ticket?.expiresAtMs || ticket.expiresAtMs > nowMs) {
+      return false
+    }
+    this._continuation = null
+    if (this._status === 'dispatching') {
+      this._status = 'idle'
+    }
+    this._notify()
+    return true
+  }
+
   private matchesContinuation(ticket: ContinuationTicket): boolean {
     return (
       this._continuation != null &&
       this._continuation.reservationNonce === ticket.reservationNonce &&
-      this._continuation.intentId === ticket.intentId
+      this._continuation.intentId === ticket.intentId &&
+      (this._continuation.admissionPayloadHash ?? '') ===
+        (ticket.admissionPayloadHash ?? '')
     )
   }
 

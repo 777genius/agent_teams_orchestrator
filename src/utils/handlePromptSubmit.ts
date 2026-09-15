@@ -243,6 +243,7 @@ export async function handlePromptSubmit(
   )
   logEvent('tengu_paste_text', { pastedTextCount, pastedTextBytes })
 
+  queryGuard.invalidateContinuationForUserSubmit()
   const isPromptExecutionBusy = queryGuard.isActive || isExternalLoading
   const shouldDeferPromptSubmission = isPromptSubmissionDeferred(
     isPromptExecutionBusy,
