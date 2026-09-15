@@ -177,6 +177,32 @@ describe('QueryGuard continuation tickets', () => {
     expect(guard.generation).toBe(0)
   })
 
+  test('cancel without admissionPayloadHash still releases a hashed reservation', () => {
+    const guard = new QueryGuard('runtime-1')
+    const reserved = guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c1',
+      reservationNonce: 'nonce-c1',
+      admissionPayloadHash: 'hash-a',
+    })
+    expect(reserved.ok).toBe(true)
+    if (!reserved.ok) return
+    expect(
+      guard.cancelReservedContinuation({
+        runtimeInstanceId: 'runtime-1',
+        expectedGeneration: 0,
+        reservationNonce: 'nonce-c1',
+        intentId: 'intent-c1',
+      }),
+    ).toBe('cancelled')
+    expect(guard.status).toBe('idle')
+    expect(guard.startReservedContinuation(reserved.ticket)).toEqual({
+      ok: false,
+      code: 'stale',
+    })
+  })
+
   test('user submit invalidation clears dispatching continuation for ordinary reserve', () => {
     const guard = new QueryGuard('runtime-1')
     guard.reserveContinuation({

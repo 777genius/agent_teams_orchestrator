@@ -132,7 +132,7 @@ export class QueryGuard {
   cancelReservedContinuation(
     ticket: ContinuationTicket,
   ): 'cancelled' | 'stale' {
-    if (!this.matchesContinuation(ticket)) {
+    if (!this.matchesContinuation(ticket, { allowOmittedHash: true })) {
       return 'stale'
     }
     this._continuation = null
@@ -267,13 +267,23 @@ export class QueryGuard {
     return true
   }
 
-  private matchesContinuation(ticket: ContinuationTicket): boolean {
+  private matchesContinuation(
+    ticket: ContinuationTicket,
+    options?: { allowOmittedHash?: boolean },
+  ): boolean {
+    if (
+      this._continuation == null ||
+      this._continuation.reservationNonce !== ticket.reservationNonce ||
+      this._continuation.intentId !== ticket.intentId
+    ) {
+      return false
+    }
+    if (options?.allowOmittedHash && !ticket.admissionPayloadHash) {
+      return true
+    }
     return (
-      this._continuation != null &&
-      this._continuation.reservationNonce === ticket.reservationNonce &&
-      this._continuation.intentId === ticket.intentId &&
       (this._continuation.admissionPayloadHash ?? '') ===
-        (ticket.admissionPayloadHash ?? '')
+      (ticket.admissionPayloadHash ?? '')
     )
   }
 

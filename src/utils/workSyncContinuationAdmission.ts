@@ -56,6 +56,7 @@ export type WorkSyncAdmissionCommand =
       intentId: string
       reservationNonce: string
       expectedGeneration: number
+      admissionPayloadHash?: string
       issuedAt: string
     }
   | {
@@ -266,6 +267,9 @@ export function applyWorkSyncAdmissionCommand(input: {
         expectedGeneration: input.command.expectedGeneration,
         reservationNonce: input.command.reservationNonce,
         intentId: input.command.intentId,
+        ...(input.command.admissionPayloadHash
+          ? { admissionPayloadHash: input.command.admissionPayloadHash }
+          : {}),
       }
       const cancelled = input.guard.cancelReservedContinuation(ticket)
       const ack: WorkSyncAdmissionAck = {
@@ -298,6 +302,9 @@ export function applyWorkSyncAdmissionCommand(input: {
       expectedGeneration: input.command.expectedGeneration,
       reservationNonce: input.command.reservationNonce,
       intentId: input.command.intentId,
+      ...(input.command.admissionPayloadHash
+        ? { admissionPayloadHash: input.command.admissionPayloadHash }
+        : {}),
     }
     const cancelled = input.guard.cancelReservedContinuation(ticket)
     const code =
@@ -611,9 +618,16 @@ export function isWorkSyncAdmissionHandshakeOpen(): boolean {
   )
 }
 
-/** D1 was enabled for this runtime; keep D0 nudges off even after Stop. */
+/**
+ * After Stop, keep automatic D0/Continue envelopes from ordinary tryStart.
+ * While the handshake is still open, fresh unticketed Continue/D0 may run;
+ * ticketed D1 envelopes still win the selector when reserved.
+ */
 export function shouldDeferUnticketedWorkSyncNudges(): boolean {
-  return Boolean(controlState?.handshakeCompleted)
+  return Boolean(
+    controlState?.handshakeCompleted &&
+      (controlState.stopped || controlState.localAdmissionClosed),
+  )
 }
 
 export const WORK_SYNC_POST_TURN_ADMISSION_WINDOW_MS = 5_000

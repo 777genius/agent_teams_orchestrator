@@ -178,6 +178,61 @@ describe('work-sync continuation admission', () => {
     expect(guard.continuationTicket).toBeNull()
   })
 
+  test('reserve with hash then cancel without hash releases the ticket so a late start cannot run', () => {
+    const guard = new QueryGuard('runtime-1')
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-open',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 1,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    const reserved = applyWorkSyncAdmissionCommand({
+      guard,
+      command: reserveCommand(guard),
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(reserved.ack).toMatchObject({ ok: true, code: 'reserved' })
+    expect(guard.status).toBe('dispatching')
+    const cancelled = applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-cancel-wire',
+        op: 'cancel',
+        scope: scope(guard.runtimeInstanceId),
+        intentId: 'intent-c1',
+        reservationNonce: 'nonce-c1',
+        expectedGeneration: 0,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(cancelled.ack).toMatchObject({ ok: true, code: 'cancelled' })
+    expect(guard.status).toBe('idle')
+    expect(guard.continuationTicket).toBeNull()
+    expect(
+      guard.startReservedContinuation({
+        runtimeInstanceId: guard.runtimeInstanceId,
+        expectedGeneration: 0,
+        reservationNonce: 'nonce-c1',
+        intentId: 'intent-c1',
+        admissionPayloadHash: 'hash-a',
+      }),
+    ).toEqual({ ok: false, code: 'stale' })
+    expect(guard.status).toBe('idle')
+    expect(guard.generation).toBe(0)
+  })
+
   test('rejects expired commands and does not extend TTL on replay', () => {
     const guard = new QueryGuard('runtime-1')
     applyWorkSyncAdmissionCommand({
@@ -634,7 +689,7 @@ describe('work-sync continuation admission', () => {
       nowMs: NOW_MS,
     })
     expect(isWorkSyncAdmissionHandshakeOpen()).toBe(true)
-    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(false)
     closeLocalWorkSyncAdmissionForUserStop(guard)
     expect(isWorkSyncAdmissionHandshakeOpen()).toBe(false)
     expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)

@@ -27,6 +27,10 @@ import {
 } from '../utils/inProcessTeammateHelpers.js'
 import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmission.js'
 import {
+  classifyTicketedWorkSyncEnvelope,
+  getOrdinaryPendingMessage,
+} from '../utils/ordinaryPendingMailboxMessage.js'
+import {
   getBoundWorkSyncContinuationTicket,
   getWorkSyncIdleDeliveryRetryDelayMs,
   isWorkSyncPostTurnAdmissionWindowOpen,
@@ -35,7 +39,6 @@ import {
   shouldDeferUnticketedWorkSyncNudges,
 } from '../utils/workSyncContinuationAdmission.js'
 import {
-  isMatchingWorkSyncContinuationTicket,
   readWorkSyncInboxContinuationTicket,
 } from '../utils/workSyncInboxTicket.js'
 import { createAssistantMessage } from '../utils/messages.js'
@@ -375,41 +378,10 @@ export function getBootstrapProcessingMessage({
     : undefined
 }
 
-export function getOrdinaryPendingMessage({
-  pendingMessages,
-  deferUnticketedWorkSyncNudges = false,
-}: {
-  pendingMessages: readonly PendingInboxMirrorMessage[]
-  deferUnticketedWorkSyncNudges?: boolean
-}): PendingInboxMirrorMessage | undefined {
-  const actionableMessages = pendingMessages.filter(
-    message =>
-      !!message.messageId &&
-      message.messageKind !== 'agent_error' &&
-      isRegularInteractiveMailboxMessage({ text: message.text }) &&
-      !(
-        message.from === TEAM_LEAD_NAME &&
-        isBootstrapMailboxInstructionText(message.text)
-      ),
-  )
-  const ticketedNudge = actionableMessages.find(
-    message =>
-      message.messageKind === 'member_work_sync_nudge' &&
-      readWorkSyncInboxContinuationTicket(message) != null,
-  )
-  if (ticketedNudge) {
-    return ticketedNudge
-  }
-  if (!deferUnticketedWorkSyncNudges) {
-    return (
-      actionableMessages.find(message => message.messageKind === 'member_work_sync_nudge')
-      ?? actionableMessages[0]
-    )
-  }
-  return actionableMessages.find(
-    message => message.messageKind !== 'member_work_sync_nudge',
-  )
-}
+export {
+  classifyTicketedWorkSyncEnvelope,
+  getOrdinaryPendingMessage,
+} from '../utils/ordinaryPendingMailboxMessage.js'
 
 export function resolveIncomingMailboxSubmissionKind(input: {
   bootstrapPendingMessage?: { messageId?: string } | null
@@ -431,23 +403,9 @@ function shouldHoldTicketedWorkSyncUntilExactMatch(message: {
   workSyncRuntimeGeneration?: number
   workSyncRuntimeInstanceId?: string
   workSyncIntentId?: string
+  workSyncAdmissionPayloadHash?: string
 }): boolean {
-  const ticket = readWorkSyncInboxContinuationTicket(message)
-  if (!ticket) {
-    return false
-  }
-  const held = getBoundWorkSyncContinuationTicket()
-  if (!held) {
-    return true
-  }
-  return !isMatchingWorkSyncContinuationTicket({
-    message,
-    runtimeInstanceId: held.runtimeInstanceId,
-    reservationNonce: held.reservationNonce,
-    intentId: held.intentId,
-    expectedGeneration: held.expectedGeneration,
-    admissionPayloadHash: held.admissionPayloadHash,
-  })
+  return classifyTicketedWorkSyncEnvelope(message) === 'wait'
 }
 
 export function getProcessingOrdinaryMessage({

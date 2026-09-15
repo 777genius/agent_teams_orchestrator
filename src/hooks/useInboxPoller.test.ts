@@ -41,8 +41,11 @@ import {
 } from '../utils/messages.js'
 import {
   armWorkSyncPostTurnAdmissionWindow,
+  bindWorkSyncContinuationAdmission,
   resetWorkSyncAdmissionProcessorForTests,
+  unbindWorkSyncContinuationAdmission,
 } from '../utils/workSyncContinuationAdmission.js'
+import { QueryGuard } from '../utils/QueryGuard.js'
 
 describe('useInboxPoller queued mailbox meta prompt', () => {
   test('detects bootstrap teammate mailbox instructions', () => {
@@ -479,29 +482,113 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         text: 'Early continuation: continue remaining assigned work.',
         messageKind: 'member_work_sync_nudge' as const,
         workSyncRuntimeTicketId: 'ticket-1',
-        workSyncRuntimeGeneration: 3,
+        workSyncRuntimeGeneration: 0,
         workSyncRuntimeInstanceId: 'runtime-1',
         workSyncIntentId: 'intent-c1',
       },
     ]
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c1',
+      reservationNonce: 'ticket-1',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
+    try {
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages,
+          deferUnticketedWorkSyncNudges: true,
+        })?.messageId,
+      ).toBe('work-sync-ticketed')
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [pendingMessages[0]!],
+          deferUnticketedWorkSyncNudges: true,
+        }),
+      ).toBeUndefined()
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [pendingMessages[0]!],
+          deferUnticketedWorkSyncNudges: false,
+        })?.messageId,
+      ).toBe('work-sync-nudge')
+    } finally {
+      unbindWorkSyncContinuationAdmission()
+    }
+  })
+
+  test('skips a stale ticketed envelope so a newer ticket or user mailbox can proceed', () => {
+    const stale = {
+      id: 'c1',
+      messageId: 'work-sync-c1',
+      mailboxClaimedBySessionId: 's',
+      from: 'system',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:01.000Z',
+      text: 'Early continuation C1.',
+      messageKind: 'member_work_sync_nudge' as const,
+      workSyncRuntimeTicketId: 'ticket-c1',
+      workSyncRuntimeGeneration: 0,
+      workSyncRuntimeInstanceId: 'runtime-1',
+      workSyncIntentId: 'intent-c1',
+    }
+    const next = {
+      id: 'c2',
+      messageId: 'work-sync-c2',
+      mailboxClaimedBySessionId: 's',
+      from: 'system',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:02.000Z',
+      text: 'Early continuation C2.',
+      messageKind: 'member_work_sync_nudge' as const,
+      workSyncRuntimeTicketId: 'ticket-c2',
+      workSyncRuntimeGeneration: 0,
+      workSyncRuntimeInstanceId: 'runtime-1',
+      workSyncIntentId: 'intent-c2',
+    }
+    const user = {
+      id: 'user-row',
+      messageId: 'user-1',
+      mailboxClaimedBySessionId: 's',
+      from: 'user',
+      status: 'pending' as const,
+      timestamp: '2026-04-09T13:00:03.000Z',
+      text: 'Please look at this.',
+    }
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 0,
+      intentId: 'intent-c2',
+      reservationNonce: 'ticket-c2',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
+    try {
+      expect(
+        getOrdinaryPendingMessage({
+          pendingMessages: [stale, next],
+          deferUnticketedWorkSyncNudges: true,
+        })?.messageId,
+      ).toBe('work-sync-c2')
+    } finally {
+      unbindWorkSyncContinuationAdmission()
+    }
     expect(
       getOrdinaryPendingMessage({
-        pendingMessages,
+        pendingMessages: [stale, user],
         deferUnticketedWorkSyncNudges: true,
       })?.messageId,
-    ).toBe('work-sync-ticketed')
-    expect(
-      getOrdinaryPendingMessage({
-        pendingMessages: [pendingMessages[0]!],
-        deferUnticketedWorkSyncNudges: true,
-      }),
-    ).toBeUndefined()
-    expect(
-      getOrdinaryPendingMessage({
-        pendingMessages: [pendingMessages[0]!],
-        deferUnticketedWorkSyncNudges: false,
-      })?.messageId,
-    ).toBe('work-sync-nudge')
+    ).toBe('user-1')
   })
 
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
@@ -810,6 +897,18 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     writeFileSync(holdPath, 'hold\n')
     const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
     process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
+    const guard = new QueryGuard('runtime-1')
+    guard.reserveContinuation({
+      runtimeInstanceId: 'runtime-1',
+      expectedGeneration: 1,
+      intentId: 'work-sync-nudge',
+      reservationNonce: 'ticket-1',
+    })
+    bindWorkSyncContinuationAdmission({
+      guard,
+      teamName: 'team-a',
+      memberName: 'bob',
+    })
     try {
       expect(
         shouldDeferPendingInboxDelivery({
@@ -834,6 +933,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         }),
       ).toBe(true)
     } finally {
+      unbindWorkSyncContinuationAdmission()
       unlinkSync(holdPath)
       if (previous === undefined) {
         delete process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
