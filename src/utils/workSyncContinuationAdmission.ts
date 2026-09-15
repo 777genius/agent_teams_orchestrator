@@ -611,6 +611,11 @@ export function isWorkSyncAdmissionHandshakeOpen(): boolean {
   )
 }
 
+/** D1 was enabled for this runtime; keep D0 nudges off even after Stop. */
+export function shouldDeferUnticketedWorkSyncNudges(): boolean {
+  return Boolean(controlState?.handshakeCompleted)
+}
+
 export const WORK_SYNC_POST_TURN_ADMISSION_WINDOW_MS = 5_000
 
 let postTurnAdmissionUntilMs = 0

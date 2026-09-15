@@ -19,6 +19,7 @@ import {
   getWorkSyncIdleDeliveryRetryDelayMs,
   isWorkSyncAdmissionHandshakeOpen,
   publishWorkSyncAdmissionFileNoReplace,
+  shouldDeferUnticketedWorkSyncNudges,
   resetWorkSyncAdmissionProcessorForTests,
   unbindWorkSyncContinuationAdmission,
   type WorkSyncAdmissionCommand,
@@ -612,5 +613,30 @@ describe('work-sync continuation admission', () => {
     })
     expect(reopened.ack).toMatchObject({ ok: false, code: 'superseded' })
     expect(isWorkSyncAdmissionHandshakeOpen()).toBe(false)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)
+  })
+
+  test('keeps deferring unticketed D0 nudges after handshake and user stop', () => {
+    const guard = new QueryGuard('runtime-1')
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(false)
+    applyWorkSyncAdmissionCommand({
+      guard,
+      command: {
+        schemaVersion: 1,
+        requestId: 'req-open',
+        op: 'sync_control',
+        scope: scope(guard.runtimeInstanceId),
+        controlRevision: 1,
+        stopped: false,
+        issuedAt: NOW,
+      },
+      nowIso: NOW,
+      nowMs: NOW_MS,
+    })
+    expect(isWorkSyncAdmissionHandshakeOpen()).toBe(true)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)
+    closeLocalWorkSyncAdmissionForUserStop(guard)
+    expect(isWorkSyncAdmissionHandshakeOpen()).toBe(false)
+    expect(shouldDeferUnticketedWorkSyncNudges()).toBe(true)
   })
 })

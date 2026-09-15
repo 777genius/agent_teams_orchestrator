@@ -29,10 +29,10 @@ import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmiss
 import {
   getBoundWorkSyncContinuationTicket,
   getWorkSyncIdleDeliveryRetryDelayMs,
-  isWorkSyncAdmissionHandshakeOpen,
   isWorkSyncPostTurnAdmissionWindowOpen,
   isWorkSyncTestConsumeHoldOpen,
   processBoundWorkSyncContinuationAdmission,
+  shouldDeferUnticketedWorkSyncNudges,
 } from '../utils/workSyncContinuationAdmission.js'
 import {
   isMatchingWorkSyncContinuationTicket,
@@ -3882,7 +3882,7 @@ export function useInboxPoller({
       bootstrapPendingMessage == null
         ? getOrdinaryPendingMessage({
             pendingMessages,
-            deferUnticketedWorkSyncNudges: isWorkSyncAdmissionHandshakeOpen(),
+            deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
           })
         : undefined
 
