@@ -19,12 +19,15 @@ export function isOpenCodeApiKeyAuthFailureMessage(lower: string): boolean {
     || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
 }
 
-function hasHttpAuthStatus(lower: string, status: '401' | '403'): boolean {
-  const statusWord = status === '401' ? 'unauthorized|unauthorised' : 'forbidden'
+function hasHttpAuthStatus(lower: string, status: '401'): boolean {
   return new RegExp(
     String.raw`\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|error(?:[\s_-]*code)?)["']?\s*(?::|=|is|of)?\s*["']?${status}\b`,
   ).test(lower)
-    || new RegExp(String.raw`\b${status}\s+(?:${statusWord})\b`).test(lower)
+    || new RegExp(String.raw`\b${status}\s+(?:unauthorized|unauthorised)\b`).test(lower)
+}
+
+function isOpenCodeUnauthorizedToken(lower: string): boolean {
+  return /\bunauthorized\b/.test(lower) || /unauthorizederror/.test(lower)
 }
 
 export function isOpenCodeCatalogAuthExpiryFailureMessage(lower: string): boolean {
@@ -39,16 +42,13 @@ export function isOpenCodeCatalogAuthExpiryFailureMessage(lower: string): boolea
     || lower.includes("please run 'agent login'")
     || lower.includes('please run `kiro-cli login`')
     || lower.includes('cursor_api_key')
-    || /\bunauthorized\b/.test(lower)
+    || isOpenCodeUnauthorizedToken(lower)
     || hasHttpAuthStatus(lower, '401')
 }
 
 export function isOpenCodeAuthenticationFailureMessage(lower: string): boolean {
   return isOpenCodeCatalogAuthExpiryFailureMessage(lower)
     || isOpenCodeApiKeyAuthFailureMessage(lower)
-    // Execution probes keep substring matching for concatenated forms such as
-    // UnauthorizedError. Catalog sanitization stays on the word-boundary helper.
-    || lower.includes('unauthorized')
     || lower.includes('forbidden')
     || /\b403\b/.test(lower)
     || /\b401\b/.test(lower)

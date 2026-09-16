@@ -26,13 +26,11 @@ describe('classifyOpenCodeProviderFailure', () => {
     expect(classifyOpenCodeProviderFailure('HTTP 403 Forbidden')).toBe('not_authenticated')
   })
 
-  test('keeps concatenated unauthorized forms as not authenticated for execution probes', () => {
+  test('keeps UnauthorizedError as not authenticated without matching unauthorized_user', () => {
     expect(classifyOpenCodeProviderFailure('UnauthorizedError: bad credentials')).toBe(
       'not_authenticated',
     )
-    expect(classifyOpenCodeProviderFailure('unauthorized_user lookup failed')).toBe(
-      'not_authenticated',
-    )
+    expect(classifyOpenCodeProviderFailure('unauthorized_user lookup failed')).toBe('unknown')
   })
 
   test('leaves unknown host crashes unclassified', () => {
@@ -76,6 +74,17 @@ describe('classifyOpenCodeCatalogSanitizedFailure', () => {
     })
   })
 
+  test('treats UnauthorizedError as catalog auth-failed', () => {
+    expect(classifyOpenCodeCatalogSanitizedFailure({
+      displayName: 'GitHub Copilot',
+      rawMessage: 'UnauthorizedError: bad credentials',
+    })).toEqual({
+      code: 'auth-failed',
+      message:
+        'GitHub Copilot sign-in is no longer valid. Sign in again, then refresh the OpenCode catalog.',
+    })
+  })
+
   test('does not treat coincidental 401/403 numbers or forbidden identifiers as catalog auth failures', () => {
     for (const rawMessage of [
       'HTTP 403 Forbidden: account not entitled',
@@ -84,7 +93,6 @@ describe('classifyOpenCodeCatalogSanitizedFailure', () => {
       'missing field: forbiddenModels',
       'timed out after 401 ms',
       'unauthorized_user lookup failed',
-      'UnauthorizedError: bad credentials',
     ]) {
       expect(classifyOpenCodeCatalogSanitizedFailure({
         displayName: 'OpenRouter',
