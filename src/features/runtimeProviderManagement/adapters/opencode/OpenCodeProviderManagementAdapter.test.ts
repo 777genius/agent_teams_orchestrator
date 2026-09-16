@@ -8305,7 +8305,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       expect(changed).toMatchObject({
         ok: false,
-        error: { message: 'OpenCode catalog request failed.' },
+        error: { message: "Couldn't load local models from OpenCode." },
       })
       expect(providerCalls).toBe(1)
       expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size)
@@ -8354,7 +8354,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const timedOut = await adapter.loadModels(input)
 
     expect(timedOut.ok).toBe(false)
-    if (!timedOut.ok) expect(timedOut.error.message).toBe('OpenCode catalog request failed.')
+    if (!timedOut.ok) expect(timedOut.error.message).toBe("Couldn't load local models from OpenCode.")
     expect(probeCalls).toBe(1)
   })
 
@@ -8576,7 +8576,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result).toMatchObject({
       ok: false,
-      error: { message: 'OpenCode catalog request failed.' },
+      error: { message: "Couldn't load local models from OpenCode." },
     })
     expect(JSON.stringify(result)).not.toContain('query-secret')
   })
@@ -8789,7 +8789,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       expect(result).toMatchObject({
         ok: false,
-        error: { message: 'OpenCode catalog request failed.' },
+        error: { message: "Couldn't load local models from OpenCode." },
       })
       expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
       expect(JSON.stringify(result)).not.toContain('unprefixed-final-identity-secret')

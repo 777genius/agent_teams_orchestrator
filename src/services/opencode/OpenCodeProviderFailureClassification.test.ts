@@ -26,6 +26,15 @@ describe('classifyOpenCodeProviderFailure', () => {
     expect(classifyOpenCodeProviderFailure('HTTP 403 Forbidden')).toBe('not_authenticated')
   })
 
+  test('keeps concatenated unauthorized forms as not authenticated for execution probes', () => {
+    expect(classifyOpenCodeProviderFailure('UnauthorizedError: bad credentials')).toBe(
+      'not_authenticated',
+    )
+    expect(classifyOpenCodeProviderFailure('unauthorized_user lookup failed')).toBe(
+      'not_authenticated',
+    )
+  })
+
   test('leaves unknown host crashes unclassified', () => {
     expect(classifyOpenCodeProviderFailure('connect ECONNREFUSED 127.0.0.1:4096')).toBe('unknown')
   })
@@ -75,6 +84,7 @@ describe('classifyOpenCodeCatalogSanitizedFailure', () => {
       'missing field: forbiddenModels',
       'timed out after 401 ms',
       'unauthorized_user lookup failed',
+      'UnauthorizedError: bad credentials',
     ]) {
       expect(classifyOpenCodeCatalogSanitizedFailure({
         displayName: 'OpenRouter',

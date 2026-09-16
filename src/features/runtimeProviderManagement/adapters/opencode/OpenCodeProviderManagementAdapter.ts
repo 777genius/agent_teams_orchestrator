@@ -43,8 +43,8 @@ import {
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
 import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
 import {
-  OPEN_CODE_CATALOG_FAILURE_MESSAGE,
   classifyOpenCodeCatalogSanitizedFailure,
+  formatOpenCodeCatalogUnknownFailureMessage,
 } from '../../../../services/opencode/OpenCodeProviderFailureClassification.js'
 import {
   buildOpenCodeModelRouteMetadata,
@@ -747,6 +747,10 @@ function catalogFailureDisplayName(providerId: string | undefined): string {
     return 'This provider'
   }
   return getProviderDisplayName(providerId)
+}
+
+function catalogSanitizedUnknownMessage(providerId?: string): string {
+  return formatOpenCodeCatalogUnknownFailureMessage(catalogFailureDisplayName(providerId))
 }
 
 async function safeRead<T>(read: () => Promise<T>): Promise<SafeValue<T>> {
@@ -3788,7 +3792,7 @@ export class OpenCodeProviderManagementAdapter
         return providerManagementError(
           'runtime-unhealthy',
           options.catalogFailureSanitization
-            ? OPEN_CODE_CATALOG_FAILURE_MESSAGE
+            ? `${catalogSanitizedUnknownMessage(options.catalogProviderId)} The catalog request timed out.`
             : inventory.probeError ?? 'OpenCode inventory probe timed out',
         )
       }
@@ -4306,7 +4310,7 @@ export class OpenCodeProviderManagementAdapter
         'runtime-unhealthy',
         deadline.signal.aborted
           ? catalogTimeoutDiagnostic(`OpenCode catalog overall deadline exceeded after ${deadline.commandBudgetMs}ms`, progress)
-          : OPEN_CODE_CATALOG_FAILURE_MESSAGE,
+          : catalogSanitizedUnknownMessage(input.providerId),
       )
     } finally {
       deadline.dispose()
@@ -4337,7 +4341,7 @@ export class OpenCodeProviderManagementAdapter
     } catch (error) {
       return providerManagementError(
         'runtime-unhealthy',
-        OPEN_CODE_CATALOG_FAILURE_MESSAGE,
+        catalogSanitizedUnknownMessage(providerId),
       )
     }
     const scopeKey = [
@@ -4356,14 +4360,14 @@ export class OpenCodeProviderManagementAdapter
         expectedScope: profileScope,
       }), deadline.signal)
     } catch {
-      return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+      return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
     }
     if (
       !prePreparationIdentity.reusable
       || (!prePreparationIdentity.managedAuthConsistent
         && !prePreparationIdentity.managedAuthAbsent)
     ) {
-      return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+      return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
     }
     const abortController = new AbortController()
     const abortFromDeadline = () => {
@@ -4430,13 +4434,13 @@ export class OpenCodeProviderManagementAdapter
         })
         leaveIdentityStep()
         if (!identity.reusable) {
-          return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+          return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
         }
         if (
           identity.key !== prePreparationIdentity.key
           || !identity.managedAuthConsistent
         ) {
-          return providerManagementError('runtime-unhealthy', OPEN_CODE_CATALOG_FAILURE_MESSAGE)
+          return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
         }
         // Health only proves the server is listening. Its first directory-scoped
         // request also initializes plugins/config, so do that once under the
@@ -4507,7 +4511,7 @@ export class OpenCodeProviderManagementAdapter
         ) {
           return providerManagementError(
             'runtime-unhealthy',
-            OPEN_CODE_CATALOG_FAILURE_MESSAGE,
+            catalogSanitizedUnknownMessage(providerId),
           )
         }
 

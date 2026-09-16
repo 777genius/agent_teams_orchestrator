@@ -46,6 +46,9 @@ export function isOpenCodeCatalogAuthExpiryFailureMessage(lower: string): boolea
 export function isOpenCodeAuthenticationFailureMessage(lower: string): boolean {
   return isOpenCodeCatalogAuthExpiryFailureMessage(lower)
     || isOpenCodeApiKeyAuthFailureMessage(lower)
+    // Execution probes keep substring matching for concatenated forms such as
+    // UnauthorizedError. Catalog sanitization stays on the word-boundary helper.
+    || lower.includes('unauthorized')
     || lower.includes('forbidden')
     || /\b403\b/.test(lower)
     || /\b401\b/.test(lower)
