@@ -8305,7 +8305,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       expect(changed).toMatchObject({
         ok: false,
-        error: { message: 'OpenCode catalog request failed.' },
+        error: { message: "Couldn't load local models from OpenCode." },
       })
       expect(providerCalls).toBe(1)
       expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size)
@@ -8354,7 +8354,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const timedOut = await adapter.loadModels(input)
 
     expect(timedOut.ok).toBe(false)
-    if (!timedOut.ok) expect(timedOut.error.message).toBe('OpenCode catalog request failed.')
+    if (!timedOut.ok) expect(timedOut.error.message).toBe("Couldn't load local models from OpenCode.")
     expect(probeCalls).toBe(1)
   })
 
@@ -8561,7 +8561,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       expect(result).toMatchObject({
         ok: false,
-        error: { message: 'OpenCode catalog request failed.' },
+        error: { message: "Couldn't load local models from OpenCode." },
       })
       expect(JSON.stringify(result)).not.toContain(leaked)
       expect(JSON.stringify(result)).not.toContain('private.invalid')
@@ -8576,9 +8576,81 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result).toMatchObject({
       ok: false,
-      error: { message: 'OpenCode catalog request failed.' },
+      error: { message: "Couldn't load local models from OpenCode." },
     })
     expect(JSON.stringify(result)).not.toContain('query-secret')
+  })
+
+  test('classifies expired OAuth catalog host failures as auth-failed without leaking the refresh payload', async () => {
+    let ensureHostCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          throw new Error(
+            'xAI token refresh failed (400): {"error":"invalid_grant","error_description":"Invalid or unknown refresh token"}',
+          )
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      projectPath: '/tmp/project',
+    })
+
+    expect(ensureHostCalls).toBe(1)
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'auth-failed',
+        message: 'local sign-in is no longer valid. Sign in again, then refresh the OpenCode catalog.',
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain('invalid_grant')
+  })
+
+  test('does not treat a bare HTTP 403 catalog host failure as auth-failed', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: {
+        ensureHost: async () => {
+          throw new Error('HTTP 403 Forbidden')
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'runtime-unhealthy',
+        message: "Couldn't load local models from OpenCode.",
+      },
+    })
   })
 
   test('allows first catalog preparation to materialize an initially absent managed credential', async () => {
@@ -8717,7 +8789,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       expect(result).toMatchObject({
         ok: false,
-        error: { message: 'OpenCode catalog request failed.' },
+        error: { message: "Couldn't load local models from OpenCode." },
       })
       expect((adapter as unknown as { catalogCache: Map<string, unknown> }).catalogCache.size).toBe(0)
       expect(JSON.stringify(result)).not.toContain('unprefixed-final-identity-secret')
