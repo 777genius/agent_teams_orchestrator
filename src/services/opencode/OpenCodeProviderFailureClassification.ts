@@ -27,7 +27,8 @@ function hasHttpAuthStatus(lower: string, status: '401'): boolean {
 }
 
 function isOpenCodeUnauthorizedToken(lower: string): boolean {
-  return /\bunauthorized\b/.test(lower) || /unauthorizederror/.test(lower)
+  return /\bunauthori[sz]ed\b/.test(lower)
+    || /unauthori[sz]ed(?:error|exception)s?\b/.test(lower)
 }
 
 export function isOpenCodeCatalogAuthExpiryFailureMessage(lower: string): boolean {
@@ -42,6 +43,8 @@ export function isOpenCodeCatalogAuthExpiryFailureMessage(lower: string): boolea
     || lower.includes("please run 'agent login'")
     || lower.includes('please run `kiro-cli login`')
     || lower.includes('cursor_api_key')
+    || lower.includes('invalid authentication credentials')
+    || /\bunauthenticated\b/.test(lower)
     || isOpenCodeUnauthorizedToken(lower)
     || hasHttpAuthStatus(lower, '401')
 }

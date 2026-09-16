@@ -30,7 +30,17 @@ describe('classifyOpenCodeProviderFailure', () => {
     expect(classifyOpenCodeProviderFailure('UnauthorizedError: bad credentials')).toBe(
       'not_authenticated',
     )
+    expect(classifyOpenCodeProviderFailure('UnauthorisedException')).toBe('not_authenticated')
+    expect(classifyOpenCodeProviderFailure('401 unauthorised')).toBe('not_authenticated')
+    expect(classifyOpenCodeProviderFailure('"unauthorized"')).toBe('not_authenticated')
     expect(classifyOpenCodeProviderFailure('unauthorized_user lookup failed')).toBe('unknown')
+    expect(classifyOpenCodeProviderFailure('UNAUTHORIZED_USER')).toBe('unknown')
+  })
+
+  test('classifies gRPC UNAUTHENTICATED as not authenticated', () => {
+    expect(classifyOpenCodeProviderFailure(
+      'UNAUTHENTICATED: Request had invalid authentication credentials.',
+    )).toBe('not_authenticated')
   })
 
   test('leaves unknown host crashes unclassified', () => {
@@ -83,6 +93,10 @@ describe('classifyOpenCodeCatalogSanitizedFailure', () => {
       message:
         'GitHub Copilot sign-in is no longer valid. Sign in again, then refresh the OpenCode catalog.',
     })
+    expect(classifyOpenCodeCatalogSanitizedFailure({
+      displayName: 'GitHub Copilot',
+      rawMessage: 'UNAUTHENTICATED: Request had invalid authentication credentials.',
+    }).code).toBe('auth-failed')
   })
 
   test('does not treat coincidental 401/403 numbers or forbidden identifiers as catalog auth failures', () => {
@@ -93,6 +107,7 @@ describe('classifyOpenCodeCatalogSanitizedFailure', () => {
       'missing field: forbiddenModels',
       'timed out after 401 ms',
       'unauthorized_user lookup failed',
+      'UNAUTHORIZED_USER',
     ]) {
       expect(classifyOpenCodeCatalogSanitizedFailure({
         displayName: 'OpenRouter',

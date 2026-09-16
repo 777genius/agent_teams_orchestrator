@@ -750,7 +750,13 @@ function catalogFailureDisplayName(providerId: string | undefined): string {
 }
 
 function catalogSanitizedUnknownMessage(providerId?: string): string {
-  return formatOpenCodeCatalogUnknownFailureMessage(catalogFailureDisplayName(providerId))
+  const raw = providerId?.trim() ?? ''
+  const normalized = raw
+    ? normalizeProviderId(canonicalizeOpenCodeProviderId(raw))
+    : null
+  return formatOpenCodeCatalogUnknownFailureMessage(
+    catalogFailureDisplayName(normalized ?? undefined),
+  )
 }
 
 async function safeRead<T>(read: () => Promise<T>): Promise<SafeValue<T>> {
