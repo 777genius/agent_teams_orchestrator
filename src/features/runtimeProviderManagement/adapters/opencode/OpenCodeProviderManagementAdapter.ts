@@ -746,9 +746,6 @@ function catalogFailureDisplayName(providerId: string | undefined): string {
   if (!providerId) {
     return 'This provider'
   }
-  if (providerId === 'xai') {
-    return 'SuperGrok'
-  }
   return getProviderDisplayName(providerId)
 }
 
