@@ -8,6 +8,10 @@ import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
+  classifyOpenCodeProviderFailure,
+  isOpenCodeUsageLimitFailureMessage,
+} from './OpenCodeProviderFailureClassification.js'
+import {
   openCodeCursorNativeFailureProbe,
   type OpenCodeCursorNativeProbeResult,
 } from './OpenCodeCursorNativeFailureProbe.js'
@@ -264,18 +268,6 @@ function normalizeFailureMessage(value: string): string {
   return trimmed
 }
 
-function isUsageLimitFailureMessage(lower: string): boolean {
-  return lower.includes('too many requests')
-    || /\b(?:rate|usage)[\s_-]*limit(?:error)?\b/.test(lower)
-    || /\bresource[\s_-]*exhausted(?:error)?\b/.test(lower)
-    || /\bfree[\s_-]*usage[\s_-]*(?:limit|exceeded)(?:error)?\b/.test(lower)
-    || /\bquota[\s_-]*exceeded(?:error)?\b/.test(lower)
-    || /\bgrpc[\s_-]*code["']?\s*[:=]\s*["']?8\b/.test(lower)
-    || /^\s*(?:error\s*[:=-]?\s*)?429\b/m.test(lower)
-    || /\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|error(?:[\s_-]*code)?|code)["']?\s*(?::|=|is|of)?\s*["']?429\b/.test(lower)
-    || /\b429\s+(?:too many requests|rate limit(?:ed)?|resource exhausted)\b/.test(lower)
-}
-
 function extractJsonMessage(value: string): string | null {
   try {
     return extractNestedErrorMessage(JSON.parse(value))
@@ -317,58 +309,19 @@ export function classifyProbeFailure(params: {
   message: string
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
   const reason = normalizeFailureMessage(params.message)
-  const lower = reason.toLowerCase()
-
-  // Provider quota markers are more specific than an accompanying HTTP 401/403.
-  // Some gateways wrap RESOURCE_EXHAUSTED in a generic forbidden response.
-  if (isUsageLimitFailureMessage(lower)) {
-    return {
-      outcome: 'unavailable',
-      reason,
-    }
-  }
-
-  if (
-    lower.includes('token refresh failed')
-    || lower.includes('authentication failed')
-    || lower.includes('authentication required')
-    || lower.includes('auth failed')
-    || lower.includes('not logged in')
-    || lower.includes('please run \'agent login\'')
-    || lower.includes('please run `kiro-cli login`')
-    || lower.includes('cursor_api_key')
-    || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
-    || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
-    || lower.includes('unauthorized')
-    || lower.includes('forbidden')
-    || /\b401\b/.test(lower)
-    || /\b403\b/.test(lower)
-  ) {
+  const kind = classifyOpenCodeProviderFailure(reason)
+  if (kind === 'not_authenticated') {
     return {
       outcome: 'not_authenticated',
       reason,
     }
   }
-
-  if (
-    lower.includes('model is not supported')
-    || lower.includes('model not supported')
-    || lower.includes('unsupported model')
-    || lower.includes('model not available')
-    || lower.includes('model unavailable')
-    || lower.includes('model is no longer available')
-    || (lower.includes('model') && lower.includes('no longer available to new users'))
-    || lower.includes('model not found')
-    || lower.includes('unknown model')
-    || lower.includes('invalid model')
-    || lower.includes('not available for your account')
-  ) {
+  if (kind === 'unavailable') {
     return {
       outcome: 'unavailable',
       reason,
     }
   }
-
   return {
     outcome: 'unknown',
     reason,
@@ -418,7 +371,7 @@ function buildCursorNativeExecutionOutcome(input: {
 
 function knownFailureMessagePriority(message: string | null): number {
   if (!message) return 0
-  if (isUsageLimitFailureMessage(message.toLowerCase())) return 3
+  if (isOpenCodeUsageLimitFailureMessage(message.toLowerCase())) return 3
   const classified = classifyProbeFailure({ message })
   if (classified.outcome === 'not_authenticated') return 2
   if (classified.outcome === 'unavailable') return 1

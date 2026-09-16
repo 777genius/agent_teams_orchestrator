@@ -8581,6 +8581,45 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(JSON.stringify(result)).not.toContain('query-secret')
   })
 
+  test('classifies expired OAuth catalog host failures as auth-failed without leaking the refresh payload', async () => {
+    let ensureHostCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          throw new Error(
+            'xAI token refresh failed (400): {"error":"invalid_grant","error_description":"Invalid or unknown refresh token"}',
+          )
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      projectPath: '/tmp/project',
+    })
+
+    expect(ensureHostCalls).toBe(1)
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'auth-failed',
+        message: 'local sign-in is no longer valid. Sign in again, then refresh the OpenCode catalog.',
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain('invalid_grant')
+  })
+
   test('allows first catalog preparation to materialize an initially absent managed credential', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-materialize-'))
     const previousData = process.env.CLAUDE_MULTIMODEL_DATA_HOME
