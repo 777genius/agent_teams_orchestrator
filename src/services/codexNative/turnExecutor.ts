@@ -40,6 +40,7 @@ import {
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
+import { buildCodexNativeUserLoopbackProviderConfigOverrides } from './userLoopbackProviderConfigOverrides.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -101,6 +102,7 @@ type ExecuteCodexNativeTurnDeps = {
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
   runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
+  buildUserLoopbackProviderConfigOverrides?: typeof buildCodexNativeUserLoopbackProviderConfigOverrides
 }
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 900_000
@@ -513,6 +515,11 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
+  const buildUserLoopbackProviderConfigOverrides =
+    deps.buildUserLoopbackProviderConfigOverrides ??
+    (process.env.BUN_TEST
+      ? () => []
+      : buildCodexNativeUserLoopbackProviderConfigOverrides)
   const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
   let capturedTurnId: string | null = null
   const emitRuntimeTurnSettled = async (input: {
@@ -614,6 +621,11 @@ export async function* executeCodexNativeTurn(
     const launchPolicy = resolveCodexNativeApprovalLaunchPolicy(
       params.permissionMode,
     )
+    const customProviderConfigOverrides = buildCodexNativeCustomProviderConfigOverrides()
+    const userLoopbackProviderConfigOverrides =
+      shouldIgnoreCodexNativeUserConfig() && customProviderConfigOverrides.length === 0
+        ? buildUserLoopbackProviderConfigOverrides()
+        : []
     const commonOptions = {
       prompt: resolvedPrompt.text,
       imagePaths: resolvedPrompt.imagePaths,
@@ -627,7 +639,8 @@ export async function* executeCodexNativeTurn(
       apiKey,
       forcedLoginMethod,
       configOverrides: [
-        ...buildCodexNativeCustomProviderConfigOverrides(),
+        ...customProviderConfigOverrides,
+        ...userLoopbackProviderConfigOverrides,
         ...buildCodexNativeMcpConfigOverrides({
           strictMcpConfig: getStrictMcpConfig(),
         }),

@@ -15,6 +15,7 @@ import {
   resolveCodexNativeExecTimeoutPolicy,
   resolveCodexNativeExecTimeoutMs,
 } from './turnExecutor.js'
+import { buildCodexNativeUserLoopbackProviderConfigOverrides } from './userLoopbackProviderConfigOverrides.js'
 
 function baseParams(overrides: Partial<Parameters<typeof executeCodexNativeTurn>[0]> = {}) {
   return {
@@ -571,6 +572,7 @@ describe('executeCodexNativeTurn', () => {
 
       await collectMessages(
         executeCodexNativeTurn(baseParams(), {
+          buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
             yield {
@@ -633,6 +635,7 @@ describe('executeCodexNativeTurn', () => {
 
       await collectMessages(
         executeCodexNativeTurn(baseParams(), {
+          buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
             yield {
@@ -697,6 +700,7 @@ describe('executeCodexNativeTurn', () => {
 
       await collectMessages(
         executeCodexNativeTurn(baseParams(), {
+          buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
             yield {
@@ -857,6 +861,67 @@ describe('executeCodexNativeTurn', () => {
           previousIgnoreUserConfig
       }
     }
+  })
+
+  test('forwards loopback user provider overrides while still isolating user config', async () => {
+    let observedConfigOverrides: string[] | undefined
+    let observedIgnoreUserConfig: boolean | undefined
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        buildUserLoopbackProviderConfigOverrides: () =>
+          buildCodexNativeUserLoopbackProviderConfigOverrides({
+            configToml: `
+model_provider = "codex-mixin"
+[model_providers.codex-mixin]
+name = "Codex Mixin"
+base_url = "http://127.0.0.1:8788/v1"
+wire_api = "responses"
+requires_openai_auth = true
+`,
+            env: { CODEX_HOME: '/tmp/codex-home' },
+          }),
+        runExec: async function* (options) {
+          observedConfigOverrides = options.configOverrides
+          observedIgnoreUserConfig = options.ignoreUserConfig
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: null,
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+      }),
+    )
+
+    expect(observedIgnoreUserConfig).toBe(true)
+    expect(observedConfigOverrides).toEqual([
+      'model_provider="codex-mixin"',
+      'model_providers.codex-mixin.base_url="http://127.0.0.1:8788/v1"',
+      'model_providers.codex-mixin.name="Codex Mixin"',
+      'model_providers.codex-mixin.wire_api="responses"',
+      'model_providers.codex-mixin.requires_openai_auth=true',
+    ])
   })
 
   test('allows explicit user config isolation opt-out for native exec', async () => {
