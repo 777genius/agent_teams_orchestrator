@@ -2164,7 +2164,26 @@ export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolution
   return resolveOpenCodeProfileScopeInternal(input)
 }
 
+async function pendingXaiOAuthReceiptOwnerProjectPath(
+  globalAuthPath: string,
+): Promise<string | null> {
+  try {
+    const raw = JSON.parse(await readFile(`${globalAuthPath}.agent-teams-xai-oauth-save.json`, 'utf8')) as {
+      owner?: { projectPath?: unknown }
+    }
+    return typeof raw.owner?.projectPath === 'string' && raw.owner.projectPath.trim()
+      ? raw.owner.projectPath
+      : null
+  } catch {
+    return null
+  }
+}
+
 async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
+  // Catalog only lists models. A pending launch/probe OAuth receipt belongs to
+  // that owner project; harvesting it from SuperGrok catalog on another path
+  // used to fail closed as a sanitized unknown with empty stderr.
+  if (input.purpose === 'catalog') return
   // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
   // Fresh launch resolution can finish an already proven native publication;
   // it cannot create provenance from an old managed auth file.
@@ -2173,6 +2192,21 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
     const managedPaths = resolveClaudeMultimodelPaths(env)
     const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
     const globalAuthPath = path.join(managedPaths.data, 'opencode', 'auth.json')
+    // Provider Settings Test uses execution_probe. A leftover launch receipt
+    // from another project must not fail-close the model route; skip harvest
+    // and keep using the already saved SuperGrok credential.
+    if (input.purpose === 'execution_probe') {
+      const ownerProjectPath = await pendingXaiOAuthReceiptOwnerProjectPath(globalAuthPath)
+      if (ownerProjectPath) {
+        const [callerProjectPath, canonicalOwnerProjectPath] = await Promise.all([
+          canonicalizeOpenCodeProjectPath(input.projectPath),
+          canonicalizeOpenCodeProjectPath(ownerProjectPath),
+        ])
+        if (callerProjectPath !== canonicalOwnerProjectPath) {
+          return
+        }
+      }
+    }
     await recoverOpenCodeOwnedOAuthSave({
       globalAuthPath, env,
       assertRetirementAuthority: async owner => {

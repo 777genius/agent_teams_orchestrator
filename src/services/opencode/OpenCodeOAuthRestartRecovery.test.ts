@@ -445,6 +445,32 @@ test('foreign project cannot authorize a pending or published restart transition
   expect((await saved(f, changed)).xai).toEqual(c1)
 })
 
+test('catalog from a foreign project does not harvest a pending OAuth restart', async () => {
+  const f = await fixture()
+  const project = path.join(f.root, 'catalog-project')
+  await mkdir(project)
+  const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' }
+  const catalog = await fresh(f, changed, 'catalog', project)
+  expect(catalog.ok).toBe(true)
+  expect(await readFile(f.receiptPath, 'utf8')).toBe(f.receiptText)
+  expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+  expect((await fresh(f, changed)).ok).toBe(true)
+  expect((await saved(f, changed)).xai).toEqual(c1)
+})
+
+test('execution probe from a foreign project does not harvest a pending OAuth restart', async () => {
+  const f = await fixture()
+  const project = path.join(f.root, 'probe-project')
+  await mkdir(project)
+  const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43102' }
+  const probe = await fresh(f, changed, 'execution_probe', project)
+  expect(probe.ok).toBe(true)
+  expect(await readFile(f.receiptPath, 'utf8')).toBe(f.receiptText)
+  expect(await exists(openCodeOAuthSuccessorPath(f.global))).toBe(false)
+  expect((await fresh(f, changed)).ok).toBe(true)
+  expect((await saved(f, changed)).xai).toEqual(c1)
+})
+
 for (const field of ['hostKey', 'processStartedAtMs', 'profileRootKey', 'messageId']) {
   test(`incomplete native identity cannot capture a restart successor: ${field}`, async () => {
     const f = await fixture()
@@ -484,12 +510,12 @@ for (const session of [false, true]) for (const terminal of [undefined, 'incompl
     if (drift === 'authority-root') env.AGENT_TEAMS_MCP_CLAUDE_DIR = path.join(f.root, 'foreign-app')
     if (drift === 'source-paths') env.XDG_DATA_HOME = path.join(f.root, 'foreign-source')
     const result = await fresh(f, env, 'execution_probe', foreign)
-    expect(result.ok).toBe(false)
+    expect(result.ok).toBe(true)
     expect(await exists(f.receiptPath)).toBe(true)
     expect(await exists(f.archivePath)).toBe(false)
     const retained = await Bun.file(f.receiptPath).json()
     expect(retained.owner).toEqual(f.receipt.owner)
-    expect(retained.successor).toEqual(terminal ? null : c1)
+    expect(retained.successor).toEqual(f.receipt.successor)
     expect(await read(f.global)).toEqual(c0)
     let calls = 0
     await expect(manager.withOwnedOAuthRefresh({ profile: f.profile, assertHostOwnership: async () => {},
