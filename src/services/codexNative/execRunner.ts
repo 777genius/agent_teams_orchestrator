@@ -35,6 +35,7 @@ export type CodexNativeExecRunnerOptions = {
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
+  extraEnv?: NodeJS.ProcessEnv
   disabledFeatures?: string[]
   imagePaths?: string[]
   ignoreUserConfig?: boolean
@@ -402,7 +403,7 @@ export async function* runCodexNativeExec(
     version: (deps.resolveVersion ?? defaultResolveVersion)(executablePath),
   }
 
-  const env: NodeJS.ProcessEnv = { ...process.env }
+  const env: NodeJS.ProcessEnv = { ...process.env, ...options.extraEnv }
   if (options.forcedLoginMethod === 'chatgpt') {
     delete env.OPENAI_API_KEY
     delete env.CODEX_API_KEY

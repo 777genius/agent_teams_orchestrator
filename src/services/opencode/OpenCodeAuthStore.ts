@@ -69,8 +69,12 @@ type OpenCodeOAuthSaveReceipt = {
   publicationRevoked?: true
 }
 
-function oauthSaveReceiptPath(globalAuthPath: string): string {
+export function openCodeOAuthSaveReceiptPath(globalAuthPath: string): string {
   return `${globalAuthPath}.agent-teams-xai-oauth-save.json`
+}
+
+function oauthSaveReceiptPath(globalAuthPath: string): string {
+  return openCodeOAuthSaveReceiptPath(globalAuthPath)
 }
 
 // This file is exclusively app-written under the existing auth coordination

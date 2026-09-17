@@ -50,8 +50,10 @@ test('startup exhausted after awaited identity cannot mutate; every unprocessed 
 test('startup multiple candidates share repeated four-second identity budget and never POST or spawn a host', async () => {
   await fixture(async path => {
     let now = 0
+    const origin = 1_700_000_000_000
+    spyOn(Date, 'now').mockImplementation(() => origin)
     const alive = new Set([41001, 41002])
-    const budget = new OpenCodeStartupCleanupBudget(Date.now() + 18_000, () => now)
+    const budget = new OpenCodeStartupCleanupBudget(origin + 18_000, () => now)
     const queryCaps: number[] = []
     const fetchJson = mock(async () => { throw new Error('unexpected HTTP') })
     const spawn = spyOn(childProcess, 'spawn').mockImplementation((_cmd, args) => {

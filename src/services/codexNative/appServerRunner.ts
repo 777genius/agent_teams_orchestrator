@@ -6,6 +6,7 @@ import {
   readdir,
   rm,
   symlink,
+  writeFile,
 } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -81,6 +82,8 @@ export type CodexNativeAppServerRunnerOptions = {
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
+  extraEnv?: NodeJS.ProcessEnv
+  loopbackOverlayToml?: string | null
   disabledFeatures?: string[]
   abortSignal?: AbortSignal
   idleTimeoutMs?: number | null
@@ -590,7 +593,7 @@ export async function* runCodexNativeAppServer(
     version: (deps.resolveVersion ?? defaultResolveVersion)(executablePath),
   }
 
-  const env: NodeJS.ProcessEnv = { ...process.env }
+  const env: NodeJS.ProcessEnv = { ...process.env, ...options.extraEnv }
   if (options.forcedLoginMethod === 'chatgpt') {
     delete env.OPENAI_API_KEY
     delete env.CODEX_API_KEY
@@ -606,6 +609,13 @@ export async function* runCodexNativeAppServer(
   }
 
   const codexHomeOverlay = await createCodexAppServerHomeOverlay(env)
+  if (options.loopbackOverlayToml && codexHomeOverlay.env.CODEX_HOME) {
+    await writeFile(
+      path.join(codexHomeOverlay.env.CODEX_HOME, CODEX_CONFIG_FILE_NAME),
+      options.loopbackOverlayToml,
+      { mode: 0o600 },
+    )
+  }
   let child: SpawnedCodexAppServerProcess
   try {
     child =
