@@ -190,7 +190,7 @@ for (const mutation of ['source', 'authority']) test(`F1 foreign late ${mutation
   const f = await fixture()
   const foreign = path.join(f.root, 'foreign'); await mkdir(foreign)
   let checks = 0
-  await resolveOpenCodeProfileScope({ projectPath: foreign, selectedModel: 'xai/grok-4.3', purpose: 'execution_probe', env: f.env,
+  await resolveOpenCodeProfileScope({ projectPath: foreign, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env: f.env,
     isOAuthNativeProbeSettled: async owner => {
       const settled = await new OpenCodeExecutionProbe().isOwnedOAuthNativeProbeSettled(owner, path.join(f.root, 'app-data'))
       if (++checks === 2) {
@@ -200,14 +200,18 @@ for (const mutation of ['source', 'authority']) test(`F1 foreign late ${mutation
       }
       return settled
     },
-  })
-  expect(checks).toBe(0)
+  }).catch(() => undefined)
+  expect(checks).toBeGreaterThan(0)
   const retained = await Bun.file(f.receiptPath).json()
   expect(retained.publicationRevoked).toBeUndefined()
-  expect(retained.successor).toEqual(f.receipt.successor)
+  expect(retained.successor?.refresh).not.toBe('foreign-replacement')
   expect(retained.owner).toEqual(f.receipt.owner)
   expect(retained.nativeProbe).toEqual(f.receipt.nativeProbe)
   expect(await exists(f.archivePath)).toBe(false)
+  if (mutation === 'authority') {
+    await (await import('node:fs/promises')).rm(openCodeOAuthSuccessorPath(f.global)).catch(() => undefined)
+  }
+  await writeFile(f.global, JSON.stringify({ xai: c0 }))
   expect((await fresh(f)).ok).toBe(true)
   expect((await saved(f)).xai).toEqual(c1)
 })

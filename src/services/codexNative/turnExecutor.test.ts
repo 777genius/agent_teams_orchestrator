@@ -69,6 +69,16 @@ async function collectMessagesAndSummary(
   }
 }
 
+function executeTurn(
+  params: Parameters<typeof executeCodexNativeTurn>[0],
+  deps: Parameters<typeof executeCodexNativeTurn>[1] = {},
+) {
+  return executeCodexNativeTurn(params, {
+    buildUserLoopbackProviderConfigOverrides: () => [],
+    ...deps,
+  })
+}
+
 afterEach(() => {
   clearDynamicTeamContext()
   setStrictMcpConfig(false)
@@ -173,7 +183,7 @@ describe('executeCodexNativeTurn', () => {
     const params = baseParams({ prompt })
 
     await collectMessages(
-      executeCodexNativeTurn(params, {
+      executeTurn(params, {
         runExec: async function* (options) {
           observedIdleTimeoutMs = options.idleTimeoutMs
           observedAbsoluteTimeoutMs = options.absoluteTimeoutMs
@@ -216,7 +226,7 @@ describe('executeCodexNativeTurn', () => {
     let observedAbsoluteTimeoutMs: number | null | undefined = undefined
 
     await collectMessages(
-      executeCodexNativeTurn(baseParams(), {
+      executeTurn(baseParams(), {
         runExec: async function* (options) {
           observedIdleTimeoutMs = options.idleTimeoutMs
           observedAbsoluteTimeoutMs = options.absoluteTimeoutMs
@@ -260,7 +270,7 @@ describe('executeCodexNativeTurn', () => {
       let observedReasoningEffort: string | null | undefined
 
       await collectMessages(
-        executeCodexNativeTurn(
+        executeTurn(
           baseParams({ model: 'gpt-5.6-sol', effortValue: effort }),
           {
             runExec: async function* (options) {
@@ -304,7 +314,7 @@ describe('executeCodexNativeTurn', () => {
     let observedApprovalPolicy: 'never' | 'on-request' | null | undefined
 
     await collectMessages(
-      executeCodexNativeTurn(baseParams({ permissionMode: 'bypassPermissions' }), {
+      executeTurn(baseParams({ permissionMode: 'bypassPermissions' }), {
         runExec: async function* (options) {
           observedApprovalPolicy = options.approvalPolicy
           yield {
@@ -359,7 +369,7 @@ describe('executeCodexNativeTurn', () => {
     let observedApprovalProvider: string | null = null
 
     const messages = await collectMessages(
-      executeCodexNativeTurn(
+      executeTurn(
         baseParams({
           permissionMode: 'default',
           requestApproval: async approval => {
@@ -435,7 +445,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedDisabledFeatures = options.disabledFeatures
             yield {
@@ -501,7 +511,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedDisabledFeatures = options.disabledFeatures
             observedApiKey = options.apiKey
@@ -571,7 +581,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
@@ -634,7 +644,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
@@ -699,7 +709,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           buildUserLoopbackProviderConfigOverrides: () => [],
           runExec: async function* (options) {
             observedConfigOverrides = options.configOverrides
@@ -766,7 +776,7 @@ describe('executeCodexNativeTurn', () => {
       })
 
       await collectMessages(
-        executeCodexNativeTurn(baseParams({ permissionMode: 'default' }), {
+        executeTurn(baseParams({ permissionMode: 'default' }), {
           runAppServer: async function* (options) {
             observedConfigOverrides = options.configOverrides
             yield {
@@ -819,7 +829,7 @@ describe('executeCodexNativeTurn', () => {
     try {
       delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedIgnoreUserConfig = options.ignoreUserConfig
             yield {
@@ -864,11 +874,15 @@ describe('executeCodexNativeTurn', () => {
   })
 
   test('forwards loopback user provider overrides while still isolating user config', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
     let observedConfigOverrides: string[] | undefined
     let observedIgnoreUserConfig: boolean | undefined
 
-    await collectMessages(
-      executeCodexNativeTurn(baseParams(), {
+    try {
+      delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      await collectMessages(
+      executeTurn(baseParams(), {
         buildUserLoopbackProviderConfigOverrides: () =>
           buildCodexNativeUserLoopbackProviderConfigOverrides({
             configToml: `
@@ -922,6 +936,14 @@ requires_openai_auth = true
       'model_providers.codex-mixin.wire_api="responses"',
       'model_providers.codex-mixin.requires_openai_auth=true',
     ])
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+    }
   })
 
   test('allows explicit user config isolation opt-out for native exec', async () => {
@@ -932,7 +954,7 @@ requires_openai_auth = true
     try {
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'false'
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedIgnoreUserConfig = options.ignoreUserConfig
             yield {
@@ -984,7 +1006,7 @@ requires_openai_auth = true
     try {
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'true'
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedIgnoreUserConfig = options.ignoreUserConfig
             yield {
@@ -1037,7 +1059,7 @@ requires_openai_auth = true
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'false'
       setStrictMcpConfig(true)
       await collectMessages(
-        executeCodexNativeTurn(baseParams(), {
+        executeTurn(baseParams(), {
           runExec: async function* (options) {
             observedIgnoreUserConfig = options.ignoreUserConfig
             yield {
@@ -1088,7 +1110,7 @@ requires_openai_auth = true
     })
     const persistenceCalls: string[] = []
     const messages = await collectMessages(
-      executeCodexNativeTurn(params, {
+      executeTurn(params, {
         runExec: async function* () {
           yield {
             type: 'normalized_event',
@@ -1181,7 +1203,7 @@ requires_openai_auth = true
       ],
     })
 
-    const messages = await collectMessages(executeCodexNativeTurn(params))
+    const messages = await collectMessages(executeTurn(params))
 
     expect(messages[0]).toMatchObject({
       type: 'assistant',
@@ -1222,7 +1244,7 @@ requires_openai_auth = true
     })
 
     const transcriptSnapshots: number[] = []
-    const iterator = executeCodexNativeTurn(params, {
+    const iterator = executeTurn(params, {
       runExec: async function* () {
         yield {
           type: 'binary_identity',
@@ -1381,7 +1403,7 @@ requires_openai_auth = true
       persistSession: true,
     })
 
-    const iterator = executeCodexNativeTurn(params, {
+    const iterator = executeTurn(params, {
       runExec: async function* () {
         yield {
           type: 'binary_identity',
@@ -1477,7 +1499,7 @@ requires_openai_auth = true
     const events: CodexNativeTurnSettledEvent[] = []
 
     await collectMessages(
-      executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+      executeTurn(baseParams({ cwd: '/tmp/alpha' }), {
         runExec: async function* () {
           yield {
             type: 'normalized_event',
@@ -1543,7 +1565,7 @@ requires_openai_auth = true
     const events: CodexNativeTurnSettledEvent[] = []
 
     await collectMessages(
-      executeCodexNativeTurn(
+      executeTurn(
         baseParams({
           cwd: '/tmp/alpha',
           initialAppState: {
@@ -1622,7 +1644,7 @@ requires_openai_auth = true
       planModeRequired: false,
     })
     const events: CodexNativeTurnSettledEvent[] = []
-    const iterator = executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+    const iterator = executeTurn(baseParams({ cwd: '/tmp/alpha' }), {
       runExec: async function* () {
         yield {
           type: 'normalized_event',
@@ -1682,7 +1704,7 @@ requires_openai_auth = true
     const events: CodexNativeTurnSettledEvent[] = []
 
     await collectMessages(
-      executeCodexNativeTurn(baseParams(), {
+      executeTurn(baseParams(), {
         runExec: async function* () {
           throw new Error('codex crashed')
         },
@@ -1708,7 +1730,7 @@ requires_openai_auth = true
     const events: CodexNativeTurnSettledEvent[] = []
 
     await collectMessages(
-      executeCodexNativeTurn(baseParams(), {
+      executeTurn(baseParams(), {
         runExec: async function* () {
           yield {
             type: 'normalized_event',

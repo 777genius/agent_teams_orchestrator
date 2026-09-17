@@ -517,9 +517,7 @@ export async function* executeCodexNativeTurn(
     deps.flushSessionStorage ?? flushSessionStorage
   const buildUserLoopbackProviderConfigOverrides =
     deps.buildUserLoopbackProviderConfigOverrides ??
-    (process.env.BUN_TEST
-      ? () => []
-      : buildCodexNativeUserLoopbackProviderConfigOverrides)
+    buildCodexNativeUserLoopbackProviderConfigOverrides
   const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
   let capturedTurnId: string | null = null
   const emitRuntimeTurnSettled = async (input: {
