@@ -998,6 +998,82 @@ requires_openai_auth = true
     }
   })
 
+  test('forwards loopback overrides even when user config isolation is off', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedConfigOverrides: string[] | undefined
+    let observedExtraEnv: NodeJS.ProcessEnv | undefined
+    let observedOverlayToml: string | null | undefined
+
+    try {
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'false'
+      await collectMessages(
+        executeTurn(
+          baseParams({ permissionMode: 'default' }),
+          {
+          resolveUserLoopbackLaunchConfig: () => ({
+            configOverrides: [
+              'model_provider="codex-mixin"',
+              'model_providers.codex-mixin.base_url="http://127.0.0.1:8788/v1"',
+            ],
+            secretEnv: { AGENT_TEAMS_CODEX_LOOPBACK_TOKEN: 'secret-mixin-token' },
+            overlayToml: '[model_providers.codex-mixin]\nexperimental_bearer_token = "secret-mixin-token"\n',
+          }),
+          runAppServer: async function* (options) {
+            observedConfigOverrides = options.configOverrides
+            observedExtraEnv = options.extraEnv
+            observedOverlayToml = options.loopbackOverlayToml
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedConfigOverrides).toEqual(
+        expect.arrayContaining([
+          'model_provider="codex-mixin"',
+          'model_providers.codex-mixin.base_url="http://127.0.0.1:8788/v1"',
+        ]),
+      )
+      expect(observedConfigOverrides?.join('\n')).not.toContain('secret-mixin-token')
+      expect(observedExtraEnv).toEqual({
+        AGENT_TEAMS_CODEX_LOOPBACK_TOKEN: 'secret-mixin-token',
+      })
+      expect(observedOverlayToml).toContain('secret-mixin-token')
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+    }
+  })
+
   test('passes explicit user config isolation to native exec', async () => {
     const previousIgnoreUserConfig =
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG

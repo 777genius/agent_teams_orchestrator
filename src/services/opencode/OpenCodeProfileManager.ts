@@ -56,6 +56,7 @@ import {
   isValidOpenCodeOAuthCredential,
   withOpenCodeOwnedOAuthRefresh,
   recoverOpenCodeOwnedOAuthSave,
+  openCodeOAuthSaveReceiptPath,
   OpenCodeOAuthPublicationRevokedError,
   type OpenCodeOAuthNativeSessionOwner,
   type OpenCodeOAuthSaveOwner,
@@ -249,7 +250,14 @@ export async function canonicalizeOpenCodeProjectPath(
   try {
     return path.normalize(await realpath(resolved))
   } catch (error) {
-    if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') {
+    const code = getErrnoCode(error)
+    if (
+      code === 'ENOENT' ||
+      code === 'ENOTDIR' ||
+      code === 'EACCES' ||
+      code === 'ELOOP' ||
+      code === 'EPERM'
+    ) {
       return resolved
     }
     throw error
@@ -2164,26 +2172,37 @@ export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolution
   return resolveOpenCodeProfileScopeInternal(input)
 }
 
-async function pendingXaiOAuthReceiptOwnerProjectPath(
-  globalAuthPath: string,
-): Promise<string | null> {
+function isForeignOpenCodeOAuthHarvestSkip(error: unknown): boolean {
+  const code = getErrnoCode(error)
+  if (code === 'EACCES' || code === 'ELOOP' || code === 'EPERM') {
+    return true
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('another project')
+}
+
+async function peekOpenCodeOAuthSaveAdmission(globalAuthPath: string): Promise<{
+  owner: OpenCodeOAuthSaveOwner
+  predecessor: OpenCodeAuthCredential
+} | null> {
   try {
-    const raw = JSON.parse(await readFile(`${globalAuthPath}.agent-teams-xai-oauth-save.json`, 'utf8')) as {
-      owner?: { projectPath?: unknown }
+    const raw = JSON.parse(await readFile(openCodeOAuthSaveReceiptPath(globalAuthPath), 'utf8')) as {
+      owner?: OpenCodeOAuthSaveOwner
+      predecessor?: OpenCodeAuthCredential
     }
-    return typeof raw.owner?.projectPath === 'string' && raw.owner.projectPath.trim()
-      ? raw.owner.projectPath
-      : null
+    if (!raw.owner?.projectPath || !raw.predecessor) {
+      return null
+    }
+    return { owner: raw.owner, predecessor: raw.predecessor }
   } catch {
     return null
   }
 }
 
 async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
-  // Catalog only lists models. A pending launch/probe OAuth receipt belongs to
-  // that owner project; harvesting it from SuperGrok catalog on another path
-  // used to fail closed as a sanitized unknown with empty stderr.
-  if (input.purpose === 'catalog') return
+  // Catalog and provider tests must not fail-close on a leftover launch receipt
+  // from another project. Owner catalog/probe still completes a pending
+  // publication through recoverOpenCodeOwnedOAuthSave under the auth-store lock.
   // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
   // Fresh launch resolution can finish an already proven native publication;
   // it cannot create provenance from an old managed auth file.
@@ -2192,21 +2211,31 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
     const managedPaths = resolveClaudeMultimodelPaths(env)
     const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
     const globalAuthPath = path.join(managedPaths.data, 'opencode', 'auth.json')
-    // Provider Settings Test uses execution_probe. A leftover launch receipt
-    // from another project must not fail-close the model route; skip harvest
-    // and keep using the already saved SuperGrok credential.
-    if (input.purpose === 'execution_probe') {
-      const ownerProjectPath = await pendingXaiOAuthReceiptOwnerProjectPath(globalAuthPath)
-      if (ownerProjectPath) {
-        const [callerProjectPath, canonicalOwnerProjectPath] = await Promise.all([
-          canonicalizeOpenCodeProjectPath(input.projectPath),
-          canonicalizeOpenCodeProjectPath(ownerProjectPath),
-        ])
-        if (callerProjectPath !== canonicalOwnerProjectPath) {
-          return
+    if (input.purpose === 'catalog' || input.purpose === 'execution_probe') {
+      const pending = await peekOpenCodeOAuthSaveAdmission(globalAuthPath)
+      if (pending) {
+        try {
+          const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+          if (
+            projectPath !== pending.owner.projectPath &&
+            !await isOpenCodeOAuthPublicationScopeCurrent(
+              pending.owner,
+              pending.predecessor,
+              env,
+              projectPath,
+            )
+          ) {
+            return
+          }
+        } catch (error) {
+          if (isForeignOpenCodeOAuthHarvestSkip(error)) {
+            return
+          }
+          throw error
         }
       }
     }
+    try {
     await recoverOpenCodeOwnedOAuthSave({
       globalAuthPath, env,
       assertRetirementAuthority: async owner => {
@@ -2266,6 +2295,15 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
         }
       },
     })
+    } catch (error) {
+      if (
+        (input.purpose === 'catalog' || input.purpose === 'execution_probe') &&
+        isForeignOpenCodeOAuthHarvestSkip(error)
+      ) {
+        return
+      }
+      throw error
+    }
   }
 }
 

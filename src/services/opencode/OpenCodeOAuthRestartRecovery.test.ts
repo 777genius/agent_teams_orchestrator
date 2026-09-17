@@ -458,6 +458,14 @@ test('catalog from a foreign project does not harvest a pending OAuth restart', 
   expect((await saved(f, changed)).xai).toEqual(c1)
 })
 
+test('catalog from the owner project completes a pending OAuth restart', async () => {
+  const f = await fixture()
+  const catalog = await fresh(f, f.env, 'catalog', f.project)
+  expect(catalog.ok).toBe(true)
+  expect((await saved(f)).xai).toEqual(c1)
+  expect(await exists(f.receiptPath)).toBe(false)
+})
+
 test('execution probe from a foreign project does not harvest a pending OAuth restart', async () => {
   const f = await fixture()
   const project = path.join(f.root, 'probe-project')

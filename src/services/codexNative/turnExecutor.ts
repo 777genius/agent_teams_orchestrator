@@ -40,7 +40,11 @@ import {
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
-import { buildCodexNativeUserLoopbackProviderConfigOverrides } from './userLoopbackProviderConfigOverrides.js'
+import {
+  buildCodexNativeUserLoopbackProviderConfigOverrides,
+  resolveCodexNativeUserLoopbackLaunchConfig,
+  type CodexNativeUserLoopbackLaunchConfig,
+} from './userLoopbackProviderConfigOverrides.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -103,6 +107,29 @@ type ExecuteCodexNativeTurnDeps = {
   flushSessionStorage?: typeof flushSessionStorage
   runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
   buildUserLoopbackProviderConfigOverrides?: typeof buildCodexNativeUserLoopbackProviderConfigOverrides
+  resolveUserLoopbackLaunchConfig?: typeof resolveCodexNativeUserLoopbackLaunchConfig
+}
+
+const EMPTY_LOOPBACK_LAUNCH_CONFIG: CodexNativeUserLoopbackLaunchConfig = {
+  configOverrides: [],
+  secretEnv: {},
+  overlayToml: null,
+}
+
+function resolveLoopbackLaunchConfig(
+  deps: ExecuteCodexNativeTurnDeps,
+): CodexNativeUserLoopbackLaunchConfig {
+  if (deps.resolveUserLoopbackLaunchConfig) {
+    return deps.resolveUserLoopbackLaunchConfig()
+  }
+  if (deps.buildUserLoopbackProviderConfigOverrides) {
+    return {
+      configOverrides: deps.buildUserLoopbackProviderConfigOverrides(),
+      secretEnv: {},
+      overlayToml: null,
+    }
+  }
+  return resolveCodexNativeUserLoopbackLaunchConfig()
 }
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 900_000
@@ -515,9 +542,6 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
-  const buildUserLoopbackProviderConfigOverrides =
-    deps.buildUserLoopbackProviderConfigOverrides ??
-    buildCodexNativeUserLoopbackProviderConfigOverrides
   const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
   let capturedTurnId: string | null = null
   const emitRuntimeTurnSettled = async (input: {
@@ -620,10 +644,10 @@ export async function* executeCodexNativeTurn(
       params.permissionMode,
     )
     const customProviderConfigOverrides = buildCodexNativeCustomProviderConfigOverrides()
-    const userLoopbackProviderConfigOverrides =
-      shouldIgnoreCodexNativeUserConfig() && customProviderConfigOverrides.length === 0
-        ? buildUserLoopbackProviderConfigOverrides()
-        : []
+    const loopbackLaunch =
+      customProviderConfigOverrides.length === 0
+        ? resolveLoopbackLaunchConfig(deps)
+        : EMPTY_LOOPBACK_LAUNCH_CONFIG
     const commonOptions = {
       prompt: resolvedPrompt.text,
       imagePaths: resolvedPrompt.imagePaths,
@@ -636,9 +660,10 @@ export async function* executeCodexNativeTurn(
       ephemeral: shouldUseEphemeralCodexNativeThread(),
       apiKey,
       forcedLoginMethod,
+      extraEnv: loopbackLaunch.secretEnv,
       configOverrides: [
         ...customProviderConfigOverrides,
-        ...userLoopbackProviderConfigOverrides,
+        ...loopbackLaunch.configOverrides,
         ...buildCodexNativeMcpConfigOverrides({
           strictMcpConfig: getStrictMcpConfig(),
         }),
@@ -657,6 +682,7 @@ export async function* executeCodexNativeTurn(
       launchPolicy.transport === 'app-server'
         ? runAppServer({
             ...commonOptions,
+            loopbackOverlayToml: loopbackLaunch.overlayToml,
             requestApproval:
               params.requestApproval ??
               (async () => {

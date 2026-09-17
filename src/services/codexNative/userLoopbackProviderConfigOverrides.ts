@@ -1,13 +1,15 @@
 import { homedir } from 'node:os'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 const CONFIG_FILE_NAME = 'config.toml'
 const PROVIDER_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/
 const HEADER_NAME_PATTERN = /^[A-Za-z0-9-]{1,64}$/
+const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/
 const OPENAI_PROVIDER_IDS = new Set(['', 'openai', 'openai-chat', 'openai-responses'])
 const MAX_OVERRIDE_LENGTH = 2048
 const MAX_OVERRIDES_TOTAL_LENGTH = 8192
+const LOOPBACK_TOKEN_ENV_KEY = 'AGENT_TEAMS_CODEX_LOOPBACK_TOKEN'
 
 export type CodexUserLoopbackProvider = {
   providerId: string
@@ -25,7 +27,20 @@ export type CodexUserLoopbackProvider = {
   modelCatalogJsonPath: string | null
 }
 
-type ParsedTomlValue = string | boolean | number | Record<string, string> | null
+export type CodexNativeUserLoopbackLaunchConfig = {
+  configOverrides: string[]
+  secretEnv: Record<string, string>
+  overlayToml: string | null
+}
+
+type TomlCache = {
+  path: string
+  mtimeMs: number
+  size: number
+  text: string
+}
+
+let tomlCache: TomlCache | null = null
 
 function defaultCodexHome(env: NodeJS.ProcessEnv = process.env): string {
   return env.CODEX_HOME?.trim() || path.join(homedir(), '.codex')
@@ -34,175 +49,70 @@ function defaultCodexHome(env: NodeJS.ProcessEnv = process.env): string {
 export function readCodexUserConfigToml(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
+  const filePath = path.join(defaultCodexHome(env), CONFIG_FILE_NAME)
   try {
-    return readFileSync(path.join(defaultCodexHome(env), CONFIG_FILE_NAME), 'utf8')
+    const stats = statSync(filePath)
+    if (
+      tomlCache &&
+      tomlCache.path === filePath &&
+      tomlCache.mtimeMs === stats.mtimeMs &&
+      tomlCache.size === stats.size
+    ) {
+      return tomlCache.text
+    }
+    const text = readFileSync(filePath, 'utf8')
+    tomlCache = {
+      path: filePath,
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      text,
+    }
+    return text
   } catch {
     return null
   }
 }
 
-function stripInlineComment(line: string): string {
-  let inSingle = false
-  let inDouble = false
-  let escaped = false
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index]
-    if (escaped) {
-      escaped = false
-      continue
-    }
-    if (char === '\\' && inDouble) {
-      escaped = true
-      continue
-    }
-    if (char === "'" && !inDouble) {
-      inSingle = !inSingle
-      continue
-    }
-    if (char === '"' && !inSingle) {
-      inDouble = !inDouble
-      continue
-    }
-    if ((char === '#' || char === ';') && !inSingle && !inDouble) {
-      return line.slice(0, index).trimEnd()
-    }
-  }
-  return line
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
 }
 
-function unescapeJsonString(raw: string): string | null {
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function parseTomlDocument(configToml: string): Record<string, unknown> | null {
   try {
-    const parsed = JSON.parse(raw) as unknown
-    return typeof parsed === 'string' ? parsed : null
+    return asRecord(Bun.TOML.parse(configToml))
   } catch {
     return null
   }
 }
 
-function parseBareString(raw: string): string {
-  if (
-    (raw.startsWith('"') && raw.endsWith('"')) ||
-    (raw.startsWith("'") && raw.endsWith("'"))
-  ) {
-    if (raw.startsWith('"')) {
-      return unescapeJsonString(raw) ?? raw.slice(1, -1)
-    }
-    return raw.slice(1, -1)
-  }
-  return raw
-}
-
-function parseInlineTable(raw: string): Record<string, string> | null {
-  const trimmed = raw.trim()
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
-    return null
-  }
-  const body = trimmed.slice(1, -1).trim()
-  if (!body) {
+function parseHttpHeaders(value: unknown): Record<string, string> {
+  const record = asRecord(value)
+  if (!record) {
     return {}
   }
-  const entries: Record<string, string> = {}
-  const parts: string[] = []
-  let current = ''
-  let inSingle = false
-  let inDouble = false
-  let escaped = false
-  for (const char of body) {
-    if (escaped) {
-      current += char
-      escaped = false
-      continue
+  const headers: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    const headerValue = asString(raw)
+    if (!HEADER_NAME_PATTERN.test(key) || !headerValue || headerValue.length > 512) {
+      return {}
     }
-    if (char === '\\' && inDouble) {
-      current += char
-      escaped = true
-      continue
-    }
-    if (char === "'" && !inDouble) {
-      inSingle = !inSingle
-      current += char
-      continue
-    }
-    if (char === '"' && !inSingle) {
-      inDouble = !inDouble
-      current += char
-      continue
-    }
-    if (char === ',' && !inSingle && !inDouble) {
-      parts.push(current)
-      current = ''
-      continue
-    }
-    current += char
+    headers[key] = headerValue
   }
-  parts.push(current)
-
-  for (const part of parts) {
-    const separator = part.indexOf('=')
-    if (separator <= 0) {
-      return null
-    }
-    const key = parseBareString(part.slice(0, separator).trim())
-    const value = parseBareString(part.slice(separator + 1).trim())
-    if (!HEADER_NAME_PATTERN.test(key) || value.length === 0 || value.length > 512) {
-      return null
-    }
-    entries[key] = value
-  }
-  return entries
-}
-
-function parseTomlValue(raw: string): ParsedTomlValue {
-  const trimmed = raw.trim()
-  if (trimmed === 'true') {
-    return true
-  }
-  if (trimmed === 'false') {
-    return false
-  }
-  if (/^-?\d+$/.test(trimmed)) {
-    return Number.parseInt(trimmed, 10)
-  }
-  if (trimmed.startsWith('{')) {
-    return parseInlineTable(trimmed)
-  }
-  return parseBareString(trimmed)
-}
-
-function parseTopLevelAndSections(configToml: string): {
-  topLevel: Record<string, ParsedTomlValue>
-  sections: Map<string, Record<string, ParsedTomlValue>>
-} {
-  const topLevel: Record<string, ParsedTomlValue> = {}
-  const sections = new Map<string, Record<string, ParsedTomlValue>>()
-  let currentSection: string | null = null
-
-  for (const rawLine of configToml.split('\n')) {
-    const line = stripInlineComment(rawLine).trim()
-    if (!line) {
-      continue
-    }
-    if (line.startsWith('[')) {
-      const match = line.match(/^\[([^\]]+)\]$/)
-      currentSection = match ? match[1] : null
-      continue
-    }
-    const separator = line.indexOf('=')
-    if (separator <= 0) {
-      continue
-    }
-    const key = line.slice(0, separator).trim()
-    const value = parseTomlValue(line.slice(separator + 1))
-    if (currentSection) {
-      const section = sections.get(currentSection) ?? {}
-      section[key] = value
-      sections.set(currentSection, section)
-      continue
-    }
-    topLevel[key] = value
-  }
-
-  return { topLevel, sections }
+  return headers
 }
 
 function isLoopbackHttpUrl(value: string): boolean {
@@ -225,40 +135,30 @@ function isLoopbackHttpUrl(value: string): boolean {
   }
 }
 
-function asString(value: ParsedTomlValue | undefined): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim() : null
-}
-
-function asBoolean(value: ParsedTomlValue | undefined): boolean | null {
-  return typeof value === 'boolean' ? value : null
-}
-
-function asNumber(value: ParsedTomlValue | undefined): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
 function isSafeLocalCatalogPath(catalogPath: string, env: NodeJS.ProcessEnv): boolean {
   if (!path.isAbsolute(catalogPath) || catalogPath.includes('\0') || catalogPath.includes('..')) {
     return false
   }
   const resolved = path.resolve(catalogPath)
-  const allowedRoots = [path.resolve(defaultCodexHome(env))]
-  return allowedRoots.some(
-    root => resolved === root || resolved.startsWith(`${root}${path.sep}`),
-  )
+  const allowedRoot = path.resolve(defaultCodexHome(env))
+  return resolved === allowedRoot || resolved.startsWith(`${allowedRoot}${path.sep}`)
 }
 
 export function parseCodexUserLoopbackProvider(
   configToml: string,
   env: NodeJS.ProcessEnv = process.env,
 ): CodexUserLoopbackProvider | null {
-  const { topLevel, sections } = parseTopLevelAndSections(configToml)
+  const topLevel = parseTomlDocument(configToml)
+  if (!topLevel) {
+    return null
+  }
+
   const providerId = asString(topLevel.model_provider)
   if (!providerId || OPENAI_PROVIDER_IDS.has(providerId) || !PROVIDER_ID_PATTERN.test(providerId)) {
     return null
   }
 
-  const section = sections.get(`model_providers.${providerId}`)
+  const section = asRecord(asRecord(topLevel.model_providers)?.[providerId])
   const baseUrl = asString(section?.base_url)
   if (!baseUrl || !isLoopbackHttpUrl(baseUrl)) {
     return null
@@ -267,16 +167,12 @@ export function parseCodexUserLoopbackProvider(
   const wireApiRaw = asString(section?.wire_api)
   const wireApi =
     wireApiRaw === 'responses' || wireApiRaw === 'chat' ? wireApiRaw : null
-  const httpHeaders =
-    section?.http_headers && typeof section.http_headers === 'object'
-      ? section.http_headers
-      : {}
-  const catalogPath = asString(topLevel.model_catalog_json)
   const envKey = asString(section?.env_key)
-  if (envKey && !/^[A-Z][A-Z0-9_]{0,63}$/.test(envKey)) {
+  if (envKey && !ENV_KEY_PATTERN.test(envKey)) {
     return null
   }
 
+  const catalogPath = asString(topLevel.model_catalog_json)
   return {
     providerId,
     name: asString(section?.name),
@@ -287,7 +183,7 @@ export function parseCodexUserLoopbackProvider(
     streamIdleTimeoutMs: asNumber(section?.stream_idle_timeout_ms),
     requestMaxRetries: asNumber(section?.request_max_retries),
     envKey,
-    httpHeaders,
+    httpHeaders: parseHttpHeaders(section?.http_headers),
     experimentalBearerToken: asString(section?.experimental_bearer_token),
     defaultModel: asString(topLevel.model),
     modelCatalogJsonPath:
@@ -322,29 +218,68 @@ function pushOverride(overrides: string[], value: string, totalLength: { value: 
   return true
 }
 
-export function buildCodexNativeUserLoopbackProviderConfigOverrides(params?: {
+function buildSecretOverlayToml(provider: CodexUserLoopbackProvider): string | null {
+  const lines = [`[model_providers.${provider.providerId}]`]
+  let hasSecret = false
+  if (provider.experimentalBearerToken) {
+    lines.push(
+      `experimental_bearer_token = ${JSON.stringify(provider.experimentalBearerToken)}`,
+    )
+    hasSecret = true
+  }
+  const headerEntries = Object.entries(provider.httpHeaders)
+  if (headerEntries.length > 0) {
+    const headerBody = headerEntries
+      .map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`)
+      .join(', ')
+    lines.push(`http_headers = { ${headerBody} }`)
+    hasSecret = true
+  }
+  return hasSecret ? `${lines.join('\n')}\n` : null
+}
+
+export function resolveCodexNativeUserLoopbackLaunchConfig(params?: {
   configToml?: string | null
   env?: NodeJS.ProcessEnv
-}): string[] {
+}): CodexNativeUserLoopbackLaunchConfig {
+  const empty: CodexNativeUserLoopbackLaunchConfig = {
+    configOverrides: [],
+    secretEnv: {},
+    overlayToml: null,
+  }
   const env = params?.env ?? process.env
-  const configToml = params?.configToml === undefined ? readCodexUserConfigToml(env) : params.configToml
+  const configToml =
+    params?.configToml === undefined ? readCodexUserConfigToml(env) : params.configToml
   if (!configToml) {
-    return []
+    return empty
   }
 
   const provider = parseCodexUserLoopbackProvider(configToml, env)
   if (!provider) {
-    return []
+    return empty
   }
 
   const prefix = `model_providers.${provider.providerId}`
   const overrides: string[] = []
   const totalLength = { value: 0 }
+  const secretEnv: Record<string, string> = {}
+  const tokenEnvKey =
+    provider.experimentalBearerToken
+      ? provider.envKey && ENV_KEY_PATTERN.test(provider.envKey)
+        ? provider.envKey
+        : LOOPBACK_TOKEN_ENV_KEY
+      : null
+  if (provider.experimentalBearerToken && tokenEnvKey) {
+    secretEnv[tokenEnvKey] = provider.experimentalBearerToken
+  }
 
   const required = [
     tomlStringOverride('model_provider', provider.providerId),
     tomlStringOverride(`${prefix}.base_url`, provider.baseUrl),
   ]
+  if (provider.defaultModel) {
+    required.push(tomlStringOverride('model', provider.defaultModel))
+  }
   if (provider.name) {
     required.push(tomlStringOverride(`${prefix}.name`, provider.name))
   }
@@ -363,30 +298,31 @@ export function buildCodexNativeUserLoopbackProviderConfigOverrides(params?: {
   if (provider.requestMaxRetries !== null) {
     required.push(`${prefix}.request_max_retries=${provider.requestMaxRetries}`)
   }
-  if (provider.envKey) {
+  if (tokenEnvKey) {
+    required.push(tomlStringOverride(`${prefix}.env_key`, tokenEnvKey))
+  } else if (provider.envKey) {
     required.push(tomlStringOverride(`${prefix}.env_key`, provider.envKey))
   }
   if (provider.modelCatalogJsonPath) {
     required.push(tomlStringOverride('model_catalog_json', provider.modelCatalogJsonPath))
   }
 
-  if (Object.keys(provider.httpHeaders).length > 0) {
-    const headerBody = Object.entries(provider.httpHeaders)
-      .map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`)
-      .join(', ')
-    required.push(`${prefix}.http_headers={ ${headerBody} }`)
-  }
-  if (provider.experimentalBearerToken) {
-    required.push(
-      tomlStringOverride(`${prefix}.experimental_bearer_token`, provider.experimentalBearerToken),
-    )
-  }
-
   for (const override of required) {
     if (!pushOverride(overrides, override, totalLength)) {
-      return []
+      return empty
     }
   }
 
-  return overrides
+  return {
+    configOverrides: overrides,
+    secretEnv,
+    overlayToml: buildSecretOverlayToml(provider),
+  }
+}
+
+export function buildCodexNativeUserLoopbackProviderConfigOverrides(params?: {
+  configToml?: string | null
+  env?: NodeJS.ProcessEnv
+}): string[] {
+  return resolveCodexNativeUserLoopbackLaunchConfig(params).configOverrides
 }
