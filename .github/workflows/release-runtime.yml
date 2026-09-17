@@ -448,39 +448,35 @@ jobs:
           fi
 
           release_id="$EXISTING_DRAFT_RELEASE_ID"
-          if [[ -z "$release_id" ]]; then
-            release_json="$(gh api \
-              --method POST \
-              "repos/${TARGET_RELEASE_REPO}/releases" \
-              -f tag_name="$TARGET_RELEASE_TAG" \
-              -f name="$TARGET_RELEASE_TAG" \
-              -f body="Runtime assets for $TARGET_RELEASE_TAG" \
-              -F draft=true \
-              -F prerelease=false \
-              -f make_latest=false)"
-            release_id="$(jq -r '.id' <<<"$release_json")"
-          else
-            while IFS= read -r asset_id; do
-              [[ -n "$asset_id" ]] || continue
-              # GitHub returns 204 No Content; `gh api` fails parsing an empty body.
-              status="$(curl --silent --show-error \
-                --output /tmp/delete-runtime-asset-body \
-                --write-out '%{http_code}' \
-                --request DELETE \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header 'Accept: application/vnd.github+json' \
-                --header 'X-GitHub-Api-Version: 2022-11-28' \
-                "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/assets/${asset_id}")"
-              if [[ "$status" != "204" && "$status" != "404" ]]; then
-                echo "Failed to delete runtime asset ${asset_id}: HTTP ${status}" >&2
-                cat /tmp/delete-runtime-asset-body >&2
-                exit 1
-              fi
-            done < <(
-              gh api "repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?per_page=100" \
-                --jq '.[].id'
-            )
+          if [[ -n "$release_id" ]]; then
+            # Recreate the draft instead of deleting large assets one-by-one.
+            # GitHub often returns 500 when deleting those zips in place.
+            status="$(curl --silent --show-error \
+              --output /tmp/delete-runtime-draft-body \
+              --write-out '%{http_code}' \
+              --request DELETE \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}")"
+            if [[ "$status" != "204" && "$status" != "404" ]]; then
+              echo "Failed to delete runtime draft ${release_id}: HTTP ${status}" >&2
+              cat /tmp/delete-runtime-draft-body >&2
+              exit 1
+            fi
+            release_id=""
           fi
+
+          release_json="$(gh api \
+            --method POST \
+            "repos/${TARGET_RELEASE_REPO}/releases" \
+            -f tag_name="$TARGET_RELEASE_TAG" \
+            -f name="$TARGET_RELEASE_TAG" \
+            -f body="Runtime assets for $TARGET_RELEASE_TAG" \
+            -F draft=true \
+            -F prerelease=false \
+            -f make_latest=false)"
+          release_id="$(jq -r '.id' <<<"$release_json")"
 
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
             echo "Invalid draft release ID: ${release_id:-<empty>}" >&2
@@ -489,18 +485,27 @@ jobs:
 
           while IFS= read -r asset_name; do
             asset_path="release-flat/$asset_name"
-            upload_json="$(curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'Accept: application/vnd.github+json' \
-              --header 'Content-Type: application/octet-stream' \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              --data-binary "@$asset_path" \
-              "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}")"
-            if [[ "$(jq -r '.state' <<<"$upload_json")" != "uploaded" ]]; then
-              echo "Runtime asset upload was not committed: $asset_name" >&2
-              exit 1
-            fi
+            upload_json=""
+            for upload_attempt in $(seq 1 5); do
+              upload_json="$(curl --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --data-binary "@$asset_path" \
+                "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}" \
+                || true)"
+              if [[ "$(jq -r '.state // empty' <<<"$upload_json")" == "uploaded" ]]; then
+                break
+              fi
+              if [[ "$upload_attempt" -eq 5 ]]; then
+                echo "Runtime asset upload was not committed: $asset_name" >&2
+                echo "$upload_json" >&2
+                exit 1
+              fi
+              sleep $((upload_attempt * 3))
+            done
           done < expected-assets.txt
 
           for attempt in $(seq 1 10); do
