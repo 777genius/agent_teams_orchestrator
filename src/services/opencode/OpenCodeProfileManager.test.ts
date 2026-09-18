@@ -3576,4 +3576,33 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     ensureSelectedOpenCodeModelInImportedConfig(config, 'ollama/oauth-authority', 'launch_runtime')
     expect(config.provider.ollama.models).toEqual({ 'qwen2.5-coder:0.5b': {} })
   })
+
+  test('canonicalizes mixed-case local provider ids when seeding', () => {
+    const config = {
+      provider: {
+        ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'Ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({
+      'qwen2.5-coder:0.5b': {},
+      'qwen2.5-coder:7b-32k': {},
+    })
+  })
+
+  test('does not expand a cloud provider allowlist', () => {
+    const config = {
+      provider: {
+        openai: { models: { 'gpt-4o-mini': { limit: { context: 8192 } } } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'openai/gpt-4o', 'launch_runtime')
+    expect(config.provider.openai.models).toEqual({
+      'gpt-4o-mini': { limit: { context: 8192 } },
+    })
+  })
 })

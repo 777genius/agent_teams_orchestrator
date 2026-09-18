@@ -25,6 +25,23 @@ export function canonicalizeOpenCodeProviderId(value: string): string {
   )
 }
 
+const LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS = new Set([
+  'llama.cpp',
+  'llamacpp',
+  'lmstudio',
+  'lm-studio',
+  'local',
+  'ollama',
+  'vllm',
+])
+
+export function isLocalInexactOpenCodeLaunchProviderId(
+  providerId: string | null | undefined,
+): boolean {
+  const normalized = normalizeOpenCodeProviderId(providerId)
+  return Boolean(normalized && LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS.has(normalized))
+}
+
 export function isLiteralLoopbackOpenCodeUrl(value: unknown): boolean {
   if (typeof value !== 'string' || !value.trim()) {
     return false

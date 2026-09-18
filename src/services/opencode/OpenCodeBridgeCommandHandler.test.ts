@@ -3069,11 +3069,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     let probedModelId: string | null = null
     let probedDisposeHostOnRelease: boolean | undefined
-    let probedBypassCache: boolean | undefined
-    openCodeExecutionProbe.probeModel = (async input => {
+    let slimProbeCalls = 0
+    openCodeExecutionProbe.probeModel = (async () => {
+      slimProbeCalls += 1
+      throw new Error('readiness proof must stay on the retained host')
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
-      probedBypassCache = input.bypassCache
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -3092,7 +3095,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         errorCount: 0,
         diagnostics: [],
       }
-    }) as typeof openCodeExecutionProbe.probeModel
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.readiness', {
@@ -3107,8 +3110,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
-    expect(probedBypassCache).toBe(true)
+    expect(probedDisposeHostOnRelease).toBeUndefined()
+    expect(slimProbeCalls).toBe(0)
     expect(provisioningOptions).toEqual([{}])
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
@@ -5009,6 +5012,60 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(memberCalls).toBe(1)
   })
 
+  test('rejects local Ollama launch proof that is not PONG', async () => {
+    let memberCalls = 0
+    openCodeProvisioningProbe.probeRetainingHost = (async () => (
+      { snapshot, host: snapshot.host, release: async () => {} }
+    )) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeExecutionProbe.probeModel = (async () => {
+      throw new Error('launch proof must stay on the retained host')
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeExecutionProbe.probeModelOnHost = (async input => ({
+      providerId: 'opencode' as const,
+      modelId: input.selectedModel,
+      observedProviderId: 'ollama',
+      observedModelId: 'qwen2.5-coder:1.5b',
+      probePrompt: input.prompt ?? '',
+      expectedOutput: input.expectedOutput ?? '',
+      outcome: 'available' as const,
+      reason: null,
+      durationMs: 1,
+      rawStatus: 'idle',
+      durableState: 'idle',
+      latestAssistantText: 'ok',
+      latestAssistantPreview: 'ok',
+      toolCallCount: 0,
+      errorCount: 0,
+      diagnostics: [],
+      verifiedAt: '2026-04-21T12:00:00.000Z',
+    })) as typeof openCodeExecutionProbe.probeModelOnHost
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.materializeSessionOnHost = (async input => {
+      memberCalls += 1
+      return {
+        record: buildRecord({
+          laneId: input.laneId, memberName: input.memberName,
+          selectedModel: input.selectedModel, opencodeSessionId: `session-${input.memberName}`,
+          expectedBehaviorFingerprint: input.expectedBehaviorFingerprint,
+        }),
+        ownerToken: { attemptId: 'test-owner', sessionId: '', version: 1 },
+        created: true,
+      }
+    }) as typeof openCodeSessionBridge.materializeSessionOnHost
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope(
+      'opencode.launchTeam', {
+        runId: 'run-ollama-non-pong', laneId: 'primary', teamId: 'team-a',
+        projectPath: '/tmp/project', selectedModel: 'ollama/qwen2.5-coder:1.5b',
+        members: [{ name: 'oscar' }],
+      },
+    ))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('local-model execution proof was mismatched')
+    expect(memberCalls).toBe(0)
+  })
+
   test('rejects mismatched exact full-model and nonce output proofs before member work', async () => {
     const prove = openCodeExecutionProbe.probeModelOnHost
     let memberCalls = 0
@@ -5025,7 +5082,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
           return { ...proof, observedProviderId: 'other' }
         }
         if (mismatch === 'observed-model') return { ...proof, observedModelId: 'not-chosen' }
-        return { ...proof, latestAssistantText: 'STRICT_LAUNCH_wrong-nonce' }
+        return {
+          ...proof,
+          latestAssistantText: 'STRICT_LAUNCH_wrong-nonce',
+          latestAssistantPreview: 'STRICT_LAUNCH_wrong-nonce',
+        }
       }) as typeof openCodeExecutionProbe.probeModelOnHost
       const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.launchTeam', {
         runId: `run-mismatched-${mismatch}`, laneId: 'primary', teamId: 'team-a',
@@ -6993,8 +7054,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
       })
     let probedModelId: string | null = null
     let probedDisposeHostOnRelease: boolean | undefined
+    let slimProbeCalls = 0
     let ensureSessionCalls = 0
-    openCodeExecutionProbe.probeModel = (async input => {
+    openCodeExecutionProbe.probeModel = (async () => {
+      slimProbeCalls += 1
+      throw new Error('launch proof must stay on the retained host')
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeExecutionProbe.probeModelOnHost = (async input => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
       return {
@@ -7015,7 +7081,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         errorCount: 0,
         diagnostics: [],
       }
-    }) as typeof openCodeExecutionProbe.probeModel
+    }) as typeof openCodeExecutionProbe.probeModelOnHost
     openCodeSessionBridge.ensureSession = (async input => {
       ensureSessionCalls += 1
       return buildRecord({
@@ -7043,7 +7109,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(false)
+    expect(probedDisposeHostOnRelease).toBeUndefined()
+    expect(slimProbeCalls).toBe(0)
     expect(ensureSessionCalls).toBe(1)
     expect(result.data.teamLaunchState).toBe('launching')
   })

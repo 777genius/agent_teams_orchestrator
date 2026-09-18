@@ -2478,6 +2478,16 @@ function shouldDisposeBridgeProbeHostOnRelease(): boolean {
   return process.platform !== 'win32'
 }
 
+function openCodeLaunchProofOutputMatches(
+  latestAssistantText: string | null | undefined,
+  latestAssistantPreview: string | null | undefined,
+  expectedOutput: string,
+  requireExactOutput: boolean,
+): boolean {
+  return probeOutputMatchesExpected(latestAssistantText, expectedOutput, requireExactOutput)
+    || probeOutputMatchesExpected(latestAssistantPreview, expectedOutput, requireExactOutput)
+}
+
 async function assertOpenCodeSelectedModelLaunchAccess(
   selectedModel: string,
   snapshot: OpenCodeProvisioningSnapshot,
@@ -2892,24 +2902,15 @@ async function runReadiness(
         throw new Error(`OpenCode selected readiness host/config/auth/project/MCP authority is unavailable${authorityDiagnostic}`)
       }
       let completedOAuthProbe: OpenCodeOAuthNativeProbeOwner | undefined
-      const useSlimLocalExecutionProbe =
-        !requiresExactOpenCodeLaunchOutput(qualifiedSelectedModel.raw)
-      const executionOutcome = useSlimLocalExecutionProbe
-        ? await openCodeExecutionProbe.probeModel({
-            selectedModel: qualifiedSelectedModel.raw,
-            projectPath,
-            runtimeDeadline,
-            cleanupSuccessfulSession: true,
-            bypassCache: true,
-            disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
-          })
-        : await openCodeExecutionProbe.probeModelOnHost({
-            onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
-            host: retained.host,
-            selectedModel: qualifiedSelectedModel.raw,
-            runtimeDeadline,
-            cleanupSuccessfulSession: true,
-          })
+      // Keep local proof on this retained host. A disposable second probe host
+      // races Ollama/llama.cpp locks the same way launch used to.
+      const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
+        onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
+        host: retained.host,
+        selectedModel: qualifiedSelectedModel.raw,
+        runtimeDeadline,
+        cleanupSuccessfulSession: true,
+      })
       const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
@@ -3745,7 +3746,10 @@ async function runLaunch(
         return { kind: 'failure', error: 'Agent Teams MCP retained connection/contract proof is unavailable' }
       }
       const expectedOutput = `STRICT_LAUNCH_${request.nonce}`
-      const requireExactOutput = requiresExactOpenCodeLaunchOutput(apiSelectedModel)
+      const requireExactOutput = requiresExactOpenCodeLaunchOutput(
+        apiSelectedModel,
+        getOpenCodeAccessPolicyCatalog(snapshot),
+      )
       const runtimeDeadline = {
         signal,
         remainingMs,
@@ -3772,7 +3776,10 @@ async function runLaunch(
       if (executionOutcome.outcome !== 'available') {
         return {
           kind: executionOutcome.outcome === 'unknown' ? 'unknown' : 'failure',
-          error: executionOutcome.reason ?? 'OpenCode exact-model execution proof failed',
+          error: executionOutcome.reason
+            ?? (requireExactOutput
+              ? 'OpenCode exact-model execution proof failed'
+              : 'OpenCode local-model execution proof failed'),
         }
       }
       if (
@@ -3780,16 +3787,19 @@ async function runLaunch(
         || executionOutcome.modelId !== apiSelectedModel
         || executionOutcome.observedProviderId !== selectedModelRef.providerId
         || executionOutcome.observedModelId !== selectedModelRef.modelId
-        || (requireExactOutput
-          ? !probeOutputMatchesExpected(
-            executionOutcome.latestAssistantText,
-            expectedOutput,
-            true,
-          )
-          : !(executionOutcome.latestAssistantText?.trim()
-            || executionOutcome.latestAssistantPreview?.trim()))
+        || !openCodeLaunchProofOutputMatches(
+          executionOutcome.latestAssistantText,
+          executionOutcome.latestAssistantPreview,
+          expectedOutput,
+          requireExactOutput,
+        )
       ) {
-        return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }
+        return {
+          kind: 'failure',
+          error: requireExactOutput
+            ? 'OpenCode exact-model execution proof was mismatched'
+            : 'OpenCode local-model execution proof was mismatched',
+        }
       }
       // The exact-model probe can take long enough for config or credentials to
       // rotate. Seal the proof only after a final fresh read on this retained host.

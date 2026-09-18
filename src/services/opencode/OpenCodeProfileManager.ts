@@ -95,10 +95,12 @@ import {
   cursorNativeSelectedIdentity,
   reconcileCursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
+import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
   isLiteralLoopbackOpenCodeUrl,
+  isLocalInexactOpenCodeLaunchProviderId,
 } from './OpenCodeProviderIdentity.js'
 import { buildCursorAgentResourceExhaustedPreloadScript } from './OpenCodeCursorResourceExhaustedPatch.js'
 import { buildCursorAgentAttributionPreloadScript } from './OpenCodeProcessAttributionStore.js'
@@ -843,11 +845,13 @@ export function ensureSelectedOpenCodeModelInImportedConfig(
   purpose: OpenCodeProfilePurpose,
 ): void {
   if (purpose === 'catalog') return
-  const parsed = parseProviderScopedModelId(selectedModel)
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
   if (!parsed || OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS.has(parsed.modelId)) return
+  const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  if (!isLocalInexactOpenCodeLaunchProviderId(providerId)) return
 
   const providers = asRecord(config.provider)
-  const providerConfig = asRecord(providers[parsed.providerId])
+  const providerConfig = asRecord(providers[providerId] ?? providers[parsed.providerId])
   const models = asRecord(providerConfig.models)
   if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
     return
@@ -855,7 +859,7 @@ export function ensureSelectedOpenCodeModelInImportedConfig(
 
   config.provider = {
     ...providers,
-    [parsed.providerId]: {
+    [providerId]: {
       ...providerConfig,
       models: {
         ...models,

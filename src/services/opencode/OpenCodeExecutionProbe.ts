@@ -1710,10 +1710,7 @@ export class OpenCodeExecutionProbe {
           }
 
           if (
-            (
-              summary.durableState === 'idle'
-              || summary.durableState === 'reply_pending'
-            )
+            summary.durableState === 'idle'
             && (
               isExpectedProbeOutput(
                 summary.latestAssistantText,

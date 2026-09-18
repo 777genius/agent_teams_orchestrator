@@ -584,6 +584,171 @@ describe('OpenCodeExecutionProbe', () => {
     expect(abortCount).toBe(1)
   })
 
+  test('keeps polling when leftover PONG text is from an earlier turn while reply is still pending', async () => {
+    let statusCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-stale-pong' }),
+          getSession: async () => ({ id: 'session-stale-pong' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-old',
+                role: 'user',
+                sessionID: 'session-stale-pong',
+                time: { created: 90 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-old',
+                role: 'assistant',
+                parentID: 'msg-user-old',
+                sessionID: 'session-stale-pong',
+                time: { created: 91, completed: 95 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+            {
+              info: {
+                id: 'msg-user-new',
+                role: 'user',
+                sessionID: 'session-stale-pong',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-new' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result.outcome).not.toBe('available')
+    expect(result.durableState).toBe('reply_pending')
+    expect(result.latestAssistantText).toBe('PONG')
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
+  test('accepts punctuation-only exact-token output after the session is idle', async () => {
+    const expected = 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67'
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-strict-punct' }),
+          getSession: async () => ({ id: 'session-strict-punct' }),
+          getSessionStatus: async () => ({ 'session-strict-punct': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-strict',
+                role: 'user',
+                sessionID: 'session-strict-punct',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: `Output only this exact token: ${expected}` }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-strict',
+                role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
+                parentID: 'msg-user-strict',
+                sessionID: 'session-strict-punct',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67' }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-strict' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      requireExactOutput: true,
+      expectedOutput: expected,
+      prompt: `Output only this exact token: ${expected}`,
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.durableState).toBe('idle')
+    expect(result.latestAssistantText).toBe('STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67')
+  })
+
   test('fails fast and aborts when prompt_async never materializes a prompt', async () => {
     let abortCount = 0
     const probe = new OpenCodeExecutionProbe({
