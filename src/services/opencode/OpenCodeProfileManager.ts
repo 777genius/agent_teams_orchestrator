@@ -298,6 +298,7 @@ function buildOpenCodeTeammatePermission(
     todoread: 'allow',
     todowrite: 'allow',
     edit: 'allow',
+    write: 'allow',
     bash: 'allow',
     task: {
       '*': 'deny',

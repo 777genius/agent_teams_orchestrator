@@ -1282,6 +1282,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
             todoread: 'allow',
             todowrite: 'allow',
             edit: 'allow',
+            write: 'allow',
             bash: 'allow',
             'agent-teams_*': 'allow',
             'agent_teams_*': 'allow',
