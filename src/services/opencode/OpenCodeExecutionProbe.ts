@@ -249,15 +249,27 @@ function isProbeSuccessOutput(value: string | null | undefined): boolean {
   return /\bPONG\b/i.test(value?.trim() ?? '')
 }
 
-function isExpectedProbeOutput(
+export function canonicalizeProbeOutput(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9]/g, '')
+}
+
+export function probeOutputMatchesExpected(
   value: string | null | undefined,
   expectedOutput: string,
   requireExactOutput: boolean,
 ): boolean {
   const normalized = value?.trim() ?? ''
   return requireExactOutput
-    ? normalized === expectedOutput
+    ? canonicalizeProbeOutput(normalized) === canonicalizeProbeOutput(expectedOutput)
     : isProbeSuccessOutput(normalized)
+}
+
+function isExpectedProbeOutput(
+  value: string | null | undefined,
+  expectedOutput: string,
+  requireExactOutput: boolean,
+): boolean {
+  return probeOutputMatchesExpected(value, expectedOutput, requireExactOutput)
 }
 
 function normalizeFailureMessage(value: string): string {
@@ -1875,7 +1887,10 @@ export class OpenCodeExecutionProbe {
               probePrompt: prompt,
               expectedOutput,
               outcome: classified.outcome,
-              reason: classified.reason,
+              reason:
+                params.requireExactOutput === true && classified.outcome === 'unknown'
+                  ? 'OpenCode exact-model execution proof was mismatched'
+                  : classified.reason,
               durationMs: buildDurationMs(startedAtMs),
               rawStatus: summary.rawStatus,
               durableState: summary.durableState,

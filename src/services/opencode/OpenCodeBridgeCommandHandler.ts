@@ -15,7 +15,10 @@ import {
   type OpenCodeStopRequest, type OpenCodeStopData,
 } from './OpenCodeStopRecovery.js'
 import { readOpenCodeLegacyStopCapability } from './OpenCodeLegacyStopAuthority.js'
-import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import {
+  openCodeExecutionProbe,
+  probeOutputMatchesExpected,
+} from './OpenCodeExecutionProbe.js'
 import {
   buildOpenCodeExecutionProof,
   parseOpenCodeExecutionProof,
@@ -3755,7 +3758,11 @@ async function runLaunch(
         || executionOutcome.modelId !== apiSelectedModel
         || executionOutcome.observedProviderId !== selectedModelRef.providerId
         || executionOutcome.observedModelId !== selectedModelRef.modelId
-        || executionOutcome.latestAssistantText?.trim() !== expectedOutput
+        || !probeOutputMatchesExpected(
+          executionOutcome.latestAssistantText,
+          expectedOutput,
+          true,
+        )
       ) {
         return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }
       }

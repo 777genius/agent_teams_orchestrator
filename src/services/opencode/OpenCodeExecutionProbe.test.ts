@@ -7,6 +7,7 @@ import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js
 import {
   classifyProbeFailure,
   OpenCodeExecutionProbe,
+  probeOutputMatchesExpected,
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
 import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
@@ -76,6 +77,17 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
   expect(resolveOpenCodeExecutionProbeContextTokens('cursor-acp/auto')).toBe(262_144)
   expect(resolveOpenCodeExecutionProbeContextTokens('kiro/auto')).toBe(262_144)
   expect(resolveOpenCodeExecutionProbeContextTokens('opencode/big-pickle')).toBe(32_000)
+})
+
+test('treats punctuation-only exact-token variants as the same launch proof', () => {
+  const expected = 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67'
+  expect(probeOutputMatchesExpected(
+    'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+    expected,
+    true,
+  )).toBe(true)
+  expect(probeOutputMatchesExpected('STRICT_LAUNCH_wrong-nonce', expected, true)).toBe(false)
+  expect(probeOutputMatchesExpected('PONG', expected, true)).toBe(false)
 })
 
 describe('OpenCodeExecutionProbe', () => {
