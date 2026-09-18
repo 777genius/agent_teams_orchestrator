@@ -3594,6 +3594,71 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     })
   })
 
+  test('rewrites mixed-case imported provider keys onto the canonical id', () => {
+    const config = {
+      provider: {
+        Ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      ollama: {
+        models: {
+          'qwen2.5-coder:0.5b': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
+  test('seeds LM Studio allowlists under the canonical lmstudio id', () => {
+    const config = {
+      provider: {
+        'lm-studio': { models: { 'local-model': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'lmstudio/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      lmstudio: {
+        models: {
+          'local-model': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
+  test('does not let an alias provider key replace an exact local allowlist', () => {
+    const config = {
+      provider: {
+        'lm-studio': { models: { alias: {} } },
+        lmstudio: { models: { 'local-model': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'lmstudio/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      'lm-studio': { models: { alias: {} } },
+      lmstudio: {
+        models: {
+          'local-model': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
   test('does not expand a cloud provider allowlist', () => {
     const config = {
       provider: {

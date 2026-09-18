@@ -3,6 +3,8 @@ import { isIP } from 'node:net'
 import { normalizeOpenCodeProviderId } from './OpenCodeModelRef.js'
 
 const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>([
+  ['lm-studio', 'lmstudio'],
+  ['llamacpp', 'llama.cpp'],
   ['minimax-token-plan', 'minimax-coding-plan'],
   ['minimax-token-plan-(minimax.io)', 'minimax-coding-plan'],
   ['xiaomi-token-plan-(europe)', 'xiaomi-token-plan-ams'],
@@ -38,8 +40,10 @@ const LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS = new Set([
 export function isLocalInexactOpenCodeLaunchProviderId(
   providerId: string | null | undefined,
 ): boolean {
-  const normalized = normalizeOpenCodeProviderId(providerId)
-  return Boolean(normalized && LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS.has(normalized))
+  if (!providerId?.trim()) return false
+  return LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS.has(
+    canonicalizeOpenCodeProviderId(providerId),
+  )
 }
 
 export function isLiteralLoopbackOpenCodeUrl(value: unknown): boolean {

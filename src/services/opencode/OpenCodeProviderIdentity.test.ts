@@ -16,6 +16,9 @@ describe('canonicalizeOpenCodeProviderId', () => {
     ['Kimi Code Membership', 'kimi-for-coding'],
     ['Amazon Q Developer / Kiro', 'kiro'],
     ['GitHub Copilot', 'github-copilot'],
+    ['LM Studio', 'lmstudio'],
+    ['lm-studio', 'lmstudio'],
+    ['llamacpp', 'llama.cpp'],
   ])('maps %s to %s', (input, expected) => {
     expect(canonicalizeOpenCodeProviderId(input)).toBe(expected)
   })

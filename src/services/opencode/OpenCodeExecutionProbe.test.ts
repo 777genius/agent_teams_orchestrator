@@ -88,6 +88,9 @@ test('treats punctuation-only exact-token variants as the same launch proof', ()
   )).toBe(true)
   expect(probeOutputMatchesExpected('STRICT_LAUNCH_wrong-nonce', expected, true)).toBe(false)
   expect(probeOutputMatchesExpected('PONG', expected, true)).toBe(false)
+  expect(probeOutputMatchesExpected('PONG', 'PONG', false)).toBe(true)
+  expect(probeOutputMatchesExpected('ok', 'PONG', false)).toBe(false)
+  expect(probeOutputMatchesExpected('PING', 'PONG', false)).toBe(false)
 })
 
 describe('OpenCodeExecutionProbe', () => {
@@ -675,6 +678,115 @@ describe('OpenCodeExecutionProbe', () => {
     expect(abortCount).toBe(1)
   })
 
+  test.each([
+    {
+      name: 'PONG',
+      sessionId: 'session-stream-pong',
+      selectedModel: 'ollama/qwen2.5-coder:1.5b',
+      text: 'PONG',
+      requireExactOutput: false,
+      expectedOutput: 'PONG',
+    },
+    {
+      name: 'STRICT token',
+      sessionId: 'session-stream-strict',
+      selectedModel: 'opencode/big-pickle',
+      text: 'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+      requireExactOutput: true,
+      expectedOutput: 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+    },
+  ])('keeps polling omitted status while streaming $name on a live generate', async ({
+    sessionId,
+    selectedModel,
+    text,
+    requireExactOutput,
+    expectedOutput,
+  }) => {
+    let statusCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: sessionId }),
+          getSession: async () => ({ id: sessionId }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-stream',
+                role: 'user',
+                sessionID: sessionId,
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: `Output only this exact token: ${expectedOutput}` }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-stream',
+                role: 'assistant',
+                parentID: 'msg-user-stream',
+                sessionID: sessionId,
+                time: { created: 101 },
+              },
+              parts: [{ type: 'text', text }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-stream' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModelOnHost({
+      host,
+      selectedModel,
+      prompt: `Output only this exact token: ${expectedOutput}`,
+      expectedOutput,
+      requireExactOutput,
+      cleanupSuccessfulSession: true,
+      bypassCache: true,
+    })
+
+    expect(result.outcome).not.toBe('available')
+    expect(result.reason).toBe('Model verification timed out')
+    expect(result.latestAssistantText).toBe(text)
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
   test('accepts punctuation-only exact-token output after the session is idle', async () => {
     const expected = 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67'
     const probe = new OpenCodeExecutionProbe({
@@ -1186,7 +1298,7 @@ describe('OpenCodeExecutionProbe', () => {
     }
   })
 
-  test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {
+  test('does not treat a completed non-PONG assistant response as inexact execution proof', async () => {
     let strictHostOnly = false
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1255,11 +1367,11 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.reason).toBeNull()
+    expect(result.outcome).toBe('unknown')
+    expect(result.reason).toBe('OpenCode local-model execution proof was mismatched')
     expect(result.latestAssistantText).toBe('PING')
-    expect(result.diagnostics.join('\n')).toContain(
-      'Model verification completed with non-matching assistant output',
+    expect(result.diagnostics.join('\n')).not.toContain(
+      'treating non-empty response as execution proof',
     )
 
     strictHostOnly = true

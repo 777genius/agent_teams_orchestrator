@@ -272,6 +272,32 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {}
 }
 
+function findCanonicalProviderConfig(
+  providers: Record<string, unknown>,
+  providerId: string,
+): { key: string; config: Record<string, unknown> } | null {
+  const exact = providers[providerId]
+  if (exact && typeof exact === 'object' && !Array.isArray(exact)) {
+    return { key: providerId, config: exact as Record<string, unknown> }
+  }
+
+  const canonical = canonicalizeOpenCodeProviderId(providerId)
+  if (canonical !== providerId) {
+    const canonicalExact = providers[canonical]
+    if (canonicalExact && typeof canonicalExact === 'object' && !Array.isArray(canonicalExact)) {
+      return { key: canonical, config: canonicalExact as Record<string, unknown> }
+    }
+  }
+
+  for (const [key, value] of Object.entries(providers)) {
+    if (key === providerId || key === canonical) continue
+    if (canonicalizeOpenCodeProviderId(key) !== canonical) continue
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    return { key, config: value as Record<string, unknown> }
+  }
+  return null
+}
+
 function buildOpenCodeTeammatePermission(
   toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
 ): Record<string, unknown> {
@@ -851,22 +877,24 @@ export function ensureSelectedOpenCodeModelInImportedConfig(
   if (!isLocalInexactOpenCodeLaunchProviderId(providerId)) return
 
   const providers = asRecord(config.provider)
-  const providerConfig = asRecord(providers[providerId] ?? providers[parsed.providerId])
-  const models = asRecord(providerConfig.models)
+  const found = findCanonicalProviderConfig(providers, providerId)
+    ?? findCanonicalProviderConfig(providers, parsed.providerId)
+  if (!found) return
+  const models = asRecord(found.config.models)
   if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
     return
   }
 
-  config.provider = {
-    ...providers,
-    [providerId]: {
-      ...providerConfig,
-      models: {
-        ...models,
-        [parsed.modelId]: {},
-      },
+  const nextProviders = { ...providers }
+  if (found.key !== providerId) delete nextProviders[found.key]
+  nextProviders[providerId] = {
+    ...found.config,
+    models: {
+      ...models,
+      [parsed.modelId]: {},
     },
   }
+  config.provider = nextProviders
 }
 
 function hasOwnRecordKeys(value: Record<string, unknown>): boolean {
@@ -1823,7 +1851,7 @@ function isolateScopedRuntimeConfig(
   providerId: string,
   purpose: OpenCodeProfilePurpose,
 ): Record<string, unknown> {
-  const selectedProvider = asRecord(config.provider)[providerId]
+  const selectedProvider = findCanonicalProviderConfig(asRecord(config.provider), providerId)
   const selectedManagedPlugins = planOpenCodeProfilePolicy({
     purpose, providerId, configFingerprint: 'isolation',
     selectedAuthIdentity: 'absent', scopeToken: 'isolation',
@@ -1831,8 +1859,9 @@ function isolateScopedRuntimeConfig(
   const isolated: Record<string, unknown> = purpose === 'launch_runtime'
     ? deepMergeOpenCodeConfig({}, config)
     : {}
-  if (selectedProvider !== undefined) isolated.provider = { [providerId]: selectedProvider }
-  else isolated.provider = {}
+  isolated.provider = selectedProvider
+    ? { [providerId]: selectedProvider.config }
+    : {}
   for (const key of ['model', 'small_model'] as const) {
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (value.startsWith(`${providerId}/`)) isolated[key] = value
@@ -1853,8 +1882,8 @@ function enforceScopedProviderIsolation(
   providerId: string,
   managedPlugins: readonly string[],
 ): void {
-  const selectedProvider = asRecord(config.provider)[providerId]
-  config.provider = selectedProvider === undefined ? {} : { [providerId]: selectedProvider }
+  const selectedProvider = findCanonicalProviderConfig(asRecord(config.provider), providerId)
+  config.provider = selectedProvider ? { [providerId]: selectedProvider.config } : {}
   for (const key of ['model', 'small_model'] as const) {
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (!value.startsWith(`${providerId}/`)) delete config[key]

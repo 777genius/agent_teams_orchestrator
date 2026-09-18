@@ -171,6 +171,14 @@ function getIdleMissingAssistantMessageId(
   return summary.replyPendingSinceMessageId
 }
 
+function isSettledProbeAssistantTurn(summary: OpenCodeSessionReconcileSummary): boolean {
+  if (summary.rawStatus === 'idle') return true
+  const latestAssistant = summary.messages.find(message =>
+    message.id === summary.latestAssistantMessageId && message.role === 'assistant',
+  )
+  return Boolean(latestAssistant && hasCompletedOpenCodeAssistantTurn(latestAssistant))
+}
+
 function statusIsRunning(value: unknown): boolean {
   if (value === 'busy' || value === 'retry') return true
   if (!value || typeof value !== 'object') return false
@@ -1711,6 +1719,7 @@ export class OpenCodeExecutionProbe {
 
           if (
             summary.durableState === 'idle'
+            && isSettledProbeAssistantTurn(summary)
             && (
               isExpectedProbeOutput(
                 summary.latestAssistantText,
@@ -1829,7 +1838,8 @@ export class OpenCodeExecutionProbe {
             })
           }
           const shouldContinuePolling =
-            (summary.durableState === 'running'
+            (!isSettledProbeAssistantTurn(summary)
+              || summary.durableState === 'running'
               || summary.durableState === 'retrying'
               || summary.durableState === 'reply_pending'
               || (summary.durableState === 'idle' && !failureMessage)
@@ -1846,41 +1856,12 @@ export class OpenCodeExecutionProbe {
             continue
           }
 
-          if (failureMessage) {
+          if (failureMessage && isSettledProbeAssistantTurn(summary)) {
             const classified = classifyProbeFailure({ message: failureMessage })
             if (classified.outcome !== 'unknown') {
               diagnostics.add(
                 `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
               )
-            }
-            if (
-              params.requireExactOutput !== true
-              &&
-              summary.durableState === 'idle'
-              && classified.outcome === 'unknown'
-              && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
-            ) {
-              sessionRequiresCleanup = false
-              diagnostics.add(
-                'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
-              )
-              return finishObservedAssistantResult({
-                providerId: 'opencode',
-                modelId: params.selectedModel,
-                probePrompt: prompt,
-                expectedOutput,
-                outcome: 'available',
-                reason: null,
-                durationMs: buildDurationMs(startedAtMs),
-                rawStatus: summary.rawStatus,
-                durableState: summary.durableState,
-                latestAssistantText: summary.latestAssistantText,
-                latestAssistantPreview: summary.latestAssistantPreview,
-                toolCallCount: summary.toolCallCount,
-                errorCount: summary.errorCount,
-                diagnostics: Array.from(diagnostics),
-                verifiedAt: new Date().toISOString(),
-              }, summary)
             }
 
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
@@ -1891,8 +1872,10 @@ export class OpenCodeExecutionProbe {
               expectedOutput,
               outcome: classified.outcome,
               reason:
-                params.requireExactOutput === true && classified.outcome === 'unknown'
-                  ? 'OpenCode exact-model execution proof was mismatched'
+                classified.outcome === 'unknown' && summary.durableState === 'idle'
+                  ? params.requireExactOutput === true
+                    ? 'OpenCode exact-model execution proof was mismatched'
+                    : 'OpenCode local-model execution proof was mismatched'
                   : classified.reason,
               durationMs: buildDurationMs(startedAtMs),
               rawStatus: summary.rawStatus,
