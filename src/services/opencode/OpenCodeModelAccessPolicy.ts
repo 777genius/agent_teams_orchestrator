@@ -4,7 +4,10 @@ import {
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
 import { isOpenCodeBuiltinFreeModelId } from './OpenCodeInventoryService.js'
-import { isLiteralLoopbackOpenCodeUrl } from './OpenCodeProviderIdentity.js'
+import {
+  isLiteralLoopbackOpenCodeUrl,
+  isLocalInexactOpenCodeLaunchProviderId,
+} from './OpenCodeProviderIdentity.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -84,6 +87,25 @@ const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([
 export function isKnownAuthlessOpenCodeProviderId(providerId: string | null | undefined): boolean {
   const normalized = normalizeOpenCodeProviderId(providerId)
   return normalized ? KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(normalized) : false
+}
+
+const OPEN_CODE_CLOUD_MODEL_TAG = /:cloud\b/i
+
+export function requiresExactOpenCodeLaunchOutput(
+  selectedModel: string,
+  catalog?: OpenCodeModelAccessCatalog | null,
+): boolean {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!parsed) return true
+  if (OPEN_CODE_CLOUD_MODEL_TAG.test(parsed.modelId)) return true
+  if (!isLocalInexactOpenCodeLaunchProviderId(parsed.providerId)) return true
+  const entries = catalog ? findProviderEntries(catalog, parsed.providerId) : []
+  if (entries.length > 0) {
+    return !entries.some(entry => isLiteralLoopbackOpenCodeUrl(getProviderEntryBaseUrl(entry)))
+  }
+  // vLLM is often a remote OpenAI-compatible server. Without a loopback URL,
+  // keep the STRICT nonce instead of accepting PONG from an untrusted host.
+  return parsed.providerId === 'vllm'
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -3,6 +3,8 @@ import { isIP } from 'node:net'
 import { normalizeOpenCodeProviderId } from './OpenCodeModelRef.js'
 
 const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>([
+  ['lm-studio', 'lmstudio'],
+  ['llamacpp', 'llama.cpp'],
   ['minimax-token-plan', 'minimax-coding-plan'],
   ['minimax-token-plan-(minimax.io)', 'minimax-coding-plan'],
   ['xiaomi-token-plan-(europe)', 'xiaomi-token-plan-ams'],
@@ -22,6 +24,25 @@ export function canonicalizeOpenCodeProviderId(value: string): string {
     OPEN_CODE_PROVIDER_ALIASES.get(label)
     ?? normalizeOpenCodeProviderId(label)
     ?? label
+  )
+}
+
+const LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS = new Set([
+  'llama.cpp',
+  'llamacpp',
+  'lmstudio',
+  'lm-studio',
+  'local',
+  'ollama',
+  'vllm',
+])
+
+export function isLocalInexactOpenCodeLaunchProviderId(
+  providerId: string | null | undefined,
+): boolean {
+  if (!providerId?.trim()) return false
+  return LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS.has(
+    canonicalizeOpenCodeProviderId(providerId),
   )
 }
 

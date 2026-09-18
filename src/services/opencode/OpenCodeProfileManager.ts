@@ -95,10 +95,12 @@ import {
   cursorNativeSelectedIdentity,
   reconcileCursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
+import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
   isLiteralLoopbackOpenCodeUrl,
+  isLocalInexactOpenCodeLaunchProviderId,
 } from './OpenCodeProviderIdentity.js'
 import { buildCursorAgentResourceExhaustedPreloadScript } from './OpenCodeCursorResourceExhaustedPatch.js'
 import { buildCursorAgentAttributionPreloadScript } from './OpenCodeProcessAttributionStore.js'
@@ -270,6 +272,32 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {}
 }
 
+function findCanonicalProviderConfig(
+  providers: Record<string, unknown>,
+  providerId: string,
+): { key: string; config: Record<string, unknown> } | null {
+  const exact = providers[providerId]
+  if (exact && typeof exact === 'object' && !Array.isArray(exact)) {
+    return { key: providerId, config: exact as Record<string, unknown> }
+  }
+
+  const canonical = canonicalizeOpenCodeProviderId(providerId)
+  if (canonical !== providerId) {
+    const canonicalExact = providers[canonical]
+    if (canonicalExact && typeof canonicalExact === 'object' && !Array.isArray(canonicalExact)) {
+      return { key: canonical, config: canonicalExact as Record<string, unknown> }
+    }
+  }
+
+  for (const [key, value] of Object.entries(providers)) {
+    if (key === providerId || key === canonical) continue
+    if (canonicalizeOpenCodeProviderId(key) !== canonical) continue
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    return { key, config: value as Record<string, unknown> }
+  }
+  return null
+}
+
 function buildOpenCodeTeammatePermission(
   toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
 ): Record<string, unknown> {
@@ -298,6 +326,7 @@ function buildOpenCodeTeammatePermission(
     todoread: 'allow',
     todowrite: 'allow',
     edit: 'allow',
+    write: 'allow',
     bash: 'allow',
     task: {
       '*': 'deny',
@@ -823,6 +852,49 @@ export function applyOpenCodeModelLimitOverrides(
       [parsedModel.providerId]: providerConfig,
     }
   }
+}
+
+const OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS = new Set([
+  'catalog',
+  'oauth-authority',
+])
+
+/**
+ * User OpenCode config can pin an Ollama/LM Studio models allowlist. Imported
+ * as-is, that list hides later local models and launch probes hang after
+ * `ProviderModelNotFoundError`. Add the selected model without shrinking a
+ * live-discovery provider (empty models map).
+ */
+export function ensureSelectedOpenCodeModelInImportedConfig(
+  config: Record<string, unknown>,
+  selectedModel: string,
+  purpose: OpenCodeProfilePurpose,
+): void {
+  if (purpose === 'catalog') return
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!parsed || OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS.has(parsed.modelId)) return
+  const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  if (!isLocalInexactOpenCodeLaunchProviderId(providerId)) return
+
+  const providers = asRecord(config.provider)
+  const found = findCanonicalProviderConfig(providers, providerId)
+    ?? findCanonicalProviderConfig(providers, parsed.providerId)
+  if (!found) return
+  const models = asRecord(found.config.models)
+  if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
+    return
+  }
+
+  const nextProviders = { ...providers }
+  if (found.key !== providerId) delete nextProviders[found.key]
+  nextProviders[providerId] = {
+    ...found.config,
+    models: {
+      ...models,
+      [parsed.modelId]: {},
+    },
+  }
+  config.provider = nextProviders
 }
 
 function hasOwnRecordKeys(value: Record<string, unknown>): boolean {
@@ -1779,7 +1851,7 @@ function isolateScopedRuntimeConfig(
   providerId: string,
   purpose: OpenCodeProfilePurpose,
 ): Record<string, unknown> {
-  const selectedProvider = asRecord(config.provider)[providerId]
+  const selectedProvider = findCanonicalProviderConfig(asRecord(config.provider), providerId)
   const selectedManagedPlugins = planOpenCodeProfilePolicy({
     purpose, providerId, configFingerprint: 'isolation',
     selectedAuthIdentity: 'absent', scopeToken: 'isolation',
@@ -1787,8 +1859,9 @@ function isolateScopedRuntimeConfig(
   const isolated: Record<string, unknown> = purpose === 'launch_runtime'
     ? deepMergeOpenCodeConfig({}, config)
     : {}
-  if (selectedProvider !== undefined) isolated.provider = { [providerId]: selectedProvider }
-  else isolated.provider = {}
+  isolated.provider = selectedProvider
+    ? { [providerId]: selectedProvider.config }
+    : {}
   for (const key of ['model', 'small_model'] as const) {
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (value.startsWith(`${providerId}/`)) isolated[key] = value
@@ -1809,8 +1882,8 @@ function enforceScopedProviderIsolation(
   providerId: string,
   managedPlugins: readonly string[],
 ): void {
-  const selectedProvider = asRecord(config.provider)[providerId]
-  config.provider = selectedProvider === undefined ? {} : { [providerId]: selectedProvider }
+  const selectedProvider = findCanonicalProviderConfig(asRecord(config.provider), providerId)
+  config.provider = selectedProvider ? { [providerId]: selectedProvider.config } : {}
   for (const key of ['model', 'small_model'] as const) {
     const value = typeof config[key] === 'string' ? config[key].trim() : ''
     if (!value.startsWith(`${providerId}/`)) delete config[key]
@@ -2383,6 +2456,11 @@ async function resolveOpenCodeProfileScopeInternal(
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
     ? isolateScopedRuntimeConfig(mergedRuntimeConfig, providerId, input.purpose)
     : mergedRuntimeConfig
+  ensureSelectedOpenCodeModelInImportedConfig(
+    importedRuntimeConfig,
+    input.selectedModel,
+    input.purpose,
+  )
   const effective = deepMergeOpenCodeConfig(
     importedRuntimeConfig,
     buildManagedConfig(null, { managedProviderId: providerId }),

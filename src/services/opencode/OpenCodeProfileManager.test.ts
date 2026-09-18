@@ -24,6 +24,7 @@ import {
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
   resolveOpenCodeProfileScope,
+  ensureSelectedOpenCodeModelInImportedConfig,
 } from './OpenCodeProfileManager.js'
 import {
   PROCESS_ATTRIBUTION_DIRECTORY_ENV,
@@ -1281,6 +1282,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
             todoread: 'allow',
             todowrite: 'allow',
             edit: 'allow',
+            write: 'allow',
             bash: 'allow',
             'agent-teams_*': 'allow',
             'agent_teams_*': 'allow',
@@ -3527,4 +3529,145 @@ test('complete Cursor wrapper uses discovered absolute CLI and owned mcptool wit
     })
     expect(output).toBe(`native:${root}:${env.XDG_CONFIG_HOME}:${env.CURSOR_CONFIG_DIR}:a b\nmanaged:c d`)
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
+  test('adds the selected local model to an imported Ollama allowlist', () => {
+    const config = {
+      provider: {
+        ollama: {
+          npm: '@ai-sdk/openai-compatible',
+          models: { 'qwen2.5-coder:0.5b': {} },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({
+      'qwen2.5-coder:0.5b': {},
+      'qwen2.5-coder:7b-32k': {},
+    })
+  })
+
+  test('does not shrink a live-discovery Ollama provider', () => {
+    const config = {
+      provider: {
+        ollama: { models: {} },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({})
+  })
+
+  test('leaves catalog scopes and placeholder models untouched', () => {
+    const config = {
+      provider: {
+        ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'ollama/qwen2.5-coder:7b-32k', 'catalog')
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'ollama/oauth-authority', 'launch_runtime')
+    expect(config.provider.ollama.models).toEqual({ 'qwen2.5-coder:0.5b': {} })
+  })
+
+  test('canonicalizes mixed-case local provider ids when seeding', () => {
+    const config = {
+      provider: {
+        ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'Ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({
+      'qwen2.5-coder:0.5b': {},
+      'qwen2.5-coder:7b-32k': {},
+    })
+  })
+
+  test('rewrites mixed-case imported provider keys onto the canonical id', () => {
+    const config = {
+      provider: {
+        Ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      ollama: {
+        models: {
+          'qwen2.5-coder:0.5b': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
+  test('seeds LM Studio allowlists under the canonical lmstudio id', () => {
+    const config = {
+      provider: {
+        'lm-studio': { models: { 'local-model': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'lmstudio/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      lmstudio: {
+        models: {
+          'local-model': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
+  test('does not let an alias provider key replace an exact local allowlist', () => {
+    const config = {
+      provider: {
+        'lm-studio': { models: { alias: {} } },
+        lmstudio: { models: { 'local-model': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'lmstudio/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider).toEqual({
+      'lm-studio': { models: { alias: {} } },
+      lmstudio: {
+        models: {
+          'local-model': {},
+          'qwen2.5-coder:7b-32k': {},
+        },
+      },
+    })
+  })
+
+  test('does not expand a cloud provider allowlist', () => {
+    const config = {
+      provider: {
+        openai: { models: { 'gpt-4o-mini': { limit: { context: 8192 } } } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'openai/gpt-4o', 'launch_runtime')
+    expect(config.provider.openai.models).toEqual({
+      'gpt-4o-mini': { limit: { context: 8192 } },
+    })
+  })
 })

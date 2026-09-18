@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildOpenCodeModelRouteMetadata,
   evaluateOpenCodeModelAccess,
+  requiresExactOpenCodeLaunchOutput,
 } from './OpenCodeModelAccessPolicy.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
@@ -33,6 +34,55 @@ function catalog(overrides: Partial<Catalog> = {}): Catalog {
 }
 
 describe('OpenCodeModelAccessPolicy', () => {
+  test('keeps exact launch output for cloud tags and credentialed models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/kimi-k2.6:cloud')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('deepinfra/chosen')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('cursor-acp/auto')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('vllm/meta-llama/Llama-3-70b')).toBe(true)
+  })
+
+  test('does not treat cloudflare-style local ids as cloud routes', () => {
+    expect(requiresExactOpenCodeLaunchOutput('lmstudio/cloudflare-local')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen-cloudsonnet')).toBe(false)
+  })
+
+  test('accepts non-exact launch output for local Ollama models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:1.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:0.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('lmstudio/local-model')).toBe(false)
+  })
+
+  test('requires exact launch output for remote Ollama and accepts loopback vLLM', () => {
+    const remoteOllama = catalog({
+      configProviders: {
+        providers: [
+          {
+            id: 'ollama',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'https://ollama.example.internal/v1' },
+            models: { 'qwen2.5-coder:1.5b': {} },
+          },
+        ],
+        default: {},
+      },
+    })
+    const loopbackVllm = catalog({
+      configProviders: {
+        providers: [
+          {
+            id: 'vllm',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:8000/v1' },
+            models: { 'local-llama': {} },
+          },
+        ],
+        default: {},
+      },
+    })
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:1.5b', remoteOllama)).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('vllm/local-llama', loopbackVllm)).toBe(false)
+  })
+
   test('allows connected providers without an execution proof', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'openrouter/moonshotai/kimi-k2',

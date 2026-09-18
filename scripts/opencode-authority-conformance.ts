@@ -25,7 +25,7 @@ export function managedAgentFixtures(mode: 'auto' | 'manual'): Config {
   const permission = mode === 'manual'
     ? { '*': 'ask', task: { '*': 'deny' }, external_directory: 'deny', doom_loop: 'deny', ...mcpAllow }
     : { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow', lsp: 'allow',
-      todoread: 'allow', todowrite: 'allow', edit: 'allow', bash: 'allow', task: { '*': 'deny' },
+      todoread: 'allow', todowrite: 'allow', edit: 'allow', write: 'allow', bash: 'allow', task: { '*': 'deny' },
       external_directory: 'deny', doom_loop: 'deny', ...mcpAllow }
   return {
     teammate: { mode: 'primary', description: 'Managed teammate agent for claude-multimodel runtime orchestration.', permission },

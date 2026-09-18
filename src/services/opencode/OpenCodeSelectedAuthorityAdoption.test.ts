@@ -92,7 +92,7 @@ test('selected persistent host adopts through real HTTP authority and remains st
       pattern: path.join(profile.env.XDG_DATA_HOME!, 'opencode', 'tool-output', '*'), action: 'allow' }
     const effectiveAgents = [
       { name: 'teammate', mode: 'primary', permission: [rule('*', 'deny'),
-        ...['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'bash']
+        ...['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash']
           .map(permission => rule(permission, 'allow')),
         ...['task', 'external_directory', 'doom_loop'].map(permission => rule(permission, 'deny')),
         ...mcpRules, truncate] },

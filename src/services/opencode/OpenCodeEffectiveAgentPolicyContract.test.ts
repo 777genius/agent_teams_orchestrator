@@ -12,7 +12,7 @@ function intended(mode: 'auto' | 'manual') {
   return [
     { name: 'teammate', permission: [
       r('*', mode === 'auto' ? 'deny' : 'ask'),
-      ...(mode === 'auto' ? ['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'bash'].map(name => r(name, 'allow')) : []),
+      ...(mode === 'auto' ? ['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash'].map(name => r(name, 'allow')) : []),
       r('task', 'deny'), r('external_directory', 'deny'), r('doom_loop', 'deny'), ...mcp, truncate,
     ] },
     { name: 'teammate-bootstrap', permission: [r('*', 'deny'), ...mcp, truncate] },
