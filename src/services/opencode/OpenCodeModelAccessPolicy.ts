@@ -86,6 +86,23 @@ export function isKnownAuthlessOpenCodeProviderId(providerId: string | null | un
   return normalized ? KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(normalized) : false
 }
 
+const LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS = new Set([
+  'llama.cpp',
+  'llamacpp',
+  'lmstudio',
+  'lm-studio',
+  'local',
+  'ollama',
+  'vllm',
+])
+
+export function requiresExactOpenCodeLaunchOutput(selectedModel: string): boolean {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!parsed) return true
+  if (parsed.modelId.toLowerCase().includes('cloud')) return true
+  return !LOCAL_INEXACT_OPEN_CODE_LAUNCH_PROVIDER_IDS.has(parsed.providerId)
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>

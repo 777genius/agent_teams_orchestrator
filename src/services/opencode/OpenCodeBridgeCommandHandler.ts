@@ -46,6 +46,7 @@ import {
   buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
   evaluateOpenCodeModelAccess,
   isKnownAuthlessOpenCodeProviderId,
+  requiresExactOpenCodeLaunchOutput,
 } from './OpenCodeModelAccessPolicy.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
@@ -2891,13 +2892,24 @@ async function runReadiness(
         throw new Error(`OpenCode selected readiness host/config/auth/project/MCP authority is unavailable${authorityDiagnostic}`)
       }
       let completedOAuthProbe: OpenCodeOAuthNativeProbeOwner | undefined
-      const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
-        onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
-        host: retained.host,
-        selectedModel: qualifiedSelectedModel.raw,
-        runtimeDeadline,
-        cleanupSuccessfulSession: true,
-      })
+      const useSlimLocalExecutionProbe =
+        !requiresExactOpenCodeLaunchOutput(qualifiedSelectedModel.raw)
+      const executionOutcome = useSlimLocalExecutionProbe
+        ? await openCodeExecutionProbe.probeModel({
+            selectedModel: qualifiedSelectedModel.raw,
+            projectPath,
+            runtimeDeadline,
+            cleanupSuccessfulSession: true,
+            bypassCache: true,
+            disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
+          })
+        : await openCodeExecutionProbe.probeModelOnHost({
+            onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
+            host: retained.host,
+            selectedModel: qualifiedSelectedModel.raw,
+            runtimeDeadline,
+            cleanupSuccessfulSession: true,
+          })
       const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
         host: retained.host,
         selectedModel: qualifiedSelectedModel.raw,
@@ -3733,19 +3745,29 @@ async function runLaunch(
         return { kind: 'failure', error: 'Agent Teams MCP retained connection/contract proof is unavailable' }
       }
       const expectedOutput = `STRICT_LAUNCH_${request.nonce}`
+      const requireExactOutput = requiresExactOpenCodeLaunchOutput(apiSelectedModel)
+      const runtimeDeadline = {
+        signal,
+        remainingMs,
+        throwIfExpired: phase => phaseContext(phase).throwIfExpired(),
+        runPhase: (phase, operation) => operation(phaseContext(phase)),
+      }
+      // Local models still accept inexact output, but proof stays on this
+      // retained lane host. A disposable second host races Ollama/llama.cpp
+      // locks and can leave the teammate pid dead after a "successful" launch.
+      // Use the cheap PONG prompt locally; the STRICT token is for cloud/exact.
       const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
         host,
         selectedModel: apiSelectedModel,
-        prompt: `Output only this exact token: ${expectedOutput}`,
-        expectedOutput,
-        requireExactOutput: true,
+        ...(requireExactOutput
+          ? {
+              prompt: `Output only this exact token: ${expectedOutput}`,
+              expectedOutput,
+              requireExactOutput: true,
+            }
+          : { requireExactOutput: false }),
         cleanupSuccessfulSession: true,
-        runtimeDeadline: {
-          signal,
-          remainingMs,
-          throwIfExpired: phase => phaseContext(phase).throwIfExpired(),
-          runPhase: (phase, operation) => operation(phaseContext(phase)),
-        },
+        runtimeDeadline,
       })
       if (executionOutcome.outcome !== 'available') {
         return {
@@ -3758,11 +3780,14 @@ async function runLaunch(
         || executionOutcome.modelId !== apiSelectedModel
         || executionOutcome.observedProviderId !== selectedModelRef.providerId
         || executionOutcome.observedModelId !== selectedModelRef.modelId
-        || !probeOutputMatchesExpected(
-          executionOutcome.latestAssistantText,
-          expectedOutput,
-          true,
-        )
+        || (requireExactOutput
+          ? !probeOutputMatchesExpected(
+            executionOutcome.latestAssistantText,
+            expectedOutput,
+            true,
+          )
+          : !(executionOutcome.latestAssistantText?.trim()
+            || executionOutcome.latestAssistantPreview?.trim()))
       ) {
         return { kind: 'failure', error: 'OpenCode exact-model execution proof was mismatched' }
       }

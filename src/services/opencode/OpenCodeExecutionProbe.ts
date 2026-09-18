@@ -158,6 +158,9 @@ function hasCompletedAssistantResponseWithoutText(
 function getIdleMissingAssistantMessageId(
   summary: OpenCodeSessionReconcileSummary,
 ): string | null {
+  // OpenCode 1.18.4 omits idle *and* in-flight entries from /session/status.
+  // Treat only an explicit idle as "generation finished". Omitted status plus
+  // reply_pending is still a live generate and must keep polling.
   if (
     summary.rawStatus !== 'idle'
     || summary.durableState !== 'reply_pending'
@@ -1707,7 +1710,10 @@ export class OpenCodeExecutionProbe {
           }
 
           if (
-            summary.durableState === 'idle'
+            (
+              summary.durableState === 'idle'
+              || summary.durableState === 'reply_pending'
+            )
             && (
               isExpectedProbeOutput(
                 summary.latestAssistantText,

@@ -499,6 +499,91 @@ describe('OpenCodeExecutionProbe', () => {
     expect(abortCount).toBe(0)
   })
 
+  test('keeps polling when OpenCode omits status without creating an assistant response', async () => {
+    let statusCallCount = 0
+    let messageCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-omitted-idle' }),
+          getSession: async () => ({ id: 'session-omitted-idle' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => {
+            messageCallCount += 1
+            return [
+              {
+                info: {
+                  id: 'msg-user-omitted-idle',
+                  role: 'user',
+                  sessionID: 'session-omitted-idle',
+                  time: { created: 100 },
+                },
+                parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+              },
+            ]
+          },
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-omitted-idle' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'Model verification timed out',
+      rawStatus: null,
+      durableState: 'reply_pending',
+      latestAssistantText: null,
+    })
+    expect(result.diagnostics).toContain('Model verification timed out')
+    expect(result.diagnostics.join('\n')).not.toContain(
+      'became idle without producing an assistant response',
+    )
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(messageCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
   test('fails fast and aborts when prompt_async never materializes a prompt', async () => {
     let abortCount = 0
     const probe = new OpenCodeExecutionProbe({

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildOpenCodeModelRouteMetadata,
   evaluateOpenCodeModelAccess,
+  requiresExactOpenCodeLaunchOutput,
 } from './OpenCodeModelAccessPolicy.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
@@ -33,6 +34,18 @@ function catalog(overrides: Partial<Catalog> = {}): Catalog {
 }
 
 describe('OpenCodeModelAccessPolicy', () => {
+  test('keeps exact launch output for cloud and credentialed models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/kimi-k2.6:cloud')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('deepinfra/chosen')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('cursor-acp/auto')).toBe(true)
+  })
+
+  test('accepts non-exact launch output for local Ollama models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:1.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:0.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('lmstudio/local-model')).toBe(false)
+  })
+
   test('allows connected providers without an execution proof', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'openrouter/moonshotai/kimi-k2',
