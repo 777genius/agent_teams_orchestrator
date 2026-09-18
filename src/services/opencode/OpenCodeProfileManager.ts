@@ -825,6 +825,45 @@ export function applyOpenCodeModelLimitOverrides(
   }
 }
 
+const OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS = new Set([
+  'catalog',
+  'oauth-authority',
+])
+
+/**
+ * User OpenCode config can pin an Ollama/LM Studio models allowlist. Imported
+ * as-is, that list hides later local models and launch probes hang after
+ * `ProviderModelNotFoundError`. Add the selected model without shrinking a
+ * live-discovery provider (empty models map).
+ */
+export function ensureSelectedOpenCodeModelInImportedConfig(
+  config: Record<string, unknown>,
+  selectedModel: string,
+  purpose: OpenCodeProfilePurpose,
+): void {
+  if (purpose === 'catalog') return
+  const parsed = parseProviderScopedModelId(selectedModel)
+  if (!parsed || OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS.has(parsed.modelId)) return
+
+  const providers = asRecord(config.provider)
+  const providerConfig = asRecord(providers[parsed.providerId])
+  const models = asRecord(providerConfig.models)
+  if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
+    return
+  }
+
+  config.provider = {
+    ...providers,
+    [parsed.providerId]: {
+      ...providerConfig,
+      models: {
+        ...models,
+        [parsed.modelId]: {},
+      },
+    },
+  }
+}
+
 function hasOwnRecordKeys(value: Record<string, unknown>): boolean {
   return Object.keys(value).length > 0
 }
@@ -2383,6 +2422,11 @@ async function resolveOpenCodeProfileScopeInternal(
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
     ? isolateScopedRuntimeConfig(mergedRuntimeConfig, providerId, input.purpose)
     : mergedRuntimeConfig
+  ensureSelectedOpenCodeModelInImportedConfig(
+    importedRuntimeConfig,
+    input.selectedModel,
+    input.purpose,
+  )
   const effective = deepMergeOpenCodeConfig(
     importedRuntimeConfig,
     buildManagedConfig(null, { managedProviderId: providerId }),

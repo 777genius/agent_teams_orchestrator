@@ -24,6 +24,7 @@ import {
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
   resolveOpenCodeProfileScope,
+  ensureSelectedOpenCodeModelInImportedConfig,
 } from './OpenCodeProfileManager.js'
 import {
   PROCESS_ATTRIBUTION_DIRECTORY_ENV,
@@ -3527,4 +3528,51 @@ test('complete Cursor wrapper uses discovered absolute CLI and owned mcptool wit
     })
     expect(output).toBe(`native:${root}:${env.XDG_CONFIG_HOME}:${env.CURSOR_CONFIG_DIR}:a b\nmanaged:c d`)
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
+  test('adds the selected local model to an imported Ollama allowlist', () => {
+    const config = {
+      provider: {
+        ollama: {
+          npm: '@ai-sdk/openai-compatible',
+          models: { 'qwen2.5-coder:0.5b': {} },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({
+      'qwen2.5-coder:0.5b': {},
+      'qwen2.5-coder:7b-32k': {},
+    })
+  })
+
+  test('does not shrink a live-discovery Ollama provider', () => {
+    const config = {
+      provider: {
+        ollama: { models: {} },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models).toEqual({})
+  })
+
+  test('leaves catalog scopes and placeholder models untouched', () => {
+    const config = {
+      provider: {
+        ollama: { models: { 'qwen2.5-coder:0.5b': {} } },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'ollama/qwen2.5-coder:7b-32k', 'catalog')
+    ensureSelectedOpenCodeModelInImportedConfig(config, 'ollama/oauth-authority', 'launch_runtime')
+    expect(config.provider.ollama.models).toEqual({ 'qwen2.5-coder:0.5b': {} })
+  })
 })
