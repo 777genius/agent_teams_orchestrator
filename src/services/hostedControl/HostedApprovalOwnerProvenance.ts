@@ -99,6 +99,8 @@ export interface OwnerWalPublicationProducer {
   isHealthy(): boolean
   prepare(input: Readonly<{ intent: OwnerWalMutationIntent; native: OwnerWalNative; previous: PreviousWalImage; next: RetainedWalImage }>): OwnerWalPreparedPublication
   poison(reason: string): never
+  /** Durably closes the currently emitted prefix without closing process-owned FD9. */
+  syncSegment?(): void
   close(): void
 }
 
@@ -231,6 +233,12 @@ class NativeOwnerWalPublicationProducer implements OwnerWalPublicationProducer {
     const error = this.#fatal ?? new Error(reason)
     if (!this.#fatal) { this.#fatal = error; try { this.onPoison?.(error) } catch { /* authoritative error retained */ } }
     throw error
+  }
+  syncSegment(): void {
+    if (!this.isHealthy()) return this.poison('owner-provenance-writer-unavailable')
+    try { this.operations.sync(HOSTED_OWNER_PROVENANCE_FD) } catch (error) {
+      return this.poison(error instanceof Error ? error.message : 'owner-provenance-segment-sync')
+    }
   }
   close(): void {
     if (this.#closed || this.#closing) return

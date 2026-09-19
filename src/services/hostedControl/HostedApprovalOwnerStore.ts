@@ -8,16 +8,48 @@ import type {
   HostedApprovalReconciliationRequest,
   HostedApprovalReconciliationResult,
 } from './HostedApprovalWire.js'
-import { classifyOwnerIngressObservation, HostedApprovalOwnerWal, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import { classifyOwnerIngressObservation, HostedApprovalOwnerPublicationError, HostedApprovalOwnerWal, type HostedApprovalOwnerState, type HostedApprovalOwnerWalOperationEnvelope } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
 import { createOwnerOperationNonce, type OwnerLeaseClaim } from './HostedApprovalOwnerProvenance.js'
 
 export class HostedApprovalOwnerStore {
-  constructor(readonly wal: HostedApprovalOwnerWal, private readonly now: () => number = Date.now) {}
+  #tail: Promise<void> = Promise.resolve()
+  constructor(readonly wal: HostedApprovalOwnerWal, private readonly now: () => number = Date.now,
+    private readonly capture?: {
+      begin?(): unknown
+      accept<T>(envelope: HostedApprovalOwnerWalOperationEnvelope<T>, operationContext?: unknown): void | Promise<void>
+      serializeOperation?<T>(operation: () => Promise<T>): Promise<T>
+    }) {}
+
+  /** Shared operation boundary: WAL cleanup and ordered corpus acceptance. */
+  async locked<T>(operation: (state: HostedApprovalOwnerState | null) => Promise<T>): Promise<T> {
+    if (this.capture?.serializeOperation) {
+      return this.capture.serializeOperation(() => this.#locked(operation))
+    }
+    const prior = this.#tail
+    let release!: () => void
+    this.#tail = new Promise(resolve => { release = resolve })
+    await prior
+    try { return await this.#locked(operation) } finally { release() }
+  }
+
+  async #locked<T>(operation: (state: HostedApprovalOwnerState | null) => Promise<T>): Promise<T> {
+    const operationContext = this.capture?.begin?.()
+    const envelope = await this.wal.lockedEnvelope(operation)
+    if (envelope.publications.length && this.capture) {
+      try { await this.capture.accept(envelope, operationContext) } catch (error) {
+        this.wal.poisonPublicationCapture('owner-live-corpus-acceptance-failed')
+        throw new HostedApprovalOwnerPublicationError(
+          'published-capture-failed', 'Hosted approval WAL published but corpus capture failed', { cause: error },
+        )
+      }
+    }
+    return envelope.result
+  }
 
   reconcileAdmission(admission: HostedApprovalRuntimeAdmission): Promise<HostedApprovalOwnerState> {
     const operationNonce = createOwnerOperationNonce()
-    return this.wal.locked(async state => {
+    return this.locked(async state => {
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
       if (state?.admissionDigest === admission.digest &&
         state.admissionGeneration === admission.admissionGeneration &&
@@ -55,7 +87,7 @@ export class HostedApprovalOwnerStore {
   admitIngress(admission: HostedApprovalRuntimeAdmission, record: HostedApprovalIngressRecord): Promise<'admitted' | 'replay' | 'quarantined'> {
     record = structuredClone(record)
     const operationNonce = createOwnerOperationNonce()
-    return this.wal.locked(async state => {
+    return this.locked(async state => {
       if (!state || state.admissionDigest !== admission.digest || !(await admission.isCurrent())) throw new Error('Hosted approval admission changed')
       const route = admission.routes.find(route => isDeepStrictEqual(route.authority, record.authority))
       if (!route || !state.routes.some(current => isDeepStrictEqual(current, route))) {
@@ -84,7 +116,7 @@ export class HostedApprovalOwnerStore {
   claim(request: HostedApprovalClaimRequest, maximumAggregateBytes: number): Promise<readonly HostedApprovalIngressRecord[]> {
     request = { ...request }
     const operationNonce = createOwnerOperationNonce()
-    return this.wal.locked(async state => {
+    return this.locked(async state => {
       if (!state) return []
       const now = this.now(); if (!Number.isSafeInteger(now) || now < 0) return []
       const records: HostedApprovalIngressRecord[] = []; const changedRecords: HostedApprovalIngressRecord[] = []
@@ -125,7 +157,7 @@ export class HostedApprovalOwnerStore {
   acknowledge(request: HostedApprovalAckRequest): Promise<HostedApprovalAckResult> {
     request = { ...request }
     const operationNonce = createOwnerOperationNonce()
-    return this.wal.locked(async state => {
+    return this.locked(async state => {
       if (!state) return { status: 'unavailable' }
       const index = state.ingress.findIndex(record => record.outboxId === request.outboxId)
       if (index < 0) return { status: 'unavailable' }
@@ -153,7 +185,7 @@ export class HostedApprovalOwnerStore {
     request: HostedApprovalReconciliationRequest,
     admission: HostedApprovalRuntimeAdmission,
   ): Promise<HostedApprovalReconciliationResult> {
-    return this.wal.locked(async state => {
+    return this.locked(async state => {
       if (!state || state.admissionGeneration !== admission.admissionGeneration ||
         state.admissionDigest !== admission.digest || !(await admission.isCurrent())) {
         return { status: 'unavailable' }

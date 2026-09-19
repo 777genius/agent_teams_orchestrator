@@ -123,7 +123,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     }
     let reconciliationOnly = false
     const operationNonce = createOwnerOperationNonce()
-    try { return await this.options.store.wal.locked(async state => {
+    try { return await this.options.store.locked(async state => {
       if (!state || state.admissionGeneration !== this.options.admission.admissionGeneration ||
         state.admissionDigest !== this.options.admission.digest) return { status: 'stale_generation' }
       const prior = findDelivery(state, input.request)

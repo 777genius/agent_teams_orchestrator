@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 
 import {
   HostedActualOwnerNativeWriter,
+  attestHostedActualOwnerWalOperationEnvelope,
   attestHostedActualOwnerWalOperationCompletion,
   buildHostedActualOwnerNativePublication,
   hostedActualOwnerStartToken,
@@ -108,6 +109,16 @@ function canonicalNative<T>(value: T): T {
 }
 
 describe('HostedActualOwnerNativeWriter', () => {
+  test('rejects a frozen but non-runtime operation envelope', async () => {
+    const request = await input()
+    const forged = Object.freeze({ result: null, publications: Object.freeze([
+      request.operationCompletion.result.publication,
+    ]) })
+    expect(() => attestHostedActualOwnerWalOperationEnvelope(forged)).toThrow(
+      'hosted_actual_owner_operation_envelope_invalid',
+    )
+  })
+
   test('retains exact N and a writer-fence-bound proof for absent P', async () => {
     const request = await input()
     const record = buildHostedActualOwnerNativePublication(request)

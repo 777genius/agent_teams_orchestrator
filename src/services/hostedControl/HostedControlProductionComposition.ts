@@ -21,6 +21,7 @@ import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
 import type { OwnerWalPublicationProducer } from './HostedApprovalOwnerProvenance.js'
+import { HostedActualOwnerCaptureSession, type HostedActualOwnerCaptureConfiguration } from './HostedActualOwnerCaptureSession.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
 import {
@@ -50,8 +51,14 @@ export function createHostedControlProductionPortFactory(
    * owns its lifecycle; no environment lookup or ambient writer occurs here.
    */
   ownerWalPublication?: OwnerWalPublicationProducer,
+  captureConfiguration?: HostedActualOwnerCaptureConfiguration,
 ): HostedControlRuntimePortFactory {
+  let liveCaptureClaimed = false
   return async (context: HostedControlRuntimePortFactoryContext) => {
+    if (captureConfiguration?.environment.CLAUDE_TEAM_PRODUCER_PROVENANCE_V2 !== undefined && liveCaptureClaimed) {
+      throw new Error('hosted_actual_owner_process_capture_already_claimed')
+    }
+    const ownerWalPath = join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE)
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
       [createOpenCodeLane()],
@@ -99,6 +106,18 @@ export function createHostedControlProductionPortFactory(
       messageDelivery,
       lifecycleEffects: lifecycle.authority,
     })
+    // context.teamRoot is the canonical root admitted by HostedControlRuntime.
+    // All ordinary composition validation above completes before FD9/corpus open.
+    let captureSession: HostedActualOwnerCaptureSession | null = null
+    if (captureConfiguration?.environment.CLAUDE_TEAM_PRODUCER_PROVENANCE_V2 !== undefined) {
+      liveCaptureClaimed = true
+      captureSession = HostedActualOwnerCaptureSession.open({
+        canonicalTeamRoot: context.teamRoot,
+        walPath: ownerWalPath,
+        configuration: captureConfiguration,
+      })
+    }
+    const publicationProducer = captureSession?.producer ?? ownerWalPublication
     const activation = context.activationV2
     const approvals = activation ? new HostedApprovalActivatablePort() : undefined
     const rawAdmissionPath = join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE)
@@ -123,10 +142,10 @@ export function createHostedControlProductionPortFactory(
             }
             const owner = new HostedApprovalOwnerService({
               store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
-                join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
+                ownerWalPath,
                 undefined,
-                ownerWalPublication,
-              )),
+                publicationProducer,
+              ), Date.now, captureSession ?? undefined),
               admission: approvalAdmission,
               runtime: new OpenCodeHostedApprovalRuntimeAdapter(),
               isCurrentOuterAuthority: () => context.isCurrentAuthority({
@@ -155,6 +174,7 @@ export function createHostedControlProductionPortFactory(
         messageDelivery.close().catch(() => undefined),
         execution.shutdown().catch(() => undefined),
       ])
+      try { await captureSession?.close() } catch { /* startup error remains authoritative */ }
       throw error
     }
     return {
@@ -165,8 +185,15 @@ export function createHostedControlProductionPortFactory(
       close: async () => {
         // Calling revoke fences the delegate synchronously; all awaited work is
         // cleanup and therefore precedes lifecycle/authority resource release.
-        await revoke().catch(() => undefined)
-        await Promise.all([messageDelivery.close(), execution.shutdown()])
+        const errors: unknown[] = []
+        try { await revoke() } catch (error) { errors.push(error) }
+        const results = await Promise.allSettled([
+          Promise.resolve().then(() => messageDelivery.close()),
+          Promise.resolve().then(() => execution.shutdown()),
+        ])
+        errors.push(...results.flatMap(result => result.status === 'rejected' ? [result.reason] : []))
+        try { await captureSession?.close() } catch (error) { errors.push(error) }
+        if (errors.length) throw new AggregateError(errors, 'hosted_control_production_cleanup_failed')
       },
     }
   }

@@ -526,7 +526,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const { path } = await walPath(); const capture = publicationCapture(path)
     const wal = new HostedApprovalOwnerWal(path, undefined, capture.producer)
     const admission = admissionFixture()
-    await wal.locked(async current => {
+    const envelope = await wal.lockedEnvelope(async current => {
       const first = await wal.publishMutation(current, {
         ...withoutRevision(state()), ingress: [], bindings: [],
       }, { operationNonce: 'a'.repeat(64), mutation: { kind: 'admission-reconciled', outcome: 'published' }, admission })
@@ -539,7 +539,12 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
       expect((await lstat(path)).ino).not.toBe(firstInode)
       expect(capture.bound!.previous.kind).toBe('retained')
       if (capture.bound!.previous.kind === 'retained') expect(Buffer.from(capture.bound!.previous.image.bytes)).toEqual(firstBytes)
+      return 'callback-result'
     })
+    expect(envelope.result).toBe('callback-result')
+    expect(envelope.publications).toHaveLength(2)
+    expect(envelope.publications.map(item => item.emission.operationNonce)).toEqual(['a'.repeat(64), 'b'.repeat(64)])
+    expect(Object.isFrozen(envelope.publications)).toBe(true)
     expect(capture.lines.map(line => line.recordType)).toEqual(['producer-open', 'owner-wal-published', 'owner-wal-published'])
     expect(capture.lines[2].previousRecordSha256).toBe(createHash('sha256').update(`${JSON.stringify(capture.lines[1])}\n`).digest('hex'))
     capture.producer.close()

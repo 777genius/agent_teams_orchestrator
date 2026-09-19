@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -27,6 +28,13 @@ import {
   HOSTED_APPROVAL_ACTIVATION_CAPABILITY,
   createHostedApprovalActivationV2Proof,
 } from './HostedApprovalRuntimeActivation.js'
+import { HOSTED_ACTUAL_OWNER_CORPUS_FILE } from './HostedActualOwnerCaptureSession.js'
+import {
+  HOSTED_OWNER_PROVENANCE_CONTRACT,
+  HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+  HOSTED_OWNER_PROVENANCE_IMPLEMENTATION,
+  type OwnerProvenanceOperations,
+} from './HostedApprovalOwnerProvenance.js'
 
 const roots: string[] = []
 const teamId = `team_${'a'.repeat(32)}`
@@ -251,6 +259,96 @@ describe('createHostedControlProductionPorts', () => {
     const revocation = session.revoke()
     expect((ports.approvals as HostedApprovalActivatablePort).lifecycle.status).toBe('revoked')
     await revocation
+  })
+
+  test('opens one explicit process capture after canonical composition and closes it with the ports', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-live-capture-')
+    await writePlan(teamRoot, 'opencode')
+    let nonce = 0; let closes = 0
+    const lines: Record<string, unknown>[] = []
+    const operations: OwnerProvenanceOperations = {
+      identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11',
+        exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+      descriptor: () => ({ device: '7', inode: '8', regular: true, append: true,
+        writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+      nonce: () => (++nonce).toString(16).padStart(64, '0'),
+      write: (_fd, bytes, offset) => {
+        lines.push(JSON.parse(Buffer.from(bytes.subarray(offset)).toString()))
+        return bytes.byteLength - offset
+      },
+      sync: () => {}, close: () => { closes += 1 },
+    }
+    const environment = { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
+      activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+      contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+      expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
+        implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+      producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
+    }) }
+    const createPorts = createHostedControlProductionPortFactory(undefined, undefined, {
+      environment, modulePath: import.meta.path, ownerGeneration: 'owner-generation-test',
+      provenanceOperations: operations,
+    })
+    const ports = await createPorts(context(teamRoot, true))
+    expect(lines.map(line => line.recordType)).toEqual(['producer-open'])
+    expect(await Bun.file(join(teamRoot, HOSTED_ACTUAL_OWNER_CORPUS_FILE)).exists()).toBe(true)
+    await expect(createPorts(context(teamRoot, true))).rejects.toThrow('process_capture_already_claimed')
+    await ports.close()
+    expect(lines.map(line => line.recordType)).toEqual(['producer-open', 'producer-close'])
+    expect(closes).toBe(1)
+    expect(OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED).toBe(false)
+  })
+
+  test('closes capture after execution shutdown rejects and retains every cleanup error', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-cleanup-errors-')
+    await writePlan(teamRoot, 'opencode')
+    let nonce = 0; let producerCloses = 0; let corpusCloses = 0; let failCaptureCleanup = false
+    const operations: OwnerProvenanceOperations = {
+      identity: () => ({ pid: process.pid, startTicks: '9', exeDev: '10', exeIno: '11',
+        exeSha256: '4'.repeat(64), moduleSha256: '5'.repeat(64) }),
+      descriptor: () => ({ device: '7', inode: '8', regular: true, append: true,
+        writeOnly: true, mode: 0o600, nlink: '1', size: '0' }),
+      nonce: () => (++nonce).toString(16).padStart(64, '0'),
+      write: (_fd, bytes, offset) => bytes.byteLength - offset,
+      sync: () => {}, close: () => { producerCloses += 1 },
+    }
+    const environment = { CLAUDE_TEAM_PRODUCER_PROVENANCE_V2: JSON.stringify({
+      activation: { controllerNonce: '1'.repeat(64), runId: 'run_test', stackManifestSha256: '2'.repeat(64) },
+      contract: HOSTED_OWNER_PROVENANCE_CONTRACT, contractSha256: HOSTED_OWNER_PROVENANCE_CONTRACT_SHA256,
+      expectedProducer: { artifactManifestSha256: '3'.repeat(64), executableSha256: '4'.repeat(64),
+        implementationId: HOSTED_OWNER_PROVENANCE_IMPLEMENTATION, moduleSha256: '5'.repeat(64) },
+      producerRole: 'owner', streams: { ownerWalTimeline: { device: '7', fd: 9, inode: '8' } }, version: 2,
+    }) }
+    const createPorts = createHostedControlProductionPortFactory(undefined, undefined, {
+      environment, modulePath: import.meta.path, ownerGeneration: 'owner-generation-test',
+      provenanceOperations: operations,
+      fileOperations: {
+        open: openSync,
+        write: (fd, bytes, offset) => writeSync(fd, bytes, offset, bytes.byteLength - offset),
+        sync: fd => { if (failCaptureCleanup) throw new Error('corpus sync failed'); fsyncSync(fd) },
+        close: fd => { closeSync(fd); corpusCloses += 1; if (failCaptureCleanup) throw new Error('corpus close failed') },
+      },
+    })
+    const ports = await createPorts(context(teamRoot))
+    const shutdownError = new Error('execution shutdown failed')
+    const shutdown = spyOn(DurableTeamLifecycleExecution.prototype, 'shutdown')
+      .mockImplementation(async () => { throw shutdownError })
+    failCaptureCleanup = true
+    try {
+      let failure: unknown
+      try { await ports.close() } catch (error) { failure = error }
+      expect(failure).toBeInstanceOf(AggregateError)
+      const errors = (failure as AggregateError).errors
+      expect(errors).toHaveLength(2)
+      expect(errors[0]).toBe(shutdownError)
+      expect(errors[1]).toBeInstanceOf(AggregateError)
+      expect((errors[1] as AggregateError).errors.map(error => (error as Error).message))
+        .toEqual(['corpus sync failed', 'corpus close failed'])
+      expect(producerCloses).toBe(1)
+      expect(corpusCloses).toBe(1)
+    } finally {
+      shutdown.mockRestore()
+    }
   })
 })
 

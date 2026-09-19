@@ -10,6 +10,8 @@ import {
 } from './HostedApprovalOwnerProvenance.js'
 import {
   HostedApprovalOwnerWal,
+  isHostedApprovalOwnerWalOperationEnvelope,
+  type HostedApprovalOwnerWalOperationEnvelope,
   type HostedApprovalOwnerWalPublishResult,
   type HostedApprovalWriterFenceIdentity,
 } from './HostedApprovalOwnerWal.js'
@@ -132,6 +134,32 @@ export type HostedActualOwnerWalOperationCompletion = Readonly<{
 
 const completedWalOperations = new WeakSet<object>()
 
+/** Attests every genuine publication in an already-completed outer lock. */
+export function attestHostedActualOwnerWalOperationEnvelope<T>(
+  envelope: HostedApprovalOwnerWalOperationEnvelope<T>,
+): readonly HostedActualOwnerWalOperationCompletion[] {
+  if (!isHostedApprovalOwnerWalOperationEnvelope(envelope) ||
+    !Object.isFrozen(envelope) || !Object.isFrozen(envelope.publications)) {
+    throw new TypeError('hosted_actual_owner_operation_envelope_invalid')
+  }
+  return Object.freeze(envelope.publications.map(publication => {
+    const evidence = Object.freeze({
+      type: 'owner-wal-operation-completed' as const,
+      status: 'succeeded' as const,
+      cleanup: 'completed' as const,
+      result: Object.freeze({ capture: 'bound' as const, state: envelopeState(publication), publication }),
+    })
+    completedWalOperations.add(evidence)
+    return evidence as HostedActualOwnerWalOperationCompletion
+  }))
+}
+
+function envelopeState(publication: BoundWalOperationResult['publication']): BoundWalOperationResult['state'] {
+  const bytes = Buffer.from(publication.next.bytes)
+  const parsed = JSON.parse(bytes.toString('utf8')) as BoundWalOperationResult['state']
+  return Object.freeze(parsed)
+}
+
 /**
  * Runs the typed publication inside the outer `HostedApprovalOwnerWal.locked`
  * operation and converts only its successful resolution into corpus evidence.
@@ -143,16 +171,12 @@ export async function attestHostedActualOwnerWalOperationCompletion(
   next: Parameters<HostedApprovalOwnerWal['publishMutation']>[1],
   intent: Parameters<HostedApprovalOwnerWal['publishMutation']>[2],
 ): Promise<HostedActualOwnerWalOperationCompletion> {
-  const result = await wal.locked(state => wal.publishMutation(state, next, intent))
-  if (result.capture !== 'bound') throw new TypeError('hosted_actual_owner_bound_completion_required')
-  const evidence = Object.freeze({
-    type: 'owner-wal-operation-completed' as const,
-    status: 'succeeded' as const,
-    cleanup: 'completed' as const,
-    result,
-  })
-  completedWalOperations.add(evidence)
-  return evidence as HostedActualOwnerWalOperationCompletion
+  const envelope = await wal.lockedEnvelope(state => wal.publishMutation(state, next, intent))
+  if (envelope.result.capture !== 'bound' || envelope.publications.length !== 1 ||
+    envelope.publications[0] !== envelope.result.publication) {
+    throw new TypeError('hosted_actual_owner_bound_completion_required')
+  }
+  return attestHostedActualOwnerWalOperationEnvelope(envelope)[0]!
 }
 
 export interface HostedActualOwnerNativeSink {
@@ -173,6 +197,11 @@ export class HostedActualOwnerNativeWriter {
   write(request: HostedActualOwnerNativeWriteRequest): HostedActualOwnerNativePublication {
     if (this.#sealed) throw new Error('hosted_actual_owner_writer_sealed')
     const record = buildHostedActualOwnerNativePublication(request)
+    const imageBytes = record.publication.final.byteSize +
+      (record.publication.predecessor.kind === 'retained' ? record.publication.predecessor.image.byteSize : 0)
+    if (imageBytes > HOSTED_ACTUAL_OWNER_MAX_RECORD_BYTES) {
+      throw new RangeError('hosted_actual_owner_publication_images_too_large')
+    }
     const bytes = Buffer.from(`${JSON.stringify(record)}\n`, 'utf8')
     if (bytes.byteLength > HOSTED_ACTUAL_OWNER_MAX_RECORD_BYTES) {
       throw new RangeError('hosted_actual_owner_publication_record_too_large')

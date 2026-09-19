@@ -71,6 +71,19 @@ export type HostedApprovalOwnerWalPublishResult =
   | Readonly<{ capture: 'off'; state: HostedApprovalOwnerState }>
   | Readonly<{ capture: 'bound'; state: HostedApprovalOwnerState; publication: BoundWalPublication }>
 
+export type HostedApprovalOwnerWalOperationEnvelope<T> = Readonly<{
+  result: T
+  /** Publications emitted by this lock invocation, in replacement order. */
+  publications: readonly BoundWalPublication[]
+}>
+
+const completedOwnerWalOperationEnvelopes = new WeakSet<object>()
+export function isHostedApprovalOwnerWalOperationEnvelope(
+  value: unknown,
+): value is HostedApprovalOwnerWalOperationEnvelope<unknown> {
+  return typeof value === 'object' && value !== null && completedOwnerWalOperationEnvelopes.has(value)
+}
+
 export class HostedApprovalOwnerPublicationError extends Error {
   constructor(
     readonly stage: 'definitely-not-replaced' | 'replacement-uncertain' | 'published-capture-failed',
@@ -261,6 +274,7 @@ export class HostedApprovalOwnerWal {
   #activeSnapshot: LockedWalSnapshot | null = null
   #activePublicationStage: 'replacement-uncertain' | 'published-capture-failed' | null = null
   #publicationCaptureFailed = false
+  #activePublications: BoundWalPublication[] | null = null
   readonly #effectTokenReleases = new Set<() => void>()
   readonly #writerContext = new AsyncLocalStorage<symbol>()
   readonly fencePath: string
@@ -282,6 +296,15 @@ export class HostedApprovalOwnerWal {
   }
 
   async locked<T>(operation: (state: HostedApprovalOwnerState | null) => Promise<T>): Promise<T> {
+    return (await this.lockedEnvelope(operation)).result
+  }
+
+  /**
+   * Runs one complete writer operation and exposes only the publications made
+   * by that invocation.  The envelope does not become observable until fence,
+   * effect-token and descriptor cleanup have all succeeded.
+   */
+  async lockedEnvelope<T>(operation: (state: HostedApprovalOwnerState | null) => Promise<T>): Promise<HostedApprovalOwnerWalOperationEnvelope<T>> {
     const prior = this.#tail; let release!: () => void
     this.#tail = new Promise(resolve => { release = resolve })
     await prior
@@ -291,6 +314,7 @@ export class HostedApprovalOwnerWal {
     let failed = false
     let failure: unknown
     let result!: T
+    let publications: BoundWalPublication[] | null = null
     try {
       const acquired = await this.#acquireWriterFence()
       fenceHandle = acquired.handle
@@ -309,6 +333,7 @@ export class HostedApprovalOwnerWal {
       const state = snapshot.state
       this.#activeSnapshot = snapshot
       this.#activePublicationStage = null
+      this.#activePublications = []
       if (state && !isDeepStrictEqual(state.writerFence, acquired.identity)) {
         throw new Error('Hosted approval WAL writer-fence generation mismatch')
       }
@@ -334,6 +359,7 @@ export class HostedApprovalOwnerWal {
       // Revoke effect authority before releasing descriptors, but retain the
       // publication stage until every fallible release has been attempted.
       const stage = this.#activePublicationStage
+      publications = this.#activePublications
       this.#activeWriter = null
       this.#activeFenceIdentity = null
       this.#activeFenceHandle = null
@@ -349,6 +375,7 @@ export class HostedApprovalOwnerWal {
         cleanupErrors.push(...await this.#releaseWriterResources(fenceHandle, lockHandle, parentHandle))
       } finally {
         this.#activePublicationStage = null
+        this.#activePublications = null
         release()
       }
       if (cleanupErrors.length > 0) {
@@ -364,7 +391,9 @@ export class HostedApprovalOwnerWal {
       }
     }
     if (failed) throw failure
-    return result
+    const envelope = Object.freeze({ result, publications: Object.freeze([...(publications ?? [])]) })
+    completedOwnerWalOperationEnvelopes.add(envelope)
+    return envelope
   }
 
   async #releaseWriterResources(fence: number | undefined, lock: number | undefined, parent: FileHandle | undefined): Promise<unknown[]> {
@@ -443,7 +472,7 @@ export class HostedApprovalOwnerWal {
 
   /** Invalidates an active capture when authority fails after a real publication. */
   poisonPublicationCapture(reason: string): void {
-    if (this.#activePublicationStage) this.#invalidatePublicationCapture(reason)
+    this.#invalidatePublicationCapture(reason)
   }
 
   /** Producer poison/closure survives WAL reconstruction; reconciliation remains readable. */
@@ -541,6 +570,7 @@ export class HostedApprovalOwnerWal {
       try {
         if (!this.isPublicationCaptureCurrent()) throw new Error('Hosted approval WAL capture poisoned')
         publication = prepared.emit()
+        this.#activePublications?.push(publication)
       } catch (error) {
         this.#invalidatePublicationCapture('owner-wal-published-capture-failed')
         throw new HostedApprovalOwnerPublicationError('published-capture-failed', 'Hosted approval WAL published but native capture failed', { cause: error })
