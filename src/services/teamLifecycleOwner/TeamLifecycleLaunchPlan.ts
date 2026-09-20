@@ -16,6 +16,11 @@ export type TeamLifecycleLaunchMember = {
   effort?: string
 }
 
+export type TeamLifecycleLaunchMemberV3 = TeamLifecycleLaunchMember & {
+  ordinal: number
+  agentId: string
+}
+
 export type TeamLifecycleLaunchLane =
   | {
       laneId: string
@@ -32,7 +37,23 @@ export type TeamLifecycleLaunchLane =
       members: readonly TeamLifecycleLaunchMember[]
     }
 
-export type TeamLifecycleLaunchPlan = {
+export type TeamLifecycleLaunchLaneV3 =
+  | {
+      laneId: string
+      kind: 'native'
+      provider: NativeTeamLifecycleProvider
+      members: readonly TeamLifecycleLaunchMemberV3[]
+    }
+  | {
+      laneId: string
+      kind: 'opencode'
+      provider: 'opencode'
+      selectedModel: string
+      effort?: string
+      members: readonly TeamLifecycleLaunchMemberV3[]
+    }
+
+export type TeamLifecycleLaunchPlanV2 = {
   schemaVersion: 2
   workspaceId: string
   teamId: string
@@ -40,6 +61,26 @@ export type TeamLifecycleLaunchPlan = {
   toolApprovalMode: 'manual' | 'auto'
   lanes: readonly TeamLifecycleLaunchLane[]
 }
+
+export type TeamLifecycleRuntimePlanRef = {
+  teamId: string
+  runId: string
+  generation: number
+  planHash: string
+}
+
+export type TeamLifecycleLaunchPlanV3 = {
+  schemaVersion: 3
+  workspaceId: string
+  teamId: string
+  workspaceRoot: string
+  toolApprovalMode: 'auto'
+  runtimePlanRef: TeamLifecycleRuntimePlanRef
+  primaryOrdinal: number
+  lanes: readonly TeamLifecycleLaunchLaneV3[]
+}
+
+export type TeamLifecycleLaunchPlan = TeamLifecycleLaunchPlanV2 | TeamLifecycleLaunchPlanV3
 
 export interface TeamLifecycleLaunchPlanStore {
   load(scope: HostedLifecycleScope): Promise<TeamLifecycleLaunchPlanAdmission | null>
@@ -136,6 +177,11 @@ function decodePlan(raw: Uint8Array): string {
 
 export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunchPlan {
   const record = asRecord(value, 'launch plan')
+  if (record.schemaVersion === 3) return parseSchema3(record)
+  return parseSchema2(record)
+}
+
+function parseSchema2(record: Record<string, unknown>): TeamLifecycleLaunchPlanV2 {
   assertExactKeys(
     record,
     ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'toolApprovalMode', 'lanes'],
@@ -198,6 +244,98 @@ export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunc
   }
 }
 
+function parseSchema3(record: Record<string, unknown>): TeamLifecycleLaunchPlanV3 {
+  assertExactKeys(
+    record,
+    [
+      'schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'toolApprovalMode',
+      'runtimePlanRef', 'primaryOrdinal', 'lanes',
+    ],
+    'launch plan',
+  )
+  const workspaceId = canonicalIdentifier(record.workspaceId, 'workspace', 'workspaceId')
+  const teamId = canonicalIdentifier(record.teamId, 'team', 'teamId')
+  if (typeof record.workspaceRoot !== 'string' || !path.isAbsolute(record.workspaceRoot) || record.workspaceRoot.includes('\0')) {
+    throw new TypeError('Invalid launch-plan workspaceRoot')
+  }
+  if (record.toolApprovalMode !== 'auto') {
+    throw new TypeError('Schema 3 launch plans require automatic tool approval')
+  }
+  const runtimeRefRecord = asRecord(record.runtimePlanRef, 'runtimePlanRef')
+  assertExactKeys(runtimeRefRecord, ['teamId', 'runId', 'generation', 'planHash'], 'runtimePlanRef')
+  const runtimePlanRef: TeamLifecycleRuntimePlanRef = {
+    teamId: canonicalIdentifier(runtimeRefRecord.teamId, 'team', 'runtimePlanRef teamId'),
+    runId: canonicalIdentifier(runtimeRefRecord.runId, 'run', 'runtimePlanRef runId'),
+    generation: positiveSafeInteger(runtimeRefRecord.generation, 'runtimePlanRef generation'),
+    planHash: sha256Digest(runtimeRefRecord.planHash, 'runtimePlanRef planHash'),
+  }
+  if (runtimePlanRef.teamId !== teamId) throw new TypeError('Launch-plan runtimePlanRef team mismatch')
+  if (!Number.isSafeInteger(record.primaryOrdinal) || (record.primaryOrdinal as number) < 0) {
+    throw new TypeError('Invalid launch-plan primaryOrdinal')
+  }
+  if (!Array.isArray(record.lanes) || record.lanes.length === 0 || record.lanes.length > 64) {
+    throw new TypeError('Launch plan requires 1-64 lanes')
+  }
+  const lanes = record.lanes.map((raw, index): TeamLifecycleLaunchLaneV3 => {
+    const lane = asRecord(raw, `lane ${index}`)
+    const laneId = identifier(lane.laneId, `lane ${index} laneId`)
+    if (lane.kind === 'native' && NATIVE_TEAM_LIFECYCLE_PROVIDERS.includes(lane.provider as NativeTeamLifecycleProvider)) {
+      assertExactKeys(lane, ['laneId', 'kind', 'provider', 'members'], `lane ${index}`)
+      return {
+        laneId,
+        kind: 'native',
+        provider: lane.provider as NativeTeamLifecycleProvider,
+        members: parseMembersV3(lane.members, index),
+      }
+    }
+    if (lane.kind === 'opencode' && lane.provider === 'opencode') {
+      const hasEffort = Object.prototype.hasOwnProperty.call(lane, 'effort')
+      assertExactKeys(
+        lane,
+        hasEffort
+          ? ['laneId', 'kind', 'provider', 'selectedModel', 'effort', 'members']
+          : ['laneId', 'kind', 'provider', 'selectedModel', 'members'],
+        `lane ${index}`,
+      )
+      return {
+        laneId,
+        kind: 'opencode',
+        provider: 'opencode',
+        selectedModel: boundedString(lane.selectedModel, `lane ${index} selectedModel`, 256),
+        ...(hasEffort ? { effort: boundedString(lane.effort, `lane ${index} effort`, 64) } : {}),
+        members: parseMembersV3(lane.members, index),
+      }
+    }
+    throw new TypeError(`Unsupported provider for lane ${index}`)
+  })
+  if (new Set(lanes.map(lane => lane.laneId)).size !== lanes.length) {
+    throw new TypeError('Duplicate launch-plan laneId')
+  }
+  const members = lanes.flatMap(lane => [...lane.members])
+  const ordinals = members.map(member => member.ordinal)
+  if (new Set(ordinals).size !== members.length ||
+    ordinals.some(ordinal => ordinal < 0 || ordinal >= members.length) ||
+    !Array.from({ length: members.length }, (_, ordinal) => ordinal).every(ordinal => ordinals.includes(ordinal))) {
+    throw new TypeError('Launch-plan member ordinals must be globally unique and dense')
+  }
+  if (new Set(members.map(member => member.agentId)).size !== members.length) {
+    throw new TypeError('Duplicate launch-plan member agentId')
+  }
+  if ((record.primaryOrdinal as number) >= members.length || !ordinals.includes(record.primaryOrdinal as number)) {
+    throw new TypeError('Launch-plan primaryOrdinal does not designate a member')
+  }
+  return {
+    schemaVersion: 3,
+    workspaceId,
+    teamId,
+    workspaceRoot: record.workspaceRoot,
+    toolApprovalMode: 'auto',
+    runtimePlanRef,
+    primaryOrdinal: record.primaryOrdinal as number,
+    lanes,
+  }
+}
+
 function parseMembers(value: unknown, laneIndex: number): readonly TeamLifecycleLaunchMember[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
     throw new TypeError(`Lane ${laneIndex} requires 1-64 members`)
@@ -224,6 +362,40 @@ function parseMembers(value: unknown, laneIndex: number): readonly TeamLifecycle
   return members
 }
 
+function parseMembersV3(value: unknown, laneIndex: number): readonly TeamLifecycleLaunchMemberV3[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new TypeError(`Lane ${laneIndex} requires 1-64 members`)
+  }
+  const members = value.map((raw, memberIndex): TeamLifecycleLaunchMemberV3 => {
+    const member = asRecord(raw, `lane ${laneIndex} member ${memberIndex}`)
+    const hasModel = Object.prototype.hasOwnProperty.call(member, 'model')
+    const hasEffort = Object.prototype.hasOwnProperty.call(member, 'effort')
+    assertExactKeys(
+      member,
+      [
+        'name', 'prompt', ...(hasModel ? ['model'] : []), ...(hasEffort ? ['effort'] : []),
+        'ordinal', 'agentId',
+      ],
+      `lane ${laneIndex} member ${memberIndex}`,
+    )
+    return {
+      name: identifier(member.name, `lane ${laneIndex} member ${memberIndex} name`),
+      prompt: boundedString(member.prompt, `lane ${laneIndex} member ${memberIndex} prompt`, 64 * 1024),
+      ...(hasModel ? { model: boundedString(member.model, `lane ${laneIndex} member ${memberIndex} model`, 256) } : {}),
+      ...(hasEffort ? { effort: boundedString(member.effort, `lane ${laneIndex} member ${memberIndex} effort`, 64) } : {}),
+      ordinal: nonNegativeSafeInteger(member.ordinal, `lane ${laneIndex} member ${memberIndex} ordinal`),
+      agentId: canonicalIdentifier(member.agentId, 'member', `lane ${laneIndex} member ${memberIndex} agentId`),
+    }
+  })
+  if (new Set(members.map(member => member.name.toLowerCase())).size !== members.length) {
+    throw new TypeError(`Duplicate member name in lane ${laneIndex}`)
+  }
+  if (members.some((member, index) => index > 0 && member.ordinal <= members[index - 1]!.ordinal)) {
+    throw new TypeError(`Member ordinals must increase within lane ${laneIndex}`)
+  }
+  return members
+}
+
 function asRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`Invalid ${label}`)
   return value as Record<string, unknown>
@@ -239,6 +411,31 @@ function assertExactKeys(record: Record<string, unknown>, keys: readonly string[
 
 function identifier(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new TypeError(`Invalid ${label}`)
+  }
+  return value
+}
+
+function canonicalIdentifier(value: unknown, prefix: 'workspace' | 'team' | 'run' | 'member', label: string): string {
+  if (typeof value !== 'string' || !new RegExp(`^${prefix}_[0-9a-f]{32}$`).test(value)) {
+    throw new TypeError(`Invalid ${label}`)
+  }
+  return value
+}
+
+function nonNegativeSafeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new TypeError(`Invalid ${label}`)
+  return value as number
+}
+
+function positiveSafeInteger(value: unknown, label: string): number {
+  const parsed = nonNegativeSafeInteger(value, label)
+  if (parsed === 0) throw new TypeError(`Invalid ${label}`)
+  return parsed
+}
+
+function sha256Digest(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) {
     throw new TypeError(`Invalid ${label}`)
   }
   return value

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
-import type { TeamLifecycleLaunchLane } from './TeamLifecycleLaunchPlan.js'
+import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
 
@@ -13,8 +13,8 @@ export type TeamLifecycleLaneObservation = {
 }
 
 export interface TeamLifecycleLaneEffectPort {
-  readonly kind: TeamLifecycleLaunchLane['kind']
-  supports(action: 'launch' | 'cancel' | 'stop' | 'recover'): boolean
+  readonly kind: TeamLifecycleLaunchPlan['lanes'][number]['kind']
+  supports(action: 'launch' | 'cancel' | 'stop' | 'recover', plan: TeamLifecycleLaunchPlan): boolean
   inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation>
   launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
   cancel(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
@@ -23,10 +23,12 @@ export interface TeamLifecycleLaneEffectPort {
 }
 
 export type TeamLifecycleLaneInput = {
+  /** Exact admitted plan; Product runtime identity is never replaced by the Owner runId. */
+  plan: TeamLifecycleLaunchPlan
   planTeamId: string
   workspaceRoot: string
   toolApprovalMode: 'manual' | 'auto'
-  lane: TeamLifecycleLaunchLane
+  lane: TeamLifecycleLaunchPlan['lanes'][number]
   /** Checked inside the lane queue immediately before a provider mutation. */
   effectGuard?: () => boolean | Promise<boolean>
   signal?: AbortSignal
@@ -51,27 +53,32 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     private readonly hasLiveCapability: () => boolean = () => false,
   ) {}
 
-  supports(): boolean { return this.hasLiveCapability() }
+  supports(_action: 'launch' | 'cancel' | 'stop' | 'recover', plan: TeamLifecycleLaunchPlan): boolean {
+    // The schema-2 bridge has no agentId/ordinal/runtime-plan identity contract.
+    // Parsing schema 3 therefore cannot silently authorize effects through it.
+    return plan.schemaVersion === 2 && this.hasLiveCapability()
+  }
 
   async inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode' || !input.runId) return idle()
+    const lane = input.lane
     return this.#serialized(input, async () => {
       await assertEffectGuard(input)
       const data = await this.#execute('opencode.reconcileTeam', input.workspaceRoot, {
         runId: input.runId,
-        laneId: input.lane.laneId,
+        laneId: lane.laneId,
         teamId: input.planTeamId,
         projectPath: input.workspaceRoot,
-        selectedModel: input.lane.selectedModel,
-        selectedVariant: input.lane.effort ?? null,
+        selectedModel: lane.selectedModel,
+        selectedVariant: lane.effort ?? null,
         toolApprovalMode: input.toolApprovalMode,
-        expectedMembers: input.lane.members.map(member => ({
+        expectedMembers: lane.members.map(member => ({
           name: member.name,
-          model: member.model ?? input.lane.selectedModel,
-          variant: member.effort ?? input.lane.effort ?? null,
+          model: member.model ?? lane.selectedModel,
+          variant: member.effort ?? lane.effort ?? null,
         })),
       }, input.signal, input.effectGuard)
-      return launchObservation(data, input.lane.members.map(member => member.name), input.recoveryBinding)
+      return launchObservation(data, lane.members.map(member => member.name), input.recoveryBinding)
     })
   }
 
@@ -115,19 +122,20 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
 
   async #stop(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
+    const lane = input.lane
     await assertEffectGuard(input)
     const data = await this.#execute('opencode.stopTeam', input.workspaceRoot, {
       runId: input.runId,
-      laneId: input.lane.laneId,
+      laneId: lane.laneId,
       teamId: input.planTeamId,
       projectPath: input.workspaceRoot,
-      selectedModel: input.lane.selectedModel,
-      selectedVariant: input.lane.effort ?? null,
+      selectedModel: lane.selectedModel,
+      selectedVariant: lane.effort ?? null,
       toolApprovalMode: input.toolApprovalMode,
-      expectedMembers: input.lane.members.map(member => ({
+      expectedMembers: lane.members.map(member => ({
         name: member.name,
-        model: member.model ?? input.lane.selectedModel,
-        variant: member.effort ?? input.lane.effort ?? null,
+        model: member.model ?? lane.selectedModel,
+        variant: member.effort ?? lane.effort ?? null,
       })),
     }, input.signal, input.effectGuard)
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
@@ -160,7 +168,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   }
 
   async #serialized<T>(
-    input: { planTeamId: string; lane: TeamLifecycleLaunchLane; runId: string | null },
+    input: { planTeamId: string; lane: TeamLifecycleLaunchPlan['lanes'][number]; runId: string | null },
     operation: () => Promise<T>,
   ): Promise<T> {
     const key = `${input.planTeamId}\0${input.lane.laneId}`

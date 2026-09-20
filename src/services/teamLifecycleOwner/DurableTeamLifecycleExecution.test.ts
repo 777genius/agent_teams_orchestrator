@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, unlink } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,9 +9,11 @@ import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.j
 import {
   OpenCodeTeamLifecycleLane,
   type TeamLifecycleLaneEffectPort,
+  type TeamLifecycleLaneInput,
   type TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
-import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
+import { PRODUCT_SCHEMA3_INTERLEAVED_PLAN_JSON } from './TeamLifecycleLaunchPlan.schema3.fixture.js'
+import { parseTeamLifecycleLaunchPlan, type TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
@@ -45,15 +48,22 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
   stoppedRunIds: string[] = []
   stoppedApprovalModes: Array<'manual' | 'auto'> = []
   actions: string[] = []
+  inspectCalls = 0
   launchResult: TeamLifecycleLaneObservation = running()
   inspectResult: TeamLifecycleLaneObservation | null = null
+  supportsSchema3 = false
+  receivedInputs: Array<TeamLifecycleLaneInput & { runId: string }> = []
 
-  supports(_action: HostedLifecycleAction): boolean { return true }
+  supports(_action: HostedLifecycleAction, candidate: TeamLifecycleLaunchPlan): boolean {
+    return candidate.schemaVersion === 2 || this.supportsSchema3
+  }
   async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
+    if (input.runId) this.inspectCalls += 1
     return input.runId ? this.inspectResult ?? this.launchResult : { phase: 'idle', recoverable: false }
   }
-  async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
+  async launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation> {
     this.actions.push('launch')
+    this.receivedInputs.push(input)
     this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
     return this.launchResult
   }
@@ -127,7 +137,7 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(lane.actions).toEqual(['launch', 'recover'])
   })
 
-  test('keeps an asynchronously admitted launch durable until inspect confirms running', async () => {
+  test('keeps supported schema-2 running state inspectable after close while fencing effects', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-async-launch-'))
     roots.push(root)
     const lane = new FakeLane()
@@ -143,12 +153,17 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(launching.phase).toBe('launching')
     await execution.close()
 
+    expect(execution.supports(plan, 'launch')).toBe(true)
+    await expect(execution.launch({
+      plan, commandId: 'command-after-close', runId: null,
+      expectedProviderGeneration: launching.providerGeneration,
+    })).rejects.toThrow('execution is closed')
     await expect(execution.inspect(plan)).resolves.toMatchObject({
       phase: 'running', runId: launching.runId, recoverable: false,
     })
   })
 
-  test('reconciles an asynchronously failed launch without inventing success', async () => {
+  test('keeps supported schema-2 failed state inspectable after close while fencing effects', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-async-failure-'))
     roots.push(root)
     const lane = new FakeLane()
@@ -162,9 +177,41 @@ describe('DurableTeamLifecycleExecution', () => {
     })
     await execution.close()
 
+    expect(execution.supports(plan, 'recover')).toBe(true)
+    await expect(execution.recover({
+      plan, commandId: 'command-after-close', runId: launching.runId,
+      expectedProviderGeneration: launching.providerGeneration,
+    })).rejects.toThrow('execution is closed')
     await expect(execution.inspect(plan)).resolves.toMatchObject({
       phase: 'failed', runId: launching.runId, recoverable: true,
     })
+  })
+
+  test('fences active unsupported schema-3 state before any lane call', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-schema3-fence-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const schema3 = { ...plan, schemaVersion: 3 as const } as unknown as TeamLifecycleLaunchPlan
+    const state = {
+      schemaVersion: 4, revision: 1,
+      planFingerprint: createHash('sha256').update(JSON.stringify(schema3)).digest('hex'),
+      toolApprovalMode: schema3.toolApprovalMode,
+      phase: 'running', runId: 'run_schema3_active', recoverable: false,
+      ownerIncarnation: null, recoveryBindings: {},
+    }
+    await writeFile(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 })
+    const lane = new FakeLane()
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane])
+
+    expect(execution.supports(schema3, 'recover')).toBe(false)
+    await expect(execution.launch({
+      plan: schema3, commandId: 'command-schema3', runId: null,
+      expectedProviderGeneration: 'generation_unused',
+    })).rejects.toThrow('unavailable for this plan')
+    await expect(execution.inspect(schema3)).rejects.toThrow('active state is unavailable')
+    await expect(execution.recoverAtStartup(schema3, () => true)).rejects.toThrow('active state is unavailable')
+    expect(lane.inspectCalls).toBe(0)
+    expect(lane.actions).toEqual([])
   })
 
   test('treats an unconfirmed launch from a previous process as recoverable crash evidence', async () => {
@@ -226,7 +273,7 @@ describe('DurableTeamLifecycleExecution', () => {
     const closing = execution.close().then(() => { closed = true })
     await Bun.sleep(0)
     expect(closed).toBe(false)
-    expect(execution.supports(plan, 'launch')).toBe(false)
+    expect(execution.supports(plan, 'launch')).toBe(true)
 
     releaseLaunch()
     await closing
@@ -338,7 +385,7 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(lane.actions).toEqual(['launch', 'stop'])
     expect(lane.stoppedRunIds).toEqual([running.runId])
     expect(lane.stoppedApprovalModes).toEqual(['manual'])
-    expect(execution.supports(plan, 'launch')).toBe(false)
+    expect(execution.supports(plan, 'launch')).toBe(true)
 
     releaseStop()
     await closing
@@ -450,7 +497,7 @@ describe('DurableTeamLifecycleExecution', () => {
 
     const planB: TeamLifecycleLaunchPlan = {
       ...plan,
-      lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/replacement-model' }],
+      lanes: [{ ...plan.lanes[0]!, kind: 'opencode', provider: 'opencode', selectedModel: 'provider/replacement-model' }],
     }
     const idleB = await execution.inspect(planB)
     await execution.launch({
@@ -608,6 +655,73 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(execution.supports(nativePlan, 'launch')).toBe(false)
   })
 
+  test('requires explicit schema 3 support and passes Product identity unchanged beside Owner run identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-schema3-seam-'))
+    roots.push(root)
+    const schema3 = parseTeamLifecycleLaunchPlan(JSON.parse(PRODUCT_SCHEMA3_INTERLEAVED_PLAN_JSON))
+    const lane = new FakeLane()
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    expect(execution.supports(schema3, 'launch')).toBe(false)
+    const idle = await execution.inspect(schema3)
+    await expect(execution.launch({
+      plan: schema3,
+      commandId: 'command-schema3-unsupported',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })).rejects.toThrow('unavailable for this plan')
+    expect(lane.actions).toEqual([])
+    lane.supportsSchema3 = true
+    expect(execution.supports(schema3, 'launch')).toBe(true)
+
+    const launching = await execution.launch({
+      plan: schema3,
+      commandId: 'command-schema3',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForPhase(execution, 'running', schema3)
+    expect(lane.receivedInputs).toHaveLength(2)
+    for (const input of lane.receivedInputs) {
+      expect(input.plan).toBe(schema3)
+      expect(input.lane).toBe(schema3.lanes[lane.receivedInputs.indexOf(input)])
+      expect(input.plan.schemaVersion).toBe(3)
+      if (input.plan.schemaVersion !== 3) throw new Error('expected schema 3 lane input')
+      expect(input.plan.runtimePlanRef.runId).toBe(`run_${'c'.repeat(32)}`)
+      expect(input.runId).toBe(launching.runId)
+      expect(input.runId).not.toBe(input.plan.runtimePlanRef.runId)
+    }
+  })
+
+  test('binds schema 3 identity into durable fingerprints and denies active replacement', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-schema3-fingerprint-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const schema3 = parseTeamLifecycleLaunchPlan(JSON.parse(PRODUCT_SCHEMA3_INTERLEAVED_PLAN_JSON))
+    if (schema3.schemaVersion !== 3) throw new Error('expected schema 3 fixture')
+    const changed = structuredClone(schema3)
+    changed.runtimePlanRef.generation += 1
+    const changedAgent = structuredClone(schema3)
+    changedAgent.lanes[1]!.members[0]!.agentId = `member_${'7'.repeat(32)}`
+    const lane = new FakeLane()
+    lane.supportsSchema3 = true
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane])
+    const originalIdle = await execution.inspect(schema3)
+    const changedIdle = await execution.inspect(changed)
+    expect(changedIdle.providerGeneration).not.toBe(originalIdle.providerGeneration)
+    const changedAgentIdle = await execution.inspect(changedAgent)
+    expect(changedAgentIdle.providerGeneration).not.toBe(originalIdle.providerGeneration)
+
+    const launching = await execution.launch({
+      plan: schema3,
+      commandId: 'command-schema3-active',
+      runId: null,
+      expectedProviderGeneration: originalIdle.providerGeneration,
+    })
+    expect(launching.phase).toBe('launching')
+    await waitForPhase(execution, 'running', schema3)
+    await expect(execution.inspect(changed)).rejects.toThrow('Active team lifecycle plan changed')
+  })
+
   test('binds recovered durable state to the admitted approval mode', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-approval-mode-'))
     roots.push(root)
@@ -643,7 +757,7 @@ describe('DurableTeamLifecycleExecution', () => {
     const changedPlans: TeamLifecycleLaunchPlan[] = [
       { ...plan, workspaceRoot: '/sandbox/other-project' },
       { ...plan, toolApprovalMode: 'auto' },
-      { ...plan, lanes: [{ ...plan.lanes[0]!, selectedModel: 'provider/other-default' }] },
+      { ...plan, lanes: [{ ...plan.lanes[0]!, kind: 'opencode', provider: 'opencode', selectedModel: 'provider/other-default' }] },
       {
         ...plan,
         lanes: [{
@@ -681,6 +795,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     const admittedLane = plan.lanes[0]!
     const input = {
+      plan,
       planTeamId: plan.teamId,
       workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode,
@@ -722,6 +837,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 300_000, () => true)
     const input = {
+      plan,
       planTeamId: plan.teamId,
       workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode,
@@ -764,6 +880,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
       ],
     }
     const input = {
+      plan,
       planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode, lane: admittedLane, runId: 'run_binding',
     }
@@ -807,11 +924,13 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     let current = true
     const first = lane.launch({
+      plan,
       planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_first',
     })
     await firstStarted
     const queued = lane.launch({
+      plan,
       planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_queued',
       effectGuard: () => current,
@@ -864,6 +983,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
 
     blockNext = true
     const first = lane.launch({
+      plan,
       planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode, lane: plan.lanes[0]!, runId: 'run_queue_blocker',
     })
@@ -898,6 +1018,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
     await lane.launch({
+      plan,
       planTeamId: plan.teamId,
       workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: 'auto',

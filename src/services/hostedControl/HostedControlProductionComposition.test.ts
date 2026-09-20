@@ -12,6 +12,7 @@ import {
   type TeamLifecycleLaneObservation,
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
+import { PRODUCT_SCHEMA3_INTERLEAVED_PLAN_JSON } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.schema3.fixture.js'
 import {
   createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
@@ -123,6 +124,34 @@ describe('createHostedControlProductionPorts', () => {
     const missing = await createHostedControlProductionPorts(context(teamRoot))
     expect((await missing.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
     expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_PLAN_FILE)
+  })
+
+  test('admits Product schema 3 but keeps production OpenCode execution capability-false', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-schema3-')
+    await writeFile(
+      join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
+      PRODUCT_SCHEMA3_INTERLEAVED_PLAN_JSON,
+      { mode: 0o600 },
+    )
+    const workspaceId = `workspace_${'b'.repeat(32)}`
+    const runtimeContext = context(teamRoot)
+    const ports = await createHostedControlProductionPorts({
+      ...runtimeContext,
+      authority: { ...runtimeContext.authority, workspaceId },
+    })
+    const request = controlStateInput()
+    const authority = { ...request.authority, workspaceId }
+    const response = await ports.lifecycle.dispatch({
+      ...request,
+      authority,
+      payload: {
+        ...request.payload,
+        authority,
+        request: { ...request.payload.request, workspaceId },
+      },
+    })
+    expect(response.payload.kind).toBe('unavailable')
+    expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
   })
 
   test('keeps an admitted OpenCode plan unavailable when its live owner capability is absent', async () => {
@@ -448,15 +477,15 @@ async function writePlan(
     kind === 'opencode'
       ? {
           laneId: 'opencode-primary',
-          kind: 'opencode',
-          provider: 'opencode',
+          kind: 'opencode' as const,
+          provider: 'opencode' as const,
           selectedModel: 'openai/gpt-5',
           members: [{ name: 'worker', prompt: 'Work only in the admitted sandbox.' }],
         }
       : {
           laneId: 'codex-primary',
-          kind: 'native',
-          provider: 'codex',
+          kind: 'native' as const,
+          provider: 'codex' as const,
           members: [{ name: 'worker', prompt: 'Work only in the admitted sandbox.' }],
         }
   const plan: TeamLifecycleLaunchPlan = {

@@ -72,13 +72,15 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   supports(plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean {
-    return this.#acceptingEffects &&
-      plan.lanes.every(lane => this.#adapters.get(lane.kind)?.supports(action) === true)
+    // Capability is a property of the plan and adapters, not of this owner's
+    // current admission state. close() fences effects separately.
+    return this.#supportsCapability(plan, action)
   }
 
   inspect(plan: TeamLifecycleLaunchPlan): Promise<HostedLifecycleProviderSnapshot> {
     return this.#serialized(async () => {
       let state = await this.#read(plan)
+      this.#assertActiveSupported(plan, state)
       if (state.phase === 'launching' && state.runId && !this.#jobs.has(state.runId)) {
         if (state.ownerIncarnation !== this.#ownerIncarnation) {
           throw new Error('Team lifecycle run is owned by another incarnation')
@@ -133,6 +135,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority is not current')
       const state = await this.#read(plan)
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
+      this.#assertActiveSupported(plan, state)
       if (state.phase === 'idle') return
 
       if (state.phase === 'running' && state.runId) {
@@ -434,6 +437,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       const adapter = this.#adapter(lane.kind)
       const expectedBinding = recoveryBindings[lane.laneId]
       const observation = await adapter.inspect({
+        plan,
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
@@ -457,6 +461,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed')
       const expectedBinding = recoveryBindings[lane.laneId]
       const observation = await adapter.inspect({
+        plan,
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
@@ -480,6 +485,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     return Promise.all(plan.lanes.map(async lane => {
       const adapter = this.#adapter(lane.kind)
       const laneInput: LaneInput = {
+        plan,
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
@@ -517,6 +523,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     return Promise.all(plan.lanes.map(lane => {
       const adapter = this.#adapter(lane.kind)
       return this.#invokeAdapter(adapter, 'stop', {
+        plan,
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
@@ -536,6 +543,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if (!(await effectGuard())) throw new Error('Team lifecycle startup authority changed before teardown')
       const adapter = this.#adapter(lane.kind)
       return this.#invokeAdapter(adapter, 'stop', {
+        plan,
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
@@ -601,7 +609,20 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   #assertSupported(plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): void {
-    if (!this.supports(plan, action)) throw new Error(`Team lifecycle ${action} is unavailable for this plan`)
+    this.#assertAcceptingEffects()
+    if (!this.#supportsCapability(plan, action)) throw new Error(`Team lifecycle ${action} is unavailable for this plan`)
+  }
+
+  #assertActiveSupported(plan: TeamLifecycleLaunchPlan, state: DurableState): void {
+    // An unsupported schema may still have durable active state. Fence before
+    // any reconciliation, adoption, inspection, or teardown can call a lane.
+    if (state.phase !== 'idle' && !this.#supportsCapability(plan, 'recover')) {
+      throw new Error('Team lifecycle active state is unavailable for this plan')
+    }
+  }
+
+  #supportsCapability(plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean {
+    return plan.lanes.every(lane => this.#adapters.get(lane.kind)?.supports(action, plan) === true)
   }
 
   #assertAcceptingEffects(): void {
