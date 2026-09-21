@@ -361,6 +361,34 @@ describe('processKill', () => {
     expect(signals).not.toContain('SIGCONT')
   })
 
+  it('contains every discovered Darwin member with one STOP and no follow-up signal', async () => {
+    const signals: Array<[number, NodeJS.Signals]> = []
+    await expect(terminateExpectedProcessTreeStable(
+      42,
+      'SIGSTOP',
+      100,
+      'darwin-audit:root',
+      {
+        timeoutMs: 1,
+        pollMs: 1,
+        escalationTimeoutMs: 1,
+        nowMs: () => 0,
+        sleep: async () => undefined,
+        platform: 'darwin',
+        darwinBoundary: {
+          // A stable second pass proves discovery completed before STOP returns.
+          listMembers: async () => [42, 43],
+          acquireMember: async pid => ({ pid, auditIdentity: pid === 42 ? 'darwin-audit:root' : 'darwin-audit:child' }),
+          signalMember: async (member, memberSignal) => {
+            signals.push([member.pid, memberSignal])
+            return true
+          },
+        },
+      },
+    )).resolves.toBe(false)
+    expect(signals).toEqual([[42, 'SIGSTOP'], [43, 'SIGSTOP']])
+  })
+
   it('does not escalate to KILL when cancellation occurs immediately after the graceful signal', async () => {
     let remaining = 10
     const signals: NodeJS.Signals[] = []
@@ -496,6 +524,16 @@ describe('processKill', () => {
   it('does not spawn an identity query for an invalid pid', async () => {
     await expect(readProcessStartTimeMs(0, 'win32')).resolves.toBeNull()
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
+  })
+
+  it('rejects fractional and unsafe PIDs before they can be normalized into another query', async () => {
+    // This would have read /proc/<current pid> after Math.trunc before the
+    // validation moved ahead of normalization.
+    await expect(readProcessStartTimeMs(process.pid + 0.9, 'linux')).resolves.toBeNull()
+    await expect(readProcessStartTimeMs(42.9, 'linux')).resolves.toBeNull()
+    for (const pid of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(readProcessStartTimeMs(pid, 'linux')).resolves.toBeNull()
+    }
   })
 
   it('parses Darwin kernel start time with microsecond precision', () => {

@@ -16,7 +16,30 @@ import { OPEN_CODE_TEAMMATE_AGENT_NAME } from '../src/services/opencode/OpenCode
 type Config = Record<string, any>
 class ProbeError extends Error {}
 let phase = 'arguments'
+type EndpointDiagnostic = Readonly<{
+  endpoint: 'providers' | 'agent' | 'mcp'
+  durationMs: number
+  category: 'ok' | 'http_status' | 'timeout' | 'transport' | 'decode'
+  status: number | null
+  childExit: { exitCode: number | null; signalCode: string | null }
+}>
+const endpointDiagnostics: Partial<Record<EndpointDiagnostic['endpoint'], EndpointDiagnostic>> = {}
 function assert(ok: unknown, message: string): asserts ok { if (!ok) throw new ProbeError(message) }
+
+function sanitizedEndpointDiagnostics(): Record<EndpointDiagnostic['endpoint'], EndpointDiagnostic | null> {
+  return {
+    providers: endpointDiagnostics.providers ?? null,
+    agent: endpointDiagnostics.agent ?? null,
+    mcp: endpointDiagnostics.mcp ?? null,
+  }
+}
+
+function endpointCategory(error: unknown): EndpointDiagnostic['category'] {
+  if (error instanceof ProbeError) return 'http_status'
+  if (error instanceof DOMException && error.name === 'TimeoutError') return 'timeout'
+  if (error instanceof SyntaxError) return 'decode'
+  return 'transport'
+}
 
 export function managedAgentFixtures(mode: 'auto' | 'manual'): Config {
   // Independent contract fixture from buildManagedConfig; deliberately not taken from /agent.
@@ -161,9 +184,27 @@ async function main(): Promise<void> {
     child = Bun.spawn([binary, 'serve', '--hostname', '127.0.0.1', '--port', String(port)],
       { cwd: roots.project, env, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
     const read = async (route: string) => {
-      const response = await fetch(`http://127.0.0.1:${port}${route}`, { signal: AbortSignal.timeout(2000) })
-      assert(response.ok, `Probe failed: ${route} HTTP ${response.status}`)
-      return response.json()
+      const endpoint = route === '/config/providers' ? 'providers' : route === '/agent' ? 'agent'
+        : route === '/mcp' ? 'mcp' : null
+      const startedAt = Date.now()
+      let status: number | null = null
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${route}`, { signal: AbortSignal.timeout(2000) })
+        status = response.status
+        assert(response.ok, `Probe failed: ${route} HTTP ${response.status}`)
+        const data = await response.json()
+        if (endpoint) endpointDiagnostics[endpoint] = {
+          endpoint, durationMs: Math.max(0, Date.now() - startedAt), category: 'ok', status,
+          childExit: { exitCode: child?.exitCode ?? null, signalCode: child?.signalCode ?? null },
+        }
+        return data
+      } catch (error) {
+        if (endpoint) endpointDiagnostics[endpoint] = {
+          endpoint, durationMs: Math.max(0, Date.now() - startedAt), category: endpointCategory(error), status,
+          childExit: { exitCode: child?.exitCode ?? null, signalCode: child?.signalCode ?? null },
+        }
+        throw error
+      }
     }
     let config: Config | undefined
     const deadline = Date.now() + 25000
@@ -205,7 +246,8 @@ async function main(): Promise<void> {
     console.log(JSON.stringify({ schemaVersion: 1, status: 'passed', policyMode: modeArg, configTransport: transport, binary: { version, sha256, reportedVersion },
       os: { platform: platform(), release: release() }, fixture: expected,
       checks: { configUncontaminated: true, providerContracts: true, negativeEndpointRejected: rejected, managedAgentOrderedPolicies: true, negativePolicyOrderRejected: policyOrderRejected, truncateExceptionObserved: true, fixtureRequests: requests },
-      responses: { configKeys: Object.keys(config), providerKeys: Object.keys(providers), agentCount: agents.length, mcpKeys: Object.keys(mcp) },
+      responses: { configKeys: Object.keys(config), providerKeys: Object.keys(providers), agentCount: agents.length, mcpKeys: Object.keys(mcp),
+        endpointDiagnostics: sanitizedEndpointDiagnostics() },
       limitations: ['Temporary HOME does not isolate system managed settings; clean disposable runner required.',
         'No model inference, permission evaluator, plugin installation, or full launch authority/E2E proven.'] }, null, 2))
   } finally {
@@ -218,7 +260,8 @@ async function main(): Promise<void> {
 
 if (import.meta.main) main().then(() => process.exit(0), error => {
   console.error(JSON.stringify({ status: 'failed', phase,
-    reason: error instanceof ProbeError ? error.message : 'Probe operation failed; raw diagnostics withheld' }))
+    reason: error instanceof ProbeError ? error.message : 'Probe operation failed; raw diagnostics withheld',
+    endpointDiagnostics: sanitizedEndpointDiagnostics() }))
   // Fetch/runtime connection pools can keep Bun alive after all owned resources close.
   process.exit(1)
 })

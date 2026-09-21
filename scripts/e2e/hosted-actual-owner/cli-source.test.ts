@@ -10,8 +10,9 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { ACTUAL_OWNER_MARKER_FILE, ACTUAL_OWNER_PURPOSE } from './contracts.js'
-import { fingerprintFixtureEffect, fingerprintFixtureSession } from './fingerprint-fixture.js'
+import { fingerprintOpenCodeApprovalSessionRecord, liveEffectFingerprint } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
 import { getOpenCodeManagedSubscriptionPluginPackages } from '../../../src/services/opencode/OpenCodeCuratedSubscriptionCatalog.js'
+import { fingerprintOpenCodeResolvedConfigEndpoints } from '../../../src/services/opencode/OpenCodeHostManager.js'
 
 const execFileAsync = promisify(execFile)
 const roots: string[] = []
@@ -129,6 +130,35 @@ afterEach(async () => {
 const isolatedEnvironment = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C', LC_ALL: 'C',
   GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', ...extra,
+})
+
+type FixtureProviderAdmission = Readonly<{
+  selectedModel: string
+  providerId: string
+  modelId: string
+}>
+
+/** The fixture is an admitted OpenCode route, never a default-model exercise. */
+function admitFixtureProviderModel(selectedModel: unknown): FixtureProviderAdmission {
+  if (typeof selectedModel !== 'string') throw new Error('fixture selectedModel is required')
+  const match = /^([a-z][a-z0-9-]*)\/([a-z0-9][a-z0-9._-]*)$/i.exec(selectedModel)
+  if (!match) throw new Error('fixture selectedModel must be provider-scoped')
+  const [, providerId, modelId] = match
+  if (providerId !== 'fixture' || modelId !== 'fixture-model') {
+    throw new Error('fixture selectedModel is not admitted')
+  }
+  return Object.freeze({ selectedModel, providerId, modelId })
+}
+
+describe('hosted actual-owner fixture admission', () => {
+  test('rejects missing or malformed selectedModel before provider startup', () => {
+    expect(() => admitFixtureProviderModel(undefined)).toThrow('selectedModel is required')
+    expect(() => admitFixtureProviderModel('fixture')).toThrow('provider-scoped')
+    expect(() => admitFixtureProviderModel('fixture/unknown')).toThrow('not admitted')
+    expect(admitFixtureProviderModel('fixture/fixture-model')).toEqual({
+      selectedModel: 'fixture/fixture-model', providerId: 'fixture', modelId: 'fixture-model',
+    })
+  })
 })
 
 async function git(root: string, args: string[]): Promise<string> {
@@ -360,6 +390,9 @@ describe('hosted actual-owner source launcher black box', () => {
     const bunBytes = await readFile(bunExecutable)
     const executableSha256 = createHash('sha256').update(bunBytes).digest('hex')
     const providerPort = await unusedPort()
+    // Admission occurs before the provider is spawned. Missing/malformed input
+    // cannot fall back to an ambient/default model or touch a host endpoint.
+    const admittedProvider = admitFixtureProviderModel('fixture/fixture-model')
     const password = 'actual-owner-fixture-password'
     const providerSource = join(root, 'provider.ts')
     await writeFile(providerSource, `
@@ -369,7 +402,8 @@ const capability = {schemaVersion:2,protocol:'agent-teams-hosted-approval-v2',au
 Bun.serve({hostname:'127.0.0.1',port,fetch(request){
   const url = new URL(request.url)
   if (url.pathname === '/global/health') return Response.json({healthy:true,version:'fixture'})
-  if (['/config','/config/providers','/agent','/mcp'].includes(url.pathname)) return Response.json({})
+  if (url.pathname === '/config' || url.pathname === '/config/providers' || url.pathname === '/mcp') return Response.json({})
+  if (url.pathname === '/agent') return Response.json([])
   if (request.headers.get('authorization') !== authorization || request.headers.get('x-opencode-directory') !== ${JSON.stringify(project)}) return new Response('forbidden',{status:403})
   if (url.pathname === '/experimental/agent-teams/hosted-approval-capability') return Response.json(capability)
   if (url.pathname === '/experimental/agent-teams/hosted-approval/session/session_1/permissions') return Response.json({schemaVersion:capability.schemaVersion,protocol:capability.protocol,runtimeInstanceId:capability.runtimeInstanceId,configGeneration:capability.configGeneration,sessionId:'session_1',permissions:[]})
@@ -377,9 +411,20 @@ Bun.serve({hostname:'127.0.0.1',port,fetch(request){
 }})
 await new Promise(() => {})
 `)
+    const scopedRuntimeConfig = {
+      model: admittedProvider.selectedModel,
+      provider: {
+        [admittedProvider.providerId]: {
+          npm: '@ai-sdk/openai-compatible',
+          options: { baseURL: `http://127.0.0.1:${providerPort}` },
+          models: { [admittedProvider.modelId]: { name: 'Actual owner fixture model' } },
+        },
+      },
+    }
     const fixtureEnvironment = isolatedEnvironment({
       HOME: home, XDG_DATA_HOME: join(home, 'xdg-data'),
       CLAUDE_MULTIMODEL_DATA_HOME: data, CLAUDE_MULTIMODEL_CACHE_HOME: cache,
+      CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT: JSON.stringify(scopedRuntimeConfig),
       OPENCODE_SERVER_PASSWORD: password,
     })
     const cleanup = new CleanupStack()
@@ -392,15 +437,17 @@ await new Promise(() => {})
     const processStartedAtMs = await linuxProcessStartTicks(provider.pid!)
     expect(processStartedAtMs).not.toBeNull()
     const processStartIdentity = `start_${createHash('sha256')
-      .update(String(provider.pid!)).update('\0').update(`proc:${processStartedAtMs}`).digest('hex')}`
+      .update(String(provider.pid!)).update('\0').update(`proc:${processStartedAtMs}`).digest('hex')}` as `start_${string}`
     const capability = {
       schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', authentication: 'opencode-basic',
       runtimeInstanceId: `runtime_instance_${'8'.repeat(32)}`,
       configGeneration: `config_generation_${'9'.repeat(32)}`,
-    }
+    } as const
 
     const profileModule = join(repositoryRoot, 'src/services/opencode/OpenCodeProfileManager.ts')
-    const profileSource = `import { OpenCodeProfileManager } from ${JSON.stringify(profileModule)}; console.log(JSON.stringify(await new OpenCodeProfileManager().prepareProfile(${JSON.stringify(project)}, {toolApprovalMode:'manual'})))`
+    // Resolve and prepare exactly as the scoped runtime path does. A manually
+    // assembled profile could bind a different provider scope than the session.
+    const profileSource = `import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from ${JSON.stringify(profileModule)}; const projectPath=${JSON.stringify(project)}; const selectedModel=${JSON.stringify(admittedProvider.selectedModel)}; const scope=await resolveOpenCodeProfileScope({projectPath,selectedModel,purpose:'launch_runtime',env:process.env}); console.log(JSON.stringify(await new OpenCodeProfileManager().prepareProfile(projectPath,{toolApprovalMode:'manual',profileScope:scope})))`
     const profile = JSON.parse((await execFileAsync(bunExecutable, ['-e', profileSource], {
       encoding: 'utf8', env: fixtureEnvironment, maxBuffer: 16 * 1024 * 1024,
     })).stdout) as Record<string, any>
@@ -409,20 +456,22 @@ await new Promise(() => {})
       await mkdir(packageRoot, { recursive: true, mode: 0o700 })
       await writeFile(join(packageRoot, 'package.json'), '{}\n', { mode: 0o600 })
     }))
-    const resolvedConfigFingerprint = createHash('sha256').update(JSON.stringify({
-      config: {}, configProviders: {}, agents: {}, mcp: [],
-    })).digest('hex')
+    const resolvedConfigFingerprint = fingerprintOpenCodeResolvedConfigEndpoints({
+      config: {}, configProviders: {}, agents: [], mcp: {},
+    })
     const hostKey = 'actual-owner-fixture-host'
     const teamId = `team_${'1'.repeat(32)}`
     const routeRunId = `run_${'2'.repeat(32)}`
+    const artifactDigest = `sha256:${executableSha256}` as `sha256:${string}`
     const session = {
       teamId, laneId: 'secondary:opencode:worker', runId: routeRunId, memberName: 'worker',
-      providerId: 'opencode', toolApprovalMode: 'manual', opencodeSessionId: 'session_1', staleReason: null,
+      providerId: 'opencode', selectedModel: admittedProvider.selectedModel,
+      toolApprovalMode: 'manual', opencodeSessionId: 'session_1', staleReason: null,
       hostKey, projectPath: project, profileRootKey: profile.profileRootKey,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
       managedConfigFingerprint: profile.managedConfigFingerprint,
       sourceAuthFingerprint: profile.sourceAuthFingerprint, managedAuthFingerprint: profile.managedAuthFingerprint,
-      runtimePid: provider.pid!, openCodeArtifactDigest: `sha256:${executableSha256}`,
+      runtimePid: provider.pid!, openCodeArtifactDigest: artifactDigest,
       createdAt: '2026-08-15T00:00:00.000Z',
     }
     const effect = { record: session, profile, host: {
@@ -446,8 +495,13 @@ await new Promise(() => {})
       openCodeBinding: { toolApprovalMode: 'manual', planGeneration: 2, credentialGeneration: 3,
         credentialId: 'credential_1', runtimeInstanceId: capability.runtimeInstanceId, deliveryOwnerId: memberId,
         openCodeArtifactDigest: session.openCodeArtifactDigest,
-        sessionRecordFingerprint: fingerprintFixtureSession(session),
-        liveEffectFingerprint: fingerprintFixtureEffect(effect, { processStartIdentity, capability }) },
+        sessionRecordFingerprint: fingerprintOpenCodeApprovalSessionRecord(session),
+        liveEffectFingerprint: liveEffectFingerprint({
+          context: { record: session, profile, host: effect.host },
+          processIdentity: { pid: provider.pid!, startIdentity: processStartIdentity },
+          endpointIdentity: { address: '127.0.0.1', port: providerPort, pid: provider.pid!, startIdentity: processStartIdentity },
+          executedArtifactDigest: artifactDigest, resolvedConfigFingerprint, capability,
+        }) },
     }
 
     const sessionStore = join(data, 'opencode', 'session-store.json')

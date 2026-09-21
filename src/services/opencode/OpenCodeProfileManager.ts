@@ -95,7 +95,11 @@ import {
   cursorNativeSelectedIdentity,
   reconcileCursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
-import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import {
+  assertOpenCodeProviderScopedModelRef,
+  OpenCodeUnsupportedProviderModelReferenceError,
+  parseOpenCodeProviderScopedModelRef,
+} from './OpenCodeModelRef.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
@@ -2266,6 +2270,87 @@ type OpenCodeScopeResolutionInput = {
   oauthSessionToRelease?: OpenCodeSessionRecord
 }
 
+/**
+ * Keep the selected reference and every provider-key lookup in the same
+ * identity domain. In particular, an old `lm-studio/foo` record must seed and
+ * bind the canonical `lmstudio` provider instead of splitting those effects.
+ */
+function canonicalizeOpenCodeProviderScopedModelRef(value: unknown) {
+  const parsed = assertOpenCodeProviderScopedModelRef(value)
+  const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  return { ...parsed, providerId, raw: `${providerId}/${parsed.modelId}` }
+}
+
+function assertStrictOpenCodeProviderModelAdmission(input: {
+  purpose: OpenCodeProfilePurpose
+  selectedModel: ReturnType<typeof canonicalizeOpenCodeProviderScopedModelRef>
+}): void {
+  if (isStrictAuthorityPurpose(input.purpose) && input.selectedModel.providerId === 'kiro') {
+    throw new OpenCodeUnsupportedProviderModelReferenceError(
+      input.selectedModel.raw,
+      `OpenCode ${input.purpose} does not support extension-bound provider kiro`,
+    )
+  }
+}
+
+/**
+ * The narrow, side-effect-free admission at every strict provider route.
+ *
+ * A selected model is persisted state at several call sites.  Do not let that
+ * state choose an approval-mode profile, a supplied prepared profile, or a
+ * host path until the provider's managed runtime requirements are known to be
+ * present.  In particular, Cursor's plugin is its managed Stop boundary; an
+ * unavailable asset is not a route that can safely degrade to the upstream
+ * extension.
+ */
+export type OpenCodeProviderRouteAdmission = Readonly<{
+  purpose: OpenCodeProfilePurpose
+  selectedModel: string
+  providerId: string
+  cursorAssets: OpenCodeCursorManagedAssets | null
+}>
+
+export async function admitOpenCodeProviderRoute(input: {
+  purpose: OpenCodeProfilePurpose
+  selectedModel: unknown
+  env?: NodeJS.ProcessEnv
+}): Promise<OpenCodeProviderRouteAdmission> {
+  const selectedModel = canonicalizeOpenCodeProviderScopedModelRef(input.selectedModel)
+  assertStrictOpenCodeProviderModelAdmission({ purpose: input.purpose, selectedModel })
+  if (!isStrictAuthorityPurpose(input.purpose) || selectedModel.providerId !== 'cursor-acp') {
+    return {
+      purpose: input.purpose,
+      selectedModel: selectedModel.raw,
+      providerId: selectedModel.providerId,
+      cursorAssets: null,
+    }
+  }
+
+  // This is intentionally the first Cursor-specific operation.  It only
+  // verifies already-staged immutable assets; it neither creates config paths
+  // nor probes/starts a provider.
+  const runtimeEnv = scopeSourceEnvironment(input.env ?? process.env)
+  const managedCursor = await resolveOpenCodeCursorManagedAssets({
+    env: runtimeEnv,
+  }).catch(error => ({
+    available: false as const,
+    reason: `probe_failed:${String(error).slice(0, 60)}`,
+  }))
+  if (!managedCursor.available) {
+    throw new OpenCodeUnsupportedProviderModelReferenceError(
+      selectedModel.raw,
+      `OpenCode ${input.purpose} does not support extension-bound provider cursor-acp`
+        + ` (managed path unavailable: ${managedCursor.reason})`,
+    )
+  }
+  return {
+    purpose: input.purpose,
+    selectedModel: selectedModel.raw,
+    providerId: selectedModel.providerId,
+    cursorAssets: managedCursor.assets,
+  }
+}
+
 function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const retainedScopeEnvironment = asRecord(safeParseJSONC(
     inputEnv[OPEN_CODE_SCOPE_ENVIRONMENT_ENV],
@@ -2279,8 +2364,18 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 }
 
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
-  await recoverOpenCodeScopedOAuth(input)
-  return resolveOpenCodeProfileScopeInternal(input)
+  // Validate the persisted authority input before OAuth recovery (which can
+  // publish credentials) or any resolver-side filesystem work.
+  const admission = await admitOpenCodeProviderRoute(input)
+  const normalizedInput = { ...input, selectedModel: admission.selectedModel }
+  await recoverOpenCodeScopedOAuth(normalizedInput, admission.providerId)
+  return resolveOpenCodeProfileScopeInternal(
+    normalizedInput,
+    undefined,
+    undefined,
+    undefined,
+    admission,
+  )
 }
 
 function isForeignOpenCodeOAuthHarvestSkip(error: unknown): boolean {
@@ -2310,14 +2405,17 @@ async function peekOpenCodeOAuthSaveAdmission(globalAuthPath: string): Promise<{
   }
 }
 
-async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
+async function recoverOpenCodeScopedOAuth(
+  input: OpenCodeScopeResolutionInput,
+  providerId: string,
+): Promise<void> {
   // Catalog and provider tests must not fail-close on a leftover launch receipt
   // from another project. Owner catalog/probe still completes a pending
   // publication through recoverOpenCodeOwnedOAuthSave under the auth-store lock.
   // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
   // Fresh launch resolution can finish an already proven native publication;
   // it cannot create provenance from an old managed auth file.
-  if (input.cacheSnapshot !== false && input.selectedModel.split('/')[0]?.trim().toLowerCase() === 'xai') {
+  if (input.cacheSnapshot !== false && providerId === 'xai') {
     const env = scopeSourceEnvironment(input.env ?? process.env)
     const managedPaths = resolveClaudeMultimodelPaths(env)
     const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
@@ -2451,11 +2549,28 @@ async function resolveOpenCodeProfileScopeInternal(
   recoveryPredecessor?: OpenCodeAuthCredential,
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
+  admittedRoute?: OpenCodeProviderRouteAdmission,
 ): Promise<OpenCodeProfileScope> {
+  // Internal callers include persisted-session recovery. Validate here too,
+  // because this path performs Cursor directory setup and authority work.
+  const admission = admittedRoute ?? await admitOpenCodeProviderRoute(input)
+  const selectedModel = canonicalizeOpenCodeProviderScopedModelRef(admission.selectedModel)
+  if (
+    admission.purpose !== input.purpose
+    || admission.providerId !== selectedModel.providerId
+    || admission.selectedModel !== selectedModel.raw
+  ) {
+    throw new Error('OpenCode provider route admission does not match the selected model')
+  }
+  input = { ...input, selectedModel: admission.selectedModel }
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
+  // This check is deliberately before project/config setup. An unstaged Cursor
+  // route is unsupported, so it must not create CURSOR_CONFIG_DIR or trigger
+  // any profile/config preparation merely to discover that fact.
+  const admittedCursorAssets = admission.cursorAssets
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   if (isStrictAuthorityPurpose(input.purpose)
-    && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
+    && selectedModel.providerId === 'cursor-acp') {
     Object.assign(envSnapshot, managedCursorNativeEnvironment(
       envSnapshot, resolveClaudeMultimodelPaths(envSnapshot).data, projectPath,
     ))
@@ -2464,27 +2579,16 @@ async function resolveOpenCodeProfileScopeInternal(
   const env = Object.freeze(envSnapshot)
   const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
   const snapshotManagedPaths = resolveClaudeMultimodelPaths(env)
-  const providerId = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '')
-  if (!providerId) {
-    throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
-  }
-  if (isStrictAuthorityPurpose(input.purpose)
-    && (providerId === 'kiro' || providerId === 'cursor-acp')) {
+  const providerId = selectedModel.providerId
+  if (isStrictAuthorityPurpose(input.purpose) && providerId === 'cursor-acp') {
     // Cursor is admitted only once the staged managed assets verify: they carry
     // the ownership barrier and the Stop control that make a terminal Stop
     // provable. Unstaged Cursor, and Kiro, stay blocked.
-    const managedCursor = providerId === 'cursor-acp'
-      ? await resolveOpenCodeCursorManagedAssets({ env })
-        .catch(error => ({ available: false as const, reason: `probe_failed:${String(error).slice(0, 60)}` }))
-      : { available: false as const, reason: 'provider_has_no_managed_path' }
-    if (!managedCursor.available) {
-      // The reason is the whole difference between "this build ships no assets"
-      // and "the environment hid the interpreter", and both used to read alike.
-      throw new Error(
-        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`
-        + ` (managed path unavailable: ${managedCursor.reason})`,
-      )
-    }
+    // `admittedCursorAssets` was verified before any config-directory effect.
+    // Keep this defense so an internal caller cannot weaken the admission.
+    if (!admittedCursorAssets) throw new OpenCodeUnsupportedProviderModelReferenceError(
+      selectedModel.raw, `OpenCode ${input.purpose} does not support extension-bound provider cursor-acp`,
+    )
   }
   const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
     ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
@@ -2552,7 +2656,7 @@ async function resolveOpenCodeProfileScopeInternal(
   // probe is, and it is only consulted when the managed assets verify.
   const cursorCandidate = isStrictAuthorityPurpose(input.purpose)
     && providerId === 'cursor-acp'
-  const cursorAssets = cursorCandidate ? await resolveManagedCursorAssets(env) : null
+  const cursorAssets = cursorCandidate ? admittedCursorAssets : null
   const cursorAssetsReady = cursorAssets !== null
   const cursorAssetsIdentity = cursorAssets ? await managedCursorAssetsIdentity(cursorAssets) : null
   const cursorNative = cursorAssetsReady ? await resolveCurrentCursorNativeAuthority(env) : null
@@ -2967,12 +3071,13 @@ export class OpenCodeProfileManager {
     isSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>,
   ): Promise<void> {
     if (record.profileScope?.providerId !== 'xai') return
+    const selectedModel = assertOpenCodeProviderScopedModelRef(record.selectedModel)
     const snapshot = openCodeEffectiveConfigSnapshots.get(record.profileScope.scopeToken)
     await recoverOpenCodeScopedOAuth({
       projectPath: record.projectPath, purpose: record.profileScope.purpose,
-      selectedModel: record.selectedModel, env: snapshot?.runtimeEnv ?? process.env,
+      selectedModel: selectedModel.raw, env: snapshot?.runtimeEnv ?? process.env,
       oauthSessionToRelease: record, isOAuthNativeSessionSettled: isSettled,
-    })
+    }, selectedModel.providerId)
   }
 
   async readSavedOAuthCredential(profile: OpenCodePreparedProfile) {

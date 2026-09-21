@@ -36,9 +36,17 @@ import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
+import {
+  assertOpenCodeProviderScopedModelRef,
+  OpenCodeUnsupportedProviderModelReferenceError,
+} from './OpenCodeModelRef.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
-import { openCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
+import {
+  admitOpenCodeProviderRoute,
+  openCodeProfileManager,
+  resolveOpenCodeProfileScope,
+} from './OpenCodeProfileManager.js'
 import { openCodeSessionStore, type MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
@@ -400,16 +408,24 @@ function parseProviderScopedModel(selectedModel: string): {
   providerID: string
   modelID: string
 } {
-  const trimmed = selectedModel.trim()
-  const separatorIndex = trimmed.indexOf('/')
-  if (separatorIndex <= 0 || separatorIndex >= trimmed.length - 1) {
-    throw new Error(`OpenCode model must be provider-scoped, received "${selectedModel}"`)
-  }
-
+  const parsed = assertOpenCodeProviderScopedModelRef(selectedModel)
   return {
-    providerID: trimmed.slice(0, separatorIndex),
-    modelID: trimmed.slice(separatorIndex + 1),
+    providerID: parsed.providerId,
+    modelID: parsed.modelId,
   }
+}
+
+function assertPersistedOpenCodeSessionModel(selectedModel: unknown): string {
+  const parsed = assertOpenCodeProviderScopedModelRef(selectedModel)
+  // Kiro has no managed strict launch path. Reject it while the record is
+  // still inert rather than allowing profile/config or host work to begin.
+  if (canonicalizeOpenCodeProviderId(parsed.providerId) === 'kiro') {
+    throw new OpenCodeUnsupportedProviderModelReferenceError(
+      `${canonicalizeOpenCodeProviderId(parsed.providerId)}/${parsed.modelId}`,
+      'extension-bound provider kiro has no managed runtime path',
+    )
+  }
+  return parsed.raw
 }
 
 function getMessageId(message: OpenCodeMessage): string | null {
@@ -720,6 +736,10 @@ export class OpenCodeSessionBridge {
   async materializeSessionOnHost(
     params: OpenCodeMaterializeSessionOnHostParams,
   ): Promise<OpenCodeMaterializeSessionOnHostResult> {
+    params = {
+      ...params,
+      selectedModel: await this.admitStrictProviderRoute(params.selectedModel),
+    }
     if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
     const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
     await this.reconcilePendingMaterializationCompensation(params)
@@ -1114,6 +1134,19 @@ export class OpenCodeSessionBridge {
     return prepareProfile(projectPath, options)
   }
 
+  /**
+   * Keep persisted selected models from selecting any session branch until the
+   * strict provider route is admitted. This precedes both the broad
+   * tool-approval profile path and caller-supplied prepared profiles.
+   */
+  private async admitStrictProviderRoute(selectedModel: unknown): Promise<string> {
+    const normalized = assertPersistedOpenCodeSessionModel(selectedModel)
+    return (await admitOpenCodeProviderRoute({
+      purpose: 'launch_runtime',
+      selectedModel: normalized,
+    })).selectedModel
+  }
+
   private sessionProfileMatchesStoredConfig(
     record: OpenCodeSessionRecord,
     profile: OpenCodePreparedProfile,
@@ -1127,6 +1160,10 @@ export class OpenCodeSessionBridge {
     projectPath: string | null | undefined = record.projectPath,
   ): Promise<PreparedSessionProfile> {
     record = this.snapshotSession(record)
+    record = {
+      ...record,
+      selectedModel: await this.admitStrictProviderRoute(record.selectedModel),
+    }
     if (this.custody) {
       if (record.toolApprovalMode !== 'manual' || record.hostKey !== this.custody.hostKey ||
         record.projectPath !== this.custody.expected.profile.projectPath) {
@@ -1384,6 +1421,7 @@ export class OpenCodeSessionBridge {
     // its successor is recovered/published by the profile owner.
     const fullRecord = await this.sessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
     if (fullRecord && fullRecord.opencodeSessionId === record.opencodeSessionId) {
+      assertOpenCodeProviderScopedModelRef(fullRecord.selectedModel)
       await openCodeProfileManager.finishOwnedOAuthBeforeSessionRelease(
         fullRecord,
         owner => this.isOwnedOAuthNativeSessionSettled(owner),
@@ -1709,12 +1747,28 @@ export class OpenCodeSessionBridge {
     fresh?: boolean
     toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<OpenCodeSessionRecord> {
+    // Fail before a persisted record can trigger profile preparation, OAuth
+    // recovery, or host acquisition.
+    params = {
+      ...params,
+      selectedModel: await this.admitStrictProviderRoute(params.selectedModel),
+    }
     if (this.custody) params = { ...params,
       preparedProfile: params.preparedProfile ? structuredClone(params.preparedProfile) : params.preparedProfile }
     const laneId = params.laneId?.trim() || 'primary'
     const selectedVariant = params.selectedVariant?.trim() || undefined
     const stored = await this.sessionStore.get(params.teamId, laneId, params.memberName)
-    const existing = stored ? this.snapshotSession(stored) : stored
+    let existing = stored ? this.snapshotSession(stored) : stored
+    let persistedModelNormalized = false
+    // A record is untrusted persisted input. Validate it before it can select
+    // a profile resolver path (or, later, retain/acquire a host).
+    if (existing) {
+      const selectedModel = await this.admitStrictProviderRoute(existing.selectedModel)
+      if (selectedModel !== existing.selectedModel) {
+        existing = { ...existing, selectedModel }
+        persistedModelNormalized = true
+      }
+    }
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
         profile: params.preparedProfile,
@@ -1752,7 +1806,7 @@ export class OpenCodeSessionBridge {
     ) {
       const host = await this.retainSessionHost(existing, params.runId, profile)
       const cleanRecord = this.withSessionProfileMetadata(existing, requestedProfile)
-      if (cleanRecord !== existing) {
+      if (cleanRecord !== existing || persistedModelNormalized) {
         await this.sessionStore.upsert(cleanRecord)
       }
       return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
@@ -1823,10 +1877,16 @@ export class OpenCodeSessionBridge {
     materializationOwnerToken?: MaterializationOwnerToken,
   ): Promise<OpenCodeSessionRecord> {
     record = this.snapshotSession(record)
-    const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
-      this.prepareProfileForSessionRecord(record),
-      this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null),
-    ])
+    const persistedSelectedModel = record.selectedModel
+    // Do not launch the profile validator and a host endpoint refresh in
+    // parallel for a malformed persisted record. The record is admitted first,
+    // then the two effectful validations run in sequence.
+    const selectedModel = await this.admitStrictProviderRoute(record.selectedModel)
+    if (selectedModel !== record.selectedModel) record = { ...record, selectedModel }
+    const sessionProfile = await this.prepareProfileForSessionRecord(record)
+    const resolvedBehaviorFingerprint = await (
+      this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null)
+    )
     const profile = sessionProfile.profile
     const next: OpenCodeSessionRecord = {
       ...record,
@@ -1844,6 +1904,7 @@ export class OpenCodeSessionBridge {
       || next.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
       || next.managedConfigFingerprint !== record.managedConfigFingerprint
       || next.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
+      || next.selectedModel !== persistedSelectedModel
 
     if (!changed) {
       return record

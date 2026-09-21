@@ -27,6 +27,10 @@ import {
   ensureSelectedOpenCodeModelInImportedConfig,
 } from './OpenCodeProfileManager.js'
 import {
+  OpenCodeInvalidProviderModelReferenceError,
+  OpenCodeUnsupportedProviderModelReferenceError,
+} from './OpenCodeModelRef.js'
+import {
   PROCESS_ATTRIBUTION_DIRECTORY_ENV,
   PROCESS_ATTRIBUTION_ID_ENV,
   mintProcessAttributionId,
@@ -201,6 +205,65 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       customCatalog.profileRootPath,
       legacy.profileRootPath,
     ]).size).toBe(6)
+  })
+
+  test('rejects invalid persisted scope references before OAuth, Cursor config, or provider preparation', async () => {
+    const projectPath = path.join(tempDir, 'invalid-scope-project')
+    const dataRoot = path.join(tempDir, 'invalid-scope-data')
+    const configRoot = path.join(tempDir, 'invalid-scope-config')
+    const cacheRoot = path.join(tempDir, 'invalid-scope-cache')
+    const calls: string[] = []
+    const resolve = (selectedModel: string | undefined) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: selectedModel as string,
+      env: {
+        ...process.env,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: dataRoot,
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: cacheRoot,
+        XDG_CONFIG_HOME: configRoot,
+      },
+      // Recovery callbacks are production resolver inputs. None may run for a
+      // malformed persisted reference.
+      isOAuthNativeProbeSettled: async () => { calls.push('oauth-recovery'); return false },
+      isOAuthNativeSessionSettled: async () => { calls.push('oauth-recovery'); return false },
+      isOAuthNativeSessionUnsubmitted: async () => { calls.push('oauth-recovery'); return false },
+    })
+
+    for (const selectedModel of [undefined, '', 'xai/', 'cursor-acp/', 'xai//grok', 'bad provider/model']) {
+      await expect(resolve(selectedModel)).rejects.toBeInstanceOf(OpenCodeInvalidProviderModelReferenceError)
+    }
+
+    expect(calls).toEqual([])
+    // These roots are created by the normal recovery/config/provider paths;
+    // validation above must leave every one absent.
+    await expect(lstat(path.join(dataRoot, 'opencode'))).rejects.toThrow()
+    await expect(lstat(configRoot)).rejects.toThrow()
+    await expect(lstat(cacheRoot)).rejects.toThrow()
+    await expect(lstat(projectPath)).rejects.toThrow()
+  })
+
+  test('rejects unsupported strict records before config-directory or provider effects', async () => {
+    const projectPath = path.join(tempDir, 'unsupported-scope-project')
+    const dataRoot = path.join(tempDir, 'unsupported-scope-data')
+    const configRoot = path.join(tempDir, 'unsupported-scope-config')
+    const env = {
+      ...process.env,
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: dataRoot,
+      XDG_CONFIG_HOME: configRoot,
+      AGENT_TEAMS_CURSOR_MANAGED_ASSETS: path.join(tempDir, 'missing-cursor-assets'),
+    }
+    for (const selectedModel of ['kiro/auto', 'cursor-acp/auto']) {
+      await expect(resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'launch_runtime',
+        selectedModel,
+        env,
+      })).rejects.toBeInstanceOf(OpenCodeUnsupportedProviderModelReferenceError)
+    }
+    await expect(lstat(path.join(dataRoot, 'opencode', 'cursor-native-config'))).rejects.toThrow()
+    await expect(lstat(configRoot)).rejects.toThrow()
+    await expect(lstat(projectPath)).rejects.toThrow()
   })
 
   test('prepares and retries an existing workspace despite Windows mkdir EEXIST', async () => {
@@ -3697,6 +3760,32 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
         },
       },
     })
+  })
+
+  test('resolves an lm-studio persisted alias through canonical scoped seeding and authority lookup', async () => {
+    const projectPath = path.join(tempDir, 'lm-studio-alias-scope')
+    await mkdir(projectPath, { recursive: true })
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'lm-studio/local-model',
+      env: {
+        ...process.env,
+        CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT: JSON.stringify({
+          provider: {
+            'lm-studio': {
+              options: { baseURL: 'http://127.0.0.1:1234/v1' },
+              models: { 'local-model': {} },
+            },
+          },
+        }),
+      },
+    })
+    expect(scope.providerId).toBe('lmstudio')
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const config = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}')
+    expect(config.provider.lmstudio.models['local-model']).toEqual({})
+    expect(config.provider['lm-studio']).toBeUndefined()
   })
 
   test('does not let an alias provider key replace an exact local allowlist', () => {

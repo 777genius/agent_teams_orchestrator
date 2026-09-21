@@ -4,6 +4,10 @@ import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const PROCESS_QUERY_TIMEOUT_MS = 2_500
+// Cold PowerShell/.NET activation on Windows regularly exceeds the generic
+// process-query budget. Process identity has its own bounded budget and never
+// extends an explicit caller-provided deadline.
+const WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS = 5_000
 const PROCESS_START_TIME_OUTPUT_LIMIT_BYTES = 64 * 1024
 const PROCESS_COMMAND_OUTPUT_LIMIT_BYTES = 256 * 1024
 
@@ -629,6 +633,9 @@ async function terminateLinuxProcessTreeStable(
         if (pass === 63) return false
       }
 
+      // The discovery freeze itself is the complete explicit STOP operation.
+      // Do not duplicate STOP or convert the request into CONT/KILL cleanup.
+      if (signal === 'SIGSTOP') return false
       const sendAll = (number: number): boolean => {
         let sent = true
         // Root last: descendants cannot outlive an early root signal without
@@ -866,6 +873,9 @@ async function terminateDarwinProcessTreeStable(
       previous = fingerprint
       if (pass === 63) return false
     }
+    // Every discovered member has already received exactly one STOP in freeze.
+    // A frozen tree is not a termination receipt.
+    if (signal === 'SIGSTOP') return false
     const sendAll = async (memberSignal: NodeJS.Signals): Promise<boolean> => {
       for (const member of [...members.values()].sort((a, b) => (a.pid === pid ? 1 : b.pid === pid ? -1 : a.pid - b.pid))) {
         if (!processKillMayContinue(options)) return false
@@ -874,10 +884,6 @@ async function terminateDarwinProcessTreeStable(
       return true
     }
     if (!(await sendAll(signal))) return false
-    // SIGSTOP is itself the requested outcome. Waiting for an empty tree and
-    // escalating to SIGKILL would silently turn an explicit freeze into a
-    // termination request.
-    if (signal === 'SIGSTOP') return false
     if (temporarilyFrozenForSignal(signal)) {
       if (!(await continueFrozen())) return false
     }
@@ -1151,8 +1157,10 @@ export async function readProcessStartTimeMs(
 ): Promise<number | null> {
   const platform = typeof platformOrTimeout === 'number' ? process.platform : platformOrTimeout
   const queryTimeoutMs = typeof platformOrTimeout === 'number' ? platformOrTimeout : timeoutMs
+  // Never normalize an untrusted PID: truncating 42.9 would query PID 42,
+  // which may be a different process incarnation altogether.
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) return null
   const normalizedPid = Math.trunc(pid)
-  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
 
   if (platform === 'linux') {
     try {
@@ -1186,8 +1194,11 @@ export async function readProcessStartTimeMs(
         '-Command',
         [
           '$ErrorActionPreference = "Stop"',
-          `$process = Get-Process -Id ${normalizedPid} -ErrorAction Stop`,
-          '$process.StartTime.ToUniversalTime().ToString("o")',
+          '$process = $null',
+          // Get-Process can auto-import modules and hang in an isolated
+          // profile. Direct .NET lookup has an explicit disposable handle.
+          `try { $process = [System.Diagnostics.Process]::GetProcessById(${normalizedPid}); $startedAt = $process.StartTime.ToUniversalTime().ToString("o") } catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }`,
+          '[Console]::Out.WriteLine($startedAt)',
         ].join('; '),
       ]
 
@@ -1195,7 +1206,7 @@ export async function readProcessStartTimeMs(
     command,
     args,
     PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
-    queryTimeoutMs,
+    queryTimeoutMs ?? WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS,
   )
   return output === null ? null : parseProcessStartTime(output)
 }

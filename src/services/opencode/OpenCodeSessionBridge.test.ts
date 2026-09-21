@@ -17,6 +17,10 @@ import {
   OpenCodeSessionBridge,
 } from './OpenCodeSessionBridge.js'
 import {
+  OpenCodeInvalidProviderModelReferenceError,
+  OpenCodeUnsupportedProviderModelReferenceError,
+} from './OpenCodeModelRef.js'
+import {
   canonicalHostedApprovalDigest,
   OpenCodePermissionConditionRejectedError,
 } from './OpenCodeClientFactory.js'
@@ -202,6 +206,167 @@ describe('OpenCodeSessionBridge', () => {
         sessionId: 'session-1',
       },
     ])
+  })
+
+  test('uses the production persisted-session scope path before host acquisition', async () => {
+    let hostAcquisitions = 0
+    let providerClientCreations = 0
+    const persisted = buildRecord({ selectedModel: 'cursor-acp/' })
+    const bridge = new OpenCodeSessionBridge({
+      // Do not inject prepareProfile: the bridge must call the production
+      // resolver for this persisted record.
+      sessionStore: {
+        get: async () => persisted,
+        upsert: async () => 'unchanged',
+        markStale: async () => persisted,
+      },
+      hostManager: {
+        ensureHost: async () => {
+          hostAcquisitions += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          providerClientCreations += 1
+          return {} as never
+        },
+      },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: persisted.teamId,
+      laneId: persisted.laneId,
+      memberName: persisted.memberName,
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: persisted.projectPath,
+    })).rejects.toBeInstanceOf(OpenCodeInvalidProviderModelReferenceError)
+
+    expect(hostAcquisitions).toBe(0)
+    expect(providerClientCreations).toBe(0)
+  })
+
+  test('rejects an unavailable persisted Cursor route before tool-approval profile preparation', async () => {
+    const previousAssetRoot = process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS
+    process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS = '/definitely-unavailable/cursor-managed-assets'
+    let profilePreparations = 0
+    let hostEffects = 0
+    let providerEffects = 0
+    let staleWrites = 0
+    const persisted = buildRecord({
+      selectedModel: 'cursor-acp/auto',
+      toolApprovalMode: 'auto',
+    })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        profilePreparations += 1
+        return profile
+      },
+      sessionStore: {
+        get: async () => persisted,
+        upsert: async () => 'unchanged',
+        markStale: async () => {
+          staleWrites += 1
+          return persisted
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          hostEffects += 1
+          return host
+        },
+        releaseHost: async () => {
+          hostEffects += 1
+        },
+      },
+      clientFactory: {
+        create: () => {
+          providerEffects += 1
+          return {} as never
+        },
+      },
+    })
+
+    try {
+      await expect(bridge.ensureSession({
+        teamId: persisted.teamId,
+        laneId: persisted.laneId,
+        memberName: persisted.memberName,
+        selectedModel: 'openai/gpt-5.4-mini',
+        projectPath: persisted.projectPath,
+        toolApprovalMode: 'auto',
+      })).rejects.toBeInstanceOf(OpenCodeUnsupportedProviderModelReferenceError)
+
+      expect(profilePreparations).toBe(0)
+      expect(hostEffects).toBe(0)
+      expect(providerEffects).toBe(0)
+      expect(staleWrites).toBe(0)
+    } finally {
+      if (previousAssetRoot === undefined) delete process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS
+      else process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS = previousAssetRoot
+    }
+  })
+
+  test('rejects an unavailable persisted Cursor route before a prepared-profile bypass', async () => {
+    const previousAssetRoot = process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS
+    process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS = '/definitely-unavailable/cursor-managed-assets'
+    let profilePreparations = 0
+    let hostEffects = 0
+    let providerEffects = 0
+    let staleWrites = 0
+    const persisted = buildRecord({
+      selectedModel: 'cursor-acp/auto',
+      toolApprovalMode: 'auto',
+    })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        profilePreparations += 1
+        return profile
+      },
+      sessionStore: {
+        get: async () => persisted,
+        upsert: async () => 'unchanged',
+        markStale: async () => {
+          staleWrites += 1
+          return persisted
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          hostEffects += 1
+          return host
+        },
+        releaseHost: async () => {
+          hostEffects += 1
+        },
+      },
+      clientFactory: {
+        create: () => {
+          providerEffects += 1
+          return {} as never
+        },
+      },
+    })
+
+    try {
+      await expect(bridge.ensureSession({
+        teamId: persisted.teamId,
+        laneId: persisted.laneId,
+        memberName: persisted.memberName,
+        selectedModel: 'openai/gpt-5.4-mini',
+        projectPath: persisted.projectPath,
+        preparedProfile: profile,
+      })).rejects.toBeInstanceOf(OpenCodeUnsupportedProviderModelReferenceError)
+
+      expect(profilePreparations).toBe(0)
+      expect(hostEffects).toBe(0)
+      expect(providerEffects).toBe(0)
+      expect(staleWrites).toBe(0)
+    } finally {
+      if (previousAssetRoot === undefined) delete process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS
+      else process.env.AGENT_TEAMS_CURSOR_MANAGED_ASSETS = previousAssetRoot
+    }
   })
 
   test('replay observes a live owner without receiving its write or release token', async () => {
@@ -2116,6 +2281,37 @@ describe('OpenCodeSessionBridge', () => {
     expect(refreshed.resolvedBehaviorFingerprint).toBe('resolved-fingerprint-v2')
     expect(upserts).toHaveLength(1)
     expect(upserts[0]?.projectBehaviorFingerprint).toBe('behavior-v2')
+  })
+
+  test('admits a persisted record before profile validation or host fingerprint refresh', async () => {
+    let profileValidations = 0
+    let fingerprintRefreshes = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        profileValidations += 1
+        return profile
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'unchanged',
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        refreshResolvedConfigFingerprint: async () => {
+          fingerprintRefreshes += 1
+          return 'changed'
+        },
+      },
+    })
+
+    await expect(bridge.refreshSessionEnvironment(buildRecord({ selectedModel: 'cursor-acp/' })))
+      .rejects.toBeInstanceOf(OpenCodeInvalidProviderModelReferenceError)
+    await expect(bridge.refreshSessionEnvironment(buildRecord({ selectedModel: 'kiro/auto' })))
+      .rejects.toBeInstanceOf(OpenCodeUnsupportedProviderModelReferenceError)
+    expect(profileValidations).toBe(0)
+    expect(fingerprintRefreshes).toBe(0)
   })
 
   test('releases a fresh host lease when session persistence fails', async () => {

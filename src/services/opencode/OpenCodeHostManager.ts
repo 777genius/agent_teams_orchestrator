@@ -339,6 +339,21 @@ function normalizeResolvedFingerprintValue(
     }, {})
 }
 
+/** Shared endpoint projection used for host retention and admitted fixtures. */
+export function fingerprintOpenCodeResolvedConfigEndpoints(input: {
+  config: unknown
+  configProviders: unknown
+  agents: unknown
+  mcp: unknown
+}): string {
+  return hashJson({
+    config: normalizeResolvedFingerprintValue(input.config, 'config'),
+    configProviders: normalizeResolvedFingerprintValue(input.configProviders, 'configProviders'),
+    agents: normalizeResolvedFingerprintValue(input.agents, 'agents'),
+    mcp: normalizeResolvedFingerprintValue(input.mcp, 'mcp'),
+  })
+}
+
 async function allocateLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -2102,7 +2117,7 @@ export class OpenCodeHostManager {
       ) {
         return null
       }
-      return hashJson(fingerprintSource)
+      return fingerprintOpenCodeResolvedConfigEndpoints(fingerprintSource)
     } catch {
       return null
     }
