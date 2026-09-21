@@ -243,6 +243,7 @@ export async function handlePromptSubmit(
   )
   logEvent('tengu_paste_text', { pastedTextCount, pastedTextBytes })
 
+  queryGuard.invalidateContinuationForUserSubmit()
   const isPromptExecutionBusy = queryGuard.isActive || isExternalLoading
   const shouldDeferPromptSubmission = isPromptSubmissionDeferred(
     isPromptExecutionBusy,
@@ -459,6 +460,7 @@ async function executeUserInput(params: ExecuteUserInputParams): Promise<void> {
     // handlePromptSubmit calls queue (via the isActive check above) instead
     // of starting a second executeUserInput. This call is a no-op if the
     // guard is already in dispatching (legacy queue-processor path).
+    queryGuard.invalidateContinuationForUserSubmit()
     queryGuard.reserve()
     queryCheckpoint('query_process_user_input_start')
 

@@ -1,0 +1,45 @@
+{
+  "nestedDetachedEscapeReproduced": true,
+  "before": 4,
+  "after": 31,
+  "writer": {
+    "pid": 40956,
+    "ppid": 1
+  },
+  "writerAfterStop": "40956     1 40956 Ss",
+  "ack": {
+    "version": 1,
+    "kind": "request-owned-preexec-barrier",
+    "requestId": "nested-fake-only",
+    "supervisorPid": 40925,
+    "nativePid": 40930,
+    "nativeCode": null,
+    "nativeSignal": null,
+    "reason": "SIGTERM",
+    "cleanupCompleted": true,
+    "events": [
+      {
+        "type": "registered-before-release",
+        "pid": 40938,
+        "ppid": 40930,
+        "pgid": 40930,
+        "state": "S",
+        "born": "Mon Sep 7 03:02:52 2026"
+      }
+    ],
+    "results": [
+      {
+        "pid": 40930,
+        "escalated": false,
+        "remaining": [],
+        "signalErrors": []
+      }
+    ],
+    "failures": [],
+    "remaining": [],
+    "limitations": [
+      "macOS current-arch prototype",
+      "HTTP abort requires separate cleanup ACK"
+    ]
+  }
+}

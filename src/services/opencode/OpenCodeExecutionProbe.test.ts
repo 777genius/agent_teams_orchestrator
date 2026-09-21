@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -7,6 +7,7 @@ import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js
 import {
   classifyProbeFailure,
   OpenCodeExecutionProbe,
+  probeOutputMatchesExpected,
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
 import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
@@ -30,6 +31,9 @@ import type {
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-v1',
@@ -75,7 +79,71 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
   expect(resolveOpenCodeExecutionProbeContextTokens('opencode/big-pickle')).toBe(32_000)
 })
 
+test('treats punctuation-only exact-token variants as the same launch proof', () => {
+  const expected = 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67'
+  expect(probeOutputMatchesExpected(
+    'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+    expected,
+    true,
+  )).toBe(true)
+  expect(probeOutputMatchesExpected('STRICT_LAUNCH_wrong-nonce', expected, true)).toBe(false)
+  expect(probeOutputMatchesExpected('PONG', expected, true)).toBe(false)
+  expect(probeOutputMatchesExpected('PONG', 'PONG', false)).toBe(true)
+  expect(probeOutputMatchesExpected('ok', 'PONG', false)).toBe(false)
+  expect(probeOutputMatchesExpected('PING', 'PONG', false)).toBe(false)
+})
+
 describe('OpenCodeExecutionProbe', () => {
+  let isolatedAuthorityRoot: string
+  const originalAuthorityEnv = {
+    HOME: process.env.HOME,
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    CLAUDE_MULTIMODEL_DATA_HOME: process.env.CLAUDE_MULTIMODEL_DATA_HOME,
+    CLAUDE_MULTIMODEL_CACHE_HOME: process.env.CLAUDE_MULTIMODEL_CACHE_HOME,
+    CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY:
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY,
+  }
+
+  beforeEach(async () => {
+    isolatedAuthorityRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-execution-probe-authority-'))
+    process.env.HOME = path.join(isolatedAuthorityRoot, 'home')
+    process.env.XDG_DATA_HOME = path.join(isolatedAuthorityRoot, 'xdg-data')
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = path.join(isolatedAuthorityRoot, 'data')
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = path.join(isolatedAuthorityRoot, 'cache')
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = path.join(
+      isolatedAuthorityRoot,
+      'agent-teams-mcp.js',
+    )
+    await writeFile(process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY, '')
+    const authDirectory = path.join(process.env.XDG_DATA_HOME, 'opencode')
+    await mkdir(authDirectory, { recursive: true })
+    await writeFile(
+      path.join(authDirectory, 'auth.json'),
+      JSON.stringify({
+        opencode: { type: 'api', key: 'test-opencode-key' },
+        openai: { type: 'api', key: 'test-openai-key' },
+        anthropic: { type: 'api', key: 'test-anthropic-key' },
+        google: { type: 'api', key: 'test-google-key' },
+        'kimi-for-coding': { type: 'api', key: 'test-kimi-key' },
+        ollama: { type: 'api', key: 'test-ollama-key' },
+        xai: {
+          type: 'oauth',
+          access: 'test-xai-access-token',
+          refresh: 'test-xai-refresh-token',
+          expires: 4_102_444_800_000,
+        },
+      }),
+    )
+  })
+
+  afterEach(async () => {
+    await rm(isolatedAuthorityRoot, { recursive: true, force: true })
+    for (const [name, value] of Object.entries(originalAuthorityEnv)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+
   test('classifies retired Google models as unavailable for the current account', () => {
     const message =
       'This model models/gemini-2.5-flash-lite is no longer available to new users.'
@@ -122,6 +190,8 @@ describe('OpenCodeExecutionProbe', () => {
     const releasedLeaseTeamIds: string[] = []
     let releaseHostCount = 0
     let promptAgent: string | null = null
+    let observedProviderId: string | undefined = 'opencode'
+    let observedModelId: string | undefined = 'big-pickle'
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -178,6 +248,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: observedProviderId,
+                modelID: observedModelId,
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -208,6 +280,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toBeNull()
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
+    expect(result).toMatchObject({
+      observedProviderId: 'opencode',
+      observedModelId: 'big-pickle',
+    })
     expect(promptAsyncCount).toBe(1)
     expect(promptAgent).toBe(OPEN_CODE_MODEL_PROBE_AGENT_NAME)
     expect(sendMessageCount).toBe(0)
@@ -229,6 +305,16 @@ describe('OpenCodeExecutionProbe', () => {
       hostLifetime: 'process',
       lease: { teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID },
     })
+
+    observedProviderId = 'other'
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable', observedProviderId: 'other' })
+    observedProviderId = undefined
+    observedModelId = undefined
+    expect(await probe.probeModel({
+      selectedModel: 'opencode/big-pickle', projectPath: '/tmp/project',
+    })).toMatchObject({ outcome: 'unavailable' })
   })
 
   async function expectCompletedAssistantResponseWithoutTextFailsFast(
@@ -415,6 +501,365 @@ describe('OpenCodeExecutionProbe', () => {
     expect(abortCount).toBe(0)
   })
 
+  test('keeps polling when OpenCode omits status without creating an assistant response', async () => {
+    let statusCallCount = 0
+    let messageCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-omitted-idle' }),
+          getSession: async () => ({ id: 'session-omitted-idle' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => {
+            messageCallCount += 1
+            return [
+              {
+                info: {
+                  id: 'msg-user-omitted-idle',
+                  role: 'user',
+                  sessionID: 'session-omitted-idle',
+                  time: { created: 100 },
+                },
+                parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+              },
+            ]
+          },
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-omitted-idle' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'Model verification timed out',
+      rawStatus: null,
+      durableState: 'reply_pending',
+      latestAssistantText: null,
+    })
+    expect(result.diagnostics).toContain('Model verification timed out')
+    expect(result.diagnostics.join('\n')).not.toContain(
+      'became idle without producing an assistant response',
+    )
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(messageCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
+  test('keeps polling when leftover PONG text is from an earlier turn while reply is still pending', async () => {
+    let statusCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-stale-pong' }),
+          getSession: async () => ({ id: 'session-stale-pong' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-old',
+                role: 'user',
+                sessionID: 'session-stale-pong',
+                time: { created: 90 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-old',
+                role: 'assistant',
+                parentID: 'msg-user-old',
+                sessionID: 'session-stale-pong',
+                time: { created: 91, completed: 95 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+            {
+              info: {
+                id: 'msg-user-new',
+                role: 'user',
+                sessionID: 'session-stale-pong',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-new' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result.outcome).not.toBe('available')
+    expect(result.durableState).toBe('reply_pending')
+    expect(result.latestAssistantText).toBe('PONG')
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
+  test.each([
+    {
+      name: 'PONG',
+      sessionId: 'session-stream-pong',
+      selectedModel: 'ollama/qwen2.5-coder:1.5b',
+      text: 'PONG',
+      requireExactOutput: false,
+      expectedOutput: 'PONG',
+    },
+    {
+      name: 'STRICT token',
+      sessionId: 'session-stream-strict',
+      selectedModel: 'opencode/big-pickle',
+      text: 'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+      requireExactOutput: true,
+      expectedOutput: 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67',
+    },
+  ])('keeps polling omitted status while streaming $name on a live generate', async ({
+    sessionId,
+    selectedModel,
+    text,
+    requireExactOutput,
+    expectedOutput,
+  }) => {
+    let statusCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 20,
+      promptStartTimeoutMs: 5,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: sessionId }),
+          getSession: async () => ({ id: sessionId }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {}
+          },
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-stream',
+                role: 'user',
+                sessionID: sessionId,
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: `Output only this exact token: ${expectedOutput}` }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-stream',
+                role: 'assistant',
+                parentID: 'msg-user-stream',
+                sessionID: sessionId,
+                time: { created: 101 },
+              },
+              parts: [{ type: 'text', text }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-stream' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModelOnHost({
+      host,
+      selectedModel,
+      prompt: `Output only this exact token: ${expectedOutput}`,
+      expectedOutput,
+      requireExactOutput,
+      cleanupSuccessfulSession: true,
+      bypassCache: true,
+    })
+
+    expect(result.outcome).not.toBe('available')
+    expect(result.reason).toBe('Model verification timed out')
+    expect(result.latestAssistantText).toBe(text)
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(abortCount).toBe(1)
+  })
+
+  test('accepts punctuation-only exact-token output after the session is idle', async () => {
+    const expected = 'STRICT_LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67'
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-strict-punct' }),
+          getSession: async () => ({ id: 'session-strict-punct' }),
+          getSessionStatus: async () => ({ 'session-strict-punct': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-strict',
+                role: 'user',
+                sessionID: 'session-strict-punct',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: `Output only this exact token: ${expected}` }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-strict',
+                role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
+                parentID: 'msg-user-strict',
+                sessionID: 'session-strict-punct',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67' }],
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-strict' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      requireExactOutput: true,
+      expectedOutput: expected,
+      prompt: `Output only this exact token: ${expected}`,
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.durableState).toBe('idle')
+    expect(result.latestAssistantText).toBe('STRICT.LAUNCH_c4c929b2-7cf2-43e6-b440-c82d0470ff67')
+  })
+
   test('fails fast and aborts when prompt_async never materializes a prompt', async () => {
     let abortCount = 0
     const probe = new OpenCodeExecutionProbe({
@@ -524,7 +969,8 @@ describe('OpenCodeExecutionProbe', () => {
         sessionCleanupTimeoutMs: 5,
       })
 
-      const result = await probe.probeModel({
+      const result = await probe.probeModelOnHost({
+        host,
         selectedModel: 'cursor-acp/auto',
         projectPath: '/tmp/project',
         bypassCache: true,
@@ -622,6 +1068,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -722,6 +1170,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -847,10 +1297,14 @@ describe('OpenCodeExecutionProbe', () => {
     }
   })
 
-  test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {
+  test('does not treat a completed non-PONG assistant response as inexact execution proof', async () => {
+    let strictHostOnly = false
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async () => {
+          if (strictHostOnly) throw new Error('strict proof must not acquire another host')
+          return host
+        },
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -890,6 +1344,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'ollama',
+                modelID: 'qwen2.5-coder:0.5b',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -910,12 +1366,24 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.reason).toBeNull()
+    expect(result.outcome).toBe('unknown')
+    expect(result.reason).toBe('OpenCode local-model execution proof was mismatched')
     expect(result.latestAssistantText).toBe('PING')
-    expect(result.diagnostics.join('\n')).toContain(
-      'Model verification completed with non-matching assistant output',
+    expect(result.diagnostics.join('\n')).not.toContain(
+      'treating non-empty response as execution proof',
     )
+
+    strictHostOnly = true
+    const strictResult = await probe.probeModelOnHost({
+      host,
+      selectedModel: 'ollama/qwen2.5-coder:0.5b',
+      prompt: 'Output only this exact token: PONG',
+      expectedOutput: 'PONG',
+      requireExactOutput: true,
+      cleanupSuccessfulSession: true,
+    })
+    expect(strictResult.outcome).toBe('unknown')
+    expect(strictResult.latestAssistantText).toBe('PING')
   })
 
   test('does not treat a plain-text Cursor authentication error as execution proof', async () => {
@@ -957,7 +1425,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1005,7 +1474,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1109,7 +1579,8 @@ describe('OpenCodeExecutionProbe', () => {
     const runtimeDeadline = new OpenCodeRuntimeDeadline(250)
     const result = await (async () => {
       try {
-        return await probe.probeModel({
+        return await probe.probeModelOnHost({
+          host: managedHost,
           selectedModel: 'cursor-acp/auto',
           projectPath: '/tmp/project',
           runtimeDeadline,
@@ -1132,12 +1603,13 @@ describe('OpenCodeExecutionProbe', () => {
     expect(hungStatusSignal?.aborted).toBe(true)
     expect(abortCalls).toBeGreaterThan(0)
 
-    const cachedResult = await probe.probeModel({
+    const freshResult = await probe.probeModelOnHost({
+      host: managedHost,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
-    expect(cachedResult.outcome).toBe('unavailable')
-    expect(nativeProbeCalls).toBe(2)
+    expect(freshResult.outcome).toBe('unavailable')
+    expect(nativeProbeCalls).toBe(3)
   })
 
   test('uses a nested terminal OpenCode retry error without a second Cursor request', async () => {
@@ -1189,7 +1661,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1252,7 +1725,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
@@ -1305,7 +1779,8 @@ describe('OpenCodeExecutionProbe', () => {
         },
       })
 
-      const result = await probe.probeModel({
+      const result = await probe.probeModelOnHost({
+        host,
         selectedModel: 'cursor-acp/auto',
         projectPath: '/tmp/project',
         bypassCache: true,
@@ -1351,6 +1826,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1371,7 +1848,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1427,7 +1905,8 @@ describe('OpenCodeExecutionProbe', () => {
       probeTimeoutMs: 1_000,
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1465,6 +1944,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1491,7 +1972,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1526,6 +2008,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'cursor-acp',
+              modelID: 'auto',
               sessionID: 'session-1',
               time: { created: 101, completed: 110 },
             },
@@ -1552,7 +2036,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1591,6 +2076,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1611,7 +2098,8 @@ describe('OpenCodeExecutionProbe', () => {
       sleep: async () => {},
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1665,7 +2153,8 @@ describe('OpenCodeExecutionProbe', () => {
       probeTimeoutMs: 1_000,
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1684,6 +2173,11 @@ describe('OpenCodeExecutionProbe', () => {
       prepareProfile: async (_projectPath, options) => {
         prepareProfileCalls += 1
         expect(options?.includeAppMcp).toBe(false)
+        expect(options?.profileScope).toMatchObject({
+          purpose: 'execution_probe',
+          providerId: 'cursor-acp',
+        })
+        expect(options?.profileScope?.configFingerprint).not.toContain('placeholder')
         return profile
       },
       hostManager: {
@@ -1712,15 +2206,14 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       cursorNativePreflightBeforeHost: true,
-    })
-
-    expect(result.outcome).toBe('unavailable')
-    expect(result.reason).toContain('RESOURCE_EXHAUSTED')
-    expect(prepareProfileCalls).toBe(1)
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
+    expect(prepareProfileCalls).toBe(0)
     expect(ensureHostCalls).toBe(0)
   })
 
@@ -1782,16 +2275,15 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
       cursorNativePreflightBeforeHost: true,
       cursorNativePreflightOnly: true,
-    })
-
-    expect(result.outcome).toBe('unknown')
-    expect(result.diagnostics.join('\n')).toContain('was inconclusive before OpenCode startup')
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
     expect(ensureHostCalls).toBe(0)
   })
 
@@ -1816,23 +2308,19 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    await expect(probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
       bypassCache: true,
       cursorNativePreflightBeforeHost: true,
       cursorNativePreflightOnly: true,
-    })
-
-    expect(result).toMatchObject({
-      outcome: 'unknown',
-      failureCode: 'execution_timeout',
-      reason: 'Cursor native execution preflight timed out after 65000ms',
-    })
+    })).rejects.toThrow(
+      'OpenCode execution_probe does not support extension-bound provider cursor-acp',
+    )
     expect(ensureHostCalls).toBe(0)
   })
 
-  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+  test('does not accept native Cursor success without canonical assistant model evidence', async () => {
     let createSessionCalls = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1875,12 +2363,14 @@ describe('OpenCodeExecutionProbe', () => {
     const result = await probe.probeModel({
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.verifiedAt).toBeTruthy()
+    expect(result.outcome).toBe('unknown')
+    expect(result.verifiedAt).toBeUndefined()
     expect(result.diagnostics.join('\n')).toContain(
-      'native execution probe confirmed model availability',
+      'without canonical assistant provider/model evidence',
     )
     expect(createSessionCalls).toBe(0)
   })
@@ -1908,6 +2398,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'cursor-acp',
+                modelID: 'auto',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -1928,7 +2420,8 @@ describe('OpenCodeExecutionProbe', () => {
       },
     })
 
-    const result = await probe.probeModel({
+    const result = await probe.probeModelOnHost({
+      host,
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
@@ -1991,6 +2484,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2075,6 +2570,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'big-pickle',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2324,7 +2821,88 @@ describe('OpenCodeExecutionProbe', () => {
     )
   })
 
-  test('deduplicates concurrent probes and reuses a short-lived successful result', async () => {
+  test.each([
+    [401, 'Доступ відхилено', 'not_authenticated'],
+    [403, 'Доступ відхилено', 'not_authenticated'],
+    ['401', 'Доступ відхилено', 'not_authenticated'],
+    ['403', 'Доступ відхилено', 'not_authenticated'],
+    [401, 'RESOURCE_EXHAUSTED', 'unavailable'],
+    [200, 'Доступ відхилено', 'unknown'],
+  ] as const)('classifies structural HTTP %s with message %s as %s', async (statusCode, message, outcome) => {
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 10, pollIntervalMs: 1,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listExperimentalToolIds: async () => { throw new Error('not used') },
+          listExperimentalTools: async () => { throw new Error('not used') },
+          answerPermission: async () => { throw new Error('not used') },
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({
+            'session-1': {
+              type: 'retry',
+              attempt: 1,
+            },
+          }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-error',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+                error: { name: 'APIError', data: { statusCode, message, usage: { tokens: 401 } } },
+              },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-error' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/ling-2.6-flash-free',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.verifiedAt).toBeUndefined()
+    expect(result.outcome).toBe(outcome)
+    expect(result.reason).toBe(outcome === 'not_authenticated' ? `HTTP ${statusCode}: ${message}` : message)
+    expect(result.durableState).toBe('retrying')
+  })
+
+  test('runs every generic execution proof fresh, including concurrent requests', async () => {
     let createSessionCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -2362,6 +2940,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2390,10 +2970,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(first.outcome).toBe('available')
     expect(second.outcome).toBe('available')
     expect(third.outcome).toBe('available')
-    expect(createSessionCount).toBe(1)
+    expect(createSessionCount).toBe(3)
   })
 
-  test('bounds an in-memory deduplicated caller by its own runtime deadline', async () => {
+  test('bounds independent concurrent callers by their own runtime deadlines', async () => {
     let createSessionCount = 0
     let releaseCreateSession!: () => void
     let markCreateSessionStarted!: () => void
@@ -2429,6 +3009,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2456,7 +3038,7 @@ describe('OpenCodeExecutionProbe', () => {
         runtimeDeadline: deadline,
       })).rejects.toMatchObject({
         name: 'OpenCodeRuntimeDeadlineError',
-        phase: 'execution_poll',
+        phase: expect.any(String),
       })
     } finally {
       deadline.dispose()
@@ -2464,7 +3046,8 @@ describe('OpenCodeExecutionProbe', () => {
     }
 
     await expect(sharedProbe).resolves.toMatchObject({ outcome: 'available' })
-    expect(createSessionCount).toBe(1)
+    expect(createSessionCount).toBeGreaterThanOrEqual(1)
+    expect(createSessionCount).toBeLessThanOrEqual(2)
   })
 
   test('does not let a short in-flight owner deadline abort a longer caller', async () => {
@@ -2500,6 +3083,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'opencode',
+              modelID: 'minimax-m2.5-free',
               sessionID: `session-${createSessionCount}`,
               time: { created: 101, completed: 110 },
             },
@@ -2535,7 +3120,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(createSessionCount).toBe(2)
   })
 
-  test('bypasses in-memory probe cache when requested', async () => {
+  test('treats bypassCache as equivalent because generic caching is disabled', async () => {
     let createSessionCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -2573,6 +3158,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: `msg-assistant-${createSessionCount}`,
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: `msg-user-${createSessionCount}`,
                 sessionID: `session-${createSessionCount}`,
                 time: { created: 101, completed: 110 },
@@ -2599,10 +3186,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(first.outcome).toBe('available')
     expect(second.outcome).toBe('available')
     expect(third.outcome).toBe('available')
-    expect(createSessionCount).toBe(2)
+    expect(createSessionCount).toBe(3)
   })
 
-  test('deduplicates concurrent probes across probe instances with the persistent cache', async () => {
+  test('does not read or store persistent generic probe proofs', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-probe-cache-'))
     try {
       let createSessionCount = 0
@@ -2665,6 +3252,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2693,7 +3282,7 @@ describe('OpenCodeExecutionProbe', () => {
       expect(first.outcome).toBe('available')
       expect(second.outcome).toBe('available')
       expect(third.outcome).toBe('available')
-      expect(createSessionCount).toBe(1)
+      expect(createSessionCount).toBe(3)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -2770,6 +3359,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2899,6 +3490,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-runtime-deadline',
                   role: 'assistant',
+                  providerID: 'ollama',
+                  modelID: 'gemma4:12b',
                   parentID: 'msg-user-runtime-deadline',
                   sessionID: 'session-runtime-deadline',
                   time: { created: 101, completed: 110 },
@@ -2965,13 +3558,31 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test('releases a host that finishes startup after the runtime deadline', async () => {
-    let resolveHost: ((value: OpenCodeHostHandle) => void) | null = null
+    let now = 0
+    let expireDeadline = () => {
+      throw new Error('runtime deadline timer was not installed')
+    }
+    let resolveHost = (_value: OpenCodeHostHandle) => {
+      throw new Error('host startup did not begin')
+    }
+    let markHostStartupStarted!: () => void
+    const hostStartupStarted = new Promise<void>(resolve => {
+      markHostStartupStarted = resolve
+    })
     let releaseHostCount = 0
-    const runtimeDeadline = new OpenCodeRuntimeDeadline(10)
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(10, {
+      monotonicNow: () => now,
+      setTimer: callback => {
+        expireDeadline = callback
+        return { unref() {} } as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => {},
+    })
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => new Promise<OpenCodeHostHandle>(resolve => {
           resolveHost = resolve
+          markHostStartupStarted()
         }),
         releaseHost: async () => {
           releaseHostCount += 1
@@ -2987,7 +3598,10 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
         runtimeDeadline,
       })
-      setTimeout(() => resolveHost?.(host), 25)
+      await hostStartupStarted
+      now = 10
+      expireDeadline()
+      resolveHost(host)
 
       await expect(result).rejects.toBeInstanceOf(OpenCodeRuntimeDeadlineError)
       expect(releaseHostCount).toBe(1)

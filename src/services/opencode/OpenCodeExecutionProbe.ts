@@ -19,6 +19,7 @@ import {
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
 import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
+import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import {
   ensureOpenCodeNativeCliCredentialBridge,
@@ -110,6 +111,7 @@ type ProbeModelParams = {
   projectPath?: string | null
   prompt?: string
   expectedOutput?: string
+  requireExactOutput?: boolean
   contextTokens?: number
   outputTokens?: number
   bypassCache?: boolean
@@ -241,6 +243,11 @@ function buildDurationMs(startedAtMs: number): number {
 function isProbeSuccessOutput(value: string | null | undefined): boolean {
   return /\bPONG\b/i.test(value?.trim() ?? '')
 }
+export function canonicalizeProbeOutput(value: string): string { return value.trim().replace(/[^A-Za-z0-9]/g, '') }
+export function probeOutputMatchesExpected(value: string | null | undefined, expectedOutput: string, requireExactOutput: boolean): boolean {
+  const normalized = value?.trim() ?? ''
+  return requireExactOutput ? canonicalizeProbeOutput(normalized) === canonicalizeProbeOutput(expectedOutput) : isProbeSuccessOutput(normalized)
+}
 
 function normalizeFailureMessage(value: string): string {
   const trimmed = value.trim()
@@ -366,11 +373,15 @@ function buildCursorNativeExecutionOutcome(input: {
   selectedModel: string
   prompt: string
   expectedOutput: string
+  requireExactOutput?: boolean
   startedAtMs: number
   diagnostics: Set<string>
 }): OpenCodeExecutionProbeResult | null {
   const { nativeResult, diagnostics } = input
-  if (nativeResult?.outcome === 'available') {
+  // The native Cursor preflight proves account/model availability but does
+  // not return the request nonce.  It must never stand in for an exact output
+  // proof used by strict launch.
+  if (nativeResult?.outcome === 'available' && !input.requireExactOutput) {
     diagnostics.add(
       `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
     )
@@ -681,6 +692,31 @@ export class OpenCodeExecutionProbe {
   >()
 
   constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
+
+  /**
+   * Recovery must ask the live native endpoint, not infer completion from an
+   * auth-file change.  The receipt's message is the operation incarnation.
+   */
+  async isOwnedOAuthNativeProbeSettled(
+    owner: OpenCodeOAuthNativeProbeOwner,
+    _dataRoot?: string,
+    requireUnsubmitted = false,
+  ): Promise<boolean> {
+    if (!owner.baseUrl || !owner.sessionId || !owner.messageId || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0 || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0) return false
+    try {
+      const client = this.clientFactory.create(owner.baseUrl)
+      const [status, messages] = await Promise.all([
+        client.getSessionStatus(),
+        client.getSessionMessages(owner.sessionId, 200),
+      ])
+      const submitted = messages.some(message => message.info?.id === owner.messageId)
+      if (requireUnsubmitted) return !submitted && !statusIsRunning(status[owner.sessionId])
+      return submitted && !statusIsRunning(status[owner.sessionId])
+    } catch {
+      return false
+    }
+  }
 
   private async prepareProbeProfile(
     params: ProbeModelParams,
@@ -999,6 +1035,26 @@ export class OpenCodeExecutionProbe {
     return cloneProbeResult(await request)
   }
 
+  async probeModelOnHost(
+    params: ProbeModelParams & { host: OpenCodeHostHandle },
+  ): Promise<OpenCodeExecutionProbeResult> {
+    const startedAtMs = nowMs()
+    const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
+    const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
+    parseProviderScopedModel(params.selectedModel)
+    return cloneProbeResult(await this.runProbeModelWithHost({
+      params: { ...params, bypassCache: true },
+      host: params.host,
+      startedAtMs,
+      prompt,
+      expectedOutput,
+      probeTimeoutMs: Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS),
+      pollIntervalMs: Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS),
+      diagnostics: new Set<string>(),
+      cacheFilePath: null,
+    }))
+  }
+
   private async runProbeModel(params: ProbeModelParams & {
     cacheKey?: string
   }): Promise<OpenCodeExecutionProbeResult> {
@@ -1041,6 +1097,7 @@ export class OpenCodeExecutionProbe {
         selectedModel: params.selectedModel,
         prompt,
         expectedOutput,
+        requireExactOutput: params.requireExactOutput,
         startedAtMs,
         diagnostics,
       })
@@ -1397,6 +1454,7 @@ export class OpenCodeExecutionProbe {
         selectedModel: params.selectedModel,
         prompt,
         expectedOutput,
+        requireExactOutput: params.requireExactOutput,
         startedAtMs,
         diagnostics,
       })
@@ -1905,8 +1963,8 @@ export class OpenCodeExecutionProbe {
           if (
             summary.durableState === 'idle'
             && (
-              isProbeSuccessOutput(summary.latestAssistantText)
-              || isProbeSuccessOutput(summary.latestAssistantPreview)
+              probeOutputMatchesExpected(summary.latestAssistantText, expectedOutput, params.requireExactOutput === true)
+              || probeOutputMatchesExpected(summary.latestAssistantPreview, expectedOutput, params.requireExactOutput === true)
             )
           ) {
             sessionRequiresCleanup = false
@@ -2042,6 +2100,7 @@ export class OpenCodeExecutionProbe {
               summary.durableState === 'idle'
               && classified.outcome === 'unknown'
               && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
+              && params.requireExactOutput !== true
             ) {
               sessionRequiresCleanup = false
               diagnostics.add(

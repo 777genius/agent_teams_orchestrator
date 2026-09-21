@@ -10,6 +10,7 @@ import {
   buildWindowsTaskkillInvocation,
   captureProcessTreeIdentity,
   confirmNaturalProcessTreeExit,
+  DARWIN_SIGNAL_NUMBER,
   getProcessTreeContainmentCapability,
   isProcessAlive,
   killProcessTreeAndWait,
@@ -22,6 +23,14 @@ import {
 } from './processKill.js'
 
 const originalSystemRoot = process.env.SystemRoot
+
+function decodeWindowsSupervisorScript(launch: ReturnType<typeof buildExactProcessTreeSpawn>): string {
+  const encodedIndex = launch.args.indexOf('-EncodedCommand')
+  expect(encodedIndex).toBeGreaterThanOrEqual(0)
+  const encoded = launch.args[encodedIndex + 1]
+  expect(encoded).toBeString()
+  return Buffer.from(encoded!, 'base64').toString('utf16le')
+}
 
 afterEach(() => {
   if (originalSystemRoot === undefined) {
@@ -47,13 +56,17 @@ describe('processKill', () => {
     expect(first.command).toBe('powershell.exe')
     expect(first.osIdentity).toStartWith('win32-job:agent-teams-')
     expect(first.osIdentity).not.toBe(second.osIdentity)
-    expect(first.args.join(' ')).toContain('AssignProcessToJobObject')
-    expect(first.args.join(' ')).toContain('BasicLimitInformation')
-    expect(first.args.join(' ')).toContain('IoInfo')
-    expect(first.args.join(' ')).toContain('PeakJobMemoryUsed')
-    expect(first.args.join(' ')).toContain('0x2000')
-    expect(first.args.join(' ')).toContain('Diagnostics.ProcessStartInfo')
-    expect(first.args.join(' ')).not.toContain('& $p.command')
+    expect(first.args).toContain('-EncodedCommand')
+    const script = decodeWindowsSupervisorScript(first)
+    expect(script).toContain('AssignProcessToJobObject')
+    expect(script).toContain('BasicLimitInformation')
+    expect(script).toContain('IoInfo')
+    expect(script).toContain('PeakJobMemoryUsed')
+    expect(script).toContain('0x2000')
+    expect(script).toContain('Diagnostics.ProcessStartInfo')
+    expect(script).not.toContain('ArgumentList')
+    expect(script).not.toContain('& $p.command')
+    expect(script).not.toContain('%*')
     expect(getProcessTreeContainmentCapability(first.osIdentity, 'win32')).toBe('exact')
   })
 
@@ -73,7 +86,7 @@ describe('processKill', () => {
     })).resolves.toBe(false)
   })
 
-  it('preserves Windows native argv through ProcessStartInfo command-line quoting', () => {
+  it('transports exact Windows argv through encoded PowerShell and .NET Framework Arguments', () => {
     const args = [
       '',
       'plain',
@@ -81,17 +94,23 @@ describe('processKill', () => {
       'require("node:fs")',
       'embedded"quote',
       'C:\\Program Files\\agent\\',
+      'unicode-こんにちは-😀',
+      'ampersand&pipe|percent%bang!paren()',
     ]
     const launch = buildExactProcessTreeSpawn('C:\\Program Files\\Bun\\bun.exe', args, {}, 'win32')
-    const script = launch.args.at(-1)!
+    const script = decodeWindowsSupervisorScript(launch)
     const encodedPayload = script.match(/FromBase64String\('([^']+)'\)/)?.[1]
     expect(encodedPayload).toBeString()
     expect(JSON.parse(Buffer.from(encodedPayload!, 'base64').toString('utf8'))).toEqual({
       command: 'C:\\Program Files\\Bun\\bun.exe',
       arguments:
         '"" "plain" "two words" "require(\\"node:fs\\")" ' +
-        '"embedded\\"quote" "C:\\Program Files\\agent\\\\"',
+        '"embedded\\"quote" "C:\\Program Files\\agent\\\\" ' +
+        '"unicode-こんにちは-😀" "ampersand&pipe|percent%bang!paren()"',
     })
+    expect(script).toContain('$s.Arguments=[string]$p.arguments')
+    expect(script).not.toContain('cmd.exe')
+    expect(script).not.toContain('%*')
   })
 
   it('passes the durable OS tree identity through the stable signal boundary', async () => {
@@ -112,6 +131,54 @@ describe('processKill', () => {
       timeoutMs: 0,
     })).resolves.toBe(false)
     expect(observed).toBe('win32-job:exact-a')
+  })
+
+  it('stops before signaling when the live deadline expires during identity verification', async () => {
+    let remaining = 50
+    let signals = 0
+    await expect(killProcessTreeAndWait(42, 'SIGTERM', {
+      expectedStartedAtMs: 100,
+      expectedOsIdentity: 'win32-job:exact-a',
+      remainingMs: () => remaining,
+      dependencies: {
+        platform: 'win32',
+        isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => {
+          remaining = 0
+          return 100
+        },
+        signalExpectedProcess: async () => {
+          signals += 1
+          return true
+        },
+      },
+    })).resolves.toBe(false)
+    expect(signals).toBe(0)
+  })
+
+  it('accepts an exact owned-tree receipt but rejects a reused PID before signaling', async () => {
+    let treeCalls = 0
+    await expect(killProcessTreeAndWait(42, 'SIGTERM', {
+      expectedStartedAtMs: 100,
+      expectedOsIdentity: 'win32-job:owned-tree',
+      dependencies: {
+        platform: 'win32',
+        isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => 100,
+        terminateExpectedProcessTree: async () => { treeCalls += 1; return true },
+      },
+    })).resolves.toBe(true)
+    await expect(killProcessTreeAndWait(42, 'SIGTERM', {
+      expectedStartedAtMs: 100,
+      expectedOsIdentity: 'win32-job:owned-tree',
+      dependencies: {
+        platform: 'win32',
+        isProcessAlive: () => true,
+        readProcessStartTimeMs: async () => 101,
+        terminateExpectedProcessTree: async () => { treeCalls += 1; return true },
+      },
+    })).resolves.toBe(false)
+    expect(treeCalls).toBe(1)
   })
 
   it('delegates cooperative cleanup policy but does not promote it to exact proof', async () => {
@@ -262,6 +329,97 @@ describe('processKill', () => {
     expect(signals).toContainEqual([43, 'SIGKILL'])
     expect(signals).toContainEqual([42, 'SIGKILL'])
     expect(getProcessTreeContainmentCapability('darwin-audit:root', 'darwin')).toBe('cooperative')
+  })
+
+  it('uses Darwin STOP/CONT constants and leaves an explicit stop frozen', async () => {
+    expect(DARWIN_SIGNAL_NUMBER.SIGSTOP).toBe(17)
+    expect(DARWIN_SIGNAL_NUMBER.SIGCONT).toBe(19)
+    const signals: NodeJS.Signals[] = []
+    await expect(terminateExpectedProcessTreeStable(
+      42,
+      'SIGSTOP',
+      100,
+      'darwin-audit:root',
+      {
+        timeoutMs: 0,
+        pollMs: 1,
+        escalationTimeoutMs: 0,
+        nowMs: () => 0,
+        sleep: async () => undefined,
+        platform: 'darwin',
+        darwinBoundary: {
+          listMembers: async () => [],
+          acquireMember: async pid => ({ pid, auditIdentity: 'darwin-audit:root' }),
+          signalMember: async (_member, memberSignal) => {
+            signals.push(memberSignal)
+            return true
+          },
+        },
+      },
+    )).resolves.toBe(false)
+    expect(signals).toEqual(['SIGSTOP'])
+    expect(signals).not.toContain('SIGCONT')
+  })
+
+  it('does not escalate to KILL when cancellation occurs immediately after the graceful signal', async () => {
+    let remaining = 10
+    const signals: NodeJS.Signals[] = []
+    await expect(terminateExpectedProcessTreeStable(
+      42,
+      'SIGTERM',
+      100,
+      'darwin-audit:root',
+      {
+        timeoutMs: 1,
+        pollMs: 1,
+        escalationTimeoutMs: 1,
+        nowMs: () => 0,
+        sleep: async () => undefined,
+        remainingMs: () => remaining,
+        platform: 'darwin',
+        darwinBoundary: {
+          listMembers: async () => [42],
+          acquireMember: async pid => ({ pid, auditIdentity: 'darwin-audit:root' }),
+          signalMember: async (_member, memberSignal) => {
+            signals.push(memberSignal)
+            if (memberSignal === 'SIGTERM') remaining = 0
+            return true
+          },
+        },
+      },
+    )).resolves.toBe(false)
+    // Cancellation revokes destructive authority but not exact-handle cleanup:
+    // the launch-captured audit token can only resume the stopped incarnation.
+    expect(signals).toEqual(['SIGSTOP', 'SIGTERM', 'SIGCONT'])
+  })
+
+  it('resumes every audit-bound temporary freeze after post-freeze discovery fails', async () => {
+    const signals: Array<[number, NodeJS.Signals]> = []
+    let scans = 0
+    await expect(terminateExpectedProcessTreeStable(
+      42,
+      'SIGKILL',
+      100,
+      'darwin-audit:root',
+      {
+        timeoutMs: 1,
+        pollMs: 1,
+        escalationTimeoutMs: 1,
+        nowMs: () => 0,
+        sleep: async () => undefined,
+        platform: 'darwin',
+        darwinBoundary: {
+          listMembers: async () => ++scans === 1 ? [42, 43] : null,
+          acquireMember: async pid => ({ pid, auditIdentity: pid === 42 ? 'darwin-audit:root' : 'darwin-audit:child' }),
+          signalMember: async (member, memberSignal) => {
+            signals.push([member.pid, memberSignal])
+            return true
+          },
+        },
+      },
+    )).resolves.toBe(false)
+    expect([...new Set(signals.filter(([, signal]) => signal === 'SIGSTOP').map(([pid]) => pid))].sort()).toEqual([42, 43])
+    expect([...new Set(signals.filter(([, signal]) => signal === 'SIGCONT').map(([pid]) => pid))].sort()).toEqual([42, 43])
   })
 
   it('fails closed when a discovered Darwin member cannot be audit-token acquired', async () => {
@@ -523,5 +681,26 @@ describe('processKill', () => {
       }),
     ).resolves.toBe(false)
     expect(stableHandleSignals).toBe(0)
+  })
+
+  it('fails a pre-aborted per-agent Job before any native setup or destructive call', async () => {
+    const controller = new AbortController()
+    controller.abort(new Error('cancelled before Job acquisition'))
+    await expect(terminateExpectedProcessTreeStable(
+      42,
+      'SIGKILL',
+      100,
+      'win32-agent-job:agent-only',
+      {
+        timeoutMs: 1_000,
+        escalationTimeoutMs: 0,
+        pollMs: 25,
+        nowMs: Date.now,
+        sleep: async () => undefined,
+        platform: 'win32',
+        signal: controller.signal,
+        remainingMs: () => 1_000,
+      },
+    )).resolves.toBe(false)
   })
 })

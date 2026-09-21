@@ -15,6 +15,11 @@ on:
         description: Runtime version label, for example 2.1.87
         required: false
         type: string
+      publish_release:
+        description: Publish the verified draft after explicit owner approval for this version
+        required: false
+        default: false
+        type: boolean
       target_release_repo:
         description: Public repository that should receive the runtime assets
         required: false
@@ -34,6 +39,9 @@ concurrency:
 
 env:
   DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
+  # --version reports the Fable 5.1 compatibility workaround, not the 0.0.x release label.
+  # Keep this aligned with scripts/build.ts: https://github.com/777genius/agent-teams-ai/issues/569
+  EXPECTED_CLAUDE_CODE_VERSION: '2.1.251'
 
 jobs:
   prepare-release:
@@ -84,6 +92,11 @@ jobs:
           fi
           if [[ "$target_tag" != "runtime-v${runtime_version}" ]]; then
             echo "Public runtime tag must be runtime-v${runtime_version}, got ${target_tag}" >&2
+            exit 1
+          fi
+          package_version="$(jq -er '.version' package.json)"
+          if [[ "$package_version" != "$runtime_version" ]]; then
+            echo "Runtime package version mismatch: expected $runtime_version, got $package_version" >&2
             exit 1
           fi
 
@@ -193,30 +206,49 @@ jobs:
 
       - name: Verify compiled runtime
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
-        env:
-          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
         run: |
           set -euo pipefail
           actual_version="$(./dist/cli --version | awk '{print $1}')"
-          if [[ "$actual_version" != "$EXPECTED_RUNTIME_VERSION" ]]; then
-            echo "Compiled runtime version mismatch: expected $EXPECTED_RUNTIME_VERSION, got $actual_version" >&2
+          if [[ "$actual_version" != "$EXPECTED_CLAUDE_CODE_VERSION" ]]; then
+            echo "Compiled Claude Code version mismatch: expected $EXPECTED_CLAUDE_CODE_VERSION, got $actual_version" >&2
             exit 1
           fi
           ./dist/cli --version
 
-      - name: Verify compiled runtime (Windows)
+      # The shared executable smoke uses Node's built-in SQLite fixture writer.
+      - name: Setup Node for Windows executable smoke
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
-        env:
-          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Verify compiled runtime (Windows)
+        timeout-minutes: 12
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh
         run: |
           $actualVersion = (& .\dist\cli.exe --version).Split(" ")[0]
-          if ($actualVersion -ne $env:EXPECTED_RUNTIME_VERSION) {
-            throw "Compiled runtime version mismatch: expected $env:EXPECTED_RUNTIME_VERSION, got $actualVersion"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compiled runtime --version failed with exit code $LASTEXITCODE"
+          }
+          if ($actualVersion -ne $env:EXPECTED_CLAUDE_CODE_VERSION) {
+            throw "Compiled Claude Code version mismatch: expected $env:EXPECTED_CLAUDE_CODE_VERSION, got $actualVersion"
           }
           .\dist\cli.exe --version
-          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = $env:BACKFILL_RUNTIME_SOURCE_COMMIT
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+
+      - name: Upload Windows executable regression evidence
+        if: always() && runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-release-${{ matrix.platform }}
+          path: backfill-runtime-evidence.json
+          if-no-files-found: warn
 
       - name: Verify compiled Windows architecture
         if: matrix.platform == 'win32-x64'
@@ -271,6 +303,11 @@ jobs:
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package cross-compiled Windows ARM64 runtime archive
@@ -288,6 +325,11 @@ jobs:
           cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
           (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
@@ -312,6 +354,9 @@ jobs:
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
+          # Resolved beside the installed binary; see the bash packaging step.
+          if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
+          Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name
@@ -389,6 +434,7 @@ jobs:
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -402,27 +448,35 @@ jobs:
           fi
 
           release_id="$EXISTING_DRAFT_RELEASE_ID"
-          if [[ -z "$release_id" ]]; then
-            release_json="$(gh api \
-              --method POST \
-              "repos/${TARGET_RELEASE_REPO}/releases" \
-              -f tag_name="$TARGET_RELEASE_TAG" \
-              -f name="$TARGET_RELEASE_TAG" \
-              -f body="Runtime assets for $TARGET_RELEASE_TAG" \
-              -F draft=true \
-              -F prerelease=false \
-              -f make_latest=false)"
-            release_id="$(jq -r '.id' <<<"$release_json")"
-          else
-            while IFS= read -r asset_id; do
-              [[ -n "$asset_id" ]] || continue
-              gh api --method DELETE \
-                "repos/${TARGET_RELEASE_REPO}/releases/assets/${asset_id}"
-            done < <(
-              gh api "repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?per_page=100" \
-                --jq '.[].id'
-            )
+          if [[ -n "$release_id" ]]; then
+            # Recreate the draft instead of deleting large assets one-by-one.
+            # GitHub often returns 500 when deleting those zips in place.
+            status="$(curl --silent --show-error \
+              --output /tmp/delete-runtime-draft-body \
+              --write-out '%{http_code}' \
+              --request DELETE \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}")"
+            if [[ "$status" != "204" && "$status" != "404" ]]; then
+              echo "Failed to delete runtime draft ${release_id}: HTTP ${status}" >&2
+              cat /tmp/delete-runtime-draft-body >&2
+              exit 1
+            fi
+            release_id=""
           fi
+
+          release_json="$(gh api \
+            --method POST \
+            "repos/${TARGET_RELEASE_REPO}/releases" \
+            -f tag_name="$TARGET_RELEASE_TAG" \
+            -f name="$TARGET_RELEASE_TAG" \
+            -f body="Runtime assets for $TARGET_RELEASE_TAG" \
+            -F draft=true \
+            -F prerelease=false \
+            -f make_latest=false)"
+          release_id="$(jq -r '.id' <<<"$release_json")"
 
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
             echo "Invalid draft release ID: ${release_id:-<empty>}" >&2
@@ -431,18 +485,27 @@ jobs:
 
           while IFS= read -r asset_name; do
             asset_path="release-flat/$asset_name"
-            upload_json="$(curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'Accept: application/vnd.github+json' \
-              --header 'Content-Type: application/octet-stream' \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              --data-binary "@$asset_path" \
-              "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}")"
-            if [[ "$(jq -r '.state' <<<"$upload_json")" != "uploaded" ]]; then
-              echo "Runtime asset upload was not committed: $asset_name" >&2
-              exit 1
-            fi
+            upload_json=""
+            for upload_attempt in $(seq 1 5); do
+              upload_json="$(curl --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --data-binary "@$asset_path" \
+                "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}" \
+                || true)"
+              if [[ "$(jq -r '.state // empty' <<<"$upload_json")" == "uploaded" ]]; then
+                break
+              fi
+              if [[ "$upload_attempt" -eq 5 ]]; then
+                echo "Runtime asset upload was not committed: $asset_name" >&2
+                echo "$upload_json" >&2
+                exit 1
+              fi
+              sleep $((upload_attempt * 3))
+            done
           done < expected-assets.txt
 
           for attempt in $(seq 1 10); do
@@ -459,6 +522,11 @@ jobs:
             sleep 2
           done
 
+          if [[ "$PUBLISH_RELEASE" != "true" ]]; then
+            echo "Runtime draft ${TARGET_RELEASE_TAG} is complete; publication requires explicit approval."
+            exit 0
+          fi
+
           gh api \
             --method PATCH \
             "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
@@ -474,7 +542,8 @@ jobs:
     if: >-
       always() &&
       needs.prepare-release.result == 'success' &&
-      (needs.prepare-release.outputs.already_published == 'true' || needs.publish.result == 'success')
+      (needs.prepare-release.outputs.already_published == 'true' ||
+       (inputs.publish_release == true && needs.publish.result == 'success'))
 
     steps:
       - name: Verify exact public release assets

@@ -32,11 +32,12 @@ import type {
 } from './types.js'
 
 export type OpenCodeConnectedAuthorizationFinalizer = () => boolean
+export const OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS = 30_000
 
 export type OpenCodeClient = {
   getHealth?(): Promise<{ healthy: boolean; version?: string }>
   getConfig(): Promise<OpenCodeConfigResponse>
-  getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
+  getConfigProviders(options?: { initializeInstance?: boolean }): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc(): Promise<OpenCodeServerDocResponse>
@@ -57,6 +58,8 @@ export type OpenCodeClient = {
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
   connectMcp?(name: string): Promise<OpenCodeMcpResponse>
   createSession(body?: { parentID?: string; title?: string }): Promise<OpenCodeSessionSummary>
+  /** Deletes a known, newly-created session during failed materialization compensation. */
+  deleteSession?(id: string): Promise<boolean>
   getSession(id: string): Promise<OpenCodeSessionSummary>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatusInput>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
@@ -933,7 +936,13 @@ export class OpenCodeClientFactory {
     return {
       getHealth: () => request('/global/health'),
       getConfig: () => request<OpenCodeConfigResponse>('/config'),
-      getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
+      getConfigProviders: options => request<OpenCodeConfigProvidersResponse>(
+        '/config/providers',
+        undefined,
+        options?.initializeInstance
+          ? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          : DEFAULT_REQUEST_TIMEOUT_MS,
+      ),
       getProviders: () => request<OpenCodeProviderResponse>('/provider'),
       getProviderAuth: () =>
         request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
@@ -1023,6 +1032,8 @@ export class OpenCodeClientFactory {
           method: 'POST',
           body: JSON.stringify(body ?? {}),
         }),
+      deleteSession: id =>
+        request<boolean>(`/session/${id}`, { method: 'DELETE' }),
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
       getSessionStatus: () =>
         request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),

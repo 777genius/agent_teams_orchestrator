@@ -2405,6 +2405,7 @@ export async function getMcpToolsCommandsAndResources(
       }
 
       const supportsResources = !!client.capabilities?.resources
+      logForDebugging(`[MCP] Server "${name}" listing tools/commands/resources`)
 
       const [tools, mcpCommands, mcpSkills, resources] = await Promise.all([
         fetchToolsForClient(client),
@@ -2419,6 +2420,9 @@ export async function getMcpToolsCommandsAndResources(
           : Promise.resolve([]),
       ])
       const commands = [...mcpCommands, ...mcpSkills]
+      logForDebugging(
+        `[MCP] Server "${name}" listed ${tools.length} tools and ${commands.length} commands`,
+      )
 
       // If this server resources and we haven't added resource tools yet,
       // include our resource tools with this client's tools

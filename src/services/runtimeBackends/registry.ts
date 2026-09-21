@@ -24,7 +24,6 @@ import {
 } from '../opencode/OpenCodeDiagnostics.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
-  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   createOpenCodeInventoryProbeProgressTracker,
   hasOpenCodeBuiltinFreeModel,
   isOpenCodeModelFree,
@@ -56,6 +55,7 @@ import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './ant
 import {
   type AnthropicRuntimeBackendInfo,
   buildAnthropicRuntimeStatus,
+  getAnthropicStatusCheckContract,
   isAnthropicSubscriptionAuthMethod,
 } from './anthropicStatus.js'
 import {
@@ -82,6 +82,10 @@ import type {
   RuntimeStatusDetailLevel,
   RuntimeStatusPayload,
 } from './types.js'
+import {
+  buildOpenCodePassiveStatus,
+  type OpenCodePassiveStatusDeps,
+} from './openCodePassiveStatus.js'
 
 const GEMINI_BACKEND_LABELS: Record<GeminiRuntimeBackendId, string> = {
   auto: 'Auto',
@@ -418,7 +422,7 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
-type RuntimeStatusRegistryDeps = {
+type RuntimeStatusRegistryDeps = OpenCodePassiveStatusDeps & {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
   getAnthropicSubscriptionRateLimits?: (
     authMethod: string | null,
@@ -521,6 +525,7 @@ async function buildAnthropicSummaryStatus(
           authMethodDetail: backend.authMethodDetail,
         }
       : null,
+    ...getAnthropicStatusCheckContract(null, backend),
   }
 }
 
@@ -596,9 +601,12 @@ async function buildOpenCodeStatus(
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeProviderStatus> {
   const summary = options.detailLevel === 'summary'
+  if (summary) {
+    return buildOpenCodePassiveStatus(deps)
+  }
   const timeoutMs =
     deps.openCodeInventoryTimeoutMs ??
-    (summary ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
   const abortController = new AbortController()
   const progress = createOpenCodeInventoryProbeProgressTracker()
   const snapshot = await withOpenCodeInventoryProbeTimeout(
@@ -606,20 +614,12 @@ async function buildOpenCodeStatus(
       ? deps.getOpenCodeInventorySnapshot()
       : openCodeInventoryService.probe(
           null,
-          summary
-            ? {
-                mode: 'summary',
-                bypassCache: true,
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              }
-            : {
-                mode: 'full',
-                includeAppMcp: false,
-                abortSignal: abortController.signal,
-                progress,
-              },
+          {
+            mode: 'full',
+            includeAppMcp: false,
+            abortSignal: abortController.signal,
+            progress,
+          },
         ),
     {
       timeoutMs,
@@ -641,6 +641,9 @@ async function buildOpenCodeStatus(
     buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
   const authenticated =
     hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
+  const statusCheck = getOpenCodeActiveStatusContract(snapshot, authenticated)
+  const authoritative = statusCheck.statusCheckOutcome === 'authoritative'
+  const effectiveAuthenticated = authoritative && authenticated
   const fetchedAt = new Date()
   const defaultModel =
     agentModels.find((model) => model === 'opencode/big-pickle') ??
@@ -711,22 +714,26 @@ async function buildOpenCodeStatus(
     providerId: 'opencode',
     displayName: 'OpenCode (75+ LLM providers)',
     supported: snapshot.detected,
-    authenticated,
-    authMethod: hasConnectedProvider
-      ? 'opencode_managed'
-      : hasBuiltinFreeModel
-        ? 'opencode_builtin_free'
-        : hasConfiguredAuthlessModel
-          ? 'opencode_configured_local'
-          : null,
+    authenticated: effectiveAuthenticated,
+    authMethod: !effectiveAuthenticated
+      ? null
+      : hasConnectedProvider
+        ? 'opencode_managed'
+        : hasBuiltinFreeModel
+          ? 'opencode_builtin_free'
+          : hasConfiguredAuthlessModel
+            ? 'opencode_configured_local'
+            : null,
     verificationState: !snapshot.detected
       ? 'offline'
-      : snapshot.probeError && snapshot.models.length === 0 && !authenticated
-        ? 'error'
+      : !authoritative
+        ? statusCheck.statusCheckOutcome === 'transient_error'
+          ? 'error'
+          : 'unknown'
         : 'verified',
     canLoginFromUi: false,
     capabilities: {
-      teamLaunch: snapshot.detected && authenticated,
+      teamLaunch: snapshot.detected && effectiveAuthenticated,
       oneShot: false,
       extensions: buildExtensionCapabilities({
         plugins: {
@@ -755,7 +762,9 @@ async function buildOpenCodeStatus(
         },
       }),
     },
-    statusMessage: authenticated ? null : buildOpenCodeStatusMessage(snapshot),
+    statusMessage: effectiveAuthenticated
+      ? null
+      : buildOpenCodeStatusMessage(snapshot),
     detailMessage: buildOpenCodeDetailMessage(snapshot),
     selectedBackendId: null,
     resolvedBackendId: null,
@@ -782,23 +791,42 @@ async function buildOpenCodeStatus(
       ? {
           kind: 'opencode-cli',
           label: 'OpenCode CLI',
-          authMethodDetail: hasConnectedProvider
-            ? (snapshot.profile?.authState ?? null)
-            : hasBuiltinFreeModel
-              ? 'built-in free models'
-              : hasConfiguredAuthlessModel
-                ? 'configured local OpenCode model'
-                : (snapshot.profile?.authState ?? null),
+          authMethodDetail: !effectiveAuthenticated
+            ? null
+            : hasConnectedProvider
+              ? (snapshot.profile?.authState ?? null)
+              : hasBuiltinFreeModel
+                ? 'built-in free models'
+                : hasConfiguredAuthlessModel
+                  ? 'configured local OpenCode model'
+                  : (snapshot.profile?.authState ?? null),
         }
       : null,
+    ...statusCheck,
   }
 
-  if (!summary) {
-    provider.modelCatalog = modelCatalog
-    provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
-  }
+  provider.modelCatalog = modelCatalog
+  provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
 
   return provider
+}
+
+function getOpenCodeActiveStatusContract(
+  snapshot: OpenCodeInventorySnapshot,
+  authenticated: boolean,
+): Pick<RuntimeProviderStatus, 'statusCheckOutcome' | 'statusCheckErrorCode'> {
+  if (!snapshot.detected) {
+    return { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'runtime_missing' }
+  }
+  if (!snapshot.probeError) {
+    return { statusCheckOutcome: 'authoritative', statusCheckErrorCode: null }
+  }
+  if (snapshot.probeError.includes('timed out')) {
+    return { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'timeout' }
+  }
+  return snapshot.models.length > 0 || authenticated
+    ? { statusCheckOutcome: 'pending', statusCheckErrorCode: 'partial_response' }
+    : { statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'unavailable' }
 }
 
 async function buildGeminiStatuses(): Promise<{
@@ -812,10 +840,29 @@ async function buildGeminiStatuses(): Promise<{
   detailMessage: string | null
   canLoginFromUi: boolean
   backend: RuntimeProviderStatus['backend']
+  statusCheckOutcome: RuntimeProviderStatus['statusCheckOutcome']
+  statusCheckErrorCode: RuntimeProviderStatus['statusCheckErrorCode']
 }> {
   const selectedBackendId = getGeminiRuntimeBackendPreference()
-  const apiStatus = await geminiApiBackend.validate()
-  const cliStatus = await geminiCliBackend.validate()
+  const validate = async (
+    backend: typeof geminiApiBackend,
+    endpointLabel: string,
+  ): Promise<GeminiBackendStatus> => {
+    try {
+      return await backend.validate()
+    } catch (error) {
+      return {
+        ok: false,
+        backend: backend.kind,
+        authMethod: 'none',
+        endpointLabel,
+        message: error instanceof Error ? error.message : String(error),
+        validationError: 'operational',
+      }
+    }
+  }
+  const apiStatus = await validate(geminiApiBackend, 'Gemini API')
+  const cliStatus = await validate(geminiCliBackend, 'Gemini CLI SDK')
 
   const apiOption = buildGeminiOptionStatus(
     'api',
@@ -876,21 +923,37 @@ async function buildGeminiStatuses(): Promise<{
           : selectedBackendId === 'cli-sdk'
             ? cliStatus
             : null
+  const validationFailed =
+    !resolvedBackendId &&
+    (selectedBackendId === 'auto'
+      ? [apiStatus, cliStatus].some(status =>
+          status.authMethod !== 'none' &&
+          status.validationError !== 'invalid_credentials')
+      : preferredStatus?.authMethod !== 'none' &&
+        preferredStatus.validationError !== 'invalid_credentials')
+  const validationUnavailable =
+    apiStatus.validationError === 'operational' ||
+    cliStatus.validationError === 'operational'
+  const effectiveResolvedBackendId = resolvedBackendId
 
   return {
     selectedBackendId,
-    resolvedBackendId,
+    resolvedBackendId: effectiveResolvedBackendId,
     availableBackends: [autoOption, apiOption, cliOption],
-    authenticated: resolvedBackendId !== null,
+    authenticated: effectiveResolvedBackendId !== null,
     authMethod:
       preferredStatus?.authMethod && preferredStatus.authMethod !== 'none'
         ? preferredStatus.authMethod
         : null,
-    verificationState: resolvedBackendId ? 'verified' : 'unknown',
+    verificationState: effectiveResolvedBackendId
+      ? 'verified'
+      : validationUnavailable
+        ? 'error'
+        : 'unknown',
     statusMessage:
-      resolvedBackendId !== null
+      effectiveResolvedBackendId !== null
         ? selectedBackendId === 'auto'
-          ? `Resolved to ${GEMINI_BACKEND_LABELS[resolvedBackendId]}`
+          ? `Resolved to ${GEMINI_BACKEND_LABELS[effectiveResolvedBackendId]}`
           : `${GEMINI_BACKEND_LABELS[selectedBackendId]} ready`
         : selectedBackendId === 'api'
           ? 'Gemini API not ready'
@@ -900,7 +963,7 @@ async function buildGeminiStatuses(): Promise<{
     detailMessage: preferredStatus?.message ?? autoStatusDetail,
     canLoginFromUi: selectedBackendId !== 'api',
     backend:
-      resolvedBackendId === 'api'
+      effectiveResolvedBackendId === 'api'
         ? {
             kind: 'api',
             label: 'Gemini API',
@@ -914,7 +977,7 @@ async function buildGeminiStatuses(): Promise<{
                 ? preferredStatus.authMethod
                 : null,
           }
-        : resolvedBackendId === 'cli-sdk'
+        : effectiveResolvedBackendId === 'cli-sdk'
           ? {
               kind: 'cli-sdk',
               label: 'Gemini CLI SDK',
@@ -927,6 +990,16 @@ async function buildGeminiStatuses(): Promise<{
                   : null,
             }
           : null,
+    statusCheckOutcome: resolvedBackendId
+      ? 'authoritative'
+      : validationUnavailable || validationFailed
+        ? 'transient_error'
+        : 'authoritative',
+    statusCheckErrorCode: resolvedBackendId
+      ? null
+      : validationUnavailable || validationFailed
+        ? 'unavailable'
+        : null,
   }
 }
 
@@ -941,6 +1014,8 @@ function buildCodexStatuses(): {
   detailMessage: string | null
   canLoginFromUi: boolean
   backend: RuntimeProviderStatus['backend']
+  statusCheckOutcome: RuntimeProviderStatus['statusCheckOutcome']
+  statusCheckErrorCode: RuntimeProviderStatus['statusCheckErrorCode']
 } {
   const resolution = resolveCodexRuntimeSelection()
   const codexNativeAvailable = resolution.resolvedBackendId === 'codex-native'
@@ -958,6 +1033,25 @@ function buildCodexStatuses(): {
       : !resolution.nativeApiKeyConfigured
         ? 'Authentication required'
         : 'Degraded'
+  const statusCheck = resolution.authCheckIndeterminate
+    ? {
+        statusCheckOutcome: 'transient_error' as const,
+        statusCheckErrorCode: 'unavailable' as const,
+      }
+    : codexNativeState === 'runtime-missing'
+    ? {
+        statusCheckOutcome: 'transient_error' as const,
+        statusCheckErrorCode: 'runtime_missing' as const,
+      }
+    : codexNativeState === 'degraded'
+      ? {
+          statusCheckOutcome: 'transient_error' as const,
+          statusCheckErrorCode: 'unavailable' as const,
+        }
+      : {
+          statusCheckOutcome: 'authoritative' as const,
+          statusCheckErrorCode: null,
+        }
 
   return {
     selectedBackendId: resolution.selectedBackendId,
@@ -976,7 +1070,9 @@ function buildCodexStatuses(): {
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
-    verificationState: resolution.authenticated ? 'verified' : 'unknown',
+    verificationState: resolution.authCheckIndeterminate
+      ? 'error'
+      : resolution.authenticated ? 'verified' : 'unknown',
     statusMessage: resolution.statusMessage,
     detailMessage: resolution.detailMessage,
     canLoginFromUi: resolution.canLoginFromUi,
@@ -989,6 +1085,7 @@ function buildCodexStatuses(): {
             authMethodDetail: resolution.authMethod,
           }
         : null,
+    ...statusCheck,
   }
 }
 
@@ -1019,7 +1116,8 @@ export async function getUnifiedRuntimeStatusPayload(
         verificationState: codex.verificationState,
         canLoginFromUi: codex.canLoginFromUi,
         capabilities: {
-          teamLaunch: true,
+          teamLaunch:
+            codex.authenticated && codex.statusCheckOutcome === 'authoritative',
           oneShot: true,
           extensions: buildExtensionCapabilities({
             plugins: {
@@ -1049,6 +1147,8 @@ export async function getUnifiedRuntimeStatusPayload(
           },
         },
         backend: codex.backend,
+        statusCheckOutcome: codex.statusCheckOutcome,
+        statusCheckErrorCode: codex.statusCheckErrorCode,
       }
     } else {
       const modelCatalog = filterCodexModelCatalog(
@@ -1058,6 +1158,19 @@ export async function getUnifiedRuntimeStatusPayload(
       const modelCatalogDynamic =
         modelCatalog.source === 'app-server' &&
         (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
+      // The catalog read has settled. A failed/stale result is recoverable,
+      // not an in-flight check that the desktop should keep waiting for.
+      const catalogStatusCheck = modelCatalog.status !== 'ready'
+        ? {
+            statusCheckOutcome: 'transient_error' as const,
+            statusCheckErrorCode: modelCatalog.diagnostics.code === 'timeout'
+              ? 'timeout' as const
+              : 'unavailable' as const,
+          }
+        : {
+            statusCheckOutcome: 'authoritative' as const,
+            statusCheckErrorCode: null,
+          }
       providers.codex = {
         providerId: 'codex',
         displayName: 'Codex',
@@ -1067,7 +1180,8 @@ export async function getUnifiedRuntimeStatusPayload(
         verificationState: codex.verificationState,
         canLoginFromUi: codex.canLoginFromUi,
         capabilities: {
-          teamLaunch: true,
+          teamLaunch:
+            codex.authenticated && codex.statusCheckOutcome === 'authoritative',
           oneShot: true,
           extensions: buildExtensionCapabilities({
             plugins: {
@@ -1098,6 +1212,12 @@ export async function getUnifiedRuntimeStatusPayload(
           },
         },
         backend: codex.backend,
+        ...(codex.statusCheckOutcome === 'authoritative'
+          ? catalogStatusCheck
+          : {
+              statusCheckOutcome: codex.statusCheckOutcome,
+              statusCheckErrorCode: codex.statusCheckErrorCode,
+            }),
       }
     }
   }
@@ -1113,7 +1233,8 @@ export async function getUnifiedRuntimeStatusPayload(
       verificationState: gemini.verificationState,
       canLoginFromUi: gemini.canLoginFromUi,
       capabilities: {
-        teamLaunch: true,
+        teamLaunch:
+          gemini.authenticated && gemini.statusCheckOutcome === 'authoritative',
         oneShot: true,
         extensions: buildExtensionCapabilities({
           plugins: {
@@ -1134,6 +1255,8 @@ export async function getUnifiedRuntimeStatusPayload(
       ],
       models: getGeminiModels(),
       backend: gemini.backend,
+      statusCheckOutcome: gemini.statusCheckOutcome,
+      statusCheckErrorCode: gemini.statusCheckErrorCode,
     }
   }
 

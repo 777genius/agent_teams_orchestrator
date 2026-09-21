@@ -5,6 +5,12 @@ import type { ChildProcess } from 'node:child_process'
 
 import { getCwd } from '../../utils/cwd.js'
 import * as lockfile from '../../utils/lockfile.js'
+import {
+  buildExactProcessTreeSpawn,
+  captureProcessTreeIdentity,
+  killProcessTreeAndWait,
+  readProcessStartTimeMs,
+} from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { gte } from '../../utils/semver.js'
 import {
@@ -20,6 +26,7 @@ import {
 } from './OpenCodeCuratedSubscriptionCatalog.js'
 import {
   areOpenCodeManagedPluginCachesReady,
+  canonicalizeOpenCodeProjectPath,
   openCodeProfileManager,
   repairEmptyOpenCodeManagedPluginCaches,
 } from './OpenCodeProfileManager.js'
@@ -36,6 +43,7 @@ import type {
   OpenCodeInventorySnapshot,
   OpenCodeModelMetadata,
   OpenCodePreparedProfile,
+  OpenCodeProfileScope,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
@@ -78,9 +86,12 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
 }
 
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
-export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
+// Summary still prepares the profile and runs sequential version/auth probes.
+// Allow profile I/O plus both per-command budgets without starting a model host.
+export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
-const OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS = 30_000
+export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
+const OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS = 2_500
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
@@ -142,6 +153,7 @@ type OpenCodeInventoryProbeOptions = {
   toolApprovalMode?: OpenCodeToolApprovalMode
   abortSignal?: AbortSignal
   progress?: OpenCodeInventoryProbeProgressTracker
+  profileScope?: OpenCodeProfileScope
 }
 
 export type OpenCodeCommandResult = {
@@ -276,6 +288,12 @@ export function getOpenCodeRefreshModelsArgs(): string[] {
   return ['models', OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER, '--refresh']
 }
 
+export function getOpenCodeInventoryCommandTimeoutMs(args: readonly string[]): number {
+  return args[0] === 'models'
+    ? OPEN_CODE_MODEL_LIST_TIMEOUT_MS
+    : OPEN_CODE_PROBE_TIMEOUT_MS
+}
+
 function getOpenCodeCatalogRefreshProfile(
   profile: OpenCodePreparedProfile,
 ): OpenCodePreparedProfile {
@@ -324,6 +342,15 @@ export function execOpenCodePortableCommand(input: {
     let settled = false
     let stopping = false
     let child: ReturnType<typeof spawnPortableCli> | null = null
+    let stdoutListener: ((chunk: Buffer) => void) | null = null
+    let stderrListener: ((chunk: Buffer) => void) | null = null
+    // Do not ever turn a PID into cleanup authority by itself.  This promise
+    // is created while the direct child is still ours and carries both the
+    // immutable birth value and the platform tree boundary into cancellation.
+    let childTreeIdentity: Promise<{
+      startedAtMs: number
+      osIdentity: string
+    } | null> | null = null
     const timeoutMs = input.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS
 
     const finish = (result: OpenCodeCommandResult): void => {
@@ -340,6 +367,44 @@ export function execOpenCodePortableCommand(input: {
       })
     }
 
+    const detachOwnedPipes = (): string | null => {
+      const ownedChild = child
+      if (!ownedChild) return null
+      try {
+        if (stdoutListener) ownedChild.stdout?.removeListener('data', stdoutListener)
+        if (stderrListener) ownedChild.stderr?.removeListener('data', stderrListener)
+        // A cancelled probe owns these pipes. Leaving either stream flowing
+        // retains the event loop and can keep a completed timeout looking live.
+        ownedChild.stdout?.destroy()
+        ownedChild.stderr?.destroy()
+        ownedChild.stdin?.destroy()
+        return null
+      } catch (cause) {
+        return cause instanceof Error ? cause.message : String(cause)
+      }
+    }
+
+    const waitForOwnedChildClose = async (ownedChild: ReturnType<typeof spawnPortableCli>): Promise<boolean> => {
+      return new Promise(resolve => {
+        let done = false
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        const finishWait = (closed: boolean) => {
+          if (done) return
+          done = true
+          if (timeout) clearTimeout(timeout)
+          ownedChild.removeListener('close', onClose)
+          ownedChild.removeListener('error', onError)
+          resolve(closed)
+        }
+        const onClose = () => finishWait(true)
+        const onError = () => finishWait(false)
+        ownedChild.once('close', onClose)
+        ownedChild.once('error', onError)
+        timeout = setTimeout(() => finishWait(false), OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS)
+        timeout.unref?.()
+      })
+    }
+
     const stopChildAndFinish = (error: string): void => {
       if (settled || stopping) {
         return
@@ -349,24 +414,66 @@ export function execOpenCodePortableCommand(input: {
       input.abortSignal?.removeEventListener('abort', abort)
 
       const ownedChild = child
+      const pipeError = detachOwnedPipes()
       if (!ownedChild?.pid) {
         finish({
           ...snapshotOutput(),
           code: 1,
-          error,
+          error: pipeError ? `${error}; failed to close owned probe pipes: ${pipeError}` : error,
         })
         return
       }
 
-      // ChildProcess.kill() is ordinary PID signaling in Node/Bun. This
-      // non-persistent probe cleanup is deliberately best-effort and must not
-      // be reused as an exact-incarnation termination primitive.
-      signalSpawnedOpenCodeChildBestEffort(ownedChild, 'SIGKILL')
-      void Promise.resolve().finally(() => {
+      // Inventory has not yet handed this process to another owner. The
+      // process-tree killer deliberately rejects PID-only authority, so wait
+      // for the spawn-time birth and tree identity before asking it to signal
+      // anything. A failed capture is a safe no-op rather than a signal to a
+      // reused PID.
+      void (async () => {
+        let identityTimeout: ReturnType<typeof setTimeout> | undefined
+        const identity = await Promise.race([
+          childTreeIdentity ?? Promise.resolve(null),
+          new Promise<null>(resolve => {
+            identityTimeout = setTimeout(resolve, OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS, null)
+            identityTimeout.unref?.()
+          }),
+        ]).finally(() => {
+          if (identityTimeout) clearTimeout(identityTimeout)
+        })
+        let terminationDetail: string | null
+        if (!identity) {
+          const closed = await waitForOwnedChildClose(ownedChild)
+          terminationDetail = closed
+            ? 'spawn identity was unavailable, but the owned child closed during bounded cleanup'
+            : 'spawn identity was unavailable and the owned child/tree may still be running'
+        } else {
+          try {
+            const terminated = await killProcessTreeAndWait(ownedChild.pid, 'SIGKILL', {
+              timeoutMs: OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS,
+              expectedStartedAtMs: identity.startedAtMs,
+              expectedOsIdentity: identity.osIdentity,
+            })
+            terminationDetail = terminated
+              ? null
+              : 'owned child tree termination could not be confirmed'
+          } catch (cause) {
+            terminationDetail = `owned child tree termination failed: ${
+              cause instanceof Error ? cause.message : String(cause)
+            }`
+          }
+        }
         finish({
           ...snapshotOutput(),
           code: 1,
-          error,
+          error: `${error}${terminationDetail ? `; ${terminationDetail}` : ''}${pipeError ? `; failed to close owned probe pipes: ${pipeError}` : ''}`,
+        })
+      })().catch(cause => {
+        finish({
+          ...snapshotOutput(),
+          code: 1,
+          error: `${error}; owned child cleanup failed: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }${pipeError ? `; failed to close owned probe pipes: ${pipeError}` : ''}`,
         })
       })
     }
@@ -391,12 +498,25 @@ export function execOpenCodePortableCommand(input: {
     input.abortSignal?.addEventListener('abort', abort, { once: true })
 
     try {
-      child = spawnPortableCli(input.binaryPath, input.args, {
+      const exactSpawn = buildExactProcessTreeSpawn(input.binaryPath, input.args, {
         cwd: input.profile.projectPath,
         env: input.profile.env,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
+      child = spawnPortableCli(exactSpawn.command, exactSpawn.args, exactSpawn.options)
+      if (child.pid) {
+        childTreeIdentity = Promise.all([
+          readProcessStartTimeMs(child.pid),
+          exactSpawn.osIdentity === 'unix-pgid:pending'
+            ? captureProcessTreeIdentity(child.pid)
+            : Promise.resolve(exactSpawn.osIdentity),
+        ]).then(([startedAtMs, osIdentity]) => (
+          Number.isFinite(startedAtMs) && startedAtMs !== null && osIdentity
+            ? { startedAtMs, osIdentity }
+            : null
+        )).catch(() => null)
+      }
     } catch (error) {
       finish({
         ...snapshotOutput(),
@@ -406,8 +526,10 @@ export function execOpenCodePortableCommand(input: {
       return
     }
 
-    child.stdout?.on('data', chunk => stdout.push(Buffer.from(chunk)))
-    child.stderr?.on('data', chunk => stderr.push(Buffer.from(chunk)))
+    stdoutListener = chunk => stdout.push(Buffer.from(chunk))
+    stderrListener = chunk => stderr.push(Buffer.from(chunk))
+    child.stdout?.on('data', stdoutListener)
+    child.stderr?.on('data', stderrListener)
     child.once('error', error => {
       if (stopping) {
         return
@@ -882,6 +1004,35 @@ function mergeConnectedProviders(
   })
 }
 
+export function deriveOpenCodeProfileConnectedProviders(input: {
+  profileScope?: OpenCodeProfileScope
+  profile: OpenCodePreparedProfile
+  readAuthProviderSummaries?: typeof readOpenCodeAuthProviderSummaries
+}): { providers: OpenCodeConnectedProvider[]; profileScopeError: boolean } {
+  const requestedScope = input.profileScope
+  const preparedScope = input.profile.profileScope
+  const sourceIdentity = input.profile.selectedSourceAuthIdentity
+  const managedIdentity = input.profile.selectedManagedAuthIdentity
+  const valid = Boolean(
+    requestedScope
+    && preparedScope
+    && JSON.stringify(preparedScope) === JSON.stringify(requestedScope)
+    && input.profile.scopeToken === requestedScope.scopeToken
+    && sourceIdentity !== undefined
+    && sourceIdentity !== 'error'
+    && managedIdentity !== undefined
+    && managedIdentity !== 'error'
+    && sourceIdentity === managedIdentity
+    && sourceIdentity === requestedScope.selectedAuthIdentity,
+  )
+  return {
+    providers: valid && sourceIdentity !== 'absent'
+      ? [{ id: requestedScope!.providerId, authHint: null, source: 'credentials' }]
+      : [],
+    profileScopeError: !valid,
+  }
+}
+
 export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSummary[] {
   const agents: OpenCodeAgentSummary[] = []
 
@@ -935,7 +1086,7 @@ export class OpenCodeInventoryService {
         args,
         profile,
         abortSignal: options.abortSignal,
-        timeoutMs: options.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs ?? getOpenCodeInventoryCommandTimeoutMs(args),
       })
     } finally {
       leaveStep?.()
@@ -947,9 +1098,10 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
-    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
+    const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
+    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
@@ -982,19 +1134,17 @@ export class OpenCodeInventoryService {
       return missingSnapshot
     }
 
-    const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
     const profile = await raceOpenCodeAbortSignal(
       openCodeProfileManager.prepareProfile(resolvedProjectPath, {
         abortSignal: options.abortSignal,
+        progress: options.progress,
         includeAppMcp: options.includeAppMcp !== false,
         includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
+        profileScope: options.profileScope,
       }),
       options.abortSignal,
     )
-      .finally(() => {
-        leaveProfileStep?.()
-      })
     return withOpenCodeInventoryCommandLock(profile, () =>
       this.probePreparedProfile({
         mode,
@@ -1055,7 +1205,7 @@ export class OpenCodeInventoryService {
               abortSignal: options.abortSignal,
               progress: options.progress,
               ...(options.refreshModels && args[0] === 'models'
-                ? { timeoutMs: OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS }
+                ? { timeoutMs: OPEN_CODE_MODEL_LIST_TIMEOUT_MS }
                 : {}),
             },
           ),
@@ -1066,18 +1216,18 @@ export class OpenCodeInventoryService {
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
     const globalAuthProviderIds = new Set(
-      (profile.globalAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
+      mode === 'profile' || !profile.globalAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
             () => [],
-          )
-        : []
-      ).map(provider => provider.id),
+          )).map(provider => provider.id),
     )
     const sourceAuthProviderIds = new Set(
-      (profile.sourceAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
-        : []
-      ).map(provider => provider.id),
+      mode === 'profile' || !profile.sourceAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(
+            () => [],
+          )).map(provider => provider.id),
     )
     const credentialScopesForProvider = (providerId: string): Array<'managed' | 'local'> => {
       const scopes: Array<'managed' | 'local'> = []
@@ -1085,30 +1235,27 @@ export class OpenCodeInventoryService {
       if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
       return scopes.length > 0 ? scopes : ['managed']
     }
-    const managedAuthProviders = (
-      await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
-    ).map(provider => ({
-      ...provider,
-      credentialScopes: credentialScopesForProvider(provider.id),
-    }))
-    const cliConnectedProviders = providerParse.connectedProviders.map(provider => {
-      if (provider.source !== 'credentials') {
-        return provider
-      }
-      return {
-        ...provider,
-        credentialScopes: credentialScopesForProvider(provider.id),
-      }
-    })
-    const discoveredConnectedProviders = mergeConnectedProviders([
-      ...cliConnectedProviders,
-      ...managedAuthProviders,
-    ])
+    const discovered = mode === 'profile'
+      ? deriveOpenCodeProfileConnectedProviders({ profileScope: options.profileScope, profile })
+      : {
+          providers: mergeConnectedProviders([
+            ...providerParse.connectedProviders.map(provider => provider.source === 'credentials'
+              ? { ...provider, credentialScopes: credentialScopesForProvider(provider.id) }
+              : provider),
+            ...(await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed'])
+              .catch(() => []))
+              .map(provider => ({
+                ...provider,
+                credentialScopes: credentialScopesForProvider(provider.id),
+              })),
+          ]),
+          profileScopeError: false,
+        }
     const {
       connectedProviders,
       unsupportedSuperGrokOAuth,
     } = filterOpenCodeConnectedProvidersForRuntime({
-      providers: discoveredConnectedProviders,
+      providers: discovered.providers,
       version,
     })
     const verboseModels =
@@ -1152,6 +1299,9 @@ export class OpenCodeInventoryService {
     const diagnostics: string[] = []
     if (profile.authState === 'stale') {
       diagnostics.push('Managed OpenCode auth differs from the source auth store')
+    }
+    if (discovered.profileScopeError) {
+      diagnostics.push('OpenCode profile scope auth evidence is invalid')
     }
     if (unsupportedSuperGrokOAuth) {
       diagnostics.push(

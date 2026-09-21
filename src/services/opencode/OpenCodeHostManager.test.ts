@@ -425,7 +425,7 @@ describe('OpenCodeHostManager', () => {
       killProcessTreeAndWait: async (pid, _signal, options) => {
         expect(pid).toBe(43141)
         expect(options.expectedStartedAtMs).toBe(1_000)
-        expect(options.dependencies?.signalExpectedProcess).toBeFunction()
+        expect(options.dependencies?.signalExpectedProcess).toBeUndefined()
         return false
       },
       sleepMs: async () => {},
@@ -1117,14 +1117,14 @@ describe('OpenCodeHostManager', () => {
         mode: 'force',
       })
 
-      expect(result.cleaned).toBe(1)
+      expect(result.cleaned).toBe(0)
       expect(result.hosts[0]).toMatchObject({
-        action: 'removed_dead',
-        reason: 'registered pid was reused by a different process',
+        action: 'failed',
+        reason: 'registered host root was replaced and descendant coverage is unproven',
       })
       expect(fetchUrls).toEqual([])
       expect(killedSignals).toEqual([])
-      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts['host-key']).toBeDefined()
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -2213,7 +2213,7 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
-  test('startup cleanup removes temp dylibs left by a dead registered host', async () => {
+  test('startup cleanup retains temp dylibs when a dead root has no tree-exhaustion receipt', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
     const profileTmpPath = path.join(tempDir, 'profiles', 'profile-root', 'tmp')
@@ -2253,8 +2253,8 @@ describe('OpenCodeHostManager', () => {
 
       const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
 
-      expect(result.hosts[0]?.action).toBe('removed_dead')
-      expect(await pathExists(dylibPath)).toBe(false)
+      expect(result.hosts[0]?.action).toBe('failed')
+      expect(await pathExists(dylibPath)).toBe(true)
       expect(await pathExists(keepPath)).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
@@ -2292,6 +2292,29 @@ describe('OpenCodeHostManager', () => {
       expect(result.diagnostics).toContain(
         'Removed 1 stale OpenCode profile temp dylib(s) (14 bytes)',
       )
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup stale-profile deadline exhaustion is structured partial coverage, not a complete empty inventory', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const profilesRoot = path.join(tempDir, 'profiles')
+    try {
+      await mkdir(path.join(profilesRoot, 'orphaned-profile', 'tmp'), { recursive: true })
+      const manager = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      const cleanup = manager as unknown as {
+        cleanupStaleManagedProfileTempDylibs: (
+          active: ReadonlySet<string>,
+          context: { remainingMs: () => number },
+        ) => Promise<{ unresolvedPaths: string[]; diagnostics: string[] }>
+      }
+      const receipt = await cleanup.cleanupStaleManagedProfileTempDylibs(new Set(), {
+        remainingMs: () => 0,
+      })
+      expect(receipt.unresolvedPaths).toEqual([profilesRoot])
+      expect(receipt.diagnostics.join(' ')).toContain('deadline exhausted')
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

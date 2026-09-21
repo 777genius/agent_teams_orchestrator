@@ -16,6 +16,31 @@ function getApiEndpointLabel(): string {
   return `${getGeminiBaseUrl().replace(/\/$/, '')}/${getGeminiApiVersion()}`
 }
 
+function isExplicitInvalidApiKeyResponse(status: number, body: string): boolean {
+  if (status !== 400) return false
+  try {
+    const payload = JSON.parse(body) as {
+      error?: {
+        status?: unknown
+        message?: unknown
+        details?: Array<{ reason?: unknown }>
+      }
+    }
+    const error = payload.error
+    if (!error) return false
+    if (error.details?.some(detail => detail.reason === 'API_KEY_INVALID')) {
+      return true
+    }
+    return (
+      error.status === 'INVALID_ARGUMENT' &&
+      typeof error.message === 'string' &&
+      /(?:API key (?:is )?not valid|invalid API key)/i.test(error.message)
+    )
+  } catch {
+    return false
+  }
+}
+
 async function validateApiAuth(): Promise<GeminiBackendStatus> {
   const auth = await resolveGeminiAuth()
   if (!auth) {
@@ -49,6 +74,11 @@ async function validateApiAuth(): Promise<GeminiBackendStatus> {
         projectId: auth.projectId,
         endpointLabel: getApiEndpointLabel(),
         message: `Gemini API auth validation failed (${response.status}): ${body}`,
+        validationError:
+          response.status === 401 ||
+          isExplicitInvalidApiKeyResponse(response.status, body)
+            ? 'invalid_credentials'
+            : 'operational',
       }
     }
     return {
@@ -66,6 +96,7 @@ async function validateApiAuth(): Promise<GeminiBackendStatus> {
       projectId: auth.projectId,
       endpointLabel: getApiEndpointLabel(),
       message: error instanceof Error ? error.message : String(error),
+      validationError: 'operational',
     }
   }
 }

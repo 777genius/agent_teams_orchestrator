@@ -29,6 +29,7 @@ export type CodexRuntimeResolution = {
   apiKeyConfigured: boolean
   nativeApiKeyConfigured: boolean
   nativeBinaryDetected: boolean
+  authCheckIndeterminate: boolean
   authenticated: boolean
   authMethod: 'oauth_token' | 'api_key' | null
   canLoginFromUi: boolean
@@ -252,19 +253,16 @@ export function resolveCodexRuntimeSelection(params?: {
     ?? (hostManagedChatGptAuthSelected
       ? detectCodexCliLoginState(Date.now(), { env })
       : 'unknown')
-  // When the host explicitly forces ChatGPT auth (chatgptModePinned) and the codex
-  // binary is present, treat 'unknown' login state as ready - the exec will surface
-  // real auth failures more accurately than a pre-flight `codex login status` check,
-  // which may disagree with the app-server's own session state.
-  // Only block on an explicit 'not_logged_in' result.
   const hostManagedChatGptAuthReady =
     hostManagedChatGptAuthSelected &&
-    (chatgptLoginState === 'logged_in' ||
-      (chatgptModePinned && nativeBinaryDetected && chatgptLoginState !== 'not_logged_in'))
+    chatgptLoginState === 'logged_in'
+  const authCheckIndeterminate =
+    hostManagedChatGptAuthSelected && chatgptLoginState === 'unknown'
   const apiKeyFallbackAllowed = forcedLoginMethod !== 'chatgpt'
 
   const nativeBackendAvailable =
     nativeBinaryDetected &&
+    !authCheckIndeterminate &&
     (hostManagedChatGptAuthReady || (apiKeyFallbackAllowed && nativeApiKeyConfigured))
   const resolvedBackendId = nativeBackendAvailable ? 'codex-native' : null
   const authenticated = resolvedBackendId !== null
@@ -315,6 +313,7 @@ export function resolveCodexRuntimeSelection(params?: {
     apiKeyConfigured,
     nativeApiKeyConfigured,
     nativeBinaryDetected,
+    authCheckIndeterminate,
     authenticated,
     authMethod,
     canLoginFromUi,

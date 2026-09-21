@@ -5,6 +5,10 @@ import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostManager.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
+import {
+  buildOpenCodeExpectedBehaviorEvidence,
+  validateOpenCodeExpectedBehaviorEvidence,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 
 import type {
   OpenCodeExecutionProof,
@@ -62,6 +66,10 @@ export function parseOpenCodeExecutionProof(value: unknown): OpenCodeExecutionPr
     || typeof proof.reusable !== 'boolean'
     || typeof proof.verifiedAt !== 'string'
     || typeof proof.expiresAt !== 'string'
+    || !proof.expectedBehaviorEvidence
+    || typeof proof.expectedBehaviorEvidence !== 'object'
+    || Object.keys(proof.expectedBehaviorEvidence).length !== 7
+    || !validateOpenCodeExpectedBehaviorEvidence(proof.expectedBehaviorEvidence)
     || typeof proof.proofHash !== 'string'
   ) {
     return null
@@ -76,7 +84,7 @@ function stableJson(value: unknown): string {
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
     return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(',')}}`
   }
   return JSON.stringify(value)
@@ -161,6 +169,13 @@ export async function buildOpenCodeExecutionProof(
       (mode === 'api' || mode === 'none')
       && typeof input.snapshot.host?.version === 'string'
       && input.snapshot.host.version.trim().length > 0,
+    expectedBehaviorEvidence: await buildOpenCodeExpectedBehaviorEvidence({
+      profile,
+      fullModelId: input.selectedModel,
+      effectiveConfigFingerprint: input.snapshot.host?.resolvedConfigFingerprint ?? null,
+      platform: deps.platform,
+      readCredential: async () => credential,
+    }),
     verifiedAt: new Date(issuedAtMs).toISOString(),
     expiresAt: new Date(issuedAtMs + OPEN_CODE_EXECUTION_PROOF_TTL_MS).toISOString(),
   }
@@ -176,7 +191,8 @@ export async function validateOpenCodeExecutionProof(
     return invalid('unsupported execution proof schema')
   }
   const { proofHash, ...unsigned } = proof
-  if (proofHash !== hashProof(unsigned)) {
+  if (proofHash !== hashProof(unsigned)
+    || !validateOpenCodeExpectedBehaviorEvidence(proof.expectedBehaviorEvidence)) {
     return invalid('execution proof integrity mismatch')
   }
   if (!proof.reusable || proof.credentialMode === 'oauth' || proof.credentialMode === 'unknown') {
@@ -204,6 +220,18 @@ export async function validateOpenCodeExecutionProof(
     || proof.managedAuthFingerprint !== profile.managedAuthFingerprint
   ) {
     return invalid('execution proof profile or authentication changed')
+  }
+  const currentEvidence = await buildOpenCodeExpectedBehaviorEvidence({
+    profile,
+    fullModelId: input.selectedModel,
+    effectiveConfigFingerprint: input.snapshot.host?.resolvedConfigFingerprint ?? null,
+    platform: deps.platform,
+    readCredential: deps.readCredential,
+  }).catch(() => null)
+  if (!currentEvidence
+    || currentEvidence.expectedBehaviorFingerprint
+      !== proof.expectedBehaviorEvidence.expectedBehaviorFingerprint) {
+    return invalid('execution proof expected behavior changed')
   }
   if (
     !proof.opencodeVersion

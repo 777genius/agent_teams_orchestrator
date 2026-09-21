@@ -8,6 +8,30 @@ export type TeamBootstrapStartupOptions = {
   teamBootstrapUserPromptFile?: string
 }
 
+function readProcessArgvOption(name: string, argv: string[] = process.argv): string | undefined {
+  const inlinePrefix = `${name}=`
+  const inlineValue = argv.find(arg => arg.startsWith(inlinePrefix))
+  if (inlineValue) {
+    return inlineValue.slice(inlinePrefix.length) || undefined
+  }
+  const index = argv.indexOf(name)
+  if (index < 0) {
+    return undefined
+  }
+  const value = argv[index + 1]
+  return value && !value.startsWith('-') ? value : undefined
+}
+
+export function resolveTeamBootstrapSpecPath(
+  optionValue: unknown,
+  argv: string[] = process.argv,
+): string | undefined {
+  if (typeof optionValue === 'string' && optionValue.trim().length > 0) {
+    return optionValue.trim()
+  }
+  return readProcessArgvOption('--team-bootstrap-spec', argv)
+}
+
 export function validateTeamBootstrapStartupOptions(params: {
   options: TeamBootstrapStartupOptions
   inputPrompt?: string | AsyncIterable<string>

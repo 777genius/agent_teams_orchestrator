@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useInterval } from 'usehooks-ts'
+import { createPendingMailboxMirrorMessage, isHumanDirectMailboxMessage } from './ordinaryMailboxMessage.js'
 import { getSessionId } from '../bootstrap/state.js'
 import type { ToolUseConfirm } from '../components/permissions/PermissionRequest.js'
 import { useTerminalNotification } from '../ink/useTerminalNotification.js'
@@ -25,6 +26,21 @@ import {
   handlePlanApprovalResponse,
 } from '../utils/inProcessTeammateHelpers.js'
 import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmission.js'
+import {
+  classifyTicketedWorkSyncEnvelope,
+  getOrdinaryPendingMessage,
+} from '../utils/ordinaryPendingMailboxMessage.js'
+import {
+  getBoundWorkSyncContinuationTicket,
+  getWorkSyncIdleDeliveryRetryDelayMs,
+  isWorkSyncPostTurnAdmissionWindowOpen,
+  isWorkSyncTestConsumeHoldOpen,
+  processBoundWorkSyncContinuationAdmission,
+  shouldDeferUnticketedWorkSyncNudges,
+} from '../utils/workSyncContinuationAdmission.js'
+import {
+  readWorkSyncInboxContinuationTicket,
+} from '../utils/workSyncInboxTicket.js'
 import { createAssistantMessage } from '../utils/messages.js'
 import {
   permissionModeFromString,
@@ -238,7 +254,7 @@ type PendingInboxMirrorMessage = Pick<
   | 'timestamp'
   | 'status'
 > &
-  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind'>>
+  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind' | 'source'>>
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
 
@@ -365,26 +381,34 @@ export function getBootstrapProcessingMessage({
     : undefined
 }
 
-export function getOrdinaryPendingMessage({
-  pendingMessages,
-}: {
-  pendingMessages: readonly PendingInboxMirrorMessage[]
-}): PendingInboxMirrorMessage | undefined {
-  const actionableMessages = pendingMessages.filter(
-    message =>
-      !!message.messageId &&
-      message.messageKind !== 'agent_error' &&
-      isRegularInteractiveMailboxMessage({ text: message.text }) &&
-      !(
-        message.from === TEAM_LEAD_NAME &&
-        isBootstrapMailboxInstructionText(message.text)
-      ),
-  )
+export {
+  classifyTicketedWorkSyncEnvelope,
+  getOrdinaryPendingMessage,
+} from '../utils/ordinaryPendingMailboxMessage.js'
 
-  return (
-    actionableMessages.find(message => message.messageKind === 'member_work_sync_nudge')
-    ?? actionableMessages[0]
-  )
+export function resolveIncomingMailboxSubmissionKind(input: {
+  bootstrapPendingMessage?: { messageId?: string } | null
+  ordinaryPendingMessage?: Parameters<typeof readWorkSyncInboxContinuationTicket>[0]
+}): IncomingPromptSubmissionKind {
+  if (input.bootstrapPendingMessage) {
+    return 'bootstrap'
+  }
+  const ticket = input.ordinaryPendingMessage
+    ? readWorkSyncInboxContinuationTicket(input.ordinaryPendingMessage)
+    : null
+  return ticket ? 'work_sync_continuation' : 'mailbox'
+}
+
+function shouldHoldTicketedWorkSyncUntilExactMatch(message: {
+  messageKind?: string
+  messageId?: string
+  workSyncRuntimeTicketId?: string
+  workSyncRuntimeGeneration?: number
+  workSyncRuntimeInstanceId?: string
+  workSyncIntentId?: string
+  workSyncAdmissionPayloadHash?: string
+}): boolean {
+  return classifyTicketedWorkSyncEnvelope(message) === 'wait'
 }
 
 export function getProcessingOrdinaryMessage({
@@ -418,16 +442,46 @@ export function shouldDeferPendingInboxDelivery(params: {
     return true
   }
 
-  if (!params.isLoading) {
-    return false
+  if (isWorkSyncTestConsumeHoldOpen()) {
+    const ticketed = getOrdinaryPendingMessage({
+      pendingMessages: params.pendingMessages,
+      deferUnticketedWorkSyncNudges: true,
+    })
+    if (
+      ticketed?.messageKind === 'member_work_sync_nudge' &&
+      readWorkSyncInboxContinuationTicket(ticketed)
+    ) {
+      return true
+    }
   }
 
-  const bootstrapPendingMessage = getBootstrapPendingMessage({
-    pendingMessages: params.pendingMessages,
-    isTeammateSession: params.isTeammateSession,
-  })
+  if (params.isLoading) {
+    const ticketed = getOrdinaryPendingMessage({
+      pendingMessages: params.pendingMessages,
+      deferUnticketedWorkSyncNudges: true,
+    })
+    if (
+      ticketed?.messageKind === 'member_work_sync_nudge' &&
+      readWorkSyncInboxContinuationTicket(ticketed) &&
+      !shouldHoldTicketedWorkSyncUntilExactMatch(ticketed)
+    ) {
+      return false
+    }
+    const bootstrapPendingMessage = getBootstrapPendingMessage({
+      pendingMessages: params.pendingMessages,
+      isTeammateSession: params.isTeammateSession,
+    })
+    return bootstrapPendingMessage == null
+  }
 
-  return bootstrapPendingMessage == null
+  if (
+    isWorkSyncPostTurnAdmissionWindowOpen() &&
+    !getBoundWorkSyncContinuationTicket()
+  ) {
+    return true
+  }
+
+  return false
 }
 
 export function getBootstrapInlineHandoffPrompt({
@@ -478,6 +532,7 @@ export function shouldSkipBootstrapReadinessWait(params: {
 
 export function getOrdinaryInlineHandoffPrompt({
   from,
+  source,
   memberName,
   messageId,
   replyProtocol = resolveOrdinaryUserDirectReplyProtocol(),
@@ -486,6 +541,7 @@ export function getOrdinaryInlineHandoffPrompt({
   timestamp,
 }: {
   from: string
+  source?: string
   memberName?: string
   messageId?: string
   replyProtocol?: OrdinaryUserDirectReplyProtocol
@@ -493,7 +549,7 @@ export function getOrdinaryInlineHandoffPrompt({
   teamName?: string
   timestamp: string
 }): string {
-  const isUserMessage = from.trim().toLowerCase() === 'user'
+  const isUserMessage = isHumanDirectMailboxMessage({ from, source })
   const normalizedTeamName = teamName?.trim()
   const normalizedMemberName = memberName?.trim()
   const normalizedMessageId = messageId?.trim()
@@ -516,7 +572,9 @@ export function getOrdinaryInlineHandoffPrompt({
     'Process this queued mailbox message now.',
     `Sender: "${from}".`,
     `Timestamp: "${timestamp}".`,
-    isUserMessage
+    source === 'system_notification'
+      ? 'This is a system notification, not a human direct message. Process its instructions; no direct reply to the initiating user is required.'
+      : isUserMessage
       ? canExplainMcpReply
         ? `If this is a human direct message, reply via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${normalizedTeamName}", to="user", from="${normalizedMemberName}", text, summary, source="runtime_delivery", and relayOfMessageId="${normalizedMessageId}". Do not use SendMessage for this Codex-native handoff. If neither MCP tool name is available before any visible-message tool attempt, write exactly the concise reply text as normal assistant text so the runtime can relay it. This handoff delivery rule supersedes older SendMessage-only wording inside queued_mailbox_message.`
         : 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
@@ -1911,7 +1969,7 @@ export function getOrdinaryProcessingAction({
     submitUserMessageUuid: attempt.submitUserMessageUuid,
   })
   const requiresUserReply =
-    processingOrdinaryMessage.from.trim().toLowerCase() === 'user'
+    isHumanDirectMailboxMessage(processingOrdinaryMessage)
   const requiresWorkSyncReport =
     processingOrdinaryMessage.messageKind === 'member_work_sync_nudge'
   const workSyncOutcome = requiresWorkSyncReport
@@ -2117,9 +2175,17 @@ export function useInboxPoller({
     Map<string, BootstrapReadinessWaitState>
   >(new Map())
   const [bootstrapReadinessTick, setBootstrapReadinessTick] = useState(0)
+  const [idleDeliveryRetryTick, setIdleDeliveryRetryTick] = useState(0)
+  const idleDeliveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  )
 
   useEffect(() => {
     return () => {
+      if (idleDeliveryRetryTimerRef.current) {
+        clearTimeout(idleDeliveryRetryTimerRef.current)
+        idleDeliveryRetryTimerRef.current = null
+      }
       for (const attempt of bootstrapAttemptsRef.current.values()) {
         if (attempt.timer) {
           clearTimeout(attempt.timer)
@@ -2151,11 +2217,13 @@ export function useInboxPoller({
     pollInFlightRef.current = true
 
     try {
-      // Use ref to avoid dependency on appState object (prevents infinite loop)
       const currentAppState = store.getState()
       const agentName = getAgentNameToPoll(currentAppState)
       if (!agentName) return
       const teamName = currentAppState.teamContext?.teamName
+      if (teamName) {
+        await processBoundWorkSyncContinuationAdmission()
+      }
       const sessionId = getSessionId()
       const staleMirroredMessageIds = new Set(
         currentAppState.inbox.messages
@@ -3086,18 +3154,7 @@ export function useInboxPoller({
           )
           const additions = messages
             .filter(message => !seenMessageIds.has(message.messageId))
-            .map(message => ({
-              id: randomUUID(),
-              messageId: message.messageId,
-              messageKind: message.messageKind,
-              mailboxClaimedBySessionId: options.claimedBySessionId,
-              from: message.from,
-              text: message.text,
-              timestamp: message.timestamp,
-              status: 'pending' as const,
-              color: message.color,
-              summary: message.summary,
-            }))
+            .map(message => createPendingMailboxMirrorMessage(message, options.claimedBySessionId))
           if (additions.length === 0) {
             return prev
           }
@@ -3158,7 +3215,18 @@ export function useInboxPoller({
         pendingMessages: liveOwnedMessagesForGate,
       })
     ) {
+      const retryMs = getWorkSyncIdleDeliveryRetryDelayMs()
+      if (retryMs != null && idleDeliveryRetryTimerRef.current == null) {
+        idleDeliveryRetryTimerRef.current = setTimeout(() => {
+          idleDeliveryRetryTimerRef.current = null
+          setIdleDeliveryRetryTick(tick => tick + 1)
+        }, retryMs)
+      }
       return
+    }
+    if (idleDeliveryRetryTimerRef.current) {
+      clearTimeout(idleDeliveryRetryTimerRef.current)
+      idleDeliveryRetryTimerRef.current = null
     }
 
     const staleMirroredMessageIds = new Set(
@@ -3916,10 +3984,28 @@ export function useInboxPoller({
 
     const ordinaryPendingMessage =
       bootstrapPendingMessage == null
-        ? getOrdinaryPendingMessage({ pendingMessages })
+        ? getOrdinaryPendingMessage({
+            pendingMessages,
+            deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
+          })
         : undefined
 
     void (async () => {
+      if (
+        ordinaryPendingMessage &&
+        shouldHoldTicketedWorkSyncUntilExactMatch(ordinaryPendingMessage)
+      ) {
+        logForDebugging(
+          '[InboxPoller] Holding ticketed work-sync envelope until the exact reserved ticket matches',
+        )
+        return
+      }
+      if (!bootstrapPendingMessage && !ordinaryPendingMessage) {
+        logForDebugging(
+          '[InboxPoller] Holding automatic work-sync until a matching D1 ticket is reserved',
+        )
+        return
+      }
       logForDebugging(
         `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
       )
@@ -4014,6 +4100,7 @@ export function useInboxPoller({
               })
             : getOrdinaryInlineHandoffPrompt({
                 from: ordinaryPendingMessage.from,
+                source: ordinaryPendingMessage.source,
                 memberName: agentName,
                 messageId: ordinaryPendingMessage.messageId,
                 text: ordinaryPendingMessage.text,
@@ -4108,7 +4195,10 @@ export function useInboxPoller({
 
       const submitted = onSubmitTeammateMessage(prompt, {
         isMeta: true,
-        submissionKind: bootstrapPendingMessage ? 'bootstrap' : 'mailbox',
+        submissionKind: resolveIncomingMailboxSubmissionKind({
+          bootstrapPendingMessage,
+          ordinaryPendingMessage,
+        }),
         ...(nativeBootstrapInjection
           ? { prefixMessages: nativeBootstrapInjection.prefixMessages }
           : {}),
@@ -4294,6 +4384,7 @@ export function useInboxPoller({
     onBootstrapConfirmed,
     setAppState,
     inboxStateSignature,
+    idleDeliveryRetryTick,
     store,
   ])
 

@@ -30,6 +30,8 @@ export type OpenCodeRuntimeTurnSettledEvent = {
   outcome: OpenCodeRuntimeTurnSettledOutcome
   runtimePromptMessageId?: string
   turnId?: string
+  runtimeInstanceId?: string
+  completedGeneration?: number
   selectedModel?: string
   runtimePid?: number
   detail?: string

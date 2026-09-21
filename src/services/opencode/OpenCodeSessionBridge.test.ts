@@ -204,6 +204,403 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('replay observes a live owner without receiving its write or release token', async () => {
+    const existing = buildRecord({ runId: 'run-1', selectedModel: 'openai/gpt-5.4-mini' })
+    const acquisitions: unknown[][] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      sessionStore: {
+        get: async () => existing,
+        upsert: async () => 'unchanged',
+        markStale: async () => existing,
+        claimMaterialization: async () => ({ kind: 'existing', record: existing }),
+        acquireMaterializationOwner: async (...args: unknown[]) => {
+          acquisitions.push(args)
+          return null
+        },
+      },
+    })
+    const result = await bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1',
+      attemptId: 'attempt-replay', selectedModel: 'openai/gpt-5.4-mini', host,
+      signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })
+    expect(result).toMatchObject({ record: existing, created: false, nonOwningReplay: true })
+    expect(result.ownerToken).toBeUndefined()
+    // No observed owner token is ever supplied to the transfer operation.
+    expect(acquisitions[0]).toHaveLength(3)
+  })
+
+  test('does not mutate a shared lease when replay retention cannot acquire its owner', async () => {
+    const existing = buildRecord({ runId: 'run-1', selectedModel: 'openai/gpt-5.4-mini' })
+    const retainedLeases: unknown[] = []
+    const releasedLeases: unknown[] = []
+    const stale: unknown[] = []
+    const releasedOwners: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async (_hostKey, lease) => { retainedLeases.push(lease); throw new Error('must not retain') },
+        releaseHostLease: async (_hostKey, lease) => { releasedLeases.push(lease) },
+      },
+      sessionStore: {
+        get: async () => existing, upsert: async () => 'unchanged', markStale: async () => existing,
+        claimMaterialization: async () => ({ kind: 'existing', record: existing }),
+        acquireMaterializationOwner: async () => null,
+        markStaleIfSession: async (...args) => { stale.push(args); return existing },
+        releaseMaterializationOwner: async (...args) => { releasedOwners.push(args); return true },
+      },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-replay',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).resolves.toMatchObject({ record: existing, created: false, nonOwningReplay: true })
+    expect(retainedLeases).toEqual([])
+    expect(releasedLeases).toEqual([])
+    expect(stale).toEqual([])
+    expect(releasedOwners).toEqual([])
+  })
+
+  test('deletes a known remote session and releases its claim when commit is lost', async () => {
+    const released: unknown[][] = []
+    const deleted: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => { throw new Error('lease must follow durable commit') },
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'unchanged',
+        markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: {
+          attemptId: 'attempt-a', sessionId: '', version: 1,
+        } }),
+        commitMaterialization: async () => null,
+        releaseMaterializationClaim: async (...args: unknown[]) => { released.push(args); return true },
+        recordMaterializationCompensation: async () => true,
+      },
+      clientFactory: {
+        create: () => ({
+          createSession: async () => ({ id: 'remote-known' }),
+          deleteSession: async (id: string) => { deleted.push(id); return true },
+        } as never),
+      },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1',
+      attemptId: 'attempt-a', selectedModel: 'openai/gpt-5.4-mini', host,
+      signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('claim was lost before commit')
+    expect(deleted).toEqual(['remote-known'])
+    expect(released).toHaveLength(1)
+  })
+
+  test('does not delete a session when commit persisted before its store-lock release rejected', async () => {
+    const owner = { attemptId: 'attempt-a', sessionId: 'remote-committed', version: 1 }
+    const reconciliations: unknown[][] = []
+    const retainedLeases: unknown[] = []
+    const deleted: string[] = []
+    const releaseError = new Error('store-lock release rejected')
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async (_hostKey, lease) => { retainedLeases.push(lease) },
+      },
+      sessionStore: {
+        get: async () => null, upsert: async () => 'unchanged', markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: { ...owner, sessionId: '' } }),
+        recordMaterializationCompensation: async () => true,
+        commitMaterialization: async () => { throw releaseError },
+        reconcileMaterializationCommit: async (...args) => { reconciliations.push(args); return owner },
+        releaseMaterializationClaim: async () => { throw new Error('must not compensate a reconciled commit') },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: 'remote-committed' }),
+        deleteSession: async (id: string) => { deleted.push(id); return true },
+      } as never) },
+    })
+    const result = await bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-a',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })
+    expect(result).toMatchObject({ created: true, ownerToken: owner, record: { opencodeSessionId: 'remote-committed' } })
+    expect(reconciliations).toHaveLength(1)
+    expect(deleted).toEqual([])
+    expect(retainedLeases).toEqual([{ teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', sessionId: 'remote-committed' }])
+  })
+
+  test('preserves the fenced unknown session when commit reconciliation itself fails', async () => {
+    const deleted: string[] = []
+    const releasedClaims: unknown[][] = []
+    const compensations: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async () => { throw new Error('must not retain an unknown commit') },
+      },
+      sessionStore: {
+        get: async () => null, upsert: async () => 'unchanged', markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: {
+          attemptId: 'attempt-a', sessionId: '', version: 1,
+        } }),
+        recordMaterializationCompensation: async (_identity, compensation) => {
+          compensations.push(compensation)
+          return true
+        },
+        commitMaterialization: async () => { throw new Error('store lock release failed') },
+        reconcileMaterializationCommit: async () => { throw new Error('store unavailable during reconciliation') },
+        getMaterializationCompensation: async () => compensations[0] as never,
+        releaseMaterializationClaim: async (...args: unknown[]) => { releasedClaims.push(args); return true },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: 'remote-unknown' }),
+        deleteSession: async (id: string) => { deleted.push(id); return true },
+      } as never) },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-a',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('commit outcome is unknown')
+    expect(compensations).toHaveLength(1)
+    expect(deleted).toEqual([])
+    expect(releasedClaims).toEqual([])
+  })
+
+  test('uses an independent bounded client to compensate a session created just before launch cancellation', async () => {
+    const abort = new AbortController()
+    const contexts: Array<{ signal?: AbortSignal; remainingMs?: () => number }> = []
+    const recorded: unknown[] = []
+    const deleted: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {}, retainHostLease: async () => {} },
+      sessionStore: {
+        get: async () => null, upsert: async () => 'unchanged', markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: { attemptId: 'attempt-a', sessionId: '', version: 1 } }),
+        recordMaterializationCompensation: async (_identity, compensation) => { recorded.push(compensation); return true },
+        commitMaterialization: async () => { throw abort.signal.reason },
+        reconcileMaterializationCommit: async () => null,
+        getMaterializationCompensation: async () => recorded[0] as never,
+        releaseMaterializationClaim: async () => true,
+      },
+      clientFactory: { create: (_baseUrl, context = {}) => {
+        contexts.push(context)
+        return contexts.length === 1
+          ? {
+            createSession: async () => { abort.abort(new Error('launch cancelled')); return { id: 'remote-cancelled' } },
+            deleteSession: async () => { throw new Error('cleanup must use its independent client') },
+          } as never
+          : { deleteSession: async (id: string) => { deleted.push(id); return false } } as never
+      } },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-a',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: abort.signal, remainingMs: () => 0,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('could not be durably committed or deleted')
+    expect(contexts).toHaveLength(2)
+    expect(abort.signal.aborted).toBe(true)
+    expect(recorded).toHaveLength(1)
+    expect(deleted).toEqual(['remote-cancelled'])
+    expect(contexts[1]?.signal).not.toBe(abort.signal)
+    expect(contexts[1]?.remainingMs?.()).toBeGreaterThan(0)
+  })
+
+  test('compensates when recording the post-create durable entry throws and preserves it if DELETE fails', async () => {
+    const deleted: string[] = []
+    const recorded: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {}, retainHostLease: async () => {} },
+      sessionStore: {
+        get: async () => null, upsert: async () => 'unchanged', markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: { attemptId: 'attempt-a', sessionId: '', version: 1 } }),
+        // The first write throws as though persistence failed after POST; the
+        // retry after failed cleanup is the durable recovery obligation.
+        recordMaterializationCompensation: async (_identity, compensation) => {
+          recorded.push(compensation)
+          if (recorded.length === 1) throw new Error('compensation write interrupted')
+          return true
+        },
+        getMaterializationCompensation: async () => null,
+        commitMaterialization: async () => { throw new Error('not reached') },
+        releaseMaterializationClaim: async () => true,
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: 'remote-record-throws' }),
+        deleteSession: async (id: string) => { deleted.push(id); return false },
+      } as never) },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-a',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('durable recovery is required')
+    expect(deleted).toEqual(['remote-record-throws'])
+    expect(recorded).toHaveLength(2)
+  })
+
+  test('releases the exact committed owner and session lease when retaining it fails', async () => {
+    const owner = { attemptId: 'attempt-a', sessionId: 'remote-lease', version: 1 }
+    const releasedLeases: unknown[] = []
+    const releasedOwners: unknown[] = []
+    const stale: unknown[] = []
+    const deleted: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async () => { throw new Error('lease write rejected') },
+        releaseHostLease: async (_key, lease) => { releasedLeases.push(lease) },
+      },
+      sessionStore: {
+        get: async () => null, upsert: async () => 'unchanged', markStale: async () => null,
+        claimMaterialization: async () => ({ kind: 'claimed', ownerToken: { ...owner, sessionId: '' } }),
+        recordMaterializationCompensation: async () => true,
+        commitMaterialization: async () => owner,
+        markStaleIfSession: async (...args) => { stale.push(args); return null },
+        releaseMaterializationOwner: async (...args) => { releasedOwners.push(args); return true },
+      },
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: 'remote-lease' }), deleteSession: async (id: string) => { deleted.push(id); return true },
+      } as never) },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-a',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('lease write rejected')
+    expect(releasedLeases).toEqual([{ teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', sessionId: 'remote-lease' }])
+    expect(releasedOwners).toEqual([expect.arrayContaining([expect.any(Object), owner])])
+    expect(stale).toHaveLength(1)
+    expect(deleted).toEqual(['remote-lease'])
+  })
+
+  test('holds the materialization owner until cancelled-session lease cleanup completes before a successor can retain it', async () => {
+    const abort = new AbortController()
+    const owner = { attemptId: 'attempt-a', sessionId: 'remote-cancelled-after-commit', version: 1 }
+    const successor = { attemptId: 'attempt-b', sessionId: owner.sessionId, version: 2 }
+    const events: string[] = []
+    let releaseLease!: () => void
+    let releaseOwner!: () => void
+    const leaseCleanupStarted = new Promise<void>(resolve => { releaseLease = resolve })
+    const ownerReleased = new Promise<void>(resolve => { releaseOwner = resolve })
+    const hostManager = {
+      ensureHost: async () => host,
+      releaseHost: async () => {},
+      retainHostLease: async (_hostKey: string, lease: { sessionId?: string | null }) => {
+        if (lease.sessionId === owner.sessionId) {
+          events.push(events.includes('owner-released') ? 'successor-retain' : 'owner-retain')
+          if (!events.includes('owner-released')) abort.abort(new Error('launch cancelled after lease retention'))
+        }
+      },
+      releaseHostLease: async () => {
+        events.push('lease-cleanup-started')
+        await leaseCleanupStarted
+        events.push('lease-cleanup-finished')
+      },
+    }
+    const sessionStore = {
+      get: async () => null, upsert: async () => 'unchanged' as const, markStale: async () => null,
+      claimMaterialization: async () => ({ kind: 'claimed' as const, ownerToken: { ...owner, sessionId: '' } }),
+      recordMaterializationCompensation: async () => true,
+      commitMaterialization: async () => owner,
+      markStaleIfSession: async () => { events.push('stale'); return null },
+      releaseMaterializationOwner: async () => {
+        events.push('owner-released')
+        releaseOwner()
+        return true
+      },
+      acquireMaterializationOwner: async () => {
+        events.push('successor-acquired')
+        return successor
+      },
+    }
+    const bridge = new OpenCodeSessionBridge({
+      hostManager,
+      sessionStore,
+      clientFactory: { create: () => ({
+        createSession: async () => ({ id: owner.sessionId }),
+        deleteSession: async () => true,
+      } as never) },
+    })
+    const cancelled = bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: owner.attemptId,
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: abort.signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })
+    while (!events.includes('lease-cleanup-started')) await Promise.resolve()
+    const successorAttempt = (async () => {
+      await ownerReleased
+      await sessionStore.acquireMaterializationOwner()
+      await hostManager.retainHostLease(host.hostKey, { sessionId: owner.sessionId })
+    })()
+    expect(events).toEqual(['owner-retain', 'lease-cleanup-started'])
+    releaseLease()
+    await expect(cancelled).rejects.toThrow('launch cancelled after lease retention')
+    await successorAttempt
+    expect(events).toEqual([
+      'owner-retain', 'lease-cleanup-started', 'lease-cleanup-finished', 'stale',
+      'owner-released', 'successor-acquired', 'successor-retain',
+    ])
+  })
+
+  test('releases an acquired replay owner and any partial exact lease when replay retention fails', async () => {
+    const existing = buildRecord({ runId: 'run-1', selectedModel: 'openai/gpt-5.4-mini' })
+    const replayOwner = { attemptId: 'attempt-replay', sessionId: existing.opencodeSessionId, version: 4 }
+    const releasedLeases: unknown[] = []
+    const releasedOwners: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host, releaseHost: async () => {},
+        retainHostLease: async () => { throw new Error('replay lease write rejected') },
+        releaseHostLease: async (_hostKey, lease) => { releasedLeases.push(lease) },
+      },
+      sessionStore: {
+        get: async () => existing, upsert: async () => 'unchanged', markStale: async () => existing,
+        claimMaterialization: async () => ({ kind: 'existing', record: existing }),
+        acquireMaterializationOwner: async () => replayOwner,
+        markStaleIfSession: async () => existing,
+        releaseMaterializationOwner: async (...args) => { releasedOwners.push(args); return true },
+      },
+    })
+    await expect(bridge.materializeSessionOnHost({
+      teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', attemptId: 'attempt-replay',
+      selectedModel: 'openai/gpt-5.4-mini', host, signal: new AbortController().signal, remainingMs: () => 10_000,
+      expectedBehaviorFingerprint: 'expected', expectedBootstrapForSession: () => ({
+        messageID: 'bootstrap', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate-bootstrap',
+      }),
+    })).rejects.toThrow('replay lease write rejected')
+    expect(releasedLeases).toEqual([{ teamId: 'team-a', laneId: 'primary', memberName: 'alice', runId: 'run-1', sessionId: 'session-1' }])
+    expect(releasedOwners).toEqual([expect.arrayContaining([existing, replayOwner])])
+  })
+
   test('authorizes permission only after prepareProfile and ensureHost, immediately before provider POST', async () => {
     const order: string[] = []
     let releaseHost!: () => void

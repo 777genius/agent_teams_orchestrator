@@ -340,19 +340,41 @@ export async function runtimeStatus(opts: {
       },
     )
 
-  if (opts.text) {
-    const payload = await loadPayload()
-    const providerOrder: RuntimeProviderId[] = ['anthropic', 'codex', 'gemini', 'opencode']
-    for (const providerId of providerOrder) {
-      const provider = payload.providers[providerId]
-      if (!provider) continue
-      printProviderStatus(provider)
+  try {
+    if (opts.text) {
+      const payload = await loadPayload()
+      const providerOrder: RuntimeProviderId[] = ['anthropic', 'codex', 'gemini', 'opencode']
+      for (const providerId of providerOrder) {
+        const provider = payload.providers[providerId]
+        if (!provider) continue
+        printProviderStatus(provider)
+      }
+    } else {
+      await withRuntimeJsonStdoutGuardedResponse(loadPayload, async (payload, stdoutWrite) => {
+        await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite, 'strict')
+        return 0
+      })
+      return
     }
-  } else {
-    await withRuntimeJsonStdoutGuardedResponse(loadPayload, async (payload, stdoutWrite) => {
-      await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite)
-      return 0
-    })
+  } catch (error) {
+    // The CLI's global rejection listener only logs telemetry. Letting this
+    // escape can therefore produce exit 0 with no response at all.
+    process.exitCode = 1
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const message = redactRuntimeProviderSecretPatterns(
+        error instanceof Error ? error.message : String(error),
+      )
+      await new Promise<void>(resolve => {
+        // Keep the process alive until the diagnostic is written, but do not
+        // hang indefinitely if stderr never calls back.
+        timer = setTimeout(resolve, STDOUT_DRAIN_FALLBACK_TIMEOUT_MS)
+        process.stderr.write(`Runtime status failed: ${message}\n`, () => resolve())
+      })
+    } finally {
+      clearTimeout(timer)
+      exitRuntimeCommand(1)
+    }
     return
   }
 
@@ -955,6 +977,7 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
 function writeStdoutAndDrain(
   payload: string,
   stdoutWrite: RuntimeStdoutWrite = process.stdout.write,
+  timeoutPolicy: 'best-effort' | 'strict' = 'best-effort',
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -979,8 +1002,15 @@ function writeStdoutAndDrain(
       resolve()
     }
     const onDrain = () => finish()
-    timer = setTimeout(() => finish(), STDOUT_DRAIN_FALLBACK_TIMEOUT_MS)
-    timer.unref?.()
+    // Status catches a strict deadline failure and explicitly exits nonzero.
+    // Other callers retain their existing best-effort deadline and exit path.
+    timer = setTimeout(
+      () => finish(timeoutPolicy === 'strict'
+        ? new Error('Timed out writing runtime command stdout')
+        : undefined),
+      STDOUT_DRAIN_FALLBACK_TIMEOUT_MS,
+    )
+    if (timeoutPolicy === 'best-effort') timer.unref?.()
     const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, error => {
       finish(error)
     })

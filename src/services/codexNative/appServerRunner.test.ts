@@ -1,13 +1,136 @@
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, test } from 'bun:test'
 
-import { runCodexNativeAppServer } from './appServerRunner.js'
+import { createCodexAppServerNotificationMapper, runCodexNativeAppServer } from './appServerRunner.js'
+import { CodexNativeTranscriptProjector } from './transcriptProjector.js'
 import type { CodexNativeExecObservation } from './execRunner.js'
+
+describe('Codex app-server assistant snapshots', () => {
+  for (const failure of ['exit', 'abort', 'idle timeout', 'absolute timeout'] as const) {
+    test(`retains partial assistant text and usage while preserving ${failure} failure`, async () => {
+      const fake = createFakeCodexAppServer()
+      const controller = new AbortController()
+      fake.stdin.on('data', chunk => {
+        for (const line of String(chunk).split('\n')) {
+          if (!line.trim()) continue
+          const message = JSON.parse(line)
+          if (!message.id) continue
+          writeJson(fake.stdout, {
+            id: message.id,
+            result: message.method === 'thread/start'
+              ? { thread: { id: 'thread' } }
+              : message.method === 'turn/start' ? { turn: { id: 'turn' } } : {},
+          })
+          if (message.method !== 'turn/start') continue
+          for (const delta of ['P', 'ON']) {
+            writeJson(fake.stdout, {
+              method: 'item/agentMessage/delta',
+              params: { threadId: 'thread', turnId: 'turn', itemId: 'partial', delta },
+            })
+          }
+          writeJson(fake.stdout, {
+            method: 'thread/tokenUsage/updated',
+            params: { threadId: 'thread', turnId: 'turn',
+              tokenUsage: { last: { inputTokens: 3, cachedInputTokens: 0, outputTokens: 1 } } },
+          })
+          if (failure === 'exit') setTimeout(() => fake.child.emit('exit', 1, null), 10)
+          if (failure === 'abort') setTimeout(() => controller.abort(new Error('test abort')), 10)
+        }
+      })
+      const observations: CodexNativeExecObservation[] = []
+      const run = async () => {
+        for await (const observation of runCodexNativeAppServer({
+          prompt: 'synthetic test', cwd: '/tmp/test-only', abortSignal: controller.signal,
+          requestApproval: async () => ({ allow: false }),
+          idleTimeoutMs: failure === 'idle timeout' ? 15 : null,
+          absoluteTimeoutMs: failure === 'absolute timeout' ? 15 : null,
+        }, {
+          which: () => '/test-only/codex', resolveVersion: () => 'test',
+          spawnProcess: (_command, _args, options) => {
+            options.signal?.addEventListener('abort', () => fake.child.emit('error', options.signal?.reason), { once: true })
+            return fake.child as never
+          },
+        })) observations.push(observation)
+      }
+      await expect(run()).rejects.toThrow(failure === 'exit' ? 'exited unexpectedly' : failure)
+      const events = observations.flatMap(observation => observation.type === 'normalized_event' ? [observation.event] : [])
+      expect(events.filter(event => event.type === 'assistant_text')).toEqual([
+        { type: 'assistant_text', itemId: 'partial', text: 'PON' },
+      ])
+      expect(events.some(event => event.type === 'usage_updated')).toBe(true)
+      expect(events.some(event => event.type === 'turn_completed')).toBe(false)
+    })
+  }
+
+  test('aggregates P + ONG at turn completion instead of returning only the final chunk', () => {
+    const map = createCodexAppServerNotificationMapper()
+    const projector = new CodexNativeTranscriptProjector()
+    const identity = { threadId: 'thread', turnId: 'turn', itemId: 'message' }
+    expect(map('item/agentMessage/delta', { ...identity, delta: 'P' })).toEqual([])
+    expect(map('item/agentMessage/delta', { ...identity, delta: 'ONG' })).toEqual([])
+    const events = map('turn/completed', { threadId: 'thread', turn: { id: 'turn' } })
+    for (const event of events) projector.apply(event)
+    expect(events[0]).toEqual({ type: 'assistant_text', itemId: 'message', text: 'PONG' })
+    expect(projector.getLastAssistantMessage()?.message.content).toEqual([{ type: 'text', text: 'PONG' }])
+  })
+
+  test('replaces chunks with a final snapshot, preserving whitespace and distinct tool-turn messages', () => {
+    const map = createCodexAppServerNotificationMapper()
+    const identity = { threadId: 'thread', turnId: 'turn' }
+    map('item/agentMessage/delta', { ...identity, itemId: 'commentary', delta: 'Working' })
+    map('item/agentMessage/delta', { ...identity, itemId: 'commentary', delta: ' ' })
+    const first = map('item/completed', {
+      ...identity, item: { type: 'agentMessage', id: 'commentary', text: 'Working now' },
+    })
+    expect(first).toEqual([{ type: 'assistant_text', itemId: 'commentary', text: 'Working now' }])
+    const tool = map('item/started', {
+      ...identity, item: { type: 'commandExecution', id: 'tool', command: 'echo test', status: 'inProgress' },
+    })
+    expect(tool[0]?.type).toBe('tool_call_started')
+    map('item/agentMessage/delta', { ...identity, itemId: 'answer', delta: 'P' })
+    map('item/agentMessage/delta', { ...identity, itemId: 'answer', delta: 'ONG\n' })
+    const answer = map('item/completed', {
+      ...identity, item: { type: 'agentMessage', id: 'answer', text: 'PONG\n' },
+    })
+    expect(answer).toEqual([{ type: 'assistant_text', itemId: 'answer', text: 'PONG\n' }])
+    expect(map('turn/completed', { threadId: 'thread', turn: { id: 'turn' } })
+      .filter(event => event.type === 'assistant_text')).toEqual([])
+  })
+
+  test('keeps reused item ids separate across turns and does not trim streamed spaces', () => {
+    const map = createCodexAppServerNotificationMapper()
+    for (const [turnId, text] of [['first', 'one'], ['second', 'two']]) {
+      map('item/agentMessage/delta', { threadId: 'thread', turnId, itemId: 'same', delta: text })
+      map('item/agentMessage/delta', { threadId: 'thread', turnId, itemId: 'same', delta: ' ' })
+      const events = map('turn/completed', { threadId: 'thread', turn: { id: turnId } })
+      expect(events[0]).toEqual({ type: 'assistant_text', itemId: 'same', text: `${text} ` })
+    }
+  })
+
+  test('emits final-only snapshots once and defers usage until buffered text is projected', () => {
+    const map = createCodexAppServerNotificationMapper()
+    const identity = { threadId: 'thread', turnId: 'turn' }
+    const completed = { ...identity, item: { type: 'agentMessage', id: 'first', text: 'first' } }
+    expect(map('item/completed', completed)).toEqual([
+      { type: 'assistant_text', itemId: 'first', text: 'first' },
+    ])
+    expect(map('item/completed', completed)).toEqual([])
+    map('item/agentMessage/delta', { ...identity, itemId: 'answer', delta: 'PONG' })
+    expect(map('thread/tokenUsage/updated', {
+      ...identity, tokenUsage: { last: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 } },
+    })).toEqual([])
+    const events = map('turn/completed', { threadId: 'thread', turn: { id: 'turn' } })
+    expect(events.map(event => event.type)).toEqual(['assistant_text', 'usage_updated', 'turn_completed'])
+    const projector = new CodexNativeTranscriptProjector()
+    for (const event of events) projector.apply(event)
+    expect(projector.getTotalUsage().output_tokens).toBe(2)
+  })
+})
 
 function createFakeCodexAppServer() {
   const stdin = new PassThrough()
@@ -17,7 +140,7 @@ function createFakeCodexAppServer() {
     stdin,
     stdout,
     stderr,
-    pid: 12345,
+    pid: 0,
     killed: false,
     exitCode: null as number | null,
     signalCode: null as NodeJS.Signals | null,
@@ -57,6 +180,9 @@ describe('runCodexNativeAppServer', () => {
 
     await writeFile(path.join(sourceHome, 'config.toml'), 'service_tier = "priority"\n')
     await writeFile(path.join(sourceHome, 'auth.json'), '{"tokens":true}\n')
+    await mkdir(path.join(sourceHome, 'sessions'), { recursive: true })
+    await writeFile(path.join(sourceHome, 'sessions', 'busy.jsonl'), '{}\n')
+    await writeFile(path.join(sourceHome, 'history.jsonl'), '{}\n')
 
     fake.stdin.on('data', chunk => {
       for (const line of String(chunk).split('\n')) {
@@ -121,6 +247,8 @@ describe('runCodexNativeAppServer', () => {
               expect(spawnedCodexHome).not.toBe(sourceHome)
               expect(existsSync(path.join(spawnedCodexHome!, 'config.toml'))).toBe(false)
               expect(existsSync(path.join(spawnedCodexHome!, 'auth.json'))).toBe(true)
+              expect(existsSync(path.join(spawnedCodexHome!, 'sessions'))).toBe(false)
+              expect(existsSync(path.join(spawnedCodexHome!, 'history.jsonl'))).toBe(false)
               return fake.child as never
             },
           },
@@ -162,7 +290,17 @@ describe('runCodexNativeAppServer', () => {
               threadId: 'thread-1',
               turnId: 'turn-1',
               itemId: 'msg-1',
-              delta: 'OK',
+              delta: 'P',
+            },
+          })
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            method: 'item/agentMessage/delta',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              itemId: 'msg-1',
+              delta: 'ONG',
             },
           })
           writeJson(fake.stdout, {
@@ -256,7 +394,7 @@ describe('runCodexNativeAppServer', () => {
         observation =>
           observation.type === 'normalized_event' &&
           observation.event.type === 'assistant_text' &&
-          observation.event.text === 'OK',
+          observation.event.text === 'PONG',
       ),
     ).toBe(true)
     expect(summary).toMatchObject({

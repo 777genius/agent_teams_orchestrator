@@ -48,6 +48,31 @@ async function withPhaseTimeout<T>(
 }
 
 describe('Windows Job process containment', () => {
+  it('round-trips hostile native argv without cmd interpolation', async () => {
+    if (process.platform !== 'win32') return
+    const root = await mkdtemp(join(os.tmpdir(), 'process-kill-argv-'))
+    const argvPath = join(root, 'argv.json')
+    const expected = ['', 'embedded"quote', 'こんにちは 😀',
+      'ampersand&pipe|percent%bang!paren()', 'C:\\path with space\\']
+    const launch = buildExactProcessTreeSpawn(process.execPath, [
+      '-e', 'require("node:fs").writeFileSync(process.env.JOB_ARGV_FILE,JSON.stringify(process.argv.slice(1)))',
+      ...expected,
+    ], {
+      stdio: 'ignore', env: { ...process.env, JOB_ARGV_FILE: argvPath },
+    }, 'win32')
+    const supervisor = spawn(launch.command, launch.args, launch.options)
+    try {
+      await withPhaseTimeout(new Promise<void>((resolve, reject) => {
+        supervisor.once('error', reject)
+        supervisor.once('close', code => code === 0 ? resolve() : reject(new Error(`supervisor exited ${code}`)))
+      }), WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS, 'Windows argv round-trip')
+      expect(JSON.parse(await readFile(argvPath, 'utf8'))).toEqual(expected)
+    } finally {
+      try { supervisor.kill('SIGKILL') } catch {}
+      await rm(root, { recursive: true, force: true })
+    }
+  }, WINDOWS_JOB_TEST_TIMEOUT_MS)
+
   it('proves a naturally completed supervisor Job empty after its named handle disappears', async () => {
     if (process.platform !== 'win32') return
     const launch = buildExactProcessTreeSpawn(process.execPath, ['-e', 'process.exit(0)'], {

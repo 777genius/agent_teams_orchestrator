@@ -28,6 +28,9 @@ export interface CodexNativeTurnSettledEvent {
   cwd: string
   outcome: CodexNativeTurnSettledOutcome
   threadId?: string
+  turnId?: string
+  runtimeInstanceId?: string
+  completedGeneration?: number
   detail?: string
 }
 
@@ -50,6 +53,9 @@ export function buildCodexNativeTurnSettledEvent(input: {
   cwd: string
   outcome: CodexNativeTurnSettledOutcome
   threadId?: string | null
+  turnId?: string | null
+  runtimeInstanceId?: string | null
+  completedGeneration?: number | null
   detail?: string
   now?: () => Date
   identity?: CodexNativeTurnSettledIdentity
@@ -65,6 +71,8 @@ export function buildCodexNativeTurnSettledEvent(input: {
   }
 
   const threadId = input.threadId?.trim()
+  const turnId = input.turnId?.trim()
+  const runtimeInstanceId = input.runtimeInstanceId?.trim()
   const detail = input.detail?.trim()
   return {
     schemaVersion: 1,
@@ -80,6 +88,11 @@ export function buildCodexNativeTurnSettledEvent(input: {
     cwd: input.cwd,
     outcome: input.outcome,
     ...(threadId ? { threadId } : {}),
+    ...(turnId ? { turnId } : {}),
+    ...(runtimeInstanceId ? { runtimeInstanceId } : {}),
+    ...(typeof input.completedGeneration === 'number'
+      ? { completedGeneration: input.completedGeneration }
+      : {}),
     ...(detail ? { detail } : {}),
   }
 }

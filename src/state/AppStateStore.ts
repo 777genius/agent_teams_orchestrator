@@ -360,12 +360,20 @@ export type AppState = DeepImmutable<{
       messageId?: string
       mailboxClaimedBySessionId?: string
       from: string
+      source?: string
       text: string
       timestamp: string
       status: 'pending' | 'processing' | 'processed'
       color?: string
       summary?: string
       messageKind?: 'agent_error' | 'member_work_sync_nudge' | 'task_comment_notification'
+      workSyncRuntimeTicketId?: string
+      workSyncRuntimeGeneration?: number
+      workSyncRuntimeInstanceId?: string
+      workSyncControlRevision?: number
+      workSyncIntentId?: string
+      workSyncPayloadHash?: string
+      workSyncAdmissionPayloadHash?: string
     }>
   }
   teammateTerminationRecovery: Record<string, {

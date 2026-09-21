@@ -35,6 +35,11 @@ function buildWindowsProcessArguments(args: string[]): string {
   }).join(' ')
 }
 
+/** Windows PowerShell 5.1-compatible transport for supervisor source. */
+function toWindowsPowerShellEncodedCommand(script: string): string {
+  return Buffer.from(script, 'utf16le').toString('base64')
+}
+
 /**
  * Build a launch with the strongest ownership boundary available here.
  * Windows uses a named Job owned by a supervisor which joins itself before
@@ -75,7 +80,11 @@ export function buildExactProcessTreeSpawn(
   ].join(';')
   return {
     command: 'powershell.exe',
-    args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    // Do not use cmd.exe or the PowerShell invocation operator here.
+    // `arguments` is a single Win32 command line built with the documented
+    // backslash/quote rules; ProcessStartInfo.Arguments exists in .NET Framework.
+    args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand',
+      toWindowsPowerShellEncodedCommand(script)],
     options: { ...options, detached: false, windowsHide: true },
     osIdentity: `win32-job:${name}`,
   }
@@ -84,7 +93,8 @@ export function buildExactProcessTreeSpawn(
 export type ProcessKillAndWaitDependencies = {
   platform?: NodeJS.Platform
   isProcessAlive?: (pid: number) => boolean
-  readProcessStartTimeMs?: (pid: number) => Promise<number | null>
+  /** The timeout is derived from the caller's still-live operation budget. */
+  readProcessStartTimeMs?: (pid: number, timeoutMs?: number) => Promise<number | null>
   /**
    * Signals through an OS-stable handle bound to the expected incarnation
    * (for example Linux pidfd_send_signal). Never implement this as a fresh PID
@@ -109,6 +119,22 @@ export type ExactProcessTreeTerminationOptions = {
   sleep: (ms: number) => Promise<void>
   platform?: NodeJS.Platform
   darwinBoundary?: DarwinProcessTreeBoundary
+  /**
+   * These are deliberately callbacks rather than a timeout snapshot.  A
+   * caller can cancel or exhaust its one operation budget while a tree is
+   * being enumerated, signalled, or verified.
+   */
+  signal?: AbortSignal
+  remainingMs?: () => number
+}
+
+function processKillMayContinue(options: Pick<ExactProcessTreeTerminationOptions, 'signal' | 'remainingMs'>): boolean {
+  return !options.signal?.aborted && (options.remainingMs?.() ?? 1) > 0
+}
+
+function processKillPollMs(options: ExactProcessTreeTerminationOptions): number {
+  const remaining = options.remainingMs?.()
+  return Math.max(1, Math.min(options.pollMs, remaining === undefined ? options.pollMs : Math.floor(remaining)))
 }
 
 export type ProcessTreeContainmentCapability = 'exact' | 'cooperative' | 'unsupported'
@@ -125,7 +151,7 @@ export function getProcessTreeContainmentCapability(
   expectedOsIdentity: string | undefined,
   platform: NodeJS.Platform = process.platform,
 ): ProcessTreeContainmentCapability {
-  if (platform === 'win32' && expectedOsIdentity?.startsWith('win32-job:')) return 'exact'
+  if (platform === 'win32' && (expectedOsIdentity?.startsWith('win32-job:') || expectedOsIdentity?.startsWith('win32-agent-job:'))) return 'exact'
   if (platform === 'linux' && expectedOsIdentity?.startsWith('unix-pgid:')) return 'cooperative'
   if (platform === 'darwin' && expectedOsIdentity?.startsWith('darwin-audit:')) return 'cooperative'
   return 'unsupported'
@@ -140,6 +166,8 @@ export type DarwinProcessTreeMember = {
 export type DarwinProcessTreeBoundary = {
   listMembers: (pgid: number) => Promise<number[] | null>
   acquireMember: (pid: number, pgid: number) => Promise<DarwinProcessTreeMember | null>
+  /** Re-read the kernel audit token immediately before a signal. */
+  revalidateMember?: (member: DarwinProcessTreeMember, pgid: number, requireAncestry: boolean) => Promise<boolean>
   signalMember: (member: DarwinProcessTreeMember, signal: NodeJS.Signals) => Promise<boolean>
   close?: () => void
 }
@@ -171,6 +199,24 @@ const LINUX_SIGNAL_NUMBER: Partial<Record<NodeJS.Signals, number>> = {
   SIGCONT: 18,
 }
 
+// Darwin deliberately does not share Linux's stop/continue numbers. Keep this
+// table separate so a macOS path can never accidentally inherit a Linux ABI
+// constant (Darwin: STOP=17, CONT=19; Linux: STOP=19, CONT=18).
+export const DARWIN_SIGNAL_NUMBER: Partial<Record<NodeJS.Signals, number>> = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGKILL: 9,
+  SIGTERM: 15,
+  SIGSTOP: 17,
+  SIGCONT: 19,
+}
+
+function temporarilyFrozenForSignal(signal: NodeJS.Signals): boolean {
+  // An explicit stop is the requested terminal state, not an implementation
+  // detail to undo. TERM/INT/HUP need a continuation so their handler can run.
+  return signal !== 'SIGKILL' && signal !== 'SIGSTOP'
+}
+
 /** Signal a concrete Linux process incarnation through a pidfd. */
 export async function signalExpectedProcessStable(
   pid: number,
@@ -182,10 +228,12 @@ export async function signalExpectedProcessStable(
   if (stableSignalPlatformImplForTests) {
     return stableSignalPlatformImplForTests(pid, signal, expectedStartedAtMs, expectedOsIdentity)
   }
-  const signalNumber = LINUX_SIGNAL_NUMBER[signal]
-  if (!signalNumber) return false
   if (platform === 'darwin') {
-    if (!expectedOsIdentity?.startsWith('darwin-audit:')) return false
+    const signalNumber = DARWIN_SIGNAL_NUMBER[signal]
+    // A task token acquired now identifies only the process that owns this
+    // numeric PID now. It is not ownership evidence for an earlier process.
+    // Require the launch-captured exact token and compare it before signal.
+    if (!signalNumber || !expectedOsIdentity?.startsWith('darwin-audit:')) return false
     try {
       const { dlopen, FFIType, ptr } = await import('bun:ffi')
       const libproc = dlopen('/usr/lib/libproc.dylib', {
@@ -223,15 +271,16 @@ export async function signalExpectedProcessStable(
           // captured at spawn. A recycled PID has a different pidversion even
           // if a timestamp observer is stale or collides.
           if (`darwin-audit:${auditToken.toString('hex')}` !== expectedOsIdentity) return false
-          // Freeze the exact root before addressing its process group. While
-          // the leader is stopped and alive its PID/PGID cannot be recycled,
-          // so a negative-PID signal targets only this launch tree.
-          if (libproc.symbols.proc_signal_with_audittoken(ptr(auditToken), 19) !== 0) return false
+          // Freeze this exact incarnation before the destructive signal. Each
+          // tree member is enumerated and signalled through its own audit
+          // token; do not use killpg because Cursor agents need not lead a
+          // private process group.
+          if (libproc.symbols.proc_signal_with_audittoken(ptr(auditToken), DARWIN_SIGNAL_NUMBER.SIGSTOP!) !== 0) return false
           try {
-            process.kill(-pid, signal)
+            if (libproc.symbols.proc_signal_with_audittoken(ptr(auditToken), signalNumber) !== 0) return false
             // A stopped process does not act on SIGTERM until continued.
-            if (signal !== 'SIGKILL') {
-              libproc.symbols.proc_signal_with_audittoken(ptr(auditToken), 18)
+            if (temporarilyFrozenForSignal(signal)) {
+              if (libproc.symbols.proc_signal_with_audittoken(ptr(auditToken), DARWIN_SIGNAL_NUMBER.SIGCONT!) !== 0) return false
             }
             return true
           } catch {
@@ -248,6 +297,8 @@ export async function signalExpectedProcessStable(
       return false
     }
   }
+  const signalNumber = LINUX_SIGNAL_NUMBER[signal]
+  if (!signalNumber) return false
   if (platform === 'win32') {
     if (!expectedOsIdentity?.startsWith('win32-job:')) return false
     const jobName = expectedOsIdentity.slice('win32-job:'.length)
@@ -433,35 +484,50 @@ async function terminateWindowsJobStable(
   expectedOsIdentity: string | undefined,
   options: ExactProcessTreeTerminationOptions,
 ): Promise<boolean> {
-  if (!expectedOsIdentity?.startsWith('win32-job:')) return false
-  const jobName = expectedOsIdentity.slice('win32-job:'.length)
+  const prefix = expectedOsIdentity?.startsWith('win32-agent-job:')
+    ? 'win32-agent-job:' : expectedOsIdentity?.startsWith('win32-job:') ? 'win32-job:' : null
+  if (!prefix || !processKillMayContinue(options)) return false
+  const jobName = expectedOsIdentity.slice(prefix.length)
   if (!/^[a-zA-Z0-9._-]{1,128}$/.test(jobName)) return false
-  const timeoutMs = Math.max(0, options.timeoutMs + options.escalationTimeoutMs)
-  const pollMs = Math.max(1, options.pollMs)
-  const script = [
-    '$ErrorActionPreference="Stop"',
-    'Add-Type -TypeDefinition @"\nusing System; using System.Runtime.InteropServices; public static class JQ { [StructLayout(LayoutKind.Sequential)] public struct A { public long TotalUserTime,TotalKernelTime,ThisPeriodTotalUserTime,ThisPeriodTotalKernelTime; public uint TotalPageFaultCount,TotalProcesses,ActiveProcesses,TotalTerminatedProcesses; } [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr OpenJobObject(uint a,bool i,string n); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr h,uint c); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr h,int c,ref A i,uint l,IntPtr r); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); }\n"@',
-    `$h=[JQ]::OpenJobObject(0x0008 -bor 0x0004,$false,'${jobName}')`,
-    'if($h -eq [IntPtr]::Zero){exit 41}',
-    'try {',
-    'if(-not [JQ]::TerminateJobObject($h,1)){exit 44}',
-    `$deadline=[DateTime]::UtcNow.AddMilliseconds(${timeoutMs})`,
-    'do {',
-    '$a=New-Object JQ+A',
-    'if(-not [JQ]::QueryInformationJobObject($h,1,[ref]$a,[Runtime.InteropServices.Marshal]::SizeOf($a),[IntPtr]::Zero)){exit 45}',
-    'if($a.ActiveProcesses -eq 0){exit 0}',
-    `Start-Sleep -Milliseconds ${pollMs}`,
-    '} while([DateTime]::UtcNow -lt $deadline)',
-    'exit 46',
-    '} finally { [void][JQ]::CloseHandle($h) }',
-  ].join(';')
-  return new Promise(resolve => {
-    const child = spawn('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-    ], { stdio: 'ignore', windowsHide: true })
-    child.once('error', () => resolve(false))
-    child.once('close', code => resolve(code === 0))
-  })
+  /*
+   * TerminateJobObject is executed by this parent through its own native
+   * handle.  Do not introduce an authorization file for a helper: a cached
+   * permission can be read after revocation and race the destructive call.
+   */
+  try {
+    if (!processKillMayContinue(options)) return false
+    const { dlopen, FFIType, ptr } = await import('bun:ffi')
+    if (!processKillMayContinue(options)) return false
+    const kernel32 = dlopen('kernel32.dll', {
+      OpenJobObjectW: { args: [FFIType.u32, FFIType.bool, FFIType.ptr], returns: FFIType.ptr },
+      TerminateJobObject: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.bool },
+      QueryInformationJobObject: {
+        args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32, FFIType.ptr],
+        returns: FFIType.bool,
+      },
+      CloseHandle: { args: [FFIType.ptr], returns: FFIType.bool },
+    })
+    const name = Buffer.from(`${jobName}\0`, 'utf16le')
+    const handle = kernel32.symbols.OpenJobObjectW(0x000c, false, ptr(name))
+    if (!handle) { kernel32.close(); return false }
+    try {
+      if (!processKillMayContinue(options) || !kernel32.symbols.TerminateJobObject(handle, 1)) return false
+      // TerminateJobObject returning success proves only that the request was
+      // accepted. Query the still-open launch-bound Job until the kernel says
+      // it contains no active processes; a root PID disappearing is not a
+      // whole-tree receipt.
+      const deadline = options.nowMs() + options.timeoutMs
+      while (options.nowMs() < deadline) {
+        const accounting = Buffer.alloc(48)
+        if (!kernel32.symbols.QueryInformationJobObject(handle, 1, ptr(accounting), accounting.length, null)) return false
+        if (accounting.readUInt32LE(40) === 0) return true
+        await options.sleep(processKillPollMs(options))
+      }
+      const accounting = Buffer.alloc(48)
+      return kernel32.symbols.QueryInformationJobObject(handle, 1, ptr(accounting), accounting.length, null)
+        && accounting.readUInt32LE(40) === 0
+    } finally { kernel32.symbols.CloseHandle(handle); kernel32.close() }
+  } catch { return false }
 }
 
 /**
@@ -479,6 +545,7 @@ async function terminateLinuxProcessTreeStable(
   if (expectedOsIdentity !== `unix-pgid:${pid}`) return false
   const signalNumber = LINUX_SIGNAL_NUMBER[signal]
   if (!signalNumber) return false
+  if (!processKillMayContinue(options)) return false
   try {
     const { dlopen, FFIType } = await import('bun:ffi')
     const libc = dlopen('libc.so.6', {
@@ -490,9 +557,21 @@ async function terminateLinuxProcessTreeStable(
       close: { args: [FFIType.i32], returns: FFIType.i32 },
     })
     const handles = new Map<number, number>()
-    const pidfdSignal = (fd: number, number: number): boolean =>
-      Number(libc.symbols.syscall(LINUX_PIDFD_SEND_SIGNAL_SYSCALL, fd, number, null, 0)) === 0
+    // These are pidfds for members for which our temporary SIGSTOP was
+    // acknowledged. Keep them separate from `handles`: an acquired member is
+    // not necessarily stopped, and cleanup must never manufacture a PID
+    // signal after cancellation or a deadline has expired.
+    const frozen = new Map<number, number>()
+    let terminationCompleted = false
+    // Do not let a cancellation/deadline race an already-acquired pidfd.  The
+    // fd binds the process incarnation, but the caller's authority still has
+    // to be live at the instant a destructive syscall is made.
+    const pidfdSignal = (fd: number, number: number): boolean => {
+      if (!processKillMayContinue(options)) return false
+      return Number(libc.symbols.syscall(LINUX_PIDFD_SEND_SIGNAL_SYSCALL, fd, number, null, 0)) === 0
+    }
     const acquire = async (memberPid: number): Promise<boolean> => {
+      if (!processKillMayContinue(options)) return false
       if (handles.has(memberPid)) return true
       const fd = libc.symbols.pidfd_open(memberPid, 0)
       if (fd < 0) return false
@@ -504,19 +583,45 @@ async function terminateLinuxProcessTreeStable(
       handles.set(memberPid, fd)
       return true
     }
+    const freeze = (memberPid: number): boolean => {
+      if (frozen.has(memberPid)) return true
+      const fd = handles.get(memberPid)
+      if (fd === undefined || !pidfdSignal(fd, 19)) return false
+      frozen.set(memberPid, fd)
+      return true
+    }
+    const resumeFrozen = (): void => {
+      // Cleanup has a different authority model from termination. A pidfd is
+      // already bound to the exact incarnation we froze, so SIGCONT cannot
+      // reach a reused PID and must run even after cancellation/deadline.
+      if (signal === 'SIGSTOP') return
+      for (const fd of frozen.values()) {
+        try { libc.symbols.syscall(LINUX_PIDFD_SEND_SIGNAL_SYSCALL, fd, 18, null, 0) } catch {}
+      }
+      frozen.clear()
+    }
+    const continueFrozen = (): boolean => {
+      let continued = true
+      for (const [memberPid, fd] of frozen) {
+        if (!pidfdSignal(fd, 18)) { continued = false; continue }
+        frozen.delete(memberPid)
+      }
+      return continued
+    }
     try {
       if (!(await acquire(pid))) return false
       // Pin and freeze the exact root before any group discovery. Holding its
       // pidfd keeps the ownership anchor alive while descendants are acquired.
-      if (!pidfdSignal(handles.get(pid)!, 19)) return false
+      if (!freeze(pid)) return false
 
       let previous = ''
       for (let pass = 0; pass < 64; pass += 1) {
+        if (!processKillMayContinue(options)) return false
         const members = await listLinuxProcessGroupMembers(pid)
         if (!members) return false
         for (const memberPid of members) {
           if (!(await acquire(memberPid))) return false
-          if (!pidfdSignal(handles.get(memberPid)!, 19)) return false
+          if (!freeze(memberPid)) return false
         }
         const fingerprint = [...handles.keys()].sort((a, b) => a - b).join(',')
         if (fingerprint === previous && members.every(memberPid => handles.has(memberPid))) break
@@ -529,14 +634,19 @@ async function terminateLinuxProcessTreeStable(
         // Root last: descendants cannot outlive an early root signal without
         // first being captured and frozen.
         const ordered = [...handles.entries()].sort(([a], [b]) => (a === pid ? 1 : b === pid ? -1 : a - b))
-        for (const [, fd] of ordered) sent = pidfdSignal(fd, number) && sent
+        for (const [, fd] of ordered) {
+          // Recheck for each member, not just once before the batch. A large
+          // tree can cross the operation deadline in the middle of a pass.
+          if (!processKillMayContinue(options)) return false
+          sent = pidfdSignal(fd, number) && sent
+        }
         return sent
       }
       if (!sendAll(signalNumber)) return false
-      if (signal !== 'SIGKILL' && !sendAll(18)) return false
+      if (signal !== 'SIGKILL' && !continueFrozen()) return false
 
       const waitUntilEmpty = async (deadline: number, escalation: boolean): Promise<boolean> => {
-        while (options.nowMs() < deadline) {
+        while (processKillMayContinue(options) && options.nowMs() < deadline) {
           const members = await listLinuxProcessGroupMembers(pid)
           if (!members) return false
           if (members.length === 0) return true
@@ -544,25 +654,32 @@ async function terminateLinuxProcessTreeStable(
             const alreadyCaptured = handles.has(memberPid)
             if (!(await acquire(memberPid))) return false
             if (escalation) {
-              pidfdSignal(handles.get(memberPid)!, 9)
+              if (!processKillMayContinue(options) || !pidfdSignal(handles.get(memberPid)!, 9)) return false
             } else if (!alreadyCaptured) {
               // A TERM handler may fork before exiting. Newly observed members
               // are still in the pinned PGID and receive the same graceful
               // signal through their own validated pidfd.
-              pidfdSignal(handles.get(memberPid)!, 19)
-              pidfdSignal(handles.get(memberPid)!, signalNumber)
-              if (signal !== 'SIGKILL') pidfdSignal(handles.get(memberPid)!, 18)
+              if (!freeze(memberPid)) return false
+              if (!pidfdSignal(handles.get(memberPid)!, signalNumber)) return false
+              if (signal !== 'SIGKILL' && !continueFrozen()) return false
             }
           }
-          await options.sleep(options.pollMs)
+          await options.sleep(processKillPollMs(options))
         }
+        if (!processKillMayContinue(options)) return false
         const members = await listLinuxProcessGroupMembers(pid)
         return members !== null && members.length === 0
       }
-      if (await waitUntilEmpty(options.nowMs() + options.timeoutMs, false)) return true
-      sendAll(9)
-      return waitUntilEmpty(options.nowMs() + options.escalationTimeoutMs, true)
+      if (await waitUntilEmpty(options.nowMs() + options.timeoutMs, false)) {
+        terminationCompleted = true
+        return true
+      }
+      if (!processKillMayContinue(options) || !sendAll(9)) return false
+      const empty = await waitUntilEmpty(options.nowMs() + options.escalationTimeoutMs, true)
+      terminationCompleted = empty
+      return empty
     } finally {
+      if (!terminationCompleted) resumeFrozen()
       for (const fd of handles.values()) libc.symbols.close(fd)
       libc.close()
     }
@@ -640,8 +757,27 @@ async function createNativeDarwinProcessTreeBoundary(): Promise<DarwinProcessTre
     return {
       listMembers,
       acquireMember,
+      revalidateMember: async (member, pgid, requireAncestry) => {
+        if (closed) return false
+        const portBuffer = Buffer.alloc(4)
+        if (libc.symbols.task_name_for_pid(selfTask, member.pid, ptr(portBuffer)) !== 0) return false
+        const taskPort = portBuffer.readUInt32LE(0)
+        try {
+          const token = Buffer.alloc(32)
+          const count = Buffer.alloc(4)
+          count.writeUInt32LE(8, 0)
+          if (libc.symbols.task_info(taskPort, 15, ptr(token), ptr(count)) !== 0) return false
+          // This comparison binds the following audit-token signal to the
+          // same incarnation whose ancestry was admitted.  A PID reuse in
+          // either gap cannot pass it.
+          if (`darwin-audit:${token.toString('hex')}` !== member.auditIdentity) return false
+          return !requireAncestry || libc.symbols.getpgid(member.pid) === pgid
+        } finally {
+          libc.symbols.mach_port_deallocate(selfTask, taskPort)
+        }
+      },
       signalMember: async (member, memberSignal) => {
-        const number = LINUX_SIGNAL_NUMBER[memberSignal]
+        const number = DARWIN_SIGNAL_NUMBER[memberSignal]
         return Boolean(number && member.nativeToken &&
           libproc.symbols.proc_signal_with_audittoken(ptr(member.nativeToken), number) === 0)
       },
@@ -664,28 +800,66 @@ async function terminateDarwinProcessTreeStable(
   options: ExactProcessTreeTerminationOptions,
 ): Promise<boolean> {
   if (!expectedOsIdentity?.startsWith('darwin-audit:')) return false
+  if (!processKillMayContinue(options)) return false
   const boundary = options.darwinBoundary ?? await createNativeDarwinProcessTreeBoundary()
   if (!boundary) return false
   const members = new Map<number, DarwinProcessTreeMember>()
+  const frozen = new Map<number, DarwinProcessTreeMember>()
+  let terminationCompleted = false
+  const resumeTemporaryFreezes = async (): Promise<void> => {
+    // A Mach audit token is an exact process capability. Cleanup intentionally
+    // bypasses the now-expired destructive-operation authorization, while the
+    // token guarantees that a recycled numeric PID is never continued.
+    if (signal === 'SIGSTOP') return
+    for (const member of frozen.values()) {
+      // Rollback is exact-capability cleanup, not a new destructive action.
+      // It deliberately bypasses a cancelled work guard, but refreshes the
+      // audit identity immediately before CONT so a recycled PID is never hit.
+      const valid = await boundary.revalidateMember?.(member, pid, false) ?? true
+      if (valid) await boundary.signalMember(member, 'SIGCONT').catch(() => false)
+    }
+    frozen.clear()
+  }
   const acquire = async (memberPid: number): Promise<boolean> => {
+    if (!processKillMayContinue(options)) return false
     if (members.has(memberPid)) return true
     const member = await boundary.acquireMember(memberPid, pid)
     if (!member || (memberPid === pid && member.auditIdentity !== expectedOsIdentity)) return false
     members.set(memberPid, member)
     return true
   }
-  const send = async (member: DarwinProcessTreeMember, memberSignal: NodeJS.Signals): Promise<boolean> =>
-    boundary.signalMember(member, memberSignal)
+  const send = async (member: DarwinProcessTreeMember, memberSignal: NodeJS.Signals): Promise<boolean> => {
+    // The audit token prevents PID reuse, while this guard prevents signaling
+    // after the owner has cancelled or exhausted its deadline.
+    if (!processKillMayContinue(options)) return false
+    if (!(await boundary.revalidateMember?.(member, pid, true) ?? true)) return false
+    return boundary.signalMember(member, memberSignal)
+  }
+  const freeze = async (member: DarwinProcessTreeMember): Promise<boolean> => {
+    if (frozen.has(member.pid)) return true
+    if (!(await send(member, 'SIGSTOP'))) return false
+    frozen.set(member.pid, member)
+    return true
+  }
+  const continueFrozen = async (): Promise<boolean> => {
+    let continued = true
+    for (const [memberPid, member] of frozen) {
+      if (!(await send(member, 'SIGCONT'))) { continued = false; continue }
+      frozen.delete(memberPid)
+    }
+    return continued
+  }
   try {
     if (!(await acquire(pid))) return false
-    if (!(await send(members.get(pid)!, 'SIGSTOP'))) return false
+    if (!(await freeze(members.get(pid)!))) return false
     let previous = ''
     for (let pass = 0; pass < 64; pass += 1) {
+      if (!processKillMayContinue(options)) return false
       const discovered = await boundary.listMembers(pid)
       if (!discovered) return false
       for (const memberPid of discovered) {
         if (!(await acquire(memberPid))) return false
-        if (!(await send(members.get(memberPid)!, 'SIGSTOP'))) return false
+        if (!(await freeze(members.get(memberPid)!))) return false
       }
       const fingerprint = [...members.keys()].sort((a, b) => a - b).join(',')
       if (fingerprint === previous && discovered.every(memberPid => members.has(memberPid))) break
@@ -694,15 +868,22 @@ async function terminateDarwinProcessTreeStable(
     }
     const sendAll = async (memberSignal: NodeJS.Signals): Promise<boolean> => {
       for (const member of [...members.values()].sort((a, b) => (a.pid === pid ? 1 : b.pid === pid ? -1 : a.pid - b.pid))) {
+        if (!processKillMayContinue(options)) return false
         if (!(await send(member, memberSignal))) return false
       }
       return true
     }
     if (!(await sendAll(signal))) return false
-    if (signal !== 'SIGKILL' && !(await sendAll('SIGCONT'))) return false
+    // SIGSTOP is itself the requested outcome. Waiting for an empty tree and
+    // escalating to SIGKILL would silently turn an explicit freeze into a
+    // termination request.
+    if (signal === 'SIGSTOP') return false
+    if (temporarilyFrozenForSignal(signal)) {
+      if (!(await continueFrozen())) return false
+    }
 
     const waitUntilEmpty = async (deadline: number, escalation: boolean): Promise<boolean> => {
-      while (options.nowMs() < deadline) {
+      while (processKillMayContinue(options) && options.nowMs() < deadline) {
         const discovered = await boundary.listMembers(pid)
         if (!discovered) return false
         if (discovered.length === 0) return true
@@ -713,19 +894,30 @@ async function terminateDarwinProcessTreeStable(
           if (escalation) {
             if (!(await send(member, 'SIGKILL'))) return false
           } else if (!alreadyCaptured) {
-            if (!(await send(member, 'SIGSTOP')) || !(await send(member, signal))) return false
-            if (signal !== 'SIGKILL' && !(await send(member, 'SIGCONT'))) return false
+            if (!(await freeze(member)) || !(await send(member, signal))) return false
+            if (temporarilyFrozenForSignal(signal)) {
+              if (!(await continueFrozen())) return false
+            }
           }
         }
-        await options.sleep(options.pollMs)
+        await options.sleep(processKillPollMs(options))
       }
+      if (!processKillMayContinue(options)) return false
       const discovered = await boundary.listMembers(pid)
       return discovered !== null && discovered.length === 0
     }
-    if (await waitUntilEmpty(options.nowMs() + options.timeoutMs, false)) return true
-    if (!(await sendAll('SIGKILL'))) return false
-    return waitUntilEmpty(options.nowMs() + options.escalationTimeoutMs, true)
+    if (await waitUntilEmpty(options.nowMs() + options.timeoutMs, false)) {
+      terminationCompleted = true
+      return true
+    }
+    if (!processKillMayContinue(options) || !(await sendAll('SIGKILL'))) return false
+    const empty = await waitUntilEmpty(options.nowMs() + options.escalationTimeoutMs, true)
+    terminationCompleted = empty
+    return empty
   } finally {
+    // Do not leave a tree stopped if capture/rescan failed during a temporary
+    // freeze. Explicit SIGSTOP is intentionally excluded by the helper.
+    if (!terminationCompleted) await resumeTemporaryFreezes()
     boundary.close?.()
   }
 }
@@ -802,6 +994,41 @@ export function parseDarwinProcessStartTimeMicros(info: Buffer): number | null {
 }
 
 /** Capture a durable OS identity while the newly spawned root is still owned. */
+/** Acquire a Darwin audit identity for an arbitrary process. Unlike the tree
+ * root capture this deliberately does not require it to lead a process group:
+ * Cursor descendants must each carry their own native identity. */
+export async function captureDarwinAuditIdentity(pid: number): Promise<string | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null
+  try {
+    const { dlopen, FFIType, ptr } = await import('bun:ffi')
+    const libc = dlopen('/usr/lib/libSystem.B.dylib', {
+      task_name_for_pid: { args: [FFIType.u32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+      task_info: { args: [FFIType.u32, FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+      mach_port_deallocate: { args: [FFIType.u32, FFIType.u32], returns: FFIType.i32 },
+      mach_task_self: { args: [], returns: FFIType.u32 },
+    })
+    try {
+      const selfTask = Number(libc.symbols.mach_task_self())
+      const taskPortBuffer = Buffer.alloc(4)
+      if (libc.symbols.task_name_for_pid(selfTask, pid, ptr(taskPortBuffer)) !== 0) return null
+      const taskPort = taskPortBuffer.readUInt32LE(0)
+      try {
+        const token = Buffer.alloc(32)
+        const count = Buffer.alloc(4)
+        count.writeUInt32LE(8, 0)
+        if (libc.symbols.task_info(taskPort, 15, ptr(token), ptr(count)) !== 0) return null
+        return `darwin-audit:${token.toString('hex')}`
+      } finally {
+        libc.symbols.mach_port_deallocate(selfTask, taskPort)
+      }
+    } finally {
+      libc.close()
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function captureProcessTreeIdentity(
   pid: number,
   platform: NodeJS.Platform = process.platform,
@@ -823,7 +1050,7 @@ export async function captureProcessTreeIdentity(
   }
   if (platform === 'darwin') {
     try {
-      const { dlopen, FFIType, ptr } = await import('bun:ffi')
+      const { dlopen, FFIType } = await import('bun:ffi')
       const libc = dlopen('/usr/lib/libSystem.B.dylib', {
         task_name_for_pid: { args: [FFIType.u32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
         task_info: { args: [FFIType.u32, FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -833,19 +1060,7 @@ export async function captureProcessTreeIdentity(
       })
       try {
         if (libc.symbols.getpgid(pid) !== pid) return null
-        const selfTask = Number(libc.symbols.mach_task_self())
-        const taskPortBuffer = Buffer.alloc(4)
-        if (libc.symbols.task_name_for_pid(selfTask, pid, ptr(taskPortBuffer)) !== 0) return null
-        const taskPort = taskPortBuffer.readUInt32LE(0)
-        try {
-          const token = Buffer.alloc(32)
-          const count = Buffer.alloc(4)
-          count.writeUInt32LE(8, 0)
-          if (libc.symbols.task_info(taskPort, 15, ptr(token), ptr(count)) !== 0) return null
-          return `darwin-audit:${token.toString('hex')}`
-        } finally {
-          libc.symbols.mach_port_deallocate(selfTask, taskPort)
-        }
+        return captureDarwinAuditIdentity(pid)
       } finally {
         libc.close()
       }
@@ -889,6 +1104,7 @@ function readProcessQueryOutput(
   command: string,
   args: string[],
   outputLimitBytes: number,
+  timeoutMs = PROCESS_QUERY_TIMEOUT_MS,
 ): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
@@ -907,7 +1123,7 @@ function readProcessQueryOutput(
         // Best-effort query cleanup.
       }
       finish(null)
-    }, PROCESS_QUERY_TIMEOUT_MS)
+    }, Math.max(1, timeoutMs))
     timeout.unref?.()
 
     try {
@@ -930,8 +1146,11 @@ function readProcessQueryOutput(
 /** Read the OS creation time. PID-only ownership is unsafe because PIDs are reused. */
 export async function readProcessStartTimeMs(
   pid: number,
-  platform: NodeJS.Platform = process.platform,
+  platformOrTimeout: NodeJS.Platform | number = process.platform,
+  timeoutMs?: number,
 ): Promise<number | null> {
+  const platform = typeof platformOrTimeout === 'number' ? process.platform : platformOrTimeout
+  const queryTimeoutMs = typeof platformOrTimeout === 'number' ? platformOrTimeout : timeoutMs
   const normalizedPid = Math.trunc(pid)
   if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
 
@@ -976,6 +1195,7 @@ export async function readProcessStartTimeMs(
     command,
     args,
     PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+    queryTimeoutMs,
   )
   return output === null ? null : parseProcessStartTime(output)
 }
@@ -983,6 +1203,7 @@ export async function readProcessStartTimeMs(
 export async function readProcessCommandLine(
   pid: number,
   platform: NodeJS.Platform = process.platform,
+  queryTimeoutMs?: number,
 ): Promise<string | null> {
   const normalizedPid = Math.trunc(pid)
   if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
@@ -1002,7 +1223,12 @@ export async function readProcessCommandLine(
         ].join('; '),
       ]
     : ['-p', String(normalizedPid), '-o', 'command=']
-  const output = await readProcessQueryOutput(command, args, PROCESS_COMMAND_OUTPUT_LIMIT_BYTES)
+  const output = await readProcessQueryOutput(
+    command,
+    args,
+    PROCESS_COMMAND_OUTPUT_LIMIT_BYTES,
+    queryTimeoutMs,
+  )
   const normalized = output?.trim()
   return normalized ? normalized : null
 }
@@ -1052,8 +1278,15 @@ async function inspectExpectedProcessIdentity(
   pid: number,
   expectedStartedAtMs: number,
   deps: Required<Pick<ProcessKillAndWaitDependencies, 'isProcessAlive' | 'readProcessStartTimeMs'>>,
+  options: Pick<ExactProcessTreeTerminationOptions, 'signal' | 'remainingMs'>,
 ): Promise<ExpectedProcessIdentityState> {
-  const actualStartedAtMs = await deps.readProcessStartTimeMs(pid).catch(() => null)
+  if (!processKillMayContinue(options)) return 'unverified'
+  const remaining = options.remainingMs?.()
+  const actualStartedAtMs = await deps.readProcessStartTimeMs(
+    pid,
+    remaining === undefined ? undefined : Math.max(1, Math.floor(remaining)),
+  ).catch(() => null)
+  if (!processKillMayContinue(options)) return 'unverified'
   if (actualStartedAtMs === expectedStartedAtMs) return 'same'
   if (actualStartedAtMs !== null) return 'changed'
   return deps.isProcessAlive(pid) ? 'unverified' : 'gone'
@@ -1070,9 +1303,13 @@ export async function killProcessTreeAndWait(
     expectedOsIdentity?: string | null
     verifyExpectedIdentity?: (pid: number) => Promise<boolean>
     dependencies?: ProcessKillAndWaitDependencies
+    /** A live caller-owned cancellation/deadline context. */
+    signal?: AbortSignal
+    remainingMs?: () => number
   } = {},
 ): Promise<boolean> {
   if (!pid || !Number.isFinite(pid) || pid <= 0) return true
+  if (!processKillMayContinue(options)) return false
 
   const expectedStartedAtMs = options.expectedStartedAtMs
   // A live PID without an immutable creation-time baseline is observable but
@@ -1086,9 +1323,10 @@ export async function killProcessTreeAndWait(
   const deps = {
     isProcessAlive: injected.isProcessAlive ?? isProcessAlive,
     readProcessStartTimeMs:
-      injected.readProcessStartTimeMs ?? ((targetPid: number) => readProcessStartTimeMs(targetPid, platform)),
+      injected.readProcessStartTimeMs ?? ((targetPid: number, timeoutMs?: number) =>
+        readProcessStartTimeMs(targetPid, platform, timeoutMs)),
   }
-  const initialIdentity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps)
+  const initialIdentity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps, options)
   if (initialIdentity === 'gone') {
     // Even for Windows, supervisor disappearance is not itself the completion
     // proof. A named Job that remains open because a child is alive must still
@@ -1099,6 +1337,7 @@ export async function killProcessTreeAndWait(
     const timeoutMs = options.timeoutMs ?? 2_500
     const pollMs = options.pollMs ?? 50
     const terminateExpectedProcessTree = injected.terminateExpectedProcessTree ?? terminateExpectedProcessTreeStable
+    if (!processKillMayContinue(options)) return false
     return terminateExpectedProcessTree(
       pid,
       signal,
@@ -1111,6 +1350,8 @@ export async function killProcessTreeAndWait(
         nowMs: injected.nowMs ?? Date.now,
         sleep: injected.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
         platform,
+        signal: options.signal,
+        remainingMs: options.remainingMs,
       },
     )
   }
@@ -1121,6 +1362,7 @@ export async function killProcessTreeAndWait(
   ) {
     return false
   }
+  if (!processKillMayContinue(options)) return false
 
   const timeoutMs = options.timeoutMs ?? 2_500
   const pollMs = options.pollMs ?? 50
@@ -1134,6 +1376,7 @@ export async function killProcessTreeAndWait(
   // ChildProcess.kill() does not satisfy that contract.
   const terminateExpectedProcessTree = injected.terminateExpectedProcessTree
   if (terminateExpectedProcessTree) {
+    if (!processKillMayContinue(options)) return false
     const terminated = await terminateExpectedProcessTree(
       pid,
       signal,
@@ -1146,6 +1389,8 @@ export async function killProcessTreeAndWait(
         nowMs: injected.nowMs ?? Date.now,
         sleep: injected.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
         platform,
+        signal: options.signal,
+        remainingMs: options.remainingMs,
       },
     )
     return exactContainment && terminated
@@ -1164,27 +1409,126 @@ export async function killProcessTreeAndWait(
         nowMs: injected.nowMs ?? Date.now,
         sleep: injected.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
         platform,
+        signal: options.signal,
+        remainingMs: options.remainingMs,
       },
     )
   }
   try {
+    // This is deliberately adjacent to the OS-stable signal call.  Identity
+    // inspection above may have awaited a process query and the caller may
+    // cancel in that gap.
+    if (!processKillMayContinue(options)) return false
     if (!(await signalExpectedProcess(pid, signal, expectedStartTime, options.expectedOsIdentity ?? undefined))) {
       return false
     }
   } catch {
-    const identity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps)
+    if (!processKillMayContinue(options)) return false
+    const identity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps, options)
     return exactContainment && (identity === 'gone' || identity === 'changed')
   }
 
   const nowMs = injected.nowMs ?? Date.now
   const sleep = injected.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
   const deadline = nowMs() + timeoutMs
-  while (nowMs() < deadline) {
-    const identity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps)
+  while (processKillMayContinue(options) && nowMs() < deadline) {
+    const identity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps, options)
     if (identity === 'gone' || identity === 'changed') return exactContainment
     if (identity === 'unverified') return false
-    await sleep(pollMs)
+    await sleep(Math.max(1, Math.min(pollMs, options.remainingMs?.() ?? pollMs)))
   }
-  const finalIdentity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps)
+  if (!processKillMayContinue(options)) return false
+  const finalIdentity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps, options)
   return exactContainment && (finalIdentity === 'gone' || finalIdentity === 'changed')
+}
+
+export type StartupProcessTermination = {
+  helperTerminated: boolean
+  rootGone: boolean
+  treeKillSucceeded: boolean
+}
+
+const startupTaskkills = new Map<number, Promise<void>>()
+export function pendingStartupTaskkill(pid: number): Promise<void> | undefined { return startupTaskkills.get(pid) }
+export async function drainStartupTaskkills(options: {
+  signal?: AbortSignal
+  remainingMs?: () => number
+} = {}): Promise<boolean> {
+  // A taskkill helper can outlive its observation window (for example when a
+  // Windows child never emits close). Startup publication must retain that
+  // uncertainty, not wait indefinitely for an unobservable helper.
+  for (;;) {
+    if (startupTaskkills.size === 0) return true
+    if (options.signal?.aborted || (options.remainingMs?.() ?? 1) <= 0) return false
+    const remaining = options.remainingMs?.()
+    const waitMs = Math.max(1, Math.min(100, remaining ?? 100))
+    let removeAbortListener: (() => void) | undefined
+    const aborted = options.signal
+      ? new Promise<false>(resolve => {
+          const onAbort = () => resolve(false)
+          options.signal!.addEventListener('abort', onAbort, { once: true })
+          removeAbortListener = () => options.signal!.removeEventListener('abort', onAbort)
+        })
+      : undefined
+    const settled = await Promise.race([
+      Promise.allSettled([...startupTaskkills.values()]).then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), waitMs)),
+      ...(aborted ? [aborted] : []),
+    ])
+    removeAbortListener?.()
+    if (!settled && (options.signal?.aborted || (options.remainingMs?.() ?? 1) <= 0)) return false
+  }
+}
+export function pendingStartupTaskkillPids(): number[] { return [...startupTaskkills.keys()] }
+export function hasPendingStartupTaskkill(pid: number): boolean { return startupTaskkills.has(pid) }
+
+export async function killProcessTreeForStartup(
+  pid: number,
+  expectedStartedAtMs: number,
+  budget: { cap(ms: number): number; assertAvailable(reserveMs?: number): void },
+  deps: {
+    readIdentity?: (pid: number, timeoutMs: number) => Promise<number | null>
+    alive?: (pid: number) => boolean
+    expectedOsIdentity?: string
+    signal?: AbortSignal
+    remainingMs?: () => number
+    terminateExpectedProcessTree?: typeof terminateExpectedProcessTreeStable
+  } = {},
+): Promise<StartupProcessTermination> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff || !Number.isFinite(expectedStartedAtMs)) throw new Error('Startup termination requires a valid PID and process birth identity')
+  const alive = deps.alive ?? isProcessAlive
+  // No helper-close receipt is exposed by this compatibility API; never
+  // manufacture `helperTerminated: true` from a failed or cancelled request.
+  const failed = (helperTerminated = false): StartupProcessTermination => ({ helperTerminated, rootGone: !alive(pid), treeKillSucceeded: false })
+  // The old taskkill /PID path checked a birth timestamp and then performed a
+  // numeric tree kill (and, on failure, numeric SIGKILL).  That leaves a PID
+  // reuse window and cannot prove containment. Startup cleanup now accepts
+  // only the launch-bound Windows Job receipt and delegates to the same
+  // identity-bound primitive used by normal persistent-host termination.
+  if (!deps.expectedOsIdentity?.startsWith('win32-job:')) return failed()
+  const mayContinue = () => !deps.signal?.aborted && (deps.remainingMs?.() ?? 1) > 0
+  if (!mayContinue()) return failed()
+  const identity = deps.readIdentity ?? ((target, timeout) => readProcessStartTimeMs(target, 'win32', timeout))
+  budget.assertAvailable(1_000)
+  if (await identity(pid, budget.cap(6_000)) !== expectedStartedAtMs || !mayContinue()) return failed()
+  budget.assertAvailable(1_000)
+  const timeoutMs = Math.min(2_500, budget.cap(3_500) - 1_000)
+  if (timeoutMs <= 0 || !mayContinue()) return failed()
+  const terminated = await (deps.terminateExpectedProcessTree ?? terminateExpectedProcessTreeStable)(
+    pid,
+    'SIGKILL',
+    expectedStartedAtMs,
+    deps.expectedOsIdentity,
+    {
+      timeoutMs,
+      pollMs: 50,
+      escalationTimeoutMs: timeoutMs,
+      nowMs: Date.now,
+      sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+      platform: 'win32',
+      signal: deps.signal,
+      remainingMs: deps.remainingMs,
+    },
+  )
+  return { helperTerminated: false, rootGone: !alive(pid), treeKillSucceeded: terminated && mayContinue() }
 }

@@ -132,7 +132,7 @@ type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | '
   >
 
 type OpenCodeProviderManagementClient = {
-  getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
+  getConfigProviders(options?: { initializeInstance?: boolean }): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc?(): Promise<OpenCodeServerDocResponse>
@@ -149,7 +149,7 @@ type OpenCodeProviderManagementClient = {
 }
 
 type OpenCodeClientFactoryLike = {
-  create(baseUrl: string): OpenCodeProviderManagementClient
+  create(baseUrl: string, options?: { signal?: AbortSignal; remainingMs?: () => number }): OpenCodeProviderManagementClient
 }
 
 type OpenCodeProviderManagementAdapterDeps = {

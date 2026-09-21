@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
+import { openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
+import type { OpenCodeStopRequest } from '../opencode/OpenCodeStopRecovery.js'
+import type { OpenCodeSessionRecord } from '../opencode/types.js'
 import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
@@ -39,7 +42,7 @@ type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecut
 
 export function createProductionOpenCodeTeamLifecycleLane(): OpenCodeTeamLifecycleLane {
   const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor()
-  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, () => true)
+  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, () => true, () => openCodeSessionStore.list())
 }
 
 /** Existing OpenCode bridge is the sole production effect owner for OpenCode sessions. */
@@ -51,6 +54,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     private readonly executeBridge: ExecuteBridge = createOwnedOpenCodeLifecycleCommandExecutor(),
     private readonly timeoutMs = 300_000,
     private readonly hasLiveCapability: () => boolean = () => false,
+    private readonly listOwnedSessions?: () => Promise<OpenCodeSessionRecord[]>,
   ) {}
 
   supports(_action: 'launch' | 'cancel' | 'stop' | 'recover', plan: TeamLifecycleLaunchPlan): boolean {
@@ -124,6 +128,20 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
     const lane = input.lane
     await assertEffectGuard(input)
+    const stopRecovery = await this.#stopRecovery(input)
+    if (stopRecovery) {
+      const prior = await this.#execute('opencode.stopOutcome', input.workspaceRoot, { stopRecovery }, input.signal, input.effectGuard)
+      if (prior.status === 'completed') {
+        if (asRecord(prior.receipt).data && asRecord(asRecord(prior.receipt).data).stopped === true) return idle()
+        throw new Error('OpenCode Stop replay retained an unconfirmed outcome')
+      }
+      if (prior.status === 'inflight') {
+        const reconciliation = await this.#execute('opencode.reconcileStop', input.workspaceRoot, { stopRecovery }, input.signal, input.effectGuard)
+        if (reconciliation.status === 'reconciled_stopped') return idle()
+        throw new Error('OpenCode Stop recovery is inflight without a terminal exact-session reconciliation')
+      }
+      if (prior.status !== 'unknown') throw new Error('OpenCode Stop recovery target changed')
+    }
     const data = await this.#execute('opencode.stopTeam', input.workspaceRoot, {
       runId: input.runId,
       laneId: lane.laneId,
@@ -137,13 +155,56 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         model: member.model ?? lane.selectedModel,
         variant: member.effort ?? lane.effort ?? null,
       })),
+      ...(stopRecovery ? { stopRecovery } : {}),
     }, input.signal, input.effectGuard)
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     return idle()
   }
 
+  /**
+   * Production Stop uses one deterministic receipt identity for the exact
+   * launched incarnation.  It lets a replacement owner replay a completed
+   * answer without probing a now-unavailable provider, while a test-only
+   * injected bridge can keep exercising the legacy wire shape.
+   */
+  async #stopRecovery(input: TeamLifecycleLaneInput & { runId: string }): Promise<OpenCodeStopRequest | null> {
+    if (!this.listOwnedSessions) return null
+    const records = (await this.listOwnedSessions()).filter(record =>
+      record.teamId === input.planTeamId && (record.laneId ?? 'primary') === input.lane.laneId
+      && record.runId === input.runId && record.projectPath === input.workspaceRoot,
+    ).sort((left, right) => left.memberName.localeCompare(right.memberName))
+    if (records.length === 0) return null
+    const expectedMembers = [...input.lane.members].map(member => member.name).sort()
+    if (records.length !== expectedMembers.length || records.some((record, index) =>
+      record.memberName !== expectedMembers[index] || !record.stopAuthority || !record.hostKey || !record.createdAt,
+    )) throw new Error('OpenCode Stop cannot establish exact durable ownership for the admitted session set')
+    const capabilitySnapshotId = records[0]!.stopAuthority!.runtime.capabilitySnapshotId
+    const expectedBehaviorFingerprint = records[0]!.expectedBehaviorFingerprint
+    if (records.some(record => record.stopAuthority!.runtime.capabilitySnapshotId !== capabilitySnapshotId
+      || record.expectedBehaviorFingerprint !== expectedBehaviorFingerprint)) {
+      throw new Error('OpenCode Stop session set has inconsistent durable authority')
+    }
+    const target = {
+      teamId: input.planTeamId,
+      laneId: input.lane.laneId,
+      runId: input.runId,
+      projectPath: input.workspaceRoot,
+      capabilitySnapshotId,
+      expectedBehaviorFingerprint,
+      members: records.map(record => ({ memberName: record.memberName, sessionId: record.opencodeSessionId })),
+    }
+    const requestHash = createHash('sha256').update(JSON.stringify(target)).digest('hex')
+    return {
+      contractVersion: 1,
+      originalRequestId: `hosted-stop-${requestHash}`,
+      idempotencyKey: `hosted-stop-${requestHash}`,
+      target,
+    }
+  }
+
   async #execute(
-    command: 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam',
+    command: 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam'
+      | 'opencode.stopOutcome' | 'opencode.reconcileStop',
     cwd: string,
     body: Record<string, unknown>,
     signal?: AbortSignal,

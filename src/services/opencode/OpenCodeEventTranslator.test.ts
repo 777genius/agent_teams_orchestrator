@@ -94,7 +94,7 @@ describe('OpenCodeEventTranslator', () => {
     expect(summary.diagnostics.join('\n')).toContain('status was busy')
   })
 
-  test('treats a following assistant response as current even when OpenCode keeps the bootstrap parent id', () => {
+  test('tracks a following tool response without settling busy when OpenCode keeps the bootstrap parent id', () => {
     const summary = translator.reconcileSessionMessages({
       sessionId: 'session-1',
       rawStatus: 'busy',
@@ -147,8 +147,86 @@ describe('OpenCodeEventTranslator', () => {
     expect(summary.latestUserMessageId).toBe('msg-delivery')
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-bootstrap-parent')
     expect(summary.replyPendingSinceMessageId).toBeNull()
-    expect(summary.durableState).toBe('idle')
-    expect(summary.diagnostics.join('\n')).toContain('status was busy')
+    expect(summary.durableState).toBe('running')
+    expect(summary.diagnostics.join('\n')).not.toContain('status was busy')
+  })
+
+  test('keeps a busy multi-step task running through completed tools until the final assistant response', () => {
+    const messages: OpenCodeMessage[] = [{
+      info: { id: 'msg-task', role: 'user', time: { created: 100 } },
+      parts: [{ type: 'text', text: 'Read the task, write and verify the result, complete it, then report.' }],
+    }]
+
+    for (const [index, tool] of ['agent-teams_task_get', 'write', 'read', 'agent-teams_task_complete', 'agent-teams_message_send'].entries()) {
+      messages.push({
+        info: {
+          id: `msg-step-${index}`,
+          parentID: 'msg-task',
+          role: 'assistant',
+          time: { created: 101 + index, completed: 102 + index },
+          finish: 'tool-calls',
+        },
+        parts: [
+          { type: 'text', text: `Executing ${tool}` },
+          {
+            type: 'tool', tool, callID: `call-${index}`,
+            state: { status: 'completed', input: {}, output: 'ok' },
+          },
+          { type: 'step-finish', reason: 'tool-calls' },
+        ],
+      })
+      const summary = translator.reconcileSessionMessages({ sessionId: 'session-1', rawStatus: 'busy', messages })
+      expect(summary.durableState).toBe('running')
+      expect(summary.replyPendingSinceMessageId).toBeNull()
+      expect(summary.diagnostics.join('\n')).not.toContain('treating session as idle')
+    }
+
+    messages.push({
+      info: { id: 'msg-final', parentID: 'msg-task', role: 'assistant', finish: 'stop', time: { created: 110, completed: 115 } },
+      parts: [{ type: 'text', text: 'Task completed and report sent.' }, { type: 'step-finish', reason: 'stop' }],
+    })
+    expect(translator.reconcileSessionMessages({ sessionId: 'session-1', rawStatus: 'busy', messages }).durableState).toBe('idle')
+  })
+
+  test('does not use an earlier completed response when a newer assistant step is unfinished', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1', rawStatus: 'busy', messages: [
+        { info: { id: 'msg-user', role: 'user' }, parts: [{ type: 'text', text: 'Continue the task.' }] },
+        {
+          info: { id: 'msg-earlier', role: 'assistant', parentID: 'msg-user', finish: 'stop', time: { completed: 100 } },
+          parts: [{ type: 'text', text: 'Earlier response' }],
+        },
+        { info: { id: 'msg-newer', role: 'assistant', parentID: 'msg-user' }, parts: [{ type: 'step-start' }] },
+      ],
+    })
+    expect(summary.durableState).toBe('running')
+    expect(summary.latestAssistantMessageId).toBe('msg-newer')
+  })
+
+  test.each(['tool-calls', 'unknown'])('does not settle a completed %s step without tool parts', finish => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1', rawStatus: 'busy', messages: [
+        { info: { id: 'msg-user', role: 'user' }, parts: [{ type: 'text', text: 'Continue.' }] },
+        {
+          info: { id: 'msg-step', role: 'assistant', parentID: 'msg-user', time: { completed: 100 } },
+          parts: [{ type: 'step-finish', reason: finish }],
+        },
+      ],
+    })
+    expect(summary.durableState).toBe('running')
+  })
+
+  test('does not treat completed tools without a finish reason as terminal', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1', rawStatus: 'busy', messages: [
+        { info: { id: 'msg-user', role: 'user' }, parts: [] },
+        {
+          info: { id: 'msg-tool', role: 'assistant', parentID: 'msg-user', time: { completed: 100 } },
+          parts: [{ type: 'tool', tool: 'write', state: { status: 'completed', input: {}, output: 'ok' } }],
+        },
+      ],
+    })
+    expect(summary.durableState).toBe('running')
   })
 
   test('keeps busy state when the latest assistant response is not complete', () => {

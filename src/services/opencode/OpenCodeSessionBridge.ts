@@ -38,11 +38,16 @@ import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { openCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
+import { openCodeSessionStore, type MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { startOpenCodeStopObserver, type OpenCodeStopObserver } from './OpenCodeStopObserver.js'
+import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
+import type { OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
 
 import type {
+  OpenCodeHostHandle,
   OpenCodeAuthState,
   OpenCodeAppMcpStatus,
   OpenCodeLogProjection,
@@ -62,15 +67,60 @@ import type {
 } from './types.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 
+export type OpenCodeStopRequestOptions = {
+  signal?: AbortSignal
+  remainingMs?: () => number
+  /** Stop-recovery must observe lease release failure before terminalizing. */
+  strictLeaseRelease?: boolean
+}
+
+type OpenCodeMaterializeSessionOnHostParams = {
+  stopAuthority?: OpenCodeSessionRecord['stopAuthority']
+  teamId: string
+  laneId: string
+  memberName: string
+  selectedModel: string
+  selectedVariant?: string
+  title?: string | null
+  runId: string
+  attemptId?: string
+  host: OpenCodeHostHandle
+  signal: AbortSignal
+  remainingMs: () => number
+  toolApprovalMode?: OpenCodeToolApprovalMode
+  expectedBehaviorFingerprint: string
+  expectedBootstrapForSession: (sessionId: string) => { messageID: string; contextHash: string; briefingHash: string; agent: string }
+}
+
+type OpenCodeMaterializeSessionOnHostResult = {
+  record: OpenCodeSessionRecord
+  ownerToken?: MaterializationOwnerToken
+  created: boolean
+  resumeBootstrap?: boolean
+  /** Existing session observed while another live attempt retains ownership. */
+  nonOwningReplay?: boolean
+}
+
+export function sessionManagedAuthMatches(record: OpenCodeSessionRecord, profile: OpenCodePreparedProfile): boolean {
+  if (record.profileScope?.purpose === 'launch_runtime' && canonicalizeOpenCodeProviderId(record.profileScope.providerId) === 'cursor-acp') {
+    return Boolean(profile.env.AGENT_TEAMS_CURSOR_READINESS) && profile.selectedManagedAuthIdentity === record.profileScope.selectedAuthIdentity && profile.profileScope?.selectedAuthIdentity === record.profileScope.selectedAuthIdentity
+  }
+  return record.managedAuthFingerprint === profile.managedAuthFingerprint || openCodeProfileManager.hasOwnedOAuthSessionProfile(record, profile)
+}
+
 type OpenCodeSessionBridgeDeps = {
   acquisitionPolicy?: OpenCodeHostAcquisitionPolicy
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease' |
-      'prepareEffectHostToken' | 'verifyEffectHost'
+      'prepareEffectHostToken' | 'verifyEffectHost' | 'resolveOwnedSessionEndpoint'
     >>
-  sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
+  sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'> & Partial<Pick<typeof openCodeSessionStore,
+    'claimMaterialization' | 'commitMaterialization' | 'releaseMaterializationClaim' | 'releaseMaterializationOwner' |
+    'acquireMaterializationOwner' | 'trackPendingMaterializationReconciliation' | 'recordMaterializationCompensation' |
+    'getMaterializationCompensation' | 'acquireMaterializationCompensation' | 'markStaleIfSession' |
+    'reconcileMaterializationCommit'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -99,6 +149,23 @@ type OpenCodeSessionBridgeDeps = {
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
+
+// Compensation is deliberately not charged to the cancelled launch budget.
+// It is short enough to bound shutdown but has its own controller, so a
+// launch abort cannot make a known remote session impossible to delete.
+const OPENCODE_MATERIALIZATION_CLEANUP_TIMEOUT_MS = 5_000
+
+/**
+ * A commit can report an error after its durable write has succeeded (for
+ * example while releasing the store lock).  This error deliberately carries
+ * no cleanup authority: callers must leave the claim/compensation fence in
+ * place until a later owner can establish the outcome under the store lock.
+ */
+class OpenCodeMaterializationCommitUnknownError extends Error {
+  constructor(cause: unknown) {
+    super('OpenCode materialization commit outcome is unknown; durable reconciliation is required', { cause })
+  }
+}
 
 type SessionIdentity = {
   teamId: string
@@ -361,6 +428,13 @@ function getMessageRole(message: OpenCodeMessage): string | null {
   return typeof info?.role === 'string' ? info.role : null
 }
 
+function sessionStatusIsRunning(value: unknown): boolean {
+  if (value === 'busy' || value === 'retry') return true
+  const status = asRecord(value)
+  return status?.type === 'busy' || status?.type === 'retry'
+    || status?.status === 'busy' || status?.status === 'retry'
+}
+
 function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
   return message.parts.some((part) => {
     const record = asRecord(part)
@@ -540,6 +614,405 @@ export class OpenCodeSessionBridge {
     }
   }
 
+  async restoreSessionLease(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'runId' | 'opencodeSessionId'>,
+  ): Promise<void> {
+    if (!this.hostManager.retainHostLease) throw new Error('OpenCode stop compensation requires persistent lease retention')
+    await this.hostManager.retainHostLease(record.hostKey, {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+      runId: record.runId ?? null,
+      sessionId: record.opencodeSessionId,
+    })
+  }
+
+  private async deleteMaterializationSessionWithCleanupClient(
+    baseUrl: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    const controller = new AbortController()
+    const deadline = Date.now() + OPENCODE_MATERIALIZATION_CLEANUP_TIMEOUT_MS
+    const timer = setTimeout(() => controller.abort(new Error('OpenCode materialization cleanup timed out')),
+      OPENCODE_MATERIALIZATION_CLEANUP_TIMEOUT_MS)
+    try {
+      // This client intentionally has neither the launch AbortSignal nor its
+      // remainingMs closure. A cancellation after POST /session therefore
+      // still gets a bounded, independently authorized DELETE attempt.
+      const client = this.clientFactory.create(baseUrl, {
+        signal: controller.signal,
+        remainingMs: () => Math.max(0, deadline - Date.now()),
+        requestTimeoutMs: OPENCODE_MATERIALIZATION_CLEANUP_TIMEOUT_MS,
+      })
+      return Boolean(client.deleteSession && await client.deleteSession(sessionId))
+    } catch {
+      return false
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private async releaseExactMaterializedSessionLease(
+    params: Pick<OpenCodeMaterializeSessionOnHostParams,
+      'teamId' | 'laneId' | 'memberName' | 'runId' | 'host'>,
+    sessionId: string,
+  ): Promise<void> {
+    if (!this.hostManager.releaseHostLease) {
+      throw new Error('OpenCode materialization cleanup requires exact persistent lease release')
+    }
+    await this.hostManager.releaseHostLease(params.host.hostKey, {
+      teamId: params.teamId,
+      laneId: params.laneId,
+      memberName: params.memberName,
+      runId: params.runId,
+      sessionId,
+    })
+  }
+
+  private async hasExactUncommittedMaterialization(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+    compensation: { ownerToken: MaterializationOwnerToken; runId: string; hostKey: string; baseUrl: string; sessionId: string },
+  ): Promise<boolean> {
+    if (!this.sessionStore.getMaterializationCompensation) return false
+    try {
+      const observed = await this.sessionStore.getMaterializationCompensation(identity)
+      return observed?.ownerToken.attemptId === compensation.ownerToken.attemptId
+        && observed.ownerToken.version === compensation.ownerToken.version
+        && observed.ownerToken.sessionId === compensation.ownerToken.sessionId
+        && observed.runId === compensation.runId
+        && observed.hostKey === compensation.hostKey
+        && observed.baseUrl === compensation.baseUrl
+        && observed.sessionId === compensation.sessionId
+    } catch {
+      return false
+    }
+  }
+
+  private async reconcilePendingMaterializationCompensation(
+    params: Pick<OpenCodeMaterializeSessionOnHostParams, 'teamId' | 'laneId' | 'memberName' | 'host' | 'runId' | 'attemptId' | 'signal'>,
+  ): Promise<void> {
+    const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
+    const observed = await this.sessionStore.getMaterializationCompensation?.(identity)
+    if (!observed) return
+    // Never aim a compensation id at a successor endpoint. The original
+    // claim remains fenced until recovery has the exact original host.
+    if (observed.hostKey !== params.host.hostKey || observed.baseUrl !== params.host.baseUrl) {
+      throw new Error('OpenCode unresolved materialization compensation belongs to a different host')
+    }
+    // Taking the compensation atomically replaces the launch claim token.
+    // The previous creator can no longer commit between this point and DELETE.
+    const pending = await this.sessionStore.acquireMaterializationCompensation?.(
+      identity, params.attemptId ?? params.runId, params.signal,
+    )
+    if (!pending) {
+      throw new Error('OpenCode unresolved materialization compensation is owned by an active launch')
+    }
+    if (!await this.deleteMaterializationSessionWithCleanupClient(pending.baseUrl, pending.sessionId)) {
+      throw new Error(`OpenCode unresolved materialization session ${pending.sessionId} could not be deleted`)
+    }
+    const released = await this.sessionStore.releaseMaterializationClaim?.(
+      identity, pending.ownerToken, pending.runId,
+    )
+    if (!released) throw new Error('OpenCode compensated materialization claim could not be released')
+  }
+
+  /** Strict launch boundary: create and persist exactly one session on the caller-retained host. */
+  async materializeSessionOnHost(
+    params: OpenCodeMaterializeSessionOnHostParams,
+  ): Promise<OpenCodeMaterializeSessionOnHostResult> {
+    if (params.signal.aborted) throwOpenCodeAbortReason(params.signal)
+    const identity = { teamId: params.teamId, laneId: params.laneId, memberName: params.memberName }
+    await this.reconcilePendingMaterializationCompensation(params)
+    const attemptId = params.attemptId ?? params.runId
+    const claim = this.sessionStore.claimMaterialization
+      ? await this.sessionStore.claimMaterialization(identity, attemptId, params.runId, params.signal)
+      : null
+    if (claim?.kind === 'owned_by_other') throw new Error('OpenCode session materialization is owned by another launch attempt')
+    if (claim?.kind === 'claimed' && (!this.sessionStore.commitMaterialization
+      || !this.sessionStore.releaseMaterializationClaim || !this.sessionStore.recordMaterializationCompensation)) {
+      throw new Error('OpenCode session materialization requires durable claim compensation')
+    }
+    const ownerToken = claim?.kind === 'claimed' ? claim.ownerToken : undefined
+    const existing = claim?.kind === 'existing' ? claim.record : claim === null
+      ? await this.sessionStore.get(params.teamId, params.laneId, params.memberName) : null
+    if (existing) {
+      if (existing.runId === params.runId && existing.hostKey === params.host.hostKey &&
+        existing.opencodeSessionId && existing.selectedModel === params.selectedModel) {
+        // Transfer only through the store's lock-held replay acquisition.  Do
+        // not hand the observer the existing owner's write/release token.
+        const replayOwner = await this.sessionStore.acquireMaterializationOwner?.(
+          existing, attemptId, params.signal,
+        )
+        // An active owner deliberately leaves replay as observation only.  It
+        // has not granted this attempt authority over the shared lease, so it
+        // must neither retain nor compensate that lease on an error path.
+        if (!replayOwner) {
+          return { record: existing, created: false, nonOwningReplay: true }
+        }
+        try {
+          await this.hostManager.retainHostLease?.(existing.hostKey, {
+            teamId: params.teamId, laneId: params.laneId, memberName: params.memberName,
+            runId: params.runId, sessionId: existing.opencodeSessionId,
+          })
+        } catch (error) {
+          // Lease retention can write before reporting an error.  A replay
+          // owner is a real capability, so release both exact identities even
+          // when retainHostLease only partially completed.
+          await this.hostManager.releaseHostLease?.(existing.hostKey, {
+            teamId: params.teamId, laneId: params.laneId, memberName: params.memberName,
+            runId: params.runId, sessionId: existing.opencodeSessionId,
+          }).catch(() => undefined)
+          if (replayOwner) {
+            if (this.sessionStore.markStaleIfSession) {
+              await this.sessionStore.markStaleIfSession(existing, 'launch_failed', replayOwner).catch(() => undefined)
+            }
+            const released = await this.sessionStore.releaseMaterializationOwner?.(existing, replayOwner)
+            if (released === false) {
+              throw new Error('OpenCode replay materialization owner could not be released after lease retention failure', { cause: error })
+            }
+          }
+          throw error
+        }
+        return { record: existing, ownerToken: replayOwner, created: false }
+      }
+      throw new Error('OpenCode committed session identity does not match strict launch')
+    }
+    const client = this.clientFactory.create(params.host.baseUrl, {
+      signal: params.signal,
+      remainingMs: params.remainingMs,
+    })
+    // Do not create a remote object unless this launch can compensate a known
+    // id if durable persistence loses its claim.
+    if (!client.deleteSession) {
+      throw new Error('OpenCode session materialization requires delete compensation')
+    }
+    const session = await client.createSession({ title: params.title?.trim() || `${params.teamId} - ${params.memberName}` })
+    let compensation: { ownerToken: MaterializationOwnerToken; runId: string; hostKey: string
+      baseUrl: string; sessionId: string; recordedAt: string } | null = null
+    let record!: OpenCodeSessionRecord
+    try {
+      compensation = ownerToken ? {
+        ownerToken,
+        runId: params.runId,
+        hostKey: params.host.hostKey,
+        baseUrl: params.host.baseUrl,
+        sessionId: session.id,
+        recordedAt: buildNowIso(),
+      } : null
+      const now = buildNowIso()
+      const bootstrap = params.expectedBootstrapForSession(session.id)
+      record = {
+      teamId: params.teamId, laneId: params.laneId, memberName: params.memberName,
+      runId: params.runId, providerId: 'opencode', selectedModel: params.selectedModel,
+      ...(params.selectedVariant ? { selectedVariant: params.selectedVariant } : {}),
+      projectPath: params.host.projectPath, profileRootKey: params.host.profileRootKey,
+      hostKey: params.host.hostKey, openCodeArtifactDigest: params.host.openCodeArtifactDigest ?? null,
+      profileScope: params.host.profile.profileScope ?? null,
+      toolApprovalMode: params.toolApprovalMode ?? 'auto', runtimePid: params.host.pid > 0 ? params.host.pid : undefined,
+      resolvedBehaviorFingerprint: params.host.resolvedConfigFingerprint, opencodeSessionId: session.id,
+      lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
+      sourceAuthFingerprint: params.host.profile.sourceAuthFingerprint,
+      managedAuthFingerprint: params.host.profile.managedAuthFingerprint,
+      projectBehaviorFingerprint: params.host.projectBehaviorFingerprint,
+      managedConfigFingerprint: params.host.profile.managedConfigFingerprint,
+      expectedBehaviorFingerprint: params.expectedBehaviorFingerprint,
+      stopAuthority: params.stopAuthority, opencodeVersion: params.host.version ?? undefined,
+      bootstrapMode: 'app_managed_context', bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: { schemaVersion: 1, ...bootstrap, model: params.selectedModel, injectionVerifiedAt: now },
+      staleReason: null, createdAt: now, updatedAt: now,
+      }
+      if (compensation) {
+        const recorded = await this.sessionStore.recordMaterializationCompensation!(identity, compensation)
+        if (!recorded) throw new Error('OpenCode materialization compensation could not be recorded')
+      }
+    } catch (error) {
+      // Every operation after POST, including compensation persistence itself,
+      // gets an independent cleanup attempt.  If it cannot delete, retrying
+      // the exact durable entry leaves recovery the id and the still-fenced
+      // claim rather than permitting another launch to create a second one.
+      const deleted = await this.deleteMaterializationSessionWithCleanupClient(params.host.baseUrl, session.id)
+      if (deleted) {
+        const released = ownerToken
+          ? await this.sessionStore.releaseMaterializationClaim!(identity, ownerToken, params.runId).catch(() => false)
+          : true
+        if (!released) {
+          throw new Error('OpenCode remote session was deleted but its materialization claim was not released', { cause: error })
+        }
+        throw error
+      }
+      let preserved = false
+      if (compensation) {
+        const persisted = await this.sessionStore.getMaterializationCompensation?.(identity).catch(() => null)
+        preserved = Boolean(persisted
+          && persisted.sessionId === compensation.sessionId
+          && persisted.hostKey === compensation.hostKey
+          && persisted.baseUrl === compensation.baseUrl
+          && persisted.runId === compensation.runId
+          && persisted.ownerToken.attemptId === compensation.ownerToken.attemptId
+          && persisted.ownerToken.version === compensation.ownerToken.version)
+        if (!preserved) {
+          preserved = await this.sessionStore.recordMaterializationCompensation!(identity, compensation)
+            .catch(() => false)
+        }
+      }
+      throw new Error(preserved
+        ? `OpenCode remote session ${session.id} could not be deleted; durable recovery is required`
+        : `OpenCode remote session ${session.id} could not be durably recorded or deleted`, { cause: error })
+    }
+    let committedOwner: MaterializationOwnerToken | null = null
+    let durable = false
+    let leaseRetained = false
+    try {
+      // Persist the exact remote id before taking its persistent host lease.
+      // If retaining the lease fails, recovery has a durable record rather
+      // than an invisible server-side session.
+      if (ownerToken && this.sessionStore.commitMaterialization) {
+        try {
+          committedOwner = await this.sessionStore.commitMaterialization(record, ownerToken, params.signal)
+        } catch (error) {
+          // A lock-release failure is an unknown outcome: commit may have
+          // already persisted. Reconcile the exact record, owner, and cleared
+          // claim before any destructive remote compensation.  A failed
+          // reconciliation is not evidence of non-commit: keep the exact
+          // durable compensation fence and never DELETE on that path.
+          if (!this.sessionStore.reconcileMaterializationCommit) {
+            throw new OpenCodeMaterializationCommitUnknownError(error)
+          }
+          let reconciled: MaterializationOwnerToken | null
+          try {
+            reconciled = await this.sessionStore.reconcileMaterializationCommit(record, ownerToken)
+          } catch {
+            throw new OpenCodeMaterializationCommitUnknownError(error)
+          }
+          if (reconciled) {
+            committedOwner = reconciled
+          } else if (!compensation || !await this.hasExactUncommittedMaterialization(identity, compensation)) {
+            // A successful read that does not prove the original fenced
+            // compensation is still ambiguous: it might be a committed record
+            // whose observation was changed by another owner.
+            throw new OpenCodeMaterializationCommitUnknownError(error)
+          }
+        }
+      }
+      if (ownerToken && this.sessionStore.commitMaterialization && !committedOwner) {
+        throw new Error('OpenCode session materialization claim was lost before commit')
+      }
+      if (!ownerToken || !this.sessionStore.commitMaterialization) await this.sessionStore.upsert(record)
+      durable = true
+      await this.hostManager.retainHostLease?.(params.host.hostKey, {
+        teamId: params.teamId, laneId: params.laneId, memberName: params.memberName,
+        runId: params.runId, sessionId: session.id,
+      })
+      leaseRetained = true
+      if (params.signal.aborted) {
+        throwOpenCodeAbortReason(params.signal)
+      }
+    } catch (error) {
+      if (!durable) {
+        if (error instanceof OpenCodeMaterializationCommitUnknownError) {
+          // Do not weaken the claim/compensation fence.  In particular, a
+          // remote DELETE here could destroy a session that committed just
+          // before the failed reconciliation.
+          throw error
+        }
+        // A rejected commit has no durable session id. Compensate the known
+        // remote object before releasing the exact claim; otherwise another
+        // attempt could create a second session while this one is orphaned.
+        const deleted = await this.deleteMaterializationSessionWithCleanupClient(params.host.baseUrl, session.id)
+        if (deleted) {
+          const released = ownerToken ? await this.sessionStore.releaseMaterializationClaim!(
+            identity, ownerToken, params.runId,
+          ).catch(() => false) : true
+          if (!released) {
+            throw new Error('OpenCode remote session was deleted but its materialization claim was not released', { cause: error })
+          }
+        } else {
+          // Do not release the claim when deletion cannot be proven. The
+          // compensation record and its fence are durable evidence that
+          // recovery must reconcile this exact remote id before another
+          // materialization may create anything.
+          throw new Error(`OpenCode remote session ${session.id} could not be durably committed or deleted`, { cause: error })
+        }
+      }
+      if (durable && !leaseRetained) {
+        // retainHostLease may have applied its write before reporting an
+        // error. Release the exact session lease, quarantine the committed
+        // record, and compensate remotely using the independent cleanup
+        // client. No caller receives the now-unusable owner capability.
+        await this.releaseExactMaterializedSessionLease(params, session.id)
+        const deleted = await this.deleteMaterializationSessionWithCleanupClient(params.host.baseUrl, session.id)
+        if (committedOwner) {
+          if (this.sessionStore.markStaleIfSession) {
+            await this.sessionStore.markStaleIfSession(record, 'launch_failed', committedOwner).catch(() => undefined)
+          }
+          if (!this.sessionStore.releaseMaterializationOwner) {
+            throw new Error('OpenCode committed materialization owner release is unavailable after lease retention failure', { cause: error })
+          }
+          const released = await this.sessionStore.releaseMaterializationOwner(record, committedOwner)
+          if (!released) {
+            throw new Error('OpenCode committed materialization owner could not be released after lease retention failure', { cause: error })
+          }
+        }
+        if (!deleted) {
+          throw new Error(`OpenCode committed session ${session.id} could not be deleted after lease retention failure`, { cause: error })
+        }
+      }
+      if (leaseRetained) {
+        // The committed materialization owner is the fence for this exact
+        // lease.  Release the lease before dropping that owner; otherwise a
+        // successor can acquire the owner and retain the same lease during the
+        // gap.  If release fails, retain ownership for deterministic recovery.
+        await this.releaseExactMaterializedSessionLease(params, session.id)
+        leaseRetained = false
+        if (committedOwner) {
+          await this.sessionStore.markStaleIfSession?.(record, 'launch_failed', committedOwner).catch(() => undefined)
+          if (!this.sessionStore.releaseMaterializationOwner) {
+            throw new Error('OpenCode committed materialization owner release is unavailable after lease cleanup', { cause: error })
+          }
+          const released = await this.sessionStore.releaseMaterializationOwner(record, committedOwner)
+          if (!released) {
+            throw new Error('OpenCode committed materialization owner could not be released after lease cleanup', { cause: error })
+          }
+          committedOwner = null
+        }
+      }
+      throw error
+    }
+    return { record, ownerToken: committedOwner ?? undefined, created: true }
+  }
+
+  private async ownedStopEndpoint(record: OpenCodeSessionRecord, options: OpenCodeStopRequestOptions) {
+    if (options.signal?.aborted) throwOpenCodeAbortReason(options.signal)
+    const current = await this.sessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
+    if (!current || !record.runId || current.runId !== record.runId
+      || current.opencodeSessionId !== record.opencodeSessionId
+      || current.hostKey !== record.hostKey || current.projectPath !== record.projectPath) {
+      throw new Error('OpenCode cleanup session ownership changed')
+    }
+    if (current.stoppedAt) return null
+    if (!this.hostManager.resolveOwnedSessionEndpoint) {
+      throw new Error('OpenCode cleanup requires persistent host ownership')
+    }
+    return this.hostManager.resolveOwnedSessionEndpoint(record.hostKey, {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+      runId: record.runId,
+      sessionId: record.opencodeSessionId,
+      projectPath: record.projectPath,
+    }, { signal: options.signal, remainingMs: options.remainingMs })
+  }
+
+  async observeStopIdle(record: OpenCodeSessionRecord, options: OpenCodeStopRequestOptions = {}): Promise<OpenCodeStopObserver> {
+    const endpoint = await this.ownedStopEndpoint(record, options)
+    if (!endpoint) return { arm: () => {}, currentStatus: () => 'idle', waitForIdle: async () => true, dispose: async () => {} }
+    return startOpenCodeStopObserver({
+      baseUrl: endpoint.baseUrl,
+      sessionId: record.opencodeSessionId,
+      signal: options.signal,
+    })
+  }
+
   private snapshotSession(record: OpenCodeSessionRecord): OpenCodeSessionRecord {
     return this.custody ? Object.freeze(structuredClone(record)) : record
   }
@@ -606,7 +1079,10 @@ export class OpenCodeSessionBridge {
     profile: OpenCodePreparedProfile,
   ): Promise<void> {
     if (this.custody) throw new Error('OpenCode supervised auth remediation unavailable')
-    if (parseProviderScopedModel(record.selectedModel).providerID !== 'xai') {
+    // Resolver-issued profiles retain their native OAuth owner through
+    // settlement. Fan-out has no successor provenance and must never publish
+    // credentials while that generation can still be live.
+    if (parseProviderScopedModel(record.selectedModel).providerID !== 'xai' || profile.profileScope) {
       return
     }
     const input = {
@@ -660,19 +1136,27 @@ export class OpenCodeSessionBridge {
       if (this.buildSessionProfileStaleReason(record, profile)) throw new Error('OpenCode supervised session profile stale')
       return { profile, toolApprovalMode: 'manual' }
     }
+    // Re-resolve from the admitted model rather than preparing a broad
+    // profile. This seals provider, auth and configuration identity after a
+    // restart and prevents an unrelated provider catalog from being reused.
+    const profileScope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: record.selectedModel,
+    })
     if (record.toolApprovalMode) {
       return {
-        profile: await this.prepareProfile(projectPath, { toolApprovalMode: record.toolApprovalMode }),
+        profile: await this.prepareProfile(projectPath, { toolApprovalMode: record.toolApprovalMode, profileScope }),
         toolApprovalMode: record.toolApprovalMode,
       }
     }
 
-    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto' })
+    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto', profileScope })
     if (this.sessionProfileMatchesStoredConfig(record, autoProfile)) {
       return { profile: autoProfile, toolApprovalMode: 'auto' }
     }
 
-    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual' })
+    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual', profileScope })
     if (this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
       return { profile: manualProfile, toolApprovalMode: 'manual' }
     }
@@ -890,22 +1374,65 @@ export class OpenCodeSessionBridge {
     return host
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
+  async releaseSession(
+    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>,
+    options: OpenCodeStopRequestOptions = {},
+  ): Promise<void> {
     record = { ...record }
+    // A scoped OAuth writer may have consumed a single-use predecessor.  Do
+    // not surrender the lease until the exact native receipt is settled and
+    // its successor is recovered/published by the profile owner.
+    const fullRecord = await this.sessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
+    if (fullRecord && fullRecord.opencodeSessionId === record.opencodeSessionId) {
+      await openCodeProfileManager.finishOwnedOAuthBeforeSessionRelease(
+        fullRecord,
+        owner => this.isOwnedOAuthNativeSessionSettled(owner),
+      )
+    }
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.#retainedSessionHosts.get(sessionKey)
-    await this.hostManager.releaseHostLease?.(record.hostKey, {
+    const releaseLease = this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
       sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
+    }, options)
+    if (options.strictLeaseRelease) await releaseLease
+    else await releaseLease?.catch(() => undefined)
     if (!retainedHostKey) {
       return
     }
 
     this.#retainedSessionHosts.delete(sessionKey)
-    await this.hostManager.releaseHost(retainedHostKey)
+    // The retained host may now be an owned, unleased host. Keep its registry
+    // lock acquisition inside the same stop cancellation/deadline as lease
+    // release so session shutdown cannot wait forever behind another owner.
+    await this.hostManager.releaseHost(retainedHostKey, options)
+  }
+
+  /** Exact receipt check used by owned OAuth recovery before releasing a lease. */
+  async isOwnedOAuthNativeSessionSettled(
+    owner: OpenCodeOAuthNativeSessionOwner,
+    requireUnsubmitted = false,
+  ): Promise<boolean> {
+    const record = owner.record
+    if (!owner.baseUrl || !owner.messageId || !record.opencodeSessionId || !record.runId
+      || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+      || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0) return false
+    try {
+      const endpoint = await this.ownedStopEndpoint(record, {})
+      if (!endpoint || endpoint.baseUrl !== owner.baseUrl || endpoint.pid !== owner.pid) return false
+      const client = this.clientFactory.create(owner.baseUrl)
+      const [status, messages] = await Promise.all([
+        client.getSessionStatus(),
+        client.getSessionMessages(record.opencodeSessionId, 200),
+      ])
+      const submitted = messages.some(message => getMessageId(message) === owner.messageId)
+      if (requireUnsubmitted) return !submitted && !sessionStatusIsRunning(status[record.opencodeSessionId])
+      return submitted && !sessionStatusIsRunning(status[record.opencodeSessionId])
+    } catch {
+      return false
+    }
   }
 
   async ensureSessionAppMcpReady(
@@ -1002,6 +1529,7 @@ export class OpenCodeSessionBridge {
       profile: OpenCodePreparedProfile
       resolvedConfigFingerprint: string | null
       runtimePid: number | null
+      runOwnedOAuthPrompt: <R>(messageId: string, noReply: boolean, operation: () => Promise<R>) => Promise<R>
     }) => Promise<T>,
   ): Promise<T> {
     record = this.snapshotSession(record)
@@ -1014,7 +1542,36 @@ export class OpenCodeSessionBridge {
     if (refreshResult.refreshed) {
       sessionProfile = await this.prepareProfileForSessionRecord(record)
     }
-    return this.withSessionHost(record, callback, sessionProfile.profile)
+    return this.withSessionHost(record, async context => {
+      const runOwnedOAuthPrompt = async <R>(messageId: string, noReply: boolean, operation: () => Promise<R>): Promise<R> => {
+        if (sessionProfile.profile.profileScope?.providerId !== 'xai') return operation()
+        if (!context.runtimePid || !context.host.processStartedAtMs || !this.hostManager.resolveOwnedSessionEndpoint) {
+          throw new Error('OpenCode owned OAuth prompt requires an exact live host identity')
+        }
+        return openCodeProfileManager.withOwnedOAuthRefresh({
+          profile: sessionProfile.profile,
+          sessionRecord: record,
+          assertHostOwnership: async () => {
+            const endpoint = await this.hostManager.resolveOwnedSessionEndpoint!(record.hostKey, {
+              teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
+              runId: record.runId, sessionId: record.opencodeSessionId, projectPath: record.projectPath,
+              expectedProcessStartedAtMs: context.host.processStartedAtMs,
+            })
+            if (endpoint.baseUrl !== context.baseUrl || endpoint.pid !== context.runtimePid) {
+              throw new Error('OpenCode owned OAuth prompt host changed')
+            }
+          },
+          operation: async armNativeSession => {
+            await armNativeSession({ record, baseUrl: context.baseUrl, pid: context.runtimePid,
+              processStartedAtMs: context.host.processStartedAtMs!, messageId, noReply })
+            return operation()
+          },
+          isNativeSettled: () => false,
+          allowNativeContinuation: true,
+        })
+      }
+      return callback({ ...context, runOwnedOAuthPrompt })
+    }, sessionProfile.profile)
   }
 
   private buildUpdatedRecord(
@@ -1261,7 +1818,10 @@ export class OpenCodeSessionBridge {
     return created.record
   }
 
-  async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
+  async refreshSessionEnvironment(
+    record: OpenCodeSessionRecord,
+    materializationOwnerToken?: MaterializationOwnerToken,
+  ): Promise<OpenCodeSessionRecord> {
     record = this.snapshotSession(record)
     const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
       this.prepareProfileForSessionRecord(record),
@@ -1290,7 +1850,7 @@ export class OpenCodeSessionBridge {
     }
 
     next.updatedAt = buildNowIso()
-    await this.sessionStore.upsert(next)
+    await this.sessionStore.upsert(next, materializationOwnerToken)
     return next
   }
 
@@ -1376,10 +1936,12 @@ export class OpenCodeSessionBridge {
   ): Promise<OpenCodeMessage> {
     record = this.snapshotSession(record)
     if (this.custody) params = structuredClone(params)
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile, runOwnedOAuthPrompt }) => {
       const client = this.clientFactory.create(baseUrl)
+      const messageID = buildOpenCodeRuntimePromptMessageId()
       try {
-        return await client.sendSessionMessage(record.opencodeSessionId, {
+        return await runOwnedOAuthPrompt(messageID, params.noReply === true, () => client.sendSessionMessage(record.opencodeSessionId, {
+          messageID,
           agent: params.agent,
           noReply: params.noReply,
           system: params.system,
@@ -1389,7 +1951,7 @@ export class OpenCodeSessionBridge {
             text: params.text,
             parts: params.parts,
           }),
-        })
+        }))
       } finally {
         await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
       }
@@ -1415,7 +1977,7 @@ export class OpenCodeSessionBridge {
   }> {
     record = this.snapshotSession(record)
     params = { ...params }
-    return this.withSessionPromptHost(record, async ({ baseUrl }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, runOwnedOAuthPrompt }) => {
       const client = this.clientFactory.create(baseUrl)
       const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
         if (!message) {
@@ -1457,14 +2019,14 @@ export class OpenCodeSessionBridge {
       // deterministic; the side-effect check below protects against OpenCode
       // accidentally producing assistant/tool output that could be mistaken for
       // launch readiness or a visible teammate reply.
-      await client.sendSessionMessage(record.opencodeSessionId, {
+      await runOwnedOAuthPrompt(params.messageID, true, () => client.sendSessionMessage(record.opencodeSessionId, {
         messageID: params.messageID,
         ...(params.agent ? { agent: params.agent } : {}),
         noReply: true,
         ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
         model: parseProviderScopedModel(record.selectedModel),
         parts: [{ type: 'text', text: params.text }],
-      })
+      }))
 
       let written: OpenCodeMessage | null = null
       for (const delay of [0, 100, 250, 500]) {
@@ -1520,10 +2082,12 @@ export class OpenCodeSessionBridge {
   ): Promise<void> {
     record = this.snapshotSession(record)
     if (this.custody) params = structuredClone(params)
-    await this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
+    await this.withSessionPromptHost(record, async ({ baseUrl, profile, runOwnedOAuthPrompt }) => {
       const client = this.clientFactory.create(baseUrl)
+      const messageID = buildOpenCodeRuntimePromptMessageId()
       try {
-        await client.promptSessionAsync(record.opencodeSessionId, {
+        await runOwnedOAuthPrompt(messageID, params.noReply === true, () => client.promptSessionAsync(record.opencodeSessionId, {
+          messageID,
           agent: params.agent,
           noReply: params.noReply,
           system: params.system,
@@ -1533,7 +2097,7 @@ export class OpenCodeSessionBridge {
             text: params.text,
             parts: params.parts,
           }),
-        })
+        }))
       } finally {
         await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
       }
@@ -1561,7 +2125,7 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile, runOwnedOAuthPrompt }) => {
       const client = this.clientFactory.create(baseUrl)
       const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
@@ -1581,7 +2145,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId: observation.runtimePromptMessageId,
           baseUrl,
         })
-        await client.promptSessionAsync(record.opencodeSessionId, {
+        await runOwnedOAuthPrompt(observation.runtimePromptMessageId, params.noReply === true, () => client.promptSessionAsync(record.opencodeSessionId, {
           messageID: observation.runtimePromptMessageId,
           agent: params.agent,
           noReply: params.noReply,
@@ -1592,7 +2156,7 @@ export class OpenCodeSessionBridge {
             text: params.text,
             parts: params.parts,
           }),
-        })
+        }))
         endpointAccepted = true
         observation.markPromptAcceptedByEndpoint()
         try {
@@ -1634,12 +2198,11 @@ export class OpenCodeSessionBridge {
     })
   }
 
-  async abort(record: OpenCodeSessionRecord): Promise<boolean> {
+  async abort(record: OpenCodeSessionRecord, options: OpenCodeStopRequestOptions = {}): Promise<boolean> {
     record = this.snapshotSession(record)
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
-      return client.abortSession(record.opencodeSessionId)
-    })
+    const endpoint = await this.ownedStopEndpoint(record, options)
+    if (!endpoint) return true
+    return this.clientFactory.create(endpoint.baseUrl, options).abortSession(record.opencodeSessionId)
   }
 
   async answerPermission(
@@ -2067,13 +2630,12 @@ export class OpenCodeSessionBridge {
     })
   }
 
-  async getRawStatus(record: OpenCodeSessionRecord): Promise<OpenCodeSessionStatusInput | null> {
+  async getRawStatus(record: OpenCodeSessionRecord, options: OpenCodeStopRequestOptions = {}): Promise<OpenCodeSessionStatusInput | null> {
     record = this.snapshotSession(record)
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
-      const statusMap = await client.getSessionStatus()
-      return statusMap[record.opencodeSessionId] ?? null
-    })
+    const endpoint = await this.ownedStopEndpoint(record, options)
+    if (!endpoint) return { type: 'idle' }
+    const statusMap = await this.clientFactory.create(endpoint.baseUrl, options).getSessionStatus()
+    return statusMap[record.opencodeSessionId] ?? null
   }
 
   async promptAsyncUntilAccepted(
@@ -2094,7 +2656,7 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile, runOwnedOAuthPrompt }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
         const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
@@ -2105,7 +2667,7 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId,
           baseUrl,
         })
-        await client.promptSessionAsync(record.opencodeSessionId, {
+        await runOwnedOAuthPrompt(runtimePromptMessageId, false, () => client.promptSessionAsync(record.opencodeSessionId, {
           messageID: runtimePromptMessageId,
           agent: params.agent,
           noReply: false,
@@ -2116,7 +2678,7 @@ export class OpenCodeSessionBridge {
             text: params.text,
             parts: params.parts,
           }),
-        })
+        }))
         try {
           await params.onPromptAccepted?.({
             sessionId: record.opencodeSessionId,
@@ -2142,17 +2704,28 @@ export class OpenCodeSessionBridge {
     options: {
       limit?: number
       sessionId?: string | null
+      /** A command deadline is live authority, not merely an observation timeout. */
+      signal?: AbortSignal
+      remainingMs?: () => number
     } = {},
   ): Promise<{
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
+    const assertLive = () => {
+      if (options.signal?.aborted) throwOpenCodeAbortReason(options.signal)
+      if (options.remainingMs && options.remainingMs() <= 0) {
+        throw new Error('OpenCode reconciliation deadline exhausted')
+      }
+    }
+    assertLive()
     record = this.snapshotSession(record)
     options = { ...options }
     if (this.custody && options.sessionId != null && options.sessionId.trim() !== record.opencodeSessionId) {
       throw new Error('OpenCode supervised reconciliation target is not the admitted session')
     }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
+    assertLive()
     const profile = sessionProfile.profile
     const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
     const staleReason = this.buildSessionProfileStaleReason(record, profile)
@@ -2172,6 +2745,7 @@ export class OpenCodeSessionBridge {
     }
 
     return this.withSessionHost(activeRecord, async ({ baseUrl, resolvedConfigFingerprint, runtimePid }) => {
+      assertLive()
       if (
         activeRecord.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
@@ -2185,7 +2759,10 @@ export class OpenCodeSessionBridge {
         })
       }
 
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(baseUrl, {
+        signal: options.signal,
+        remainingMs: options.remainingMs,
+      })
       let permissionDiagnostic: string | null = null
       const [statusMap, pendingPermissions] = await Promise.all([
         client.getSessionStatus(),
@@ -2194,9 +2771,11 @@ export class OpenCodeSessionBridge {
           return []
         }),
       ])
+      assertLive()
       const messageDiagnostics: string[] = []
       const targetSessionId = options.sessionId?.trim() || activeRecord.opencodeSessionId
       let messages = await client.getSessionMessages(targetSessionId, options.limit)
+      assertLive()
       if (
         typeof options.limit === 'number'
         && activeRecord.lastCanonicalCursor
@@ -2206,6 +2785,7 @@ export class OpenCodeSessionBridge {
           `Stored cursor ${activeRecord.lastCanonicalCursor} was missing from the latest ${options.limit} messages, rebuilding full OpenCode session history`,
         )
         messages = await client.getSessionMessages(targetSessionId)
+        assertLive()
       }
       const rawStatus = statusMap[targetSessionId] ?? null
       const summary = this.eventTranslator.reconcileSessionMessages({
@@ -2255,7 +2835,11 @@ export class OpenCodeSessionBridge {
           || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
+        // The final side effect is guarded separately: a response resolving
+        // at the deadline must never turn into a post-timeout persistence.
+        assertLive()
         await this.sessionStore.upsert(nextRecord)
+        assertLive()
       }
 
       const reconciledRecord = isCurrentSession ? nextRecord : activeRecord

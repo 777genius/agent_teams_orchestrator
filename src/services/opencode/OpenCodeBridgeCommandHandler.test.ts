@@ -406,6 +406,8 @@ const originalGet = openCodeSessionStore.get
 const originalUpsert = openCodeSessionStore.upsert
 const originalMarkStale = openCodeSessionStore.markStale
 const originalDelete = openCodeSessionStore.delete
+const originalMarkStaleIfSession = openCodeSessionStore.markStaleIfSession
+const originalDeleteIfSession = openCodeSessionStore.deleteIfSession
 const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
 const originalOutcomeQuery = openCodeCommandOutcomeStore.query
 const originalOutcomePrune = openCodeCommandOutcomeStore.prune
@@ -582,6 +584,8 @@ beforeEach(async () => {
     record) as typeof openCodeSessionBridge.refreshSessionEnvironment
   openCodeSessionStore.upsert = (async () => 'updated') as typeof openCodeSessionStore.upsert
   openCodeSessionStore.delete = (async () => true) as typeof openCodeSessionStore.delete
+  openCodeSessionStore.markStaleIfSession = (async () => null) as typeof openCodeSessionStore.markStaleIfSession
+  openCodeSessionStore.deleteIfSession = (async () => true) as typeof openCodeSessionStore.deleteIfSession
 })
 
 afterEach(async () => {
@@ -645,6 +649,8 @@ afterEach(async () => {
   openCodeSessionStore.upsert = originalUpsert
   openCodeSessionStore.markStale = originalMarkStale
   openCodeSessionStore.delete = originalDelete
+  openCodeSessionStore.markStaleIfSession = originalMarkStaleIfSession
+  openCodeSessionStore.deleteIfSession = originalDeleteIfSession
   openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
   openCodeCommandOutcomeStore.query = originalOutcomeQuery
   openCodeCommandOutcomeStore.prune = originalOutcomePrune

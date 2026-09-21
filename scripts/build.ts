@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { dirname, join, relative, resolve } from 'path'
+import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -162,7 +163,10 @@ const outfile = compile
 const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
 const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
-const version = dev ? getDevVersion(pkg.version) : pkg.version
+// Compatibility workaround: Anthropic rejects Fable 5.1 when MACRO.VERSION is
+// our 0.0.x package version. Report 2.1.251 globally; this is not an upstream upgrade.
+// https://github.com/777genius/agent-teams-ai/issues/569
+const version = dev ? getDevVersion('2.1.251') : '2.1.251'
 
 const outfileDir = dirname(outfile)
 if (outfileDir !== '.') {
@@ -220,6 +224,9 @@ const defines = {
   'process.env.CLAUDE_CODE_VERIFY_PLAN': JSON.stringify('false'),
   'process.env.CCR_FORCE_BUNDLE': JSON.stringify('true'),
   'MACRO.VERSION': JSON.stringify(version),
+  // The runtime's own package version. MACRO.VERSION above is the Claude Code
+  // compatibility version and says nothing about which runtime build is running.
+  'MACRO.RUNTIME_VERSION': JSON.stringify(pkg.version),
   'MACRO.BUILD_TIME': JSON.stringify(buildTime),
   'MACRO.PACKAGE_URL': JSON.stringify(pkg.name),
   'MACRO.NATIVE_PACKAGE_URL': 'undefined',
@@ -464,3 +471,10 @@ if (compile) {
 
   console.log(`Built ${outfile} -> ${bundleEntrypoint}`)
 }
+
+// Ship the reviewed Cursor plugin next to the built runtime. Without this the
+// managed path only works for someone who staged assets by hand, which is not a
+// delivery mechanism.
+const cursorManagedRoot = `${compile ? './dist' : bundleOutdir}/cursor-managed`
+await stageCursorManagedAssets(cursorManagedRoot)
+console.log(`Staged Cursor managed assets -> ${cursorManagedRoot}`)

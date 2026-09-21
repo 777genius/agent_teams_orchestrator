@@ -256,6 +256,33 @@ function normalizeModelKey(value: string | undefined | null): string {
   return value?.trim().toLowerCase() ?? ''
 }
 
+function resolveAnthropicReleaseDate(
+  model: AnthropicApiModelInfo | null,
+): string | null {
+  const createdAt =
+    typeof model?.created_at === 'string' ? model.created_at.trim() : null
+  const match = createdAt?.match(
+    /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i,
+  )
+  if (!createdAt || !match) {
+    return null
+  }
+
+  const calendarDate = `${match[1]}-${match[2]}-${match[3]}`
+  const calendarTimestamp = Date.parse(`${calendarDate}T00:00:00Z`)
+  if (
+    !Number.isFinite(calendarTimestamp) ||
+    new Date(calendarTimestamp).toISOString().slice(0, 10) !== calendarDate
+  ) {
+    return null
+  }
+
+  const releaseTimestamp = Date.parse(createdAt)
+  return Number.isFinite(releaseTimestamp) && releaseTimestamp > 0
+    ? createdAt
+    : null
+}
+
 function getAnthropicApiBaseUrl(): string {
   const configured = process.env.ANTHROPIC_BASE_URL?.trim()
   const baseUrl =
@@ -673,6 +700,9 @@ function createAnthropicCatalogItem(params: {
     source: params.source,
     badgeLabel: params.definition.hidden ? null : displayName,
     statusMessage: params.statusMessage ?? null,
+    metadata: params.liveModel
+      ? { releaseDate: resolveAnthropicReleaseDate(params.liveModel) }
+      : undefined,
   }
 }
 
@@ -709,6 +739,7 @@ function createLiveAnthropicCatalogItem(params: {
         typeof params.model.max_input_tokens === 'number'
           ? params.model.max_input_tokens
           : null,
+      releaseDate: resolveAnthropicReleaseDate(params.model),
     },
   }
 }
@@ -1167,6 +1198,7 @@ export function buildAnthropicCompatibleRuntimeModelCatalogFromApiModels(
               typeof model.max_input_tokens === 'number'
                 ? model.max_input_tokens
                 : null,
+            releaseDate: resolveAnthropicReleaseDate(model),
           },
         } satisfies RuntimeProviderModelCatalogItem,
       ]
