@@ -668,7 +668,7 @@ describe('OpenCodeProcessAttributionStore', () => {
     expect(await exists(unreadablePath)).toBe(true)
   })
 
-  test('prunes an agent that reported its own exit', async () => {
+  test('retains a root-exit record until a whole-tree reconciler has a termination receipt', async () => {
     const directory = await createStoreDirectory()
     const attributionId = mintProcessAttributionId()
     const exitedPath = await writeAgentRecordFile(directory, attributionId, '333-1.json',
@@ -676,15 +676,15 @@ describe('OpenCodeProcessAttributionStore', () => {
     const livePath = await writeAgentRecordFile(directory, attributionId, '444-1.json',
       buildAgentRecord({ attributionId, pid: 444, writtenAtMs: Date.now() }))
 
-    // The exit handler rewrites the record only when it could not unlink it, so
-    // the process is gone whatever its pid says now.
+    // A child may already have been reparented when the root exit handler
+    // runs. Root exit is evidence to retain, not a deletion authorization.
     const result = await pruneStaleAttributionRecords(directory, {
       isProcessAlive: () => true,
       readProcessStartTimeMs: async () => null,
     })
 
-    expect(result).toMatchObject({ prunedAgents: 1 })
-    expect(await exists(exitedPath)).toBe(false)
+    expect(result).toMatchObject({ prunedAgents: 0 })
+    expect(await exists(exitedPath)).toBe(true)
     expect(await exists(livePath)).toBe(true)
   })
 

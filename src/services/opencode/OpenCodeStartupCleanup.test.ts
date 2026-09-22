@@ -1,10 +1,10 @@
-import { hasPendingStartupTaskkill, killProcessTreeForStartup } from '../../utils/processKill.js'
+import { killProcessTreeForStartup } from '../../utils/processKill.js'
 import { afterEach, expect, mock, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import * as childProcess from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
 import { OpenCodeHostManager, openCodeHostManager } from './OpenCodeHostManager.js'
 import { runtimeOpenCodeCommand } from '../../cli/handlers/runtimeOpenCodeCommand.js'
@@ -41,7 +41,10 @@ test('startup exhausted after awaited identity cannot mutate; every unprocessed 
     const result = await manager.reconcilePersistentHosts({ startupBudget: budget, reason: 'startup' })
     expect(result.cleaned).toBe(0)
     expect(result.hosts.map(h => h.action)).toEqual(['failed', 'failed'])
-    expect(result.startupCleanup).toEqual({ completion: 'drained', coverage: 'partial', survivingPids: [41001, 41002] })
+    expect(result.startupCleanup).toMatchObject({
+      completion: 'drained', coverage: 'partial', survivingPids: [41001, 41002],
+      unresolvedPaths: [join(dirname(path), 'profiles')],
+    })
     expect(await readFile(path, 'utf8')).toBe(original)
     expect(kill).not.toHaveBeenCalled()
   })
@@ -68,7 +71,10 @@ test('startup multiple candidates share repeated four-second identity budget and
       spawnHostProcess: () => { throw new Error('unexpected host') } })
     const result = await manager.reconcilePersistentHosts({ startupBudget: budget, reason: 'startup' })
     expect(result.cleaned).toBe(1)
-    expect(result.startupCleanup).toEqual({ completion: 'drained', coverage: 'partial', survivingPids: [41002] })
+    expect(result.startupCleanup).toMatchObject({
+      completion: 'drained', coverage: 'partial', survivingPids: [41002],
+      unresolvedPaths: [join(dirname(path), 'profiles')],
+    })
     expect(fetchJson).not.toHaveBeenCalled()
     expect(queryCaps).toEqual([6000, 6000, 6000, 6000, 2000])
     expect(spawn).toHaveBeenCalledTimes(1)
@@ -138,65 +144,24 @@ test('actual CLI startup command dispatch has no readiness, host creation or dis
   expect(dispose).not.toHaveBeenCalled()
 })
 
-test('CLI publishes drained partial evidence only after original late helper close, without redispatch', async () => {
+test('startup cleanup uses the launch-bound Windows Job receipt and never falls back to PID taskkill', async () => {
   Object.defineProperty(process, 'platform', { value: 'win32' })
-  await fixture(async path => {
-    const events: string[] = []
-    const child = Object.assign(new EventEmitter(), { pid: 90001, kill: mock(() => true) })
-    const spawn = spyOn(childProcess, 'spawn').mockReturnValue(child as unknown as childProcess.ChildProcess)
-    const signal = spyOn(process, 'kill').mockReturnValue(true)
-    const nativeTimeout = globalThis.setTimeout
-    let cutoff!: () => void
-    let helperTimeout!: () => void
-    spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
-      if (ms === 2500 || ms === 3500) {
-        if (ms === 2500) helperTimeout = fn
-        else cutoff = fn
-        return nativeTimeout(() => {}, 60_000)
-      }
-      return nativeTimeout(fn, ms, ...args)
-    }) as typeof setTimeout)
-    const manager = new OpenCodeHostManager({ persistentRegistryPath: path,
-      isProcessAlive: () => true, readProcessStartTimeMs: async () => 1000, killProcess: signal })
-    const reconcile = spyOn(openCodeHostManager, 'reconcilePersistentHosts')
-      .mockImplementation(opts => manager.reconcilePersistentHosts(opts))
-    spyOn(openCodeHostManager, 'drainStartupCleanupLockReleases').mockImplementation(async () => {
-      await manager.drainStartupCleanupLockReleases()
-      events.push('locks-drained')
+  const terminate = mock(async (_pid: number, _signal: NodeJS.Signals, _birth: number,
+    identity: string | undefined) => identity === 'win32-job:launch-bound-job')
+  const result = await killProcessTreeForStartup(41001, 1000,
+    new OpenCodeStartupCleanupBudget(Date.now() + 30_000), {
+      readIdentity: async () => 1000,
+      alive: () => false,
+      expectedOsIdentity: 'win32-job:launch-bound-job',
+      terminateExpectedProcessTree: terminate,
     })
-    let payload: any
-    const command = runtimeOpenCodeCommand({ input: '/synthetic-envelope' }, {
-      readInput: async () => JSON.stringify({ schemaVersion: 1, requestId: 'late-close',
-        command: 'opencode.cleanupStartupHosts', cwd: '/synthetic', startedAt: new Date().toISOString(),
-        timeoutMs: 30_000, body: { deadlineUnixMs: Date.now() + 30_000 } }),
-      writePayload: async (_opts, value) => { events.push('write'); payload = JSON.parse(value) },
-      exit: () => { events.push('exit') }, onSignal: () => {}, offSignal: () => {},
+  expect(result).toEqual({ helperTerminated: false, rootGone: true, treeKillSucceeded: true })
+  expect(terminate).toHaveBeenCalledWith(41001, 'SIGKILL', 1000, 'win32-job:launch-bound-job', expect.any(Object))
+
+  const noJob = await killProcessTreeForStartup(41001, 1000,
+    new OpenCodeStartupCleanupBudget(Date.now() + 30_000), {
+      readIdentity: async () => 1000, alive: () => true, terminateExpectedProcessTree: terminate,
     })
-    // Yield to fixture I/O without advancing the captured observation timers.
-    for (let attempts = 0; !cutoff && attempts < 1000; attempts++) {
-      await new Promise(resolve => nativeTimeout(resolve, 1))
-    }
-    expect(cutoff).toBeDefined()
-    helperTimeout()
-    cutoff()
-    await new Promise(resolve => nativeTimeout(resolve, 20))
-    expect(events).toEqual([])
-    expect(hasPendingStartupTaskkill(41001)).toBe(true)
-    const retry = await killProcessTreeForStartup(41001, 1000,
-      new OpenCodeStartupCleanupBudget(Date.now() + 30_000),
-      { readIdentity: async () => 1000, alive: () => true, signal })
-    expect(retry.helperTerminated).toBe(false)
-    expect(spawn).toHaveBeenCalledTimes(1)
-    expect(signal).not.toHaveBeenCalled()
-    events.push('close')
-    child.emit('close', 0)
-    await command
-    expect(events).toEqual(['close', 'locks-drained', 'write', 'exit'])
-    expect(payload.requestId).toBe('late-close')
-    expect(payload.data.cleaned).toBe(0)
-    expect(payload.data.startupCleanup).toEqual({ completion: 'drained', coverage: 'partial', survivingPids: [41001] })
-    expect(reconcile).toHaveBeenCalledTimes(1)
-    expect(spawn).toHaveBeenCalledTimes(1)
-    expect(signal).not.toHaveBeenCalled()
-  }, [record(41001)])
+  expect(noJob.treeKillSucceeded).toBe(false)
+  expect(terminate).toHaveBeenCalledTimes(1)
 })

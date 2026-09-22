@@ -27,6 +27,10 @@ import {
   ensureSelectedOpenCodeModelInImportedConfig,
 } from './OpenCodeProfileManager.js'
 import {
+  OpenCodeInvalidProviderModelReferenceError,
+  OpenCodeUnsupportedProviderModelReferenceError,
+} from './OpenCodeModelRef.js'
+import {
   PROCESS_ATTRIBUTION_DIRECTORY_ENV,
   PROCESS_ATTRIBUTION_ID_ENV,
   mintProcessAttributionId,
@@ -201,6 +205,65 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       customCatalog.profileRootPath,
       legacy.profileRootPath,
     ]).size).toBe(6)
+  })
+
+  test('rejects invalid persisted scope references before OAuth, Cursor config, or provider preparation', async () => {
+    const projectPath = path.join(tempDir, 'invalid-scope-project')
+    const dataRoot = path.join(tempDir, 'invalid-scope-data')
+    const configRoot = path.join(tempDir, 'invalid-scope-config')
+    const cacheRoot = path.join(tempDir, 'invalid-scope-cache')
+    const calls: string[] = []
+    const resolve = (selectedModel: string | undefined) => resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'launch_runtime',
+      selectedModel: selectedModel as string,
+      env: {
+        ...process.env,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: dataRoot,
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: cacheRoot,
+        XDG_CONFIG_HOME: configRoot,
+      },
+      // Recovery callbacks are production resolver inputs. None may run for a
+      // malformed persisted reference.
+      isOAuthNativeProbeSettled: async () => { calls.push('oauth-recovery'); return false },
+      isOAuthNativeSessionSettled: async () => { calls.push('oauth-recovery'); return false },
+      isOAuthNativeSessionUnsubmitted: async () => { calls.push('oauth-recovery'); return false },
+    })
+
+    for (const selectedModel of [undefined, '', 'xai/', 'cursor-acp/', 'xai//grok', 'bad provider/model']) {
+      await expect(resolve(selectedModel)).rejects.toBeInstanceOf(OpenCodeInvalidProviderModelReferenceError)
+    }
+
+    expect(calls).toEqual([])
+    // These roots are created by the normal recovery/config/provider paths;
+    // validation above must leave every one absent.
+    await expect(lstat(path.join(dataRoot, 'opencode'))).rejects.toThrow()
+    await expect(lstat(configRoot)).rejects.toThrow()
+    await expect(lstat(cacheRoot)).rejects.toThrow()
+    await expect(lstat(projectPath)).rejects.toThrow()
+  })
+
+  test('rejects unsupported strict records before config-directory or provider effects', async () => {
+    const projectPath = path.join(tempDir, 'unsupported-scope-project')
+    const dataRoot = path.join(tempDir, 'unsupported-scope-data')
+    const configRoot = path.join(tempDir, 'unsupported-scope-config')
+    const env = {
+      ...process.env,
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: dataRoot,
+      XDG_CONFIG_HOME: configRoot,
+      AGENT_TEAMS_CURSOR_MANAGED_ASSETS: path.join(tempDir, 'missing-cursor-assets'),
+    }
+    for (const selectedModel of ['kiro/auto', 'cursor-acp/auto']) {
+      await expect(resolveOpenCodeProfileScope({
+        projectPath,
+        purpose: 'launch_runtime',
+        selectedModel,
+        env,
+      })).rejects.toBeInstanceOf(OpenCodeUnsupportedProviderModelReferenceError)
+    }
+    await expect(lstat(path.join(dataRoot, 'opencode', 'cursor-native-config'))).rejects.toThrow()
+    await expect(lstat(configRoot)).rejects.toThrow()
+    await expect(lstat(projectPath)).rejects.toThrow()
   })
 
   test('prepares and retries an existing workspace despite Windows mkdir EEXIST', async () => {
@@ -1712,6 +1775,38 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(windowsSource).toContain(
       'if defined AGENT_TEAMS_CURSOR_PRELOAD set "NODE_OPTIONS=--require="%AGENT_TEAMS_CURSOR_PRELOAD%" %NODE_OPTIONS%"',
     )
+    // Cursor receives a Job minted for this invocation. The host Job is never
+    // published to the attribution preload or reused for agent termination.
+    // The batch file has exactly one complete PowerShell invocation.  Its
+    // program is UTF-16LE EncodedCommand data, so cmd never consumes a quote
+    // from the command Cursor is about to receive.
+    const powerShellLines = windowsSource.split(/\r?\n/).filter(line =>
+      line.startsWith('powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass '),
+    )
+    expect(powerShellLines).toHaveLength(1)
+    const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)$/.exec(powerShellLines[0]!)?.[1]
+    expect(encoded).toBeDefined()
+    const decoded = Buffer.from(encoded!, 'base64').toString('utf16le')
+    expect(decoded).toContain("$ErrorActionPreference='Stop'")
+    // The argument tail never follows EncodedCommand or a batch `%*`
+    // expansion. Inspect both decoded payloads: the native boundary owns the
+    // original Unicode command line and no plaintext batch assertion can
+    // establish the C# Job/identity implementation.
+    expect(windowsSource).toContain('set "AGENT_TEAMS_CURSOR_WRAPPER=%~f0"')
+    expect(windowsSource).not.toContain('%*')
+    expect(powerShellLines[0]).not.toContain('%*')
+    expect(decoded).not.toContain('%*')
+    expect(decoded).toContain('Get-WmiObject Win32_Process')
+    expect(decoded).toContain("[ATJ]::Run('")
+    const sourcePayload = /FromBase64String\('([^']+)'\)/.exec(decoded)?.[1]
+    expect(sourcePayload).toBeDefined()
+    const nativeSource = Buffer.from(sourcePayload!, 'base64').toString('utf8')
+    expect(nativeSource).toContain('CommandLineToArgvW')
+    expect(nativeSource).toContain('ProcessStartInfo')
+    expect(nativeSource).toContain('psi.Arguments=')
+    expect(nativeSource).not.toContain('ArgumentList')
+    expect(decoded).toContain('agent-teams-cursor-')
+    expect(decoded).toContain('AGENT_TEAMS_CURSOR_AGENT_OS_IDENTITY')
     expect(windowsSource).not.toContain(buildCursorAgentPreloadRequireOption(
       path.join(windows.binPath, 'cursor-agent-preload.cjs'), 'win32',
     ))
@@ -1882,8 +1977,39 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const cursorBridgeSource = await readFile(bridge.cursorAgentExecutablePath, 'utf8')
     expect(cursorBridgeSource).toContain('NODE_OPTIONS=--require="')
     expect(cursorBridgeSource).not.toContain('NODE_OPTIONS=--require=\\"')
-    expect(cursorBridgeSource).toContain(`call "${cursorAgentExecutable}" %*`)
+    const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)$/.exec(
+      cursorBridgeSource.split(/\r?\n/).find(line => line.startsWith('powershell.exe ')) ?? '',
+    )?.[1]
+    expect(encoded).toBeDefined()
+    const decoded = Buffer.from(encoded!, 'base64').toString('utf16le')
+    expect(decoded).toContain(`[ATJ]::Run('${cursorAgentExecutable}',$raw)`)
+    expect(decoded).not.toContain('%*')
+    const sourcePayload = /FromBase64String\('([^']+)'\)/.exec(decoded)?.[1]
+    expect(sourcePayload).toBeDefined()
+    const nativeSource = Buffer.from(sourcePayload!, 'base64').toString('utf8')
+    expect(nativeSource).toContain('psi.Arguments=')
+    expect(nativeSource).not.toContain('ArgumentList')
   })
+
+  test.skipIf(process.platform !== 'win32')('Windows Cursor Job wrapper preserves quoted, empty, Unicode and metacharacter argv without PowerShell parsing', async () => {
+    const profileRootPath = path.join(tempDir, 'windows-argv-profile')
+    const probe = path.join(tempDir, 'argv-probe.js')
+    await writeFile(probe, 'process.stdout.write(JSON.stringify(process.argv.slice(2)))')
+    const bridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath, {
+      USERPROFILE: tempDir,
+      PATH: path.dirname(process.execPath),
+      CURSOR_AGENT_EXECUTABLE: process.execPath,
+    }, 'win32')
+    const argv = ['', 'space value', '雪☃', '"quoted"', 'a&b', 'dollar$semi;pipe|caret^percent%', 'trailing\\']
+    const run = Bun.spawnSync([bridge.cursorAgentExecutablePath, probe, ...argv], {
+      env: { ...process.env, PATH: path.dirname(process.execPath), USERPROFILE: tempDir, HOME: tempDir },
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(run.exitCode, new TextDecoder().decode(run.stderr)).toBe(0)
+    // The probe is the executable's first ordinary argument; every following
+    // value must arrive byte-for-byte as one argv element and never as syntax.
+    expect(JSON.parse(new TextDecoder().decode(run.stdout))).toEqual(argv)
+  }, 60_000)
 
   test('prepares only Kiro native credentials for a Kiro-scoped profile', async () => {
     const calls: string[] = []
@@ -3634,6 +3760,32 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
         },
       },
     })
+  })
+
+  test('resolves an lm-studio persisted alias through canonical scoped seeding and authority lookup', async () => {
+    const projectPath = path.join(tempDir, 'lm-studio-alias-scope')
+    await mkdir(projectPath, { recursive: true })
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath,
+      purpose: 'catalog',
+      selectedModel: 'lm-studio/local-model',
+      env: {
+        ...process.env,
+        CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT: JSON.stringify({
+          provider: {
+            'lm-studio': {
+              options: { baseURL: 'http://127.0.0.1:1234/v1' },
+              models: { 'local-model': {} },
+            },
+          },
+        }),
+      },
+    })
+    expect(scope.providerId).toBe('lmstudio')
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const config = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}')
+    expect(config.provider.lmstudio.models['local-model']).toEqual({})
+    expect(config.provider['lm-studio']).toBeUndefined()
   })
 
   test('does not let an alias provider key replace an exact local allowlist', () => {

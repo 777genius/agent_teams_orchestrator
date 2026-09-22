@@ -4,8 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  drainStartupTaskkills,
-  hasPendingStartupTaskkill,
+  buildExactProcessTreeSpawn,
   isProcessAlive,
   killProcessTreeForStartup,
   readProcessStartTimeMs,
@@ -13,8 +12,8 @@ import {
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
 
 // Run this file on Windows without platform overrides or process/identity mocks.
-// A single leaf is intentional: this proves native taskkill and admission/drain,
-// not descendant enumeration or the synthetic delayed-helper-close scenario.
+// A single leaf is intentional: it uses the production launch-bound Job and
+// its native termination receipt, not a PID-only taskkill approximation.
 const nativeTest = process.platform === 'win32' ? test : test.skip
 const QUERY_MS = 6_000
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
@@ -36,12 +35,14 @@ async function bounded<T>(promise: Promise<T>, ms: number, label: string): Promi
 type Owned = {
   name: string
   child: ChildProcess
+  agentPid: number | null
+  osIdentity: string
   closed: Promise<void>
   didClose: boolean
   birth: number | null
 }
 
-nativeTest('native startup taskkill drains, preserves other births and refuses wrong birth', async () => {
+nativeTest('native launch-bound Windows Job termination preserves other births and refuses wrong birth', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'opencode-startup-native-'))
   const owned: Owned[] = []
   const manifest = join(directory, 'owned-processes.json')
@@ -53,15 +54,17 @@ nativeTest('native startup taskkill drains, preserves other births and refuses w
   async function start(name: string): Promise<Owned> {
     const profile = join(directory, name)
     await mkdir(profile)
-    const child = spawn(process.execPath, [join(directory, 'fixture.cjs')], {
+    const launch = buildExactProcessTreeSpawn(process.execPath, [join(directory, 'fixture.cjs')], {
       cwd: profile,
       env: { ...process.env, HOME: profile, USERPROFILE: profile, APPDATA: profile,
         LOCALAPPDATA: profile, TEMP: profile, TMP: profile },
       stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true,
-    })
+    }, 'win32')
+    const child = spawn(launch.command, launch.args, launch.options)
     // Track before any await; even readiness/identity/manifest failure owns cleanup.
-    const entry: Owned = { name, child, birth: null, didClose: false, closed: Promise.resolve() }
+    const entry: Owned = { name, child, agentPid: null, osIdentity: launch.osIdentity,
+      birth: null, didClose: false, closed: Promise.resolve() }
     owned.push(entry)
     entry.closed = new Promise(resolve => child.once('close', () => {
       entry.didClose = true
@@ -75,13 +78,16 @@ nativeTest('native startup taskkill drains, preserves other births and refuses w
       child.once('close', () => reject(new Error(`${name} closed before ready`)))
       child.stdout!.on('data', chunk => {
         output = (output + chunk.toString()).slice(-256)
-        if (output.includes(`READY ${child.pid}\n`)) resolve()
+        const ready = /READY (\d+)\r?\n/.exec(output)
+        if (ready) { entry.agentPid = Number(ready[1]); resolve() }
       })
     }), 10_000, `${name} readiness`)
     entry.birth = await readProcessStartTimeMs(child.pid!, 'win32', QUERY_MS)
     expect(entry.birth).not.toBeNull()
     expect(Number.isFinite(entry.birth)).toBe(true)
     expect(entry.didClose).toBe(false)
+    expect(entry.agentPid).toBeNumber()
+    expect(entry.osIdentity).toStartWith('win32-job:')
     await saveManifest()
     return entry
   }
@@ -90,6 +96,7 @@ nativeTest('native startup taskkill drains, preserves other births and refuses w
     expect(entry.didClose).toBe(false)
     expect(isProcessAlive(entry.child.pid!)).toBe(true)
     expect(await readProcessStartTimeMs(entry.child.pid!, 'win32', QUERY_MS)).toBe(entry.birth)
+    expect(isProcessAlive(entry.agentPid!)).toBe(true)
   }
 
   try {
@@ -105,20 +112,22 @@ process.stdout.write('READY ' + process.pid + '\\n');
     const sentinel = await start('sentinel')
     const target = await start('target')
     const result = await bounded(killProcessTreeForStartup(target.child.pid!, target.birth!,
-      new OpenCodeStartupCleanupBudget(Date.now() + 30_000)), 20_000, 'native termination')
-    await bounded(drainStartupTaskkills(), 10_000, 'startup drain')
-    expect(result).toEqual({ helperTerminated: true, rootGone: true, treeKillSucceeded: true })
-    expect(hasPendingStartupTaskkill(target.child.pid!)).toBe(false)
+      new OpenCodeStartupCleanupBudget(Date.now() + 30_000), {
+        expectedOsIdentity: target.osIdentity,
+      }), 20_000, 'native termination')
+    // The Job terminator returns the production containment receipt directly;
+    // this fixture intentionally does not exercise the obsolete taskkill drain.
+    expect(result).toEqual({ helperTerminated: false, rootGone: true, treeKillSucceeded: true })
     await bounded(target.closed, 5_000, 'target close')
     expect(isProcessAlive(target.child.pid!)).toBe(false)
     await stillSame(sentinel)
 
     const fresh = await start('after-drain')
     const refused = await bounded(killProcessTreeForStartup(sentinel.child.pid!, sentinel.birth! + 60_000,
-      new OpenCodeStartupCleanupBudget(Date.now() + 30_000)), 20_000, 'wrong-birth refusal')
-    await bounded(drainStartupTaskkills(), 10_000, 'refusal drain')
-    expect(refused).toEqual({ helperTerminated: true, rootGone: false, treeKillSucceeded: false })
-    expect(hasPendingStartupTaskkill(sentinel.child.pid!)).toBe(false)
+      new OpenCodeStartupCleanupBudget(Date.now() + 30_000), {
+        expectedOsIdentity: sentinel.osIdentity,
+      }), 20_000, 'wrong-birth refusal')
+    expect(refused).toEqual({ helperTerminated: false, rootGone: false, treeKillSucceeded: false })
     // Observe beyond the helper's 2.5s timeout plus 1s observation window.
     await pause(4_000)
     await stillSame(sentinel)

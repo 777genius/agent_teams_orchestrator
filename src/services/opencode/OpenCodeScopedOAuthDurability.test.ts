@@ -269,6 +269,7 @@ describe('scoped OAuth native durability integration', () => {
         getConfig: async () => structuredClone(profile.managedConfig),
         listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME!),
         createSession: async () => ({ id: 'owned-session' }),
+        deleteSession: async () => true,
         getSessionMessages: async () => nativeCalls && submittedMessageId ? [
           { info: { id: submittedMessageId, role: 'user' }, parts: [] },
           { info: { id: 'reply', role: 'assistant', parentID: submittedMessageId,

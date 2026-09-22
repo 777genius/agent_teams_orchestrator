@@ -83,6 +83,29 @@ function readNumberOption(args: string[], name: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
+async function runHostedControlFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'hosted-control' || hasHelpOption(args)) return false
+  if (!feature('HOSTED_CONTROL')) {
+    throw new Error('Hosted control is not included in this build')
+  }
+  if (args.length !== 1) throw new Error('Hosted control accepts no options')
+  const { runHostedControlFromDescriptors } = await import('../services/hostedControl/HostedControlMain.js')
+  await runHostedControlFromDescriptors()
+  return true
+}
+
+async function runHostedControlSocketBrokerFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== '--hosted-control-socket-broker') return false
+  if (!feature('HOSTED_CONTROL')) {
+    throw new Error('Hosted control is not included in this build')
+  }
+  const { runHostedControlSocketBroker } = await import(
+    '../services/hostedControl/HostedControlSocketBroker.js'
+  )
+  await runHostedControlSocketBroker(args.slice(1))
+  return true
+}
+
 function parseOpenCodeCommandOptions(args: string[]): {
   input: string
   json?: boolean
@@ -222,9 +245,18 @@ async function main(): Promise<void> {
     return
   }
 
+  if (await runHostedControlSocketBrokerFastPath(args)) {
+    return
+  }
+
   // For all other paths, load the startup profiler
   const { profileCheckpoint } = await import('../utils/startupProfiler.js')
   profileCheckpoint('cli_entry')
+
+  if (await runHostedControlFastPath(args)) {
+    profileCheckpoint('cli_hosted_control_path')
+    return
+  }
 
   if (
     args[0] === 'runtime' &&

@@ -75,6 +75,12 @@ const fullExperimentalFeatures = [
   'VOICE_MODE',
 ] as const
 
+const productionFeatures = ['HOSTED_CONTROL'] as const
+const devFullFeatures = [
+  ...fullExperimentalFeatures,
+  ...productionFeatures,
+] as const
+
 function runCommand(cmd: string[]): string | null {
   const proc = Bun.spawnSync({
     cmd,
@@ -105,13 +111,15 @@ function getVersionChangelog(): string {
   )
 }
 
-const defaultFeatures = ['VOICE_MODE']
+const defaultFeatures = dev
+  ? ['VOICE_MODE']
+  : ['VOICE_MODE', ...productionFeatures]
 const featureSet = new Set(defaultFeatures)
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i]
   if (arg === '--feature-set' && args[i + 1]) {
     if (args[i + 1] === 'dev-full') {
-      for (const feature of fullExperimentalFeatures) {
+      for (const feature of devFullFeatures) {
         featureSet.add(feature)
       }
     }
@@ -119,7 +127,7 @@ for (let i = 0; i < args.length; i += 1) {
     continue
   }
   if (arg === '--feature-set=dev-full') {
-    for (const feature of fullExperimentalFeatures) {
+    for (const feature of devFullFeatures) {
       featureSet.add(feature)
     }
     continue
@@ -133,7 +141,17 @@ for (let i = 0; i < args.length; i += 1) {
     featureSet.add(arg.slice('--feature='.length))
   }
 }
+for (const feature of productionFeatures) {
+  if (featureSet.has(feature) && featureSet.has('UDS_INBOX')) {
+    throw new Error('HOSTED_CONTROL and UDS_INBOX cannot own the same UDS listener')
+  }
+}
 const features = [...featureSet]
+
+if (args.includes('--print-build-plan')) {
+  console.log(JSON.stringify({ compile, dev, features }))
+  process.exit(0)
+}
 
 const outfile = compile
   ? dev

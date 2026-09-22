@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { readdir, readFile, rm, rmdir, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
-import { writeFileAtomic } from '../../utils/atomicWrite.js'
+import { writeFileAtomic, type AtomicWriteContext } from '../../utils/atomicWrite.js'
 import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
@@ -62,6 +62,8 @@ export type CursorAgentAttributionRecord = {
   startTimeToleranceMs: number
   /** Exact OS birth: proc:<Linux ticks> or epoch:<Windows/macOS native milliseconds>. */
   nativeStartToken: string | null
+  /** Per-agent containment identity; never inherited from the OpenCode host. */
+  processOsIdentity?: string | null
   /** The exact `--workspace` argv element, never a re-parsed command line. */
   workspacePath: string | null
   cwd: string | null
@@ -70,6 +72,12 @@ export type CursorAgentAttributionRecord = {
   runtimeVersion: string | null
   writtenAtMs: number
   exitedAtMs: number | null
+  /**
+   * The root has exited, but its children may have been reparented.  This is
+   * retained evidence, not a stale-record hint: only a reaper's whole-tree
+   * termination receipt may remove it.
+   */
+  retainedRootExited?: boolean
 }
 
 export type OpenCodeHostAttributionOwner = {
@@ -210,6 +218,8 @@ export async function writeHostAttributionRecord(input: {
   projectPath: string
   owners: readonly OpenCodeHostAttributionOwner[]
   now?: () => Date
+  /** The same command authority that will publish the registry entry. */
+  context?: AtomicWriteContext
 }): Promise<void> {
   if (!isProcessAttributionId(input.attributionId) || !Number.isSafeInteger(input.hostPid)) {
     return
@@ -239,7 +249,10 @@ export async function writeHostAttributionRecord(input: {
     ),
     updatedAt: now.toISOString(),
   }
-  await writeFileAtomic(recordPath, JSON.stringify(record), { mode: 0o600 })
+  await writeFileAtomic(recordPath, JSON.stringify(record), {
+    mode: 0o600,
+    context: input.context,
+  })
 }
 
 /**
@@ -397,6 +410,7 @@ function parseAgentAttributionRecord(
       startedAtMs,
       startTimeToleranceMs: clampStartTimeToleranceMs(source.startTimeToleranceMs),
       nativeStartToken: asOptionalString(source.nativeStartToken),
+      processOsIdentity: asOptionalString(source.processOsIdentity),
       workspacePath: asOptionalString(source.workspacePath),
       cwd: asOptionalString(source.cwd),
       appInstanceId: asOptionalString(source.appInstanceId),
@@ -404,6 +418,7 @@ function parseAgentAttributionRecord(
       runtimeVersion: asOptionalString(source.runtimeVersion),
       writtenAtMs,
       exitedAtMs: asOptionalFiniteNumber(source.exitedAtMs),
+      retainedRootExited: source.retainedRootExited === true || source.exitedAtMs !== null,
     },
   }
 }
@@ -605,8 +620,11 @@ async function judgeAgentRecord(
   record: CursorAgentAttributionRecord,
   judge: AgentJudge,
 ): Promise<'live' | 'stale'> {
-  // The process said it was leaving and could not remove its own record.
-  if (record.exitedAtMs !== null) return 'stale'
+  // A root exit is not proof that its tree died.  Children can outlive and be
+  // reparented before a reader observes this file. Keep the attribution until
+  // the reconciler has an exact termination receipt; age is never authority
+  // to delete it.
+  if (record.retainedRootExited || record.exitedAtMs !== null) return 'live'
   const liveness = judge.liveness(record.pid)
   if (liveness === 'dead') return 'stale'
   if (liveness === 'unknown') return judge.expired(record.writtenAtMs) ? 'stale' : 'live'
@@ -785,6 +803,10 @@ export function buildCursorAgentAttributionPreloadScript(): string {
     '      startedAtMs: startedAtMs,',
     `      startTimeToleranceMs: ${PROCESS_ATTRIBUTION_START_TIME_TOLERANCE_MS},`,
     '      nativeStartToken: nativeStartToken,',
+    // A third-party Cursor launch cannot safely borrow the host Job.  The
+    // launch wrapper may provide a separate, opaque per-agent identity; an
+    // absent value deliberately makes Windows reaping partial/fail-closed.
+    '      processOsIdentity: process.env.AGENT_TEAMS_CURSOR_AGENT_OS_IDENTITY || null,',
     '      workspacePath: workspacePath,',
     '      cwd: process.cwd(),',
     `      appInstanceId: process.env[${JSON.stringify(APP_INSTANCE_ID_ENV)}] || null,`,
@@ -792,6 +814,7 @@ export function buildCursorAgentAttributionPreloadScript(): string {
     `      runtimeVersion: process.env[${JSON.stringify(PROCESS_ATTRIBUTION_RUNTIME_VERSION_ENV)}] || null,`,
     '      writtenAtMs: Date.now(),',
     '      exitedAtMs: null,',
+    '      retainedRootExited: false,',
     '    }',
     "    const recordDirectory = nodePath.join(directory, 'v1', 'agents', attributionId)",
     "    const recordPath = nodePath.join(recordDirectory, process.pid + '-' + startedAtMs + '.json')",
@@ -812,6 +835,7 @@ export function buildCursorAgentAttributionPreloadScript(): string {
     "        if (error && error.code === 'ENOENT') return",
     '        try {',
     '          record.exitedAtMs = Date.now()',
+    '          record.retainedRootExited = true',
     "          fs.writeFileSync(recordPath, JSON.stringify(record), { encoding: 'utf8', mode: 0o600 })",
     '        } catch (writeError) { /* the reader validates liveness anyway */ }',
     '      }',

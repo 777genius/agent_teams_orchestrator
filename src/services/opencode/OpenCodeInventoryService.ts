@@ -1,10 +1,16 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
+import type { ChildProcess } from 'node:child_process'
 
 import { getCwd } from '../../utils/cwd.js'
 import * as lockfile from '../../utils/lockfile.js'
-import { killProcessTreeAndWait } from '../../utils/processKill.js'
+import {
+  buildExactProcessTreeSpawn,
+  captureProcessTreeIdentity,
+  killProcessTreeAndWait,
+  readProcessStartTimeMs,
+} from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { gte } from '../../utils/semver.js'
 import {
@@ -85,6 +91,7 @@ export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
 export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
+const OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS = 2_500
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
@@ -315,6 +322,13 @@ function stripOneFinalNewline(value: string): string {
   return value.replace(/\r?\n$/, '')
 }
 
+export function signalSpawnedOpenCodeChildBestEffort(
+  child: Pick<ChildProcess, 'pid' | 'kill'>,
+  signal: NodeJS.Signals,
+): boolean {
+  return Boolean(child.pid) && child.kill(signal)
+}
+
 export function execOpenCodePortableCommand(input: {
   binaryPath: string
   args: string[]
@@ -328,6 +342,15 @@ export function execOpenCodePortableCommand(input: {
     let settled = false
     let stopping = false
     let child: ReturnType<typeof spawnPortableCli> | null = null
+    let stdoutListener: ((chunk: Buffer) => void) | null = null
+    let stderrListener: ((chunk: Buffer) => void) | null = null
+    // Do not ever turn a PID into cleanup authority by itself.  This promise
+    // is created while the direct child is still ours and carries both the
+    // immutable birth value and the platform tree boundary into cancellation.
+    let childTreeIdentity: Promise<{
+      startedAtMs: number
+      osIdentity: string
+    } | null> | null = null
     const timeoutMs = input.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS
 
     const finish = (result: OpenCodeCommandResult): void => {
@@ -344,6 +367,44 @@ export function execOpenCodePortableCommand(input: {
       })
     }
 
+    const detachOwnedPipes = (): string | null => {
+      const ownedChild = child
+      if (!ownedChild) return null
+      try {
+        if (stdoutListener) ownedChild.stdout?.removeListener('data', stdoutListener)
+        if (stderrListener) ownedChild.stderr?.removeListener('data', stderrListener)
+        // A cancelled probe owns these pipes. Leaving either stream flowing
+        // retains the event loop and can keep a completed timeout looking live.
+        ownedChild.stdout?.destroy()
+        ownedChild.stderr?.destroy()
+        ownedChild.stdin?.destroy()
+        return null
+      } catch (cause) {
+        return cause instanceof Error ? cause.message : String(cause)
+      }
+    }
+
+    const waitForOwnedChildClose = async (ownedChild: ReturnType<typeof spawnPortableCli>): Promise<boolean> => {
+      return new Promise(resolve => {
+        let done = false
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        const finishWait = (closed: boolean) => {
+          if (done) return
+          done = true
+          if (timeout) clearTimeout(timeout)
+          ownedChild.removeListener('close', onClose)
+          ownedChild.removeListener('error', onError)
+          resolve(closed)
+        }
+        const onClose = () => finishWait(true)
+        const onError = () => finishWait(false)
+        ownedChild.once('close', onClose)
+        ownedChild.once('error', onError)
+        timeout = setTimeout(() => finishWait(false), OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS)
+        timeout.unref?.()
+      })
+    }
+
     const stopChildAndFinish = (error: string): void => {
       if (settled || stopping) {
         return
@@ -352,21 +413,67 @@ export function execOpenCodePortableCommand(input: {
       clearTimeout(timeout)
       input.abortSignal?.removeEventListener('abort', abort)
 
-      const pid = child?.pid
-      if (!pid) {
+      const ownedChild = child
+      const pipeError = detachOwnedPipes()
+      if (!ownedChild?.pid) {
         finish({
           ...snapshotOutput(),
           code: 1,
-          error,
+          error: pipeError ? `${error}; failed to close owned probe pipes: ${pipeError}` : error,
         })
         return
       }
 
-      void killProcessTreeAndWait(pid, 'SIGKILL').finally(() => {
+      // Inventory has not yet handed this process to another owner. The
+      // process-tree killer deliberately rejects PID-only authority, so wait
+      // for the spawn-time birth and tree identity before asking it to signal
+      // anything. A failed capture is a safe no-op rather than a signal to a
+      // reused PID.
+      void (async () => {
+        let identityTimeout: ReturnType<typeof setTimeout> | undefined
+        const identity = await Promise.race([
+          childTreeIdentity ?? Promise.resolve(null),
+          new Promise<null>(resolve => {
+            identityTimeout = setTimeout(resolve, OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS, null)
+            identityTimeout.unref?.()
+          }),
+        ]).finally(() => {
+          if (identityTimeout) clearTimeout(identityTimeout)
+        })
+        let terminationDetail: string | null
+        if (!identity) {
+          const closed = await waitForOwnedChildClose(ownedChild)
+          terminationDetail = closed
+            ? 'spawn identity was unavailable, but the owned child closed during bounded cleanup'
+            : 'spawn identity was unavailable and the owned child/tree may still be running'
+        } else {
+          try {
+            const terminated = await killProcessTreeAndWait(ownedChild.pid, 'SIGKILL', {
+              timeoutMs: OPEN_CODE_PROBE_PROCESS_TERMINATION_TIMEOUT_MS,
+              expectedStartedAtMs: identity.startedAtMs,
+              expectedOsIdentity: identity.osIdentity,
+            })
+            terminationDetail = terminated
+              ? null
+              : 'owned child tree termination could not be confirmed'
+          } catch (cause) {
+            terminationDetail = `owned child tree termination failed: ${
+              cause instanceof Error ? cause.message : String(cause)
+            }`
+          }
+        }
         finish({
           ...snapshotOutput(),
           code: 1,
-          error,
+          error: `${error}${terminationDetail ? `; ${terminationDetail}` : ''}${pipeError ? `; failed to close owned probe pipes: ${pipeError}` : ''}`,
+        })
+      })().catch(cause => {
+        finish({
+          ...snapshotOutput(),
+          code: 1,
+          error: `${error}; owned child cleanup failed: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }${pipeError ? `; failed to close owned probe pipes: ${pipeError}` : ''}`,
         })
       })
     }
@@ -391,12 +498,25 @@ export function execOpenCodePortableCommand(input: {
     input.abortSignal?.addEventListener('abort', abort, { once: true })
 
     try {
-      child = spawnPortableCli(input.binaryPath, input.args, {
+      const exactSpawn = buildExactProcessTreeSpawn(input.binaryPath, input.args, {
         cwd: input.profile.projectPath,
         env: input.profile.env,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
+      child = spawnPortableCli(exactSpawn.command, exactSpawn.args, exactSpawn.options)
+      if (child.pid) {
+        childTreeIdentity = Promise.all([
+          readProcessStartTimeMs(child.pid),
+          exactSpawn.osIdentity === 'unix-pgid:pending'
+            ? captureProcessTreeIdentity(child.pid)
+            : Promise.resolve(exactSpawn.osIdentity),
+        ]).then(([startedAtMs, osIdentity]) => (
+          Number.isFinite(startedAtMs) && startedAtMs !== null && osIdentity
+            ? { startedAtMs, osIdentity }
+            : null
+        )).catch(() => null)
+      }
     } catch (error) {
       finish({
         ...snapshotOutput(),
@@ -406,8 +526,10 @@ export function execOpenCodePortableCommand(input: {
       return
     }
 
-    child.stdout?.on('data', chunk => stdout.push(Buffer.from(chunk)))
-    child.stderr?.on('data', chunk => stderr.push(Buffer.from(chunk)))
+    stdoutListener = chunk => stdout.push(Buffer.from(chunk))
+    stderrListener = chunk => stderr.push(Buffer.from(chunk))
+    child.stdout?.on('data', stdoutListener)
+    child.stderr?.on('data', stderrListener)
     child.once('error', error => {
       if (stopping) {
         return

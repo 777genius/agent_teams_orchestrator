@@ -32,7 +32,9 @@ import {
   isMemberBriefingToolName,
   shouldSkipBootstrapReadinessWait,
   shouldDeferPendingInboxDelivery,
+  preserveTeammateAfterTerminationFailure,
 } from './useInboxPoller.js'
+import type { AppState } from '../state/AppState.js'
 import {
   createAssistantAPIErrorMessage,
   createAssistantMessage,
@@ -48,6 +50,41 @@ import {
 import { QueryGuard } from '../utils/QueryGuard.js'
 
 describe('useInboxPoller queued mailbox meta prompt', () => {
+  test('failed shutdown keeps inbox member identity and adds retry state', () => {
+    const state = {
+      inbox: { messages: [] },
+      teamContext: {
+        teammates: {
+          'bob@alpha': {
+            name: 'bob',
+            processStartedAtMs: 100,
+            processOwnerToken: 'owner-token',
+            processRunId: 'run-a',
+          },
+        },
+      },
+    } as unknown as AppState
+
+    const next = preserveTeammateAfterTerminationFailure(state, {
+      teammateName: 'bob',
+      paneId: 'process:42',
+      processStartedAtMs: 100,
+      processOwnerToken: 'owner-token',
+      processRunId: 'run-a',
+    })
+
+    expect(next.teamContext?.teammates?.['bob@alpha']).toEqual(
+      state.teamContext?.teammates?.['bob@alpha'],
+    )
+    expect(next.inbox.messages).toEqual([])
+    expect(next.teammateTerminationRecovery.bob).toMatchObject({
+        paneId: 'process:42',
+        processStartedAtMs: 100,
+        processOwnerToken: 'owner-token',
+        processRunId: 'run-a',
+    })
+  })
+
   test('detects bootstrap teammate mailbox instructions', () => {
     expect(
       isBootstrapMailboxInstructionText(

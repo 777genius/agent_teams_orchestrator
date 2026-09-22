@@ -332,7 +332,6 @@ async function runChild(root: string, requestId: string, mode: PersistentInvocat
     if (existing) {
       const ownerToken = await store.acquireMaterializationOwner(
         existing, attemptId, input.signal,
-        claim.kind === 'existing' ? claim.ownerToken : undefined,
       )
       if (!ownerToken) throw new Error('fake resume reservation unavailable')
       const expectedBootstrap = input.expectedBootstrapForSession(existing.opencodeSessionId)

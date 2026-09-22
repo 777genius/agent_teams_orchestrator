@@ -88,6 +88,7 @@ test('materialized selected sessions preserve sealed authority across repeated s
         getConfig: async () => { reads += 1; return liveConfig },
         listAgents: async () => { agentReads += 1; return effectiveAgentsFixture(profile.managedConfig, profile.env.XDG_DATA_HOME) },
         createSession: async () => { sessionsCreated += 1; return { id: 'selected-session' } },
+        deleteSession: async () => true,
         getSessionMessages: async () => { messageReads += 1; return [] },
         getSessionStatus: async () => ({}), getPermissions: async () => [],
         promptSessionAsync: async () => { prompts += 1 },

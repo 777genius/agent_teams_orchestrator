@@ -197,14 +197,17 @@ export function buildCursorReadinessFingerprint(input: {
   authority: CursorNativeAuthority
   assetsFingerprint: string
   profileScopeToken: string
-  /** Already covers the selected model, provider options and App MCP config. */
+  /** Exact fingerprint of the managed config written into this profile. */
   managedConfigFingerprint: string
+  /** Separately binds the managed MCP section, not a host aggregate. */
+  managedMcpConfigFingerprint: string
   proxyPort: number
 }): string {
   for (const [name, value] of Object.entries({
     assetsFingerprint: input.assetsFingerprint,
     profileScopeToken: input.profileScopeToken,
     managedConfigFingerprint: input.managedConfigFingerprint,
+    managedMcpConfigFingerprint: input.managedMcpConfigFingerprint,
   })) {
     if (typeof value !== 'string' || value.trim().length === 0) {
       throw new Error(`Cursor readiness fingerprint requires ${name}`)
@@ -221,6 +224,7 @@ export function buildCursorReadinessFingerprint(input: {
     input.assetsFingerprint,
     input.profileScopeToken,
     input.managedConfigFingerprint.trim(),
+    input.managedMcpConfigFingerprint.trim(),
     input.proxyPort,
   ]))
 }

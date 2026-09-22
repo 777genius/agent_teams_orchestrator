@@ -260,7 +260,12 @@ import {
   isTeamLead,
 } from './teammate.js'
 import { isInProcessTeammate } from './teammateContext.js'
-import { removeTeammateFromTeamFile } from './swarm/teamHelpers.js'
+import { readTeamFileAsync, removeTeammateFromTeamFileIfIdentityMatches } from './swarm/teamHelpers.js'
+import { killProcessBackendRuntime } from './swarm/processBackend.js'
+import { ensureBackendsRegistered, getBackendByType } from './swarm/backends/registry.js'
+import { isInsideTmux } from './swarm/backends/detection.js'
+import { isPaneBackend } from './swarm/backends/types.js'
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from './teammateTermination.js'
 import { unassignTeammateTasks } from './tasks.js'
 import { getCompanionIntroAttachment } from '../buddy/prompt.js'
 
@@ -3821,12 +3826,7 @@ export async function getTeammateMailboxAttachments(
     }
   }
 
-  const attachment: Attachment[] = [
-    {
-      type: 'teammate_mailbox',
-      messages: allMessages,
-    },
-  ]
+  const handledShutdownApprovals = new Set<(typeof allMessages)[number]>()
   const fileBackedRegularMessagesToFinalize = fileBackedRegularMessages.filter(
     message => message.messageKind !== 'member_work_sync_nudge',
   )
@@ -3847,20 +3847,6 @@ export async function getTeammateMailboxAttachments(
     )
   }
 
-  if (
-    fileBackedProtocolMessages.length > 0 &&
-    shouldFinalizeFileBackedProtocolMessages
-  ) {
-    await markMessagesAsReadByIds(
-      agentName,
-      fileBackedProtocolMessages.map(message => message.messageId),
-      teamName,
-    )
-    logForDebugging(
-      `[MailboxBridge] marked ${fileBackedProtocolMessages.length} file-backed protocol message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
-    )
-  }
-
   // Process shutdown_approved messages - remove teammates from team file
   // This mirrors what useInboxPoller does in interactive mode (lines 546-606)
   // In -p mode, useInboxPoller doesn't run, so we must handle this here
@@ -3868,6 +3854,12 @@ export async function getTeammateMailboxAttachments(
     for (const m of allMessages) {
       const shutdownApproval = isShutdownApproved(m.text)
       if (shutdownApproval) {
+        if (shutdownApproval.from !== m.from) {
+          logForDebugging(
+            `[SwarmMailbox] Ignoring shutdown approval whose claimed sender ${shutdownApproval.from} does not match mailbox sender ${m.from}`,
+          )
+          continue
+        }
         const teammateToRemove = shutdownApproval.from
         logForDebugging(
           `[SwarmMailbox] Processing shutdown_approved from ${teammateToRemove}`,
@@ -3875,17 +3867,129 @@ export async function getTeammateMailboxAttachments(
 
         // Find the teammate ID by name
         const teammateId = appState.teamContext?.teammates
-          ? Object.entries(appState.teamContext.teammates).find(
+          ? (Object.entries(appState.teamContext.teammates) as Array<[string, { name?: string }]>).find(
               ([, t]) => t.name === teammateToRemove,
             )?.[0]
           : undefined
 
         if (teammateId) {
+          const teammate = (await readTeamFileAsync(teamName))?.members.find(
+            member => member.agentId === teammateId,
+          )
+          if (!teammate || teammate.name !== m.from) continue
+          if (teammate?.outstandingShutdownRequestId !== shutdownApproval.requestId) {
+            continue
+          }
+          const messagePaneId = shutdownApproval.paneId?.trim()
+          const persistedPaneId = teammate?.tmuxPaneId?.trim()
+          if (
+            messagePaneId !== persistedPaneId ||
+            shutdownApproval.backendType !== teammate.backendType
+          ) {
+            logForDebugging(
+              `[SwarmMailbox] Ignoring shutdown approval with substituted runtime binding for ${teammateToRemove}`,
+            )
+            continue
+          }
+          const paneId = persistedPaneId
+          const isProcessRuntime =
+            shutdownApproval.backendType === 'process' ||
+            Boolean(messagePaneId?.startsWith('process:')) ||
+            Boolean(persistedPaneId?.startsWith('process:'))
+          if (isProcessRuntime) {
+            const approvedOwnerToken = shutdownApproval.processOwnerToken?.trim()
+            const approvedRunId = shutdownApproval.processRunId?.trim()
+            const identityMatches =
+              paneId !== undefined &&
+              (messagePaneId === undefined ||
+                persistedPaneId === undefined ||
+                messagePaneId === persistedPaneId) &&
+              Number.isFinite(shutdownApproval.processStartedAtMs) &&
+              shutdownApproval.processStartedAtMs === teammate?.processStartedAtMs &&
+              shutdownApproval.processOsIdentity === teammate?.processOsIdentity &&
+              approvedOwnerToken !== undefined &&
+              approvedOwnerToken === teammate?.processOwnerToken &&
+              approvedRunId !== undefined &&
+              approvedRunId === teammate?.processRunId
+            const terminated = identityMatches
+              ? await killProcessBackendRuntime(paneId!, {
+                  expectedAgentId: teammateId,
+                  teamName,
+                  expectedStartedAtMs: shutdownApproval.processStartedAtMs,
+                  expectedOsIdentity: shutdownApproval.processOsIdentity,
+                  expectedOwnerToken: approvedOwnerToken,
+                  expectedRunId: approvedRunId,
+                }).catch(() => false)
+              : false
+            if (!terminated) {
+              await persistTeammateTerminationRecovery(teamName, teammateId, {
+                teammateName: teammateToRemove,
+                requestId: shutdownApproval.requestId,
+                paneId,
+                processStartedAtMs: shutdownApproval.processStartedAtMs,
+                processOsIdentity: shutdownApproval.processOsIdentity,
+                processOwnerToken: shutdownApproval.processOwnerToken,
+                processRunId: shutdownApproval.processRunId,
+              })
+              toolUseContext.setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                teammateName: teammateToRemove,
+                requestId: shutdownApproval.requestId,
+                paneId,
+                processStartedAtMs: shutdownApproval.processStartedAtMs,
+                processOsIdentity: shutdownApproval.processOsIdentity,
+                processOwnerToken: shutdownApproval.processOwnerToken,
+                processRunId: shutdownApproval.processRunId,
+              }))
+              continue
+            }
+          } else if (paneId && teammate?.backendType && isPaneBackend(teammate.backendType)) {
+            await ensureBackendsRegistered()
+            const terminated = Boolean(await getBackendByType(teammate.backendType).killPane(
+              paneId,
+              !(await isInsideTmux()),
+            ).catch(() => false))
+            if (!terminated) {
+              await persistTeammateTerminationRecovery(teamName, teammateId, {
+                teammateName: teammateToRemove,
+                requestId: shutdownApproval.requestId,
+                paneId,
+                detail: 'Pane termination was not confirmed.',
+              })
+              toolUseContext.setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                teammateName: teammateToRemove,
+                requestId: shutdownApproval.requestId,
+                paneId,
+                detail: 'Pane termination was not confirmed.',
+              }))
+              continue
+            }
+          } else {
+            await persistTeammateTerminationRecovery(teamName, teammateId, {
+              teammateName: teammateToRemove,
+              requestId: shutdownApproval.requestId,
+              paneId,
+              detail: 'Runtime type is unavailable; termination cannot be confirmed.',
+            })
+            toolUseContext.setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+              teammateName: teammateToRemove,
+              requestId: shutdownApproval.requestId,
+              paneId,
+              detail: 'Runtime type is unavailable; termination cannot be confirmed.',
+            }))
+            continue
+          }
           // Remove from team file
-          await removeTeammateFromTeamFile(teamName, {
+          const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
             agentId: teammateId,
-            name: teammateToRemove,
+            paneId: teammate.tmuxPaneId,
+            processStartedAtMs: teammate.processStartedAtMs,
+            processOsIdentity: teammate.processOsIdentity,
+            processOwnerToken: teammate.processOwnerToken,
+            processRunId: teammate.processRunId,
+            spawnClaimToken: teammate.spawnClaimToken,
+            spawnClaimRunId: teammate.spawnClaimRunId,
           })
+          if (!removed) continue
           logForDebugging(
             `[SwarmMailbox] Removed ${teammateToRemove} from team file`,
           )
@@ -3912,9 +4016,23 @@ export async function getTeammateMailboxAttachments(
               },
             }
           })
+          handledShutdownApprovals.add(m)
         }
       }
     }
+  }
+
+  // Structured rows are finalized only after their side effects above have
+  // either succeeded or durably published a termination-recovery record.
+  if (
+    fileBackedProtocolMessages.length > 0 &&
+    shouldFinalizeFileBackedProtocolMessages
+  ) {
+    await markMessagesAsReadByIds(
+      agentName,
+      fileBackedProtocolMessages.map(message => message.messageId),
+      teamName,
+    )
   }
 
   // Mark AppState inbox messages as processed LAST, after attachment is built
@@ -3956,7 +4074,12 @@ export async function getTeammateMailboxAttachments(
     }))
   }
 
-  return attachment
+  const modelFacingMessages = allMessages.filter(
+    message => !handledShutdownApprovals.has(message),
+  )
+  return modelFacingMessages.length > 0
+    ? [{ type: 'teammate_mailbox', messages: modelFacingMessages }]
+    : []
 }
 
 /**

@@ -1,16 +1,11 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { isDeepStrictEqual } from 'node:util'
 
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { withTimeout } from '../../utils/sleep.js'
-import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
-import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
-import {
-  classifyOpenCodeProviderFailure,
-  isOpenCodeUsageLimitFailureMessage,
-} from './OpenCodeProviderFailureClassification.js'
 import {
   openCodeCursorNativeFailureProbe,
   type OpenCodeCursorNativeProbeResult,
@@ -23,13 +18,13 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
-import { readOpenCodeAuthCredential, withOpenCodeOAuthRefreshLock, type OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
+import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
+import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import {
   ensureOpenCodeNativeCliCredentialBridge,
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
-  resolveOpenCodeProfileScope,
 } from './OpenCodeProfileManager.js'
 import {
   type OpenCodePhaseContext,
@@ -55,6 +50,10 @@ const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
 const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 120_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
+const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 40_000
+const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
+const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
+const OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS = 300_000
 const OPEN_CODE_EXECUTION_PROMPT_START_TIMEOUT_MS = 5_000
 const OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS = 5_000
 const OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS = 150
@@ -70,8 +69,10 @@ const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
 const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
-  hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
-    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease' | 'releaseHostLease'>>
+  hostManager?: Pick<
+    typeof openCodeHostManager,
+    'ensureHost' | 'releaseHost' | 'releaseHostLease'
+  >
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (
@@ -94,24 +95,28 @@ type OpenCodeExecutionProbeDeps = {
   cursorNativeFailureProbe?: Pick<typeof openCodeCursorNativeFailureProbe, 'probe'>
 }
 
+type ProbeCacheFile = {
+  version: 1
+  expiresAtMs: number
+  result: OpenCodeExecutionProbeResult
+}
+
+type PersistentProbeCachePaths = {
+  cacheFilePath: string
+  lockDirPath: string
+}
+
 type ProbeModelParams = {
-  // Private readiness handoff after settled, successful owned native execution.
-  onOwnedOAuthProbeSuccess?: (owner: OpenCodeOAuthNativeProbeOwner) => void
   selectedModel: string
   projectPath?: string | null
-  scopeEnvironment?: NodeJS.ProcessEnv
   prompt?: string
   expectedOutput?: string
+  requireExactOutput?: boolean
   contextTokens?: number
   outputTokens?: number
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
-  runtimeDeadline?: Pick<
-    OpenCodeRuntimeDeadline,
-    'signal' | 'remainingMs' | 'throwIfExpired' | 'runPhase'
-  >
-  requireExactOutput?: boolean
-  cleanupSuccessfulSession?: boolean
+  runtimeDeadline?: OpenCodeRuntimeDeadline
   cursorNativePreflightBeforeHost?: boolean
   cursorNativePreflightOnly?: boolean
 }
@@ -158,9 +163,6 @@ function hasCompletedAssistantResponseWithoutText(
 function getIdleMissingAssistantMessageId(
   summary: OpenCodeSessionReconcileSummary,
 ): string | null {
-  // OpenCode 1.18.4 omits idle *and* in-flight entries from /session/status.
-  // Treat only an explicit idle as "generation finished". Omitted status plus
-  // reply_pending is still a live generate and must keep polling.
   if (
     summary.rawStatus !== 'idle'
     || summary.durableState !== 'reply_pending'
@@ -169,14 +171,6 @@ function getIdleMissingAssistantMessageId(
     return null
   }
   return summary.replyPendingSinceMessageId
-}
-
-function isSettledProbeAssistantTurn(summary: OpenCodeSessionReconcileSummary): boolean {
-  if (summary.rawStatus === 'idle') return true
-  const latestAssistant = summary.messages.find(message =>
-    message.id === summary.latestAssistantMessageId && message.role === 'assistant',
-  )
-  return Boolean(latestAssistant && hasCompletedOpenCodeAssistantTurn(latestAssistant))
 }
 
 function statusIsRunning(value: unknown): boolean {
@@ -228,16 +222,6 @@ function parseProviderScopedModel(selectedModel: string): {
   }
 }
 
-function getObservedAssistantModel(
-  summary: OpenCodeSessionReconcileSummary,
-): { providerId: string; modelId: string } | null {
-  const assistant = [...summary.messages]
-    .reverse()
-    .find(message => message.id === summary.latestAssistantMessageId && message.role === 'assistant')
-  if (!assistant?.providerId || !assistant.modelId) return null
-  return { providerId: assistant.providerId, modelId: assistant.modelId }
-}
-
 export function resolveOpenCodeExecutionProbeContextTokens(selectedModel: string): number {
   return selectedModel.startsWith('cursor-acp/') || selectedModel.startsWith('kiro/')
     ? OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT
@@ -259,28 +243,10 @@ function buildDurationMs(startedAtMs: number): number {
 function isProbeSuccessOutput(value: string | null | undefined): boolean {
   return /\bPONG\b/i.test(value?.trim() ?? '')
 }
-
-export function canonicalizeProbeOutput(value: string): string {
-  return value.trim().replace(/[^A-Za-z0-9]/g, '')
-}
-
-export function probeOutputMatchesExpected(
-  value: string | null | undefined,
-  expectedOutput: string,
-  requireExactOutput: boolean,
-): boolean {
+export function canonicalizeProbeOutput(value: string): string { return value.trim().replace(/[^A-Za-z0-9]/g, '') }
+export function probeOutputMatchesExpected(value: string | null | undefined, expectedOutput: string, requireExactOutput: boolean): boolean {
   const normalized = value?.trim() ?? ''
-  return requireExactOutput
-    ? canonicalizeProbeOutput(normalized) === canonicalizeProbeOutput(expectedOutput)
-    : isProbeSuccessOutput(normalized)
-}
-
-function isExpectedProbeOutput(
-  value: string | null | undefined,
-  expectedOutput: string,
-  requireExactOutput: boolean,
-): boolean {
-  return probeOutputMatchesExpected(value, expectedOutput, requireExactOutput)
+  return requireExactOutput ? canonicalizeProbeOutput(normalized) === canonicalizeProbeOutput(expectedOutput) : isProbeSuccessOutput(normalized)
 }
 
 function normalizeFailureMessage(value: string): string {
@@ -289,6 +255,18 @@ function normalizeFailureMessage(value: string): string {
     return 'OpenCode model execution probe failed'
   }
   return trimmed
+}
+
+function isUsageLimitFailureMessage(lower: string): boolean {
+  return lower.includes('too many requests')
+    || /\b(?:rate|usage)[\s_-]*limit(?:error)?\b/.test(lower)
+    || /\bresource[\s_-]*exhausted(?:error)?\b/.test(lower)
+    || /\bfree[\s_-]*usage[\s_-]*(?:limit|exceeded)(?:error)?\b/.test(lower)
+    || /\bquota[\s_-]*exceeded(?:error)?\b/.test(lower)
+    || /\bgrpc[\s_-]*code["']?\s*[:=]\s*["']?8\b/.test(lower)
+    || /^\s*(?:error\s*[:=-]?\s*)?429\b/m.test(lower)
+    || /\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|error(?:[\s_-]*code)?|code)["']?\s*(?::|=|is|of)?\s*["']?429\b/.test(lower)
+    || /\b429\s+(?:too many requests|rate limit(?:ed)?|resource exhausted)\b/.test(lower)
 }
 
 function extractJsonMessage(value: string): string | null {
@@ -332,19 +310,58 @@ export function classifyProbeFailure(params: {
   message: string
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
   const reason = normalizeFailureMessage(params.message)
-  const kind = classifyOpenCodeProviderFailure(reason)
-  if (kind === 'not_authenticated') {
-    return {
-      outcome: 'not_authenticated',
-      reason,
-    }
-  }
-  if (kind === 'unavailable') {
+  const lower = reason.toLowerCase()
+
+  // Provider quota markers are more specific than an accompanying HTTP 401/403.
+  // Some gateways wrap RESOURCE_EXHAUSTED in a generic forbidden response.
+  if (isUsageLimitFailureMessage(lower)) {
     return {
       outcome: 'unavailable',
       reason,
     }
   }
+
+  if (
+    lower.includes('token refresh failed')
+    || lower.includes('authentication failed')
+    || lower.includes('authentication required')
+    || lower.includes('auth failed')
+    || lower.includes('not logged in')
+    || lower.includes('please run \'agent login\'')
+    || lower.includes('please run `kiro-cli login`')
+    || lower.includes('cursor_api_key')
+    || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
+    || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
+    || lower.includes('unauthorized')
+    || lower.includes('forbidden')
+    || /\b401\b/.test(lower)
+    || /\b403\b/.test(lower)
+  ) {
+    return {
+      outcome: 'not_authenticated',
+      reason,
+    }
+  }
+
+  if (
+    lower.includes('model is not supported')
+    || lower.includes('model not supported')
+    || lower.includes('unsupported model')
+    || lower.includes('model not available')
+    || lower.includes('model unavailable')
+    || lower.includes('model is no longer available')
+    || (lower.includes('model') && lower.includes('no longer available to new users'))
+    || lower.includes('model not found')
+    || lower.includes('unknown model')
+    || lower.includes('invalid model')
+    || lower.includes('not available for your account')
+  ) {
+    return {
+      outcome: 'unavailable',
+      reason,
+    }
+  }
+
   return {
     outcome: 'unknown',
     reason,
@@ -356,15 +373,35 @@ function buildCursorNativeExecutionOutcome(input: {
   selectedModel: string
   prompt: string
   expectedOutput: string
+  requireExactOutput?: boolean
   startedAtMs: number
   diagnostics: Set<string>
 }): OpenCodeExecutionProbeResult | null {
   const { nativeResult, diagnostics } = input
-  if (nativeResult?.outcome === 'available') {
+  // The native Cursor preflight proves account/model availability but does
+  // not return the request nonce.  It must never stand in for an exact output
+  // proof used by strict launch.
+  if (nativeResult?.outcome === 'available' && !input.requireExactOutput) {
     diagnostics.add(
-      `Cursor native execution probe completed in ${nativeResult.durationMs}ms without canonical assistant provider/model evidence`,
+      `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
     )
-    return null
+    return {
+      providerId: 'opencode',
+      modelId: input.selectedModel,
+      probePrompt: input.prompt,
+      expectedOutput: input.expectedOutput,
+      outcome: 'available',
+      reason: null,
+      durationMs: buildDurationMs(input.startedAtMs),
+      rawStatus: null,
+      durableState: 'idle',
+      latestAssistantText: null,
+      latestAssistantPreview: null,
+      toolCallCount: 0,
+      errorCount: 0,
+      diagnostics: Array.from(diagnostics),
+      verifiedAt: new Date().toISOString(),
+    }
   }
 
   if (nativeResult?.outcome !== 'failure') return null
@@ -394,7 +431,7 @@ function buildCursorNativeExecutionOutcome(input: {
 
 function knownFailureMessagePriority(message: string | null): number {
   if (!message) return 0
-  if (isOpenCodeUsageLimitFailureMessage(message.toLowerCase())) return 3
+  if (isUsageLimitFailureMessage(message.toLowerCase())) return 3
   const classified = classifyProbeFailure({ message })
   if (classified.outcome === 'not_authenticated') return 2
   if (classified.outcome === 'unavailable') return 1
@@ -475,10 +512,7 @@ function extractNestedKnownFailureMessage(value: unknown, depth = 0): string | n
   }
   for (const key of ['statusCode', 'status_code', 'httpStatus', 'http_status']) {
     const candidate = record[key]
-    if (candidate === 401 || candidate === '401' || candidate === 403 || candidate === '403') {
-      const providerMessage = extractNestedErrorMessage(record)
-      consider(`HTTP ${candidate}${providerMessage ? `: ${providerMessage}` : ''}`)
-    } else if (candidate === 429 || candidate === '429') {
+    if (candidate === 429 || candidate === '429') {
       consider('HTTP 429')
     } else {
       consider(extractNestedKnownFailureMessage(candidate, depth + 1))
@@ -522,6 +556,19 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
   return null
 }
 
+function buildProbeCacheKey(params: ProbeModelParams): string {
+  return [
+    params.projectPath?.trim() || '<default-project>',
+    params.selectedModel.trim(),
+    params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT,
+    params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT,
+    String(params.contextTokens ?? ''),
+    String(params.outputTokens ?? ''),
+    params.cursorNativePreflightBeforeHost === true ? 'native-before-host' : 'host-first',
+    params.cursorNativePreflightOnly === true ? 'native-only' : 'opencode-fallback',
+  ].join('\u0000')
+}
+
 function cloneProbeResult(result: OpenCodeExecutionProbeResult): OpenCodeExecutionProbeResult {
   return {
     ...result,
@@ -529,8 +576,147 @@ function cloneProbeResult(result: OpenCodeExecutionProbeResult): OpenCodeExecuti
   }
 }
 
+function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number {
+  if (result.outcome === 'available') {
+    return OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS
+  }
+  const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
+  if (result.outcome === 'unavailable' && isUsageLimitFailureMessage(lower)) {
+    return OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS
+  }
+  return 0
+}
+
+function hashProbeCacheKey(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function buildPersistentProbeCacheKey(cacheKey: string, host: OpenCodeHostHandle): string {
+  // The resolved host config contains runtime-only values that can change when
+  // the app MCP attachment or a local provider proxy is refreshed. The managed
+  // config/auth fingerprints already cover durable launch inputs, so including
+  // the resolved fingerprint made a successful wizard probe invisible to the
+  // later teammate launch process.
+  return [
+    cacheKey,
+    host.profile.profileRootKey,
+    host.profile.projectBehaviorFingerprint,
+    host.profile.managedAuthFingerprint ?? 'no-auth',
+    host.profile.managedConfigFingerprint,
+    host.version ?? 'unknown-version',
+  ].join('\u0000')
+}
+
+function getPersistentProbeCachePaths(
+  params: {
+    cacheKey: string
+    host: OpenCodeHostHandle
+    rootDir?: string
+  },
+): PersistentProbeCachePaths {
+  const rootDir = params.rootDir?.trim()
+    || path.join(params.host.profile.profileRootPath, '.agent-teams-cache')
+  const cacheDir = path.join(rootDir, 'execution-probes')
+  const keyHash = hashProbeCacheKey(buildPersistentProbeCacheKey(params.cacheKey, params.host))
+  return {
+    cacheFilePath: path.join(cacheDir, `${keyHash}.json`),
+    lockDirPath: path.join(cacheDir, `${keyHash}.lock`),
+  }
+}
+
+function isProbeCacheFile(value: unknown): value is ProbeCacheFile {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const record = value as Record<string, unknown>
+  const result = record.result as Partial<OpenCodeExecutionProbeResult> | undefined
+  if (!result || typeof result !== 'object') {
+    return false
+  }
+  return (
+    record.version === 1
+    && typeof record.expiresAtMs === 'number'
+    && Number.isFinite(record.expiresAtMs)
+    && result.providerId === 'opencode'
+    && typeof result.modelId === 'string'
+    && (result.outcome === 'available'
+      || result.outcome === 'unavailable'
+      || result.outcome === 'not_authenticated'
+      || result.outcome === 'unknown')
+    && Array.isArray(result.diagnostics)
+  )
+}
+
+async function readPersistentProbeCache(
+  cacheFilePath: string,
+): Promise<OpenCodeExecutionProbeResult | null> {
+  try {
+    const parsed = JSON.parse(await readFile(cacheFilePath, 'utf8')) as unknown
+    if (!isProbeCacheFile(parsed)) {
+      return null
+    }
+    if (parsed.expiresAtMs <= nowMs()) {
+      await rm(cacheFilePath, { force: true }).catch(() => undefined)
+      return null
+    }
+    return cloneProbeResult(parsed.result)
+  } catch {
+    return null
+  }
+}
+
+async function writePersistentProbeCache(
+  cacheFilePath: string,
+  result: OpenCodeExecutionProbeResult,
+  ttlMs: number,
+): Promise<void> {
+  if (ttlMs <= 0) {
+    return
+  }
+  const cacheFile: ProbeCacheFile = {
+    version: 1,
+    expiresAtMs: nowMs() + ttlMs,
+    result: cloneProbeResult(result),
+  }
+  await writeFileAtomic(cacheFilePath, `${JSON.stringify(cacheFile)}\n`)
+}
+
 export class OpenCodeExecutionProbe {
+  private readonly inFlightProbes = new Map<string, {
+    promise: Promise<OpenCodeExecutionProbeResult>
+    deadlineAtMs: number | null
+  }>()
+  private readonly probeCache = new Map<
+    string,
+    { expiresAtMs: number, result: OpenCodeExecutionProbeResult }
+  >()
+
   constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
+
+  /**
+   * Recovery must ask the live native endpoint, not infer completion from an
+   * auth-file change.  The receipt's message is the operation incarnation.
+   */
+  async isOwnedOAuthNativeProbeSettled(
+    owner: OpenCodeOAuthNativeProbeOwner,
+    _dataRoot?: string,
+    requireUnsubmitted = false,
+  ): Promise<boolean> {
+    if (!owner.baseUrl || !owner.sessionId || !owner.messageId || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0 || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0) return false
+    try {
+      const client = this.clientFactory.create(owner.baseUrl)
+      const [status, messages] = await Promise.all([
+        client.getSessionStatus(),
+        client.getSessionMessages(owner.sessionId, 200),
+      ])
+      const submitted = messages.some(message => message.info?.id === owner.messageId)
+      if (requireUnsubmitted) return !submitted && !statusIsRunning(status[owner.sessionId])
+      return submitted && !statusIsRunning(status[owner.sessionId])
+    } catch {
+      return false
+    }
+  }
 
   private async prepareProbeProfile(
     params: ProbeModelParams,
@@ -548,12 +734,6 @@ export class OpenCodeExecutionProbe {
         },
       ],
       ...(context ? { abortSignal: context.signal } : {}),
-      profileScope: await resolveOpenCodeProfileScope({
-        projectPath: params.projectPath,
-        purpose: 'execution_probe',
-        selectedModel: params.selectedModel,
-        env: params.scopeEnvironment,
-      }),
     }
     return this.deps.prepareProfile
       ? this.deps.prepareProfile(params.projectPath, options)
@@ -650,20 +830,18 @@ export class OpenCodeExecutionProbe {
     return this.deps.sleep ?? sleep
   }
 
+  private get persistentCacheEnabled() {
+    return this.deps.persistentCache ?? (this.deps.clientFactory == null)
+  }
+
   private runPhase<T>(
-    deadline: ProbeModelParams['runtimeDeadline'],
+    deadline: OpenCodeRuntimeDeadline | undefined,
     phase: OpenCodePhaseContext['phase'],
     operation: (context?: OpenCodePhaseContext) => Promise<T>,
-    host?: OpenCodeHostHandle,
   ): Promise<T> {
-    const invoke = (context?: OpenCodePhaseContext) => host && this.hostManager.withHostOperation
-      ? this.hostManager.withHostOperation(host, null, () => operation(context))
-      : operation(context)
-    // Admission belongs inside the deadline race: a timeout cannot release the
-    // pin while the underlying callback is still capable of dispatching.
     return deadline
-      ? deadline.runPhase(phase, context => invoke(context))
-      : invoke(undefined)
+      ? deadline.runPhase(phase, context => operation(context))
+      : operation(undefined)
   }
 
   private createClient(host: OpenCodeHostHandle, context?: OpenCodePhaseContext): OpenCodeClient {
@@ -791,9 +969,70 @@ export class OpenCodeExecutionProbe {
   }
 
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
-    // A generic probe key cannot prove the exact prepared host identity. Until
-    // that identity is available here, every proof is deliberately fresh.
-    return cloneProbeResult(await this.runProbeModel({ ...params, bypassCache: true }))
+    const cacheKey = buildProbeCacheKey(params)
+    let shouldRegisterInFlight = !params.bypassCache
+    if (!params.bypassCache) {
+      const cached = this.probeCache.get(cacheKey)
+      if (cached && cached.expiresAtMs > nowMs()) {
+        return cloneProbeResult(cached.result)
+      }
+      if (cached) {
+        this.probeCache.delete(cacheKey)
+      }
+
+      const inFlight = this.inFlightProbes.get(cacheKey)
+      if (inFlight) {
+        const callerDeadlineAtMs = params.runtimeDeadline
+          ? performance.now() + params.runtimeDeadline.remainingMs()
+          : null
+        const ownerDeadlineCoversCaller = inFlight.deadlineAtMs === null
+          || (
+            callerDeadlineAtMs !== null
+            && inFlight.deadlineAtMs + 5 >= callerDeadlineAtMs
+          )
+        if (ownerDeadlineCoversCaller) {
+          const joined = params.runtimeDeadline
+            ? this.runPhase(params.runtimeDeadline, 'execution_poll', () => inFlight.promise)
+            : inFlight.promise
+          return cloneProbeResult(await joined)
+        }
+        // A shorter owner deadline must not abort a caller with a longer (or
+        // unbounded) budget. Run independently without replacing the owner.
+        shouldRegisterInFlight = false
+      }
+    }
+
+    const request = this.runProbeModel({ ...params, cacheKey })
+      .then(result => {
+        if (!params.bypassCache) {
+          const ttlMs = getProbeResultCacheTtlMs(result)
+          if (ttlMs > 0) {
+            this.probeCache.set(cacheKey, {
+              expiresAtMs: nowMs() + ttlMs,
+              result: cloneProbeResult(result),
+            })
+          }
+        }
+        return result
+      })
+      .finally(() => {
+        if (
+          shouldRegisterInFlight
+          && this.inFlightProbes.get(cacheKey)?.promise === request
+        ) {
+          this.inFlightProbes.delete(cacheKey)
+        }
+      })
+
+    if (shouldRegisterInFlight) {
+      this.inFlightProbes.set(cacheKey, {
+        promise: request,
+        deadlineAtMs: params.runtimeDeadline
+          ? performance.now() + params.runtimeDeadline.remainingMs()
+          : null,
+      })
+    }
+    return cloneProbeResult(await request)
   }
 
   async probeModelOnHost(
@@ -812,10 +1051,13 @@ export class OpenCodeExecutionProbe {
       probeTimeoutMs: Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS),
       pollIntervalMs: Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS),
       diagnostics: new Set<string>(),
+      cacheFilePath: null,
     }))
   }
 
-  private async runProbeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
+  private async runProbeModel(params: ProbeModelParams & {
+    cacheKey?: string
+  }): Promise<OpenCodeExecutionProbeResult> {
     const startedAtMs = nowMs()
     const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
     const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
@@ -855,6 +1097,7 @@ export class OpenCodeExecutionProbe {
         selectedModel: params.selectedModel,
         prompt,
         expectedOutput,
+        requireExactOutput: params.requireExactOutput,
         startedAtMs,
         diagnostics,
       })
@@ -893,6 +1136,9 @@ export class OpenCodeExecutionProbe {
     const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
       promise: null,
     }
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      `model-probe-${params.selectedModel}`,
+    )
     let host: OpenCodeHostHandle
     try {
       host = await this.runPhase(params.runtimeDeadline, 'host_start', async context => {
@@ -910,16 +1156,11 @@ export class OpenCodeExecutionProbe {
                     resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
                 },
               ],
-              profileScope: await resolveOpenCodeProfileScope({
-                projectPath: params.projectPath,
-                purpose: 'execution_probe',
-                selectedModel: params.selectedModel,
-                env: params.scopeEnvironment,
-              }),
             },
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
             ...(context ? { abortSignal: context.signal } : {}),
             hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
+            lease: preflightLease,
           })
           if (context?.signal.aborted) {
             await this.hostManager.releaseHost(ensuredHost.hostKey).catch(() => undefined)
@@ -948,11 +1189,102 @@ export class OpenCodeExecutionProbe {
       }
       throw error
     }
-    const preflightLease = createOpenCodePreflightHostLeaseInput(
-      `model-probe-${params.selectedModel}`,
-    )
     try {
-      await this.hostManager.retainHostLease?.(host.hostKey, preflightLease)
+      const cachePaths = this.persistentCacheEnabled && !params.bypassCache
+        ? getPersistentProbeCachePaths({
+          cacheKey: params.cacheKey ?? buildProbeCacheKey(params),
+          host,
+          rootDir: this.deps.persistentCacheRoot,
+        })
+        : null
+      if (cachePaths) {
+        params.runtimeDeadline?.throwIfExpired('execution_submit')
+        const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
+        if (cached) {
+          return cached
+        }
+
+        const lockStaleMs = Math.max(
+          probeTimeoutMs,
+          OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS,
+          params.runtimeDeadline?.commandBudgetMs ?? 0,
+        ) + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS
+        const lockWaitMs = Math.min(
+          lockStaleMs,
+          params.runtimeDeadline?.remainingMs()
+            ?? probeTimeoutMs + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS,
+        )
+        const acquiredLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
+        if (!acquiredLock) {
+          const sharedResult = await this.waitForPersistentProbeResult(
+            cachePaths,
+            lockWaitMs,
+            params.runtimeDeadline,
+          )
+          if (sharedResult) {
+            return sharedResult
+          }
+
+          const retryLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
+          if (retryLock) {
+            try {
+              return await this.runProbeModelWithHost({
+                params,
+                host,
+                startedAtMs,
+                prompt,
+                expectedOutput,
+                probeTimeoutMs,
+                pollIntervalMs,
+                diagnostics,
+                cacheFilePath: cachePaths.cacheFilePath,
+              })
+            } finally {
+              await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
+                undefined
+              )
+            }
+          }
+
+          return {
+            providerId: 'opencode',
+            modelId: params.selectedModel,
+            probePrompt: prompt,
+            expectedOutput,
+            outcome: 'unknown',
+            reason: 'OpenCode selected model verification is already in progress',
+            durationMs: buildDurationMs(startedAtMs),
+            rawStatus: null,
+            durableState: 'unknown',
+            latestAssistantText: null,
+            latestAssistantPreview: null,
+            toolCallCount: 0,
+            errorCount: 0,
+            diagnostics: [
+              'OpenCode selected model verification is already in progress; retry shortly',
+            ],
+          }
+        } else {
+          try {
+            return await this.runProbeModelWithHost({
+              params,
+              host,
+              startedAtMs,
+              prompt,
+              expectedOutput,
+              probeTimeoutMs,
+              pollIntervalMs,
+              diagnostics,
+              cacheFilePath: cachePaths.cacheFilePath,
+            })
+          } finally {
+            await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
+              undefined
+            )
+          }
+        }
+      }
+
       return await this.runProbeModelWithHost({
         params,
         host,
@@ -962,6 +1294,7 @@ export class OpenCodeExecutionProbe {
         probeTimeoutMs,
         pollIntervalMs,
         diagnostics,
+        cacheFilePath: null,
       })
     } finally {
       await this.hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
@@ -969,6 +1302,64 @@ export class OpenCodeExecutionProbe {
         await this.hostManager.releaseHost(host.hostKey)
       }
     }
+  }
+
+  private async tryAcquirePersistentProbeLock(
+    cachePaths: PersistentProbeCachePaths,
+    staleMs: number,
+  ): Promise<boolean> {
+    try {
+      await mkdir(path.dirname(cachePaths.lockDirPath), { recursive: true })
+      await mkdir(cachePaths.lockDirPath)
+      return true
+    } catch (error) {
+      const code = (error as { code?: unknown }).code
+      if (code !== 'EEXIST') {
+        return false
+      }
+    }
+
+    try {
+      const lockStat = await stat(cachePaths.lockDirPath)
+      if (nowMs() - lockStat.mtimeMs > staleMs) {
+        await rm(cachePaths.lockDirPath, { recursive: true, force: true })
+        await mkdir(cachePaths.lockDirPath)
+        return true
+      }
+    } catch {
+      return false
+    }
+
+    return false
+  }
+
+  private async waitForPersistentProbeResult(
+    cachePaths: PersistentProbeCachePaths,
+    timeoutMs: number,
+    runtimeDeadline?: OpenCodeRuntimeDeadline,
+  ): Promise<OpenCodeExecutionProbeResult | null> {
+    runtimeDeadline?.throwIfExpired('execution_submit')
+    const deadlineMs = nowMs() + Math.min(
+      timeoutMs,
+      runtimeDeadline?.remainingMs() ?? timeoutMs,
+    )
+    while (nowMs() < deadlineMs) {
+      runtimeDeadline?.throwIfExpired('execution_submit')
+      const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
+      if (cached) {
+        return cached
+      }
+      try {
+        await stat(cachePaths.lockDirPath)
+      } catch {
+        return null
+      }
+      await this.sleep(
+        Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, Math.max(0, deadlineMs - nowMs())),
+      )
+    }
+    runtimeDeadline?.throwIfExpired('execution_submit')
+    return readPersistentProbeCache(cachePaths.cacheFilePath)
   }
 
   private async runProbeModelWithHost(input: {
@@ -980,21 +1371,7 @@ export class OpenCodeExecutionProbe {
     probeTimeoutMs: number
     pollIntervalMs: number
     diagnostics: Set<string>
-  }): Promise<OpenCodeExecutionProbeResult> {
-    return this.hostManager.withHostOperation
-      ? this.hostManager.withHostOperation(input.host, null, () => this.runProtectedProbeModelWithHost(input))
-      : this.runProtectedProbeModelWithHost(input)
-  }
-
-  private async runProtectedProbeModelWithHost(input: {
-    params: ProbeModelParams
-    host: OpenCodeHostHandle
-    startedAtMs: number
-    prompt: string
-    expectedOutput: string
-    probeTimeoutMs: number
-    pollIntervalMs: number
-    diagnostics: Set<string>
+    cacheFilePath: string | null
   }): Promise<OpenCodeExecutionProbeResult> {
     const providerId = parseProviderScopedModel(input.params.selectedModel).providerID
     if (providerId !== 'xai') {
@@ -1008,118 +1385,8 @@ export class OpenCodeExecutionProbe {
       authPath: input.host.profile.managedAuthPath,
       providerId,
       abortSignal: input.params.runtimeDeadline?.signal,
-      operation: async () => {
-        if (!input.host.profile.profileScope
-          || (await readOpenCodeAuthCredential({ authPath: input.host.profile.managedAuthPath, providerId }))?.type !== 'oauth') {
-          return this.runProbeModelWithHostUnlocked(input)
-        }
-        const hostIdentity = () => ({
-          hostKey: input.host.hostKey, baseUrl: input.host.baseUrl,
-          pid: input.host.pid, processStartedAtMs: input.host.processStartedAtMs,
-          profileRootKey: input.host.profileRootKey,
-        })
-        const expectedHost = hostIdentity()
-        let nativeOwner: OpenCodeOAuthNativeProbeOwner | undefined
-        let settled = false
-        const completion = await openCodeProfileManager.withOwnedOAuthRefresh({
-          profile: input.host.profile,
-          abortSignal: input.params.runtimeDeadline?.signal,
-          assertHostOwnership: async () => {
-            if (!isDeepStrictEqual(hostIdentity(), expectedHost)
-              || !expectedHost.processStartedAtMs
-              || await readProcessStartTimeMs(expectedHost.pid) !== expectedHost.processStartedAtMs) {
-              throw new Error('OpenCode OAuth execution host changed or process ownership is unavailable')
-            }
-          },
-          operation: async (_armSession, armProbe) => {
-            let result: OpenCodeExecutionProbeResult | undefined
-            let error: unknown
-            try {
-              result = await this.runProbeModelWithHostUnlocked({ ...input,
-                armOAuthNativeProbe: async (sessionId, messageId) => {
-                  nativeOwner = { ...expectedHost, processStartedAtMs: expectedHost.processStartedAtMs!,
-                    projectPath: input.host.profile.projectPath, scopeToken: input.host.profile.scopeToken!,
-                    profileRootKey: input.host.profile.profileRootKey, sessionId, messageId,
-                    selectedModel: input.params.selectedModel }
-                  await armProbe(nativeOwner)
-                },
-              })
-            } catch (caught) { error = caught }
-            if (!nativeOwner && error !== undefined) throw error
-            settled = !!nativeOwner && await this.isOwnedOAuthNativeProbeSettled(nativeOwner)
-            return { result, error }
-          },
-          isNativeSettled: () => settled,
-        })
-        if (completion.error !== undefined) throw completion.error
-        if (!completion.result) throw new Error('OpenCode OAuth execution probe produced no result')
-        const selected = parseProviderScopedModel(input.params.selectedModel)
-        if (settled && nativeOwner && completion.result.outcome === 'available'
-          && completion.result.observedProviderId === selected.providerID
-          && completion.result.observedModelId === selected.modelID) {
-          input.params.onOwnedOAuthProbeSuccess?.({ ...nativeOwner })
-        }
-        return completion.result
-      },
+      operation: () => this.runProbeModelWithHostUnlocked(input),
     })
-  }
-
-  /** Exact canonical terminal prompt under live or confirmed absent ownership. */
-  async isOwnedOAuthNativeProbeSettled(owner: OpenCodeOAuthNativeProbeOwner, recoveryDataRoot?: string, unsubmitted = false): Promise<boolean> {
-    if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0
-      || !Number.isFinite(owner.processStartedAtMs) || owner.processStartedAtMs <= 0
-      || !/^[a-f0-9]{64}$/.test(owner.scopeToken) || !owner.hostKey.includes(owner.scopeToken)
-      || !owner.sessionId || !owner.messageId || !owner.profileRootKey.startsWith('scope-')) return false
-    const url = new URL(owner.baseUrl)
-    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port
-      || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return false
-    const sameProcess = async () => await readProcessStartTimeMs(owner.pid) === owner.processStartedAtMs
-    const absent = () => {
-      try { process.kill(owner.pid, 0); return false }
-      catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH' }
-    }
-    const completedPrompt = (messages: OpenCodeMessage[]) => {
-      const model = parseProviderScopedModel(owner.selectedModel)
-      if (model.providerID !== 'xai') return false
-      const userPresent = messages.some(message => message.info?.id === owner.messageId && message.info?.role === 'user')
-      return userPresent && messages.some(message => {
-        const info = message.info
-        const completed = info.time && typeof info.time === 'object' && 'completed' in info.time
-          ? info.time.completed : undefined
-        return info.role === 'assistant' && info.parentID === owner.messageId
-          && info.providerID === model.providerID && info.modelID === model.modelID
-          && (typeof completed === 'number' && Number.isFinite(completed)
-            || !!info.error && typeof info.error === 'object')
-      })
-    }
-    if (!await sameProcess()) {
-      if (!recoveryDataRoot || !absent()) return false
-      const offline = await new OpenCodeOfflineSessionReader(recoveryDataRoot).readSession({
-        profileRootKey: owner.profileRootKey, projectPath: owner.projectPath, opencodeSessionId: owner.sessionId,
-      })
-      return offline?.historyShape === 'supported'
-        && offline.sessionIdentity?.sessionId === owner.sessionId
-        && offline.sessionIdentity.directory === owner.projectPath
-        && (unsubmitted
-          ? offline.historyComplete === true && !offline.messages.some(message => message.info?.id === owner.messageId || message.info?.parentID === owner.messageId)
-          : completedPrompt(offline.messages))
-        && absent()
-    }
-    if (unsubmitted) return false // Idle does not exclude an in-flight submission.
-    const client = this.clientFactory.create(owner.baseUrl)
-    const idle = async () => {
-      const statuses = await client.getSessionStatus()
-      if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses)) return false
-      // Native /session/status is sparse: v1.18.4 removes idle entries. Omission
-      // proves only idle; exact terminal history and process ownership below
-      // are still required. A failed read or malformed entry is not idle.
-      if (!Object.prototype.hasOwnProperty.call(statuses, owner.sessionId)) return true
-      const status = statuses[owner.sessionId]
-      return status === 'idle' || (typeof status === 'object' && status?.type === 'idle')
-    }
-    if (!await idle()) return false
-    const messages = await client.getSessionMessages(owner.sessionId)
-    return completedPrompt(messages) && await idle() && await sameProcess()
   }
 
   private async runProbeModelWithHostUnlocked(input: {
@@ -1131,7 +1398,7 @@ export class OpenCodeExecutionProbe {
     probeTimeoutMs: number
     pollIntervalMs: number
     diagnostics: Set<string>
-    armOAuthNativeProbe?: (sessionId: string, messageId: string) => Promise<void>
+    cacheFilePath: string | null
   }): Promise<OpenCodeExecutionProbeResult> {
     const {
       params,
@@ -1142,14 +1409,12 @@ export class OpenCodeExecutionProbe {
       probeTimeoutMs,
       pollIntervalMs,
       diagnostics,
+      cacheFilePath,
     } = input
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
-      // Scoped operations publish only their own native successor through the
-      // predecessor-bound owner surrounding the entire settled operation.
-      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai'
-        && !host.profile.profileScope) {
+      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
         await this.fanOutOAuthCredential({
           providerId: 'xai',
           sourceAuthPath: host.profile.managedAuthPath,
@@ -1159,32 +1424,14 @@ export class OpenCodeExecutionProbe {
           )
         })
       }
+      if (cacheFilePath) {
+        await writePersistentProbeCache(
+          cacheFilePath,
+          result,
+          getProbeResultCacheTtlMs(result),
+        ).catch(() => undefined)
+      }
       return result
-    }
-    const finishObservedAssistantResult = (
-      result: OpenCodeExecutionProbeResult,
-      summary: OpenCodeSessionReconcileSummary,
-    ): Promise<OpenCodeExecutionProbeResult> => {
-      const observed = getObservedAssistantModel(summary)
-      const selected = parseProviderScopedModel(params.selectedModel)
-      if (observed) {
-        result.observedProviderId = observed.providerId
-        result.observedModelId = observed.modelId
-      }
-      if (
-        !observed
-        || observed.providerId !== selected.providerID
-        || observed.modelId !== selected.modelID
-      ) {
-        const actual = observed
-          ? `"${observed.providerId}/${observed.modelId}"`
-          : 'unavailable'
-        result.outcome = 'unavailable'
-        result.reason = `OpenCode canonical assistant provider/model was ${actual}; expected "${params.selectedModel}"`
-        delete result.verifiedAt
-        result.diagnostics.push(result.reason)
-      }
-      return finish(result)
     }
 
     const nativeFailureProbe = this.cursorNativeFailureProbe
@@ -1207,6 +1454,7 @@ export class OpenCodeExecutionProbe {
         selectedModel: params.selectedModel,
         prompt,
         expectedOutput,
+        requireExactOutput: params.requireExactOutput,
         startedAtMs,
         diagnostics,
       })
@@ -1241,7 +1489,6 @@ export class OpenCodeExecutionProbe {
             parts: [{ type: 'text', text: prompt }],
           }
 
-          await input.armOAuthNativeProbe?.(session.id, messageID)
           try {
             await client.promptSessionAsync(session.id, probeMessage)
           } catch (error) {
@@ -1275,7 +1522,6 @@ export class OpenCodeExecutionProbe {
             }
           }
         },
-        host,
       )
 
       if (!submitted.started) {
@@ -1351,17 +1597,14 @@ export class OpenCodeExecutionProbe {
           || !nativeFailureProbe
         ) return
         nativeFailureAttempts += 1
-        const dispatch = () => nativeFailureProbe.probe({
+        nativeFailurePending = nativeFailureProbe.probe({
           selectedModel: params.selectedModel,
           // Quota/auth is account-scoped. Keep this auxiliary request out of
           // the user project so project rules and tools cannot affect it.
           projectPath: host.profile.tmpPath,
           env: host.profile.env,
           signal: nativeFailureController.signal,
-        })
-        nativeFailurePending = (this.hostManager.withHostOperation
-          ? this.hostManager.withHostOperation(host, null, dispatch)
-          : dispatch()).then(result => {
+        }).then(result => {
           if (!result) return
           if (result.outcome === 'available') {
             nativeProbeConclusive = true
@@ -1514,7 +1757,7 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'OpenCode original probe recovered before the auxiliary Cursor failure was applied',
               )
-              return finishObservedAssistantResult({
+              return finish({
                 providerId: 'opencode',
                 modelId: params.selectedModel,
                 probePrompt: prompt,
@@ -1530,7 +1773,7 @@ export class OpenCodeExecutionProbe {
                 errorCount: recovered.errorCount,
                 diagnostics: Array.from(diagnostics),
                 verifiedAt: new Date().toISOString(),
-              }, recovered)
+              })
             }
             diagnostics.add(
               `Cursor native failure probe confirmed a terminal provider error in ${nativeTerminalFailure.durationMs}ms`,
@@ -1719,22 +1962,13 @@ export class OpenCodeExecutionProbe {
 
           if (
             summary.durableState === 'idle'
-            && isSettledProbeAssistantTurn(summary)
             && (
-              isExpectedProbeOutput(
-                summary.latestAssistantText,
-                expectedOutput,
-                params.requireExactOutput === true,
-              )
-              || isExpectedProbeOutput(
-                summary.latestAssistantPreview,
-                expectedOutput,
-                params.requireExactOutput === true,
-              )
+              probeOutputMatchesExpected(summary.latestAssistantText, expectedOutput, params.requireExactOutput === true)
+              || probeOutputMatchesExpected(summary.latestAssistantPreview, expectedOutput, params.requireExactOutput === true)
             )
           ) {
             sessionRequiresCleanup = false
-            return finishObservedAssistantResult({
+            return finish({
               providerId: 'opencode',
               modelId: params.selectedModel,
               probePrompt: prompt,
@@ -1750,7 +1984,7 @@ export class OpenCodeExecutionProbe {
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
               verifiedAt: new Date().toISOString(),
-            }, summary)
+            })
           }
 
           const latestAssistantError = getLatestAssistantMessageError(
@@ -1838,8 +2072,7 @@ export class OpenCodeExecutionProbe {
             })
           }
           const shouldContinuePolling =
-            (!isSettledProbeAssistantTurn(summary)
-              || summary.durableState === 'running'
+            (summary.durableState === 'running'
               || summary.durableState === 'retrying'
               || summary.durableState === 'reply_pending'
               || (summary.durableState === 'idle' && !failureMessage)
@@ -1856,12 +2089,40 @@ export class OpenCodeExecutionProbe {
             continue
           }
 
-          if (failureMessage && isSettledProbeAssistantTurn(summary)) {
+          if (failureMessage) {
             const classified = classifyProbeFailure({ message: failureMessage })
             if (classified.outcome !== 'unknown') {
               diagnostics.add(
                 `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
               )
+            }
+            if (
+              summary.durableState === 'idle'
+              && classified.outcome === 'unknown'
+              && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
+              && params.requireExactOutput !== true
+            ) {
+              sessionRequiresCleanup = false
+              diagnostics.add(
+                'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
+              )
+              return finish({
+                providerId: 'opencode',
+                modelId: params.selectedModel,
+                probePrompt: prompt,
+                expectedOutput,
+                outcome: 'available',
+                reason: null,
+                durationMs: buildDurationMs(startedAtMs),
+                rawStatus: summary.rawStatus,
+                durableState: summary.durableState,
+                latestAssistantText: summary.latestAssistantText,
+                latestAssistantPreview: summary.latestAssistantPreview,
+                toolCallCount: summary.toolCallCount,
+                errorCount: summary.errorCount,
+                diagnostics: Array.from(diagnostics),
+                verifiedAt: new Date().toISOString(),
+              })
             }
 
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
@@ -1871,12 +2132,7 @@ export class OpenCodeExecutionProbe {
               probePrompt: prompt,
               expectedOutput,
               outcome: classified.outcome,
-              reason:
-                classified.outcome === 'unknown' && summary.durableState === 'idle'
-                  ? params.requireExactOutput === true
-                    ? 'OpenCode exact-model execution proof was mismatched'
-                    : 'OpenCode local-model execution proof was mismatched'
-                  : classified.reason,
+              reason: classified.reason,
               durationMs: buildDurationMs(startedAtMs),
               rawStatus: summary.rawStatus,
               durableState: summary.durableState,
@@ -1911,7 +2167,7 @@ export class OpenCodeExecutionProbe {
         nativeFailureController?.abort()
       })
     } finally {
-      if (sessionId && (sessionRequiresCleanup || params.cleanupSuccessfulSession === true)) {
+      if (sessionId && sessionRequiresCleanup) {
         await this.cleanupProbeSession(host, sessionId).catch(() => undefined)
       }
     }

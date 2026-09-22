@@ -26,7 +26,7 @@ function fixture() {
   const options = { deadline: Date.now() + 10000, guard: () => {}, profileScope: 'profile',
     pendingOAuth: async () => false, processLifetime: () => false,
     native: { platform: 'linux' as const, selfPid: 999, birth: async (pid: number) => pid === 100 ? 10 : 20,
-      tree: async () => [{ pid: 101, ppid: 100 }], signal: (pid: number) => { signals.push(pid) },
+      tree: async () => [{ pid: 101, ppid: 100 }], signalExact: async (pid: number) => { signals.push(pid); return true },
       alive: (pid: number) => signals.includes(pid) ? 'gone' as const : 'alive' as const } }
   const result: CursorAgentReapResult = { contractVersion: 1, status: 'kept', killedPids: [], diagnostics: [] }
   return { registry, host, records, signals, input, options, result }
@@ -151,16 +151,40 @@ test('real registry gate serializes durable admission with full termination', as
   }
 })
 
-test.each(['darwin', 'win32'] as const)('requires an exact recorded native epoch birth on %s', async platform => {
+test.each(['darwin', 'win32'] as const)('requires an exact launch-bound recorded native identity on %s', async platform => {
   for (const token of [null, 'epoch:19', 'epoch:20']) {
     const f = fixture()
     f.options.native.platform = platform as 'linux'
     f.records.hosts[0]!.record.hostStartTimeFormat = 'epoch-ms'
     f.records.agents[0]!.record.nativeStartToken = token
+    if (platform === 'darwin') f.records.agents[0]!.record.processOsIdentity = 'darwin-audit:launch-bound-token'
     if (platform === 'win32') {
-      Object.assign(f.options.native, { taskkill: async () => { f.signals.push(101) } })
+      f.records.agents[0]!.record.processOsIdentity = 'win32-agent-job:launch-bound-job'
+      let receivedIdentity: string | undefined
+      Object.assign(f.options.native, { terminateExactTree: async (_pid: number, _birth: number, _timeout: number, identity?: string) => {
+        receivedIdentity = identity
+        f.signals.push(101)
+        return true
+      } })
+      await reapCursorAgents(f.input, f.registry, f.records, f.options, f.result)
+      expect(f.signals).toEqual(token === 'epoch:20' ? [101] : [])
+      expect(receivedIdentity).toBe(token === 'epoch:20' ? 'win32-agent-job:launch-bound-job' : undefined)
+      continue
     }
     await reapCursorAgents(f.input, f.registry, f.records, f.options, f.result)
     expect(f.signals).toEqual(token === 'epoch:20' ? [101] : [])
   }
+})
+
+test('macOS refuses rapid PID reuse evidence when no launch-captured audit identity exists', async () => {
+  const f = fixture()
+  f.options.native.platform = 'darwin' as 'linux'
+  f.records.hosts[0]!.record.hostStartTimeFormat = 'epoch-ms'
+  f.records.agents[0]!.record.nativeStartToken = 'epoch:20'
+  // A current birth value can match a coarse timestamp after rapid PID reuse;
+  // it is deliberately not substituted for the audit token captured at launch.
+  f.records.agents[0]!.record.processOsIdentity = null
+  await reapCursorAgents(f.input, f.registry, f.records, f.options, f.result)
+  expect(f.signals).toEqual([])
+  expect(f.result.diagnostics.join(' ')).toContain('launch-captured audit identity')
 })

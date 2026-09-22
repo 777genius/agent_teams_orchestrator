@@ -76,9 +76,10 @@ export async function isInsideTmux(): Promise<boolean> {
 export async function createTeammatePaneInSwarmView(
   teammateName: string,
   teammateColor: AgentColorName,
+  onCreated?: (paneId: string) => Promise<void>,
 ): Promise<{ paneId: string; isFirstTeammate: boolean }> {
   const backend = await getBackend()
-  return backend.createTeammatePaneInSwarmView(teammateName, teammateColor)
+  return backend.createTeammatePaneInSwarmView(teammateName, teammateColor, onCreated)
 }
 
 /**

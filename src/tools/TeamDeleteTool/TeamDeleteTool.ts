@@ -7,6 +7,12 @@ import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { isPaneBackend } from '../../utils/swarm/backends/types.js'
+import {
+  buildProcessBackendPaneId,
+  getProcessBackendRuntimeState,
+  parseProcessBackendPid,
+} from '../../utils/swarm/processBackend.js'
 import {
   cleanupTeamDirectories,
   readTeamFile,
@@ -82,6 +88,20 @@ export const TeamDeleteTool: Tool<InputSchema, Output> = buildTool({
           m => m.name !== TEAM_LEAD_NAME,
         )
 
+        // A roster entry is the durable recovery handle for every runtime kind.
+        // Team deletion must never erase it merely because UI activity is idle:
+        // shutdown first has to confirm termination and remove the exact member.
+        if (nonLeadMembers.length > 0) {
+          const memberNames = nonLeadMembers.map(m => m.name).join(', ')
+          return {
+            data: {
+              success: false,
+              message: `Cannot cleanup team with ${nonLeadMembers.length} registered member(s): ${memberNames}. Use requestShutdown and wait for confirmed roster removal first.`,
+              team_name: teamName,
+            },
+          }
+        }
+
         // Separate truly active members from idle/dead ones
         // Members with isActive === false are idle (finished their turn or crashed)
         const activeMembers = nonLeadMembers.filter(m => m.isActive !== false)
@@ -92,6 +112,63 @@ export const TeamDeleteTool: Tool<InputSchema, Output> = buildTool({
             data: {
               success: false,
               message: `Cannot cleanup team with ${activeMembers.length} active member(s): ${memberNames}. Use requestShutdown to gracefully terminate teammates first.`,
+              team_name: teamName,
+            },
+          }
+        }
+
+        const processMembers = nonLeadMembers.filter(
+          member =>
+            member.backendType === 'process' ||
+            member.tmuxPaneId?.trim().startsWith('process:') ||
+            (typeof member.runtimePid === 'number' && member.runtimePid > 0),
+        )
+        for (const member of processMembers) {
+          const paneId =
+            member.tmuxPaneId?.trim() ||
+            (member.runtimePid
+              ? buildProcessBackendPaneId(member.runtimePid)
+              : undefined)
+          const pid = parseProcessBackendPid(paneId)
+          if (!pid) {
+            return {
+              data: {
+                success: false,
+                message: `Cannot cleanup team while ${member.name}'s process identity is incomplete. Retry shutdown or inspect the preserved team record.`,
+                team_name: teamName,
+              },
+            }
+          }
+          const runtimeState = await getProcessBackendRuntimeState(
+            pid,
+            member.agentId,
+            teamName,
+            {
+              expectedStartedAtMs: member.processStartedAtMs,
+              expectedOsIdentity: member.processOsIdentity,
+              expectedOwnerToken: member.processOwnerToken,
+              expectedRunId: member.processRunId,
+            },
+          )
+          if (runtimeState === 'confirmed' || runtimeState === 'legacy_unverifiable') {
+            return {
+              data: {
+                success: false,
+                message: `Cannot cleanup team while ${member.name}'s exact process termination is unconfirmed. Retry shutdown or inspect the preserved team record.`,
+                team_name: teamName,
+              },
+            }
+          }
+        }
+        const uncertainMembers = nonLeadMembers.filter(member =>
+          !processMembers.includes(member) &&
+          !(member.tmuxPaneId && member.backendType && isPaneBackend(member.backendType)),
+        )
+        if (uncertainMembers.length > 0) {
+          return {
+            data: {
+              success: false,
+              message: `Cannot cleanup team while runtime termination is unconfirmed for: ${uncertainMembers.map(member => member.name).join(', ')}.`,
               team_name: teamName,
             },
           }

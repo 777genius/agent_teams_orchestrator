@@ -162,7 +162,8 @@ describe('selected launch authority contract', () => {
     const g = fixture()
     const controller = new AbortController()
     const phaseContext: OpenCodePhaseContext = { phase: 'post_probe_refresh', signal: controller.signal,
-      remainingMs: () => 10000, throwIfExpired: () => { if (controller.signal.aborted) throw controller.signal.reason } }
+      remainingMs: () => 10000, throwIfExpired: () => { if (controller.signal.aborted) throw controller.signal.reason },
+      markLateEffectsSafelyIsolated: () => {} }
     let started!: () => void
     const entered = new Promise<void>(resolve => { started = resolve })
     let late!: (value: any) => void

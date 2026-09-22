@@ -23,6 +23,7 @@ import {
   TEAMMATE_STARTUP_READY_SENTINEL_ENV,
 } from '../startupReadySentinel.js'
 import { assignTeammateColor } from '../teammateLayoutManager.js'
+import { recordOutstandingShutdownRequest } from '../teamHelpers.js'
 import { isInsideTmux } from './detection.js'
 import type {
   PaneBackend,
@@ -338,6 +339,9 @@ export class PaneBackendExecutor implements TeammateExecutor {
       requestId: `shutdown-${agentId}-${Date.now()}`,
       from: 'team-lead',
       reason,
+    }
+    if (!(await recordOutstandingShutdownRequest(teamName, agentName, shutdownRequest.requestId))) {
+      return false
     }
 
     await writeToMailbox(

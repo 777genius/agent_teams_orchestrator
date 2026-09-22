@@ -1,3 +1,4 @@
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
@@ -8,6 +9,10 @@ import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
+import {
+  hostedApprovalRuntimeBindingFences,
+  type HostedApprovalRuntimeBindingMutationFence,
+} from '../hostedControl/HostedApprovalRuntimeBindingFence.js'
 
 import {
   matchesStopTarget, parseOpenCodeStopRequest, sameStopRequest, stopBinding,
@@ -16,7 +21,11 @@ import {
   type OpenCodeStopReconciliation, type OpenCodeStopData,
 } from './OpenCodeStopRecovery.js'
 
-import type { OpenCodeSessionRecord, OpenCodeSessionStopAuthority } from './types.js'
+import type {
+  OpenCodeSessionCleanupCapability,
+  OpenCodeSessionRecord,
+  OpenCodeSessionStopAuthority,
+} from './types.js'
 
 type SessionStoreShape = {
   schemaVersion: 1
@@ -24,9 +33,16 @@ type SessionStoreShape = {
   stopReceipts?: Record<string, OpenCodeStopReceipt>
   materializationClaims?: Record<string, string>
   materializationClaimRuns?: Record<string, string>
+  /** Process identity for an in-flight claim.  Unlike a committed owner this
+   * fences recovery before the remote session is made visible in `records`. */
+  materializationClaimProcesses?: Record<string, MaterializationOwnerProcessIdentity>
   materializationOwners?: Record<string, MaterializationOwnerToken>
   materializationOwnerVersions?: Record<string, number>
   materializationOwnerProcesses?: Record<string, MaterializationOwnerProcessIdentity>
+  /** A remote session exists but has not yet been committed to `records`.
+   * Keep its exact identity with the claim so a later owner can compensate it
+   * instead of creating a second, invisible remote session. */
+  materializationCompensations?: Record<string, MaterializationCompensation>
 }
 
 type LegacyMaterializationOwnerToken = Omit<MaterializationOwnerToken, 'version'>
@@ -35,13 +51,38 @@ type UpsertResult = 'created' | 'updated' | 'unchanged'
 export type MaterializationClaimResult =
   | { kind: 'claimed'; ownerToken: MaterializationOwnerToken }
   | { kind: 'already_owned' }
-  | { kind: 'existing'; record: OpenCodeSessionRecord; ownerToken?: MaterializationOwnerToken | null }
+  // Observing an existing record is deliberately non-owning.  An owner token
+  // authorizes writes and releases, so returning somebody else's token from a
+  // replay would turn an observation into a capability leak.
+  | { kind: 'existing'; record: OpenCodeSessionRecord }
   | { kind: 'owned_by_other' }
 
 export type MaterializationOwnerToken = {
   attemptId: string
   sessionId: string
   version: number
+}
+
+export type MaterializationCompensation = {
+  ownerToken: MaterializationOwnerToken
+  runId: string
+  hostKey: string
+  baseUrl: string
+  sessionId: string
+  recordedAt: string
+}
+
+/** A recovery-only capability.  Replacing the claim token with this token
+ * prevents its former launch owner from committing while DELETE is in flight. */
+export type MaterializationCompensationRecovery = MaterializationCompensation
+
+function isMaterializationCompensation(value: unknown): value is MaterializationCompensation {
+  if (!value || typeof value !== 'object') return false
+  const compensation = value as Partial<MaterializationCompensation>
+  return isMaterializationOwnerToken(compensation.ownerToken)
+    && typeof compensation.runId === 'string' && typeof compensation.hostKey === 'string'
+    && typeof compensation.baseUrl === 'string' && typeof compensation.sessionId === 'string'
+    && typeof compensation.recordedAt === 'string'
 }
 
 type MaterializationOwnerProcessIdentity = {
@@ -108,6 +149,7 @@ const LOCK_RETRY_OPTIONS = {
 const LOCK_OPTIONS = {
   retries: LOCK_RETRY_OPTIONS,
 }
+const MAX_EFFECT_STORE_BYTES = 16 * 1024 * 1024
 
 type OpenCodeSessionStoreDeps = {
   lock?: typeof lockfile.lock
@@ -131,6 +173,30 @@ function isMaterializationOwnerProcessIdentity(
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
   return `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}`
+}
+
+function matchesCleanupCapability(
+  record: OpenCodeSessionRecord,
+  capability: OpenCodeSessionCleanupCapability,
+): boolean {
+  return record.teamId === capability.teamId
+    && record.laneId === capability.laneId
+    && record.memberName === capability.memberName
+    && record.runId === capability.runId
+    && record.opencodeSessionId === capability.opencodeSessionId
+    && record.selectedModel === capability.selectedModel
+    && record.projectPath === capability.projectPath
+    && record.profileRootKey === capability.profileRootKey
+    && record.hostKey === capability.hostKey
+    && record.openCodeArtifactDigest === capability.openCodeArtifactDigest
+    && record.resolvedBehaviorFingerprint === capability.resolvedBehaviorFingerprint
+    && record.sourceAuthFingerprint === capability.sourceAuthFingerprint
+    && record.managedAuthFingerprint === capability.managedAuthFingerprint
+    && record.projectBehaviorFingerprint === capability.projectBehaviorFingerprint
+    && record.managedConfigFingerprint === capability.managedConfigFingerprint
+    && record.expectedBehaviorFingerprint === capability.expectedBehaviorFingerprint
+    && record.opencodeVersion === capability.opencodeVersion
+    && record.createdAt === capability.createdAt
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -268,8 +334,13 @@ export class OpenCodeSessionStore {
   private ownerProcessIdentityPromise?: Promise<MaterializationOwnerProcessIdentity | null>
   private readonly pendingLateLockReleases = new Set<Promise<void>>()
   private readonly pendingMaterializationReconciliations = new Set<Promise<unknown>>()
+  private readonly bindingMutationFence: HostedApprovalRuntimeBindingMutationFence
 
-  constructor(filePath?: string, deps: OpenCodeSessionStoreDeps = {}) {
+  constructor(
+    filePath?: string,
+    deps: OpenCodeSessionStoreDeps = {},
+    bindingMutationFence: HostedApprovalRuntimeBindingMutationFence = hostedApprovalRuntimeBindingFences,
+  ) {
     const paths = resolveClaudeMultimodelPaths()
     this.filePath = filePath ?? path.join(paths.data, 'opencode', 'session-store.json')
     this.lockPath = `${this.filePath}.lock`
@@ -282,6 +353,7 @@ export class OpenCodeSessionStore {
     this.onLateLockReleaseError = deps.onLateLockReleaseError ?? (error => {
       console.warn('[OpenCodeSessionStore] Late lock release failed after cancellation', error)
     })
+    this.bindingMutationFence = bindingMutationFence
   }
 
   private currentOwnerProcessIdentity(): Promise<MaterializationOwnerProcessIdentity | null> {
@@ -576,6 +648,64 @@ export class OpenCodeSessionStore {
     return store.records[buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })] ?? null
   }
 
+  /** Return a one-use proof that the persisted manual-approval session image is unchanged. */
+  async prepareEffectToken(
+    teamId: string,
+    laneId: string,
+    memberName: string,
+    expectedRecord: OpenCodeSessionRecord,
+  ): Promise<{ consume(): boolean } | null> {
+    const expectedImage = jsonStringify(expectedRecord)
+    let fd = -1
+    try {
+      fd = openSync(this.filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      const opened = fstatSync(fd)
+      const linked = lstatSync(this.filePath)
+      if (!opened.isFile() || !linked.isFile() || linked.isSymbolicLink() ||
+        opened.dev !== linked.dev || opened.ino !== linked.ino ||
+        opened.size < 2 || opened.size > MAX_EFFECT_STORE_BYTES ||
+        realpathSync(this.filePath) !== path.resolve(this.filePath)) return null
+      const raw = Buffer.alloc(opened.size)
+      if (readSync(fd, raw, 0, raw.length, 0) !== raw.length) return null
+      const parsed = JSON.parse(raw.toString('utf8')) as SessionStoreShape
+      const record = parsed.schemaVersion === 1
+        ? parsed.records?.[buildRecordKey({ teamId, laneId, memberName })]
+        : undefined
+      if (!record || record.toolApprovalMode !== 'manual' || jsonStringify(record) !== expectedImage) return null
+      const expectedStoreImage = raw.toString('utf8')
+      const identity = { dev: opened.dev, ino: opened.ino, size: opened.size }
+      const ownedFd = fd
+      fd = -1
+      let consumed = false
+      return { consume: () => {
+        if (consumed) return false
+        consumed = true
+        try {
+          const current = fstatSync(ownedFd)
+          const linkedBefore = lstatSync(this.filePath)
+          if (!current.isFile() || !linkedBefore.isFile() || linkedBefore.isSymbolicLink() ||
+            current.dev !== identity.dev || current.ino !== identity.ino ||
+            linkedBefore.dev !== identity.dev || linkedBefore.ino !== identity.ino ||
+            current.size !== identity.size || realpathSync(this.filePath) !== path.resolve(this.filePath)) return false
+          const currentRaw = Buffer.alloc(current.size)
+          const complete = readSync(ownedFd, currentRaw, 0, currentRaw.length, 0) === currentRaw.length
+          const linkedAfter = lstatSync(this.filePath)
+          return complete && linkedAfter.isFile() && !linkedAfter.isSymbolicLink() &&
+            linkedAfter.dev === identity.dev && linkedAfter.ino === identity.ino &&
+            realpathSync(this.filePath) === path.resolve(this.filePath) &&
+            currentRaw.toString('utf8') === expectedStoreImage
+        } catch { return false } finally { closeSync(ownedFd) }
+      } }
+    } catch {
+      return null
+    } finally {
+      // Validation failure is an ordinary result, not necessarily an
+      // exception. Keep the descriptor only after ownership moves into the
+      // one-use token (which sets fd to -1).
+      if (fd >= 0) closeSync(fd)
+    }
+  }
+
   async observeMaterialization(
     identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
     signal?: AbortSignal,
@@ -595,7 +725,7 @@ export class OpenCodeSessionStore {
       expectedRecord = structuredClone(expectedRecord)
       record = structuredClone(record)
     }
-    return this.withStoreLock(async () => {
+    return this.bindingMutationFence.withTeamBindingMutation(record.teamId, () => this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
@@ -631,7 +761,7 @@ export class OpenCodeSessionStore {
       store.records[key] = record
       await this.writeStore(store)
       return previous ? 'updated' : 'created'
-    })
+    }))
   }
 
   async claimMaterialization(
@@ -640,6 +770,7 @@ export class OpenCodeSessionStore {
     requestedRunId?: string,
     signal?: AbortSignal,
   ): Promise<MaterializationClaimResult> {
+    const claimProcessIdentity = await this.currentOwnerProcessIdentity()
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(identity)
@@ -665,7 +796,6 @@ export class OpenCodeSessionStore {
         return {
           kind: 'existing',
           record: existing,
-          ownerToken: store.materializationOwners?.[key] ?? null,
         }
       }
       store.materializationClaims ??= {}
@@ -684,6 +814,12 @@ export class OpenCodeSessionStore {
       if (normalizedRunId) {
         store.materializationClaimRuns ??= {}
         store.materializationClaimRuns[key] = normalizedRunId
+      }
+      if (claimProcessIdentity) {
+        store.materializationClaimProcesses ??= {}
+        store.materializationClaimProcesses[key] = claimProcessIdentity
+      } else if (store.materializationClaimProcesses) {
+        delete store.materializationClaimProcesses[key]
       }
       await this.writeStore(store)
       return { kind: 'claimed', ownerToken }
@@ -727,6 +863,10 @@ export class OpenCodeSessionStore {
       store.records[key] = record
       delete store.materializationClaims[key]
       if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
+      if (store.materializationClaimProcesses) delete store.materializationClaimProcesses[key]
+      // The remote id is now durably represented by the session record. It is
+      // no longer an uncommitted compensation obligation.
+      if (store.materializationCompensations) delete store.materializationCompensations[key]
       store.materializationOwners ??= {}
       store.materializationOwners[key] = committedOwner
       if (ownerProcessIdentity) {
@@ -737,6 +877,33 @@ export class OpenCodeSessionStore {
       }
       await this.writeStore(store)
       return committedOwner
+    }, signal)
+  }
+
+  /**
+   * Resolve an uncertain commit outcome without making a new write.  In
+   * particular, `withStoreLock` can reject while releasing its lock after the
+   * record has already been atomically written.  The caller must not delete
+   * that remote session unless this exact record, owner, and cleared claim
+   * state are absent together.
+   */
+  async reconcileMaterializationCommit(
+    record: OpenCodeSessionRecord,
+    ownerToken: MaterializationOwnerToken,
+    signal?: AbortSignal,
+  ): Promise<MaterializationOwnerToken | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const key = buildRecordKey(record)
+      const committedOwner = { ...ownerToken, sessionId: record.opencodeSessionId }
+      return jsonStringify(store.records[key]) === jsonStringify(record)
+        && ownerTokensEqual(store.materializationOwners?.[key], committedOwner)
+        && store.materializationClaims?.[key] === undefined
+        && store.materializationClaimRuns?.[key] === undefined
+        && store.materializationClaimProcesses?.[key] === undefined
+        && store.materializationCompensations?.[key] === undefined
+        ? committedOwner
+        : null
     }, signal)
   }
 
@@ -754,12 +921,21 @@ export class OpenCodeSessionStore {
       if (!existing || jsonStringify(existing) !== jsonStringify(record)) return null
       const owner = store.materializationOwners?.[key]
       if (owner !== undefined && !isMaterializationOwnerToken(owner)) return null
-      if (expectedOwnerToken === undefined
-        || (expectedOwnerToken !== null && !isMaterializationOwnerToken(expectedOwnerToken))) return null
+      if (expectedOwnerToken !== undefined
+        && expectedOwnerToken !== null && !isMaterializationOwnerToken(expectedOwnerToken)) return null
       if (expectedOwnerToken === null) {
         if (owner !== undefined) return null
-      } else {
+      } else if (expectedOwnerToken !== undefined) {
         if (!ownerTokensEqual(owner, expectedOwnerToken)) return null
+        const ownerIsActive = await this.materializationOwnerIsActive(
+          store.materializationOwnerProcesses?.[key],
+        )
+        if (signal?.aborted) throwOpenCodeAbortReason(signal)
+        if (ownerIsActive) return null
+      } else if (owner !== undefined) {
+        // This is the replay transfer path. It performs observation, liveness
+        // validation, and replacement under one store lock, so callers never
+        // receive the old owner's capability as an intermediate value.
         const ownerIsActive = await this.materializationOwnerIsActive(
           store.materializationOwnerProcesses?.[key],
         )
@@ -840,8 +1016,99 @@ export class OpenCodeSessionStore {
       if (claimedRunId && requestedRunId?.trim() && claimedRunId !== requestedRunId.trim()) return false
       delete store.materializationClaims[key]
       if (store.materializationClaimRuns) delete store.materializationClaimRuns[key]
+      if (store.materializationClaimProcesses) delete store.materializationClaimProcesses[key]
+      const compensation = store.materializationCompensations?.[key]
+      if (compensation && ownerTokensEqual(compensation.ownerToken, ownerToken)) {
+        delete store.materializationCompensations![key]
+      }
       await this.writeStore(store)
       return true
+    })
+  }
+
+  async recordMaterializationCompensation(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+    compensation: MaterializationCompensation,
+  ): Promise<boolean> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(identity)
+      if (!isMaterializationCompensation(compensation)
+        || store.materializationClaims?.[key] !== JSON.stringify(compensation.ownerToken)) return false
+      store.materializationCompensations ??= {}
+      const previous = store.materializationCompensations[key]
+      if (previous && (!ownerTokensEqual(previous.ownerToken, compensation.ownerToken)
+        || previous.sessionId !== compensation.sessionId || previous.hostKey !== compensation.hostKey
+        || previous.baseUrl !== compensation.baseUrl || previous.runId !== compensation.runId)) return false
+      store.materializationCompensations[key] = structuredClone(compensation)
+      await this.writeStore(store)
+      return true
+    })
+  }
+
+  /**
+   * Atomically take an orphaned compensation claim.  A live launch keeps its
+   * claim, and a dead launch's commit token is replaced before recovery is
+   * allowed to issue DELETE.  Thus a recovery can never delete a session and
+   * then let its original creator commit it.
+   */
+  async acquireMaterializationCompensation(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+    recoveryAttemptId: string,
+    signal?: AbortSignal,
+  ): Promise<MaterializationCompensationRecovery | null> {
+    const recoveryProcessIdentity = await this.currentOwnerProcessIdentity()
+    return this.withStoreLock(async () => {
+      const store = await this.readStore()
+      const key = buildRecordKey(identity)
+      const pending = store.materializationCompensations?.[key]
+      if (!pending || !isMaterializationCompensation(pending)
+        || store.materializationClaims?.[key] !== JSON.stringify(pending.ownerToken)) return null
+      const ownerIsActive = await this.materializationOwnerIsActive(
+        store.materializationClaimProcesses?.[key],
+      )
+      if (signal?.aborted) throwOpenCodeAbortReason(signal)
+      if (ownerIsActive) return null
+
+      const currentVersion = store.materializationOwnerVersions?.[key]
+      const nextVersion = Math.max(
+        typeof currentVersion === 'number' && Number.isSafeInteger(currentVersion) ? currentVersion : 0,
+        pending.ownerToken.version,
+      ) + 1
+      const recoveryOwner = { attemptId: recoveryAttemptId, sessionId: '', version: nextVersion }
+      store.materializationClaims![key] = JSON.stringify(recoveryOwner)
+      store.materializationOwnerVersions ??= {}
+      store.materializationOwnerVersions[key] = nextVersion
+      store.materializationCompensations![key] = {
+        ...pending,
+        ownerToken: recoveryOwner,
+      }
+      if (recoveryProcessIdentity) {
+        store.materializationClaimProcesses ??= {}
+        store.materializationClaimProcesses[key] = recoveryProcessIdentity
+      } else if (store.materializationClaimProcesses) {
+        delete store.materializationClaimProcesses[key]
+      }
+      await this.writeStore(store)
+      return structuredClone(store.materializationCompensations![key])
+    }, signal)
+  }
+
+  async getMaterializationCompensation(
+    identity: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>,
+  ): Promise<MaterializationCompensation | null> {
+    return this.withStoreLock(async () => {
+      const store = await this.readStore(true)
+      const key = buildRecordKey(identity)
+      const value = store.materializationCompensations?.[key]
+      // A compensation entry is cleanup authority only while its exact claim
+      // still fences the identity.  Treat dangling/malformed evidence as
+      // unknown rather than allowing a caller to delete a possibly committed
+      // remote session.
+      return value && isMaterializationCompensation(value)
+        && store.materializationClaims?.[key] === JSON.stringify(value.ownerToken)
+        && (!store.materializationClaimRuns?.[key] || store.materializationClaimRuns[key] === value.runId)
+        ? structuredClone(value) : null
     })
   }
 
@@ -905,7 +1172,7 @@ export class OpenCodeSessionStore {
   }
 
   async markStaleIfSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
+    record: OpenCodeSessionCleanupCapability,
     staleReason: string,
     ownerToken?: MaterializationOwnerToken,
   ): Promise<OpenCodeSessionRecord | null> {
@@ -913,8 +1180,8 @@ export class OpenCodeSessionStore {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
-      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
-        || previous.runId !== record.runId || isOpenCodeSessionStopped(previous)) return null
+      if (!previous || !matchesCleanupCapability(previous, record)
+        || isOpenCodeSessionStopped(previous)) return null
       const owner = store.materializationOwners?.[key]
       if (!ownerTokenAuthorizes(owner, ownerToken)) return null
       const next = { ...previous, staleReason, updatedAt: new Date().toISOString() }
@@ -925,15 +1192,15 @@ export class OpenCodeSessionStore {
   }
 
   async deleteIfSession(
-    record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId' | 'runId'>,
+    record: OpenCodeSessionCleanupCapability,
     ownerToken?: MaterializationOwnerToken,
   ): Promise<boolean> {
-    return this.withStoreLock(async () => {
+    return this.bindingMutationFence.withTeamBindingMutation(record.teamId, () => this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
       const previous = store.records[key]
-      if (!previous || previous.opencodeSessionId !== record.opencodeSessionId
-        || previous.runId !== record.runId || isOpenCodeSessionStopped(previous)) return false
+      if (!previous || !matchesCleanupCapability(previous, record)
+        || isOpenCodeSessionStopped(previous)) return false
       const owner = store.materializationOwners?.[key]
       if (!ownerTokenAuthorizes(owner, ownerToken)) return false
       delete store.records[key]
@@ -941,7 +1208,7 @@ export class OpenCodeSessionStore {
       if (store.materializationOwnerProcesses) delete store.materializationOwnerProcesses[key]
       await this.writeStore(store)
       return true
-    })
+    }))
   }
 
   async releaseMaterializationOwner(
@@ -1002,7 +1269,7 @@ export class OpenCodeSessionStore {
   async delete(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<boolean> {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
-    return this.withStoreLock(async () => {
+    return this.bindingMutationFence.withTeamBindingMutation(teamId, () => this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })
       if (!store.records[key]) {
@@ -1012,7 +1279,7 @@ export class OpenCodeSessionStore {
       delete store.records[key]
       await this.writeStore(store)
       return true
-    })
+    }))
   }
 }
 

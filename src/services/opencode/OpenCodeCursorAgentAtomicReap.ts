@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { unlink } from 'node:fs/promises'
 import type { AttributionRecords } from './OpenCodeProcessAttributionStore.js'
 import { killCursorAgentTree, nativePorts, positive, type CursorAgentNativePorts } from './OpenCodeCursorAgentTreeKill.js'
 
@@ -61,7 +62,7 @@ export async function reapCursorAgents(input: CursorAgentReapInput, raw: unknown
     check()
     const reject = (reason: string) => { kept = true; keep(`Kept pid=${agent.pid}: ${reason}`) }
     const workspace = agent.workspacePath ?? agent.cwd
-    if (agent.kind !== 'cursor-agent' || agent.exitedAtMs !== null
+    if (agent.kind !== 'cursor-agent'
       || !positive(agent.startedAtMs) || agent.startedAtMs >= input.startedBeforeMs
       || !absolute(workspace) || !scopes.has(normalize(workspace))
       || agent.appProfileScope !== options.profileScope) { reject('agent scope, kind or cutoff mismatch'); continue }
@@ -87,6 +88,7 @@ export async function reapCursorAgents(input: CursorAgentReapInput, raw: unknown
       || metadata.hostPid !== host.pid || metadata.hostStartedAtNative !== host.processStartedAtMs
       || !absolute(metadata.projectPath) || normalize(metadata.projectPath) !== normalize(host.projectPath)
       || metadata.appProfileScope !== options.profileScope
+      || metadata.owners.length !== 0
       || (agent.appInstanceId && metadata.appInstanceId && agent.appInstanceId !== metadata.appInstanceId)) {
       reject('host attribution native identity or profile mismatch'); continue
     }
@@ -105,11 +107,24 @@ export async function reapCursorAgents(input: CursorAgentReapInput, raw: unknown
       && agent.nativeStartToken === `${format === 'linux-ticks' ? 'proc' : 'epoch'}:${live}`
     if (!matchesBirth || !positive(live)) { reject('agent native identity unavailable or changed'); continue }
     check()
+    // A host Job contains the desktop host and potentially siblings. It is
+    // never authority to terminate a Cursor agent. Windows must carry a
+    // distinct agent Job/subtree identity written by the agent launch path.
+    const expectedOsIdentity = typeof agent.processOsIdentity === 'string' ? agent.processOsIdentity : undefined
+    if (ports.platform === 'darwin' && !expectedOsIdentity?.startsWith('darwin-audit:')) {
+      reject('macOS launch-captured audit identity is unavailable'); continue
+    }
+    if (ports.platform === 'win32' && !expectedOsIdentity?.startsWith('win32-agent-job:')) {
+      reject('Windows per-agent Job identity is unavailable'); continue
+    }
     const killed = await killCursorAgentTree({ pid: agent.pid, expectedBirth: live,
-      deadline: options.deadline, guard: check, protectedPids }, ports)
+      deadline: options.deadline, guard: check, protectedPids, expectedOsIdentity }, ports)
     result.killedPids.push(...killed.killedPids)
     result.diagnostics.push(...killed.diagnostics)
     if (!killed.complete) { result.status = 'incomplete'; return }
+    // `complete` is the exact whole-tree receipt. This is the only cleanup
+    // path allowed for a retained root-exit record.
+    await unlink(agent.filePath).catch(() => undefined)
     completed = true
   }
   result.killedPids = [...new Set(result.killedPids)]

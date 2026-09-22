@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm } from 'fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -14,10 +24,12 @@ import {
   claimUnreadRegularMessages,
   classifyIdleNotification,
   createCompatibilityInboxMessageId,
+  createShutdownApprovedMessage,
   finalizeClaimedMessagesAsRead,
   isAgentErrorNotificationMessage,
   isLegacyPlanApprovalResponseMessage,
   isPlanApprovalResponse,
+  isShutdownApproved,
   isSilentRegularMailboxMessageForLiveContext,
   isLiveInboxMirrorMessageOwnedBySession,
   readAndClaimInteractiveMailboxSnapshot,
@@ -25,6 +37,7 @@ import {
   readUnreadMessages,
   supersedeStaleLeadBootstrapMessages,
   writeToMailbox,
+  writeToMailboxAtCanonicalTeamRootVerified,
   writeToMailboxVerified,
 } from './teammateMailbox.js'
 
@@ -99,6 +112,14 @@ const implicitFailureIdleNotification = JSON.stringify({
   failureReason: 'filesystem permission denied',
 })
 
+async function makeExplicitTeamRoot(parent: string): Promise<string> {
+  const teams = join(parent, 'explicit-teams')
+  await mkdir(teams, { mode: 0o700 })
+  const root = join(teams, 'legacy')
+  await mkdir(root, { mode: 0o700 })
+  return realpath(root)
+}
+
 describe('teammateMailbox', () => {
   const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   let tempConfigDir: string
@@ -151,6 +172,40 @@ describe('teammateMailbox', () => {
       requestId: 'plan_approval-alice-1',
       approved: true,
     })
+  })
+
+  it('round-trips exact process identity while continuing to parse legacy shutdown approvals', () => {
+    const exact = createShutdownApprovedMessage({
+      requestId: 'shutdown-1',
+      from: 'alice',
+      paneId: 'process:42',
+      backendType: 'process',
+      processStartedAtMs: 123,
+      processOsIdentity: 'unix-pgid:42',
+      processOwnerToken: 'owner-token',
+      processRunId: 'run-a',
+    })
+    expect(isShutdownApproved(JSON.stringify(exact))).toMatchObject({
+      processStartedAtMs: 123,
+      processOsIdentity: 'unix-pgid:42',
+      processOwnerToken: 'owner-token',
+      processRunId: 'run-a',
+    })
+
+    expect(
+      isShutdownApproved(
+        JSON.stringify({
+          type: 'shutdown_approved',
+          requestId: 'shutdown-legacy',
+          from: 'alice',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          paneId: 'process:42',
+          backendType: 'process',
+        }),
+      ),
+    ).toMatchObject({ requestId: 'shutdown-legacy', paneId: 'process:42' })
+    expect(isShutdownApproved(JSON.stringify({ ...exact, backendType: 'forged-backend' }))).toBeNull()
+    expect(isShutdownApproved(JSON.stringify({ ...exact, unexpected: true }))).toBeNull()
   })
 
   it('writes canonical message ids for new mailbox rows', async () => {
@@ -235,6 +290,97 @@ describe('teammateMailbox', () => {
       totalMessages: 1,
     })
     expect(await readMailbox('atlas', 'my-team')).toHaveLength(1)
+  })
+
+  it('fails closed on duplicate message ids in an explicit-root mailbox', async () => {
+    const teamRoot = await makeExplicitTeamRoot(tempConfigDir)
+    const inboxDir = join(teamRoot, 'inboxes')
+    await mkdir(inboxDir, { mode: 0o700 })
+    const inboxPath = join(inboxDir, 'team-lead.json')
+    const row = {
+      messageId: 'hosted-message-1',
+      from: 'user',
+      text: 'hello',
+      timestamp: '2026-01-02T00:00:00.000Z',
+      read: false,
+    }
+    await writeFile(inboxPath, JSON.stringify([row, row]), { mode: 0o600 })
+
+    expect(
+      await writeToMailboxAtCanonicalTeamRootVerified({
+        canonicalTeamRoot: teamRoot,
+        recipientName: 'team-lead',
+        message: row,
+      }),
+    ).toEqual({ kind: 'conflict' })
+    expect(JSON.parse(await readFile(inboxPath, 'utf8'))).toHaveLength(2)
+  })
+
+  it('rejects unsafe explicit-root mailbox objects without changing their permissions', async () => {
+    const teamRoot = await makeExplicitTeamRoot(tempConfigDir)
+    const inboxDir = join(teamRoot, 'inboxes')
+    await mkdir(inboxDir, { mode: 0o700 })
+    const inboxPath = join(inboxDir, 'team-lead.json')
+    await writeFile(inboxPath, '[]', { mode: 0o640 })
+    await chmod(inboxPath, 0o640)
+
+    await expect(
+      writeToMailboxAtCanonicalTeamRootVerified({
+        canonicalTeamRoot: teamRoot,
+        recipientName: 'team-lead',
+        message: {
+          messageId: 'hosted-message-2',
+          from: 'user',
+          text: 'hello',
+          timestamp: '2026-01-02T00:00:00.000Z',
+        },
+      }),
+    ).rejects.toThrow('Unsafe explicit-root mailbox file')
+    expect((await lstat(inboxPath)).mode & 0o077).toBe(0o040)
+  })
+
+  it('rejects a group-writable explicit-root inbox directory without repairing it', async () => {
+    const teamRoot = await makeExplicitTeamRoot(tempConfigDir)
+    const inboxDir = join(teamRoot, 'inboxes')
+    await mkdir(inboxDir, { mode: 0o700 })
+    await chmod(inboxDir, 0o770)
+
+    await expect(
+      writeToMailboxAtCanonicalTeamRootVerified({
+        canonicalTeamRoot: teamRoot,
+        recipientName: 'team-lead',
+        message: {
+          messageId: 'hosted-message-unsafe-directory',
+          from: 'user',
+          text: 'hello',
+          timestamp: '2026-01-02T00:00:00.000Z',
+        },
+      }),
+    ).rejects.toThrow('Unsafe explicit-root mailbox directory')
+    expect((await lstat(inboxDir)).mode & 0o077).toBe(0o070)
+  })
+
+  it('rejects a symlinked explicit-root mailbox without touching its target', async () => {
+    const teamRoot = await makeExplicitTeamRoot(tempConfigDir)
+    const inboxDir = join(teamRoot, 'inboxes')
+    await mkdir(inboxDir, { mode: 0o700 })
+    const target = join(teamRoot, 'target.json')
+    await writeFile(target, '[]', { mode: 0o600 })
+    await symlink(target, join(inboxDir, 'team-lead.json'))
+
+    await expect(
+      writeToMailboxAtCanonicalTeamRootVerified({
+        canonicalTeamRoot: teamRoot,
+        recipientName: 'team-lead',
+        message: {
+          messageId: 'hosted-message-3',
+          from: 'user',
+          text: 'hello',
+          timestamp: '2026-01-02T00:00:00.000Z',
+        },
+      }),
+    ).rejects.toThrow()
+    expect(await readFile(target, 'utf8')).toBe('[]')
   })
 
   it('supersedes only stale lead-authored bootstrap rows before writing a fresh launch prompt', async () => {
@@ -374,7 +520,9 @@ describe('teammateMailbox', () => {
       uiPresentation: 'peer_summary',
     })
 
-    expect(classifyIdleNotification(whitespaceSummaryIdleNotification)).toMatchObject({
+    expect(
+      classifyIdleNotification(whitespaceSummaryIdleNotification),
+    ).toMatchObject({
       primaryKind: 'heartbeat',
       hasPeerSummary: false,
       peerSummary: null,
@@ -383,15 +531,19 @@ describe('teammateMailbox', () => {
       uiPresentation: 'heartbeat',
     })
 
-    expect(classifyIdleNotification(interruptedIdleNotification)).toMatchObject({
-      primaryKind: 'interrupted',
-      hasPeerSummary: true,
-      countsAsBootstrapConfirmation: true,
-      liveDelivery: 'visible_actionable',
-      uiPresentation: 'interrupted',
-    })
+    expect(classifyIdleNotification(interruptedIdleNotification)).toMatchObject(
+      {
+        primaryKind: 'interrupted',
+        hasPeerSummary: true,
+        countsAsBootstrapConfirmation: true,
+        liveDelivery: 'visible_actionable',
+        uiPresentation: 'interrupted',
+      },
+    )
 
-    expect(classifyIdleNotification(resolvedTaskIdleNotification)).toMatchObject({
+    expect(
+      classifyIdleNotification(resolvedTaskIdleNotification),
+    ).toMatchObject({
       primaryKind: 'task_terminal',
       hasPeerSummary: true,
       countsAsBootstrapConfirmation: true,
@@ -399,13 +551,15 @@ describe('teammateMailbox', () => {
       uiPresentation: 'task_terminal',
     })
 
-    expect(classifyIdleNotification(blockedTaskIdleNotification)).toMatchObject({
-      primaryKind: 'task_terminal',
-      hasPeerSummary: false,
-      countsAsBootstrapConfirmation: true,
-      liveDelivery: 'visible_actionable',
-      uiPresentation: 'task_terminal',
-    })
+    expect(classifyIdleNotification(blockedTaskIdleNotification)).toMatchObject(
+      {
+        primaryKind: 'task_terminal',
+        hasPeerSummary: false,
+        countsAsBootstrapConfirmation: true,
+        liveDelivery: 'visible_actionable',
+        uiPresentation: 'task_terminal',
+      },
+    )
 
     expect(classifyIdleNotification(failedIdleNotification)).toMatchObject({
       primaryKind: 'failure',
@@ -415,7 +569,9 @@ describe('teammateMailbox', () => {
       uiPresentation: 'failure',
     })
 
-    expect(classifyIdleNotification(implicitFailureIdleNotification)).toMatchObject({
+    expect(
+      classifyIdleNotification(implicitFailureIdleNotification),
+    ).toMatchObject({
       primaryKind: 'failure',
       hasPeerSummary: false,
       countsAsBootstrapConfirmation: false,
@@ -582,7 +738,9 @@ describe('teammateMailbox', () => {
 
     const unread = await readUnreadMessages('team-lead', 'my-team')
     expect(unread).toHaveLength(2)
-    const regularRow = unread.find(message => message.text === 'regular-message')
+    const regularRow = unread.find(
+      message => message.text === 'regular-message',
+    )
     expect(regularRow?.claimedBySessionId).toBe('session-a')
     const protocolRow = unread.find(
       message => message.text === structuredModeSetRequest,
@@ -646,7 +804,9 @@ describe('teammateMailbox', () => {
       'fresh-message',
     ])
     expect(
-      claimedBySessionB.every(message => message.claimedBySessionId === 'session-b'),
+      claimedBySessionB.every(
+        message => message.claimedBySessionId === 'session-b',
+      ),
     ).toBe(true)
   })
 
@@ -744,10 +904,7 @@ describe('teammateMailbox', () => {
     )
     expect(initialClaim.claimedBySessionId).toBe(initialSessionId)
 
-    switchSession(
-      asSessionId('11111111-1111-4111-8111-111111111111'),
-      null,
-    )
+    switchSession(asSessionId('11111111-1111-4111-8111-111111111111'), null)
     const switchedSessionId = getSessionId()
     expect(switchedSessionId).not.toBe(initialSessionId)
 

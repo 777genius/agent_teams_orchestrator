@@ -15,6 +15,7 @@ import {
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
 } from './OpenCodeManagedPaths.js'
 import {
+  buildManagedConfigFingerprint,
   ensureOpenCodeNativeCliCredentialBridge,
   OpenCodeProfileManager,
 } from './OpenCodeProfileManager.js'
@@ -102,7 +103,7 @@ test.skipIf(process.platform !== 'darwin')('binds readiness to the account, bina
   const root = await mkdtemp(path.join(os.tmpdir(), 'cursor-readiness-'))
   const keys = [
     CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV, CURSOR_MANAGED_ASSET_ROOT_ENV,
-    'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'CURSOR_AGENT_EXECUTABLE',
+    'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'CURSOR_AGENT_EXECUTABLE', 'OPENCODE_CONFIG_CONTENT',
   ]
   const original = Object.fromEntries(keys.map(key => [key, process.env[key]]))
   try {
@@ -123,6 +124,9 @@ test.skipIf(process.platform !== 'darwin')('binds readiness to the account, bina
     process.env.XDG_DATA_HOME = path.join(root, 'source-data')
     process.env.XDG_CACHE_HOME = path.join(root, 'source-cache')
     process.env.CURSOR_AGENT_EXECUTABLE = fakeAgent
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      mcp: { 'launch-mcp': { type: 'local', command: '/usr/bin/launch-mcp', args: ['first'] } },
+    })
 
     const manager = new OpenCodeProfileManager()
     const prepare = () => manager.prepareProfile(projectPath, {
@@ -133,6 +137,10 @@ test.skipIf(process.platform !== 'darwin')('binds readiness to the account, bina
     expect(Number(port)).toBeGreaterThan(1024)
     expect(JSON.parse(first.env.OPENCODE_CONFIG_CONTENT ?? '{}').provider['cursor-acp'].options.baseURL)
       .toBe(`http://127.0.0.1:${port}/v1`)
+    // Production readiness must bind the same managed config image exported
+    // to the native bridge, rather than the pre-managed resolver environment.
+    expect(first.managedConfigFingerprint)
+      .toBe(buildManagedConfigFingerprint(first.managedConfig, first.env))
     expect(first.env.AGENT_TEAMS_CURSOR_READINESS).toMatch(/^[a-f0-9]{64}$/)
 
     // Nothing drifted, so the retained port and the readiness answer must not either.
@@ -141,6 +149,16 @@ test.skipIf(process.platform !== 'darwin')('binds readiness to the account, bina
     // A drifting managed config would also churn hosts on every launch.
     expect(again.env.OPENCODE_CONFIG_CONTENT).toBe(first.env.OPENCODE_CONFIG_CONTENT)
     expect(again.env.AGENT_TEAMS_CURSOR_READINESS).toBe(first.env.AGENT_TEAMS_CURSOR_READINESS)
+
+    // This is a production-profile launch path, not a host-resolved-config
+    // fixture: changing only the individual managed MCP configuration must
+    // revoke the readiness token before any retained host can be reused.
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      mcp: { 'launch-mcp': { type: 'local', command: '/usr/bin/launch-mcp', args: ['second'] } },
+    })
+    const changedMcp = await prepare()
+    expect(changedMcp.env.AGENT_TEAMS_CURSOR_READINESS).toMatch(/^[a-f0-9]{64}$/)
+    expect(changedMcp.env.AGENT_TEAMS_CURSOR_READINESS).not.toBe(first.env.AGENT_TEAMS_CURSOR_READINESS)
 
     // A different account behind the same path must invalidate the answer.
     await writeFile(fakeAgent, '#!/bin/sh\necho "Logged in as second@example.com"\n', 'utf8')

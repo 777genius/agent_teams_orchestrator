@@ -142,7 +142,7 @@ test('the readiness fingerprint changes with every bound input', () => {
   }
   const base = {
     authority, assetsFingerprint: 'assets', profileScopeToken: 'scope',
-    managedConfigFingerprint: 'config', proxyPort: 45123,
+    managedConfigFingerprint: 'config', managedMcpConfigFingerprint: 'mcp-config', proxyPort: 45123,
   }
   const fingerprint = buildCursorReadinessFingerprint(base)
   expect(fingerprint).toMatch(/^[a-f0-9]{64}$/)
@@ -156,12 +156,14 @@ test('the readiness fingerprint changes with every bound input', () => {
     { assetsFingerprint: 'other' },
     { profileScopeToken: 'other' },
     { managedConfigFingerprint: 'other' },
+    { managedMcpConfigFingerprint: 'other' },
     { proxyPort: 45124 },
   ]
   for (const variant of variants) {
     expect(buildCursorReadinessFingerprint({ ...base, ...variant })).not.toBe(fingerprint)
   }
-  for (const invalid of [{ assetsFingerprint: ' ' }, { profileScopeToken: '' }, { managedConfigFingerprint: '  ' }]) {
+  for (const invalid of [{ assetsFingerprint: ' ' }, { profileScopeToken: '' },
+    { managedConfigFingerprint: '  ' }, { managedMcpConfigFingerprint: '' }]) {
     expect(() => buildCursorReadinessFingerprint({ ...base, ...invalid })).toThrow('requires')
   }
   for (const port of [0, 1024, 1.5]) {

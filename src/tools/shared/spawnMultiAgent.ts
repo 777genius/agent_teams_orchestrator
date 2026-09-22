@@ -44,7 +44,13 @@ import { getAPIProvider } from '../../utils/model/providers.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import { parseArguments } from '../../utils/argumentSubstitution.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
-import { isProcessAlive, killProcessTree } from '../../utils/processKill.js'
+import {
+  buildExactProcessTreeSpawn,
+  captureProcessTreeIdentity,
+  confirmNaturalProcessTreeExit,
+  isProcessAlive,
+  readProcessStartTimeMs,
+} from '../../utils/processKill.js'
 import {
   IT2_COMMAND,
   isTmuxAvailable,
@@ -91,11 +97,17 @@ import {
 } from '../../utils/swarm/spawnUtils.js'
 import {
   buildProcessBackendPaneId,
+  getProcessBackendRuntimeState,
   isProcessBackendCommandForTeammate as isProcessBackendCommandForTeammateValue,
-  isProcessBackendRuntimeAlive,
   killProcessBackendRuntime,
   parseProcessBackendPid as parseProcessBackendPidValue,
 } from '../../utils/swarm/processBackend.js'
+import {
+  attemptProcessCleanupOnce,
+  canReplaceProcessSpawnReservation,
+  isUnpublishedProcessRecoveryBlocker,
+} from '../../utils/swarm/processSpawnRecovery.js'
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from '../../utils/teammateTermination.js'
 import {
   cleanupSpawnReadySentinelDir,
   createSpawnReadySentinel,
@@ -123,9 +135,17 @@ import {
 } from '../../services/teamBootstrap/bootstrapProofValidation.js'
 import { isBootstrapMailboxInstructionText } from '../../services/teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 import {
+  claimTeamMemberForSpawn,
+  armTeamMemberSpawnClaim,
+  finalizeTeamMemberSpawnClaim,
+  recordArmedTeamMemberSpawnRuntime,
   readTeamFileAsync,
+  removeTeammateFromTeamFileIfIdentityMatches,
+  releaseTeamMemberSpawnClaim,
   sanitizeAgentName,
   sanitizeName,
+  type TeamMember,
+  type TeamMemberIdentity,
   updateTeamFileAsync,
   upsertTeamMember,
 } from '../../utils/swarm/teamHelpers.js'
@@ -934,6 +954,10 @@ export type SpawnOutput = {
   is_splitpane?: boolean
   backend_type?: BackendType
   runtime_pid?: number
+  process_started_at_ms?: number
+  process_os_identity?: string
+  process_owner_token?: string
+  process_run_id?: string
   runtime_events_log?: string
   runtime_stdout_log?: string
   runtime_stderr_log?: string
@@ -983,6 +1007,8 @@ export type SpawnTeammateConfig = {
    *  spawned this teammate. Threaded through to TeammateAgentContext for
    *  lineage tracing on tengu_api_* events. */
   invokingRequestId?: string
+  /** Internal durable reservation propagated after the cross-process claim. */
+  spawnClaimToken?: string
 }
 
 // Internal input type matching TeammateTool's spawn parameters
@@ -1006,6 +1032,7 @@ type SpawnInput = {
   bootstrapRunId?: string
   bootstrapTimeoutMs?: number
   invokingRequestId?: string
+  spawnClaimToken?: string
   worktreeInfo?: TeammateWorktreeInfo
 }
 
@@ -1024,7 +1051,10 @@ type SpawnResult = {
 }
 
 type ExistingTeammateDecision =
-  | { decision: 'allow_spawn' | 'allow_respawn_after_terminal_failure' }
+  | {
+      decision: 'allow_spawn' | 'allow_respawn_after_terminal_failure'
+      expectedExisting?: TeamMemberIdentity
+    }
   | {
       decision: 'duplicate_already_running' | 'duplicate_bootstrap_pending'
       reason: DuplicateSkippedReason
@@ -1093,6 +1123,26 @@ function worktreeEnv(worktreeInfo: TeammateWorktreeInfo | undefined): Record<str
   }
 }
 
+async function isRecoverableUnarmedSpawnClaim(
+  member: TeamMember,
+): Promise<boolean> {
+  const ownerPid = member.spawnClaimOwnerPid
+  if (!ownerPid || member.spawnClaimRuntimeMayExist) return false
+  if (!isProcessAlive(ownerPid)) return true
+  const expectedStartedAtMs = member.spawnClaimOwnerStartedAtMs
+  return expectedStartedAtMs !== undefined &&
+    await readProcessStartTimeMs(ownerPid) !== expectedStartedAtMs
+}
+
+export async function __isRecoverableUnarmedSpawnClaimForTests(
+  member: TeamMember,
+): Promise<boolean> {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__isRecoverableUnarmedSpawnClaimForTests is only available in tests')
+  }
+  return isRecoverableUnarmedSpawnClaim(member)
+}
+
 async function resolveExistingTeammateState(
   input: SpawnInput,
   context: ToolUseContext,
@@ -1140,21 +1190,30 @@ async function resolveExistingTeammateState(
   if (inMemoryTeammate) {
     const [teammateId, teammate] = inMemoryTeammate
     let runtimeAlive = false
+    let runtimeUnverifiable = false
     const paneId = teammate.tmuxPaneId?.trim()
     const processPid = parseProcessBackendPid(paneId)
     if (processPid) {
-      runtimeAlive = await isProcessBackendRuntimeAlive(
+      const runtimeState = await getProcessBackendRuntimeState(
         processPid,
         teammateId,
         teamName,
+        {
+          expectedStartedAtMs: teammate.processStartedAtMs,
+          expectedOwnerToken: teammate.processOwnerToken,
+          expectedRunId: teammate.processRunId,
+          expectedOsIdentity: teammate.processOsIdentity,
+        },
       )
+      runtimeAlive = runtimeState === 'confirmed'
+      runtimeUnverifiable = runtimeState === 'legacy_unverifiable'
     } else if (paneId && paneId !== 'in-process') {
       runtimeAlive =
         (await isTmuxPaneAlive(paneId, false)) ||
         (await isTmuxPaneAlive(paneId, true)) ||
         (await isItermPaneAlive(paneId))
     }
-    if (runtimeAlive) {
+    if (runtimeAlive || runtimeUnverifiable) {
       const bootstrapExpectedAfter = getBootstrapExpectedAfterForTeammate(
         teamFile,
         teammateId,
@@ -1167,10 +1226,13 @@ async function resolveExistingTeammateState(
         teammate.name || canonicalName,
       )
       return {
-        decision: bootstrapConfirmed
+        decision: !runtimeUnverifiable && bootstrapConfirmed
           ? 'duplicate_already_running'
           : 'duplicate_bootstrap_pending',
-        reason: bootstrapConfirmed ? 'already_running' : 'bootstrap_pending',
+        reason:
+          !runtimeUnverifiable && bootstrapConfirmed
+            ? 'already_running'
+            : 'bootstrap_pending',
       }
     }
   }
@@ -1184,7 +1246,40 @@ async function resolveExistingTeammateState(
     return { decision: 'allow_spawn' }
   }
 
+  // A durable spawn claim is an owned launch generation, even before a pane or
+  // PID is published. Absence of a runtime identity is not proof that the
+  // launcher did not create one, so fail closed until explicit recovery clears
+  // the exact claim.
+  if (
+    existingMember.spawnClaimToken ||
+    existingMember.tmuxPaneId.startsWith('spawn:pending:')
+  ) {
+    if (await isRecoverableUnarmedSpawnClaim(existingMember)) {
+      return {
+        decision: 'allow_respawn_after_terminal_failure',
+        expectedExisting: {
+          agentId: existingMember.agentId,
+          tmuxPaneId: existingMember.tmuxPaneId,
+          processStartedAtMs: existingMember.processStartedAtMs,
+          processOsIdentity: existingMember.processOsIdentity,
+          processOwnerToken: existingMember.processOwnerToken,
+          processRunId: existingMember.processRunId,
+          spawnClaimToken: existingMember.spawnClaimToken,
+          spawnClaimRunId: existingMember.spawnClaimRunId,
+          spawnClaimOwnerPid: existingMember.spawnClaimOwnerPid,
+          spawnClaimOwnerStartedAtMs: existingMember.spawnClaimOwnerStartedAtMs,
+          spawnClaimRuntimeMayExist: existingMember.spawnClaimRuntimeMayExist,
+        },
+      }
+    }
+    return {
+      decision: 'duplicate_bootstrap_pending',
+      reason: 'bootstrap_pending',
+    }
+  }
+
   let runtimeAlive = false
+  let runtimeUnverifiable = false
   const paneId = existingMember.tmuxPaneId?.trim()
   const persistedProcessPid =
     parseProcessBackendPid(paneId) ?? existingMember.runtimePid
@@ -1204,33 +1299,78 @@ async function resolveExistingTeammateState(
   } else if (paneId && existingMember.backendType === 'iterm2') {
     runtimeAlive = await isItermPaneAlive(paneId)
   } else if (existingMember.backendType === 'process') {
-    runtimeAlive = persistedProcessPid
-      ? await isProcessBackendRuntimeAlive(
+    if (persistedProcessPid) {
+      const runtimeState = await getProcessBackendRuntimeState(
           persistedProcessPid,
           existingMember.agentId || canonicalAgentId,
           teamName,
+          {
+            expectedStartedAtMs: existingMember.processStartedAtMs,
+            expectedOwnerToken: existingMember.processOwnerToken,
+            expectedRunId: existingMember.processRunId,
+            expectedOsIdentity: existingMember.processOsIdentity,
+          },
         )
-      : false
+      runtimeAlive = runtimeState === 'confirmed'
+      runtimeUnverifiable = runtimeState === 'legacy_unverifiable'
+    } else if (isUnpublishedProcessRecoveryBlocker(existingMember, null)) {
+      // A durable pre-spawn reservation or failed PID publication is a blocker.
+      // Absence of a PID is not proof that no child was created.
+      runtimeUnverifiable = true
+    }
   } else if (paneId) {
-    runtimeAlive = persistedProcessPid
-      ? await isProcessBackendRuntimeAlive(
+    if (persistedProcessPid) {
+      const runtimeState = await getProcessBackendRuntimeState(
           persistedProcessPid,
           existingMember.agentId || canonicalAgentId,
           teamName,
+          {
+            expectedStartedAtMs: existingMember.processStartedAtMs,
+            expectedOwnerToken: existingMember.processOwnerToken,
+            expectedRunId: existingMember.processRunId,
+            expectedOsIdentity: existingMember.processOsIdentity,
+          },
         )
-      : (await isTmuxPaneAlive(paneId, false)) ||
+      runtimeAlive = runtimeState === 'confirmed'
+      runtimeUnverifiable = runtimeState === 'legacy_unverifiable'
+    } else {
+      runtimeAlive = (await isTmuxPaneAlive(paneId, false)) ||
         (await isTmuxPaneAlive(paneId, true)) ||
         (await isItermPaneAlive(paneId))
+    }
   } else if (persistedProcessPid) {
-    runtimeAlive = await isProcessBackendRuntimeAlive(
+    const runtimeState = await getProcessBackendRuntimeState(
       persistedProcessPid,
       existingMember.agentId || canonicalAgentId,
       teamName,
+      {
+        expectedStartedAtMs: existingMember.processStartedAtMs,
+        expectedOwnerToken: existingMember.processOwnerToken,
+        expectedRunId: existingMember.processRunId,
+        expectedOsIdentity: existingMember.processOsIdentity,
+      },
     )
+    runtimeAlive = runtimeState === 'confirmed'
+    runtimeUnverifiable = runtimeState === 'legacy_unverifiable'
   }
 
-  if (!runtimeAlive) {
-    return { decision: 'allow_respawn_after_terminal_failure' }
+  if (!runtimeAlive && !runtimeUnverifiable) {
+    return {
+      decision: 'allow_respawn_after_terminal_failure',
+      expectedExisting: {
+        agentId: existingMember.agentId,
+        tmuxPaneId: existingMember.tmuxPaneId,
+        processStartedAtMs: existingMember.processStartedAtMs,
+        processOsIdentity: existingMember.processOsIdentity,
+        processOwnerToken: existingMember.processOwnerToken,
+        processRunId: existingMember.processRunId,
+        spawnClaimToken: existingMember.spawnClaimToken,
+        spawnClaimRunId: existingMember.spawnClaimRunId,
+        spawnClaimOwnerPid: existingMember.spawnClaimOwnerPid,
+        spawnClaimOwnerStartedAtMs: existingMember.spawnClaimOwnerStartedAtMs,
+        spawnClaimRuntimeMayExist: existingMember.spawnClaimRuntimeMayExist,
+      },
+    }
   }
 
   const bootstrapConfirmed = await hasBootstrapConfirmation(
@@ -1240,10 +1380,13 @@ async function resolveExistingTeammateState(
     existingMember.name || canonicalName,
   )
   return {
-    decision: bootstrapConfirmed
+    decision: !runtimeUnverifiable && bootstrapConfirmed
       ? 'duplicate_already_running'
       : 'duplicate_bootstrap_pending',
-    reason: bootstrapConfirmed ? 'already_running' : 'bootstrap_pending',
+    reason:
+      !runtimeUnverifiable && bootstrapConfirmed
+        ? 'already_running'
+        : 'bootstrap_pending',
   }
 }
 
@@ -1724,7 +1867,7 @@ async function handleSpawnSplitPane(
   const workingDir = worktreeInfo?.worktreePath ?? cwd ?? getCwd()
 
   // Detect the appropriate backend and check if setup is needed
-  let detectionResult = await detectAndGetBackend()
+  let detectionResult = await getSpawnMultiAgentDeps().detectAndGetBackend()
 
   // If in iTerm2 but it2 isn't set up, prompt the user
   if (detectionResult.needsIt2Setup && context.setToolJSX) {
@@ -1758,7 +1901,7 @@ async function handleSpawnSplitPane(
     //   and subsequent spawns skip this prompt
     if (setupResult === 'installed' || setupResult === 'use-tmux') {
       resetBackendDetection()
-      detectionResult = await detectAndGetBackend()
+      detectionResult = await getSpawnMultiAgentDeps().detectAndGetBackend()
     }
   }
 
@@ -1772,10 +1915,53 @@ async function handleSpawnSplitPane(
   // - Inside tmux: splits current window (leader on left, teammates on right)
   // - In iTerm2 with it2: uses native iTerm2 split panes
   // - Outside both: creates claude-swarm session with tiled teammates
-  const { paneId, isFirstTeammate } = await createTeammatePaneInSwarmView(
-    sanitizedName,
-    teammateColor,
-  )
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before pane launch.`)
+  }
+  let paneIdForRecovery: string | null = null
+  let paneIdentityRecorded = false
+  let paneCreationResult: Awaited<ReturnType<typeof createTeammatePaneInSwarmView>>
+  try {
+    paneCreationResult = await getSpawnMultiAgentDeps().createTeammatePaneInSwarmView(
+      sanitizedName,
+      teammateColor,
+      async paneId => {
+        paneIdForRecovery = paneId
+        paneIdentityRecorded = await recordArmedTeamMemberSpawnRuntime(
+          teamName,
+          teammateId,
+          input.spawnClaimToken!,
+          { paneId, backendType: detectionResult.backend.type },
+        )
+        if (!paneIdentityRecorded) {
+          throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim after pane creation.`)
+        }
+        await spawnMultiAgentDepsForTests?.afterPaneCreated?.({
+          teamName,
+          agentId: teammateId,
+          claimToken: input.spawnClaimToken!,
+          paneId,
+          backendType: detectionResult.backend.type,
+        })
+      },
+    )
+  } catch (error) {
+    if (paneIdForRecovery && !paneIdentityRecorded) {
+      const terminated = await detectionResult.backend.killPane(paneIdForRecovery, !insideTmux).catch(() => false)
+      if (!terminated) {
+        await persistTeammateTerminationRecovery(teamName, teammateId, {
+          teammateName: sanitizedName,
+          paneId: paneIdForRecovery,
+          detail: 'Pane was created but its exact durable spawn identity could not be published or terminated.',
+        }).catch(() => undefined)
+      }
+    }
+    throw error
+  }
+  const { paneId, isFirstTeammate } = paneCreationResult
 
   // Enable pane border status on first teammate when inside tmux
   // (outside tmux, this is handled in createTeammatePaneInSwarmView)
@@ -1962,13 +2148,14 @@ async function handleSpawnSplitPane(
 
   // Register agent in the team file
   const updateResult = await updateTeamFileAsync(teamName, teamFile =>
-    upsertTeamMember(teamFile, {
+    teamFile.members.find(member => member.agentId === teammateId)?.spawnClaimToken === input.spawnClaimToken
+      ? upsertTeamMember(teamFile, {
       agentId: teammateId,
       name: sanitizedName,
       agentType: agent_type,
       model,
       provider,
-      effort,
+      effort: toTeamFileEffort(effort),
       prompt,
       color: teammateColor,
       planModeRequired: plan_mode_required,
@@ -1999,9 +2186,12 @@ async function handleSpawnSplitPane(
         : {}),
       subscriptions: [],
       backendType: detectionResult.backend.type,
-    }),
+      spawnClaimToken: input.spawnClaimToken,
+      spawnClaimRunId: bootstrapRunId,
+        })
+      : { changed: false, teamFile },
   )
-  if (updateResult.status === 'missing') {
+  if (updateResult.status !== 'updated') {
     throw new Error(
       `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
     )
@@ -2026,7 +2216,7 @@ async function handleSpawnSplitPane(
       agent_type,
       model,
       provider,
-      effort,
+      effort: toTeamFileEffort(effort),
       name: sanitizedName,
       color: teammateColor,
       tmux_session_name: sessionName,
@@ -2090,14 +2280,24 @@ async function handleSpawnSeparateWindow(
   const windowName = `teammate-${sanitizeName(sanitizedName)}`
   const workingDir = worktreeInfo?.worktreePath ?? cwd ?? getCwd()
 
-  // Ensure the swarm session exists
-  await ensureSession(SWARM_SESSION_NAME)
-
   // Assign a unique color to this teammate
   const teammateColor = assignTeammateColor(teammateId)
 
-  // Create a new window for this teammate
-  const createWindowResult = await execFileNoThrow(TMUX_COMMAND, [
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before window launch.`)
+  }
+
+  // Session creation is itself an external tmux effect, so it also belongs
+  // after the durable runtime-may-exist fence.
+  await getSpawnMultiAgentDeps().ensureSession(SWARM_SESSION_NAME)
+
+  // Create a new window for this teammate only after the claim is durably armed.
+  // Run the command under a hookable boundary so tests can model a process
+  // disappearing immediately after tmux returns the exact pane identity.
+  const createWindowResult = await getSpawnMultiAgentDeps().createSeparateWindow(TMUX_COMMAND, [
     'new-window',
     '-t',
     SWARM_SESSION_NAME,
@@ -2115,6 +2315,27 @@ async function handleSpawnSeparateWindow(
   }
 
   const paneId = createWindowResult.stdout.trim()
+  if (!await recordArmedTeamMemberSpawnRuntime(teamName, teammateId, input.spawnClaimToken, {
+    paneId,
+    backendType: 'tmux',
+  })) {
+    const terminated = await getBackendByType('tmux').killPane(paneId, true).catch(() => false)
+    if (!terminated) {
+      await persistTeammateTerminationRecovery(teamName, teammateId, {
+        teammateName: sanitizedName,
+        paneId,
+        detail: 'Window was created but its exact durable spawn identity could not be published or terminated.',
+      }).catch(() => undefined)
+    }
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim after window creation.`)
+  }
+  await spawnMultiAgentDepsForTests?.afterPaneCreated?.({
+    teamName,
+    agentId: teammateId,
+    claimToken: input.spawnClaimToken,
+    paneId,
+    backendType: 'tmux',
+  })
 
   // Build the command to spawn Claude Code with teammate identity
   // Note: We spawn without a prompt - initial instructions are sent via mailbox
@@ -2289,13 +2510,14 @@ async function handleSpawnSeparateWindow(
 
   // Register agent in the team file
   const updateResult = await updateTeamFileAsync(teamName, teamFile =>
-    upsertTeamMember(teamFile, {
+    teamFile.members.find(member => member.agentId === teammateId)?.spawnClaimToken === input.spawnClaimToken
+      ? upsertTeamMember(teamFile, {
       agentId: teammateId,
       name: sanitizedName,
       agentType: agent_type,
       model,
       provider,
-      effort,
+      effort: toTeamFileEffort(effort),
       prompt,
       color: teammateColor,
       planModeRequired: plan_mode_required,
@@ -2326,9 +2548,12 @@ async function handleSpawnSeparateWindow(
         : {}),
       subscriptions: [],
       backendType: 'tmux', // This handler always uses tmux directly
-    }),
+      spawnClaimToken: input.spawnClaimToken,
+      spawnClaimRunId: bootstrapRunId,
+        })
+      : { changed: false, teamFile },
   )
-  if (updateResult.status === 'missing') {
+  if (updateResult.status !== 'updated') {
     throw new Error(
       `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
     )
@@ -2391,6 +2616,7 @@ function registerOutOfProcessTeammateTask(
     backendType,
     toolUseId,
     worktreeInfo,
+    processIdentity,
   }: {
     teammateId: string
     sanitizedName: string
@@ -2403,12 +2629,37 @@ function registerOutOfProcessTeammateTask(
     backendType: BackendType
     toolUseId?: string
     worktreeInfo?: TeammateWorktreeInfo
+    processIdentity?: {
+      paneId?: string
+      startedAtMs?: number
+      osIdentity?: string
+      ownerToken: string
+      runId: string
+    }
   },
 ): void {
   const taskId = generateTaskId('in_process_teammate')
   const description = `${sanitizedName}: ${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}`
 
   const abortController = new AbortController()
+
+  const terminateExternalRuntime = async (): Promise<boolean> => {
+    if (isPaneBackend(backendType)) {
+      return getBackendByType(backendType).killPane(paneId, !insideTmux)
+    }
+    if (backendType === 'process') {
+      return killProcessBackendRuntime(processIdentity?.paneId ?? paneId, {
+        signal: 'SIGTERM',
+        expectedAgentId: teammateId,
+        teamName,
+        expectedStartedAtMs: processIdentity?.startedAtMs,
+        expectedOsIdentity: processIdentity?.osIdentity,
+        expectedOwnerToken: processIdentity?.ownerToken,
+        expectedRunId: processIdentity?.runId,
+      })
+    }
+    return false
+  }
 
   const taskState: InProcessTeammateTaskState = {
     ...createTaskStateBase(
@@ -2437,6 +2688,15 @@ function registerOutOfProcessTeammateTask(
       ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
       : {}),
     abortController,
+    terminateExternalRuntime,
+    externalRuntime: {
+      paneId,
+      backendType,
+      processStartedAtMs: processIdentity?.startedAtMs,
+      processOsIdentity: processIdentity?.osIdentity,
+      processOwnerToken: processIdentity?.ownerToken,
+      processRunId: processIdentity?.runId,
+    },
     awaitingPlanApproval: false,
     permissionMode: plan_mode_required ? 'plan' : 'default',
     isIdle: false,
@@ -2447,26 +2707,6 @@ function registerOutOfProcessTeammateTask(
   }
 
   registerTask(taskState, setAppState)
-
-  // When abort is signaled, kill the pane using the backend that created it
-  // (tmux kill-pane for tmux panes, it2 session close for iTerm2 native panes).
-  // SDK task_notification bookend is emitted by killInProcessTeammate (the
-  // sole abort trigger for this controller).
-  abortController.signal.addEventListener(
-    'abort',
-    () => {
-      if (isPaneBackend(backendType)) {
-        void getBackendByType(backendType).killPane(paneId, !insideTmux)
-      } else if (backendType === 'process') {
-        void killProcessBackendRuntime(paneId, {
-          signal: 'SIGTERM',
-          expectedAgentId: teammateId,
-          teamName,
-        })
-      }
-    },
-    { once: true },
-  )
 }
 
 /**
@@ -2512,6 +2752,8 @@ async function handleSpawnNativeProcess(
     agentName: sanitizedName,
   })
   const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
+  const processRunId = getSessionId()
+  const processOwnerToken = randomUUID()
 
   try {
     const workingDirStat = await stat(workingDir)
@@ -2553,7 +2795,9 @@ async function handleSpawnNativeProcess(
     '--agent-color',
     teammateColor,
     '--parent-session-id',
-    getSessionId(),
+    processRunId,
+    '--process-owner-token',
+    processOwnerToken,
     ...(plan_mode_required ? ['--plan-mode-required'] : []),
     ...(agent_type ? ['--agent-type', agent_type] : []),
   ]
@@ -2591,7 +2835,7 @@ async function handleSpawnNativeProcess(
     teammateName: sanitizedName,
     provider,
     model,
-    effort,
+    effort: toTeamFileEffort(effort),
     prompt,
     strictMcpConfig: effectiveStrictMcpConfig,
   })
@@ -2607,6 +2851,29 @@ async function handleSpawnNativeProcess(
       : undefined
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
+  let naturalClose: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null
+  let runtimePid: number | undefined
+  let processPaneId: string | undefined
+  let processStartedAtMs: number | null = null
+  let processOsIdentity: string | null = null
+  let deterministicProcessOsIdentity: string | null = null
+  let settleNaturalExitIdentity!: () => void
+  let naturalExitIdentitySettled = false
+  const naturalExitIdentityReady = new Promise<void>(resolve => { settleNaturalExitIdentity = resolve })
+  const markNaturalExitIdentityReady = () => {
+    if (naturalExitIdentitySettled) return
+    naturalExitIdentitySettled = true
+    settleNaturalExitIdentity()
+  }
+  let settleNaturalExitState!: () => void
+  let naturalExitStateSettled = false
+  const naturalExitStateReady = new Promise<void>(resolve => { settleNaturalExitState = resolve })
+  const markNaturalExitStateReady = () => {
+    if (naturalExitStateSettled) return
+    naturalExitStateSettled = true
+    settleNaturalExitState()
+  }
+  const cleanupState = { attempted: false, confirmed: false }
   let stdoutLog: WriteStream | undefined
   let stderrLog: WriteStream | undefined
   const startupReadySentinel = await createSpawnReadySentinel()
@@ -2634,6 +2901,219 @@ async function handleSpawnNativeProcess(
     },
   )
 
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process reservation.`)
+  }
+
+  let reservationOwned = false
+  const reservationResult = await updateTeamFileAsync(teamName, teamFile => {
+    const concurrent = teamFile.members.find(member =>
+      member.agentId === teammateId || sanitizeAgentName(member.name) === sanitizedName,
+    )
+    if (
+      concurrent?.spawnClaimToken &&
+      concurrent.spawnClaimToken !== input.spawnClaimToken
+    ) {
+      return { changed: false, teamFile }
+    }
+    if (concurrent && !concurrent.processOwnerToken) {
+      if (concurrent.spawnClaimToken === input.spawnClaimToken) {
+        // The cross-backend claim belongs to this exact spawn attempt.
+      } else {
+      const legacyPid = parseProcessBackendPid(concurrent.tmuxPaneId) ?? concurrent.runtimePid
+      const deadLegacyProcess =
+        concurrent.backendType === 'process' &&
+        Boolean(legacyPid) &&
+        !isProcessAlive(legacyPid!)
+      if (!deadLegacyProcess) return { changed: false, teamFile }
+      }
+    }
+    if (concurrent?.processOwnerToken && concurrent.processOwnerToken !== processOwnerToken) {
+      const concurrentPid = parseProcessBackendPid(concurrent.tmuxPaneId) ?? concurrent.runtimePid
+      if (!canReplaceProcessSpawnReservation({
+        existingOwnerToken: concurrent.processOwnerToken,
+        nextOwnerToken: processOwnerToken,
+        existingPid: concurrentPid,
+        existingPidAlive: concurrentPid ? isProcessAlive(concurrentPid) : false,
+      })) {
+        return { changed: false, teamFile }
+      }
+    }
+    reservationOwned = true
+    return upsertTeamMember(teamFile, {
+      agentId: teammateId,
+      name: sanitizedName,
+      agentType: agent_type,
+      model,
+      provider,
+      effort: persistedEffort,
+      prompt,
+      color: teammateColor,
+      planModeRequired: plan_mode_required,
+      joinedAt: Date.now(),
+      bootstrapExpectedAfter: launchBoundaryIso,
+      bootstrapProofToken,
+      bootstrapRunId,
+      bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+      tmuxPaneId: `process:pending:${processOwnerToken}`,
+      cwd: workingDir,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.headCommit ? { worktreeHeadCommit: worktreeInfo.headCommit } : {}),
+      ...(worktreeInfo?.gitRoot ? { worktreeGitRoot: worktreeInfo.gitRoot } : {}),
+      ...(worktreeInfo?.hookBased ? { worktreeHookBased: true } : {}),
+      ...(worktreeInfo?.baseWorkspaceRoot ? { worktreeBaseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot } : {}),
+      processOwnerToken,
+      processRunId,
+      spawnClaimToken: input.spawnClaimToken,
+      spawnClaimRunId: bootstrapRunId,
+      runtimePid: undefined,
+      processStartedAtMs: undefined,
+      subscriptions: [],
+      backendType: 'process',
+    })
+  })
+  if (reservationResult.status === 'missing') {
+    throw new Error(
+      `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+    )
+  }
+  if (!reservationOwned) {
+    throw new Error(`Teammate "${sanitizedName}" already has a concurrent process spawn reservation.`)
+  }
+
+  const processIdentity: {
+    paneId?: string
+    startedAtMs?: number
+    ownerToken: string
+    runId: string
+    osIdentity?: string
+  } = { ownerToken: processOwnerToken, runId: processRunId }
+  const pendingPaneId = `process:pending:${processOwnerToken}`
+  setAppState(prev => ({
+    ...prev,
+    teamContext: {
+      ...prev.teamContext,
+      teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
+      teamFilePath: prev.teamContext?.teamFilePath ?? '',
+      leadAgentId: prev.teamContext?.leadAgentId ?? '',
+      teammates: {
+        ...(prev.teamContext?.teammates || {}),
+        [teammateId]: {
+          name: sanitizedName,
+          agentType: agent_type,
+          color: teammateColor,
+          tmuxSessionName: 'process',
+          tmuxPaneId: pendingPaneId,
+          cwd: workingDir,
+          ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+          spawnedAt: Date.now(),
+          processOwnerToken,
+          processRunId,
+          spawnClaimToken: input.spawnClaimToken,
+          spawnClaimRunId: bootstrapRunId,
+        },
+      },
+    },
+  }))
+  registerOutOfProcessTeammateTask(setAppState, {
+    teammateId,
+    sanitizedName,
+    teamName,
+    teammateColor,
+    prompt,
+    plan_mode_required,
+    paneId: pendingPaneId,
+    insideTmux: false,
+    backendType: 'process',
+    toolUseId: context.toolUseId,
+    worktreeInfo,
+    processIdentity,
+  })
+
+  const removeOwnedRecoveryReservation = async (): Promise<void> => {
+    await updateTeamFileAsync(teamName, teamFile => {
+      const owned = teamFile.members.find(
+        member =>
+          member.agentId === teammateId &&
+          member.processOwnerToken === processOwnerToken &&
+          member.processRunId === processRunId &&
+          (processOsIdentity === null || member.processOsIdentity === processOsIdentity),
+      )
+      if (!owned) return { changed: false, teamFile }
+      return {
+        changed: true,
+        teamFile: {
+          ...teamFile,
+          members: teamFile.members.filter(member => member !== owned),
+        },
+      }
+    })
+  }
+
+  const handleNaturalProcessClose = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
+    void writeParentOwnedTeammateRuntimeEvent({
+      type: 'exited', eventsPath: runtimePaths.eventsPath, pid: runtimePid,
+      teamName, agentName: sanitizedName, agentId: teammateId,
+      runId: getSessionId(), bootstrapRunId, source: 'spawnMultiAgent.process',
+      detail: code !== null ? `process exited with code ${code}` : signal ? `process exited from signal ${signal}` : 'process exited',
+    })
+    finishRuntimeLogStreams([stdoutLog, stderrLog])
+    const treeEmpty = runtimePid
+      ? await confirmNaturalProcessTreeExit(
+          runtimePid,
+          processOsIdentity ?? deterministicProcessOsIdentity,
+        ).catch(() => false)
+      : false
+    if (!treeEmpty) return
+    const exactProcessIdentity = {
+      agentId: teammateId, paneId: processPaneId,
+      processStartedAtMs: processStartedAtMs ?? undefined,
+      processOsIdentity, processOwnerToken, processRunId,
+      spawnClaimRunId: bootstrapRunId,
+    }
+    const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+      ...exactProcessIdentity, spawnClaimToken: input.spawnClaimToken,
+    }).catch(() => false) || await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+      ...exactProcessIdentity, spawnClaimToken: undefined,
+    }).catch(() => false)
+    if (!removed) return
+    setAppState(prev => {
+      const teammates = prev.teamContext?.teammates
+      const owned = teammates?.[teammateId]
+      const exactClaim = owned?.processOwnerToken === processOwnerToken &&
+        owned.processRunId === processRunId && owned.spawnClaimRunId === bootstrapRunId
+      const exactFinalized = exactClaim && owned.tmuxPaneId === processPaneId &&
+        owned.processStartedAtMs === (processStartedAtMs ?? undefined) &&
+        owned.processOsIdentity === processOsIdentity &&
+        (owned.spawnClaimToken === input.spawnClaimToken || owned.spawnClaimToken === undefined)
+      const exactPreFinalized = exactClaim && owned.tmuxPaneId === pendingPaneId &&
+        owned.processStartedAtMs === undefined && owned.processOsIdentity === undefined &&
+        owned.spawnClaimToken === input.spawnClaimToken
+      const exactOwned = exactFinalized || exactPreFinalized
+      const recovery = prev.teammateTerminationRecovery[sanitizedName]
+      const exactRecovery = recovery?.processOwnerToken === processOwnerToken &&
+        recovery.processRunId === processRunId &&
+        (recovery.paneId === processPaneId || recovery.paneId === pendingPaneId)
+      const teammateTerminationRecovery = exactRecovery
+        ? Object.fromEntries(Object.entries(prev.teammateTerminationRecovery).filter(([name]) => name !== sanitizedName))
+        : prev.teammateTerminationRecovery
+      const tasks = Object.fromEntries(Object.entries(prev.tasks).filter(([, task]) =>
+        !isInProcessTeammateTask(task) || task.identity.agentId !== teammateId ||
+        task.externalRuntime?.paneId !== processPaneId ||
+        task.externalRuntime.processStartedAtMs !== processStartedAtMs ||
+        task.externalRuntime.processOsIdentity !== processOsIdentity ||
+        task.externalRuntime.processOwnerToken !== processOwnerToken ||
+        task.externalRuntime.processRunId !== processRunId))
+      if (!prev.teamContext || !teammates || !exactOwned) return { ...prev, tasks, teammateTerminationRecovery }
+      const { [teammateId]: _retired, ...remaining } = teammates
+      return { ...prev, tasks, teammateTerminationRecovery, teamContext: { ...prev.teamContext, teammates: remaining } }
+    })
+  }
+
   try {
     stdoutLog = createWriteStream(runtimePaths.stdoutPath, {
       flags: 'a',
@@ -2656,9 +3136,8 @@ async function handleSpawnNativeProcess(
       )
     })
 
-    child = spawn(command, argv, {
+    const exactSpawn = buildExactProcessTreeSpawn(command, argv, {
       cwd: workingDir,
-      detached: shouldDetachNativeProcessBackend(),
       env: {
         ...process.env,
         ...buildInheritedEnvObject({
@@ -2678,44 +3157,151 @@ async function handleSpawnNativeProcess(
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
+    child = spawn(exactSpawn.command, exactSpawn.args, exactSpawn.options)
 
     if (!child.pid) {
-      throw new Error(`Failed to spawn teammate process for ${teammateId}: missing pid`)
+      // Node reports an exec failure asynchronously: spawn() still returns a
+      // ChildProcess, but it has no pid and emits error followed by close. Do
+      // not preserve a process:pending blocker until that no-process boundary
+      // is proven and the armed durable claim can be retired safely.
+      let spawnError: Error | null = null
+      await new Promise<void>(resolve => {
+        child!.once('error', error => { spawnError = error })
+        child!.once('close', () => resolve())
+      })
+      child = null
+      throw new Error(
+        `Failed to spawn teammate process for ${teammateId}: missing pid${
+          spawnError ? ` (${spawnError.message})` : ''
+        }`,
+      )
     }
 
-    const runtimePid = child.pid
-    const processPaneId = buildProcessBackendPaneId(runtimePid)
+    runtimePid = child.pid
+    deterministicProcessOsIdentity = exactSpawn.osIdentity === 'unix-pgid:pending'
+      ? `unix-pgid:${runtimePid}`
+      : exactSpawn.osIdentity
+    // Drain output before asynchronous identity capture. A short-lived child
+    // can exit during that probe, and its failure evidence must not be lost.
+    child.stdout?.pipe(stdoutLog)
+    child.stderr?.pipe(stderrLog)
+    // Subscribe before the first asynchronous identity probe. Very short-lived
+    // children can otherwise emit close before cleanup has a listener.
+    naturalClose = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child!.once('close', (code, signal) => resolve({ code, signal }))
+    })
+    void naturalClose.then(async ({ code, signal }) => {
+      await naturalExitIdentityReady
+      await naturalExitStateReady
+      await handleNaturalProcessClose(code, signal)
+    })
+    processOsIdentity = exactSpawn.osIdentity === 'unix-pgid:pending'
+      ? await captureProcessTreeIdentity(runtimePid)
+      : exactSpawn.osIdentity
+    if (!processOsIdentity) {
+      throw new Error(`Failed to capture exact process-tree identity for teammate ${teammateId}`)
+    }
+    processIdentity.osIdentity = processOsIdentity
+    processPaneId = buildProcessBackendPaneId(runtimePid)
+    processIdentity.paneId = processPaneId
+    markNaturalExitIdentityReady()
+    let pidPublishOwned = false
+    const pidPublishResult = await updateTeamFileAsync(teamName, teamFile => {
+      const owned = teamFile.members.find(member => member.agentId === teammateId)
+      if (owned?.processOwnerToken !== processOwnerToken || owned.processRunId !== processRunId) {
+        return { changed: false, teamFile }
+      }
+      pidPublishOwned = true
+      return upsertTeamMember(teamFile, {
+        ...owned,
+        tmuxPaneId: processPaneId!,
+        runtimePid,
+        processOwnerToken,
+        processRunId,
+        processOsIdentity,
+        backendType: 'process',
+      })
+    })
+    if (pidPublishResult.status === 'missing' || !pidPublishOwned) {
+      throw new Error(`Team "${teamName}" disappeared while publishing process recovery identity.`)
+    }
+
+    processStartedAtMs = await readProcessStartTimeMs(runtimePid)
+    if (processStartedAtMs === null) {
+      throw new Error(
+        `Failed to capture immutable process identity for teammate ${teammateId}`,
+      )
+    }
+    processIdentity.startedAtMs = processStartedAtMs
+    let identityPublishOwned = false
+    const identityPublishResult = await updateTeamFileAsync(teamName, teamFile => {
+      const owned = teamFile.members.find(member => member.agentId === teammateId)
+      if (owned?.processOwnerToken !== processOwnerToken || owned.processRunId !== processRunId) {
+        return { changed: false, teamFile }
+      }
+      identityPublishOwned = true
+      return upsertTeamMember(teamFile, {
+        ...owned,
+        processStartedAtMs,
+        processOsIdentity,
+      })
+    })
+    if (identityPublishResult.status === 'missing' || !identityPublishOwned) {
+      throw new Error(`Team "${teamName}" disappeared while publishing immutable process identity.`)
+    }
+    setAppState(prev => {
+      const teammates = prev.teamContext?.teammates
+      const existingTeammate = teammates?.[teammateId]
+      const tasks = Object.fromEntries(
+        Object.entries(prev.tasks).map(([taskId, task]) => {
+          if (
+            !isInProcessTeammateTask(task) ||
+            task.identity.agentId !== teammateId ||
+            task.externalRuntime?.processOwnerToken !== processOwnerToken
+          ) {
+            return [taskId, task]
+          }
+          return [taskId, {
+            ...task,
+            externalRuntime: {
+              ...task.externalRuntime,
+              paneId: processPaneId!,
+              processStartedAtMs,
+              processOsIdentity,
+            },
+          }]
+        }),
+      )
+      return {
+        ...prev,
+        tasks,
+        ...(prev.teamContext && teammates && existingTeammate
+          ? {
+              teamContext: {
+                ...prev.teamContext,
+                teammates: {
+                  ...teammates,
+                  [teammateId]: {
+                    ...existingTeammate,
+                    tmuxPaneId: processPaneId!,
+                    processStartedAtMs,
+                    processOsIdentity,
+                  },
+                },
+              },
+            }
+          : {}),
+      }
+    })
     child.stdin?.on('error', error => {
       logForDebugging(
         `[handleSpawnNativeProcess] stdin pipe failed for ${teammateId}: ${error.message}`,
         { level: 'warn' },
       )
     })
-    child.stdout?.pipe(stdoutLog)
-    child.stderr?.pipe(stderrLog)
     ;(child.stdin as { unref?: () => void } | null)?.unref?.()
     ;(child.stdout as { unref?: () => void } | null)?.unref?.()
     ;(child.stderr as { unref?: () => void } | null)?.unref?.()
-    child.once('close', (code, signal) => {
-      void writeParentOwnedTeammateRuntimeEvent({
-        type: 'exited',
-        eventsPath: runtimePaths.eventsPath,
-        pid: runtimePid,
-        teamName,
-        agentName: sanitizedName,
-        agentId: teammateId,
-        runId: getSessionId(),
-        bootstrapRunId,
-        source: 'spawnMultiAgent.process',
-        detail:
-          code !== null
-            ? `process exited with code ${code}`
-            : signal
-              ? `process exited from signal ${signal}`
-              : 'process exited',
-      })
-      finishRuntimeLogStreams([stdoutLog, stderrLog])
-    })
     child.once('error', error => {
       void writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
@@ -2733,7 +3319,7 @@ async function handleSpawnNativeProcess(
     await writeParentOwnedTeammateRuntimeEvent({
       type: 'process_spawned',
       eventsPath: runtimePaths.eventsPath,
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2745,7 +3331,7 @@ async function handleSpawnNativeProcess(
     await writeParentOwnedTeammateRuntimeEvent({
       type: 'stdout_attached',
       eventsPath: runtimePaths.eventsPath,
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2756,7 +3342,17 @@ async function handleSpawnNativeProcess(
     })
     const spawnFailure = await probeNativeProcessTeammateSpawn(child, teammateId)
     if (spawnFailure) {
-      killProcessTree(runtimePid, 'SIGTERM')
+      await attemptProcessCleanupOnce(
+        cleanupState,
+        () => killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }),
+      )
       await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
@@ -2782,7 +3378,7 @@ async function handleSpawnNativeProcess(
         fallbackMs: getProcessRuntimeReadyTimeoutMs(),
         deadlineMs: bootstrapDeadlineMs,
       }),
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2791,11 +3387,21 @@ async function handleSpawnNativeProcess(
       isStillAlive: () => isProcessAlive(runtimePid),
     })
     if (!runtimeReady.ok) {
-      killProcessTree(runtimePid, 'SIGTERM')
+      await attemptProcessCleanupOnce(
+        cleanupState,
+        () => killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }),
+      )
       const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
       const stdoutTail = await readProcessLogTail(runtimePaths.stdoutPath)
       const detail = [
-        runtimeReady.reason,
+        'reason' in runtimeReady ? runtimeReady.reason : 'Runtime readiness was not confirmed.',
         stderrTail ? `Last stderr:\n${stderrTail}` : '',
         stdoutTail ? `Last stdout:\n${stdoutTail}` : '',
       ]
@@ -2818,8 +3424,14 @@ async function handleSpawnNativeProcess(
       )
     }
 
-    const updateResult = await updateTeamFileAsync(teamName, teamFile =>
-      upsertTeamMember(teamFile, {
+    let finalPublishOwned = false
+    const updateResult = await updateTeamFileAsync(teamName, teamFile => {
+      const owned = teamFile.members.find(member => member.agentId === teammateId)
+      if (owned?.processOwnerToken !== processOwnerToken || owned.processRunId !== processRunId) {
+        return { changed: false, teamFile }
+      }
+      finalPublishOwned = true
+      return upsertTeamMember(teamFile, {
         agentId: teammateId,
         name: sanitizedName,
         agentType: agent_type,
@@ -2843,6 +3455,10 @@ async function handleSpawnNativeProcess(
           : {}),
         tmuxPaneId: processPaneId,
         runtimePid,
+        processStartedAtMs,
+        processOsIdentity,
+        processOwnerToken,
+        processRunId,
         cwd: workingDir,
         ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
         ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
@@ -2857,9 +3473,11 @@ async function handleSpawnNativeProcess(
           : {}),
         subscriptions: [],
         backendType: 'process',
-      }),
-    )
-    if (updateResult.status === 'missing') {
+        spawnClaimToken: input.spawnClaimToken,
+        spawnClaimRunId: bootstrapRunId,
+      })
+    })
+    if (updateResult.status === 'missing' || !finalPublishOwned) {
       throw new Error(
         `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
       )
@@ -2879,7 +3497,7 @@ async function handleSpawnNativeProcess(
     await writeParentOwnedTeammateRuntimeEvent({
       type: 'mailbox_bootstrap_written',
       eventsPath: runtimePaths.eventsPath,
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2897,7 +3515,7 @@ async function handleSpawnNativeProcess(
         fallbackMs: getProcessInboxPollerReadyTimeoutMs(),
         deadlineMs: bootstrapDeadlineMs,
       }),
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2909,14 +3527,21 @@ async function handleSpawnNativeProcess(
       // After team metadata registration, cleanup goes through the process
       // backend guard so a reused pid cannot be killed without matching the
       // expected agent/team identity.
-      await killProcessBackendRuntime(processPaneId, {
-        expectedAgentId: teammateId,
-        teamName,
-      })
+      await attemptProcessCleanupOnce(
+        cleanupState,
+        () => killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }),
+      )
       const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
       const stdoutTail = await readProcessLogTail(runtimePaths.stdoutPath)
       const detail = [
-        inboxPollerReady.reason,
+        'reason' in inboxPollerReady ? inboxPollerReady.reason : 'Inbox poller readiness was not confirmed.',
         stderrTail ? `Last stderr:\n${stderrTail}` : '',
         stdoutTail ? `Last stdout:\n${stdoutTail}` : '',
       ]
@@ -2948,7 +3573,7 @@ async function handleSpawnNativeProcess(
         fallbackMs: PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS,
         deadlineMs: bootstrapDeadlineMs,
       }),
-      pid: runtimePid,
+      pid: process.platform === 'win32' ? undefined : runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
@@ -2966,10 +3591,17 @@ async function handleSpawnNativeProcess(
     if (bootstrapSubmitted.type !== 'submitted') {
       // Same guarded cleanup path as above: bootstrap transport failure is
       // terminal for this launch, but process termination must remain scoped.
-      await killProcessBackendRuntime(processPaneId, {
-        expectedAgentId: teammateId,
-        teamName,
-      })
+      await attemptProcessCleanupOnce(
+        cleanupState,
+        () => killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }),
+      )
       const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
       const detail = stderrTail
         ? `${bootstrapSubmitted.reason}\nLast stderr:\n${stderrTail}`
@@ -3029,26 +3661,19 @@ async function handleSpawnNativeProcess(
             cwd: workingDir,
             ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
             spawnedAt: Date.now(),
+            processStartedAtMs,
+            processOsIdentity,
+            processOwnerToken,
+            processRunId,
+            spawnClaimToken: input.spawnClaimToken,
+            spawnClaimRunId: bootstrapRunId,
           },
         },
       },
     }))
 
-    registerOutOfProcessTeammateTask(setAppState, {
-      teammateId,
-      sanitizedName,
-      teamName,
-      teammateColor,
-      prompt,
-      plan_mode_required,
-      paneId: processPaneId,
-      insideTmux: false,
-      backendType: 'process',
-      toolUseId: context.toolUseId,
-      worktreeInfo,
-    })
-
     child.unref()
+    markNaturalExitStateReady()
     logForDebugging(
       `[handleSpawnNativeProcess] Spawned teammate ${teammateId} as pid ${runtimePid}`,
     )
@@ -3060,7 +3685,7 @@ async function handleSpawnNativeProcess(
         agent_type,
         model,
         provider,
-        effort,
+        effort: toTeamFileEffort(effort),
         name: sanitizedName,
         color: teammateColor,
         tmux_session_name: 'process',
@@ -3070,6 +3695,10 @@ async function handleSpawnNativeProcess(
         is_splitpane: false,
         backend_type: 'process',
         runtime_pid: runtimePid,
+        process_started_at_ms: processStartedAtMs,
+        process_os_identity: processOsIdentity,
+        process_owner_token: processOwnerToken,
+        process_run_id: processRunId,
         runtime_events_log: runtimePaths.eventsPath,
         runtime_stdout_log: runtimePaths.stdoutPath,
         runtime_stderr_log: runtimePaths.stderrPath,
@@ -3082,9 +3711,96 @@ async function handleSpawnNativeProcess(
       },
     }
   } catch (error) {
-    if (child?.pid) {
-      killProcessTree(child.pid, 'SIGTERM')
+    markNaturalExitIdentityReady()
+    const failureAlreadyRecorded = await readTeammateRuntimeEvents(runtimePaths.eventsPath)
+      .then(events => events.some(event =>
+        event.type === 'failed' && event.bootstrapRunId === bootstrapRunId,
+      ))
+      .catch(() => false)
+    if (!failureAlreadyRecorded) {
+      await writeParentOwnedTeammateRuntimeEvent({
+        type: 'failed', eventsPath: runtimePaths.eventsPath, pid: runtimePid,
+        teamName, agentName: sanitizedName, agentId: teammateId,
+        runId: getSessionId(), bootstrapRunId, source: 'spawnMultiAgent.process',
+        detail: errorMessage(error),
+      }).catch(() => undefined)
     }
+    let terminated = child === null || cleanupState.confirmed
+    if (!cleanupState.attempted && child && runtimePid && processPaneId && processStartedAtMs !== null) {
+      terminated = await attemptProcessCleanupOnce(
+        cleanupState,
+        () => killProcessBackendRuntime(processPaneId, {
+          expectedAgentId: teammateId,
+          teamName,
+          expectedStartedAtMs: processStartedAtMs,
+          expectedOwnerToken: processOwnerToken,
+          expectedRunId: processRunId,
+          expectedOsIdentity: processOsIdentity,
+        }),
+      )
+    } else if (!cleanupState.attempted && child) {
+      // A child can exit before immutable PID identity publication. The spawn
+      // boundary still gives Unix a deterministic PGID and Windows a unique
+      // named Job. Only after the exact ChildProcess close and a kernel-level
+      // empty-boundary proof may the pre-finalized claim be retired.
+      const rootExited = runtimePid !== undefined && !isProcessAlive(runtimePid)
+      if (rootExited && naturalClose && deterministicProcessOsIdentity) {
+        await naturalClose
+        terminated = await confirmNaturalProcessTreeExit(
+          runtimePid,
+          deterministicProcessOsIdentity,
+        ).catch(() => false)
+      } else {
+        terminated = false
+      }
+    }
+    if (terminated) {
+      await removeOwnedRecoveryReservation().catch(() => undefined)
+      setAppState(prev => {
+        const teammates = prev.teamContext?.teammates
+        const owned = teammates?.[teammateId]
+        const remainingTasks = Object.fromEntries(
+          Object.entries(prev.tasks).filter(([, task]) =>
+            !isInProcessTeammateTask(task) ||
+            task.identity.agentId !== teammateId ||
+            task.externalRuntime?.processOwnerToken !== processOwnerToken,
+          ),
+        )
+        if (!prev.teamContext || !teammates || owned?.processOwnerToken !== processOwnerToken) {
+          return { ...prev, tasks: remainingTasks }
+        }
+        const { [teammateId]: _, ...remainingTeammates } = teammates
+        return {
+          ...prev,
+          tasks: remainingTasks,
+          teamContext: { ...prev.teamContext, teammates: remainingTeammates },
+        }
+      })
+    } else if (child) {
+      await persistTeammateTerminationRecovery(teamName, teammateId, {
+        teammateName: sanitizedName,
+        paneId: processPaneId ?? pendingPaneId,
+        processStartedAtMs: processStartedAtMs ?? undefined,
+        processOsIdentity: processOsIdentity ?? undefined,
+        processOwnerToken,
+        processRunId,
+        detail: `Process spawn failed and exact termination was not confirmed: ${errorMessage(error)}`,
+      }).catch(() => undefined)
+      setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+        teammateName: sanitizedName,
+        paneId: processPaneId ?? pendingPaneId,
+        processStartedAtMs: processStartedAtMs ?? undefined,
+        processOsIdentity: processOsIdentity ?? undefined,
+        processOwnerToken,
+        processRunId,
+        detail: `Process spawn failed and exact termination was not confirmed: ${errorMessage(error)}`,
+      }))
+      logForDebugging(
+        `[handleSpawnNativeProcess] Teammate ${teammateId} cleanup was not confirmed; retaining recovery blocker ${processOwnerToken}`,
+        { level: 'warn' },
+      )
+    }
+    markNaturalExitStateReady()
     finishRuntimeLogStreams([stdoutLog, stderrLog])
     throw error
   } finally {
@@ -3171,7 +3887,7 @@ async function handleSpawnInProcess(
     color: teammateColor,
     planModeRequired: plan_mode_required ?? false,
     model,
-    effort,
+    effort: toTeamFileEffort(effort),
     ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
     ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
     ...(worktreeInfo?.baseWorkspaceRoot
@@ -3193,6 +3909,12 @@ async function handleSpawnInProcess(
   })
 
   const launchBoundaryIso = new Date().toISOString()
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before in-process launch.`)
+  }
   const result = await spawnInProcessTeammate(config, context)
 
   if (!result.success) {
@@ -3251,13 +3973,14 @@ async function handleSpawnInProcess(
 
     // Register agent in the team file
     const updateResult = await updateTeamFileAsync(teamName, teamFile =>
-      upsertTeamMember(teamFile, {
+      teamFile.members.find(member => member.agentId === teammateId)?.spawnClaimToken === input.spawnClaimToken
+        ? upsertTeamMember(teamFile, {
         agentId: teammateId,
         name: sanitizedName,
         agentType: agent_type,
         model,
         provider,
-        effort,
+        effort: toTeamFileEffort(effort),
         prompt,
         color: teammateColor,
         planModeRequired: plan_mode_required,
@@ -3278,11 +4001,28 @@ async function handleSpawnInProcess(
           : {}),
         subscriptions: [],
         backendType: 'in-process',
-      }),
+        spawnClaimToken: input.spawnClaimToken,
+        spawnClaimRunId: input.bootstrapRunId,
+          })
+        : { changed: false, teamFile },
     )
-    if (updateResult.status === 'missing') {
+    if (updateResult.status !== 'updated') {
       throw new Error(
         `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+      )
+    }
+
+    if (
+      !input.spawnClaimToken ||
+      !await (spawnMultiAgentDepsForTests?.finalizeTeamMemberSpawnClaim ?? finalizeTeamMemberSpawnClaim)(
+        teamName,
+        teammateId,
+        input.spawnClaimToken,
+        input.bootstrapRunId,
+      )
+    ) {
+      throw new Error(
+        `Teammate "${sanitizedName}" lost its durable spawn claim before execution.`,
       )
     }
 
@@ -3307,7 +4047,7 @@ async function handleSpawnInProcess(
         prompt,
         description: input.description,
         model,
-        effort,
+        effort: toTeamFileEffort(effort),
         agentDefinition,
         teammateContext: result.teammateContext,
         // Strip messages: the teammate never reads toolUseContext.messages
@@ -3387,6 +4127,18 @@ type SpawnMultiAgentDepsForTests = {
   detectAndGetBackend?: typeof detectAndGetBackend
   getTeammateModeFromSnapshot?: typeof getTeammateModeFromSnapshot
   isInProcessEnabled?: typeof isInProcessEnabled
+  finalizeTeamMemberSpawnClaim?: typeof finalizeTeamMemberSpawnClaim
+  beforeHandleSpawn?: (params: { teamName: string; agentId: string; claimToken: string }) => Promise<void>
+  createTeammatePaneInSwarmView?: typeof createTeammatePaneInSwarmView
+  ensureSession?: typeof ensureSession
+  createSeparateWindow?: typeof execFileNoThrow
+  afterPaneCreated?: (params: {
+    teamName: string
+    agentId: string
+    claimToken: string
+    paneId: string
+    backendType: 'tmux' | 'iterm2'
+  }) => Promise<void>
 }
 
 let spawnMultiAgentDepsForTests: SpawnMultiAgentDepsForTests | null = null
@@ -3409,6 +4161,16 @@ function getSpawnMultiAgentDeps(): Required<SpawnMultiAgentDepsForTests> {
       getTeammateModeFromSnapshot,
     isInProcessEnabled:
       spawnMultiAgentDepsForTests?.isInProcessEnabled ?? isInProcessEnabled,
+    finalizeTeamMemberSpawnClaim:
+      spawnMultiAgentDepsForTests?.finalizeTeamMemberSpawnClaim ?? finalizeTeamMemberSpawnClaim,
+    beforeHandleSpawn:
+      spawnMultiAgentDepsForTests?.beforeHandleSpawn ?? (async () => undefined),
+    createTeammatePaneInSwarmView:
+      spawnMultiAgentDepsForTests?.createTeammatePaneInSwarmView ?? createTeammatePaneInSwarmView,
+    ensureSession: spawnMultiAgentDepsForTests?.ensureSession ?? ensureSession,
+    createSeparateWindow: spawnMultiAgentDepsForTests?.createSeparateWindow ?? execFileNoThrow,
+    afterPaneCreated:
+      spawnMultiAgentDepsForTests?.afterPaneCreated ?? (async () => undefined),
   }
 }
 
@@ -3515,7 +4277,17 @@ async function handleSpawn(
     }
     return await handleSpawnSeparateWindow(spawnInput, context)
   } catch (error) {
-    await cleanupCreatedTeammateWorktree(spawnedWorktreeInfo)
+    const failedTeamName = spawnInput.team_name || context.getAppState().teamContext?.teamName
+    const failedTeammateName = spawnInput.name?.trim()
+    const teammateId = failedTeamName && failedTeammateName
+      ? formatAgentId(sanitizeAgentName(failedTeammateName), failedTeamName)
+      : undefined
+    const retainedRecovery = teammateId
+      ? context.getAppState().teamContext?.teammates?.[teammateId]
+      : undefined
+    if (!retainedRecovery?.processOwnerToken) {
+      await cleanupCreatedTeammateWorktree(spawnedWorktreeInfo)
+    }
     throw error
   }
 }
@@ -3551,6 +4323,8 @@ export async function spawnTeammate(
   }
 
   pendingTeammateSpawnReservations.add(reservationKey)
+  let claimToken: string | null = null
+  const agentId = formatAgentId(sanitizeAgentName(teammateName), teamName)
   try {
     const existingState = await resolveExistingTeammateState(
       config,
@@ -3573,7 +4347,97 @@ export async function spawnTeammate(
         context,
       )
     }
-    return handleSpawn(config, context)
+    claimToken = randomUUID()
+    const claimRunId = config.bootstrapRunId ?? getSessionId()
+    const sanitizedName = sanitizeAgentName(teammateName)
+    const claimed = await claimTeamMemberForSpawn(teamName, {
+      agentId,
+      name: sanitizedName,
+      agentType: config.agent_type,
+      model: resolveSpawnModel(config.model, context.getAppState().mainLoopModel, config.provider),
+      provider: resolveTeammateProvider(config.provider),
+      effort: toTeamFileEffort(config.effort),
+      prompt: config.prompt,
+      color: assignTeammateColor(agentId),
+      planModeRequired: config.plan_mode_required,
+      joinedAt: Date.now(),
+      tmuxPaneId: `spawn:pending:${claimToken}`,
+      cwd: config.cwd ?? getCwd(),
+      subscriptions: [],
+      spawnClaimToken: claimToken,
+      spawnClaimRunId: claimRunId,
+      spawnClaimOwnerPid: process.pid,
+      spawnClaimOwnerStartedAtMs: await readProcessStartTimeMs(process.pid) ?? undefined,
+    }, 'expectedExisting' in existingState ? existingState.expectedExisting : undefined)
+    if (!claimed) {
+      if (!await readTeamFileAsync(teamName)) {
+        throw new Error(
+          `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+        )
+      }
+      return buildDuplicateSkippedResult(config, teamName, 'bootstrap_pending', context)
+    }
+    await spawnMultiAgentDepsForTests?.beforeHandleSpawn?.({ teamName, agentId, claimToken })
+    const result = await handleSpawn({
+      ...config,
+      bootstrapRunId: claimRunId,
+      spawnClaimToken: claimToken,
+    }, context)
+    if (!await (spawnMultiAgentDepsForTests?.finalizeTeamMemberSpawnClaim ?? finalizeTeamMemberSpawnClaim)(teamName, agentId, claimToken, claimRunId)) {
+      const data = 'data' in result && result.data && typeof result.data === 'object'
+        ? result.data as SpawnOutput
+        : null
+      if (data?.backend_type === 'in-process') {
+        const task = Object.values(context.getAppState().tasks).find(candidate =>
+          isInProcessTeammateTask(candidate) &&
+          candidate.status === 'running' &&
+          candidate.identity.agentId === agentId,
+        )
+        if (task && isInProcessTeammateTask(task)) {
+          await killInProcessTeammate(task.id, context.setAppState)
+        }
+      } else if (data?.backend_type === 'process' && data.tmux_pane_id) {
+        const terminated = await killProcessBackendRuntime(data.tmux_pane_id, {
+          expectedAgentId: agentId,
+          teamName,
+          expectedStartedAtMs: data.process_started_at_ms,
+          expectedOsIdentity: data.process_os_identity,
+          expectedOwnerToken: data.process_owner_token,
+          expectedRunId: data.process_run_id,
+        }).catch(() => false)
+        if (!terminated) {
+          await persistTeammateTerminationRecovery(teamName, agentId, {
+            teammateName: sanitizedName,
+            paneId: data.tmux_pane_id,
+            processStartedAtMs: data.process_started_at_ms,
+            processOsIdentity: data.process_os_identity,
+            processOwnerToken: data.process_owner_token,
+            processRunId: data.process_run_id,
+            detail: 'Spawn publication failed and exact runtime termination was not confirmed.',
+          }).catch(() => undefined)
+        }
+      } else if (data?.backend_type && isPaneBackend(data.backend_type) && data.tmux_pane_id) {
+        const terminated = await getBackendByType(data.backend_type)
+          .killPane(data.tmux_pane_id, true)
+          .catch(() => false)
+        if (!terminated) {
+          await persistTeammateTerminationRecovery(teamName, agentId, {
+            teammateName: sanitizedName,
+            paneId: data.tmux_pane_id,
+            detail: 'Spawn publication failed and pane termination was not confirmed.',
+          }).catch(() => undefined)
+        }
+      }
+      throw new Error(
+        `Teammate "${sanitizedName}" lost its durable spawn claim before publication.`,
+      )
+    }
+    return result
+  } catch (error) {
+    if (claimToken) {
+      await releaseTeamMemberSpawnClaim(teamName, agentId, claimToken)
+    }
+    throw error
   } finally {
     pendingTeammateSpawnReservations.delete(reservationKey)
   }

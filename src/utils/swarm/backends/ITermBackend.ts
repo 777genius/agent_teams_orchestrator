@@ -114,6 +114,7 @@ export class ITermBackend implements PaneBackend {
   async createTeammatePaneInSwarmView(
     name: string,
     color: AgentColorName,
+    onCreated?: (paneId: PaneId) => Promise<void>,
   ): Promise<CreatePaneResult> {
     logForDebugging(
       `[ITermBackend] createTeammatePaneInSwarmView called for ${name} with color ${color}`,
@@ -221,6 +222,7 @@ export class ITermBackend implements PaneBackend {
             `Failed to parse session ID from split output: ${splitResult.stdout}`,
           )
         }
+        await onCreated?.(paneId)
         logForDebugging(
           `[ITermBackend] Created teammate pane for ${name}: ${paneId}`,
         )

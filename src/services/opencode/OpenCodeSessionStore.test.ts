@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as lockfile from '../../utils/lockfile.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import type { MaterializationOwnerToken } from './OpenCodeSessionStore.js'
+import { captureOpenCodeSessionCleanupCapability } from './types.js'
 
 const token = (attemptId: string, version = 1, sessionId = ''): MaterializationOwnerToken =>
   ({ attemptId, sessionId, version })
@@ -115,6 +116,25 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.markStaleIfSession(baseRecord, 'launch_failed', token(loser))).toBeNull()
     expect(await store.deleteIfSession(baseRecord, token(loser))).toBe(false)
     expect(await store.get(baseRecord.teamId, baseRecord.memberName)).toEqual(baseRecord)
+  })
+
+  test('durably records an uncommitted remote session and clears it only with its exact claim', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const store = new OpenCodeSessionStore(filePath)
+    const identity = { teamId: baseRecord.teamId, laneId: baseRecord.laneId, memberName: baseRecord.memberName }
+    const claim = await store.claimMaterialization(identity, 'attempt-a', 'run-a')
+    if (claim.kind !== 'claimed') throw new Error('expected materialization claim')
+    const compensation = {
+      ownerToken: claim.ownerToken, runId: 'run-a', hostKey: baseRecord.hostKey,
+      baseUrl: 'http://127.0.0.1:4111', sessionId: 'remote-uncommitted',
+      recordedAt: '2026-04-21T00:00:00.000Z',
+    }
+    expect(await store.recordMaterializationCompensation(identity, compensation)).toBe(true)
+    expect(await store.getMaterializationCompensation(identity)).toEqual(compensation)
+    const persisted = JSON.parse(await readFile(filePath, 'utf8'))
+    expect(persisted.materializationCompensations['team-a::primary::alice']).toEqual(compensation)
+    expect(await store.releaseMaterializationClaim(identity, claim.ownerToken, 'run-a')).toBe(true)
+    expect(await store.getMaterializationCompensation(identity)).toBeNull()
   })
 
   test('distinguishes a newly acquired claim from a replay by the same attempt', async () => {
@@ -333,6 +353,32 @@ describe('OpenCodeSessionStore', () => {
       .toBeNull()
   })
 
+  test('reconciles a persisted commit after store-lock release rejects without accepting an owner or claim mismatch', async () => {
+    const filePath = path.join(tempDir, 'session-store.json')
+    const releaseError = new Error('commit lock release failed')
+    let releaseCalls = 0
+    const store = new OpenCodeSessionStore(filePath, {
+      lock: (async () => async () => {
+        releaseCalls += 1
+        if (releaseCalls === 2) throw releaseError
+      }) as typeof lockfile.lock,
+    })
+    const record = { ...baseRecord, runId: 'run-a' }
+
+    expect(await store.claimMaterialization(record, 'attempt-a', 'run-a')).toEqual(expect.objectContaining({ kind: 'claimed' }))
+    await expect(store.commitMaterialization(record, token('attempt-a'))).rejects.toBe(releaseError)
+    expect(await store.reconcileMaterializationCommit(record, token('attempt-a')))
+      .toEqual(token('attempt-a', 1, record.opencodeSessionId))
+    expect(await store.reconcileMaterializationCommit({ ...record, selectedModel: 'foreign/model' }, token('attempt-a')))
+      .toBeNull()
+    expect(await store.reconcileMaterializationCommit(record, token('foreign-attempt'))).toBeNull()
+    const persisted = JSON.parse(await readFile(filePath, 'utf8'))
+    persisted.materializationClaims ??= {}
+    persisted.materializationClaims['team-a::primary::alice'] = JSON.stringify(token('attempt-a'))
+    await writeFile(filePath, JSON.stringify(persisted))
+    expect(await store.reconcileMaterializationCommit(record, token('attempt-a'))).toBeNull()
+  })
+
   test('clears the pending retry timer when lock acquisition is aborted', async () => {
     const controller = new AbortController()
     const abortReason = new Error('cancel retry timer')
@@ -384,8 +430,8 @@ describe('OpenCodeSessionStore', () => {
     const stopped = await store.markStoppedIfSession(record)
     expect(stopped?.stoppedAt).toBeDefined()
     expect(await store.markStoppedIfSession(record)).toEqual(stopped)
-    expect(await store.claimMaterialization(record, 'same-run-attempt', 'run-1')).toEqual({ kind: 'existing', record: stopped, ownerToken: token('old-attempt', 1, record.opencodeSessionId) })
-    expect(await store.claimMaterialization(record, 'legacy-attempt')).toEqual({ kind: 'existing', record: stopped, ownerToken: token('old-attempt', 1, record.opencodeSessionId) })
+    expect(await store.claimMaterialization(record, 'same-run-attempt', 'run-1')).toEqual({ kind: 'existing', record: stopped })
+    expect(await store.claimMaterialization(record, 'legacy-attempt')).toEqual({ kind: 'existing', record: stopped })
     expect(await store.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual(expect.objectContaining({ kind: 'claimed' }))
     expect(await store.commitMaterialization({ ...record, runId: 'run-2', opencodeSessionId: 'session-2' }, token('new-attempt', 2))).not.toBeNull()
     expect(await store.markStoppedIfSession(record)).toBeNull()
@@ -526,9 +572,9 @@ describe('OpenCodeSessionStore', () => {
     expect(cancelledState.materializationClaimRuns['team-a::primary::alice']).toBeUndefined()
     expect(cancelledState.materializationOwners['team-a::primary::alice']).toEqual(token('old-attempt', 1, record.opencodeSessionId))
     expect(await store.claimMaterialization(identity, 'same-run-attempt', 'run-1'))
-      .toEqual({ kind: 'existing', record: stopped, ownerToken: token('old-attempt', 1, record.opencodeSessionId) })
+      .toEqual({ kind: 'existing', record: stopped })
     expect(await store.claimMaterialization(identity, 'missing-run-attempt'))
-      .toEqual({ kind: 'existing', record: stopped, ownerToken: token('old-attempt', 1, record.opencodeSessionId) })
+      .toEqual({ kind: 'existing', record: stopped })
 
     expect(await store.claimMaterialization(identity, 'retry-attempt', 'run-2')).toEqual(expect.objectContaining({ kind: 'claimed' }))
     expect(await store.commitMaterialization({
@@ -586,7 +632,7 @@ describe('OpenCodeSessionStore', () => {
     for (const stoppedAt of ['', 'invalid', '1']) {
       const malformed = { ...record, stoppedAt }
       await malformedStore.upsert(malformed)
-      expect(await malformedStore.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual({ kind: 'existing', record: malformed, ownerToken: null })
+      expect(await malformedStore.claimMaterialization(record, 'new-attempt', 'run-2')).toEqual({ kind: 'existing', record: malformed })
     }
   })
 
@@ -611,6 +657,21 @@ describe('OpenCodeSessionStore', () => {
     expect(await store.markStale('team-a', 'primary', 'alice', 'late-observer', old)).toBeNull()
     expect(await store.markStale('team-a', 'primary', 'alice', 'generic-observer', next)).toBeNull()
     expect(await store.get('team-a', 'primary', 'alice')).toEqual(next)
+  })
+
+  test('late launch cleanup cannot delete a replacement with the same session id but newer configuration', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'sessions.json'))
+    const old = { ...baseRecord, runId: 'run-1', opencodeVersion: '1.2.3',
+      expectedBehaviorFingerprint: 'behavior-old' }
+    const capability = captureOpenCodeSessionCleanupCapability(old)
+    await store.upsert(old)
+    const replacement = { ...old, expectedBehaviorFingerprint: 'behavior-new',
+      managedConfigFingerprint: 'config-new' }
+    await store.upsert(replacement)
+
+    expect(await store.markStaleIfSession(capability, 'launch_failed')).toBeNull()
+    expect(await store.deleteIfSession(capability)).toBe(false)
+    expect(await store.get(old.teamId, old.laneId, old.memberName)).toEqual(replacement)
   })
 
   test('drains a tracked materialization reconciliation before command cleanup completes', async () => {
@@ -704,14 +765,45 @@ describe('OpenCodeSessionStore', () => {
     }
 
     const transfers = await Promise.all([
-      store.acquireMaterializationOwner(record, 'attempt-a', undefined, firstObservation.ownerToken),
-      store.acquireMaterializationOwner(record, 'attempt-a', undefined, secondObservation.ownerToken),
+      store.acquireMaterializationOwner(record, 'attempt-a'),
+      store.acquireMaterializationOwner(record, 'attempt-a'),
     ])
     expect(transfers.filter(Boolean)).toHaveLength(0)
     const consumed = await store.claimMaterialization(record, 'attempt-a', 'run-1')
-    expect(consumed).toMatchObject({ kind: 'existing', ownerToken: {
-      attemptId: 'attempt-a', sessionId: record.opencodeSessionId, version: 1,
-    } })
+    expect(consumed).toEqual({ kind: 'existing', record })
+  })
+
+  test('does not let recovery delete an active materialization and fences its commit before takeover cleanup', async () => {
+    const filePath = path.join(tempDir, 'session-store-recovery-race.json')
+    const alive = new Map([[111, true], [222, true]])
+    const startedAt = new Map([[111, 1_000], [222, 2_000]])
+    const storeFor = (ownerPid: number) => new OpenCodeSessionStore(filePath, {
+      ownerPid,
+      isProcessAlive: pid => alive.get(pid) ?? false,
+      readProcessStartTimeMs: async pid => startedAt.get(pid) ?? null,
+    })
+    const original = storeFor(111)
+    const record = { ...baseRecord, runId: 'run-1', opencodeSessionId: 'remote-race' }
+    const claim = await original.claimMaterialization(record, 'attempt-a', record.runId)
+    if (claim.kind !== 'claimed') throw new Error('expected original claim')
+    expect(await original.recordMaterializationCompensation(record, {
+      ownerToken: claim.ownerToken,
+      runId: record.runId!, hostKey: record.hostKey, baseUrl: 'http://127.0.0.1:4096',
+      sessionId: record.opencodeSessionId, recordedAt: record.createdAt,
+    })).toBe(true)
+
+    const recovery = storeFor(222)
+    // A second launch cannot take the compensation from the active creator,
+    // so it has no authority to issue DELETE.
+    expect(await recovery.acquireMaterializationCompensation(record, 'attempt-b')).toBeNull()
+
+    // Once A is demonstrably gone, B obtains an exclusive replacement claim
+    // before it can DELETE.  A's stale commit capability is now fenced.
+    alive.set(111, false)
+    const taken = await recovery.acquireMaterializationCompensation(record, 'attempt-b')
+    expect(taken?.ownerToken).toEqual(token('attempt-b', 2))
+    expect(await original.commitMaterialization(record, claim.ownerToken)).toBeNull()
+    expect(await recovery.releaseMaterializationClaim(record, taken!.ownerToken, record.runId)).toBe(true)
   })
 
   test('does not let concurrent retries take over an active incomplete-session owner', async () => {
@@ -730,11 +822,12 @@ describe('OpenCodeSessionStore', () => {
     if (observedByB.kind !== 'existing' || observedByC.kind !== 'existing') {
       throw new Error('both retries must observe the incomplete record')
     }
-    expect(observedByB.ownerToken).toEqual(observedByC.ownerToken)
+    expect(observedByB).toEqual({ kind: 'existing', record })
+    expect(observedByC).toEqual({ kind: 'existing', record })
 
     const transfers = await Promise.all([
-      store.acquireMaterializationOwner(record, 'attempt-b', undefined, observedByB.ownerToken),
-      store.acquireMaterializationOwner(record, 'attempt-c', undefined, observedByC.ownerToken),
+      store.acquireMaterializationOwner(record, 'attempt-b'),
+      store.acquireMaterializationOwner(record, 'attempt-c'),
     ])
     expect(transfers.filter(Boolean)).toHaveLength(0)
     expect(await store.observeMaterialization(record)).toEqual({

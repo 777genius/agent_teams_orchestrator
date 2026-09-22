@@ -1,9 +1,4 @@
-import path from 'node:path'
-
-import {
-  openCodeClientFactory,
-  OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
-} from '../../../../services/opencode/OpenCodeClientFactory.js'
+import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
   getOpenCodeCuratedSubscriptionProviderIds,
@@ -24,7 +19,6 @@ import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenC
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   openCodeHostManager,
-  resolveOpenCodeBinaryHostIdentity,
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
@@ -38,30 +32,15 @@ import {
   openCodeInventoryService,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
-  type OpenCodeInventoryProbeProgressTracker,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
-import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
-import {
-  classifyOpenCodeCatalogSanitizedFailure,
-  formatOpenCodeCatalogUnknownFailureMessage,
-} from '../../../../services/opencode/OpenCodeProviderFailureClassification.js'
 import {
   buildOpenCodeModelRouteMetadata,
   evaluateOpenCodeModelAccess,
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
-import {
-  canonicalizeOpenCodeProjectPath,
-  openCodeProfileManager,
-  resolveOpenCodeProfileScope,
-} from '../../../../services/opencode/OpenCodeProfileManager.js'
-import { resolveOpenCodeBinaryPath } from '../../../../services/opencode/OpenCodeBinaryResolver.js'
-import {
-  OpenCodeRuntimeDeadline,
-  raceOpenCodeAbortSignal,
-  throwOpenCodeAbortReason,
-} from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
+import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
   clearOpenCodeManagedDefaultModel,
@@ -87,7 +66,6 @@ import type {
   OpenCodeProviderOAuthCallbackInput,
   OpenCodeProviderListEntry,
   OpenCodeProviderResponse,
-  OpenCodePrepareProfileOptions,
   OpenCodeServerDocResponse,
 } from '../../../../services/opencode/types.js'
 import { isRecommendedProvider, sortProviderConnections } from '../../domain/providerOrdering.js'
@@ -203,14 +181,6 @@ type OpenCodeProviderManagementAdapterDeps = {
   }
   profileManager?: {
     listManagedAuthPaths(): Promise<string[]>
-    readCatalogSelectedAuthIdentity?(input: {
-      projectPath?: string | null
-      profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
-    }): Promise<{
-      source: 'absent' | 'error' | `known:${string}`
-      managed: 'absent' | 'error' | `known:${string}`
-      preferences: 'absent' | 'error' | `known:${string}`
-    }>
   }
   executionProbe?: {
     probeModel(input: {
@@ -235,15 +205,6 @@ type OpenCodeProviderManagementAdapterDeps = {
     ): Promise<unknown>
   }
   inventoryTimeoutMs?: number
-  /** Settings preparation and HTTP budget; cancellation must drain before CLI exit. */
-  viewTimeoutMs?: number
-  resolveBinaryPath?: () => string | null
-  resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
-  /** Query, model normalization, and identity-publication budget after host readiness. */
-  catalogTimeoutMs?: number
-  catalogInstanceTimeoutMs?: number
-  /** Includes preparation, host startup, query, and cleanup; defaults to the existing 60s inventory budget. */
-  catalogOverallTimeoutMs?: number
 }
 
 type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
@@ -361,11 +322,11 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/zai-org/glm-5.1',
   ],
   'github-copilot': [
-    'github-copilot/gpt-5.6-luna',
     'github-copilot/gpt-5-mini',
     'github-copilot/gpt-5.5',
     'github-copilot/claude-haiku-4.5',
     'github-copilot/claude-sonnet-4.6',
+    'github-copilot/gpt-5.6-luna',
   ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
@@ -415,39 +376,11 @@ const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 const CONNECT_EXECUTION_PROOF_MAX_CANDIDATES = 3
 const CONNECT_EXECUTION_PROOF_CANDIDATE_TIMEOUT_MS = 45_000
-const CATALOG_IDENTITY_RECHECK_TIMEOUT_MS = 250
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
   value: ProviderDirectoryView
   modelIdsByProviderId: Record<string, string[]>
-}
-
-type ProviderCatalogCacheEntry = {
-  identity: string
-  inventory: OpenCodeInventorySnapshot
-  configProviders: OpenCodeConfigProvidersResponse | null
-  providers: OpenCodeProviderResponse | null
-  managedModelLimitOverrides?: OpenCodeManagedRuntimePreferences['modelLimitOverrides']
-  diagnostics: string[]
-}
-
-type CatalogIdentityComponent =
-  | { state: 'known'; value: string }
-  | { state: 'absent' }
-  | { state: 'error' }
-
-type CatalogIdentity = {
-  key: string
-  reusable: boolean
-  managedAuthConsistent: boolean
-  managedAuthAbsent: boolean
-}
-
-function catalogIdentityComponent(value: string | null | undefined): CatalogIdentityComponent {
-  if (value === 'error') return { state: 'error' }
-  if (!value || value === 'absent') return { state: 'absent' }
-  return { state: 'known', value }
 }
 
 type OpenCodeProviderManagementCapabilities = {
@@ -681,43 +614,13 @@ function redactDiagnostic(message: string): string {
   return message
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted]')
     .replace(/tp-[A-Za-z0-9_-]{5,}/g, '[redacted]')
-    .replace(
-      /((?:authorization|proxy-authorization)\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s,"'}]+/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /((?:cookie|set-cookie|(?:[a-z0-9-]+-)?api[-_]?key|[a-z0-9-]*token)\s*[:=]\s*)[^\n,}"']+/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /([?&](?:key|token|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|auth)=)[^&\s"']+/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /("[^"]*(?:authorization|cookie|api[-_]?key|token|secret)[^"]*"\s*:\s*")[^"]*/gi,
-      '$1[redacted]',
-    )
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, '$1[redacted]')
+    .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"']+/gi, '$1[redacted]')
     .slice(0, 1_600)
 }
 
 function redactDiagnostics(messages: readonly string[]): string[] {
   return messages.map(redactDiagnostic).filter(Boolean)
-}
-
-function redactCatalogDiagnostics(messages: readonly string[]): string[] {
-  return messages.map(message => {
-    const lower = message.toLowerCase()
-    if (lower.includes('timed out') || lower.includes('timeout')) {
-      return 'OpenCode catalog request timed out.'
-    }
-    if (/(?:auth|credential|api[-_ ]?key|token|secret|cookie)/i.test(message)) {
-      return 'OpenCode catalog authentication diagnostic redacted.'
-    }
-    if (/(?:https?:\/\/|endpoint|request|response|network|connect|fetch|http)/i.test(message)) {
-      return 'OpenCode catalog endpoint request failed.'
-    }
-    return 'OpenCode catalog diagnostic redacted.'
-  }).filter((message, index, all) => all.indexOf(message) === index)
 }
 
 function appendViewDiagnostics(
@@ -740,23 +643,6 @@ function getProviderDisplayName(providerId: string, entry?: OpenCodeProviderList
   }
   const name = asString(entry?.name)
   return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? providerId
-}
-
-function catalogFailureDisplayName(providerId: string | undefined): string {
-  if (!providerId) {
-    return 'This provider'
-  }
-  return getProviderDisplayName(providerId)
-}
-
-function catalogSanitizedUnknownMessage(providerId?: string): string {
-  const raw = providerId?.trim() ?? ''
-  const normalized = raw
-    ? normalizeProviderId(canonicalizeOpenCodeProviderId(raw))
-    : null
-  return formatOpenCodeCatalogUnknownFailureMessage(
-    catalogFailureDisplayName(normalized ?? undefined),
-  )
 }
 
 async function safeRead<T>(read: () => Promise<T>): Promise<SafeValue<T>> {
@@ -2272,7 +2158,7 @@ function buildSummaryConfigProviders(
   const providers = Object.entries(managedProviders).flatMap(([rawProviderId, rawConfig]) => {
     const providerId = normalizeProviderId(rawProviderId)
     const config = asRecord(rawConfig)
-    if (!providerId || !config) {
+    if (!providerId || !config || !SUMMARY_PROVIDER_IDS.has(providerId)) {
       return []
     }
     const name = asString(config.name)
@@ -2301,16 +2187,14 @@ function buildSummaryProviderDirectory(input: {
   limit?: number | null
   cursor?: string | null
 }): ProviderDirectoryView {
-  const configProviders = buildSummaryConfigProviders(input.inventory)
-  const providerIds = new Set([
-    ...SUMMARY_PROVIDER_IDS, 'opencode',
-    ...input.inventory.connectedProviders.map(provider => provider.id),
-    ...(configProviders?.providers ?? []).map(provider => provider.id),
-  ])
   const inventory: OpenCodeInventorySnapshot = {
     ...input.inventory,
-    availableProviders: [...providerIds],
+    availableProviders: Array.from(new Set([
+      ...input.inventory.availableProviders,
+      ...SUMMARY_PROVIDER_IDS,
+    ])),
   }
+  const configProviders = buildSummaryConfigProviders(inventory)
   const source = {
     inventory,
     configProviders,
@@ -2321,10 +2205,13 @@ function buildSummaryProviderDirectory(input: {
   }
   const unpagedDirectory = buildProviderDirectory({
     ...source,
-    query: null, filter: 'all', limit: Number.MAX_SAFE_INTEGER, cursor: null,
+    query: null,
+    filter: 'all',
+    limit: Number.MAX_SAFE_INTEGER,
+    cursor: null,
   })
   const entries = unpagedDirectory.entries.filter(entry =>
-    providerIds.has(entry.providerId),
+    SUMMARY_PROVIDER_IDS.has(entry.providerId),
   )
   const summaryDirectory: ProviderDirectoryView = {
     ...unpagedDirectory,
@@ -2610,7 +2497,6 @@ async function readLiveView(input: {
   host: OpenCodeHostHandle
   client: OpenCodeProviderManagementClient
   diagnostics?: readonly string[]
-  degradeOnReadFailure?: boolean
 }): Promise<ProviderManagementView> {
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
@@ -2635,7 +2521,7 @@ async function readLiveView(input: {
     ...safeReadDiagnostics(serverDocResult),
   ]
 
-  const view = buildView({
+  return buildView({
     inventory: input.inventory,
     host: input.host,
     configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
@@ -2644,11 +2530,6 @@ async function readLiveView(input: {
     capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
     diagnostics,
   })
-  if (input.degradeOnReadFailure && [configProvidersResult, providersResult, providerAuthResult, serverDocResult]
-    .some(result => !result.ok)) {
-    view.runtime.state = 'degraded'
-  }
-  return view
 }
 
 function findProviderConnection(
@@ -2761,22 +2642,7 @@ function getProviderCredentialValidationModelIds(input: {
   configProviders: OpenCodeConfigProvidersResponse | null
   providers: OpenCodeProviderResponse | null
 }): string[] {
-  const configModels = asRecord(input.configProviders?.providers?.find(
-    provider => normalizeProviderId(provider.id) === input.providerId,
-  )?.models)
-  const liveModels = asRecord(input.providers?.all?.find(
-    provider => normalizeProviderId(provider.id) === input.providerId,
-  )?.models)
-  const modelIds = collectProviderModelIds(input).filter(modelId => {
-    const nestedModelId = modelId.slice(input.providerId.length + 1)
-    // Credential verification sends a text prompt. Image/video input is fine,
-    // but models that cannot answer with text must not consume candidate slots.
-    return [
-      input.inventory.modelMetadata?.find(metadata => metadata.id === modelId)?.raw,
-      configModels?.[nestedModelId],
-      liveModels?.[nestedModelId],
-    ].every(supportsCredentialValidationTextOutput)
-  })
+  const modelIds = collectProviderModelIds(input)
   if (modelIds.length === 0) {
     return []
   }
@@ -2811,23 +2677,6 @@ function getProviderCredentialValidationModelIds(input: {
     ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
     : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
   return candidates.slice(0, maxCandidates)
-}
-
-function supportsCredentialValidationTextOutput(value: unknown): boolean {
-  const model = asRecord(value)
-  const output = asRecord(asRecord(model?.capabilities)?.output)
-  if (output?.text === false) return false
-  if (output && output.text !== true && Object.values(output).some(enabled => enabled === true)) {
-    return false
-  }
-  const modalities = asRecord(model?.modalities)?.output
-  if (Array.isArray(modalities)) {
-    const declared = modalities.filter((modality): modality is string => typeof modality === 'string')
-      .map(modality => modality.trim().toLowerCase()).filter(Boolean)
-    if (declared.length > 0 && !declared.includes('text')) return false
-  }
-  // Older/custom catalogs may omit modality metadata. Keep their text probe path.
-  return true
 }
 
 function buildProviderDirectoryModelSearchIndex(input: {
@@ -2976,7 +2825,6 @@ function buildProviderModelsView(input: {
     models,
     defaultModelId,
     diagnostics: input.diagnostics ?? [],
-    catalogState: 'fresh',
   }
 }
 
@@ -3129,21 +2977,6 @@ function getModelAccessError(input: {
   return null
 }
 
-function catalogTimeoutDiagnostic(
-  prefix: string,
-  progress: OpenCodeInventoryProbeProgressTracker,
-): string {
-  const snapshot = progress.snapshot()
-  let message = snapshot.currentStep
-    ? `${prefix} during ${snapshot.currentStep} (${snapshot.currentStepElapsedMs}ms)`
-    : prefix
-  if (snapshot.completedSteps.length > 0) {
-    message += `; completed: ${snapshot.completedSteps
-      .map(step => `${step.label} (${step.durationMs}ms)`).join(', ')}`
-  }
-  return message
-}
-
 export class OpenCodeProviderManagementAdapter
   implements
     ProviderManagementQueryPort,
@@ -3151,116 +2984,27 @@ export class OpenCodeProviderManagementAdapter
     ProviderManagementCommandPort
 {
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
-  private readonly catalogCache = new Map<string, ProviderCatalogCacheEntry>()
-  private readonly catalogGenerationByScope = new Map<string, number>()
   private hostLeaseSequence = 0
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
 
-  private async readCatalogIdentity(input: {
-    projectPath?: string | null
-    providerId: string
-    expectedScope?: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
-    expectedBinaryPath?: string | null
-  }): Promise<CatalogIdentity> {
-    const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
-    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
-    let config: CatalogIdentityComponent
-    try {
-      profileScope = await resolveOpenCodeProfileScope({
-        projectPath,
-        purpose: 'catalog',
-        selectedModel: `${input.providerId}/catalog`,
-      })
-      config = input.expectedScope
-        && (
-          input.expectedScope.configFingerprint !== profileScope.configFingerprint
-          || input.expectedScope.selectedAuthIdentity !== profileScope.selectedAuthIdentity
-          || input.expectedScope.scopeToken !== profileScope.scopeToken
-        )
-        ? { state: 'error' }
-        : { state: 'known', value: profileScope.configFingerprint }
-    } catch {
-      profileScope = input.expectedScope ?? {
-        purpose: 'catalog',
-        providerId: input.providerId,
-        configFingerprint: 'identity-read-error',
-        selectedAuthIdentity: 'error',
-        scopeToken: 'identity-read-error',
-      }
-      config = { state: 'error' }
-    }
-
-    let binary: CatalogIdentityComponent
-    try {
-      const binaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
-      if (input.expectedBinaryPath !== undefined && binaryPath !== input.expectedBinaryPath) {
-        binary = { state: 'error' }
-      } else if (!binaryPath) {
-        binary = { state: 'absent' }
-      } else {
-        const resolveIdentity = this.deps.resolveBinaryIdentity ?? resolveOpenCodeBinaryHostIdentity
-        binary = { state: 'known', value: `${binaryPath}:${await resolveIdentity(binaryPath)}` }
-      }
-    } catch {
-      binary = { state: 'error' }
-    }
-
-    let sourceAuth: CatalogIdentityComponent = { state: 'error' }
-    let managedSelectedAuth: CatalogIdentityComponent = { state: 'error' }
-    let preferences: CatalogIdentityComponent = { state: 'error' }
-    try {
-      const reader = this.deps.profileManager?.readCatalogSelectedAuthIdentity
-        ? this.deps.profileManager.readCatalogSelectedAuthIdentity.bind(this.deps.profileManager)
-        : openCodeProfileManager.readCatalogSelectedAuthIdentity.bind(openCodeProfileManager)
-      const auth = await reader({ projectPath, profileScope })
-      sourceAuth = catalogIdentityComponent(auth.source)
-      managedSelectedAuth = catalogIdentityComponent(auth.managed)
-      preferences = catalogIdentityComponent(auth.preferences)
-    } catch {
-      // An identity read error must fail closed for stale evidence.
-    }
-    const selectedAuth = catalogIdentityComponent(profileScope.selectedAuthIdentity)
-    const components = {
-      projectPath,
-      providerId: input.providerId,
-      binary,
-      config,
-      scopeToken: catalogIdentityComponent(profileScope.scopeToken),
-      selectedAuth,
-      preferences,
-      sourceAuth,
-      generation: 'catalog-generation-v3',
-    }
+  private createProviderManagementHostLease(): OpenCodeHostLeaseInput {
     return {
-      key: JSON.stringify(components),
-      reusable: Object.values(components).every(value =>
-        !value || typeof value !== 'object' || !('state' in value) || value.state !== 'error')
-        && JSON.stringify(sourceAuth) === JSON.stringify(selectedAuth),
-      managedAuthConsistent: managedSelectedAuth.state !== 'error'
-        && JSON.stringify(managedSelectedAuth) === JSON.stringify(selectedAuth),
-      managedAuthAbsent: managedSelectedAuth.state === 'absent',
-    }
-  }
-
-  private async retainProviderManagementHost(
-    hostManager: OpenCodeHostManagerLike,
-    host: OpenCodeHostHandle,
-    evictIdleHosts = true,
-  ): Promise<OpenCodeHostLeaseInput | null> {
-    if (!hostManager.retainHostLease) {
-      return null
-    }
-    const lease: OpenCodeHostLeaseInput = {
       teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
       laneId: 'provider-management',
       memberName: `provider-management-${process.pid}-${++this.hostLeaseSequence}`,
       runId: null,
       sessionId: null,
     }
+  }
+
+  private async reconcileProviderManagementHostLease(
+    hostManager: OpenCodeHostManagerLike,
+    host: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput,
+  ): Promise<OpenCodeHostLeaseInput | null> {
     try {
-      await hostManager.retainHostLease(host.hostKey, lease)
-      if (evictIdleHosts) await hostManager.reconcilePersistentHosts?.({
+      await hostManager.reconcilePersistentHosts?.({
         mode: 'stale',
         reason: 'provider-management-idle-eviction',
         staleAgeMs: OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS,
@@ -3335,34 +3079,26 @@ export class OpenCodeProviderManagementAdapter
     projectPath?: string | null,
     options?: Parameters<typeof openCodeInventoryService.probe>[1],
   ): Promise<OpenCodeInventorySnapshot> {
-    const canonicalProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const abortController = new AbortController()
-    const progress = options?.progress ?? createOpenCodeInventoryProbeProgressTracker()
-    const abortFromCaller = () => abortController.abort(options?.abortSignal?.reason)
-    options?.abortSignal?.addEventListener('abort', abortFromCaller, { once: true })
-    if (options?.abortSignal?.aborted) abortFromCaller()
-    try {
-      return await withOpenCodeInventoryProbeTimeout(
-        inventoryService.probe(canonicalProjectPath, {
-          ...options,
-          includeAppMcp: false,
-          abortSignal: abortController.signal,
-          progress,
-        }),
-        {
-          projectPath: canonicalProjectPath,
-          timeoutMs:
-            this.deps.inventoryTimeoutMs ??
-            (options?.mode === 'summary'
-              ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS
-              : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
-          progress,
-          onTimeout: () => abortController.abort(),
-        },
-      )
-    } finally {
-      options?.abortSignal?.removeEventListener('abort', abortFromCaller)
-    }
+    const progress = createOpenCodeInventoryProbeProgressTracker()
+    return withOpenCodeInventoryProbeTimeout(
+      inventoryService.probe(projectPath, {
+        ...options,
+        includeAppMcp: false,
+        abortSignal: abortController.signal,
+        progress,
+      }),
+      {
+        projectPath,
+        timeoutMs:
+          this.deps.inventoryTimeoutMs ??
+          (options?.mode === 'summary'
+            ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS
+            : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
+        progress,
+        onTimeout: () => abortController.abort(),
+      },
+    )
   }
 
   private getAuthStore() {
@@ -3597,7 +3333,7 @@ export class OpenCodeProviderManagementAdapter
     if (validationModelIds.length === 0) {
       return providerManagementError(
         'model-missing',
-        `OpenCode did not expose a text-response model for provider ${input.providerId} credential verification`,
+        `OpenCode did not expose a probeable model for provider ${input.providerId}`,
       )
     }
 
@@ -3676,80 +3412,6 @@ export class OpenCodeProviderManagementAdapter
     )
   }
 
-  private async refreshConnectedProviderAdmission(input: {
-    inventory: OpenCodeInventorySnapshot
-    inventoryService: OpenCodeInventoryServiceLike
-    providerId: string
-    providerAuth: Record<string, OpenCodeProviderAuthMethod[]> | null
-    capabilities: OpenCodeProviderManagementCapabilities
-  }): Promise<ProviderManagementResult<{
-    inventory: OpenCodeInventorySnapshot
-    configProviders: OpenCodeConfigProvidersResponse | null
-    providers: OpenCodeProviderResponse
-    provider: ProviderConnection | null
-  }>> {
-    const hostManager = this.deps.hostManager ?? openCodeHostManager
-    const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
-    let host: OpenCodeHostHandle | null = null
-    try {
-      this.invalidateDirectoryCache()
-      const refreshedInventory = await this.probeInventory(
-        input.inventoryService,
-        input.inventory.projectPath,
-        { bypassCache: true },
-      )
-      const refresh = useActionRefreshInventory(
-        input.inventory,
-        refreshedInventory,
-        inventory => addManagedProviderToInventory(inventory, input.providerId),
-      )
-      if (!refresh.inventory.detected || !refresh.inventory.profile) {
-        throw new Error('OpenCode refreshed managed profile is unavailable')
-      }
-      // Auth callback/PUT can leave the instance's provider snapshot stale.
-      // Process lifetime without an explicit hostKey allocates a unique host,
-      // even when refresh falls back to the previous profile after a timeout.
-      // Read admission and model selection there, before execution verification.
-      host = await hostManager.ensureHost({
-        projectPath: refresh.inventory.projectPath,
-        preparedProfile: refresh.inventory.profile,
-        hostLifetime: 'process',
-        resolveConfigFingerprint: false,
-        // Inventory (or the initial host on timeout) already prewarmed this profile.
-        prewarmManagedSubscriptionPlugins: false,
-      })
-      const client = clientFactory.create(host.baseUrl)
-      const [configProvidersResult, providersResult] = await Promise.all([
-        safeRead(() => client.getConfigProviders()),
-        safeRead(() => client.getProviders()),
-      ])
-      // An unavailable endpoint is not negative provider admission, and cannot
-      // fall back to credential metadata as positive admission either.
-      if (!providersResult.ok) {
-        throw new Error('OpenCode refreshed provider admission is unavailable')
-      }
-      const providers = providersResult.value
-      const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
-      const provider = buildProviderConnections({
-        inventory: refresh.inventory,
-        configProviders,
-        providers,
-        providerAuth: input.providerAuth,
-        capabilities: input.capabilities,
-      }).find(candidate => candidate.providerId === input.providerId) ?? null
-      return { ok: true, value: { inventory: refresh.inventory, configProviders, providers, provider } }
-    } catch {
-      return providerManagementError(
-        'runtime-unhealthy',
-        'OpenCode could not refresh provider admission after saving credentials. Connection could not be verified.',
-      )
-    } finally {
-      if (host) {
-        await hostManager.releaseHost(host.hostKey, { keepPersistentAlive: false }).catch(() => undefined)
-      }
-    }
-  }
-
   private async withManagedOpenCodeClient<T>(
     runtimeId: ProviderManagementRuntimeId,
     projectPath: string | null | undefined,
@@ -3764,12 +3426,6 @@ export class OpenCodeProviderManagementAdapter
       secretToRedact?: string | null
       inventoryMode?: 'full' | 'summary' | 'profile'
       hostLifetime?: 'persistent' | 'process'
-      profileScope?: OpenCodePrepareProfileOptions['profileScope']
-      prewarmManagedSubscriptionPlugins?: boolean
-      abortSignal?: AbortSignal
-      catalogFailureSanitization?: boolean
-      catalogProviderId?: string
-      progress?: OpenCodeInventoryProbeProgressTracker
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3781,78 +3437,54 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+    const inventory = await this.probeInventory(inventoryService, projectPath, {
+      mode: options.inventoryMode ?? 'full',
+    })
+
+    if (!inventory.detected) {
+      return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
+    }
+    if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        inventory.probeError ?? 'OpenCode inventory probe timed out',
+      )
+    }
+
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
-      const inventory = await this.probeInventory(inventoryService, projectPath, {
-        mode: options.inventoryMode ?? 'full',
-        profileScope: options.profileScope,
-        abortSignal: options.abortSignal,
-        progress: options.progress,
-      })
-      if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
-        return providerManagementError(
-          'runtime-unhealthy',
-          options.catalogFailureSanitization
-            ? `${catalogSanitizedUnknownMessage(options.catalogProviderId)} The catalog request timed out.`
-            : inventory.probeError ?? 'OpenCode inventory probe timed out',
-        )
-      }
-      // A timed-out probe cannot establish that the binary is absent.
-      if (!inventory.detected) {
-        return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
-      }
-      const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
       host = await hostManager.ensureHost({
-        projectPath: projectPath ?? inventory.projectPath,
-        preparedProfile: options.profileScope ? inventory.profile ?? undefined : undefined,
-        profileOptions: options.profileScope ? { profileScope: options.profileScope } : undefined,
+        projectPath: inventory.projectPath,
         hostLifetime,
         resolveConfigFingerprint: false,
-        prewarmManagedSubscriptionPlugins: options.prewarmManagedSubscriptionPlugins,
-        abortSignal: options.abortSignal,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
-      leaveHostStep?.()
-      const leaveLeaseStep = options.progress?.enterStep('retain catalog host lease')
-      if (hostLifetime === 'persistent') {
-        hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
       }
-      leaveLeaseStep?.()
-      const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
-      return await raceOpenCodeAbortSignal(
-        run({ inventory, inventoryService, host, client }),
-        options.abortSignal,
-      )
+      const client = clientFactory.create(host.baseUrl)
+      return await run({ inventory, inventoryService, host, client })
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
-      if (options.catalogFailureSanitization) {
-        const classified = classifyOpenCodeCatalogSanitizedFailure({
-          displayName: catalogFailureDisplayName(options.catalogProviderId),
-          rawMessage,
-        })
-        return providerManagementError(
-          options.failureCode ?? classified.code,
-          classified.message,
-        )
-      }
       return providerManagementError(
         options.failureCode ?? 'runtime-unhealthy',
-        redactDiagnostic(redactSecret(rawMessage, options.secretToRedact)),
+        redactSecret(rawMessage, options.secretToRedact),
       )
     } finally {
       if (host) {
-        const leaveReleaseStep = options.progress?.enterStep('release catalog host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, {
             keepPersistentAlive: hostLifetime === 'persistent',
           })
           .catch(() => undefined)
-        leaveReleaseStep?.()
       }
     }
   }
@@ -3872,45 +3504,8 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
-    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? 75_000)
-    const progress = createOpenCodeInventoryProbeProgressTracker()
-    let timeoutMessage: string | undefined
-    const captureTimeout = () => {
-      timeoutMessage = catalogTimeoutDiagnostic(
-        `OpenCode provider settings timed out after ${deadline.commandBudgetMs}ms`, progress,
-      )
-    }
-    deadline.signal.addEventListener('abort', captureTimeout, { once: true })
-    try {
-      const result = await this.loadSettingsView(request, deadline, progress, () => timeoutMessage)
-      // Finalizers are awaited before the CLI may exit, even if the budget expires there.
-      if (deadline.signal.aborted && result.ok) {
-        result.value.runtime.state = 'degraded'
-        if (timeoutMessage && !result.value.diagnostics.includes(timeoutMessage)) {
-          result.value.diagnostics = [...result.value.diagnostics, timeoutMessage]
-        }
-      }
-      return result
-    } catch (error) {
-      return providerManagementError('runtime-unhealthy', timeoutMessage
-        ?? (error instanceof Error ? error.message : String(error)))
-    } finally {
-      deadline.signal.removeEventListener('abort', captureTimeout)
-      deadline.dispose()
-    }
-  }
-
-  private async loadSettingsView(
-    request: LoadProviderManagementViewInput,
-    deadline: OpenCodeRuntimeDeadline,
-    progress: OpenCodeInventoryProbeProgressTracker,
-    getTimeoutMessage: () => string | undefined,
-  ): Promise<ProviderManagementResult<ProviderManagementView>> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, request.projectPath, {
-      abortSignal: deadline.signal,
-      progress,
-    })
+    const inventory = await this.probeInventory(inventoryService, request.projectPath)
 
     if (!inventory.detected) {
       return {
@@ -3941,12 +3536,9 @@ export class OpenCodeProviderManagementAdapter
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
-    let liveView: ProviderManagementView | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = this.createProviderManagementHostLease()
 
     try {
-      deadline.throwIfExpired()
-      const leaveHost = progress.enterStep('prepare settings host')
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
@@ -3956,34 +3548,25 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime: 'persistent',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
-        abortSignal: deadline.signal,
+        lease: hostLease,
       })
-      leaveHost()
-      deadline.throwIfExpired()
-      const leaveLease = progress.enterStep('retain settings host lease')
-      // Reading settings must not synchronously evict unrelated persistent hosts.
-      hostLease = await this.retainProviderManagementHost(hostManager, host, false)
-      leaveLease()
-      deadline.throwIfExpired()
-      const client = clientFactory.create(host.baseUrl, {
-        signal: deadline.signal,
-        remainingMs: () => deadline.remainingMs(),
-      })
-      const leaveHttp = progress.enterStep('read settings HTTP endpoints')
+      hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+      const client = clientFactory.create(host.baseUrl)
 
-      liveView = await readLiveView({
-          degradeOnReadFailure: true,
+      return {
+        ok: true,
+        value: await readLiveView({
           inventory,
           host,
           client,
           diagnostics: inventory.diagnostics,
-        })
-      leaveHttp()
-      deadline.throwIfExpired()
-      return { ok: true, value: liveView }
+        }),
+      }
     } catch (error) {
-      const message = getTimeoutMessage() ?? (error instanceof Error ? error.message : String(error))
-      const value = liveView ?? buildView({
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        ok: true,
+        value: buildView({
           inventory,
           host,
           configProviders: null,
@@ -3991,18 +3574,14 @@ export class OpenCodeProviderManagementAdapter
           providerAuth: null,
           diagnostics: [...inventory.diagnostics, message],
           hostStartError: host ? null : message,
-        })
-      if (liveView) value.diagnostics = [...value.diagnostics, message]
-      if (deadline.signal.aborted) value.runtime.state = 'degraded'
-      return { ok: true, value }
+        }),
+      }
     } finally {
       if (host) {
-        const leaveRelease = progress.enterStep('release settings host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, { keepPersistentAlive: true })
           .catch(() => undefined)
-        leaveRelease()
       }
     }
   }
@@ -4074,7 +3653,9 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
       host = await hostManager.ensureHost({
@@ -4086,8 +3667,11 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+      }
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
@@ -4237,20 +3821,6 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
-    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
-    try {
-      profileScope = await resolveOpenCodeProfileScope({
-        projectPath: input.projectPath,
-        purpose: 'catalog',
-        selectedModel: `${providerId}/catalog`,
-      })
-    } catch (error) {
-      return providerManagementError(
-        'runtime-unhealthy',
-        'OpenCode provider setup could not prepare a provider-scoped profile.',
-      )
-    }
-
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
@@ -4294,199 +3864,49 @@ export class OpenCodeProviderManagementAdapter
           }),
         }
       },
-      {
-        inventoryMode: 'profile',
-        profileScope,
-        prewarmManagedSubscriptionPlugins: false,
-      },
+      { inventoryMode: 'profile' },
     )
   }
 
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
-    const deadline = new OpenCodeRuntimeDeadline(
-      this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
-    )
-    const progress = createOpenCodeInventoryProbeProgressTracker()
-    try {
-      return await raceOpenCodeAbortSignal(this.loadModelsWithinDeadline(input, deadline, progress), deadline.signal)
-    } catch {
-      return providerManagementError(
-        'runtime-unhealthy',
-        deadline.signal.aborted
-          ? catalogTimeoutDiagnostic(`OpenCode catalog overall deadline exceeded after ${deadline.commandBudgetMs}ms`, progress)
-          : catalogSanitizedUnknownMessage(input.providerId),
-      )
-    } finally {
-      deadline.dispose()
-    }
-  }
-
-  private async loadModelsWithinDeadline(
-    input: LoadProviderModelsInput,
-    deadline: OpenCodeRuntimeDeadline,
-    progress: OpenCodeInventoryProbeProgressTracker,
-  ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
-    const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
+    const providerId = normalizeProviderId(input.providerId)
     if (!providerId) {
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
-    let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
-    let canonicalProjectPath: string
-    try {
-      canonicalProjectPath = await raceOpenCodeAbortSignal(
-        canonicalizeOpenCodeProjectPath(input.projectPath), deadline.signal,
-      )
-      profileScope = await raceOpenCodeAbortSignal(resolveOpenCodeProfileScope({
-        projectPath: canonicalProjectPath,
-        purpose: 'catalog',
-        selectedModel: `${providerId}/catalog`,
-      }), deadline.signal)
-    } catch (error) {
-      return providerManagementError(
-        'runtime-unhealthy',
-        catalogSanitizedUnknownMessage(providerId),
-      )
-    }
-    const scopeKey = [
-      canonicalProjectPath,
-      providerId,
-      profileScope.configFingerprint,
-      profileScope.scopeToken,
-    ].join('|')
-    const generation = (this.catalogGenerationByScope.get(scopeKey) ?? 0) + 1
-    this.catalogGenerationByScope.set(scopeKey, generation)
-    let prePreparationIdentity: CatalogIdentity
-    try {
-      prePreparationIdentity = await raceOpenCodeAbortSignal(this.readCatalogIdentity({
-        projectPath: canonicalProjectPath,
-        providerId,
-        expectedScope: profileScope,
-      }), deadline.signal)
-    } catch {
-      return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
-    }
-    if (
-      !prePreparationIdentity.reusable
-      || (!prePreparationIdentity.managedAuthConsistent
-        && !prePreparationIdentity.managedAuthAbsent)
-    ) {
-      return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
-    }
-    const abortController = new AbortController()
-    const abortFromDeadline = () => {
-      abortController.abort(deadline.signal.reason)
-      if (this.catalogGenerationByScope.get(scopeKey) === generation) {
-        this.catalogGenerationByScope.set(scopeKey, generation + 1)
-      }
-    }
-    deadline.signal.addEventListener('abort', abortFromDeadline, { once: true })
-    if (deadline.signal.aborted) abortFromDeadline()
-    const timeoutMs = this.deps.catalogTimeoutMs ?? 15_000
-    let timeoutMessage = `OpenCode catalog refresh timed out after ${timeoutMs}ms`
-    const render = (entry: ProviderCatalogCacheEntry, stale: boolean) => buildProviderModelsView({
-      providerId,
-      inventory: entry.inventory,
-      configProviders: entry.configProviders,
-      providers: entry.providers,
-      query: input.query,
-      limit: input.limit,
-      cursor: input.cursor,
-      diagnostics: stale
-        ? [...entry.diagnostics, `${timeoutMessage}; showing stale selectable evidence.`]
-        : entry.diagnostics,
-      managedModelLimitOverrides: entry.managedModelLimitOverrides,
-    })
-    const readReusableStaleCatalog = async () => {
-      let identityTimeout: ReturnType<typeof setTimeout> | undefined
-      try {
-        const identity = await Promise.race([
-          this.readCatalogIdentity({
-            projectPath: input.projectPath ?? canonicalProjectPath,
-            providerId,
-            expectedScope: profileScope,
-          }).catch(() => null),
-          new Promise<null>(resolve => {
-            identityTimeout = setTimeout(() => resolve(null), CATALOG_IDENTITY_RECHECK_TIMEOUT_MS)
-          }),
-        ])
-        return identity?.reusable
-          && identity.managedAuthConsistent
-          && identity.key === prePreparationIdentity.key
-          ? this.catalogCache.get(identity.key)
-          : undefined
-      } finally {
-        if (identityTimeout) clearTimeout(identityTimeout)
-      }
-    }
-    let catalogInstanceStarted = false
-    let startPhaseTimeout = (_phase: 'instance' | 'query'): void => {}
-    const operation = this.withManagedOpenCodeClient(
+    return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
       async ({ inventory, client }) => {
-        catalogInstanceStarted = true
-        // Native cold startup owns the existing host budget, not the query budget.
-        deadline.throwIfExpired()
-        startPhaseTimeout('instance')
-        const leaveIdentityStep = progress.enterStep('verify prepared catalog identity')
-        const identity = await this.readCatalogIdentity({
-          projectPath: canonicalProjectPath,
-          providerId,
-          expectedScope: profileScope,
-          expectedBinaryPath: inventory.binaryPath,
-        })
-        leaveIdentityStep()
-        if (!identity.reusable) {
-          return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
-        }
-        if (
-          identity.key !== prePreparationIdentity.key
-          || !identity.managedAuthConsistent
-        ) {
-          return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
-        }
-        // Health only proves the server is listening. Its first directory-scoped
-        // request also initializes plugins/config, so do that once under the
-        // startup phase, without consuming the subsequent query's budget.
-        const leaveInstanceStep = progress.enterStep('initialize catalog instance and read config providers')
-        const configProvidersResult = await safeRead(() => client.getConfigProviders({ initializeInstance: true }))
-        leaveInstanceStep()
-        if (abortController.signal.aborted) throwOpenCodeAbortReason(abortController.signal)
-        deadline.throwIfExpired()
-        startPhaseTimeout('query')
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
-        const leaveHttpStep = progress.enterStep('read catalog HTTP endpoints and preferences')
-        const [providersResult, preferencesResult] = await Promise.all([
+        const [configProvidersResult, providersResult, preferencesResult] = await Promise.all([
+          safeRead(() => client.getConfigProviders()),
           safeRead(() => client.getProviders()),
           managedPreferencesResult,
         ])
-        leaveHttpStep()
         const diagnostics = [
           ...inventory.diagnostics,
           ...safeReadDiagnostics(configProvidersResult),
           ...safeReadDiagnostics(providersResult),
         ]
-        const sanitizedInventory = {
-          ...inventory,
-          diagnostics: redactCatalogDiagnostics(inventory.diagnostics),
-        }
-        const entry: ProviderCatalogCacheEntry = {
-          identity: identity.key,
-          inventory: sanitizedInventory,
+        const modelsView = buildProviderModelsView({
+          providerId,
+          inventory,
           configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
           providers: providersResult.ok ? providersResult.value : null,
-          diagnostics: redactCatalogDiagnostics(diagnostics),
+          query: input.query,
+          limit: input.limit,
+          cursor: input.cursor,
+          diagnostics,
           managedModelLimitOverrides:
             preferencesResult.ok && preferencesResult.value
               ? preferencesResult.value.modelLimitOverrides
               : undefined,
-        }
-        const modelsView = render(entry, false)
+        })
 
         if (modelsView.models.length === 0) {
           const knownProviderIds = getKnownProviderIds({
@@ -4502,110 +3922,9 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
-        const leavePublishStep = progress.enterStep('verify catalog publish identity')
-        const publishIdentity = await this.readCatalogIdentity({
-          projectPath: canonicalProjectPath,
-          providerId,
-          expectedScope: profileScope,
-          expectedBinaryPath: inventory.binaryPath,
-        }).catch(() => null)
-        leavePublishStep()
-        if (
-          !publishIdentity?.reusable
-          || !publishIdentity.managedAuthConsistent
-          || publishIdentity.key !== prePreparationIdentity.key
-        ) {
-          return providerManagementError(
-            'runtime-unhealthy',
-            catalogSanitizedUnknownMessage(providerId),
-          )
-        }
-
-        if (this.catalogGenerationByScope.get(scopeKey) !== generation) {
-          return providerManagementError(
-            'runtime-unhealthy',
-            'OpenCode catalog response was superseded by a newer provider request',
-          )
-        }
-        this.catalogCache.set(entry.identity, entry)
-        return {
-          ok: true,
-          value: modelsView,
-        }
-      },
-      {
-        inventoryMode: 'profile',
-        hostLifetime: 'process',
-        profileScope,
-        prewarmManagedSubscriptionPlugins: false,
-        abortSignal: abortController.signal,
-        catalogFailureSanitization: true,
-        catalogProviderId: providerId,
-        progress,
+        return { ok: true, value: modelsView }
       },
     )
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    try {
-    return await raceOpenCodeAbortSignal(Promise.race([
-      operation.then(async value => {
-        if (abortController.signal.aborted) {
-          return new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(() => {})
-        }
-        if (!value.ok && value.error.code === 'runtime-unhealthy' && !catalogInstanceStarted
-          && this.catalogGenerationByScope.get(scopeKey) === generation) {
-          const cached = await readReusableStaleCatalog()
-          if (cached && !abortController.signal.aborted && deadline.remainingMs() > 0
-            && this.catalogGenerationByScope.get(scopeKey) === generation) {
-            timeoutMessage = catalogTimeoutDiagnostic('OpenCode catalog preparation or host startup failed', progress)
-            return { ok: true as const, value: { ...render(cached, true), catalogState: 'stale' as const } }
-          }
-        }
-        return value
-      }),
-      new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(resolve => {
-        startPhaseTimeout = phase => {
-        if (abortController.signal.aborted) return
-        if (timeout) clearTimeout(timeout)
-        const phaseTimeoutMs = phase === 'instance'
-          ? this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
-          : timeoutMs
-        timeoutMessage = phase === 'instance'
-          ? `OpenCode catalog instance initialization timed out after ${phaseTimeoutMs}ms`
-          : `OpenCode catalog refresh timed out after ${phaseTimeoutMs}ms`
-        timeout = setTimeout(async () => {
-          timeoutMessage = catalogTimeoutDiagnostic(timeoutMessage, progress)
-          abortController.abort(new Error(timeoutMessage))
-          const ownsGeneration = this.catalogGenerationByScope.get(scopeKey) === generation
-          if (ownsGeneration) {
-            this.catalogGenerationByScope.set(scopeKey, generation + 1)
-          }
-          const cached = await readReusableStaleCatalog()
-          let cleanupTimeout: ReturnType<typeof setTimeout> | undefined
-          await Promise.race([
-            operation.then(() => undefined),
-            new Promise<void>(settle => { cleanupTimeout = setTimeout(settle, 1_000) }),
-          ])
-          if (cleanupTimeout) clearTimeout(cleanupTimeout)
-          resolve(cached && ownsGeneration && this.catalogGenerationByScope.get(scopeKey) === generation + 1
-            ? {
-                ok: true,
-                value: {
-                  ...render(cached, true),
-                  catalogState: 'stale',
-                },
-              }
-            : providerManagementError(
-                'runtime-unhealthy',
-                timeoutMessage,
-              ))
-        }, phaseTimeoutMs)
-        }
-      }),
-    ]), deadline.signal)
-    } finally {
-      if (timeout) clearTimeout(timeout)
-      deadline.signal.removeEventListener('abort', abortFromDeadline)
-    }
   }
 
   async connectWithApiKey(
@@ -4674,7 +3993,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, client }) => {
+      async ({ inventory, inventoryService, host, client }) => {
         if (!client.authorizeProviderOAuth || !client.completeProviderOAuth) {
           return providerManagementError(
             'unsupported-auth-method',
@@ -4996,45 +4315,38 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        try {
-          await observer.authorizationCompleted?.({
-            operationId,
-            providerId,
-            displayName,
-            authOptionId: authOption.id,
-            methodIndex,
-            completionMethod: authorization.method,
-          })
-        } catch (error) {
-          // Progress transport can close after mirroring but before admission.
-          // This is still an unverified transaction and must restore its baseline.
-          await this.rollbackProviderAuth({
-            client,
-            providerId,
-            authPaths: Array.from(authPaths),
-            canDeleteProviderAuth: capabilities.deleteAuth,
-            previousCredentials,
-          })
-          return providerManagementError(
-            'auth-failed',
-            error instanceof Error ? error.message : 'OAuth verification was interrupted',
-          )
-        }
-
-        const admission = await this.refreshConnectedProviderAdmission({
-          inventory, inventoryService, providerId, providerAuth, capabilities,
+        await observer.authorizationCompleted?.({
+          operationId,
+          providerId,
+          displayName,
+          authOptionId: authOption.id,
+          methodIndex,
+          completionMethod: authorization.method,
         })
-        if (!admission.ok) {
-          await this.rollbackProviderAuth({
+
+        this.invalidateDirectoryCache()
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
+        )
+        const view = appendViewDiagnostics(
+          await readLiveView({
+            inventory: refresh.inventory,
+            host,
             client,
-            providerId,
-            authPaths: Array.from(authPaths),
-            canDeleteProviderAuth: capabilities.deleteAuth,
-            previousCredentials,
-          })
-          return admission
-        }
-        const { provider } = admission.value
+            diagnostics: refresh.inventory.diagnostics,
+          }),
+          refresh.postViewDiagnostics,
+        )
+        const provider = findProviderConnection(view, providerId)
         if (
           !provider ||
           provider.state !== 'connected' ||
@@ -5054,9 +4366,9 @@ export class OpenCodeProviderManagementAdapter
         }
         const executionProof = await this.verifyConnectedProviderExecution({
           providerId,
-          inventory: admission.value.inventory,
-          configProviders: admission.value.configProviders,
-          providers: admission.value.providers,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
         })
         if (!executionProof.ok) {
           await this.rollbackProviderAuth({
@@ -5119,7 +4431,7 @@ export class OpenCodeProviderManagementAdapter
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
-      async ({ inventory, inventoryService, client }) => {
+      async ({ inventory, inventoryService, host, client }) => {
         if (!client.setProviderAuth) {
           return providerManagementError(
             'unsupported-action',
@@ -5257,6 +4569,13 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
+        // OpenCode snapshots connected providers when an instance starts. The auth
+        // endpoint persists the credential but does not refresh that in-memory
+        // snapshot, so this host can legitimately remain stale after a successful
+        // write. Confirm against the bypass-cache inventory below, which starts
+        // from the updated managed auth store, and then prove providers that need
+        // credential validation with a real model request.
+
         const authStore = this.getAuthStore()
         try {
           await authStore.upsertApiAuth({
@@ -5282,20 +4601,27 @@ export class OpenCodeProviderManagementAdapter
             error instanceof Error ? error.message : 'OpenCode auth mirror failed',
           )
         }
-        const admission = await this.refreshConnectedProviderAdmission({
-          inventory, inventoryService, providerId, providerAuth, capabilities,
+        this.invalidateDirectoryCache()
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
+        )
+        const view = await readLiveView({
+          inventory: refresh.inventory,
+          host,
+          client,
+          diagnostics: refresh.inventory.diagnostics,
         })
-        if (!admission.ok) {
-          await this.rollbackProviderAuth({
-            client,
-            providerId,
-            authPaths: [globalAuthPath, managedAuthPath],
-            canDeleteProviderAuth,
-            previousCredentials,
-          })
-          return admission
-        }
-        const { provider } = admission.value
+        const viewWithRefreshDiagnostics = appendViewDiagnostics(view, refresh.postViewDiagnostics)
+        const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           await this.rollbackProviderAuth({
             client,
@@ -5309,10 +4635,7 @@ export class OpenCodeProviderManagementAdapter
             `OpenCode did not return provider ${providerId} after connecting`,
           )
         }
-        if (
-          provider.state !== 'connected' ||
-          !provider.ownership.includes('managed')
-        ) {
+        if (provider.state !== 'connected' || !provider.ownership.includes('managed')) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -5327,9 +4650,9 @@ export class OpenCodeProviderManagementAdapter
         }
         const executionProof = await this.verifyConnectedProviderExecution({
           providerId,
-          inventory: admission.value.inventory,
-          configProviders: admission.value.configProviders,
-          providers: admission.value.providers,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
           secretToRedact: apiKey,
           required: true,
         })

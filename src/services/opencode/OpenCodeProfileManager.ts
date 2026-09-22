@@ -95,7 +95,11 @@ import {
   cursorNativeSelectedIdentity,
   reconcileCursorNativeAuthority,
 } from './OpenCodeCursorNativeAuthority.js'
-import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import {
+  assertOpenCodeProviderScopedModelRef,
+  OpenCodeUnsupportedProviderModelReferenceError,
+  parseOpenCodeProviderScopedModelRef,
+} from './OpenCodeModelRef.js'
 import { planOpenCodeProfilePolicy } from './OpenCodeProfilePolicy.js'
 import {
   canonicalizeOpenCodeProviderId,
@@ -1492,6 +1496,43 @@ function buildWindowsCursorPreloadLines(): string[] {
   ]
 }
 
+/**
+ * Cursor is launched by OpenCode's plugin rather than our process, so Windows
+ * cleanup cannot use the host's Job: that would also own the OpenCode server
+ * and unrelated lanes.  The managed shim creates one Job for this invocation,
+ * publishes its opaque identity to the preload, and waits for the exact child
+ * before closing its only handle.  A missing/failed Job makes reaping partial
+ * rather than widening authority to the host Job.
+ */
+function buildWindowsCursorAgentJobLines(hostCommand: string, attachJob = true): string[] {
+  // This value is embedded only in UTF-16LE EncodedCommand, never in a cmd
+  // source line, so batch escaping would corrupt a legitimate native path.
+  const psHostCommand = hostCommand.replace(/'/g, "''")
+  // PowerShell never splats user arguments. The wrapper reads its cmd.exe
+  // parent's original Unicode command line through the Windows process API and
+  // passes the native-decoded tail via
+  // ProcessStartInfo.Arguments, which is supported by Windows PowerShell/.NET
+  // Framework, including older Windows PowerShell runtimes. The batch body
+  // never interpolates argv.
+  const source = 'using System;using System.Diagnostics;using System.IO;using System.Runtime.InteropServices;public static class ATJ{[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]public static extern IntPtr CreateJobObject(IntPtr a,string n);[DllImport("kernel32.dll",SetLastError=true)]public static extern bool AssignProcessToJobObject(IntPtr h,IntPtr p);[DllImport("kernel32.dll")]public static extern IntPtr GetCurrentProcess();[DllImport("kernel32.dll")]public static extern bool CloseHandle(IntPtr h);[DllImport("shell32.dll",CharSet=CharSet.Unicode)]static extern IntPtr CommandLineToArgvW(string s,out int n);[DllImport("kernel32.dll")]static extern IntPtr LocalFree(IntPtr p);static string[] Parts(string raw){int n;var p=CommandLineToArgvW(raw,out n);if(p==IntPtr.Zero||n<1)throw new InvalidOperationException("argv decode failed");try{var a=new string[n];for(var i=0;i<n;i++)a[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(p,i*IntPtr.Size))??"";return a;}finally{LocalFree(p);}}public static string[] Tail(string raw,string wrapper){var a=Parts(raw);var w=Path.GetFullPath(wrapper);for(var i=0;i<a.Length;i++)try{if(string.Equals(Path.GetFullPath(a[i]),w,StringComparison.OrdinalIgnoreCase)){var r=new string[a.Length-i-1];Array.Copy(a,i+1,r,0,r.Length);return r;}}catch{}throw new InvalidOperationException("wrapper argv missing");}static string Q(string a){var r="\\\"";var b=0;foreach(var c in a){if(c==\'\\\\\'){b++;continue;}if(c==\'\\\"\')r+=new string(\'\\\\\',b*2+1)+c;else r+=new string(\'\\\\\',b)+c;b=0;}return r+new string(\'\\\\\',b*2)+"\\\"";}public static int Run(string file,string raw,string wrapper){var psi=new ProcessStartInfo();psi.FileName=file;psi.Arguments=string.Join(" ",Array.ConvertAll(Tail(raw,wrapper),Q));psi.UseShellExecute=false;using(var p=Process.Start(psi)){if(p==null)throw new InvalidOperationException("cursor start failed");p.WaitForExit();return p.ExitCode;}}}'
+  const encodedSource = Buffer.from(source, 'utf8').toString('base64')
+  // Query the parent cmd.exe's CommandLine rather than expanding it in batch.
+  // Get-WmiObject is present in Windows PowerShell/.NET Framework and returns
+  // the original Unicode command line without a second cmd parse.
+  const run = `[ATJ]::Run('${psHostCommand}',$raw,$wrapper)`
+  const jobProgram = attachJob
+    ? `$n='agent-teams-cursor-'+[Guid]::NewGuid().ToString('N');$h=[ATJ]::CreateJobObject([IntPtr]::Zero,$n);if($h -eq [IntPtr]::Zero){exit 50};try{if(-not [ATJ]::AssignProcessToJobObject($h,[ATJ]::GetCurrentProcess())){exit 51};$env:AGENT_TEAMS_CURSOR_AGENT_OS_IDENTITY='win32-agent-job:'+$n;exit ${run}}finally{[void][ATJ]::CloseHandle($h)}`
+    : `exit ${run}`
+  const program = `$ErrorActionPreference='Stop';Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedSource}')));$self=Get-WmiObject Win32_Process -Filter ('ProcessId='+$PID);$raw=(Get-WmiObject Win32_Process -Filter ('ProcessId='+$self.ParentProcessId)).CommandLine;$wrapper=$env:AGENT_TEAMS_CURSOR_WRAPPER;if([string]::IsNullOrWhiteSpace($raw)-or[string]::IsNullOrWhiteSpace($wrapper)){exit 52};${jobProgram}`
+  const encodedProgram = Buffer.from(program, 'utf16le').toString('base64')
+  return [
+    'setlocal DisableDelayedExpansion',
+    'set "AGENT_TEAMS_CURSOR_WRAPPER=%~f0"',
+    `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedProgram}`,
+    'exit /b',
+  ]
+}
+
 function buildPosixCursorPreloadLines(
   preloadPath: string,
   platform: NodeJS.Platform,
@@ -1560,8 +1601,9 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'set "XDG_CACHE_HOME="',
         `set "PATH=${escapeWindowsBatchValue(hostPath)}"`,
         ...(command === 'cursor-agent' ? buildWindowsCursorPreloadLines() : []),
-        `call "${escapeWindowsBatchValue(hostCommand)}" %*`,
-        'exit /b %ERRORLEVEL%',
+        ...(command === 'cursor-agent'
+          ? buildWindowsCursorAgentJobLines(hostCommand)
+          : buildWindowsCursorAgentJobLines(hostCommand, false)),
         '',
       ].join('\r\n')
       await publishNativeCliFile(bridgePath, content, 0o700)
@@ -2228,6 +2270,87 @@ type OpenCodeScopeResolutionInput = {
   oauthSessionToRelease?: OpenCodeSessionRecord
 }
 
+/**
+ * Keep the selected reference and every provider-key lookup in the same
+ * identity domain. In particular, an old `lm-studio/foo` record must seed and
+ * bind the canonical `lmstudio` provider instead of splitting those effects.
+ */
+function canonicalizeOpenCodeProviderScopedModelRef(value: unknown) {
+  const parsed = assertOpenCodeProviderScopedModelRef(value)
+  const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  return { ...parsed, providerId, raw: `${providerId}/${parsed.modelId}` }
+}
+
+function assertStrictOpenCodeProviderModelAdmission(input: {
+  purpose: OpenCodeProfilePurpose
+  selectedModel: ReturnType<typeof canonicalizeOpenCodeProviderScopedModelRef>
+}): void {
+  if (isStrictAuthorityPurpose(input.purpose) && input.selectedModel.providerId === 'kiro') {
+    throw new OpenCodeUnsupportedProviderModelReferenceError(
+      input.selectedModel.raw,
+      `OpenCode ${input.purpose} does not support extension-bound provider kiro`,
+    )
+  }
+}
+
+/**
+ * The narrow, side-effect-free admission at every strict provider route.
+ *
+ * A selected model is persisted state at several call sites.  Do not let that
+ * state choose an approval-mode profile, a supplied prepared profile, or a
+ * host path until the provider's managed runtime requirements are known to be
+ * present.  In particular, Cursor's plugin is its managed Stop boundary; an
+ * unavailable asset is not a route that can safely degrade to the upstream
+ * extension.
+ */
+export type OpenCodeProviderRouteAdmission = Readonly<{
+  purpose: OpenCodeProfilePurpose
+  selectedModel: string
+  providerId: string
+  cursorAssets: OpenCodeCursorManagedAssets | null
+}>
+
+export async function admitOpenCodeProviderRoute(input: {
+  purpose: OpenCodeProfilePurpose
+  selectedModel: unknown
+  env?: NodeJS.ProcessEnv
+}): Promise<OpenCodeProviderRouteAdmission> {
+  const selectedModel = canonicalizeOpenCodeProviderScopedModelRef(input.selectedModel)
+  assertStrictOpenCodeProviderModelAdmission({ purpose: input.purpose, selectedModel })
+  if (!isStrictAuthorityPurpose(input.purpose) || selectedModel.providerId !== 'cursor-acp') {
+    return {
+      purpose: input.purpose,
+      selectedModel: selectedModel.raw,
+      providerId: selectedModel.providerId,
+      cursorAssets: null,
+    }
+  }
+
+  // This is intentionally the first Cursor-specific operation.  It only
+  // verifies already-staged immutable assets; it neither creates config paths
+  // nor probes/starts a provider.
+  const runtimeEnv = scopeSourceEnvironment(input.env ?? process.env)
+  const managedCursor = await resolveOpenCodeCursorManagedAssets({
+    env: runtimeEnv,
+  }).catch(error => ({
+    available: false as const,
+    reason: `probe_failed:${String(error).slice(0, 60)}`,
+  }))
+  if (!managedCursor.available) {
+    throw new OpenCodeUnsupportedProviderModelReferenceError(
+      selectedModel.raw,
+      `OpenCode ${input.purpose} does not support extension-bound provider cursor-acp`
+        + ` (managed path unavailable: ${managedCursor.reason})`,
+    )
+  }
+  return {
+    purpose: input.purpose,
+    selectedModel: selectedModel.raw,
+    providerId: selectedModel.providerId,
+    cursorAssets: managedCursor.assets,
+  }
+}
+
 function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const retainedScopeEnvironment = asRecord(safeParseJSONC(
     inputEnv[OPEN_CODE_SCOPE_ENVIRONMENT_ENV],
@@ -2241,8 +2364,18 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 }
 
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
-  await recoverOpenCodeScopedOAuth(input)
-  return resolveOpenCodeProfileScopeInternal(input)
+  // Validate the persisted authority input before OAuth recovery (which can
+  // publish credentials) or any resolver-side filesystem work.
+  const admission = await admitOpenCodeProviderRoute(input)
+  const normalizedInput = { ...input, selectedModel: admission.selectedModel }
+  await recoverOpenCodeScopedOAuth(normalizedInput, admission.providerId)
+  return resolveOpenCodeProfileScopeInternal(
+    normalizedInput,
+    undefined,
+    undefined,
+    undefined,
+    admission,
+  )
 }
 
 function isForeignOpenCodeOAuthHarvestSkip(error: unknown): boolean {
@@ -2272,14 +2405,17 @@ async function peekOpenCodeOAuthSaveAdmission(globalAuthPath: string): Promise<{
   }
 }
 
-async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): Promise<void> {
+async function recoverOpenCodeScopedOAuth(
+  input: OpenCodeScopeResolutionInput,
+  providerId: string,
+): Promise<void> {
   // Catalog and provider tests must not fail-close on a leftover launch receipt
   // from another project. Owner catalog/probe still completes a pending
   // publication through recoverOpenCodeOwnedOAuthSave under the auth-store lock.
   // Authority comparisons explicitly use cacheSnapshot:false and stay read-only.
   // Fresh launch resolution can finish an already proven native publication;
   // it cannot create provenance from an old managed auth file.
-  if (input.cacheSnapshot !== false && input.selectedModel.split('/')[0]?.trim().toLowerCase() === 'xai') {
+  if (input.cacheSnapshot !== false && providerId === 'xai') {
     const env = scopeSourceEnvironment(input.env ?? process.env)
     const managedPaths = resolveClaudeMultimodelPaths(env)
     const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
@@ -2413,11 +2549,28 @@ async function resolveOpenCodeProfileScopeInternal(
   recoveryPredecessor?: OpenCodeAuthCredential,
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
+  admittedRoute?: OpenCodeProviderRouteAdmission,
 ): Promise<OpenCodeProfileScope> {
+  // Internal callers include persisted-session recovery. Validate here too,
+  // because this path performs Cursor directory setup and authority work.
+  const admission = admittedRoute ?? await admitOpenCodeProviderRoute(input)
+  const selectedModel = canonicalizeOpenCodeProviderScopedModelRef(admission.selectedModel)
+  if (
+    admission.purpose !== input.purpose
+    || admission.providerId !== selectedModel.providerId
+    || admission.selectedModel !== selectedModel.raw
+  ) {
+    throw new Error('OpenCode provider route admission does not match the selected model')
+  }
+  input = { ...input, selectedModel: admission.selectedModel }
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
+  // This check is deliberately before project/config setup. An unstaged Cursor
+  // route is unsupported, so it must not create CURSOR_CONFIG_DIR or trigger
+  // any profile/config preparation merely to discover that fact.
+  const admittedCursorAssets = admission.cursorAssets
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   if (isStrictAuthorityPurpose(input.purpose)
-    && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
+    && selectedModel.providerId === 'cursor-acp') {
     Object.assign(envSnapshot, managedCursorNativeEnvironment(
       envSnapshot, resolveClaudeMultimodelPaths(envSnapshot).data, projectPath,
     ))
@@ -2426,27 +2579,16 @@ async function resolveOpenCodeProfileScopeInternal(
   const env = Object.freeze(envSnapshot)
   const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
   const snapshotManagedPaths = resolveClaudeMultimodelPaths(env)
-  const providerId = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '')
-  if (!providerId) {
-    throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
-  }
-  if (isStrictAuthorityPurpose(input.purpose)
-    && (providerId === 'kiro' || providerId === 'cursor-acp')) {
+  const providerId = selectedModel.providerId
+  if (isStrictAuthorityPurpose(input.purpose) && providerId === 'cursor-acp') {
     // Cursor is admitted only once the staged managed assets verify: they carry
     // the ownership barrier and the Stop control that make a terminal Stop
     // provable. Unstaged Cursor, and Kiro, stay blocked.
-    const managedCursor = providerId === 'cursor-acp'
-      ? await resolveOpenCodeCursorManagedAssets({ env })
-        .catch(error => ({ available: false as const, reason: `probe_failed:${String(error).slice(0, 60)}` }))
-      : { available: false as const, reason: 'provider_has_no_managed_path' }
-    if (!managedCursor.available) {
-      // The reason is the whole difference between "this build ships no assets"
-      // and "the environment hid the interpreter", and both used to read alike.
-      throw new Error(
-        `OpenCode ${input.purpose} does not support extension-bound provider ${providerId}`
-        + ` (managed path unavailable: ${managedCursor.reason})`,
-      )
-    }
+    // `admittedCursorAssets` was verified before any config-directory effect.
+    // Keep this defense so an internal caller cannot weaken the admission.
+    if (!admittedCursorAssets) throw new OpenCodeUnsupportedProviderModelReferenceError(
+      selectedModel.raw, `OpenCode ${input.purpose} does not support extension-bound provider cursor-acp`,
+    )
   }
   const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
     ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
@@ -2514,7 +2656,7 @@ async function resolveOpenCodeProfileScopeInternal(
   // probe is, and it is only consulted when the managed assets verify.
   const cursorCandidate = isStrictAuthorityPurpose(input.purpose)
     && providerId === 'cursor-acp'
-  const cursorAssets = cursorCandidate ? await resolveManagedCursorAssets(env) : null
+  const cursorAssets = cursorCandidate ? admittedCursorAssets : null
   const cursorAssetsReady = cursorAssets !== null
   const cursorAssetsIdentity = cursorAssets ? await managedCursorAssetsIdentity(cursorAssets) : null
   const cursorNative = cursorAssetsReady ? await resolveCurrentCursorNativeAuthority(env) : null
@@ -2730,6 +2872,18 @@ export function buildManagedConfigFingerprint(
 }
 
 /**
+ * MCP connection details are launch authority.  Unlike the broad config
+ * fingerprint, retain remote URLs and per-server environment identity here so
+ * a changed MCP target cannot hide behind a resolved-host aggregate.
+ */
+export function buildManagedMcpConfigFingerprint(
+  managedConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return hashString(JSON.stringify(redactConfigIdentity(managedConfig.mcp ?? null, env)))
+}
+
+/**
  * Per-section fingerprints of the same config the whole fingerprint covers.
  * A stale session otherwise reports only "some hash changed", which is exactly
  * the question a launch failure leaves you asking.
@@ -2917,12 +3071,13 @@ export class OpenCodeProfileManager {
     isSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>,
   ): Promise<void> {
     if (record.profileScope?.providerId !== 'xai') return
+    const selectedModel = assertOpenCodeProviderScopedModelRef(record.selectedModel)
     const snapshot = openCodeEffectiveConfigSnapshots.get(record.profileScope.scopeToken)
     await recoverOpenCodeScopedOAuth({
       projectPath: record.projectPath, purpose: record.profileScope.purpose,
-      selectedModel: record.selectedModel, env: snapshot?.runtimeEnv ?? process.env,
+      selectedModel: selectedModel.raw, env: snapshot?.runtimeEnv ?? process.env,
       oauthSessionToRelease: record, isOAuthNativeSessionSettled: isSettled,
-    })
+    }, selectedModel.providerId)
   }
 
   async readSavedOAuthCredential(profile: OpenCodePreparedProfile) {
@@ -3465,7 +3620,17 @@ export class OpenCodeProfileManager {
     }
     const managedConfigFingerprint = buildManagedConfigFingerprint(
       managedConfig,
-      configSnapshot?.runtimeEnv ?? process.env,
+      // This is the environment that will actually launch Cursor/OpenCode,
+      // after managed Cursor paths have been installed.  A resolver snapshot
+      // is only input authority; hashing it here would bind a different config
+      // image than OPENCODE_CONFIG_CONTENT and the MCP bridge consume.
+      runtimeEnv,
+    )
+    // Bind the exact managed image and its MCP section separately. A resolved
+    // host digest is an aggregate observation, not this configuration authority.
+    const managedMcpConfigFingerprint = buildManagedMcpConfigFingerprint(
+      managedConfig,
+      runtimeEnv,
     )
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
@@ -3609,6 +3774,7 @@ export class OpenCodeProfileManager {
           assetsFingerprint: cursorManagedAssets.fingerprint,
           profileScopeToken: policy?.scope.scopeToken ?? profileRootKey,
           managedConfigFingerprint,
+          managedMcpConfigFingerprint,
           proxyPort: cursorManagedProxyPort,
         })
       }
@@ -3750,6 +3916,7 @@ export class OpenCodeProfileManager {
       globalAuthPath,
       managedAuthPath,
       sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
+      sourceAuthSources: sourceAuthSources.map(source => ({ ...source })),
       sourceAuthFingerprint,
       managedAuthFingerprint,
       selectedSourceAuthIdentity,

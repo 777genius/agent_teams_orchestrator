@@ -1,8 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import { readFile } from 'node:fs/promises'
-import { drainStartupTaskkills } from '../../utils/processKill.js'
-
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
@@ -138,8 +136,10 @@ export async function runtimeOpenCodeCommand(opts: {
   let cleanupPromise: Promise<void> | null = null
   const drainCleanupOnce = (timeoutMs?: number): Promise<void> => {
     cleanupPromise ??= startupCleanupOnly
-      ? Promise.all([drainStartupTaskkills(), openCodeHostManager.drainStartupCleanupLockReleases(),
-        openCodeSessionStore.drainPendingLateLockReleases()]).then(() => undefined)
+      // Startup cleanup has already made its bounded observation and embeds
+      // unknown/partial evidence in the response. A taskkill helper that
+      // never closes must not prevent that receipt from being published.
+      ? Promise.resolve()
       : drainCleanup(timeoutMs)
     return cleanupPromise
   }
@@ -182,8 +182,8 @@ export async function runtimeOpenCodeCommand(opts: {
       // unwinds. Do not snapshot cleanup tracking until that registration is done.
       settleCommandExecution()
     }
-    // Startup terminal evidence is published only after helpers, fallback
-    // continuations and their retained locks have drained.
+    // The cleanup command has a shared bounded observation budget; publication
+    // must not wait for an unbounded late helper after that budget expires.
     if (startupCleanupOnly) await drainCleanupOnce()
     if (signalCleanupPromise) {
       await signalCleanupPromise
